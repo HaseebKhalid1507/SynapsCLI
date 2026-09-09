@@ -617,6 +617,24 @@ mod tests {
     use crate::test_env::{BaseDirGuard, EnvVarGuard};
 
     const BODY_SENTINEL: &str = "MEMORY-BODY-SENTINEL-4af1";
+
+    #[test]
+    #[serial]
+    fn host_scope_uses_capability_cwd_when_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let nested = project.join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        // The env override would short-circuit discovery; make sure it is unset.
+        let saved = std::env::var_os("SYNAPS_PROJECT_ROOT");
+        std::env::remove_var("SYNAPS_PROJECT_ROOT");
+        let scope = host_scope(Some(&nested)).unwrap();
+        if let Some(v) = saved {
+            std::env::set_var("SYNAPS_PROJECT_ROOT", v);
+        }
+        assert_eq!(scope.root(), project.canonicalize().unwrap());
+    }
     /// Placed at the END of stored bodies — beyond any snippet budget, so
     /// its appearance in search output would prove a full-body leak.
     const TAIL_SENTINEL: &str = "MEMORY-TAIL-SENTINEL-9be2";

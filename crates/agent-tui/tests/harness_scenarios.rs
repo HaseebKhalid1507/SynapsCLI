@@ -1931,3 +1931,89 @@ fn effort_enter_closes_modal_and_emits_guarded_apply_action() {
         "Enter must emit the deferred guarded apply action: {actions:?}"
     );
 }
+
+// ── Confirm prompts (PromptKind::Confirm) ────────────────────────────────────
+// `activate_tools` / extension confirm hooks ride the same async prompt
+// channel as secret prompts but are y/n questions: the FULL body (the exact
+// tool-id list) must be visible and unmasked, and only `y` may allow.
+
+const CONFIRM_BODY: &str = "The model requests session-scoped activation of 2 exact tool id(s):\n\
+    mcp.github.create_issue\n\
+    mcp.github.list_issues\n\
+    Type y/yes to allow exactly these tools; anything else denies.";
+
+#[test]
+fn scenario_confirm_prompt_renders_dialog_not_password_box() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let _rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
+    assert!(h.secret_prompt_active());
+    assert_eq!(h.modal_stack_depth(), 1);
+
+    let frame = h.snapshot();
+    assert!(frame.contains("Confirm tool activation"), "title:\n{frame}");
+    for line in [
+        "mcp.github.create_issue",
+        "mcp.github.list_issues",
+        "Type y/yes to allow exactly these tools; anything else denies.",
+    ] {
+        assert!(frame.contains(line), "body line {line:?} must render:\n{frame}");
+    }
+    assert!(frame.contains("y allow · n/esc deny"), "footer:\n{frame}");
+    assert!(
+        !frame.contains("password:"),
+        "confirm must NOT render the masked field:\n{frame}"
+    );
+    assert!(!frame.contains('\u{2022}'), "no mask glyphs:\n{frame}");
+}
+
+#[test]
+fn scenario_confirm_prompt_y_answers_y() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
+    h.key(KeyCode::Char('y'), KeyModifiers::NONE);
+    assert!(!h.secret_prompt_active(), "y resolves the prompt");
+    assert_eq!(h.modal_stack_depth(), 0);
+    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()));
+}
+
+#[test]
+fn scenario_confirm_prompt_n_esc_enter_deny() {
+    for code in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
+        let mut h = TestHarness::boot_with_size(100, 30);
+        let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
+        h.key(code, KeyModifiers::NONE);
+        assert!(!h.secret_prompt_active(), "{code:?} resolves the prompt");
+        assert_eq!(rx.try_recv().unwrap(), None, "{code:?} must deny");
+    }
+}
+
+#[test]
+fn scenario_confirm_prompt_ignores_other_keys_and_paste() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
+    h.type_str("xqz");
+    h.paste("y");
+    assert!(h.secret_prompt_active(), "junk / paste never resolves a confirm");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let frame = h.snapshot();
+    assert!(!frame.contains('\u{2022}'), "nothing is echoed or masked:\n{frame}");
+}
+
+/// The same defect hit long Secret prompts (a sudo reason): the body is
+/// word-wrapped instead of truncated to the first line.
+#[test]
+fn scenario_secret_prompt_long_body_wraps() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.activate_secret_prompt(
+        "Sudo",
+        "The tool needs root to restart the service.\nEnter the sudo password for deploy@prod-web-01 to continue with the rollout.",
+    );
+    let frame = h.snapshot();
+    assert!(frame.contains("restart the service."), "{frame}");
+    assert!(frame.contains("deploy@prod-web-01"), "{frame}");
+    assert!(frame.contains("rollout."), "wrapped tail must be visible:\n{frame}");
+    assert!(frame.contains("password:"), "{frame}");
+}

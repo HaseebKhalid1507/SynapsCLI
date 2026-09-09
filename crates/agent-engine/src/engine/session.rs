@@ -11,7 +11,7 @@ use crate::{Runtime, Session};
 /// A failed (or dropped in-flight) publication requires explicit reload/new
 /// session before saving or scheduling more inference. Never rollback-save an
 /// old head: `save_durable` can fail after publishing its replacement.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ContextHeadPersistence {
     blocked_session: Option<String>,
 }
@@ -81,6 +81,7 @@ impl ContextHeadPersistence {
 }
 
 /// Conversation state tracked by the engine.
+#[derive(Clone)]
 pub struct ConversationState {
     pub session: Session,
     pub context_head: ContextHeadPersistence,
@@ -194,6 +195,31 @@ impl ConversationState {
             runtime.system_prompt(),
         );
         runtime.reset_context_continuation(&self.session.id, &[]);
+    }
+
+    /// Serializable mirror for clients (`SessionEventWire::Conversation`).
+    /// `consecutive_auto_turns` is actor/App-side state, not conversation
+    /// state, so the caller supplies it.
+    pub fn snapshot(
+        &self,
+        consecutive_auto_turns: u32,
+    ) -> crate::session::ConversationSnapshot {
+        crate::session::ConversationSnapshot {
+            header: crate::session::SessionHeader::from(&self.session),
+            api_messages: self.api_messages.clone(),
+            messages_len: self.api_messages.len(),
+            tokens: crate::session::ConversationTokens {
+                input: self.total_input_tokens,
+                output: self.total_output_tokens,
+                cache_read: self.total_cache_read_tokens,
+                cache_creation: self.total_cache_creation_tokens,
+            },
+            cost: self.session_cost,
+            abort_context: self.abort_context.clone(),
+            queued_message: self.queued_message.clone(),
+            pending_events_len: self.pending_events.len(),
+            consecutive_auto_turns,
+        }
     }
 
     /// Add usage from a model turn.

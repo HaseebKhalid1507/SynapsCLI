@@ -158,9 +158,27 @@ pub fn compute_extension_load_hint(
     }
 }
 
+/// Process-level discovery state (daemon-mode phase 2, C2). Discovery walks
+/// the plugin roots and spawns sidecars ONCE per manager; a second
+/// `discover_and_load` call replays the recorded result instead of
+/// re-walking (which would report every extension as "already loaded" —
+/// N false failures on the second host in one process).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DiscoveryState {
+    #[default]
+    NotStarted,
+    Running,
+    Done {
+        loaded: Vec<String>,
+        failed: Vec<ExtensionLoadFailure>,
+    },
+}
+
 /// Manages the lifecycle of all loaded extensions.
 pub struct ExtensionManager {
     exclusive_memory: bool,
+    /// Once-per-process discovery record; see [`DiscoveryState`].
+    discovery: DiscoveryState,
     /// The shared hook bus.
     hook_bus: Arc<HookBus>,
     /// Optional shared tool registry for extension-provided tools.
@@ -252,6 +270,7 @@ impl ExtensionManager {
         Self {
             exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
                 .exclusive(),
+            discovery: DiscoveryState::NotStarted,
             hook_bus,
             tools: None,
             providers: ProviderRegistry::new(),
@@ -278,6 +297,7 @@ impl ExtensionManager {
         Self {
             exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
                 .exclusive(),
+            discovery: DiscoveryState::NotStarted,
             hook_bus,
             tools: Some(tools),
             providers: ProviderRegistry::new(),
@@ -1148,8 +1168,25 @@ impl ExtensionManager {
         self.load_with_cwd(id, manifest, cwd).await
     }
 
-    /// Shut down all extensions gracefully.
+    /// Current process-level discovery state.
+    pub fn discovery_state(&self) -> &DiscoveryState {
+        &self.discovery
+    }
+
+    /// `Some((loaded, failed))` once discovery has completed on this
+    /// manager; `None` while not started / running. Idempotence seam for
+    /// [`crate::extensions::loader::spawn_discover_and_load`].
+    pub fn discovery_done(&self) -> Option<(Vec<String>, Vec<ExtensionLoadFailure>)> {
+        match &self.discovery {
+            DiscoveryState::Done { loaded, failed } => Some((loaded.clone(), failed.clone())),
+            _ => None,
+        }
+    }
+
+    /// Shut down all extensions gracefully. Resets discovery so a later
+    /// `discover_and_load` on this manager walks the roots again.
     pub async fn shutdown_all(&mut self) {
+        self.discovery = DiscoveryState::NotStarted;
         let ids: Vec<String> = self.extensions.keys().cloned().collect();
         for id in ids {
             let _ = self.unload(&id).await;
@@ -1669,6 +1706,32 @@ impl ExtensionManager {
     pub async fn discover_and_load_with_progress<F>(
         &mut self,
         mut progress: F,
+    ) -> (Vec<String>, Vec<ExtensionLoadFailure>)
+    where
+        F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),
+    {
+        // Idempotent (daemon-mode C2): discovery runs once per manager.
+        // A second call replays the recorded result and spawns nothing.
+        if let Some(done) = self.discovery_done() {
+            tracing::debug!(
+                loaded = done.0.len(),
+                failed = done.1.len(),
+                "Extension discovery already done; replaying recorded result"
+            );
+            return done;
+        }
+        self.discovery = DiscoveryState::Running;
+        let (loaded, failed) = self.discover_and_load_uncached(&mut progress).await;
+        self.discovery = DiscoveryState::Done {
+            loaded: loaded.clone(),
+            failed: failed.clone(),
+        };
+        (loaded, failed)
+    }
+
+    async fn discover_and_load_uncached<F>(
+        &mut self,
+        progress: &mut F,
     ) -> (Vec<String>, Vec<ExtensionLoadFailure>)
     where
         F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),

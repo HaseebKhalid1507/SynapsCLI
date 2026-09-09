@@ -32,8 +32,9 @@ use synaps_cli::{
     },
     core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
     engine::reactor::{
-        claim_auto_turn, drain_event_queue, event_payload_from_drained,
-        spawn_prompt_registration_check, wake_action, WakeAction, AUTO_TURN_CAP,
+        auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue,
+        event_payload_from_drained, spawn_prompt_registration_check, wake_action_with_cap,
+        WakeAction,
     },
     engine::setup::{self, EngineOpts},
     Runtime, Session, SessionEvent, StreamEvent,
@@ -70,7 +71,7 @@ struct RpcState {
     /// when the turn completes (Done path), then injected for the next turn.
     pending_events: Vec<String>,
     /// Number of consecutive auto-triggered turns since the last real user message.
-    /// Reset to 0 on every real Prompt / FollowUp. Capped at AUTO_TURN_CAP.
+    /// Reset to 0 on every real Prompt / FollowUp. Capped at `auto_turn_cap`.
     consecutive_auto_turns: u32,
     /// `true` while an auto-turn has been reserved but its `spawn_prompt` call
     /// has not yet registered `in_flight`.  Counts as busy so concurrent Prompt
@@ -79,6 +80,8 @@ struct RpcState {
     auto_turn_pending: bool,
     /// Mirror of `config.events.auto_turn` — loaded once at boot.
     events_auto_turn: bool,
+    /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
+    auto_turn_cap: u32,
 }
 
 impl RpcState {
@@ -181,7 +184,7 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 /// Controls whether a post-flush auto-turn may be reserved:
 ///
 /// * **`true`** (Done path): if all conditions are met (`events_auto_turn` enabled,
-///   buffered events present, `consecutive_auto_turns < AUTO_TURN_CAP`, last
+///   buffered events present, `consecutive_auto_turns` under `auto_turn_cap` (0 = unlimited), last
 ///   message is `role=user`), atomically claim the cap slot, set
 ///   `auto_turn_pending = true`, and return `Some(auto_id)`.  The caller
 ///   **must** forward the id to the scheduler without holding the lock.
@@ -213,7 +216,7 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
         && !st.context_head.is_blocked(&st.session)
         && had_buffered
         && st.events_auto_turn
-        && st.consecutive_auto_turns < AUTO_TURN_CAP
+        && !auto_turn_cap_reached(st.consecutive_auto_turns, st.auto_turn_cap)
         && st
             .api_messages
             .last()
@@ -221,7 +224,8 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
             .unwrap_or(false)
     {
         // Atomically claim the turn and reserve pending flag.
-        if claim_auto_turn(&mut st.consecutive_auto_turns) {
+        let cap = st.auto_turn_cap;
+        if claim_auto_turn_with_cap(&mut st.consecutive_auto_turns, cap) {
             st.auto_turn_pending = true;
             let auto_id = format!("auto:post-flush-{}", chrono::Utc::now().timestamp_millis());
             return Some(auto_id);
@@ -1125,8 +1129,11 @@ pub async fn run(
     let ready_session_id = session.id.clone();
     let ready_model = runtime.model().to_string();
 
-    // Load config for events_auto_turn (default: true per SynapsConfig defaults).
-    let events_auto_turn = load_config().events.auto_turn;
+    // Load config for events_auto_turn (default: true per SynapsConfig defaults)
+    // and the consecutive auto-turn cap (default 5; 0 = unlimited).
+    let boot_config = load_config();
+    let events_auto_turn = boot_config.events.auto_turn;
+    let auto_turn_cap = boot_config.events.auto_turn_cap;
 
     // 4. Build shared state.
     let state = Arc::new(Mutex::new(RpcState {
@@ -1142,6 +1149,7 @@ pub async fn run(
         consecutive_auto_turns: 0,
         auto_turn_pending: false,
         events_auto_turn,
+        auto_turn_cap,
     }));
 
     // 5. Spawn the writer task that owns stdout.
@@ -1189,6 +1197,7 @@ pub async fn run(
                     let mut st = state_d.lock().await;
                     let busy = st.is_busy();
                     let events_auto_turn = st.events_auto_turn;
+                    let auto_turn_cap = st.auto_turn_cap;
                     let consecutive = st.consecutive_auto_turns;
                     // Drain: split borrows explicitly to satisfy the borrow checker
                     // for the drain call, then drop the split borrow before
@@ -1216,22 +1225,27 @@ pub async fn run(
                         .collect();
 
                     // Decide auto-turn: only when idle + enabled + wake says RunTurn.
-                    let auto_id =
-                        if !busy && events_auto_turn && !st.context_head.is_blocked(&st.session) {
-                            let action =
-                                wake_action(&drained, &st.api_messages, false, true, consecutive);
-                            if action == WakeAction::RunTurn {
-                                // Atomically claim and reserve — one turn per batch.
-                                if claim_auto_turn(&mut st.consecutive_auto_turns) {
-                                    st.auto_turn_pending = true;
-                                    let first_id = drained
-                                        .first()
-                                        .map(|d| d.event.id.clone())
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    Some(format!("auto:{first_id}"))
-                                } else {
-                                    None
-                                }
+                    let auto_id = if !busy && events_auto_turn && !st.context_head.is_blocked(&st.session) {
+                        let action = wake_action_with_cap(
+                            &drained,
+                            &st.api_messages,
+                            false,
+                            true,
+                            consecutive,
+                            auto_turn_cap,
+                        );
+                        if action == WakeAction::RunTurn {
+                            // Atomically claim and reserve — one turn per batch.
+                            if claim_auto_turn_with_cap(
+                                &mut st.consecutive_auto_turns,
+                                auto_turn_cap,
+                            ) {
+                                st.auto_turn_pending = true;
+                                let first_id = drained
+                                    .first()
+                                    .map(|d| d.event.id.clone())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                Some(format!("auto:{first_id}"))
                             } else {
                                 None
                             }

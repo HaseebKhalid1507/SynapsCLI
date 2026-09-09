@@ -16,6 +16,31 @@ use tokio_util::sync::CancellationToken;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
 /// Constructed once by `Runtime::run_stream_with_messages` before spawning the stream task.
+/// Host activation policy for MODEL-INITIATED `activate_tools`
+/// (`tools.activation_confirm` + `server.auto_approve_confirms`).
+///
+/// Returns `(authority, host_prompt_allowed)`:
+/// * `auto_approve_confirms` or `Auto` → `ModelConfirmed`, no prompt.
+/// * `Prompt` → `Unauthorized` + prompt allowed: `activate_tools` asks the
+///   host (y/n confirm dialog) and only an explicit y/yes authorizes.
+/// * `Deny` → `Unauthorized` + prompt NOT allowed: always
+///   `ConfirmationRequired`, no dialog is ever raised.
+pub fn activation_policy(
+    mode: agent_core::config::ActivationConfirm,
+    auto_approve_confirms: bool,
+) -> (crate::tools::activation::ActivationAuthority, bool) {
+    use agent_core::config::ActivationConfirm;
+    use crate::tools::activation::ActivationAuthority;
+    if auto_approve_confirms {
+        return (ActivationAuthority::ModelConfirmed, false);
+    }
+    match mode {
+        ActivationConfirm::Auto => (ActivationAuthority::ModelConfirmed, false),
+        ActivationConfirm::Prompt => (ActivationAuthority::Unauthorized, true),
+        ActivationConfirm::Deny => (ActivationAuthority::Unauthorized, false),
+    }
+}
+
 pub(super) struct StreamSession {
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
     pub(super) memory_context: Option<super::memory_context::MemoryContextCapability>,
@@ -58,6 +83,12 @@ pub(super) struct StreamSession {
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
     pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    /// Conversation id keying the `on_session_start` injection. `None`
+    /// (workers) reads nothing.
+    pub(super) session_id: Option<String>,
+    /// Per-session working directory forwarded as `ToolCapabilities.cwd`.
+    /// `None` = process cwd (every in-process host today).
+    pub(super) cwd: Option<PathBuf>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
@@ -67,6 +98,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.activation_confirm` policy (auto | prompt | deny).
+    pub(super) activation_confirm: agent_core::config::ActivationConfirm,
     /// Runtime-scoped tool-session identity the execution gate scopes the
     /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
     /// turns/clones of one Runtime; never a persisted session id.
@@ -309,6 +342,8 @@ impl StreamMethods {
             subagent_registry,
             event_queue,
             hook_bus,
+            session_id,
+            cwd,
             secret_prompt,
             auto_approve_confirms,
             telemetry_level,
@@ -316,6 +351,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            activation_confirm,
             tool_session_id,
             mcp_runtime,
             mcp_session_scope,
@@ -445,11 +481,8 @@ impl StreamMethods {
         });
         let _extension_session_scope = extension_session_scope;
 
-        let activation_authority = if auto_approve_confirms {
-            crate::tools::activation::ActivationAuthority::ModelConfirmed
-        } else {
-            crate::tools::activation::ActivationAuthority::Unauthorized
-        };
+        let (activation_authority, activation_prompt_allowed) =
+            activation_policy(activation_confirm, auto_approve_confirms);
 
         // ═══ TURN BUDGET (Task 23, spec §8.1) ═══
         // One meter for the whole turn; the shared usage counters are
@@ -595,11 +628,14 @@ impl StreamMethods {
             // the catalog generation since the retained set was built (e.g.
             // `connect_mcp_server` drained after the previous round),
             // rebuild it here — explicitly, deterministically, from the
-            // currently verified capabilities, with ZERO inherited
-            // activations (catalog drift invalidates exact activations by
-            // design). This is the ONLY rebuild site; individual calls
-            // never refresh it. The catalog snapshot cloned here feeds the
-            // passive discovery/activation capability context this round.
+            // currently verified capabilities. Exact activations whose
+            // record still matches its pinned digest+provenance are carried
+            // forward (re-issued at the new generation); drifted/removed
+            // ones are dropped. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores
+            // the zero-inherit rebuild. This is the ONLY rebuild site;
+            // individual calls never refresh it. The catalog snapshot cloned
+            // here feeds the passive discovery/activation capability context
+            // this round.
             let (tools_snapshot, catalog_snapshot) = {
                 let registry = prepare_or_cancel!(tools.read());
                 {
@@ -607,12 +643,25 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        *set = super::continuation::context_tool_set(
-                            tool_session_id.clone(),
-                            registry.catalog(),
-                            progressive_tool_disclosure,
-                            context_enabled,
-                        );
+                        if crate::tools::activation::carry_forward_enabled() {
+                            let (next, dropped) = set
+                                .rebuilt_for_catalog(registry.catalog(), progressive_tool_disclosure);
+                            for d in &dropped {
+                                tracing::warn!(
+                                    tool = %d.id,
+                                    reason = ?d.reason,
+                                    "activation dropped at round-top rebuild"
+                                );
+                            }
+                            *set = next;
+                        } else {
+                            *set = super::continuation::context_tool_set(
+                                tool_session_id.clone(),
+                                registry.catalog(),
+                                progressive_tool_disclosure,
+                                context_enabled,
+                            );
+                        }
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
@@ -635,14 +684,17 @@ impl StreamMethods {
 
             // Session-scoped context in system: byte-identical across the
             // whole session, cache-safe by construction.
-            let injected_system: Option<String> =
-                match prepare_or_cancel!(hook_bus.session_injection()) {
-                    Some(content) => Some(wrap_extension_context(
-                        system_prompt.as_deref().unwrap_or_default(),
-                        &content,
-                    )),
-                    None => system_prompt.clone(),
-                };
+            let session_injection = match session_id.as_deref() {
+                Some(id) => hook_bus.session_injection_for(id).await,
+                None => None,
+            };
+            let injected_system: Option<String> = match session_injection {
+                Some(content) => Some(wrap_extension_context(
+                    system_prompt.as_deref().unwrap_or_default(),
+                    &content,
+                )),
+                None => system_prompt.clone(),
+            };
 
             // Extract the last user message text — handles both string content
             // and block array content (common after tool results).
@@ -667,7 +719,8 @@ impl StreamMethods {
                 });
             let turn_injected_context: Option<String> = if let Some(ref msg_text) = last_user_msg {
                 let hook_event =
-                    crate::extensions::hooks::events::HookEvent::before_message(msg_text);
+                    crate::extensions::hooks::events::HookEvent::before_message(msg_text)
+                        .with_session(session_id.as_deref());
                 if let crate::extensions::hooks::events::HookResult::Inject { content } =
                     prepare_or_cancel!(hook_bus.emit(&hook_event))
                 {
@@ -1076,7 +1129,8 @@ impl StreamMethods {
                         "content_block_count": content.len(),
                         "has_tool_use": !tool_uses.is_empty(),
                     }),
-                );
+                )
+                .with_session(session_id.as_deref());
                 let _ = super::api::await_or_cancel(&cancel, hook_bus.emit(&hook_event)).await;
 
                 // If no tool uses, check for steering messages before finishing.
@@ -1282,6 +1336,7 @@ impl StreamMethods {
                                             &tool_name,
                                             Some(&runtime_name),
                                             input.clone(),
+                                            session_id.as_deref(),
                                         )
                                         .await,
                                         secret_prompt.as_ref(),
@@ -1303,7 +1358,7 @@ impl StreamMethods {
                                         let input_for_hook = input.clone();
                                         match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -1318,6 +1373,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
+                                                session_id.as_deref(),
                                             )).await.unwrap_or_else(|_| output.clone());
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
@@ -1551,6 +1607,8 @@ impl StreamMethods {
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
                         let prompt_inner = secret_prompt.clone();
+                        let cwd_inner = cwd.clone();
+                        let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
                         let mcp_leases_inner = mcp_lease_capability.clone();
@@ -1561,7 +1619,8 @@ impl StreamMethods {
                             catalog_snapshot.clone(),
                             std::sync::Arc::clone(&session_tool_set),
                             activation_authority,
-                        );
+                        )
+                        .with_host_prompt(activation_prompt_allowed);
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
@@ -1595,6 +1654,7 @@ impl StreamMethods {
                                             &tool_name_for_hook,
                                             Some(&runtime_name_for_hook),
                                             input.clone(),
+                                            session_id_inner.as_deref(),
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
@@ -1633,7 +1693,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -1648,6 +1708,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
+                                                session_id_inner.as_deref(),
                                             )).await.unwrap_or_else(|_| output.clone());
                                             // Hook Replace wins over rich blocks (see single-tool site).
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
@@ -2793,6 +2854,8 @@ mod rich_output_tests {
             )),
             event_queue: Arc::new(crate::events::EventQueue::new(100)),
             hook_bus,
+            session_id: None,
+            cwd: None,
             secret_prompt: None,
             auto_approve_confirms: true,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
@@ -2800,6 +2863,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: false,
+            activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             mcp_runtime: None,
             mcp_session_scope: None,

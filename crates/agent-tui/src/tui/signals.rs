@@ -28,16 +28,21 @@
 //! `render_thread.rs`).  The main task never blocks on stdout, so the
 //! `select!` is always free to receive a signal, and the bounded teardown in
 //! `mod.rs` always runs.  The watchdog was therefore **removed** — shutdown is
-//! self-bounding via `SAVE_TIMEOUT_SECS` + `HOOKS_TIMEOUT_SECS` (plus the
-//! render thread's own teardown-ack budget).
+//! self-bounding via the actor's budgets (plus the render thread's own
+//! teardown-ack budget).
 //!
 //! # Teardown timeout budgets
 //!
-//! The post-loop teardown in `mod.rs` is split into two sequential budgets:
+//! The session teardown runs inside `SessionActor::finish` under the
+//! engine's budgets (`agent_engine::session::budgets`, re-exported here):
 //!   - `SAVE_TIMEOUT_SECS`  : save_session + append_record (data safety first)
 //!   - `HOOKS_TIMEOUT_SECS` : on_session_end hook emit (concurrent, fail-open)
+//!   - plus the observability flush and, when quitting mid-turn, the
+//!     cancel-turn save.
 //!
-//! `TEARDOWN_TIMEOUT_SECS` = their sum (total teardown budget).
+//! `SESSION_END_TIMEOUT_SECS` is what the TUI waits for `Ended`: the sum of
+//! those plus a margin. `TEARDOWN_TIMEOUT_SECS` (= SAVE + HOOKS) is the
+//! render thread's budget.
 
 // ── Teardown timing constants ────────────────────────────────────────────────
 //
@@ -48,9 +53,29 @@
 //   SAVE_TIMEOUT_SECS  — budget for save_session() + append_record()
 //   HOOKS_TIMEOUT_SECS — budget for concurrent on_session_end hook emit
 //   TEARDOWN_TIMEOUT_SECS — sum of the above; total teardown budget for mod.rs
-pub(crate) const SAVE_TIMEOUT_SECS: u64 = 2;
-pub(crate) const HOOKS_TIMEOUT_SECS: u64 = 5;
-pub(crate) const TEARDOWN_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS;
+pub(crate) use agent_engine::session::budgets::{
+    HOOKS_TIMEOUT_SECS, SAVE_TIMEOUT_SECS, TEARDOWN_TIMEOUT_SECS,
+};
+
+/// Bounded observability flush inside `SessionActor::finish` (STEP 3).
+pub(crate) const FLUSH_TIMEOUT_SECS: u64 =
+    agent_engine::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs();
+
+/// Slack for `background.shutdown()` + channel delivery of `Ended`.
+pub(crate) const SESSION_END_MARGIN_SECS: u64 = 2;
+
+/// How long the TUI waits for `Ended` after sending `End` (in-process).
+/// `SessionActor::finish` runs, sequentially and each under its own
+/// budget: the cancel-turn save (streaming quit) + the final save
+/// (`SAVE_TIMEOUT` each), `on_session_end` (`HOOKS_TIMEOUT`), the
+/// observability flush (`FLUSH_TIMEOUT`); then `background.shutdown()`.
+/// The wait covers the worst case plus margin so a slow-but-in-budget
+/// teardown never turns into `emergency_exit()` (exit 1).
+pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS
+    + SAVE_TIMEOUT_SECS
+    + HOOKS_TIMEOUT_SECS
+    + FLUSH_TIMEOUT_SECS
+    + SESSION_END_MARGIN_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
@@ -89,21 +114,92 @@ pub(crate) fn signal_label(signal: ShutdownSignal) -> &'static str {
     }
 }
 
-/// A handle that can stop the signal-listener thread.
+/// Where the signal listener runs (PLAN-phase4 §6 #4).
 ///
-/// Dropping or calling `.close()` unregisters the signal hooks and causes the
+/// `Thread` is the historical signal-hook std thread (see the module doc for
+/// why the in-process TUI keeps it). `Tokio` is `tokio::signal::unix` on the
+/// runtime's own driver — no thread; used by the socket client, whose
+/// current-thread runtime has no history with the resolution problem above
+/// (covered by `tokio_backend_delivers_sigterm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalBackend {
+    Thread,
+    Tokio,
+}
+
+impl SignalBackend {
+    /// Socket client → `Tokio` unless `SYNAPS_CLIENT_SIGNAL_THREAD=1`;
+    /// in-process → `Thread`.
+    pub(crate) fn for_socket(socket: bool) -> Self {
+        if socket && !std::env::var("SYNAPS_CLIENT_SIGNAL_THREAD").is_ok_and(|v| v == "1") {
+            Self::Tokio
+        } else {
+            Self::Thread
+        }
+    }
+}
+
+/// A handle that can stop the signal listener.
+///
+/// Thread backend: `.close()` unregisters the signal hooks and causes the
 /// blocking `Signals::forever()` iterator to return, letting the thread exit
-/// cleanly.
+/// cleanly. Tokio backend: aborts the listener task.
 pub(crate) struct SignalHandle {
     #[cfg(unix)]
-    inner: signal_hook::iterator::Handle,
+    inner: SignalHandleInner,
+}
+
+#[cfg(unix)]
+enum SignalHandleInner {
+    Thread(signal_hook::iterator::Handle),
+    Tokio(tokio::task::JoinHandle<()>),
 }
 
 impl SignalHandle {
     pub(crate) fn close(self) {
         #[cfg(unix)]
-        self.inner.close();
+        match self.inner {
+            SignalHandleInner::Thread(h) => h.close(),
+            SignalHandleInner::Tokio(t) => t.abort(),
+        }
     }
+}
+
+/// `tokio::signal::unix` listener on the current runtime (no thread).
+#[cfg(unix)]
+pub(crate) fn spawn_shutdown_signal_task_with(
+    tx: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
+    backend: SignalBackend,
+) -> SignalHandle {
+    if backend == SignalBackend::Thread {
+        return spawn_shutdown_signal_task(tx);
+    }
+    use tokio::signal::unix::{signal, SignalKind};
+    let task = tokio::spawn(async move {
+        let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!("signals: tokio backend unavailable; no OS signal handling");
+            return;
+        };
+        let shutdown = tokio::select! {
+            _ = term.recv() => ShutdownSignal::Terminate,
+            _ = hup.recv() => ShutdownSignal::Hangup,
+            _ = int.recv() => ShutdownSignal::Interrupt,
+        };
+        let _ = tx.send(shutdown);
+    });
+    SignalHandle { inner: SignalHandleInner::Tokio(task) }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_shutdown_signal_task_with(
+    tx: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
+    _backend: SignalBackend,
+) -> SignalHandle {
+    spawn_shutdown_signal_task(tx)
 }
 
 /// Spawn a **std::thread** that delivers OS signals over the existing tokio
@@ -153,7 +249,7 @@ pub(crate) fn spawn_shutdown_signal_task(
         })
         .expect("failed to spawn signal-listener thread");
 
-    SignalHandle { inner: handle }
+    SignalHandle { inner: SignalHandleInner::Thread(handle) }
 }
 
 #[cfg(not(unix))]
@@ -211,11 +307,61 @@ mod tests {
         }
     }
 
+    /// A3: SIGTERM to self under a current-thread runtime reaches the
+    /// channel through the tokio backend (no signal-listener thread).
+    #[cfg(unix)]
+    #[test]
+    fn tokio_backend_delivers_sigterm() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = spawn_shutdown_signal_task_with(tx, SignalBackend::Tokio);
+            // Let the listener register before raising.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            signal_hook::low_level::raise(signal_hook::consts::signal::SIGTERM).unwrap();
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("SIGTERM never delivered");
+            assert_eq!(got, Some(ShutdownSignal::Terminate));
+            handle.close();
+        });
+    }
+
+    #[test]
+    fn backend_selection() {
+        assert_eq!(SignalBackend::for_socket(false), SignalBackend::Thread);
+        if std::env::var("SYNAPS_CLIENT_SIGNAL_THREAD").is_err() {
+            assert_eq!(SignalBackend::for_socket(true), SignalBackend::Tokio);
+        }
+    }
+
     #[test]
     fn teardown_budget_is_sum_of_parts() {
         assert_eq!(
             TEARDOWN_TIMEOUT_SECS,
             SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// M5: the TUI's wait for `Ended` must cover `SessionActor::finish`'s
+    /// worst case (cancel save + save + hooks + flush ≈ 11 s) with margin;
+    /// the old 7 s wait turned a slow-but-in-budget teardown into exit 1.
+    #[test]
+    fn session_end_wait_covers_actor_finish_worst_case() {
+        let actor_worst_case =
+            SAVE_TIMEOUT_SECS + SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS + FLUSH_TIMEOUT_SECS;
+        assert_eq!(actor_worst_case, 11);
+        assert!(SESSION_END_TIMEOUT_SECS > actor_worst_case);
+        assert!(SESSION_END_TIMEOUT_SECS >= actor_worst_case + SESSION_END_MARGIN_SECS);
+        assert!(SESSION_END_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS);
     }
 }
