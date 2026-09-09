@@ -216,13 +216,7 @@ impl Tool for BashTool {
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
         let script = bash_script_with_secure_sudo(command);
-        run_shell_command(
-            &script,
-            ShellSpec::Bash,
-            params["timeout"].as_u64(),
-            ctx,
-        )
-        .await
+        run_shell_command(&script, ShellSpec::Bash, params["timeout"].as_u64(), ctx).await
     }
 }
 
@@ -256,11 +250,15 @@ pub(crate) async fn run_shell_command(
 
         let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = match spec {
             ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
-            ShellSpec::PowerShell => {
-                (powershell_program(), vec!["-NoProfile".into(), "-Command".into(), script.into()])
-            }
+            ShellSpec::PowerShell => (
+                powershell_program(),
+                vec!["-NoProfile".into(), "-Command".into(), script.into()],
+            ),
         };
         let mut cmd = tokio::process::Command::new(program);
+        if let Some(cwd) = ctx.capabilities.cwd.as_deref() {
+            cmd.current_dir(cwd);
+        }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -962,5 +960,32 @@ exit 1
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
         assert!(error.contains("failed") || error.contains("exit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_honours_capability_cwd_when_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expected = tmp.path().canonicalize().unwrap();
+        let mut ctx = create_tool_context();
+        ctx.capabilities.cwd = Some(tmp.path().to_path_buf());
+        let out = BashTool
+            .execute(json!({"command": "pwd -P"}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), expected.to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_inherits_process_cwd_when_capability_cwd_is_none() {
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let ctx = create_tool_context();
+        assert!(ctx.capabilities.cwd.is_none());
+        let out = BashTool
+            .execute(json!({"command": "pwd -P"}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), expected.to_string_lossy());
     }
 }

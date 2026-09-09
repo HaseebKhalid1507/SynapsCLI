@@ -35,10 +35,9 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime: &mut crate::Runtime,
     config: &crate::config::SynapsConfig,
 ) {
-    // Inherit credential source / token cache from the parent session's
-    // resolved config — Remote broker endpoints must be reachable from
-    // the subagent thread. (#158 A3)
-    runtime.apply_auth_config(config);
+    // Credential source / token cache: host-built workers already share the
+    // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
+    // path re-applies auth config there. (#158 A3 → engine-host B2)
     runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
@@ -54,6 +53,55 @@ pub(crate) fn apply_subagent_runtime_policy(
         crate::runtime::budget::TurnRole::Worker,
         &config.turn_budgets,
     ));
+}
+
+/// Called after model selection by start, oneshot AND resume. Only inherit
+/// Ultra for the exact authorized foreground identity: explicitly selected
+/// different models/providers retain their own defaults. The worker planner
+/// revalidates current capability data and lowers Ultra to its wire effort;
+/// Worker role keeps proactive delegation disabled regardless of selection.
+pub(crate) fn apply_codex_worker_reasoning(
+    runtime: &mut crate::Runtime,
+    parent: Option<&crate::runtime::openai::catalog::CodexExecutionPlan>,
+) {
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    let Some(parent) = parent else { return };
+    if runtime.codex_request_role() == CodexRequestRole::Worker
+        && parent.automatic_delegation()
+        && parent.request_role == CodexRequestRole::Foreground
+        && runtime.model() == parent.qualified_model
+    {
+        runtime.set_reasoning_level(agent_core::reasoning::ReasoningLevel::Ultra);
+    }
+}
+
+/// Kill-switch: `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` restores the pre-engine-host
+/// spawn path (fresh `Runtime::new()`, fresh HTTP client, registry rebuilt,
+/// global broker re-installed with a fresh token cache on every spawn).
+pub fn legacy_fresh_runtime() -> bool {
+    std::env::var("SYNAPS_SUBAGENT_FRESH_RUNTIME").is_ok_and(|v| v == "1")
+}
+
+/// Build the runtime a subagent runs on. Preferred: `EngineHost::worker_runtime()`
+/// — shares the host credential source and token cache (so NO
+/// `set_global_broker` re-install and NO token-cache eviction per spawn) and
+/// takes a clone of the cached worker registry template. Legacy path (no host
+/// installed, or kill-switch set): today's `Runtime::new()` + rebuilt tools +
+/// `apply_auth_config`, verbatim.
+///
+/// Called from the subagent's own OS thread / current-thread tokio runtime:
+/// `EngineHost::current()` is a `OnceLock` read and `worker_runtime()` only
+/// touches `tokio::sync` primitives, so this is runtime-agnostic.
+pub async fn spawn_runtime() -> crate::Result<crate::Runtime> {
+    if !legacy_fresh_runtime() {
+        if let Some(host) = crate::EngineHost::current() {
+            return host.worker_runtime().await;
+        }
+    }
+    let mut rt = crate::Runtime::new().await?;
+    rt.set_tools(subagent_tools().await);
+    rt.apply_auth_config(&crate::config::load_config());
+    Ok(rt)
 }
 
 /// Build the subagent tool registry: extension tools if the routing manager
@@ -340,5 +388,131 @@ mod preamble_tests {
         assert!(composed.contains("You are spike."));
         let parts: Vec<&str> = composed.splitn(2, "\n\n").collect();
         assert_eq!(parts.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod codex_ultra_worker_tests {
+    use super::*;
+    use crate::runtime::openai::catalog::{
+        plan_codex_execution, CodexRequestRole, CodexWireEffort,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+
+    fn parent(
+        model: &str,
+        level: ReasoningLevel,
+    ) -> Option<crate::runtime::openai::catalog::CodexExecutionPlan> {
+        crate::Runtime::codex_delegation_plan(model, level, CodexRequestRole::Foreground)
+    }
+
+    #[test]
+    fn astra_ultra_worker_inherits_ultra_but_sends_xhigh_without_recursion() {
+        let parent = parent("openai-codex/gpt-6-astra", ReasoningLevel::Ultra).unwrap();
+        assert_eq!(parent.wire_effort, Some(CodexWireEffort::XHigh));
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &Default::default());
+        runtime.set_model(parent.qualified_model.clone());
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
+        apply_codex_worker_reasoning(&mut runtime, Some(&parent));
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Ultra);
+        let plan = plan_codex_execution(
+            runtime.model(),
+            runtime.reasoning_level(),
+            runtime.codex_request_role(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.wire_effort, Some(CodexWireEffort::XHigh));
+        assert!(!plan.automatic_delegation());
+        assert!(crate::Runtime::codex_delegation_plan(
+            runtime.model(),
+            runtime.reasoning_level(),
+            runtime.codex_request_role()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn astra_ultra_never_overrides_another_model_or_provider() {
+        let parent = parent("openai-codex/gpt-6-astra", ReasoningLevel::Ultra).unwrap();
+        for model in [
+            "openai-codex/gpt-5.6-sol",
+            "anthropic/claude-sonnet-4-6",
+            "openrouter/openai/gpt-6-astra",
+        ] {
+            let mut runtime = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut runtime, &Default::default());
+            runtime.set_model(model.into());
+            let default = runtime.reasoning_level();
+            apply_codex_worker_reasoning(&mut runtime, Some(&parent));
+            assert_eq!(runtime.reasoning_level(), default, "{model}");
+        }
+        for role in [CodexRequestRole::Foreground, CodexRequestRole::Internal] {
+            let mut runtime = crate::Runtime::new_headless();
+            runtime.set_codex_request_role(role);
+            runtime.set_model(parent.qualified_model.clone());
+            apply_codex_worker_reasoning(&mut runtime, Some(&parent));
+            assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
+        }
+    }
+
+    #[test]
+    fn non_ultra_parent_has_no_worker_override_and_worker_role_cannot_forward_it() {
+        for level in [
+            ReasoningLevel::Off,
+            ReasoningLevel::Adaptive,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ] {
+            assert!(
+                parent("openai-codex/gpt-6-astra", level).is_none(),
+                "{level}"
+            );
+        }
+        assert!(parent("openrouter/openai/gpt-6-astra", ReasoningLevel::Ultra).is_none());
+        for role in [CodexRequestRole::Worker, CodexRequestRole::Internal] {
+            assert!(crate::Runtime::codex_delegation_plan(
+                "openai-codex/gpt-6-astra",
+                ReasoningLevel::Ultra,
+                role
+            )
+            .is_none());
+        }
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &Default::default());
+        runtime.set_model("openai-codex/gpt-6-astra".into());
+        apply_codex_worker_reasoning(&mut runtime, None);
+        assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
+    }
+
+    #[test]
+    fn all_spawn_paths_apply_codex_worker_reasoning_after_model_selection() {
+        for (name, source) in [
+            ("start", include_str!("start.rs")),
+            ("oneshot", include_str!("oneshot.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let policy = source
+                .find("super::apply_subagent_runtime_policy(")
+                .unwrap();
+            let model = source.find("runtime.set_model(").unwrap();
+            let reasoning = source.find("super::apply_codex_worker_reasoning(").unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(
+                policy < model && model < reasoning && reasoning < stream,
+                "{name}"
+            );
+            assert_eq!(
+                source
+                    .matches("super::apply_codex_worker_reasoning(")
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
     }
 }

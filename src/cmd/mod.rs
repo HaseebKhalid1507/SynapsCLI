@@ -1,6 +1,8 @@
 pub(crate) mod agent;
+pub(crate) mod attach;
 pub(crate) mod auth_broker;
 pub(crate) mod chat;
+pub(crate) mod daemon;
 pub(crate) mod login;
 pub(crate) mod prompt;
 pub(crate) mod retention;

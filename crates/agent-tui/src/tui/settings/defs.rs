@@ -1,10 +1,24 @@
 //! Single source of truth for every tweakable setting.
 //!
 //! One macro invocation generates both the UI schema (`ALL_SETTINGS`) and the
-//! runtime apply dispatch (`apply_setting_dispatch`). Add a setting here and
-//! both sides stay in sync — drift is impossible.
+//! apply dispatch (`apply_setting_dispatch`). Add a setting here and both
+//! sides stay in sync — drift is impossible.
+//!
+//! Runtime-backed keys produce a [`SettingApply::Session`] (the
+//! `SessionSetting` the caller sends as `Set{id, ..}`); local keys apply
+//! synchronously and yield [`SettingApply::Local`].
 
 use super::schema::{Category, EditorKind, SettingDef};
+use agent_engine::session::SessionSetting;
+
+/// What a settings apply resolves to (PLAN-phase3 §3.2 settings/defs).
+pub(crate) enum SettingApply {
+    /// Send this to the session; the reply decides the config write.
+    Session(SessionSetting),
+    /// Applied locally (theme, keybinds, …) or a no-op; `Err` = rejected
+    /// (the caller must NOT write the value to the config file).
+    Local(Result<(), String>),
+}
 
 macro_rules! define_settings {
     ($(
@@ -23,24 +37,23 @@ macro_rules! define_settings {
             )*
         ];
 
-        /// Apply a setting by key/value and return `Ok(())` on success or
-        /// `Err(user-facing message)` on validation failure.  Handlers that
-        /// do not perform validation always return `Ok(())`.  On `Err` the
-        /// caller must NOT write the value to the config file.
+        /// Resolve a setting by key/value: a `SessionSetting` to send, or the
+        /// local outcome. Handlers that do not perform validation always
+        /// yield `Local(Ok(()))`. On `Local(Err)` the caller must NOT write
+        /// the value to the config file.
         pub(crate) fn apply_setting_dispatch(
             key: &str,
             value: &str,
-            runtime: &mut synaps_cli::Runtime,
             app: &mut crate::tui::app::App,
-        ) -> Result<(), String> {
+        ) -> SettingApply {
             match key {
                 $(
                     stringify!($key) => {
-                        let handler: fn(&mut synaps_cli::Runtime, &mut crate::tui::app::App, &str) -> Result<(), String> = $apply;
-                        handler(runtime, app, value)
+                        let handler: fn(&mut crate::tui::app::App, &str) -> SettingApply = $apply;
+                        handler(app, value)
                     }
                 )*
-                _ => Ok(())
+                _ => SettingApply::Local(Ok(()))
             }
         }
     };
@@ -49,123 +62,127 @@ macro_rules! define_settings {
 define_settings! {
     model, "Model", Model, EditorKind::ModelPicker,
         "Which Claude model to use.",
-        |runtime, _app, value| { runtime.set_model(value.to_string()); Ok(()) };
+        |_app, value| SettingApply::Session(SessionSetting::Model { model: value.to_string() });
 
     thinking, "Thinking", Model,
         EditorKind::DynamicCycler,
         "Thinking depth — controls effort on adaptive models, budget on legacy.",
-        |runtime, _app, value| {
+        |app, value| {
             use agent_core::reasoning::ReasoningLevel;
             if let Some(level) = ReasoningLevel::parse(value) {
-                // Validate against capability cache/static before mutating.
-                // On Err: return the error so apply_setting can skip config write.
-                runtime.set_reasoning_level_checked(level)
+                // Validate against capability cache/static before sending
+                // (client-local pre-check; the actor re-validates). On Err:
+                // return the error so apply_setting can skip config write.
+                if let Err(e) = synaps_cli::runtime::openai::catalog::validation::validate_reasoning_mutation(
+                    &app.session.model, level,
+                ) {
+                    return SettingApply::Local(Err(e));
+                }
+                SettingApply::Session(SessionSetting::ReasoningLevel { level })
             } else {
                 // Unknown string — ignore silently (cycler only emits valid strings).
-                Ok(())
+                SettingApply::Local(Ok(()))
             }
         };
 
     reasoning_type, "Reasoning", Model,
         EditorKind::Display,
         "How the active model expresses reasoning depth (derived from exact model capabilities; read-only).",
-        |_runtime, _app, _value| { /* display-only: no editor emits Apply for this key */ Ok(()) };
+        |_app, _value| { /* display-only: no editor emits Apply for this key */ SettingApply::Local(Ok(())) };
 
     context_window, "Context window", Model,
         EditorKind::Cycler(&["200k", "1m", "auto"]),
         "Override context window limit (auto = model default).",
-        |runtime, app, value| {
+        |_app, value| {
             let window = match value {
                 "200k" | "200K" => Some(200_000u64),
                 "1m" | "1M" => Some(1_000_000u64),
                 "auto" => None,
-                _ => return Ok(()),
+                _ => return SettingApply::Local(Ok(())),
             };
-            runtime.set_context_window(window);
-            // Also update the bar denominator immediately so the UI reflects the change.
-            app.last_turn_context_window = runtime.context_window();
-            Ok(())
+            // The bar denominator (`last_turn_context_window`) follows the
+            // reply's view in apply_setting().
+            SettingApply::Session(SessionSetting::ContextWindow { tokens: window })
         };
 
     compaction_model, "Compaction model", Model,
         EditorKind::ModelPicker,
         "Model used for /compact (default: claude-sonnet-4-6).",
-        |runtime, _app, value| {
+        |_app, value| {
             let model = if value.is_empty() || value == "auto" || value == "default" {
                 None
             } else {
                 Some(value.to_string())
             };
-            runtime.set_compaction_model(model);
-            Ok(())
+            SettingApply::Session(SessionSetting::CompactionModel { model })
         };
 
     api_retries, "API retries", Agent, EditorKind::Text { numeric: true },
         "Retries on transient API errors.",
-        |runtime, _app, value| {
-            if let Ok(n) = value.parse::<u32>() { runtime.set_api_retries(n); }
-            Ok(())
+        |_app, value| match value.parse::<u32>() {
+            Ok(n) => SettingApply::Session(SessionSetting::ApiRetries { n }),
+            Err(_) => SettingApply::Local(Ok(())),
         };
 
     subagent_timeout, "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
-        |runtime, _app, value| {
-            if let Ok(n) = value.parse::<u64>() { runtime.set_subagent_timeout(n); }
-            Ok(())
+        |_app, value| match value.parse::<u64>() {
+            Ok(secs) => SettingApply::Session(SessionSetting::SubagentTimeout { secs }),
+            Err(_) => SettingApply::Local(Ok(())),
         };
 
     max_tool_output, "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
-        |runtime, _app, value| {
-            if let Ok(n) = value.parse::<usize>() { runtime.set_max_tool_output(n); }
-            Ok(())
+        |_app, value| match value.parse::<usize>() {
+            Ok(bytes) => SettingApply::Session(SessionSetting::MaxToolOutput { bytes }),
+            Err(_) => SettingApply::Local(Ok(())),
         };
 
     bash_timeout, "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
-        |runtime, _app, value| {
-            if let Ok(n) = value.parse::<u64>() { runtime.set_bash_timeout(n); }
-            Ok(())
+        |_app, value| match value.parse::<u64>() {
+            Ok(secs) => SettingApply::Session(SessionSetting::BashTimeout { secs }),
+            Err(_) => SettingApply::Local(Ok(())),
         };
 
     bash_max_timeout, "Bash max timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Legacy setting retained for config compatibility; requested bash timeouts are no longer clamped.",
-        |runtime, _app, value| {
-            if let Ok(n) = value.parse::<u64>() { runtime.set_bash_max_timeout(n); }
-            Ok(())
+        |_app, value| match value.parse::<u64>() {
+            Ok(secs) => SettingApply::Session(SessionSetting::BashMaxTimeout { secs }),
+            Err(_) => SettingApply::Local(Ok(())),
         };
 
     theme, "Theme", Appearance, EditorKind::ThemePicker,
         "Color theme (restart required).",
-        |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ Ok(()) };
+        |_app, _value| { /* handled after write_config_value in apply_setting() */ SettingApply::Local(Ok(())) };
 
     tui_background_opaque, "Background", Appearance, EditorKind::Cycler(&["opaque", "invisible"]),
         "Opaque paints Synaps' theme background; invisible uses your terminal background.",
-        |_runtime, _app, value| {
+        |_app, value| {
             match value {
                 "opaque" => super::super::theme::set_background_opaque(true),
                 "invisible" => super::super::theme::set_background_opaque(false),
-                _ => return Err("expected opaque or invisible".to_string()),
+                _ => return SettingApply::Local(Err("expected opaque or invisible".to_string())),
             }
-            Ok(())
+            SettingApply::Local(Ok(()))
         };
 
     theme_transition, "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
         "Animated cross-fade on theme changes (on = 350ms). Off = instant snap. Integer ms (0-2000) accepted in the config file.",
-        |_runtime, _app, value| {
+        |_app, value| {
             match synaps_cli::config::ThemeTransitionMode::parse(value) {
                 Some(mode) => {
                     super::super::theme::transition::set_transition_mode(mode);
-                    Ok(())
+                    SettingApply::Local(Ok(()))
                 }
-                None => Err("expected on, off, or milliseconds (0-2000)".to_string()),
+                None => SettingApply::Local(Err("expected on, off, or milliseconds (0-2000)".to_string())),
             }
         };
 
     sidecar_toggle_key, "Sidecar toggle key", Sidecar,
         EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
         "Keybind that toggles the active sidecar plugin. Takes effect immediately.",
-        |_runtime, app, value| {
+        |app, value| {
             if let Some(kb) = app.keybinds.as_ref() {
                 match kb.write() {
                     Ok(mut g) => {
@@ -176,7 +193,7 @@ define_settings! {
                     Err(_) => tracing::warn!("sidecar_toggle_key apply: registry poisoned"),
                 }
             }
-            Ok(())
+            SettingApply::Local(Ok(()))
         };
 }
 
@@ -227,80 +244,84 @@ mod tests {
         }
     }
 
-    // B2: apply_setting_dispatch returns Result; rejected thinking must not mutate.
-    #[test]
-    fn thinking_dispatch_rejects_unsupported_level_returns_err_no_mutation() {
-        let mut rt = synaps_cli::Runtime::new_headless();
-        rt.set_model("openai-codex/gpt-5.6-luna".to_string()); // luna: no ultra
-        let before = rt.reasoning_level();
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
+    fn app_with_model(model: &str) -> crate::tui::app::App {
+        crate::tui::app::App::new(synaps_cli::Session::new(model, "medium", None))
+    }
 
-        let result = apply_setting_dispatch("thinking", "ultra", &mut rt, &mut app);
-        assert!(result.is_err(), "ultra must be rejected for luna");
-        assert_eq!(
-            rt.reasoning_level(),
-            before,
-            "runtime must not be mutated when dispatch returns Err"
-        );
+    // Rejected thinking never becomes a `Set` (the config write is skipped).
+    #[test]
+    fn thinking_dispatch_rejects_unsupported_level_returns_err_no_set() {
+        let mut app = app_with_model("openai-codex/gpt-5.6-luna"); // luna: no ultra
+        match apply_setting_dispatch("thinking", "ultra", &mut app) {
+            SettingApply::Local(Err(_)) => {}
+            _ => panic!("ultra must be rejected for luna before any Set"),
+        }
     }
 
     #[test]
-    fn thinking_dispatch_accepts_valid_level_returns_ok_and_mutates() {
-        let mut rt = synaps_cli::Runtime::new_headless();
-        rt.set_model("openai-codex/gpt-5.6-sol".to_string()); // sol: supports ultra
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
-
-        let result = apply_setting_dispatch("thinking", "ultra", &mut rt, &mut app);
-        assert!(result.is_ok(), "ultra must be accepted for sol");
-        assert_eq!(
-            rt.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::Ultra,
-            "runtime must be updated when dispatch returns Ok"
-        );
+    fn thinking_dispatch_accepts_valid_level_yields_set() {
+        let mut app = app_with_model("openai-codex/gpt-5.6-sol"); // sol: supports ultra
+        match apply_setting_dispatch("thinking", "ultra", &mut app) {
+            SettingApply::Session(SessionSetting::ReasoningLevel { level }) => {
+                assert_eq!(level, agent_core::reasoning::ReasoningLevel::Ultra)
+            }
+            _ => panic!("ultra must be accepted for sol"),
+        }
     }
 
     #[test]
-    fn thinking_dispatch_rejects_off_on_xai_45_no_mutation_or_persist() {
-        let mut rt = synaps_cli::Runtime::new_headless();
-        rt.set_model("xai-auth/grok-4.5".to_string());
-        // Documented model default applied on switch.
-        assert_eq!(
-            rt.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::High
-        );
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
-
+    fn thinking_dispatch_rejects_off_on_xai_45_no_set() {
+        let mut app = app_with_model("xai-auth/grok-4.5");
         // Off must be rejected (reasoning cannot be disabled), never omitted.
-        let result = apply_setting_dispatch("thinking", "off", &mut rt, &mut app);
-        assert!(result.is_err(), "off must be rejected for grok-4.5");
-        assert_eq!(
-            rt.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::High
-        );
-
+        assert!(matches!(
+            apply_setting_dispatch("thinking", "off", &mut app),
+            SettingApply::Local(Err(_))
+        ));
         // xhigh is not documented for grok-4.5 either.
-        assert!(apply_setting_dispatch("thinking", "xhigh", &mut rt, &mut app).is_err());
-        assert_eq!(
-            rt.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::High
-        );
-
+        assert!(matches!(
+            apply_setting_dispatch("thinking", "xhigh", &mut app),
+            SettingApply::Local(Err(_))
+        ));
         // A documented effort is accepted.
-        assert!(apply_setting_dispatch("thinking", "low", &mut rt, &mut app).is_ok());
-        assert_eq!(
-            rt.reasoning_level(),
-            agent_core::reasoning::ReasoningLevel::Low
-        );
+        assert!(matches!(
+            apply_setting_dispatch("thinking", "low", &mut app),
+            SettingApply::Session(SessionSetting::ReasoningLevel {
+                level: agent_core::reasoning::ReasoningLevel::Low
+            })
+        ));
     }
 
     #[test]
-    fn non_thinking_dispatches_always_return_ok() {
-        let mut rt = synaps_cli::Runtime::new_headless();
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("m", "medium", None));
-        // model, api_retries, etc. return Ok(()) unconditionally.
-        assert!(apply_setting_dispatch("model", "claude-opus-4-7", &mut rt, &mut app).is_ok());
-        assert!(apply_setting_dispatch("api_retries", "5", &mut rt, &mut app).is_ok());
-        assert!(apply_setting_dispatch("bash_timeout", "30", &mut rt, &mut app).is_ok());
-        assert!(apply_setting_dispatch("unknown_key_xyz", "val", &mut rt, &mut app).is_ok());
+    fn runtime_keys_yield_the_expected_session_setting() {
+        let mut app = app_with_model("m");
+        assert!(matches!(
+            apply_setting_dispatch("model", "claude-opus-4-7", &mut app),
+            SettingApply::Session(SessionSetting::Model { model }) if model == "claude-opus-4-7"
+        ));
+        assert!(matches!(
+            apply_setting_dispatch("api_retries", "5", &mut app),
+            SettingApply::Session(SessionSetting::ApiRetries { n: 5 })
+        ));
+        assert!(matches!(
+            apply_setting_dispatch("bash_timeout", "30", &mut app),
+            SettingApply::Session(SessionSetting::BashTimeout { secs: 30 })
+        ));
+        assert!(matches!(
+            apply_setting_dispatch("context_window", "1m", &mut app),
+            SettingApply::Session(SessionSetting::ContextWindow { tokens: Some(1_000_000) })
+        ));
+        assert!(matches!(
+            apply_setting_dispatch("compaction_model", "auto", &mut app),
+            SettingApply::Session(SessionSetting::CompactionModel { model: None })
+        ));
+        // Unparseable numerics and unknown keys are local no-ops.
+        assert!(matches!(
+            apply_setting_dispatch("api_retries", "x", &mut app),
+            SettingApply::Local(Ok(()))
+        ));
+        assert!(matches!(
+            apply_setting_dispatch("unknown_key_xyz", "val", &mut app),
+            SettingApply::Local(Ok(()))
+        ));
     }
 }

@@ -509,6 +509,7 @@ fn live_reactive_subagent_end_to_end() {
                 session_manager: None,
                 subagent_registry: Some(Arc::clone(&registry)),
                 delegation_parent: None,
+                codex_parent_plan: None,
                 event_queue: Some(Arc::clone(&queue)),
                 secret_prompt: None,
                 orchestration: Some(Arc::clone(&orchestration)),
@@ -516,6 +517,7 @@ fn live_reactive_subagent_end_to_end() {
                 mcp_leases: None,
                 extension_leases: None,
                 memory_context: None,
+                cwd: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -586,6 +588,7 @@ fn live_reactive_subagent_end_to_end() {
                 session_manager: None,
                 subagent_registry: Some(Arc::clone(&registry)),
                 delegation_parent: None,
+                codex_parent_plan: None,
                 event_queue: Some(Arc::clone(&queue)),
                 secret_prompt: None,
                 orchestration: Some(Arc::clone(&orchestration)),
@@ -593,6 +596,7 @@ fn live_reactive_subagent_end_to_end() {
                 mcp_leases: None,
                 extension_leases: None,
                 memory_context: None,
+                cwd: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,

@@ -136,6 +136,7 @@ impl Tool for SubagentStartTool {
                 RuntimeError::Tool(error.to_string())
             })?;
         let model = decision.model.as_str().to_owned();
+        let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -244,19 +245,21 @@ impl Tool for SubagentStartTool {
                 let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
                     use futures::StreamExt;
 
-                    let mut runtime = match crate::Runtime::new().await {
+                    // Host-built worker (shared client/creds/token cache, cached
+                    // registry) or the legacy fresh runtime — see `spawn_runtime`.
+                    let mut runtime = match super::spawn_runtime().await {
                         Ok(r) => r,
                         Err(_) => return Err("subagent runtime initialization failed".into()),
                     };
 
-                    // Apply subagent spawn policy: inherit credential source AND
-                    // unconditionally force cache TTL to 5m. Subagents are short-lived
-                    // one-shots — paying the 1h write premium (~2× input price) on them
-                    // is unrecoverable waste (~$0.23 per 10-spawn fan-out). (#110)
+                    // Apply subagent spawn policy: worker role, 5m cache TTL, worker
+                    // turn budget. Subagents are short-lived one-shots — paying the 1h
+                    // write premium (~2× input price) on them is unrecoverable waste
+                    // (~$0.23 per 10-spawn fan-out). (#110)
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model_a.clone());
-                    runtime.set_tools(super::subagent_tools().await);
+                    super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
                     runtime.install_worker_orchestration(Arc::clone(
                         &orchestration_for_runtime,
                     ));
