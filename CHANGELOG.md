@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] — 2026-09-07
+
+### Added
+
+- **Vision — the model can see images.** The `read` tool now returns PNG, JPEG,
+  GIF, and WebP as image content blocks instead of a path or error, so the model
+  receives the actual pixels. Zero-dimension images are rejected before they
+  reach the provider.
+- **Session UI overhaul** plus support for `~/.synaps-cli/subagent-preamble.md`:
+  a user-authored preamble loaded into every subagent spawn.
+- **`system_msg` theme field** — system messages get their own configurable
+  color, independent of assistant/user text.
+
+### Changed
+
+- **Execution gate: per-tool digest + provenance validation.** Tool-call
+  authorization is now validated per tool against its catalog digest and
+  provenance, replacing the coarser set-wide generation-denial check — tighter,
+  and it stops a stale catalog entry from denying an otherwise-valid call.
+
+### Fixed
+
+- **Providers:** surface Kimi Code quota `403`s as an actionable message, clamp
+  Grok reasoning effort on model switch, and retry xAI capacity errors.
+- **Concurrency:** uniform `runtime`-before-`conv` lock order across the server
+  (`/model`, `/compact`, command-result mirroring) — removes a lock inversion.
+- **Sessions:** persist `message_count` in the session header and refresh it at
+  write time without cloning the session; clamp a resumed session's thinking
+  level against the model's supported range.
+- Replace silent `unwrap_or_default` fallbacks in the watcher and agent paths
+  with logged fallbacks, so failures are visible instead of swallowed.
+- Normalize the `ToolOutput::Blocks` text-first invariant in release builds and
+  report dropped output completely.
+- Use an absolute shell path in the PTY integration tests (fixes flakiness
+  under restricted `PATH`).
+
+### Internal
+
+- Centralize the crate version and the three internal dependencies via
+  `[workspace.package]` / `[workspace.dependencies]` inheritance — a version
+  bump is now a single edit in the root manifest.
+
 ## [0.9.0] — 2026-08-20
 
 ### Added
