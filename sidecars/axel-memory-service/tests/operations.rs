@@ -829,3 +829,52 @@ fn tombstone_first_capture_worker_recovers_source_before_acknowledgement() {
         }
     }
 }
+#[test]
+fn history_seal_evicts_oldest_to_fit_capacity() {
+    // docs/specs/archive-size-fit.md: a full inventory never fails a seal.
+    let (_d, p) = temp();
+    let mut ids = Vec::new();
+    for i in 0..128 {
+        let q = seal(
+            &format!("session-{i}"),
+            json!({"role":"user","content":format!("evidence {i}")}),
+        );
+        ids.push(ok(call(&p, "history_seal", q))["id"].clone());
+    }
+    // Forget one live row: the tombstone is the first eviction candidate.
+    ok(call(&p, "history_forget", json!({"id":ids[5]})));
+    let q = seal("session-128", json!({"role":"user","content":"evidence 128"}));
+    let newest = ok(call(&p, "history_seal", q.clone()));
+    // Tombstone evicted, oldest live row (ids[0]) still present.
+    assert_eq!(
+        ok(call(&p, "history_fetch", json!({"id":ids[0],"start":0,"limit":1}))).as_array().unwrap().len(),
+        1
+    );
+    // Next seal evicts the oldest live row.
+    let q2 = seal("session-129", json!({"role":"user","content":"evidence 129"}));
+    ok(call(&p, "history_seal", q2));
+    assert_eq!(
+        call(&p, "history_fetch", json!({"id":ids[0],"start":0,"limit":1}))["error"]["code"],
+        "not_found"
+    );
+    assert_eq!(
+        ok(call(&p, "history_fetch", json!({"id":ids[1],"start":0,"limit":1}))).as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        ok(call(&p, "history_fetch", json!({"id":newest["id"],"start":0,"limit":1}))),
+        q["messages"]
+    );
+    // Forgotten evidence stays suppressed after eviction of its tombstone.
+    let again = seal("session-5", json!({"role":"user","content":"evidence 5"}));
+    assert_eq!(call(&p, "history_seal", again)["error"]["code"], "id_conflict");
+    // Imports remain strict: an export with 128 rows into a full scope still fails.
+    let (_d2, p2) = temp();
+    for i in 0..128 {
+        ok(call(&p2, "history_seal", seal(&format!("x-{i}"), json!({"role":"user","content":format!("x {i}")}))));
+    }
+    assert_eq!(
+        call(&p2, "migration_apply", apply(ok(call(&p, "export", json!({"full":true})))))["error"]["code"],
+        "size_limit"
+    );
+}

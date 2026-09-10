@@ -142,6 +142,8 @@ impl Service {
                     if !c.query_row("SELECT EXISTS(SELECT 1 FROM synaps_history WHERE id=?1)",[&candidate],|r|r.get::<_,bool>(0))?{id=candidate;break}
                 }
                 if id.is_empty(){return Err(Error::Conflict)}
+                // Seals evict for capacity (bounded ring); imports stay strict.
+                self.evict_history_for(c,&q)?;
                 self.insert_history(c,&HistoryImport{id:id.clone(),logical_id:q.logical_id.clone(),digest:q.digest.clone(),source_message_count:q.source_message_count,messages:q.messages.clone(),note:q.note.clone(),tombstone:false})?;
                 id
             };
@@ -150,6 +152,23 @@ impl Service {
         })?;
         acknowledge_commit(self.durable())?;
         Ok(result)
+    }
+    /// Make room for one incoming seal (docs/specs/archive-size-fit.md).
+    /// Oldest tombstoned rows go first (their suppression already lives in
+    /// synaps_fingerprints), then oldest live rows. Evicted rows are deleted,
+    /// never tombstoned or fingerprinted: capacity reclamation is not a forget.
+    /// A seal that cannot fit alone still fails closed via history_bounds.
+    fn evict_history_for(&self, c: &Connection, q: &Seal) -> Result<()> {
+        let incoming = serde_json::to_vec(&q.messages)?.len() + q.note.len();
+        loop {
+            let (count,bytes):(usize,usize)=c.query_row("SELECT count(*),coalesce(sum(length(CAST(messages AS BLOB))+length(CAST(note AS BLOB))),0) FROM synaps_history WHERE project_key IN (SELECT member FROM synaps_scope_members WHERE canonical=(SELECT canonical FROM synaps_scope_members WHERE member=?1))",[&self.project],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            if count + 1 <= MAX_HISTORY_RECORDS && bytes + incoming <= 256 * 1024 * 1024 {
+                return Ok(());
+            }
+            let victim:Option<String>=c.query_row("SELECT id FROM synaps_history WHERE project_key IN (SELECT member FROM synaps_scope_members WHERE canonical=(SELECT canonical FROM synaps_scope_members WHERE member=?1)) ORDER BY tombstoned DESC,created_ms ASC,id ASC LIMIT 1",[&self.project],|r|r.get(0)).optional()?;
+            let Some(victim) = victim else { return Ok(()) };
+            c.execute("DELETE FROM synaps_history WHERE id=?1", [&victim])?;
+        }
     }
     pub(crate) fn history_bounds(&self, c: &Connection) -> Result<()> {
         let (count,bytes):(usize,usize)=c.query_row("SELECT count(*),coalesce(sum(length(CAST(messages AS BLOB))+length(CAST(note AS BLOB))),0) FROM synaps_history WHERE project_key IN (SELECT member FROM synaps_scope_members WHERE canonical=(SELECT canonical FROM synaps_scope_members WHERE member=?1))",[&self.project],|r|Ok((r.get(0)?,r.get(1)?)))?;
