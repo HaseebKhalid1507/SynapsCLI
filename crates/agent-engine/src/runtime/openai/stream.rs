@@ -600,7 +600,11 @@ pub(crate) async fn call_codex_stream_inner(
         .ok_or("Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`")?;
 
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
-    let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
+    // Codex already receives the effective system prompt in `instructions`.
+    // Do not also prepend it to `input`: that doubles prompt tokens and repeats
+    // context/checkpoint guidance. Pass history to the translator unchanged;
+    // only the synthetic prepend is suppressed. Other providers keep their placement.
+    let oai_messages = translate::messages_to_oai(messages, &None, &name_map);
 
     // Use the shared pure helper so production and unit tests exercise identical
     // body construction — no duplication between call_codex_stream_inner and tests.

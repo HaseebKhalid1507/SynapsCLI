@@ -140,14 +140,23 @@ async fn small_repeated_checkpoints_self_heal_and_preserve_round_budget() {
         );
     }
     let bodies = bodies.lock().unwrap();
-    let recovered: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
-    assert!(recovered["messages"]
-        .as_array()
+    // One preparation notice, one no-shrink transition, then quiet even as
+    // the model repeats phase reports and the host retries the no-shrink check.
+    for (index, body) in bodies.iter().enumerate() {
+        let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let messages = request["messages"].to_string();
+        assert_eq!(
+            messages.matches("[Host context advisory,").count(),
+            usize::from(index < 2)
+        );
+        assert_eq!(
+            messages.contains("do not repeat context_checkpoint merely to force rollover"),
+            index == 1
+        );
+    }
+    assert!(!serde_json::to_string(history)
         .unwrap()
-        .iter()
-        .any(|m| m["content"]
-            .to_string()
-            .contains("do not repeat context_checkpoint merely to force rollover")));
+        .contains("[Host context advisory,"));
 }
 
 #[tokio::test]

@@ -13,12 +13,12 @@ impl Tool for ContextCheckpointTool {
         ToolOrigin::Builtin
     }
     fn description(&self) -> &str {
-        "Report task phase and a bounded working note for automatic context management. Call alone before executing a completed plan or starting a large new task. Host may roll over before the next request. Does not grant permissions or forget history."
+        "Report a substantial task boundary (plan, execute, wrap_up, new_task) to automatic context management. Call alone at such a boundary or when requested by the host, not for routine progress logging. Note optional; no summary required. Host checks capacity automatically. Does not grant permissions or forget history."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","additionalProperties":false,"properties":{
         "phase":{"type":"string","enum":["plan","execute","wrap_up","new_task"]},
-        "note":{"type":"string","maxLength":8192,"description":"Requirements, decisions, failed approaches, next actions and source references; no secrets."}
+        "note":{"type":"string","maxLength":8192,"description":"Optional few lines of unfinished state, next action and essential source references. Do not repeat the transcript, settled requirements or completed work; no secrets."}
     },"required":["phase"]})
     }
     async fn execute(&self, params: Value, _ctx: ToolContext) -> crate::Result<String> {
@@ -32,7 +32,7 @@ impl Tool for ContextCheckpointTool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.checkpoint(phase, params["note"].as_str())?;
         Ok(format!(
-            "phase={}; context policy will assess before next request",
+            "phase={} recorded; continue authorized work. The host checks capacity automatically.",
             phase.as_str()
         ))
     }

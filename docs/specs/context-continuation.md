@@ -53,6 +53,24 @@ User-facing pressure notices show only the estimated token count, not internal
 phase names or task-planning instructions. `/context status` reports the
 configured capacity, current window, and effective thresholds.
 
+Auto mode alone is not a pressure signal. Model advisories are request-local and
+sent only when the current state changes (preparation, bounded finish, pending
+workers, or an unproductive rollover), not on every tool round. Normal/disabled
+assessments and committed rollovers clear stale advisory state. These notices
+never enter durable history; their bounded size is included in admission reserves.
+
+The model should continue normal work, reporting substantial task boundaries,
+not writing routine progress logs. Checkpoint notes are optional, a few lines of
+unfinished state and next action; no speculative summary/spec is required for
+context management. After rollover, use retained messages and the working note
+first. Search/fetch archived history only for a specific missing fact, not to
+reconstruct completed work. These guidance changes do not relax hard capacity,
+phase/finish allowances, worker gates, or the durable-head barrier. Conservative
+token estimation and the configured thresholds/reserves are unchanged. On Codex,
+the effective system prompt (including this guidance) is sent once, in
+`instructions`, not also as a synthetic system message in `input`. This does not
+change historical message translation or other providers' system placement.
+
 `memory_context` controls continuous-memory consent, not context-window usage.
 For a consent status read, agents should send `{"action":"status"}`. Providers
 that require every schema property can instead send:

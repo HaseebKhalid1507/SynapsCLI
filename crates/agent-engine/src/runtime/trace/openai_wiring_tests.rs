@@ -786,6 +786,109 @@ async fn codex_success_emits_one_record_with_status_and_request_id() {
 }
 
 #[tokio::test]
+async fn codex_system_guidance_is_sent_once_and_preserves_history_prefix() {
+    let (upstream, bodies, _hits) = spawn_codex_stub(vec![]).await;
+    let h = harness();
+    let cfg = ProviderConfig {
+        base_url: upstream,
+        model: "gpt-5.6-sol".into(),
+        provider: "openai-codex".into(),
+    };
+    let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let system = Some(format!(
+        "EFFECTIVE_SYSTEM_ONLY {}",
+        crate::runtime::continuation::GUIDANCE
+    ));
+    let mut history: Vec<crate::SharedMessage> = vec![
+        Arc::new(json!({"role": "user", "content": "Perform the authorized task. Do not deploy."})),
+        Arc::new(json!({"role": "assistant", "content": "Retained result."})),
+        Arc::new(json!({"role": "user", "content": "Finish the implementation."})),
+    ];
+    for turn in 0..2 {
+        if turn == 1 {
+            history.push(Arc::new(
+                json!({"role": "assistant", "content": "First step done."}),
+            ));
+            history.push(Arc::new(
+                json!({"role": "user", "content": "Continue remaining work."}),
+            ));
+        }
+        call_codex_stream_inner(
+            &cfg,
+            &reqwest::Client::new(),
+            &broker,
+            &[],
+            &system,
+            &history,
+            &tx,
+            None,
+            None,
+            agent_core::reasoning::ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &CancellationToken::new(),
+            0,
+            &h.trace,
+        )
+        .await
+        .expect("loopback Codex request");
+    }
+    let requests = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::from_slice::<Value>(body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    for body in &requests {
+        let instructions = body["instructions"].as_str().unwrap();
+        assert_eq!(
+            instructions
+                .matches(crate::runtime::continuation::GUIDANCE)
+                .count(),
+            1
+        );
+        assert_eq!(body.to_string().matches("EFFECTIVE_SYSTEM_ONLY").count(), 1);
+        assert_eq!(
+            instructions
+                .matches("[Synaps autonomous harness policy]")
+                .count(),
+            1
+        );
+        let input = body["input"].as_array().unwrap();
+        assert!(
+            !input.iter().any(|item| item["role"] == "system"),
+            "no duplicate synthetic system message"
+        );
+        assert!(!body["input"]
+            .to_string()
+            .contains(crate::runtime::continuation::GUIDANCE));
+        for (role, text) in [
+            ("user", "Perform the authorized task. Do not deploy."),
+            ("assistant", "Retained result."),
+            ("user", "Finish the implementation."),
+        ] {
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| item["role"] == role && item["content"] == text)
+                    .count(),
+                1
+            );
+        }
+    }
+    let prefix = requests[0]["input"].as_array().unwrap();
+    assert_eq!(
+        &requests[1]["input"].as_array().unwrap()[..prefix.len()],
+        prefix.as_slice()
+    );
+    assert_eq!(
+        requests[0]["prompt_cache_key"],
+        requests[1]["prompt_cache_key"]
+    );
+}
+
+#[tokio::test]
 async fn codex_retry_emits_one_record_per_attempt_with_shared_request_id() {
     let (upstream, bodies, hits) = spawn_codex_stub(vec![500]).await;
     let h = harness();

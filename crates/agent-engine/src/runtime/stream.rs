@@ -386,6 +386,10 @@ impl StreamMethods {
             }
         } else {
             prepare_or_cancel!(tools.write()).disable(&["context_checkpoint".into()]);
+            continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .update_advisory(None);
         }
         let system_prompt = if context_enabled {
             Some(format!(
@@ -768,7 +772,9 @@ impl StreamMethods {
                 &metered_options
             };
 
+            let mut context_advisory = None;
             if context_enabled {
+                use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
                 use agent_core::core::context_policy::{
                     assess_context, ContextAction, ContextBudget,
                 };
@@ -805,12 +811,13 @@ impl StreamMethods {
                             required_next_round_tokens: assessment
                                 .reserves
                                 .total()
-                                .saturating_add(512),
+                                .saturating_add(ADVISORY_RESERVE_TOKENS),
                         },
                     );
                     s.policy = d.next_state;
                     d
                 };
+                let current_advisory;
                 if time_checkpoint
                     || matches!(
                         decision.action,
@@ -859,7 +866,7 @@ impl StreamMethods {
                                 .send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                             return Err(crate::RuntimeError::Config("context hard limit reached with pending workers; collect/reconcile before continuing; history retained".into()));
                         }
-                        let _=tx.send(StreamEvent::Session(SessionEvent::Notice("Context rollover pending: finish/collect workers first; no new large task.".into())));
+                        current_advisory = Some(ContextAdvisory::WorkersPending);
                     } else {
                         // Compute before awaiting: never hold a synchronous
                         // continuation guard across archive I/O. Charge dynamic
@@ -874,7 +881,7 @@ impl StreamMethods {
                                 assessment
                                     .reserves
                                     .total()
-                                    .saturating_add(512)
+                                    .saturating_add(ADVISORY_RESERVE_TOKENS)
                                     .max(minimum_reserve)
                                     .saturating_add(assessment.used_tokens().saturating_sub(
                                         super::context::estimate_history(&messages),
@@ -904,12 +911,7 @@ impl StreamMethods {
                                 state
                                     .policy
                                     .defer_unproductive_rollover(assessment.used_tokens());
-                                if state.last_notice != "unproductive" {
-                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
-                                        "Context rollover deferred: retained history cannot shrink further yet; continuing safely with unchanged history and budgets. Hard capacity remains enforced.".into()
-                                    )));
-                                }
-                                state.last_notice = "unproductive".into();
+                                current_advisory = Some(ContextAdvisory::Unproductive);
                             }
                             Ok(super::continuation::RolloverPreparation::Unproductive) => {
                                 let _ = tx.send(StreamEvent::Session(
@@ -943,42 +945,32 @@ impl StreamMethods {
                             }
                         }
                     }
-                } else if decision.reason
-                    != agent_core::core::context_policy::ContextReason::UnproductiveRollover
-                    && matches!(
-                        decision.action,
-                        ContextAction::Advisory | ContextAction::FinishBounded { .. }
-                    )
-                {
-                    let notice = super::continuation::pressure_notice(assessment.used_tokens());
-                    let mut s = continuation
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let key = format!("{:?}", decision.band);
-                    if s.last_notice != key {
-                        s.last_notice = key;
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
-                    }
+                } else {
+                    current_advisory = ContextAdvisory::from_assessment(&decision);
+                }
+                context_advisory = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .update_advisory(current_advisory);
+                if let Some(advisory) = context_advisory {
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                        advisory.notice(assessment.used_tokens()),
+                    )));
                 }
             }
 
+            // Request-only, once per state transition. Never replay an earlier
+            // pressure warning on every tool round or persist it into history.
             let pressure_request;
-            let request_messages = if context_enabled {
-                let s = continuation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !s.last_notice.is_empty() {
-                    pressure_request = request_messages.iter().cloned().chain(std::iter::once(Arc::new(json!({
-                        "role":"user", "content": if s.last_notice == "unproductive" {
-                            "[Host context-pressure advisory, not a new user request] A rollover currently cannot reduce retained history. Continue remaining authorized work from the current checkpoint; do not repeat context_checkpoint merely to force rollover. The host will reassess automatically. Hard capacity, permissions, and all budgets remain authoritative.".to_owned()
-                        } else {
-                            format!("[Host context-pressure advisory, not a new user request] Phase={}. Finish bounded work or prepare a spec/checkpoint. Do not start a large new task without reporting phase=new_task or execute using context_checkpoint alone. Host capacity limits remain authoritative.",s.policy.phase().as_str())
-                        }
-                    })))).collect::<Vec<_>>();
-                    pressure_request.as_slice()
-                } else {
-                    request_messages
-                }
+            let request_messages = if let Some(advisory) = context_advisory {
+                pressure_request = request_messages
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(Arc::new(json!({
+                        "role": "user", "content": advisory.message()
+                    }))))
+                    .collect::<Vec<_>>();
+                pressure_request.as_slice()
             } else {
                 request_messages
             };
@@ -2916,6 +2908,111 @@ mod rich_output_tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn context_pressure_advisory_is_once_per_episode_not_per_request() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        let state = Arc::new(Mutex::new(
+            super::super::continuation::ContinuationState::default(),
+        ));
+        state.lock().unwrap().config = agent_core::config::ContextManagementConfig {
+            mode: agent_core::config::ContextManagementMode::Auto,
+            pressure_tokens: Some(30_000),
+            rollover_tokens: Some(100_000),
+            ..Default::default()
+        };
+        let mut history = vec![
+            user_msg(json!("Implement the requested fix; do not deploy.")),
+            assistant_msg(&"RETAINED_WORK ".repeat(7000)),
+            user_msg(json!("Continue implementation.")),
+        ];
+        // Each drive makes two requests. Remain pressured across a fresh
+        // stream, then reassess as Normal, then enter a new pressure episode.
+        for (turn, (pressure, expected)) in [
+            (30_000, [1, 0]),
+            (30_000, [0, 0]),
+            (80_000, [0, 0]),
+            (30_000, [1, 0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.lock().unwrap().config.pressure_tokens = Some(pressure);
+            let before = history.clone();
+            let tool_id = format!("toolu_notice_{turn}");
+            let d = drive_with_context(
+                history,
+                vec![Arc::new(TextTool)],
+                &[(&tool_id, "text_stub")],
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                state.clone(),
+            )
+            .await;
+            for (body, count) in d.bodies.iter().zip(expected) {
+                assert_eq!(
+                    body["messages"]
+                        .to_string()
+                        .matches("[Host context advisory,")
+                        .count(),
+                    count
+                );
+                assert!(body.to_string().contains("RETAINED_WORK"));
+            }
+            assert!(!serde_json::to_string(&d.history)
+                .unwrap()
+                .contains("[Host context advisory,"));
+            assert_eq!(
+                &d.history[..before.len()],
+                before.as_slice(),
+                "advisories must not rewrite the cached history prefix"
+            );
+            assert_eq!(state.lock().unwrap().window, 1);
+            history = d.history;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn normal_and_disabled_context_do_not_send_stale_pressure() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        for enabled in [true, false] {
+            let state = Arc::new(Mutex::new(
+                super::super::continuation::ContinuationState::default(),
+            ));
+            if enabled {
+                state.lock().unwrap().config.mode = agent_core::config::ContextManagementMode::Auto;
+            }
+            state
+                .lock()
+                .unwrap()
+                .update_advisory(Some(super::super::continuation::ContextAdvisory::Pressure));
+            let d = drive_with_context(
+                vec![user_msg(json!("Small task, proceed normally."))],
+                vec![Arc::new(TextTool)],
+                &[("toolu_normal", "text_stub")],
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                state.clone(),
+            )
+            .await;
+            for body in &d.bodies {
+                assert!(!body.to_string().contains("[Host context advisory,"));
+                assert_eq!(
+                    body.to_string()
+                        .contains(super::super::continuation::GUIDANCE),
+                    enabled
+                );
+            }
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .update_advisory(Some(super::super::continuation::ContextAdvisory::Pressure)),
+                Some(super::super::continuation::ContextAdvisory::Pressure),
+                "normal/off must clear the old advisory"
+            );
+        }
+    }
+
     struct ContextEvidenceTool(super::super::continuation::SharedContinuation);
     #[async_trait::async_trait]
     impl Tool for ContextEvidenceTool {
@@ -3036,6 +3133,11 @@ mod rich_output_tests {
         assert_eq!(state.lock().unwrap().window, 2);
         let serialized = d.bodies[1].to_string();
         assert!(!serialized.contains("HISTORICAL_DETAIL"));
+        assert!(
+            !serialized.contains("[Host context advisory,"),
+            "a fresh window must not inherit old pressure"
+        );
+        assert!(serialized.contains("if a specific needed fact is missing"));
         assert!(serialized.contains("Do not deploy."));
         assert!(serialized.contains("SPEC_COMPLETE_EVIDENCE"));
         assert!(!serialized.contains("_synaps_context"));
