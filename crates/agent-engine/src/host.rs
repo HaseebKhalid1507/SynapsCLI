@@ -425,9 +425,17 @@ impl EngineHost {
                 if let Some(h) = handles.iter().find(|h| h.name().as_deref() == Some(q.as_str())) {
                     return Some(h.clone());
                 }
-                crate::core::session::resolve_session(q).ok()?.id
+                // F24: resolve on disk and follow compacted_into so
+                // `--continue <old>` finds the live successor.
+                let session = crate::core::session::resolve_session(q).ok()?;
+                let resolved = crate::core::session::follow_compaction_chain(session).ok()?;
+                resolved.session.id
             }
-            None => crate::core::session::latest_session().ok()?.id,
+            None => {
+                let session = crate::core::session::latest_session().ok()?;
+                let resolved = crate::core::session::follow_compaction_chain(session).ok()?;
+                resolved.session.id
+            }
         };
         by_id(&id)
     }

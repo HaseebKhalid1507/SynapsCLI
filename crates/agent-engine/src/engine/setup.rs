@@ -102,8 +102,10 @@ pub struct EngineBoot {
 /// Info about how a continued session was resolved.
 pub struct ContinueInfo {
     pub session_id: String,
-    pub resolved_via: Option<String>, // "chain", "name", or None
+    pub resolved_via: Option<String>, // "chain", "name", "compacted", or None
     pub query: String,
+    /// F24: set when the requested session was compacted into a successor.
+    pub compaction_notice: Option<String>,
 }
 
 /// Run the full engine boot sequence:
@@ -386,7 +388,7 @@ fn resolve_or_create_session(
 ) -> Result<SessionBootResult> {
     match continue_session {
         Some(ref maybe_id) => {
-            let mut session = match maybe_id {
+            let raw_session = match maybe_id {
                 Some(ref id) => resolve_session(id).map_err(|e| {
                     crate::error::RuntimeError::Tool(format!(
                         "Failed to load session '{}': {}",
@@ -397,6 +399,12 @@ fn resolve_or_create_session(
                     crate::error::RuntimeError::Tool(format!("No sessions to continue: {}", e))
                 })?,
             };
+            // F24: follow compacted_into forward so --continue <old> lands
+            // on the final successor, never on a pre-compaction fork point.
+            let resolved = agent_core::session::follow_compaction_chain(raw_session)
+                .map_err(|e| crate::error::RuntimeError::Session(e.to_string()))?;
+            let compaction_notice = resolved.compaction_notice;
+            let mut session = resolved.session;
             runtime.set_model(session.model.clone());
             // Restore the session's named reasoning level so max/ultra/off
             // and custom budgets survive --continue — then clamp against the
@@ -415,24 +423,42 @@ fn resolve_or_create_session(
                 runtime.set_system_prompt(sp.clone());
             }
 
-            let continue_info = maybe_id.as_ref().map(|q| {
-                let resolved_via = if *q != session.id {
-                    if crate::chain::load_chain(q).is_ok() {
-                        Some("chain".to_string())
-                    } else if agent_core::session::find_session_by_name(q).is_ok() {
-                        Some("name".to_string())
-                    } else {
-                        None
+            let continue_info = {
+                let (resolved_via, query) = match maybe_id {
+                    Some(ref q) => {
+                        let via = if *q != session.id {
+                            if crate::chain::load_chain(q).is_ok() {
+                                Some("chain".to_string())
+                            } else if agent_core::session::find_session_by_name(q).is_ok() {
+                                Some("name".to_string())
+                            } else if compaction_notice.is_some() {
+                                Some("compacted".to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        (via, q.clone())
                     }
+                    None => {
+                        let via = compaction_notice.as_ref().map(|_| "compacted".to_string());
+                        (via, session.id.clone())
+                    }
+                };
+                // Always produce ContinueInfo when we have a compaction notice,
+                // even for bare --continue (no explicit id).
+                if maybe_id.is_some() || compaction_notice.is_some() {
+                    Some(ContinueInfo {
+                        session_id: session.id.clone(),
+                        resolved_via,
+                        query,
+                        compaction_notice: compaction_notice.clone(),
+                    })
                 } else {
                     None
-                };
-                ContinueInfo {
-                    session_id: session.id.clone(),
-                    resolved_via,
-                    query: q.clone(),
                 }
-            });
+            };
 
             Ok(SessionBootResult {
                 api_messages: session.api_messages.clone(),

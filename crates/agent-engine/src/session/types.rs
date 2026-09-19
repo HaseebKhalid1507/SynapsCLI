@@ -145,9 +145,12 @@ impl Default for SessionConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinueInfoWire {
     pub session_id: String,
-    /// "chain", "name", or None.
+    /// "chain", "name", "compacted", or None.
     pub resolved_via: Option<String>,
     pub query: String,
+    /// F24: notice when the session was followed through a compaction chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_notice: Option<String>,
 }
 
 impl From<&crate::engine::setup::ContinueInfo> for ContinueInfoWire {
@@ -156,6 +159,7 @@ impl From<&crate::engine::setup::ContinueInfo> for ContinueInfoWire {
             session_id: c.session_id.clone(),
             resolved_via: c.resolved_via.clone(),
             query: c.query.clone(),
+            compaction_notice: c.compaction_notice.clone(),
         }
     }
 }
