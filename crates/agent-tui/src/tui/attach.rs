@@ -241,6 +241,10 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
+    // Notices queued before boot (a plain `synaps` adopting the daemon) go first.
+    for n in super::run_setup::take_boot_notices() {
+        app.push_msg(ChatMessage::System(n));
+    }
     for w in &config.warnings {
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
     }

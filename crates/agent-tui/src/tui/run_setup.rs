@@ -127,7 +127,7 @@ pub fn push_boot_notice(text: impl Into<String>) {
     BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()).push(text.into());
 }
 
-fn take_boot_notices() -> Vec<String> {
+pub(crate) fn take_boot_notices() -> Vec<String> {
     std::mem::take(&mut *BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
