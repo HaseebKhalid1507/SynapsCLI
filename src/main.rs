@@ -633,7 +633,6 @@ async fn async_main() -> anyhow::Result<()> {
     if ADOPTED.load(std::sync::atomic::Ordering::SeqCst) && cli.command.is_none() && cli.attach.is_none() {
         cli.attach = Some(None);
         cli.new_session = true;
-        tui::push_boot_notice("attached to the running daemon (fresh session) — SYNAPS_DAEMON_ADOPT=0 or `synaps daemon stop` for in-process");
     }
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
@@ -673,6 +672,7 @@ async fn async_main() -> anyhow::Result<()> {
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
                     name: cli.session_name,
+                    adopted: ADOPTED.load(std::sync::atomic::Ordering::SeqCst),
                 })
                 .await?;
             }
