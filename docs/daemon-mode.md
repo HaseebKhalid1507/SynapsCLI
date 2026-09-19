@@ -73,6 +73,25 @@ With no ID: attaches to the single live session, creates one if none, lists if s
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
 | `daemon.pid` | 0600 | pid |
 
+## Per-session journal lock (F10)
+
+Each session with an active `Runtime` holds an exclusive advisory `flock` on
+`<sessions_dir>/<session_id>.lock` (0600). This prevents two runtimes (e.g.
+a daemon actor and an in-process `synaps --continue X` with `SYNAPS_DAEMON=0`)
+from writing to the same journal — the second writer would silently erase the
+first's turns (last-writer-wins).
+
+| File | Scope | Purpose |
+|---|---|---|
+| `<sessions_dir>/<id>.lock` | 0600, per session | **flock = journal ownership.** Body: `<pid>\n<kind>\n` (`kind` = `daemon` or `tui`). Acquired on `SessionActor::create`; released on `Park` (no `Runtime`); re-acquired on `unpark`. Compaction (`LinkedSuccessor`) and `NewSession` re-acquire on the new id. |
+
+**Behaviour:**
+- `--continue X` when the lock is held → error: `session X is live in another process (pid N, kind) — use synaps --attach X, or synaps daemon sessions`.
+- Fresh sessions: best-effort lock (warn on failure, e.g. read-only fs).
+- Stale locks from dead processes never block (`flock` is released on fd close / process death).
+- `unpark` failure (lock held by another process) → error surfaced to the attaching client: `cannot unpark session X: journal locked by another process`.
+- **Windows:** `fs4` maps to `LockFileEx` — same semantics, no feature-gate needed.
+
 ## Protocol summary (line-JSON over UDS, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
 
 ```
