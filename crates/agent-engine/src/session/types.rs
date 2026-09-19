@@ -183,6 +183,10 @@ pub struct SessionMeta {
     /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
     #[serde(default)]
     pub journal_id: String,
+    /// Set when the session's journal is locked by another process (F23):
+    /// `"pid N (kind)"`. Shown in `daemon sessions`; cleared on unpark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<String>,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).

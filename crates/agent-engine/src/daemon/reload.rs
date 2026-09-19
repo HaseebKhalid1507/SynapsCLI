@@ -525,10 +525,47 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
 /// A session whose journal was never written (no turn yet — `save` skips
 /// an empty conversation) cannot be continued; it is recreated fresh under
 /// a new id and aliased from the old one.
+/// F23: detect "is live in another process" in the error string — this is
+/// the `SessionLockError::Held` case, where an in-process runtime holds
+/// the journal lock. Instead of aliasing to an empty impostor, register a
+/// Parked placeholder under the SAME id.
+fn is_lock_held_error(e: &str) -> bool {
+    e.contains("is live in another process")
+}
+
+/// Extract `"pid N (kind)"` from the lock-held error message.
+fn parse_holder_from_error(e: &str) -> String {
+    // "session X is live in another process (pid N, kind) — …"
+    if let Some(start) = e.find("(pid ") {
+        let after = &e[start + 1..]; // "pid N, kind) — …"
+        if let Some(end) = after.find(')') {
+            return after[..end].to_string();
+        }
+    }
+    "unknown holder".to_string()
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     for s in &rs.sessions {
         let created = match state.create(s.config.clone()).await {
             Ok(h) => Ok(h),
+            // F23: journal locked by another process — register a Parked
+            // placeholder under the SAME id. No alias, no fresh session.
+            Err(e) if is_lock_held_error(&e) => {
+                let holder = parse_holder_from_error(&e);
+                tracing::warn!(
+                    session = %s.id, holder = %holder,
+                    "daemon: journal locked by another process; registering Parked placeholder"
+                );
+                let sid = crate::session::SessionId::from(s.id.as_str());
+                let (handle, _task) = crate::session::handle::locked_placeholder::spawn(
+                    sid,
+                    s.config.clone(),
+                    holder,
+                );
+                state.insert(handle);
+                continue;
+            }
             Err(e) if s.config.continue_session.is_some() => {
                 tracing::warn!(session = %s.id, error = %e, "daemon: journal not continuable; recreating fresh");
                 state

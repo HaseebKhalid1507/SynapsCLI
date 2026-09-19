@@ -512,6 +512,7 @@ impl SessionActor {
             input_owner: None,
             awaiting_input: 0,
             journal_id: sb.session.id.clone(),
+            locked_by: None,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
