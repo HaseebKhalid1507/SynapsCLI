@@ -356,7 +356,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                         }
                     }
                     None => {
-                        if !run_setup::try_reconnect(&mut app, &mut link, &mode).await {
+                        if !run_setup::try_reconnect(&mut app, &mut link, &mode, &render_handle, &registry).await {
                             break;
                         }
                     }
@@ -437,6 +437,16 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
         // restored, so calling it here is safe even if the render thread did
         // eventually finish teardown after the timeout.
         lifecycle::emergency_teardown_terminal();
+    }
+
+    // ── F9: daemon-lost exit — stderr message + non-zero code ──
+    if let Some(lost) = app.daemon_lost {
+        eprintln!(
+            "synaps: lost the daemon (pid {}) and could not reconnect within {} s \
+             — session {}; resume with synaps --attach {} / --continue {}",
+            lost.pid, lost.budget_secs, lost.session_id, lost.session_id, lost.session_id,
+        );
+        std::process::exit(agent_engine::daemon::EXIT_DAEMON_LOST);
     }
 
     Ok(())

@@ -29,6 +29,14 @@ pub(crate) struct ResumePending {
     pub clamp_notice: Option<String>,
 }
 
+/// F9: info retained when the daemon was lost and reconnection failed, so
+/// `run_loop` can produce the required stderr message and exit code.
+pub(crate) struct DaemonLostInfo {
+    pub pid: u32,
+    pub session_id: String,
+    pub budget_secs: u64,
+}
+
 /// Scrollback cap for [`super::transcript::TranscriptStore::set_scrollback`]
 /// by transport (PLAN-phase4 §2.3): Socket → 400 msgs / 2 MiB, Local → 0/0
 /// (unbounded — today's behaviour, so the R-vs-L differential cannot move).
@@ -189,6 +197,9 @@ pub(crate) struct App {
     /// Compaction in flight on the actor (`CompactionStarted` … `Applied`/
     /// `Failed`/`Cancelled`). Client-side guard for `/compact` and Submit.
     pub(crate) compacting: bool,
+    /// F9: set when the daemon died and reconnection failed — `run_loop` uses
+    /// this to exit non-zero with a stderr explanation.
+    pub(crate) daemon_lost: Option<DaemonLostInfo>,
     /// Mirror of the actor's buffered-during-streaming event count
     /// (`ConversationSnapshot.pending_events_len`).
     pub(crate) pending_events_len: usize,
@@ -402,6 +413,7 @@ impl App {
             // channel separately (mod.rs). Starts empty (no active prompt).
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compacting: false,
+            daemon_lost: None,
             pending_events_len: 0,
             subagent_rows: Vec::new(),
             compaction_applied: None,

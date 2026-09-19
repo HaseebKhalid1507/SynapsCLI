@@ -63,6 +63,19 @@ pub trait ClientTransport: Send {
     /// Socket only (Local returns `Err(Unsupported)`): after `Reloading`/EOF,
     /// reconnect with backoff and re-attach with `mode` (C3/A4).
     async fn reconnect(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError>;
+    /// F9: single reconnect attempt (no retry loop). Socket only.
+    async fn reconnect_once(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        self.reconnect(mode).await
+    }
+    /// `true` if the daemon announced a reload before EOF (graceful). Always
+    /// `false` on `LocalTransport`.
+    fn is_reload_pending(&self) -> bool {
+        false
+    }
+    /// The daemon pid from `Welcome`. Returns `0` on `LocalTransport`.
+    fn daemon_pid(&self) -> u32 {
+        0
+    }
 }
 
 /// Attach handshake budget.
