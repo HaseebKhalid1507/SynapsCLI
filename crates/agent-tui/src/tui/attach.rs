@@ -61,7 +61,7 @@ pub fn adopt_banner(
     if others.is_empty() {
         return None;
     }
-    others.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    others.sort_by_key(|m| std::cmp::Reverse(m.created_at));
     let n = others.len();
     let parked = others.iter().filter(|m| matches!(m.lifecycle, L::Parked)).count();
     let live = n - parked;
@@ -405,6 +405,8 @@ mod tests {
             lifecycle,
             clients,
             input_owner: None,
+            awaiting_input: false,
+            journal_id: None,
         }
     }
 
