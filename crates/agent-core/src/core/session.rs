@@ -24,16 +24,18 @@ pub struct Session {
     /// `session_journal::save_session_in_dir`. Legacy files → 0.
     #[serde(default)]
     pub message_count: usize,
+    /// ID of the session this was compacted from (backward link).
+    /// Declared before `api_messages` so `read_session_header` sees it (F24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// ID of the session created by compacting this one (forward link).
+    /// Declared before `api_messages` so `read_session_header` sees it (F24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_into: Option<String>,
     pub api_messages: Vec<SharedMessage>,
     /// Saved abort context — injected into the next user message on /continue
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_context: Option<String>,
-    /// ID of the session this was compacted from (backward link)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session: Option<String>,
-    /// ID of the session created by compacting this one (forward link)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compacted_into: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_provenance: Option<crate::prompt::PromptProvenance>,
     /// Typed compaction summary provenance (spec §9.3). Present on sessions
@@ -538,6 +540,103 @@ pub fn find_session_by_name(name: &str) -> std::io::Result<Session> {
         std::io::ErrorKind::NotFound,
         format!("no session named '{}'", name),
     ))
+}
+
+/// Result of resolving a session that may have been compacted into a successor.
+#[derive(Debug)]
+pub struct ResolvedSession {
+    pub session: Session,
+    /// If the originally matched session had `compacted_into` set, this
+    /// contains a human-readable notice like
+    /// `"<old> was compacted into <new> — continuing there"`.
+    pub compaction_notice: Option<String>,
+}
+
+/// Maximum number of `compacted_into` hops before we bail (cycle guard).
+const MAX_COMPACTION_HOPS: usize = 32;
+
+/// Follow the `compacted_into` chain from `session` to its final successor.
+/// Returns the final session and a notice if any hops were taken.
+/// Errors on cycles, missing successors, or exceeding the hop limit.
+pub fn follow_compaction_chain(session: Session) -> std::io::Result<ResolvedSession> {
+    if session.compacted_into.is_none() {
+        return Ok(ResolvedSession {
+            session,
+            compaction_notice: None,
+        });
+    }
+
+    let original_id = session.id.clone();
+    let mut current = session;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(current.id.clone());
+
+    while let Some(ref successor_id) = current.compacted_into {
+        let succ_id = successor_id.clone();
+        if !visited.insert(succ_id.clone()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "compaction cycle detected: session {} loops back to {}",
+                    current.id, succ_id
+                ),
+            ));
+        }
+        if visited.len() > MAX_COMPACTION_HOPS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "compaction chain too long (>{} hops) starting from {}",
+                    MAX_COMPACTION_HOPS, original_id
+                ),
+            ));
+        }
+        current = Session::load(&succ_id).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "session {} was compacted into {}, but the successor failed to load: {}",
+                    current.id, succ_id, e
+                ),
+            )
+        })?;
+    }
+
+    let notice = format!(
+        "{} was compacted into {} \u{2014} continuing there",
+        original_id, current.id
+    );
+    tracing::info!("{}", notice);
+    Ok(ResolvedSession {
+        session: current,
+        compaction_notice: Some(notice),
+    })
+}
+
+/// Read only the `compacted_into` field from a session's header on disk,
+/// without loading the full message history.
+pub fn read_compacted_into(id: &str) -> std::io::Result<Option<String>> {
+    read_compacted_into_in_dir(&sessions_dir(), id)
+}
+
+/// Like [`read_compacted_into`] but for a caller-selected sessions directory.
+pub fn read_compacted_into_in_dir(dir: &std::path::Path, id: &str) -> std::io::Result<Option<String>> {
+    let file_name = format!("{}.json", id);
+    let header = read_session_header(dir, &file_name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no session file for '{}'", id),
+        )
+    })?;
+    #[derive(serde::Deserialize)]
+    struct Hdr {
+        #[serde(default)]
+        compacted_into: Option<String>,
+    }
+    let hdr: Hdr = serde_json::from_str(&header).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+    })?;
+    Ok(hdr.compacted_into)
 }
 
 /// Resolve a query string to a Session. Resolution order:
@@ -1107,4 +1206,112 @@ mod tests {
             assert_eq!(info.message_count, 0);
         }
     }
+
+    // ─── follow_compaction_chain tests ─────────────────────────────
+
+    use serial_test::serial;
+
+    fn save_test_session(dir: &std::path::Path, session: &Session) {
+        crate::core::session_journal::save_session_in_dir(
+            dir,
+            session,
+            crate::core::session_journal::SessionPersistence::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn follow_chain_no_compaction_is_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        std::fs::create_dir_all(dir.path().join(".synaps-cli/sessions")).unwrap();
+        let s = Session::new("m", "brief", None);
+        save_test_session(&dir.path().join(".synaps-cli/sessions"), &s);
+        let resolved = follow_compaction_chain(s.clone()).unwrap();
+        assert_eq!(resolved.session.id, s.id);
+        assert!(resolved.compaction_notice.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn follow_chain_of_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".synaps-cli/sessions");
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut a = Session::new("m", "brief", None);
+        a.id = "aaa".into();
+        let mut b = Session::new("m", "brief", None);
+        b.id = "bbb".into();
+        b.parent_session = Some("aaa".into());
+        let mut c = Session::new("m", "brief", None);
+        c.id = "ccc".into();
+        c.parent_session = Some("bbb".into());
+
+        a.compacted_into = Some("bbb".into());
+        b.compacted_into = Some("ccc".into());
+        // c has no compacted_into — it's the end
+
+        save_test_session(&sessions_dir, &a);
+        save_test_session(&sessions_dir, &b);
+        save_test_session(&sessions_dir, &c);
+
+        let resolved = follow_compaction_chain(a).unwrap();
+        assert_eq!(resolved.session.id, "ccc");
+        let notice = resolved.compaction_notice.unwrap();
+        assert!(notice.contains("aaa"), "notice mentions original: {notice}");
+        assert!(notice.contains("ccc"), "notice mentions final: {notice}");
+    }
+
+    #[test]
+    #[serial]
+    fn follow_chain_cycle_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".synaps-cli/sessions");
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut a = Session::new("m", "brief", None);
+        a.id = "aaa".into();
+        let mut b = Session::new("m", "brief", None);
+        b.id = "bbb".into();
+
+        a.compacted_into = Some("bbb".into());
+        b.compacted_into = Some("aaa".into()); // cycle!
+
+        save_test_session(&sessions_dir, &a);
+        save_test_session(&sessions_dir, &b);
+
+        let err = follow_compaction_chain(a).unwrap_err();
+        assert!(
+            err.to_string().contains("cycle"),
+            "error mentions cycle: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn follow_chain_missing_successor_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".synaps-cli/sessions");
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut a = Session::new("m", "brief", None);
+        a.id = "aaa".into();
+        a.compacted_into = Some("nonexistent".into());
+
+        save_test_session(&sessions_dir, &a);
+
+        let err = follow_compaction_chain(a).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compacted into nonexistent") && msg.contains("failed to load"),
+            "error names the missing successor: {msg}"
+        );
+    }
+
 }

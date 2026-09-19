@@ -47,6 +47,13 @@ impl SessionLock {
     /// Returns `Ok(lock)` on success; `Err` with an actionable message if
     /// another process holds it (or on I/O error).
     pub fn try_acquire(dir: &Path, id: &str, holder: LockHolder) -> Result<Self, SessionLockError> {
+        // F24: refuse to lock a session that was compacted into a successor.
+        if let Ok(Some(successor)) = crate::session::read_compacted_into_in_dir(dir, id) {
+            return Err(SessionLockError::CompactedInto {
+                session_id: id.to_string(),
+                successor_id: successor,
+            });
+        }
         let path = dir.join(format!("{}.lock", id));
         std::fs::create_dir_all(dir).map_err(|e| SessionLockError::Io(e, path.clone()))?;
         let file = OpenOptions::new()
@@ -101,6 +108,12 @@ pub enum SessionLockError {
         session_id: String,
         holder: Option<LockHolder>,
     },
+    /// The session was compacted into a successor — locking the predecessor
+    /// would fork pre-compaction history (F24).
+    CompactedInto {
+        session_id: String,
+        successor_id: String,
+    },
 }
 
 impl std::fmt::Display for SessionLockError {
@@ -124,6 +137,15 @@ impl std::fmt::Display for SessionLockError {
                 "session {} is live in another process \
                  — use `synaps --attach {}`, or `synaps daemon sessions`",
                 session_id, session_id
+            ),
+            Self::CompactedInto {
+                session_id,
+                successor_id,
+            } => write!(
+                f,
+                "session {} was compacted into {} \
+                 — continue {} instead",
+                session_id, successor_id, successor_id
             ),
         }
     }

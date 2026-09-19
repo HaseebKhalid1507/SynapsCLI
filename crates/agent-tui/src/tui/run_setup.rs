@@ -277,6 +277,9 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
                     via, info.query
                 )));
             }
+            if let Some(ref notice) = info.compaction_notice {
+                app.push_msg(ChatMessage::System(format!("  ↳ {}", notice)));
+            }
         }
     }
     if app.abort_context.is_some() {
