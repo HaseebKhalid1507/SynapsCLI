@@ -245,12 +245,17 @@ back Parked** — rehydrate creates it then sends the host-only `Park`), the non
 worker grants, **`/system`**), and the **current** model/thinking (a `/model` change mid-session
 survives; the create-time `--model` override is not re-applied). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
+A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
+NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
+in its metadata. Attach is refused with a message naming the lock holder's pid and kind (F23).
+`daemon sessions` shows it as Parked with the `locked_by` marker.
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
 owner again, second turn works; older `--exe` refused with the daemon still serving; a turn in flight is
 checkpointed and its abort context comes back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
+F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
 
 ## cwd caveats (risk §6.1)
 
