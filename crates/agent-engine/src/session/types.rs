@@ -56,15 +56,6 @@ const ENV_STRIP_PREFIXES: &[&str] = &[
 
 /// Secret patterns (case-insensitive suffix/infix) stripped at the client.
 /// Secrets never reach the daemon — the broker owns credentials.
-const SECRET_PATTERNS: &[&str] = &[
-    "_API_KEY",
-    "_TOKEN",
-    "_SECRET",
-    "PASSWORD",
-    "AWS_SECRET_",
-    "_CREDENTIALS",
-];
-
 /// Build a [`SessionEnv`] from the current process environment, stripping
 /// client-only prefixes and secrets. Used by thin clients before `Hello`.
 pub fn capture_client_env() -> SessionEnv {
@@ -89,12 +80,16 @@ pub fn should_strip_env(key: &str) -> bool {
 /// Whether a key matches the secret denylist (case-insensitive).
 pub fn is_secret_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    for pat in SECRET_PATTERNS {
-        if upper.contains(pat) {
-            return true;
-        }
-    }
-    false
+    // Suffix-anchored so `_TOKEN` matches `GH_TOKEN` but not `TOKENBUCKET_SIZE`;
+    // `*SECRET*` / `*PASSWORD*` / `*_CREDENTIALS` / `AWS_SECRET_*` stay substring
+    // because they name the thing wherever they sit (`SECRET_KEY_BASE`).
+    upper.ends_with("_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_CREDENTIALS")
+        || upper.ends_with("_API_KEY")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
 }
 
 /// Everything `EngineHost::create_session` needs. Serializable: it is the
@@ -980,6 +975,14 @@ mod tests {
         // Not a secret
         assert!(!should_strip_env("MY_VALUE"));
         assert!(!should_strip_env("TOKENBUCKET_SIZE"));
+        // suffix-anchored: the secret name must END the key
+        assert!(!should_strip_env("API_TOKEN_TTL_SECS"));
+        assert!(!should_strip_env("KEYBOARD_LAYOUT"));
+        assert!(!should_strip_env("SSH_KEY_PATH"));
+        assert!(should_strip_env("GH_TOKEN"));
+        assert!(should_strip_env("SSH_KEY"));
+        assert!(should_strip_env("SECRET_KEY_BASE"));
+        assert!(should_strip_env("MY_PASSWD"));
     }
 
     #[test]

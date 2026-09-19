@@ -162,7 +162,9 @@ impl Client {
         }
         match line {
             "" => return true,
-            "/detach" | "/quit" | "/exit" => {
+            // `/detach` is the explicit "leave it running" verb — no double-press.
+            "/detach" => return false,
+            "/quit" | "/exit" => {
                 if self.streaming {
                     if self.quit_guard.press(std::time::Instant::now()) {
                         return false;
