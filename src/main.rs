@@ -349,11 +349,24 @@ fn thin_client() -> Option<ThinClient> {
     thin_client_from(std::env::args().skip(1), agent_engine::daemon::enabled())
 }
 
+/// Top-level `Cli` options that always take a value (`--system FILE`,
+/// `-s FILE`, `--name NAME`, `--prompt-manifest PATH`). Their value must
+/// not be mistaken for a subcommand positional, or `synaps --attach --new
+/// --system x.md` silently boots as a fat in-process-shaped client on the
+/// socket (no auto-spawn, no allocator diet, multi-thread runtime).
+const VALUE_OPTS: &[&str] = &["--system", "-s", "--name", "--prompt-manifest"];
+/// Top-level options with an optional value (`num_args = 0..=1`): the next
+/// token is their value iff it does not start with `-`, exactly as clap
+/// parses `synaps --attach abc` / `synaps --continue foo`.
+const OPT_VALUE_OPTS: &[&str] = &["--attach", "--continue"];
+
 fn thin_client_from<I: IntoIterator<Item = String>>(args: I, daemon_enabled: bool) -> Option<ThinClient> {
     if !daemon_enabled {
         return None;
     }
     let mut want_profile = false;
+    let mut want_value = false;
+    let mut maybe_value = false;
     let mut profile: Option<String> = None;
     let mut first_positional: Option<String> = None;
     let mut attach_flag = false;
@@ -363,12 +376,27 @@ fn thin_client_from<I: IntoIterator<Item = String>>(args: I, daemon_enabled: boo
             profile = Some(a);
             continue;
         }
+        if want_value {
+            want_value = false;
+            continue;
+        }
+        if maybe_value {
+            maybe_value = false;
+            if !a.starts_with('-') {
+                continue;
+            }
+        }
         if a == "--attach" || a.starts_with("--attach=") {
             attach_flag = true;
+            maybe_value = a == "--attach";
         } else if a == "--profile" {
             want_profile = true;
         } else if let Some(p) = a.strip_prefix("--profile=") {
             profile = Some(p.to_string());
+        } else if VALUE_OPTS.contains(&a.as_str()) {
+            want_value = true;
+        } else if OPT_VALUE_OPTS.contains(&a.as_str()) {
+            maybe_value = true;
         } else if !a.starts_with('-') && first_positional.is_none() {
             first_positional = Some(a);
         }
@@ -754,6 +782,29 @@ mod worker_threads_tests {
         // `--attach` next to a subcommand is not the TUI attach path
         assert_eq!(thin_client_from(v(&["daemon", "status", "--attach"]), true), None);
         assert_eq!(thin_client_from(v(&[]), true), None);
+    }
+
+    #[test]
+    fn thin_client_sniff_skips_option_values() {
+        use super::ThinClient::{Line, Tui};
+        let t = Some(Tui { profile: None });
+        // value-taking options: their value is not a subcommand positional
+        assert_eq!(thin_client_from(v(&["--attach", "--new", "--system", "/tmp/id.md"]), true), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--new", "-s", "you are x"]), true), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--new", "--name", "ambient"]), true), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--prompt-manifest", "m.toml"]), true), t);
+        assert_eq!(thin_client_from(v(&["--system", "/tmp/id.md", "--attach", "--new"]), true), t);
+        // optional-value options: next non-dash token is the value (clap num_args 0..=1)
+        assert_eq!(thin_client_from(v(&["--attach", "abc"]), true), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--continue", "foo"]), true), t);
+        assert_eq!(thin_client_from(v(&["--continue", "--attach"]), true), t);
+        // a real positional after the option values still means "not the TUI attach path"
+        assert_eq!(thin_client_from(v(&["--attach", "abc", "status"]), true), None);
+        assert_eq!(thin_client_from(v(&["--system", "x", "daemon", "status"]), true), None);
+        assert_eq!(thin_client_from(v(&["--system", "x", "attach"]), true), Some(Line { profile: None }));
+        // the value itself may be a subcommand name — still a value
+        assert_eq!(thin_client_from(v(&["--attach", "--name", "attach"]), true), t);
+        assert_eq!(thin_client_from(v(&["--system", "attach"]), true), None);
     }
 
     #[test]
