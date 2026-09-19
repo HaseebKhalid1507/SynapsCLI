@@ -81,7 +81,7 @@ pub fn adopt_banner(
             _ if m.clients > 0 => "live, attached",
             _ => "live",
         };
-        let short: String = m.id.as_str().chars().take(13).collect();
+        let short = m.id.as_str();
         let name = m.name.as_deref().map(|n| format!(" \"{n}\"")).unwrap_or_default();
         let cwd = m.cwd.as_ref().map(|c| format!(" {}", c.display())).unwrap_or_default();
         line.push_str(&format!("\n  {short}{name}  {state}  {age}{cwd}"));
@@ -427,8 +427,8 @@ mod tests {
         assert!(!b.contains("ours"), "{b}");
         // newest first, state + age + cwd per row
         let rows: Vec<&str> = b.lines().skip(1).collect();
-        assert!(rows[0].contains("20260919-0200") && rows[0].contains("live, attached") && rows[0].contains("m ago") && rows[0].contains("/w"), "{b}");
-        assert!(rows[1].contains("20260919-0100") && rows[1].contains("parked") && rows[1].contains("2h ago"), "{b}");
+        assert!(rows[0].contains("20260919-020000-bbbb") && rows[0].contains("live, attached") && rows[0].contains("m ago") && rows[0].contains("/w"), "{b}");
+        assert!(rows[1].contains("20260919-010000-aaaa") && rows[1].contains("parked") && rows[1].contains("2h ago"), "{b}");
         // capped at 5 rows + overflow line
         let many: Vec<_> = (0..8).map(|i| meta(&format!("20260919-00000{i}-xxxx"), L::Parked, 0, i)).collect();
         let b = adopt_banner(&many, &ours, now).unwrap();
