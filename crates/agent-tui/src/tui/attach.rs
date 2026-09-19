@@ -405,8 +405,8 @@ mod tests {
             lifecycle,
             clients,
             input_owner: None,
-            awaiting_input: false,
-            journal_id: None,
+            awaiting_input: 0,
+            journal_id: String::new(),
         }
     }
 
