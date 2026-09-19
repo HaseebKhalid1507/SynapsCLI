@@ -200,6 +200,9 @@ pub(crate) struct App {
     /// F9: set when the daemon died and reconnection failed — `run_loop` uses
     /// this to exit non-zero with a stderr explanation.
     pub(crate) daemon_lost: Option<DaemonLostInfo>,
+    /// F27: quit-while-streaming guard (socket only). First Ctrl+C shows a
+    /// notice; second within 3 s detaches.
+    pub(crate) quit_guard: super::quit_guard::QuitGuard,
     /// Mirror of the actor's buffered-during-streaming event count
     /// (`ConversationSnapshot.pending_events_len`).
     pub(crate) pending_events_len: usize,
@@ -414,6 +417,7 @@ impl App {
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compacting: false,
             daemon_lost: None,
+            quit_guard: super::quit_guard::QuitGuard::new(),
             pending_events_len: 0,
             subagent_rows: Vec::new(),
             compaction_applied: None,

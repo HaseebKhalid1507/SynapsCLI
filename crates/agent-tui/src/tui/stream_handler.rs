@@ -154,6 +154,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
         }
         StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
+            app.quit_guard.reset();
             app.drop_empty_thinking();
             // Reconcile HUD against the registry rows (last `SubagentRows`)
             // instead of clearing — retains running entries whose tx_events
@@ -178,6 +179,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 err.category_label()
             )));
             app.streaming = false;
+            app.quit_guard.reset();
             // Reconcile HUD against registry rows on error path too (same as Done).
             reconcile_subagents(
                 &mut app.subagents,
@@ -431,6 +433,7 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Ended { .. } => return ArmFlow::Ended,
         SessionEventWire::Aborted { context_saved } => {
             app.streaming = false;
+            app.quit_guard.reset();
             app.subagents.clear();
             // The actor decided (`TurnLog::abort_context`); the mirror's
             // `abort_context` only lands with the `Conversation` that follows.
@@ -528,6 +531,7 @@ pub(super) async fn handle_session_event_arm(
                 // The pre-send presentation assumed a turn: undo it.
                 if app.streaming && app.turn_baseline == app.api_messages_len {
                     app.streaming = false;
+            app.quit_guard.reset();
                     app.status_text = None;
                     app.drop_empty_thinking();
                 }

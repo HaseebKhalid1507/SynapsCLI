@@ -63,6 +63,30 @@ stderr tail). Measured on bella: ready in ~75 ms.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
 
+## Detach vs abort (F27)
+
+Over a socket transport (daemon session), **Ctrl+C / `/quit` detaches the client
+but leaves the turn running** in the daemon. This is the correct default for
+"close the lid" workflows, but a footgun when the user meant to stop a
+destructive command.
+
+To avoid accidental headless turns:
+
+- **First Ctrl+C (or `/quit`) while streaming** shows a notice:
+  `turn still running in the daemon — press Esc to abort it, or Ctrl+C again
+  within 3 s to detach (session keeps running)`.
+- **Second Ctrl+C within 3 seconds** detaches as before (the turn continues in
+  the daemon).
+- **Esc while streaming** aborts the turn (sends `Cancel` to the actor) — same
+  as in-process.
+- **Ctrl+C while idle** (not streaming) detaches immediately — no double-press
+  needed.
+- **In-process** (`TransportMode::Local`, i.e. `SYNAPS_DAEMON=0` or no daemon)
+  is unchanged: quit ends the session.
+
+The line client (`synaps attach`) follows the same double-press rule. The notice
+is printed to stderr so scripts piping stdout are not affected.
+
 ## Files (under `registry_dir()`, one set per profile: `daemon-<P>.*`)
 
 | File | Mode | Purpose |
