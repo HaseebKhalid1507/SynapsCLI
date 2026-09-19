@@ -665,7 +665,7 @@ async fn async_main() -> anyhow::Result<()> {
                 tui::attach::run_attached(tui::attach::AttachOpts {
                     profile: cli.profile,
                     id,
-                    continue_session: cli.continue_session.flatten(),
+                    continue_session: cli.continue_session,
                     system: cli.system,
                     prompt_manifest: cli.prompt_manifest,
                     mode: tui::attach::attach_mode(cli.observe, cli.takeover),

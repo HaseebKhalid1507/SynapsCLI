@@ -29,7 +29,11 @@ pub struct AttachOpts {
     /// Session id (prefix ok); `None` = the only live session, else create.
     pub id: Option<String>,
     /// Create by continuing a saved session (name or id).
-    pub continue_session: Option<String>,
+    /// `--continue [NAME_OR_ID]`: `Some(None)` = most recent journal (bare
+    /// `--continue`), `Some(Some(x))` = that one. Must stay two-level: the
+    /// attach path used to flatten it, which turned a bare `--continue`
+    /// into a fresh session under adopt / `--new` (soak F21).
+    pub continue_session: Option<Option<String>>,
     pub system: Option<String>,
     pub prompt_manifest: Option<PathBuf>,
     pub mode: AttachMode,
@@ -126,7 +130,7 @@ pub fn choose_attach(
         return Err("cannot combine --attach <ID> with --new: pick one".to_string());
     }
     if let Some(c) = &opts.continue_session {
-        return Ok((create(Some(Some(c.clone()))), None));
+        return Ok((create(Some(c.clone())), None));
     }
     if opts.new_session {
         return Ok((create(None), None));
@@ -407,6 +411,27 @@ mod tests {
             input_owner: None,
             awaiting_input: 0,
             journal_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn bare_continue_means_most_recent_not_fresh() {
+        // F21: `synaps --continue` (no id) over the attach path must reach the
+        // daemon as `continue_session: Some(None)` (= most recent journal),
+        // even when --new is also set (adopt sets it).
+        let mut o = opts(None, true);
+        o.continue_session = Some(None);
+        let (a, _) = choose_attach(&o, &[live("abc")], None).unwrap();
+        match a {
+            Attach::Create { config, .. } => assert_eq!(config.continue_session, Some(None)),
+            other => panic!("expected Create, got {other:?}"),
+        }
+        let mut o = opts(None, false);
+        o.continue_session = Some(Some("xyz".into()));
+        let (a, _) = choose_attach(&o, &[], None).unwrap();
+        match a {
+            Attach::Create { config, .. } => assert_eq!(config.continue_session, Some(Some("xyz".into()))),
+            other => panic!("expected Create, got {other:?}"),
         }
     }
 
