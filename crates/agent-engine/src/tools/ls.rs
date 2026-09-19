@@ -42,7 +42,11 @@ impl Tool for LsTool {
             ctx.capabilities.cwd.as_deref(),
         );
 
-        let output = Command::new("ls")
+        let mut cmd = Command::new("ls");
+        if let Some(env) = &ctx.capabilities.env {
+            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
+        let output = cmd
             .arg("-lah")
             .arg(&path)
             .output()

@@ -56,6 +56,9 @@ impl Tool for FindTool {
         let file_type = params["type"].as_str();
 
         let mut cmd = Command::new("find");
+        if let Some(env) = &ctx.capabilities.env {
+            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
         cmd.arg(&path);
 
         cmd.args(["-not", "-path", "*/.git/*"]);

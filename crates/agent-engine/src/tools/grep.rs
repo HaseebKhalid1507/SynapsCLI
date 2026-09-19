@@ -61,6 +61,9 @@ impl Tool for GrepTool {
         let context = params["context"].as_u64();
 
         let mut cmd = Command::new("grep");
+        if let Some(env) = &ctx.capabilities.env {
+            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
         cmd.arg("-rn");
         cmd.arg("--color=never");
 
