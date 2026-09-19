@@ -64,6 +64,8 @@ struct Client {
     streaming: bool,
     pending: Vec<PromptRequest>,
     stdout: std::io::Stdout,
+    /// F27: double-press guard for quit-while-streaming.
+    quit_guard: agent_tui::tui::quit_guard::QuitGuard,
 }
 
 impl Client {
@@ -85,10 +87,12 @@ impl Client {
             }
             SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done)) => {
                 self.streaming = false;
+                self.quit_guard.reset();
                 self.out("\n");
             }
             SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Error(e))) => {
                 self.streaming = false;
+                self.quit_guard.reset();
                 let label = if matches!(e.outcome, TurnOutcome::Canceled) { "canceled" } else { "error" };
                 self.out(&format!("\n[{label}] {} ({})\n", e.message, e.category_label()));
             }
@@ -122,6 +126,7 @@ impl Client {
             | SessionEventWire::Attached { .. } => {}
             SessionEventWire::Aborted { context_saved } => {
                 self.streaming = false;
+                self.quit_guard.reset();
                 self.out(if *context_saved { "[aborted — context saved for next message]\n" } else { "[aborted]\n" })
             }
             SessionEventWire::Cleared { session_id } => {
@@ -157,7 +162,16 @@ impl Client {
         }
         match line {
             "" => return true,
-            "/detach" | "/quit" | "/exit" => return false,
+            "/detach" | "/quit" | "/exit" => {
+                if self.streaming {
+                    if self.quit_guard.press(std::time::Instant::now()) {
+                        return false;
+                    }
+                    self.out(&format!("[{}]\n", agent_tui::tui::quit_guard::NOTICE_LINE));
+                    return true;
+                }
+                return false;
+            }
             "/abort" => {
                 let _ = self.t.send(SessionCommand::Cancel).await;
             }
@@ -269,7 +283,7 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
 
     let existing = matches!(attach, Attach::Existing { .. });
     let (t, snap) = SocketTransport::attach(conn, attach).await.map_err(|e| anyhow::anyhow!("attach: {e}"))?;
-    let mut c = Client { t, streaming: snap.streaming, pending: snap.pending_prompts.clone(), stdout: std::io::stdout() };
+    let mut c = Client { t, streaming: snap.streaming, pending: snap.pending_prompts.clone(), stdout: std::io::stdout(), quit_guard: agent_tui::tui::quit_guard::QuitGuard::new() };
     if args.keep_warm && existing {
         let _ = c.t.send(SessionCommand::KeepWarm { on: true }).await;
     }
@@ -295,8 +309,17 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         line.clear();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                c.out("\n[detaching; the session keeps running]\n");
-                break;
+                if c.streaming {
+                    if c.quit_guard.press(std::time::Instant::now()) {
+                        c.out("\n[detaching; the session keeps running]\n");
+                        break;
+                    } else {
+                        eprintln!("\n{}", agent_tui::tui::quit_guard::NOTICE_LINE);
+                    }
+                } else {
+                    c.out("\n[detaching]\n");
+                    break;
+                }
             }
             r = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line) => {
                 match r {
@@ -321,6 +344,7 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
                         let daemon_pid = c.t.daemon_pid();
                         let session_id = c.t.session_id().to_string();
                         c.streaming = false;
+                        c.quit_guard.reset();
 
                         let budget = SocketTransport::reconnect_budget();
                         let budget_secs = budget.as_secs();

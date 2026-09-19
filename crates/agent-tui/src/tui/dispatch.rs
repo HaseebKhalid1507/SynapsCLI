@@ -104,6 +104,8 @@ pub(crate) struct LoopState<'a> {
         &'a std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
     >,
     pub exit_fx_sent: &'a mut bool,
+    /// Whether we are running over a socket transport (F27 quit guard).
+    pub is_socket: bool,
 }
 
 /// Stand-in extension manager for the socket client (no extension host in
@@ -168,6 +170,7 @@ pub(crate) async fn handle_input_action(
         event_reader,
         ext_mgr_shared,
         exit_fx_sent,
+        is_socket,
     } = state;
     let ext_mgr_shared: &std::sync::Arc<
         tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>,
@@ -181,8 +184,24 @@ pub(crate) async fn handle_input_action(
         InputAction::None => {}
         InputAction::HelpFindOutcome => {}
         InputAction::Quit => {
-            render_handle.send_exit_fx(quit_effect());
-            *exit_fx_sent = true;
+            // F27: if streaming over a socket, the turn keeps running in the
+            // daemon after detach. First Ctrl+C shows a notice; second within
+            // 3 s detaches. In-process or idle → quit immediately.
+            if is_socket && app.streaming {
+                if app.quit_guard.press(std::time::Instant::now()) {
+                    // Second press within window → detach.
+                    render_handle.send_exit_fx(quit_effect());
+                    *exit_fx_sent = true;
+                } else {
+                    app.push_msg(ChatMessage::System(
+                        super::quit_guard::NOTICE.to_string(),
+                    ));
+                }
+            } else {
+                app.quit_guard.reset();
+                render_handle.send_exit_fx(quit_effect());
+                *exit_fx_sent = true;
+            }
         }
         InputAction::Abort => {
             // The actor cancels the turn, captures abort context, dequeues,
@@ -210,8 +229,21 @@ pub(crate) async fn handle_input_action(
                 CommandAction::None => {}
                 CommandAction::StartStream => {} // reserved for future use
                 CommandAction::Quit => {
-                    render_handle.send_exit_fx(quit_effect());
-                    *exit_fx_sent = true;
+                    // F27: same guard as Ctrl+C (above).
+                    if is_socket && app.streaming {
+                        if app.quit_guard.press(std::time::Instant::now()) {
+                            render_handle.send_exit_fx(quit_effect());
+                            *exit_fx_sent = true;
+                        } else {
+                            app.push_msg(ChatMessage::System(
+                                super::quit_guard::NOTICE.to_string(),
+                            ));
+                        }
+                    } else {
+                        app.quit_guard.reset();
+                        render_handle.send_exit_fx(quit_effect());
+                        *exit_fx_sent = true;
+                    }
                 }
                 CommandAction::LaunchGamba => {
                     drop(event_reader.take());
@@ -1250,8 +1282,21 @@ pub(crate) async fn handle_input_action(
                         }
                     }
                     CommandAction::Quit => {
-                        render_handle.send_exit_fx(quit_effect());
-                        *exit_fx_sent = true;
+                        // F27: same guard as Ctrl+C.
+                        if is_socket && app.streaming {
+                            if app.quit_guard.press(std::time::Instant::now()) {
+                                render_handle.send_exit_fx(quit_effect());
+                                *exit_fx_sent = true;
+                            } else {
+                                app.push_msg(ChatMessage::System(
+                                    super::quit_guard::NOTICE.to_string(),
+                                ));
+                            }
+                        } else {
+                            app.quit_guard.reset();
+                            render_handle.send_exit_fx(quit_effect());
+                            *exit_fx_sent = true;
+                        }
                     }
                     CommandAction::LaunchGamba => {
                         drop(event_reader.take());
