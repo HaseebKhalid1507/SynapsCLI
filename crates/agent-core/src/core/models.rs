@@ -3,7 +3,8 @@
 
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-4-6", "Sonnet 4.6 — balanced (default)"),
-    ("claude-fable-5", "Fable 5 — latest"),
+    ("claude-fable-5-1", "Fable 5.1"),
+    ("claude-fable-5", "Fable 5"),
     ("claude-opus-4-7", "Opus 4.7 — most capable"),
     ("claude-opus-4-6", "Opus 4.6 — previous flagship"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
@@ -148,6 +149,8 @@ mod tests {
     #[test]
     fn known_models_has_expected_ids() {
         let ids: Vec<&str> = KNOWN_MODELS.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&"claude-fable-5-1"));
+        assert!(ids.contains(&"claude-fable-5"));
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5-20251001"));
