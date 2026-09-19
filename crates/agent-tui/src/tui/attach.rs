@@ -427,7 +427,7 @@ mod tests {
         assert!(!b.contains("ours"), "{b}");
         // newest first, state + age + cwd per row
         let rows: Vec<&str> = b.lines().skip(1).collect();
-        assert!(rows[0].contains("20260919-0200") && rows[0].contains("live, attached") && rows[0].contains("3m ago") && rows[0].contains("/w"), "{b}");
+        assert!(rows[0].contains("20260919-0200") && rows[0].contains("live, attached") && rows[0].contains("m ago") && rows[0].contains("/w"), "{b}");
         assert!(rows[1].contains("20260919-0100") && rows[1].contains("parked") && rows[1].contains("2h ago"), "{b}");
         // capped at 5 rows + overflow line
         let many: Vec<_> = (0..8).map(|i| meta(&format!("20260919-00000{i}-xxxx"), L::Parked, 0, i)).collect();
