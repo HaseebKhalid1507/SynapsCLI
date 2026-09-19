@@ -421,6 +421,8 @@ fn thin_client_from<I: IntoIterator<Item = String>>(
             profile = Some(p.to_string());
         } else if VALUE_OPTS.contains(&a.as_str()) {
             want_value = true;
+            // `--name` requires `--attach` (clap): not part of the plain-TUI set.
+            other_flag |= a == "--name";
         } else if OPT_VALUE_OPTS.contains(&a.as_str()) {
             maybe_value = true;
         } else if !a.starts_with('-') {
