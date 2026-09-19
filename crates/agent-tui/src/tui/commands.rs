@@ -1117,7 +1117,7 @@ pub(super) async fn handle_command(
             if super::helpers::reload_display_tail(app, link).await {
                 app.push_msg(ChatMessage::System(format!(
                     "transcript resynced from session {} ({} messages)",
-                    app.session.id, app.api_messages_len
+                    app.session.id, app.transcript.message_count()
                 )));
             }
         }

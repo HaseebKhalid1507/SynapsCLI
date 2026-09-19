@@ -250,10 +250,21 @@ pub(crate) async fn run_setup(
 pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
     let conv = &snapshot.conversation;
     let session = app::session_from_header(&conv.header);
-    let mut app = if snapshot.meta.continued {
-        let mut app = App::new_with_clock(session, clock::TuiClock::real());
+    // F2: apply conversation + display unconditionally when there is history.
+    // `continued` only gates the "resumed session …" notice — a fresh session
+    // re-attached after parking has history but `continued == false`.
+    let has_history = conv.messages_len > 0
+        || !conv.api_messages.is_empty()
+        || snapshot
+            .display_tail
+            .as_ref()
+            .is_some_and(|t| !t.items.is_empty());
+    let mut app = App::new_with_clock(session, clock::TuiClock::real());
+    if has_history {
         app.apply_conversation(conv);
         rebuild_display_from_snapshot(&mut app, snapshot);
+    }
+    if snapshot.meta.continued {
         app.push_msg(ChatMessage::System(format!(
             "resumed session {}",
             conv.header.id
@@ -266,16 +277,13 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
                 )));
             }
         }
-        if app.abort_context.is_some() {
-            app.push_msg(ChatMessage::System(
-                "⚠ abort context from previous session will be injected into next message"
-                    .to_string(),
-            ));
-        }
-        app
-    } else {
-        App::new_with_clock(session, clock::TuiClock::real())
-    };
+    }
+    if app.abort_context.is_some() {
+        app.push_msg(ChatMessage::System(
+            "⚠ abort context from previous session will be injected into next message"
+                .to_string(),
+        ));
+    }
     app.last_turn_context_window = snapshot.view.context_window;
     app
 }
