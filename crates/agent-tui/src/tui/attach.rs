@@ -412,6 +412,7 @@ mod tests {
             input_owner: None,
             awaiting_input: 0,
             journal_id: String::new(),
+            locked_by: None,
         }
     }
 

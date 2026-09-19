@@ -64,6 +64,7 @@ impl ScriptedTransport {
             input_owner: Some(ClientId(1)),
             awaiting_input: 0,
             journal_id: session.id.clone(),
+            locked_by: None,
         };
         let view = Arc::new(RuntimeView::snapshot(&runtime, 0));
         Self {
