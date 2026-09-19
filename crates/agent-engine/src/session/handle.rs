@@ -52,6 +52,9 @@ pub struct SessionHandle {
     /// Session name — `--name` at create / `/cmd saveas` later. Written by
     /// the actor so listings and `--continue <name>` see renames live.
     name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// F23: only on a lock-held placeholder — the config to retry the real
+    /// `create` with on the next attach. `None` for real actors.
+    placeholder_config: Option<Arc<SessionConfig>>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -95,6 +98,7 @@ impl SessionHandle {
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
             name: Arc::clone(&name),
+            placeholder_config: None,
         };
         (
             handle,
@@ -167,6 +171,16 @@ impl SessionHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Envelope> {
         self.events.subscribe()
+    }
+
+    /// F23: the retry config carried by a lock-held placeholder.
+    pub fn placeholder_config(&self) -> Option<&SessionConfig> {
+        self.placeholder_config.as_deref()
+    }
+
+    pub(crate) fn with_placeholder_config(mut self, cfg: SessionConfig) -> Self {
+        self.placeholder_config = Some(Arc::new(cfg));
+        self
     }
 
     pub fn meta(&self) -> &SessionMeta {
@@ -482,6 +496,7 @@ pub mod locked_placeholder {
             prompt_inspection: None,
         };
         let (handle, ep) = SessionHandle::new(meta, view);
+        let handle = handle.with_placeholder_config(config.clone());
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
         let task = tokio::spawn(run(id, ep, config, holder_desc));

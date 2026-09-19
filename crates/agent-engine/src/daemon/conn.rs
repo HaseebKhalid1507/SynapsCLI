@@ -282,6 +282,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let mut attached_to_live = false;
     let (handle, mode) = match attach {
         Attach::Existing { session_id, mode } => match state.attach(&session_id) {
+            Some(h) if h.meta().locked_by.is_some() => (state.retry_locked_placeholder(h).await, mode),
             Some(h) => (h, mode),
             None => {
                 let _ = tx

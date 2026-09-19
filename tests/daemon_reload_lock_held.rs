@@ -232,6 +232,27 @@ async fn reload_lock_held_keeps_same_id_parked_and_refuses_attach() {
         "session must still exist after lock release: {metas:?}"
     );
 
+    // 7. RECOVERY: the next attach retries the real create under the same id —
+    //    the placeholder is replaced and the journal's history comes back.
+    let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut t, snap) = SocketTransport::attach(
+        conn,
+        Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror },
+    )
+    .await
+    .expect("attach after lock release must succeed (placeholder replaced)");
+    assert_eq!(snap.meta.id, sid, "same id, no alias");
+    assert!(snap.meta.locked_by.is_none(), "real session, not the placeholder: {:?}", snap.meta);
+    assert!(
+        snap.conversation.messages_len >= 2,
+        "history restored from journal, got messages_len={}",
+        snap.conversation.messages_len
+    );
+    let metas = SocketTransport::sessions(&d.paths.sock).await.unwrap();
+    assert_eq!(metas.iter().filter(|m| m.id == sid).count(), 1, "exactly one entry: {metas:?}");
+    assert!(metas.iter().all(|m| m.locked_by.is_none()), "no placeholder left: {metas:?}");
+    let _ = t.detach().await;
+
     // Cleanup.
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
     let t0 = std::time::Instant::now();

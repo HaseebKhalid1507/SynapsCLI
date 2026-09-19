@@ -228,6 +228,38 @@ impl DaemonState {
         Ok(handle)
     }
 
+    /// F23: a lock-held placeholder (`meta.locked_by.is_some()`) is retried on
+    /// every attach. Pull it out of the map first — otherwise the host's
+    /// attach-if-live short-circuit hands the placeholder straight back —
+    /// and re-run the real `create` from the journal. Success replaces the
+    /// placeholder under the same id; still-held puts it back and the caller
+    /// attaches to it (→ `AttachRefused` naming the holder).
+    pub async fn retry_locked_placeholder(&self, placeholder: SessionHandle) -> SessionHandle {
+        let cfg = SessionConfig {
+            continue_session: Some(Some(placeholder.id.as_str().to_string())),
+            ..placeholder.placeholder_config().cloned().unwrap_or_default()
+        };
+        self.remove(&placeholder.id);
+        match (self.factory)(cfg).await {
+            Ok(real) if real.id == placeholder.id || real.journal_id() == placeholder.id.as_str() => {
+                tracing::info!(session = %placeholder.id, "daemon: locked journal released — placeholder replaced by the real session");
+                self.insert(real.clone());
+                real
+            }
+            Ok(other) => {
+                // Journal resolved somewhere else (e.g. compacted_into follow): keep it, drop the placeholder.
+                tracing::warn!(session = %placeholder.id, resolved = %other.id, "daemon: placeholder retry resolved to a different id");
+                self.insert(other.clone());
+                other
+            }
+            Err(e) => {
+                tracing::debug!(session = %placeholder.id, error = %e, "daemon: journal still locked; keeping placeholder");
+                self.insert(placeholder.clone());
+                placeholder
+            }
+        }
+    }
+
     pub fn request_shutdown(&self, force: bool) {
         if force {
             self.force_shutdown.store(true, Ordering::SeqCst);
