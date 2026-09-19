@@ -18,6 +18,7 @@ pub mod rpc_protocol;
 pub mod session;
 pub mod session_index;
 pub mod session_journal;
+pub mod session_lock;
 pub mod shell_config;
 pub mod stream_types;
 pub mod watcher_types;

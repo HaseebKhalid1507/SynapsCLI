@@ -375,6 +375,8 @@ pub struct SessionActor {
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
     /// Mirrors `handle.name()`; `sync_name` after any rename.
     pub(crate) name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// F10: per-session journal ownership lock. Held while Live, released on Park.
+    pub(crate) session_lock: Option<agent_core::session_lock::SessionLock>,
 }
 
 impl SessionActor {
@@ -458,6 +460,44 @@ impl SessionActor {
         }
 
         let id = SessionId::from(sb.session.id.clone());
+
+        // F10: acquire the per-session journal ownership lock.
+        let lock_kind = if cfg.await_extensions { "daemon" } else { "tui" };
+        let session_lock = if sb.continued {
+            // Continuing an existing session — the lock MUST succeed.
+            // If another process holds it, refuse with an actionable error.
+            let dir = agent_core::session_lock::sessions_dir();
+            let holder = agent_core::session_lock::LockHolder {
+                pid: std::process::id(),
+                kind: lock_kind.to_string(),
+            };
+            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
+                Ok(lock) => Some(lock),
+                Err(agent_core::session_lock::SessionLockError::Held { session_id, holder }) => {
+                    let msg = agent_core::session_lock::SessionLockError::Held { session_id, holder };
+                    return Err(crate::RuntimeError::Session(msg.to_string()));
+                }
+                Err(e) => {
+                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
+                    None
+                }
+            }
+        } else {
+            // Fresh session — best-effort lock.
+            let dir = agent_core::session_lock::sessions_dir();
+            let holder = agent_core::session_lock::LockHolder {
+                pid: std::process::id(),
+                kind: lock_kind.to_string(),
+            };
+            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
+                    None
+                }
+            }
+        };
+
         let meta = SessionMeta {
             id: id.clone(),
             name: sb.session.name.clone(),
@@ -542,6 +582,7 @@ impl SessionActor {
             journal_id,
             presence,
             name,
+            session_lock,
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -674,6 +715,23 @@ impl SessionActor {
             .is_file()
     }
 
+    /// F10: release the old lock, acquire on `new_id`. Best-effort (log on failure).
+    fn reacquire_session_lock(&mut self, new_id: &str) {
+        // Drop old lock first — release the flock.
+        self.session_lock = None;
+        let dir = agent_core::session_lock::sessions_dir();
+        let holder = agent_core::session_lock::LockHolder {
+            pid: std::process::id(),
+            kind: "daemon".to_string(),
+        };
+        match agent_core::session_lock::SessionLock::try_acquire(&dir, new_id, holder) {
+            Ok(lock) => self.session_lock = Some(lock),
+            Err(e) => {
+                tracing::warn!(session = %new_id, "reacquire session lock: {e}");
+            }
+        }
+    }
+
     fn rearm_park(&mut self) {
         if !self.can_park() {
             self.park_deadline = None;
@@ -738,6 +796,10 @@ impl SessionActor {
         // dirty/muzzy for its decay window, and a parked session that
         // still shows in RssAnon buys nothing.
         crate::core::memstat::purge_arenas();
+        // F10: release the journal lock so an in-process --continue can
+        // pick up the parked session (the daemon will fail to re-acquire
+        // on unpark and surface a clear error instead of a zombie).
+        self.session_lock = None;
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
@@ -750,6 +812,31 @@ impl SessionActor {
     pub(crate) async fn unpark(&mut self) -> Result<()> {
         let started = std::time::Instant::now();
         let journal_id = (**self.journal_id.load()).clone();
+
+        // F10: re-acquire the journal lock before rebuilding the runtime.
+        // If an in-process --continue took over while we were parked, fail
+        // loudly so the attach gets a clear error instead of a zombie.
+        {
+            let dir = agent_core::session_lock::sessions_dir();
+            let holder = agent_core::session_lock::LockHolder {
+                pid: std::process::id(),
+                kind: "daemon".to_string(),
+            };
+            match agent_core::session_lock::SessionLock::try_acquire(&dir, &journal_id, holder) {
+                Ok(lock) => self.session_lock = Some(lock),
+                Err(agent_core::session_lock::SessionLockError::Held { .. }) => {
+                    return Err(crate::RuntimeError::Session(format!(
+                        "cannot unpark session {}: journal locked by another process",
+                        journal_id
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(session = %journal_id, "unpark: session lock: {e}");
+                    // Non-fatal: proceed without the lock (e.g. read-only fs).
+                }
+            }
+        }
+
         let host = Arc::clone(&self.host);
         let cfg = self.config.clone();
         let queue = Arc::clone(&self.event_queue);
@@ -1378,6 +1465,8 @@ impl SessionActor {
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
                         self.journal_id.store(Arc::new(new_id.clone()));
+                        // F10: lock follows the new journal id.
+                        self.reacquire_session_lock(&new_id);
                         self.emit(SessionEventWire::CompactionApplied {
                             previous_session_id: previous,
                             session_id: new_id,
@@ -1923,6 +2012,8 @@ impl SessionActor {
                 self.runtime
                     .set_session_id(Some(self.conv.session.id.clone()));
                 self.journal_id.store(Arc::new(self.conv.session.id.clone()));
+                // F10: lock follows the new session id.
+                self.reacquire_session_lock(&self.conv.session.id.clone());
                 self.emit(SessionEventWire::Cleared {
                     session_id: self.conv.session.id.clone(),
                 });
