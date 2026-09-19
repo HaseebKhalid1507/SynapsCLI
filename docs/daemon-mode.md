@@ -258,6 +258,42 @@ Tools, shell and the memory tool honour the session `cwd` (`Runtime.cwd`). Still
 daemon today: memory project scope, `host_project_root`, project-local plugin discovery, extension
 process cwd. Start the daemon in the project you care about until day 2's `memory_project_scope(cwd)`.
 
+## Session identity — environment snapshot (wave 1, T1–T3)
+
+**Principle:** a daemon session's process identity (env, cwd) comes from the
+*creating client*, not the daemon. The daemon's own env is used by exactly one
+thing: the daemon itself.
+
+### How it works
+
+1. **Client captures env at Hello.** `Hello::new()` calls `capture_client_env()`
+   which snapshots `std::env::vars()`, sorts by key, and strips:
+   - Client-only prefixes: `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*`, `SYNAPS_DAEMON_*`, `SYNAPS_MEM_TRACE*`
+   - Secrets (case-insensitive): `*_API_KEY`, `*_TOKEN`, `*_SECRET*`, `*PASSWORD*`,
+     `AWS_SECRET_*`, `*_CREDENTIALS`
+2. **Daemon copies `hello.env` → `config.env` on `Attach::Create` only.**
+   Attaching to an existing session never changes its env (creator's env is final).
+3. **`SessionConfig.env` → `Runtime.env` → `ToolCapabilities.env`** — same pipe as cwd.
+4. **Tools apply `env_clear().envs(session_env)`** when `env` is `Some`:
+   `bash.rs`, `find.rs`, `grep.rs`, `ls.rs`. No daemon env var leaks through.
+5. **In-process hosts pass `env: None`** — inherit the process env, byte-identical to before.
+
+### `SYNAPS_*` split (stub — T11 will formalize)
+
+| Category | Prefixes | Read by | In session env? |
+|---|---|---|---|
+| Client-only | `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*` | Thin TUI client | No (stripped) |
+| Daemon-only | `SYNAPS_DAEMON_*` | Daemon boot | No (stripped) |
+| Debug | `SYNAPS_MEM_TRACE*` | Profiling harness | No (stripped) |
+| Session | everything else (`SYNAPS_ANTHROPIC_BASE_URL`, etc.) | Runtime/tools | Yes |
+
+### What is NOT yet covered (wave 2+)
+
+- **Journal persistence of env minus secrets** (T5) — env does not survive daemon restart today.
+- **Extension protocol: per-call env/cwd** (T6) — sidecars still get the daemon's env.
+- **`--system` by content** (T4) — path-like args still resolved against daemon cwd.
+- **`SO_PEERCRED` uid check** (T11) — no auth boundary on the socket yet.
+
 ## What changes on the default (in-process) path — read before merging
 
 Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):
