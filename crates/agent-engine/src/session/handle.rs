@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 use super::transport::TransportError;
-use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionId, SessionLifecycle, SessionMeta};
+use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
