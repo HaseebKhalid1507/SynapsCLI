@@ -58,7 +58,15 @@ Durable context is the real differentiator: **rollover with retrievable original
 6. **Driver → actor** (42–55 h). Then update `session-drivers.md` "local TUI only" → "any session".
 7. T6/T7 extension env protocol, T11 peer-cred, alongside 5–6.
 
-## Decisions for Haseeb
+## Decisions (Haseeb, 2026-09-19 17:21: "go with your picks, I trust you")
+1. Engine half first, dark — **yes**.
+2. F19 — **inside the stream.rs merge pass**, with its regression test.
+3. Multi-tenancy — **A now** (one driver grant per plugin daemon-wide, zero plugin changes), B later.
+4. Zero-client prompt — **suspend + notify + timeout → revoke**. Never auto-approve under a driver.
+5. Spend caps — **per-run USD from Start + per-daemon ceiling in config**; ceiling is JR's call on Praxis, Haseeb's on jade.
+6. Identity questions — see session-identity.md Decisions.
+
+### (original questions, for the record)
 
 1. **Engine half first, dark** — agree? (The alternative — hold all 50k lines until the driver port is done — is 3+ more weeks of drift.)
 2. **F19 inside the merge pass** (5 lines, same file) or a separate PR for attribution?

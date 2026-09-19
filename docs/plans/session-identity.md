@@ -195,8 +195,8 @@ Every task: build on bella only; `cargo test --workspace --locked` + clippy `-D 
 ## Out of scope (tracked separately)
 F19 empty-end_turn data loss (#377), F4/F5 reload-vs-in-flight-turn (#366), F7 incremental journal (#369), F6 abort-context-as-injection (#370), F8 orphan tool children on SIGKILL (#371), F18 zero-turn sessions never park (#376).
 
-## Open questions for Haseeb
-1. Full env vs allowlist — plan says full. Confirm.
-2. Should `*_API_KEY` in a client env ever become session env, or always stripped + ignored (broker owns creds)? Plan leans stripped+ignored.
-3. T7 per-session fallback: acceptable RAM cost for unflagged spawners, or refuse to load them under the daemon until they opt in?
-4. T8: two-Ctrl+C-to-detach, or a y/n prompt?
+## Decisions (Haseeb, 2026-09-19 17:21: "go with your picks")
+1. **Full client env**, not an allowlist. Strip only `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*`, `SYNAPS_DAEMON_*`, `SYNAPS_MEM_TRACE*`.
+2. **`*_API_KEY`/`*_TOKEN`/`*_SECRET*`/`*PASSWORD*`/`AWS_SECRET_*`/`*_CREDENTIALS` are stripped AND ignored** — never session env, never journaled. The broker owns credentials.
+3. **T7: unflagged subprocess-spawning plugins get a per-session instance** + a logged warning. Never refuse to load.
+4. **T8: second Ctrl+C within 3 s detaches**; first shows the notice. No y/n prompt.
