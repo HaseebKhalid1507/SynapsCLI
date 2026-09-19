@@ -320,8 +320,27 @@ thing: the daemon itself.
 
 - **Journal persistence of env minus secrets** (T5) — env does not survive daemon restart today.
 - **Extension protocol: per-call env/cwd** (T6) — sidecars still get the daemon's env.
-- **`--system` by content** (T4) — path-like args still resolved against daemon cwd.
 - **`SO_PEERCRED` uid check** (T11) — no auth boundary on the socket yet.
+
+### Path-like arg resolution — `--system` by content (T4, F26)
+
+Thin clients resolve path-like `--system` and `--prompt-manifest` arguments
+against the **client's** cwd before sending `Hello`, so
+`cd /tmp/proj && synaps --system ./prompt.md` works identically over adopt
+and in-process.
+
+**Heuristic** (`session::client_args::looks_path_like`): a value is path-like
+when it starts with `/`, `./`, `../`, or `~`, **or** ends with `.md`/`.txt`
+(case-insensitive) — AND contains no newlines or runs of double-spaces (prose
+guard).  Path-like + readable → replaced with the file's **contents**.
+Path-like + missing → non-zero exit with `--system <val>: no such file
+(resolved <abs>)`.  Non-path-like → passed through as literal prompt text.
+
+`--prompt-manifest` is canonicalized against client cwd; missing → error.
+
+> **Design note:** a cleaner signal would be `--system @file` (like curl),
+> but the launcher `~/Jawz/tools/jawz` already passes `--system /tmp/jawz-identity.md`
+> unchanged, so the heuristic must accept bare paths.
 
 ## What changes on the default (in-process) path — read before merging
 

@@ -229,7 +229,7 @@ fn set_echo(on: bool) {
     }
 }
 
-pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow::Result<()> {
     if let Err(code) = super::daemon::require_enabled("synaps attach") {
         std::process::exit(code);
     }
@@ -251,13 +251,31 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         eprintln!("[notice] daemon binary {} differs from client {} (same protocol)", conn.welcome.daemon_version, binary_version());
     }
 
+    // T4: resolve path-like args against client cwd before shipping to the daemon.
+    let client_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    {
+        let mut probe = SessionConfig {
+            system: args.system.clone(),
+            prompt_manifest: None, // line client doesn't expose --prompt-manifest yet
+            ..Default::default()
+        };
+        if let Err(e) = agent_engine::session::client_args::resolve_client_session_args(
+            &mut probe,
+            &client_cwd,
+        ) {
+            eprintln!("synaps attach: {e}");
+            std::process::exit(1);
+        }
+        args.system = probe.system;
+    }
+
     let mode = args.attach_mode();
     let attach = if args.create || args.continue_session.is_some() {
         Attach::Create {
             config: SessionConfig {
                 continue_session: args.continue_session.clone().map(Some),
                 system: args.system.clone(),
-                cwd: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+                cwd: Some(client_cwd.clone()),
                 env: None,
                 keep_warm: args.keep_warm,
                 name: args.name.clone(),
@@ -272,7 +290,7 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
         Attach::Existing { session_id: conn.welcome.sessions[0].id.clone(), mode }
     } else if conn.welcome.sessions.is_empty() {
         Attach::Create {
-            config: SessionConfig { cwd: std::env::current_dir().ok(), keep_warm: args.keep_warm, ..Default::default() },
+            config: SessionConfig { cwd: Some(client_cwd), keep_warm: args.keep_warm, ..Default::default() },
             mode,
         }
     } else {
