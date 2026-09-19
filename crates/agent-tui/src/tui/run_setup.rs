@@ -401,30 +401,137 @@ pub(crate) async fn finish_setup(
 
 /// The session envelope stream ended. In-process: the actor is gone — leave.
 /// Socket (A4): reconnect with backoff and re-mirror; `false` = give up.
+///
+/// F9: when the daemon died (not a reload), show "daemon connection lost"
+/// immediately, clear streaming state, and update the line on each retry.
+/// On success show the reconnect notice. On failure set `app.daemon_lost`
+/// for the caller to exit non-zero.
 pub(crate) async fn try_reconnect(
     app: &mut App,
     link: &mut SessionLink,
     mode: &TransportMode,
+    render_handle: &super::render_thread::RenderHandle,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
 ) -> bool {
     match mode {
         TransportMode::Local { .. } => false,
         TransportMode::Socket => {
+            use agent_engine::session::socket_transport::SocketTransport;
+            use std::time::Duration;
+
             let attach_mode = link.mode();
-            match link.transport_mut().reconnect(attach_mode).await {
-                Ok(snapshot) => {
-                    link.refresh_view();
-                    remirror(app, &snapshot);
-                    app.toasts.upsert(
-                        toast::Toast::new("reload", "reconnected").titled("Daemon"),
-                    );
-                    app.request_redraw();
-                    true
+            // Snapshot transport state before entering the loop (avoids
+            // holding a `&mut` on link across force_publish / refresh_view).
+            let is_reload = link.transport_mut().is_reload_pending();
+            let daemon_pid = link.transport_mut().daemon_pid();
+            let session_id = link.transport_mut().session_id().clone();
+            let budget = SocketTransport::reconnect_budget();
+            let budget_secs = budget.as_secs();
+
+            // F9: clear streaming state — a turn cannot be streaming without a daemon.
+            if app.streaming {
+                app.streaming = false;
+            }
+            app.compacting = false;
+
+            // Show the initial message (reload = existing text, crash = F9 notice).
+            if !is_reload {
+                app.push_msg(ChatMessage::System(format!(
+                    "daemon connection lost — reconnecting ({budget_secs}s left)…"
+                )));
+                app.request_redraw();
+                force_publish(app, link, registry, render_handle);
+            }
+
+            let deadline = tokio::time::Instant::now() + budget;
+            let mut backoff = Duration::from_millis(100);
+            let mut attempts = 0u32;
+
+            loop {
+                match link.transport_mut().reconnect_once(attach_mode).await {
+                    Ok(snapshot) => {
+                        link.refresh_view();
+                        let new_pid = link.transport_mut().daemon_pid();
+                        let lifecycle = &snapshot.meta.lifecycle;
+                        let status = format!("{lifecycle:?}");
+                        remirror(app, &snapshot);
+                        app.push_msg(ChatMessage::System(format!(
+                            "reconnected to daemon (pid {new_pid}) — session {} {status}",
+                            session_id
+                        )));
+                        app.toasts.upsert(
+                            toast::Toast::new("reload", "reconnected").titled("Daemon"),
+                        );
+                        app.request_redraw();
+                        return true;
+                    }
+                    Err(agent_engine::session::TransportError::Refused(_))
+                    | Err(agent_engine::session::TransportError::Version { .. }) => {
+                        // Terminal errors — stop retrying.
+                        break;
+                    }
+                    Err(_e) => {
+                        attempts += 1;
+                    }
                 }
-                Err(e) => {
-                    app.push_msg(ChatMessage::Error(format!("connection lost: {e}")));
-                    app.request_redraw();
-                    false
+
+                if tokio::time::Instant::now() + backoff > deadline {
+                    break;
                 }
+
+                // Update the countdown message (at least on each retry).
+                if !is_reload {
+                    let left = deadline.duration_since(tokio::time::Instant::now());
+                    let secs_left = left.as_secs();
+                    app.status_text = Some(format!(
+                        "reconnecting… ({secs_left}s left, attempt {attempts})"
+                    ));
+                    app.request_redraw();
+                    force_publish(app, link, registry, render_handle);
+                }
+
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+
+            // Reconnect failed.
+            app.status_text = None;
+            if !is_reload {
+                app.daemon_lost = Some(super::app::DaemonLostInfo {
+                    pid: daemon_pid,
+                    session_id: session_id.to_string(),
+                    budget_secs,
+                });
+            }
+            app.push_msg(ChatMessage::Error(format!(
+                "lost the daemon (pid {daemon_pid}) — could not reconnect within {budget_secs}s"
+            )));
+            app.request_redraw();
+            false
+        }
+    }
+}
+
+/// Push one render frame from inside `try_reconnect` (the main event loop is
+/// blocked, so we replicate the build+publish path directly).
+fn force_publish(
+    app: &mut App,
+    link: &mut SessionLink,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &super::render_thread::RenderHandle,
+) {
+    if let Ok((w, h)) = crossterm::terminal::size() {
+        if w > 0 && h > 0 {
+            let size = ratatui::layout::Size { width: w, height: h };
+            let built = super::draw::build_render_model(
+                &mut super::view_model::ViewInputs::from_app(app),
+                &**link.view(),
+                registry,
+                size,
+            );
+            if let Some((model, patch)) = built {
+                patch.apply(app);
+                render_handle.publish(model);
             }
         }
     }

@@ -174,6 +174,12 @@ C: bye | socket close = Detach (turn keeps running)
   pre-actor TUI/chat only cancelled the token. Defensible (the model is told the previous answer was cut);
   `/clear` or a fresh session discards it. Documented in `synaps chat /help` too.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
+- Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
+  within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
+  and could not reconnect within M s — session <id>; resume with synaps --attach <id> / --continue <id>`.
+  Both TUI (`--attach`) and line client (`synaps attach`) exit this way; the in-process TUI is unaffected.
+  During the reconnect window the client shows `daemon connection lost — reconnecting (Ns left)…` and
+  clears streaming/compacting state. A successful reconnect prints a notice and resumes normally.
 
 ## Reload (`synaps daemon reload`, phase 3 C3)
 

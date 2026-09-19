@@ -314,7 +314,60 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
                         if let Some(p) = c.pending.first() { if p.kind == PromptKind::Secret { set_echo(false); } }
                         if ended { set_echo(true); return Ok(()); }
                     }
-                    None => { c.out("[connection closed]\n"); set_echo(true); return Ok(()); }
+                    None => {
+                        set_echo(true);
+                        let is_reload = c.t.is_reload_pending();
+                        let daemon_pid = c.t.daemon_pid();
+                        let session_id = c.t.session_id().to_string();
+                        c.streaming = false;
+
+                        let budget = SocketTransport::reconnect_budget();
+                        let budget_secs = budget.as_secs();
+                        if !is_reload {
+                            c.out(&format!(
+                                "\n[daemon connection lost — reconnecting ({budget_secs}s left)…]\n"
+                            ));
+                        }
+
+                        let deadline = tokio::time::Instant::now() + budget;
+                        let mut backoff = std::time::Duration::from_millis(100);
+                        let mut reconnected = false;
+                        loop {
+                            match c.t.reconnect_once(AttachMode::Mirror).await {
+                                Ok(snap) => {
+                                    let new_pid = c.t.daemon_pid();
+                                    let lifecycle = format!("{:?}", snap.meta.lifecycle);
+                                    c.streaming = snap.streaming;
+                                    c.out(&format!(
+                                        "[reconnected to daemon (pid {new_pid}) — session {} {}]\n",
+                                        session_id, lifecycle
+                                    ));
+                                    reconnected = true;
+                                    break;
+                                }
+                                Err(TransportError::Refused(_))
+                                | Err(TransportError::Version { .. }) => break,
+                                Err(_) => {}
+                            }
+                            if tokio::time::Instant::now() + backoff > deadline {
+                                break;
+                            }
+                            if !is_reload {
+                                let left = deadline.duration_since(tokio::time::Instant::now());
+                                c.out(&format!("[reconnecting… ({}s left)]\n", left.as_secs()));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                        }
+                        if !reconnected {
+                            eprintln!(
+                                "synaps: lost the daemon (pid {daemon_pid}) and could not reconnect \
+                                 within {budget_secs} s — session {session_id}; \
+                                 resume with synaps --attach {session_id} / --continue {session_id}"
+                            );
+                            std::process::exit(agent_engine::daemon::EXIT_DAEMON_LOST);
+                        }
+                    }
                 }
             }
         }
