@@ -93,6 +93,7 @@ async fn attach_to_parked_session_replays_conversation() {
         Attach::Create {
             config: SessionConfig {
                 cwd: Some(cwd.clone()),
+                env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 persist: true,
                 ..Default::default()

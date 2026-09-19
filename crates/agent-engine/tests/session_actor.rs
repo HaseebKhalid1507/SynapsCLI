@@ -349,6 +349,7 @@ async fn create_session_sets_cwd_and_session_id() {
     let handle = host
         .create_session(SessionConfig {
             cwd: Some(tmp.path().to_path_buf()),
+            env: None,
             ..cfg()
         })
         .await

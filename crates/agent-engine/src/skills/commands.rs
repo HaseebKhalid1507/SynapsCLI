@@ -159,6 +159,7 @@ fn empty_tool_context() -> ToolContext {
             extension_leases: None,
             memory_context: None,
             cwd: None,
+            env: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

@@ -242,6 +242,7 @@ pub(crate) async fn run(profile: Option<String>, args: AttachArgs) -> anyhow::Re
                 continue_session: args.continue_session.clone().map(Some),
                 system: args.system.clone(),
                 cwd: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+                env: None,
                 keep_warm: args.keep_warm,
                 name: args.name.clone(),
                 ..Default::default()

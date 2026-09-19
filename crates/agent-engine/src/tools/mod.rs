@@ -132,6 +132,10 @@ pub struct ToolCapabilities {
     /// directories in one process). `None` = inherit the process cwd — the
     /// only value Phase 1 ever sets, so behaviour is byte-identical.
     pub cwd: Option<PathBuf>,
+    /// Per-session environment snapshot (session-identity T1). `None` =
+    /// inherit process env. When `Some`, tools call `env_clear().envs()`
+    /// so no daemon env leaks into session subprocesses.
+    pub env: Option<crate::session::types::SessionEnv>,
 }
 
 /// Configuration limits and timeouts.

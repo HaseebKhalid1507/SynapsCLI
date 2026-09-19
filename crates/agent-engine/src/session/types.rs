@@ -42,6 +42,61 @@ impl From<&str> for SessionId {
     }
 }
 
+/// Ordered key-value snapshot of a client's environment.
+pub type SessionEnv = Vec<(String, String)>;
+
+/// Prefixes stripped from the client env before it enters the session.
+/// These are client-only or daemon-only knobs — never session identity.
+const ENV_STRIP_PREFIXES: &[&str] = &[
+    "SYNAPS_CLIENT_",
+    "SYNAPS_TUI_",
+    "SYNAPS_DAEMON_",
+    "SYNAPS_MEM_TRACE",
+];
+
+/// Secret patterns (case-insensitive suffix/infix) stripped at the client.
+/// Secrets never reach the daemon — the broker owns credentials.
+const SECRET_PATTERNS: &[&str] = &[
+    "_API_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "PASSWORD",
+    "AWS_SECRET_",
+    "_CREDENTIALS",
+];
+
+/// Build a [`SessionEnv`] from the current process environment, stripping
+/// client-only prefixes and secrets. Used by thin clients before `Hello`.
+pub fn capture_client_env() -> SessionEnv {
+    let mut env: SessionEnv = std::env::vars()
+        .filter(|(k, _)| !should_strip_env(k))
+        .collect();
+    env.sort_by(|(a, _), (b, _)| a.cmp(b));
+    env
+}
+
+/// Whether a key should be stripped from the client env snapshot.
+pub fn should_strip_env(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    for prefix in ENV_STRIP_PREFIXES {
+        if upper.starts_with(prefix) {
+            return true;
+        }
+    }
+    is_secret_key(&upper)
+}
+
+/// Whether a key matches the secret denylist (case-insensitive).
+pub fn is_secret_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    for pat in SECRET_PATTERNS {
+        if upper.contains(pat) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Everything `EngineHost::create_session` needs. Serializable: it is the
 /// payload of the wire `Attach::Create`. Mirrors `EngineOpts` minus the
 /// host-level fields (profile, no_extensions), plus the per-session facts a
@@ -65,6 +120,12 @@ pub struct SessionConfig {
     /// `Hello.cwd`.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Per-session environment snapshot. `None` = inherit process env
+    /// (in-process hosts). The daemon fills it from `Hello.env` on
+    /// `Attach::Create` only; attaching to an existing session does not
+    /// change the creator's env.
+    #[serde(default)]
+    pub env: Option<SessionEnv>,
     /// `Confirm` hook results auto-approved (server `--auto-approve-confirms`).
     /// Interactive hosts: false.
     #[serde(default)]
@@ -129,6 +190,7 @@ impl Default for SessionConfig {
             system: None,
             prompt_manifest: None,
             cwd: None,
+            env: None,
             auto_approve_confirms: false,
             model_override: None,
             persist: true,
@@ -866,6 +928,65 @@ mod tests {
             serde_json::to_value(SessionConfig::default()).unwrap()["persist"],
             serde_json::Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn session_config_env_defaults_to_none() {
+        let cfg: SessionConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.env.is_none());
+    }
+
+    #[test]
+    fn session_config_env_round_trips() {
+        let env = vec![("FOO".into(), "bar".into()), ("PATH".into(), "/usr/bin".into())];
+        let cfg = SessionConfig { env: Some(env.clone()), ..Default::default() };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: SessionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg2.env, Some(env));
+    }
+
+    #[test]
+    fn should_strip_env_client_prefixes() {
+        assert!(should_strip_env("SYNAPS_CLIENT_REEXEC"));
+        assert!(should_strip_env("SYNAPS_TUI_SCROLLBACK"));
+        assert!(should_strip_env("SYNAPS_DAEMON_ADOPT"));
+        assert!(should_strip_env("SYNAPS_MEM_TRACE"));
+        assert!(should_strip_env("SYNAPS_MEM_TRACE_FOO"));
+        // Session env — not stripped
+        assert!(!should_strip_env("SYNAPS_ANTHROPIC_BASE_URL"));
+        assert!(!should_strip_env("HOME"));
+        assert!(!should_strip_env("PATH"));
+        assert!(!should_strip_env("VIRTUAL_ENV"));
+    }
+
+    #[test]
+    fn should_strip_env_secrets() {
+        assert!(should_strip_env("ANTHROPIC_API_KEY"));
+        assert!(should_strip_env("OPENAI_API_KEY"));
+        assert!(should_strip_env("my_secret_token"));
+        assert!(should_strip_env("AWS_SECRET_ACCESS_KEY"));
+        assert!(should_strip_env("DB_PASSWORD"));
+        assert!(should_strip_env("GCP_CREDENTIALS"));
+        // Case insensitive
+        assert!(should_strip_env("My_Api_Key"));
+        // Not a secret
+        assert!(!should_strip_env("MY_VALUE"));
+        assert!(!should_strip_env("TOKENBUCKET_SIZE"));
+    }
+
+    #[test]
+    fn capture_client_env_is_sorted_and_stripped() {
+        // We can't fully control the process env in a unit test, but we can
+        // verify the output is sorted and that known strip-list vars are absent.
+        let env = capture_client_env();
+        // Sorted
+        for w in env.windows(2) {
+            assert!(w[0].0 <= w[1].0, "not sorted: {:?} > {:?}", w[0].0, w[1].0);
+        }
+        // No secrets or client-only vars
+        for (k, _) in &env {
+            assert!(!should_strip_env(k), "should have been stripped: {k}");
+        }
     }
 
     #[test]

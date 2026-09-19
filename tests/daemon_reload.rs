@@ -86,6 +86,7 @@ async fn attach_create(paths: &registry::DaemonPaths, cwd: &Path) -> (SocketTran
         Attach::Create {
             config: SessionConfig {
                 cwd: Some(cwd.to_path_buf()),
+                env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },

@@ -284,6 +284,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         None => (
             SessionConfig {
                 cwd: meta.cwd.clone(),
+                env: None,
                 ..SessionConfig::default()
             },
             false,

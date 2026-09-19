@@ -150,6 +150,7 @@ pub(crate) async fn run_setup(
             system,
             prompt_manifest,
             cwd: None,
+            env: None,
             auto_approve_confirms: false,
             model_override: None,
             persist: true,

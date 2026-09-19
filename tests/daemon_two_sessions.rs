@@ -67,6 +67,7 @@ async fn two_sessions_one_daemon_isolated() {
             Attach::Create {
                 config: SessionConfig {
                     cwd: Some(cwd.clone()),
+                    env: None,
                     model_override: Some("claude-sonnet-4-5".into()),
                     persist: false,
                     ..Default::default()
@@ -186,6 +187,7 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
         Attach::Create {
             config: SessionConfig {
                 cwd: Some(cwd.clone()),
+                env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 name: Some("ambient".into()),
                 ..Default::default()
@@ -209,6 +211,7 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
                 config: SessionConfig {
                     continue_session: Some(Some(query.to_string())),
                     cwd: Some(cwd.clone()),
+                    env: None,
                     ..Default::default()
                 },
                 mode: AttachMode::Mirror,

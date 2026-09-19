@@ -118,6 +118,7 @@ pub fn choose_attach(
             system: opts.system.clone(),
             prompt_manifest: opts.prompt_manifest.clone(),
             cwd: cwd.clone(),
+            env: None,
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: true,
             keep_warm: opts.keep_warm,

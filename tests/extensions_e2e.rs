@@ -225,6 +225,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     extension_leases: None,
                     memory_context: None,
                     cwd: None,
+                    env: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -393,6 +394,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     extension_leases: None,
                     memory_context: None,
                     cwd: None,
+                    env: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
