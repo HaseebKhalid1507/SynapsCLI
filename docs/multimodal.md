@@ -146,3 +146,12 @@ For `/trace next content`, binary media is structurally redacted. OpenAI request
 containing text-document attachments explicitly withhold the content capture
 bundle (reported by trace status), because lowering to ordinary input text loses
 attachment provenance. Metadata tracing continues normally.
+
+## Model capability gating — a note on model ids
+
+Attachments are accepted or refused per model by `validate_messages`. The static
+modality table is keyed by **provider-prefixed** ids (`anthropic/claude-sonnet-4-6`,
+`openai-codex/gpt-6-astra`). Live catalog evidence (the capability cache) extends
+it at runtime. An unprefixed id with no cached evidence is treated as text-only
+and image attachments are refused with `attachments rejected: Selected model
+lacks exact image input capability metadata`. Profiles normally use prefixed ids.
