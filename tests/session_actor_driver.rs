@@ -337,16 +337,27 @@ async fn armed_session_does_not_park() {
         }
     }
 
-    // Detach the client.
+    // Force the idle/park deadline to fire immediately: without the driver
+    // guards on can_park AND can_end_idle (F6), a zero-turn armed session
+    // would be idle-ENDED here, killing the run mid-arm.
+    std::env::set_var("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
+    std::env::set_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS", "0");
     t.send(SessionCommand::Detach {
         client: ClientId(1),
     })
     .await
     .unwrap();
-    // Give the park timer a chance to fire (it shouldn't).
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    std::env::remove_var("SYNAPS_DAEMON_PARK_GRACE_SECS");
+    std::env::remove_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS");
 
-    // The session should NOT be parked — verify by re-attaching.
+    // The session must be alive (not Ended, not Parked) — re-attach proves it.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), handle.closed())
+            .await
+            .is_err(),
+        "armed session was ended by the idle deadline (F6)"
+    );
     let (mut t2, _snap2) =
         LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
             .await

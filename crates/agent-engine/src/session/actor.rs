@@ -1536,6 +1536,12 @@ impl SessionActor {
             && self.conv.queued_message.is_none()
             && !self.keep_warm
             && !self.is_parked()
+            // An armed driver keeps the session alive between turns exactly
+            // like an attached client would (shady P3/P4 F6: without this, a
+            // zero-turn armed session is idle-ended 5 s after the last client
+            // detaches, killing the run mid-arm). `can_park` already guards.
+            && self.driver.is_none()
+            && self.driver_pending.is_none()
     }
 
     fn rearm_park(&mut self) {
