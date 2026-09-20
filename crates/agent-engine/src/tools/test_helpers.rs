@@ -12,6 +12,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            memory_backend: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,

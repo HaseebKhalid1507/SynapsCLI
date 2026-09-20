@@ -12,13 +12,15 @@ use std::sync::{Arc, Mutex};
 mod bash;
 mod edit;
 mod extension;
+pub(crate) mod context_checkpoint;
 mod find;
+pub mod forum;
 mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
 mod powershell;
-mod read;
+pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
 #[doc(hidden)]
@@ -36,6 +38,7 @@ pub mod respond;
 pub mod send_channel;
 pub mod shell;
 pub(crate) mod util;
+pub(crate) use util::expand_path;
 pub mod watcher_exit;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
@@ -91,6 +94,8 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
+    // TODO(session-identity T1/§4): MemoryBinding must be built from the SESSION cwd under the daemon
+    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
@@ -316,7 +321,7 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 #[cfg(test)]
 mod tool_output_tests {

@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 mod api;
 mod api_sync;
+pub mod attachments;
 mod auth;
+mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
@@ -21,6 +23,7 @@ pub mod chat_capture;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod context;
+pub mod continuation;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
@@ -221,6 +224,44 @@ pub struct ReasoningClamp {
     pub to: agent_core::reasoning::ReasoningLevel,
 }
 
+fn validated_single_tool_output(
+    model: &str,
+    output: crate::ToolOutput,
+) -> (String, Option<Vec<Value>>) {
+    let (summary, blocks) = output.into_parts();
+    if let Some(ref blocks) = blocks {
+        if let Err(error) = attachments::validate_tool_blocks(model, blocks) {
+            return (format!("Attachment not sent: {error}"), None);
+        }
+    }
+    (summary, blocks)
+}
+
+/// A summary rewrite (including the post-hook truncation) invalidates rich
+/// blocks: retaining them would bypass the hook's replacement/redaction.
+fn retain_single_tool_blocks(
+    blocks: Option<Vec<Value>>,
+    original: &str,
+    hooked: &str,
+) -> Option<Vec<Value>> {
+    if original == hooked {
+        blocks
+    } else {
+        None
+    }
+}
+
+fn single_tool_result_content(
+    result: &str,
+    blocks: Option<Vec<Value>>,
+    max_tool_output: usize,
+) -> Value {
+    match blocks {
+        Some(blocks) => Value::Array(blocks),
+        None => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
+    }
+}
+
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
 #[derive(Clone)]
@@ -260,6 +301,9 @@ pub struct Runtime {
     /// `models::context_window_for_model`. Lets users cap context at e.g.
     /// 200k even on models that natively support 1M.
     context_window_override: Option<u64>,
+    /// Opt-in context windows within a stable logical session (JR #112).
+    /// DARK by default: `ContextManagementMode::Off`.
+    pub(crate) continuation: continuation::SharedContinuation,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
@@ -315,6 +359,13 @@ pub struct Runtime {
     /// memory-context state from a parent runtime into a freshly
     /// constructed one.
     memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
+    /// Immutable host-owned note backend and captured project scope (JR #112).
+    /// DARK by default: `MemoryBinding::legacy_current()`.
+    memory_backend: crate::memory_backend::MemoryBinding,
+    /// First explicit host selection; never replace the captured binding.
+    memory_backend_config: Option<crate::config::MemoryBackendConfig>,
+    /// Sticky across same-session clones: live extension policy needs restart.
+    memory_backend_reconfigure_denied: Arc<std::sync::atomic::AtomicBool>,
     /// Production resolves the exact leased extension provider at dispatch.
     /// Tests may install this in-process provider to observe the same worker
     /// boundary without spawning an extension process.
@@ -669,6 +720,82 @@ fn memory_provider_id() -> memory_context::ContextProviderId {
         .expect("static provider id is always valid")
 }
 
+#[allow(dead_code)] // merge(112): consumed in phase 3
+fn terminal_capture_start(messages: &[crate::SharedMessage]) -> Option<crate::SharedMessage> {
+    messages
+        .iter()
+        .rfind(|message| {
+            message["role"] == "user"
+                && (message["content"].is_string()
+                    || message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| block["type"] != "tool_result")
+                    }))
+        })
+        .cloned()
+}
+
+#[allow(dead_code)] // merge(112): consumed in phase 3
+fn terminal_capture_messages<'a>(
+    messages: &'a [crate::SharedMessage],
+    start: &crate::SharedMessage,
+) -> Option<&'a [crate::SharedMessage]> {
+    // Identity, not an index (recall may prepend) or text equality (old turns
+    // can have identical prompts). If rollover removed the source, fail closed
+    // rather than recapturing its summary or unrelated earlier history.
+    let index = messages
+        .iter()
+        .position(|message| Arc::ptr_eq(message, start))?;
+    Some(&messages[index..])
+}
+
+/// The stream publishes history only after a valid terminal completion. Consume
+/// it once, never capture the pre-inference prompt or reselect a changed lease.
+#[allow(dead_code)] // merge(112): consumed in phase 3
+fn dispatch_completed_terminal_capture(
+    completed: bool,
+    final_history: &std::sync::Mutex<Option<Vec<crate::SharedMessage>>>,
+    state: &std::sync::Mutex<memory_context::SessionMemoryState>,
+    selected: Option<(
+        memory_context::MemoryContextLease,
+        Arc<dyn capture_worker::CaptureProvider>,
+    )>,
+    started_at: std::time::SystemTime,
+    turn_start: Option<&crate::SharedMessage>,
+) -> bool {
+    let history = final_history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (Some(messages), Some((lease, provider))) = (history, selected) else {
+        return false;
+    };
+    if !completed {
+        return false;
+    }
+    let Some(messages) = turn_start.and_then(|start| terminal_capture_messages(&messages, start))
+    else {
+        return false;
+    };
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state
+        .capture_lease_at(std::time::SystemTime::now())
+        .as_ref()
+        != Some(&lease)
+    {
+        return false;
+    }
+    memory_capture_worker()
+        .submit_terminal(
+            &lease,
+            terminal_capture_history(&lease, messages, started_at),
+            memory_context::RetentionClass::Standard,
+            provider,
+        )
+        .unwrap_or(false)
+}
+
 /// Idle timeout for the runtime HTTP client: how long a request may go
 /// without receiving *any* bytes (headers or body chunks) before it is
 /// killed. Resets on every received chunk, so healthy long-running streams
@@ -862,6 +989,11 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            // DARK defaults: legacy memory backend, continuation off (JR #112).
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_backend_config: None,
+            memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
             pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
@@ -2131,6 +2263,73 @@ impl Runtime {
             .map_or(0, |manager| manager.lease_count())
     }
 
+    /// Inherit storage authority only, with a fresh worker execution author.
+    /// Oneshot, start, and resume share this path; even resume must not reuse
+    /// a prior actor. Off/no-lease context state and tool grants stay untouched.
+    #[allow(dead_code)] // merge(112): consumed in phase 5
+    pub(crate) fn inherit_memory_backend(&mut self, binding: crate::memory_backend::MemoryBinding) {
+        self.memory_backend = binding.fork_for_worker();
+    }
+
+    /// Bind standalone host entry points without applying unrelated settings.
+    pub fn apply_memory_backend_config(&mut self, config: &crate::config::MemoryBackendConfig) {
+        if let Some(selected) = &self.memory_backend_config {
+            if selected != config {
+                self.memory_backend_reconfigure_denied
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!("memory backend change denied: live extension processes cannot be reconfigured at runtime; original binding retained; restart required");
+                self.memory_context_disable();
+                self.clear_memory_contribution();
+            }
+            return;
+        }
+        if config.kind != crate::config::MemoryBackendKind::Legacy {
+            self.memory_context_disable();
+        }
+        // TODO(session-identity T1/§4): must take session cwd under the daemon
+        self.memory_backend = crate::memory_backend::MemoryBinding::from_config(config);
+        self.memory_backend_config = Some(config.clone());
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // merge(112): consumed in phase 5
+    pub(crate) fn memory_backend_for_test(&self) -> crate::memory_backend::MemoryBinding {
+        self.memory_backend.clone()
+    }
+
+    /// True when legacy note/history/provider access is forbidden by the host
+    /// selection, including invalid or unavailable backend configuration.
+    pub fn memory_backend_exclusive(&self) -> bool {
+        self.memory_backend.exclusive()
+    }
+
+    fn memory_context_project_id(&self) -> memory_context::ProjectId {
+        if self.memory_backend.exclusive() {
+            self.memory_backend
+                .scope()
+                .ok()
+                .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
+                .unwrap_or_else(|| {
+                    memory_context::ProjectId::parse("project-unresolved").expect("static id")
+                })
+        } else {
+            memory_project_id()
+        }
+    }
+
+    pub fn memory_tool_capability(&self) -> Option<memory_context::MemoryContextCapability> {
+        if !self.memory_backend.exclusive() {
+            return None;
+        }
+        let runtime = self.clone();
+        Some(memory_context::MemoryContextCapability::control_only(
+            self.memory_context_state.clone(),
+            self.memory_context_project_id(),
+            memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID).expect("static id"),
+            Arc::new(move || runtime.memory_context_disable()),
+        ))
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     /// Includes the `disabled_tools` pass on this runtime's registry — the
     /// fresh-`Runtime::new()` path, where the registry holds builtins only.
@@ -2149,6 +2348,21 @@ impl Runtime {
     }
 
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
+        // JR #112: apply memory backend config early (binding is immutable once set).
+        self.apply_memory_backend_config(&config.memory_backend);
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Unavailable selections revoke grants; never retain an extension escape hatch.
+            self.memory_context_disable();
+            self.clear_memory_contribution();
+            *self
+                .retained_recall_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
@@ -2170,6 +2384,10 @@ impl Runtime {
             );
         }
         self.context_window_override = config.context_window;
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config = config.context_management;
         self.compaction_model = config.compaction_model.clone();
         self.compaction_mode = config.compaction_mode;
         self.compaction_exclusions = config.compaction_exclude.clone();
@@ -3122,6 +3340,17 @@ impl Runtime {
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
+        if self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+        {
+            return Err(RuntimeError::Session(
+                "context head save is unresolved; reload the session before further inference"
+                    .into(),
+            ));
+        }
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         // Refresh OAuth token if expired only after capability preflight.
@@ -3230,7 +3459,7 @@ impl Runtime {
                         (tool_use["name"].as_str(), tool_use["id"].as_str())
                     {
                         let input = &tool_use["input"];
-                        let result = match self.tools.read().await.get(tool_name).cloned() {
+                        let (result, rich_blocks) = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
                                 let input = self
                                     .tools
@@ -3249,6 +3478,7 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        memory_backend: Some(self.memory_backend.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -3265,7 +3495,7 @@ impl Runtime {
                                         tool_activation: None,
                                         mcp_leases: None,
                                         extension_leases: None,
-                                        memory_context: None,
+                                        memory_context: self.memory_tool_capability(),
                                         cwd: self.cwd.clone(),
                                         env: self.env.clone(),
                                         env_stripped: self.env_stripped.clone(),
@@ -3294,36 +3524,37 @@ impl Runtime {
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
-                                    format!("Tool call blocked by extension: {}", reason)
+                                    (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
                                     else {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
-                                    let output = match tool.execute(input, ctx).await {
-                                        Ok(output) => output,
-                                        Err(e) => e.to_string(),
+                                    let (output, rich_blocks) = match tool.execute_rich(input, ctx).await {
+                                        Ok(output) => validated_single_tool_output(&self.model, output),
+                                        Err(e) => (e.to_string(), None),
                                     };
-                                    let output = emit_after_tool_call(
+                                    let hooked_output = emit_after_tool_call(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
-                                        output,
+                                        output.clone(),
                                         self.max_tool_output,
                                         self.session_id.as_deref(),
                                     )
                                     .await;
-                                    output
+                                    let rich_blocks = retain_single_tool_blocks(rich_blocks, &output, &hooked_output);
+                                    (hooked_output, rich_blocks)
                                 }
                             }
-                            None => format!("Unknown tool: {}", tool_name),
+                            None => (format!("Unknown tool: {}", tool_name), None),
                         };
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
+                            "content": single_tool_result_content(&result, rich_blocks, self.max_tool_output)
                         }));
                     }
                 } else {
@@ -3368,12 +3599,15 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let orchestration_inner = cfg_orchestration.clone();
+                            let memory_backend_inner = self.memory_backend.clone();
+                            let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
                             let env_inner = cfg_env.clone();
                             let env_stripped_inner = self.env_stripped.clone();
                             let env_warned_inner = self.env_warned.clone();
                             let session_id_inner = cfg_session_id.clone();
+                            let attachment_model = self.model.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -3399,7 +3633,7 @@ impl Runtime {
                                             reason,
                                         } = decision
                                         {
-                                            format!("Tool call blocked by extension: {}", reason)
+                                            (format!("Tool call blocked by extension: {}", reason), None)
                                         } else {
                                             let crate::runtime::BeforeToolCallDecision::Continue {
                                                 input,
@@ -3413,6 +3647,7 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    memory_backend: Some(memory_backend_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
@@ -3425,7 +3660,7 @@ impl Runtime {
                                                     tool_activation: None,
                                                     mcp_leases: None,
                                                     extension_leases: None,
-                                                    memory_context: None,
+                                                    memory_context: memory_context_inner,
                                                     cwd: cwd_inner,
                                                     env: env_inner,
                                                     env_stripped: env_stripped_inner,
@@ -3440,24 +3675,34 @@ impl Runtime {
                                                 },
                                             };
                                             let input_for_hook = input.clone();
-                                            let output = match t.execute(input, ctx).await {
-                                                Ok(output) => output,
-                                                Err(e) => e.to_string(),
-                                            };
-                                            let output = crate::runtime::emit_after_tool_call(
-                                                &hook_bus_inner,
-                                                &tool_name_for_hook,
-                                                Some(&runtime_name_for_hook),
-                                                input_for_hook,
-                                                output,
-                                                cfg_max_tool_output,
-                                                session_id_inner.as_deref(),
-                                            )
-                                            .await;
-                                            output
+                                            let (output, rich_blocks) =
+                                                match t.execute_rich(input, ctx).await {
+                                                    Ok(output) => validated_single_tool_output(
+                                                        &attachment_model,
+                                                        output,
+                                                    ),
+                                                    Err(e) => (e.to_string(), None),
+                                                };
+                                            let hooked_output =
+                                                crate::runtime::emit_after_tool_call(
+                                                    &hook_bus_inner,
+                                                    &tool_name_for_hook,
+                                                    Some(&runtime_name_for_hook),
+                                                    input_for_hook,
+                                                    output.clone(),
+                                                    cfg_max_tool_output,
+                                                    session_id_inner.as_deref(),
+                                                )
+                                                .await;
+                                            let rich_blocks = retain_single_tool_blocks(
+                                                rich_blocks,
+                                                &output,
+                                                &hooked_output,
+                                            );
+                                            (hooked_output, rich_blocks)
                                         }
                                     }
-                                    None => format!("Unknown tool: {}", tool_name),
+                                    None => (format!("Unknown tool: {}", tool_name), None),
                                 };
                                 (tool_id, result)
                             });
@@ -3481,13 +3726,13 @@ impl Runtime {
                     // Build tool_results in original order — every tool_use MUST have a result
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            let result = results_map.remove(tool_id).unwrap_or_else(|| {
-                                "Tool execution failed: task panicked".to_string()
+                            let (result, rich_blocks) = results_map.remove(tool_id).unwrap_or_else(|| {
+                                ("Tool execution failed: task panicked".to_string(), None)
                             });
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
+                                "content": single_tool_result_content(&result, rich_blocks, self.max_tool_output)
                             }));
                         }
                     }
@@ -3548,6 +3793,23 @@ impl Runtime {
         // One correlation ID per turn: carried by the typed terminal outcome
         // (spec §5.2) so every frontend can tie the failure to trace lines.
         let turn_correlation_id = agent_core::next_turn_correlation_id();
+
+        if self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+        {
+            let error = RuntimeError::Session(
+                "context head save is unresolved; reload the session before further inference"
+                    .into(),
+            );
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&error, &turn_correlation_id),
+            )));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
+        }
 
         if let Err(error) = self.validate_request_preflight().await {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
@@ -3770,6 +4032,7 @@ impl Clone for Runtime {
             explicit_reasoning: self.explicit_reasoning,
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
+            continuation: Arc::clone(&self.continuation),
             compaction_model: self.compaction_model.clone(),
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),
@@ -3797,6 +4060,9 @@ impl Clone for Runtime {
             // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
             // they always start Off/no-lease (task A5 invariant).
             memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            memory_backend: self.memory_backend.clone(),
+            memory_backend_config: self.memory_backend_config.clone(),
+            memory_backend_reconfigure_denied: Arc::clone(&self.memory_backend_reconfigure_denied),
             pending_history_import_preview: std::sync::Arc::clone(
                 &self.pending_history_import_preview,
             ),
