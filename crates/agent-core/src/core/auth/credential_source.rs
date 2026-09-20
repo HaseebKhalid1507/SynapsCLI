@@ -248,6 +248,9 @@ pub enum TokenFetchError {
     InvalidAccount,
     /// Fetcher/broker cannot address named slots.
     UnsupportedAccount,
+    /// Broker served a token for a different slot than the one requested
+    /// (or, for a named slot, did not say which). Never cached.
+    AccountMismatch,
     /// Any other HTTP status.
     Http(u16),
     /// Transport or response-shape failure (message already secret-free).
@@ -261,6 +264,10 @@ impl std::fmt::Display for TokenFetchError {
             Self::UnknownAccount => write!(f, "broker reports unknown account (404)"),
             Self::InvalidAccount => write!(f, "broker rejected account label (400)"),
             Self::UnsupportedAccount => write!(f, "named accounts are not supported by this fetcher"),
+            Self::AccountMismatch => write!(
+                f,
+                "broker served a token for a different account than requested (broker too old for named accounts?)"
+            ),
             Self::Http(status) => write!(f, "broker returned HTTP {status}"),
             Self::Other(msg) => f.write_str(msg),
         }
@@ -283,6 +290,10 @@ impl TokenFetchError {
                 provider: cred.provider.as_str().to_string(),
                 label: cred.account.label_str().to_string(),
             },
+            Self::AccountMismatch => BrokerError::Transport(format!(
+                "broker served a token for a different account than '{}' (no fallback)",
+                cred
+            )),
             Self::Http(status) => BrokerError::Transport(format!("broker returned HTTP {status}")),
             Self::Other(msg) => BrokerError::Transport(msg),
         }
@@ -364,6 +375,12 @@ pub async fn resolve_remote_credential<F: TokenFetcher>(
                 return Ok(tok);
             }
             Err(e)
+        }
+        Err(rejected @ TokenFetchError::AccountMismatch) => {
+            // Wrong slot served: never serve a cached token for a slot the
+            // broker no longer honours; the caller sees the mismatch.
+            cache.invalidate_credential(scope, cred);
+            Err(rejected)
         }
         Err(rejected) => {
             // The broker positively rejected this credential/principal: a
@@ -463,8 +480,17 @@ impl BrokerClient {
         source_scope(&self.endpoint, &self.machine_token)
     }
 
-    /// `GET /token?provider=X[&account=Y]`. The `account` parameter is sent
-    /// only for named slots so older brokers keep serving the default slot.
+    /// `GET /token?provider=X[&account=Y]`.
+    ///
+    /// `account: None` is the legacy, policy-free call (`fetch_token`): the
+    /// broker host applies its own policy and the result is cached under the
+    /// bare provider key. `Some(slot)` is an EXPLICIT slot (including
+    /// `default`): the parameter is always sent, and the response must name
+    /// that same slot — a broker serving another slot (or an old broker that
+    /// ignores the parameter and says nothing) is rejected for named slots and
+    /// never cached under the requested key. An absent `account` is tolerated
+    /// only for `default`, because pre-multi-account brokers always served the
+    /// bare provider slot.
     async fn fetch_token_query(
         &self,
         provider: &str,
@@ -491,10 +517,31 @@ impl BrokerClient {
             s if !status.is_success() => return Err(TokenFetchError::Http(s)),
             _ => {}
         }
-        let mut tok = resp
-            .json::<BrokerToken>()
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            access_token: String,
+            expires: u64,
+            #[serde(default)]
+            ttl_ms: Option<u64>,
+            #[serde(default)]
+            account: Option<String>,
+        }
+        let wire = resp
+            .json::<Wire>()
             .await
             .map_err(|e| TokenFetchError::Other(format!("invalid broker token response: {e}")))?;
+        if let Some(requested) = account {
+            match wire.account.as_deref() {
+                Some(served) if served == requested => {}
+                None if requested == super::account::DEFAULT_ACCOUNT_NAME => {}
+                _ => return Err(TokenFetchError::AccountMismatch),
+            }
+        }
+        let mut tok = BrokerToken {
+            access_token: wire.access_token,
+            expires: wire.expires,
+            ttl_ms: wire.ttl_ms,
+        };
         // C3: prefer the broker's relative TTL over its absolute clock.
         if let Some(ttl) = tok.ttl_ms {
             tok.expires = now_millis().saturating_add(ttl);
@@ -523,11 +570,11 @@ impl TokenFetcher for BrokerClient {
     }
 
     async fn fetch_credential(&self, cred: &CredentialRef) -> Result<BrokerToken, TokenFetchError> {
-        let account = match &cred.account {
-            Account::Default => None,
-            Account::Named(label) => Some(label.as_str()),
-        };
-        self.fetch_token_query(cred.provider.as_str(), account).await
+        // Explicit slot — ALWAYS sent, including `default`, so the broker
+        // host's own policy (which may point at a named or `auto` slot) can
+        // never be cached under this client's `default` key.
+        self.fetch_token_query(cred.provider.as_str(), Some(cred.account.label_str()))
+            .await
     }
 }
 
