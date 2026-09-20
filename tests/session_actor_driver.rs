@@ -560,3 +560,210 @@ async fn event_wake_inhibited_while_armed() {
     assert!(matches!(ev, SessionEventWire::DriverRevoked { .. }));
     actor.end().await;
 }
+
+// ── P6 submit routing tests ────────────────────────────────────────────────
+
+/// While the driver is armed and idle (not streaming), a Submit should
+/// queue to the steering FIFO instead of starting a normal turn.
+#[tokio::test]
+async fn submit_while_armed_idle_queues_steering() {
+    let (host, _temp) = host_with_plugin().await;
+    let mut actor = session(&host).await;
+    actor.arm().await;
+
+    // Submit while armed + idle → should go to steering, not TurnStarted.
+    actor
+        .send(SessionCommand::Submit {
+            text: "steer me".into(), attachments: vec![],
+        })
+        .await;
+    let ev = actor
+        .until(|e| {
+            matches!(
+                e,
+                SessionEventWire::Steered { .. } | SessionEventWire::TurnStarted { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(ev, SessionEventWire::Steered { .. }),
+        "expected Steered, got: {ev:?}"
+    );
+
+    // Cancel and verify undelivered steering comes back.
+    actor.send(SessionCommand::Cancel).await;
+    let ev = actor
+        .until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))
+        .await;
+    match ev {
+        SessionEventWire::DriverRevoked {
+            undelivered_steering,
+            ..
+        } => {
+            assert!(
+                undelivered_steering.iter().any(|s| s.contains("steer me")),
+                "expected undelivered steering, got: {undelivered_steering:?}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    actor.end().await;
+}
+
+/// Submit while unarmed is a normal turn.
+#[tokio::test]
+async fn unarmed_submit_is_a_normal_turn() {
+    let host = host().await;
+    let mut actor = session(&host).await;
+
+    actor
+        .send(SessionCommand::Submit {
+            text: "hello".into(), attachments: vec![],
+        })
+        .await;
+    let ev = actor
+        .until(|e| {
+            matches!(
+                e,
+                SessionEventWire::TurnStarted { .. } | SessionEventWire::SystemNotice(_)
+            )
+        })
+        .await;
+    // Without driver, submit should start a normal turn.
+    assert!(
+        matches!(
+            ev,
+            SessionEventWire::TurnStarted { .. } | SessionEventWire::SystemNotice(_)
+        ),
+        "expected TurnStarted, got: {ev:?}"
+    );
+    // Cancel the turn.
+    actor.send(SessionCommand::Cancel).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor.until(|e| matches!(e, SessionEventWire::Idle))).await;
+    actor.end().await;
+}
+
+/// The steering FIFO has a 16 message cap.
+#[tokio::test]
+async fn steering_fifo_16_msg_cap() {
+    let (host, _temp) = host_with_plugin().await;
+    let mut actor = session(&host).await;
+    actor.arm().await;
+
+    // Queue 16 messages (at the cap).
+    for i in 0..16 {
+        actor
+            .send(SessionCommand::Submit {
+                text: format!("msg-{i}"),
+                attachments: vec![],
+            })
+            .await;
+        let _ = actor
+            .until(|e| matches!(e, SessionEventWire::Steered { .. }))
+            .await;
+    }
+
+    // 17th should be refused.
+    actor
+        .send(SessionCommand::Submit {
+            text: "overflow".into(), attachments: vec![],
+        })
+        .await;
+    let ev = actor
+        .until(|e| matches!(e, SessionEventWire::SystemNotice(_)))
+        .await;
+    match ev {
+        SessionEventWire::SystemNotice(msg) => {
+            assert!(
+                msg.contains("full") || msg.contains("16"),
+                "expected cap notice, got: {msg}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    actor.send(SessionCommand::Cancel).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), actor.until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))).await;
+    actor.end().await;
+}
+
+/// The steering FIFO has a 256 KiB byte cap (UTF-8 byte count).
+#[tokio::test]
+async fn steering_fifo_256kib_cap_counts_utf8_bytes() {
+    let (host, _temp) = host_with_plugin().await;
+    let mut actor = session(&host).await;
+    actor.arm().await;
+
+    // Send a message just under 256 KiB.
+    let big = "x".repeat(200 * 1024);
+    actor
+        .send(SessionCommand::Submit { text: big, attachments: vec![] })
+        .await;
+    let _ = actor
+        .until(|e| matches!(e, SessionEventWire::Steered { .. }))
+        .await;
+
+    // Second message that crosses the 256 KiB total.
+    let big2 = "y".repeat(100 * 1024);
+    actor
+        .send(SessionCommand::Submit { text: big2, attachments: vec![] })
+        .await;
+    let ev = actor
+        .until(|e| matches!(e, SessionEventWire::SystemNotice(_)))
+        .await;
+    match ev {
+        SessionEventWire::SystemNotice(msg) => {
+            assert!(
+                msg.contains("full") || msg.contains("256"),
+                "expected byte cap notice, got: {msg}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    actor.send(SessionCommand::Cancel).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), actor.until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))).await;
+    actor.end().await;
+}
+
+/// Revocation returns undelivered steering.
+#[tokio::test]
+async fn revocation_restores_undelivered_steering() {
+    let (host, _temp) = host_with_plugin().await;
+    let mut actor = session(&host).await;
+    actor.arm().await;
+
+    // Queue some steering.
+    actor
+        .send(SessionCommand::Submit {
+            text: "first".into(), attachments: vec![],
+        })
+        .await;
+    let _ = actor
+        .until(|e| matches!(e, SessionEventWire::Steered { .. }))
+        .await;
+    actor
+        .send(SessionCommand::Submit {
+            text: "second".into(), attachments: vec![],
+        })
+        .await;
+    let _ = actor
+        .until(|e| matches!(e, SessionEventWire::Steered { .. }))
+        .await;
+
+    // Cancel → DriverRevoked should carry undelivered steering.
+    actor.send(SessionCommand::Cancel).await;
+    let ev = actor
+        .until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))
+        .await;
+    match ev {
+        SessionEventWire::DriverRevoked {
+            undelivered_steering,
+            ..
+        } => {
+            assert_eq!(undelivered_steering.len(), 2);
+            assert_eq!(undelivered_steering[0], "first");
+            assert_eq!(undelivered_steering[1], "second");
+        }
+        _ => unreachable!(),
+    }
+    actor.end().await;
+}

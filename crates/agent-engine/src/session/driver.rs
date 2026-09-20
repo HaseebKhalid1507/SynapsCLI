@@ -53,6 +53,7 @@ pub(crate) struct DriverPending {
 pub(crate) enum TaskResult {
     Command {
         owner: String,
+        #[allow(dead_code)] // stored for diagnostics, matched as `_`
         command: String,
         handler: Arc<dyn ExtensionHandler>,
         handler_generation: Option<u64>,
@@ -77,6 +78,7 @@ pub(crate) struct DriverState {
     pub cancel: CancellationToken,
     pub workers: Workers,
     pub worker_epoch: u64,
+    #[allow(dead_code)] // consumed by P7 deadline enforcement
     pub deadline_task: Option<Task<()>>,
     pub proposal: Option<Scheduled>,
     pub selection: Selection,
@@ -89,6 +91,7 @@ pub(crate) struct DriverState {
     /// / 256 KiB total UTF-8 bytes (§2).
     pub steering: VecDeque<String>,
     pub auto_wakes_blocked: bool,
+    #[allow(dead_code)] // consumed by P7 cost gate
     pub cost_at_arm: f64,
 }
 
@@ -101,8 +104,8 @@ impl Drop for DriverState {
 
 // ── Steering bounds ─────────────────────────────────────────────────────────
 
-const STEERING_MAX_MESSAGES: usize = 16;
-const STEERING_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const STEERING_MAX_MESSAGES: usize = 16;
+pub(crate) const STEERING_MAX_BYTES: usize = 256 * 1024;
 
 // ── Lifecycle helpers ───────────────────────────────────────────────────────
 

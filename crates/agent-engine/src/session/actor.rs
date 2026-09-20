@@ -1907,7 +1907,51 @@ impl SessionActor {
         }
         if self.streaming {
             // A Submit while streaming is what the TUI calls StreamingInput.
+            // P6: if the driver is armed and streaming, steer AND update
+            // the driver's steering FIFO.
+            if let Some(driver) = self.driver.as_mut() {
+                let byte_total: usize = driver.steering.iter().map(|s| s.len()).sum();
+                if driver.steering.len() >= super::driver::STEERING_MAX_MESSAGES {
+                    self.emit(SessionEventWire::SystemNotice(
+                        "steering queue full (16 messages) — message dropped".into(),
+                    ));
+                    return;
+                }
+                if byte_total + text.len() > super::driver::STEERING_MAX_BYTES {
+                    self.emit(SessionEventWire::SystemNotice(
+                        "steering queue full (256 KiB) — message dropped".into(),
+                    ));
+                    return;
+                }
+                driver.steering.push_back(text.clone());
+            }
             self.steer(text);
+            return;
+        }
+        // P6: while the driver is armed and idle, route to steering FIFO
+        // instead of starting a normal turn.
+        if self.driver.is_some() {
+            let driver = self.driver.as_mut().unwrap();
+            let byte_total: usize = driver.steering.iter().map(|s| s.len()).sum();
+            if driver.steering.len() >= super::driver::STEERING_MAX_MESSAGES {
+                self.emit(SessionEventWire::SystemNotice(
+                    "steering queue full (16 messages) — message dropped".into(),
+                ));
+                return;
+            }
+            if byte_total + text.len() > super::driver::STEERING_MAX_BYTES {
+                self.emit(SessionEventWire::SystemNotice(
+                    "steering queue full (256 KiB) — message dropped".into(),
+                ));
+                return;
+            }
+            driver.steering.push_back(text.clone());
+            // Clear auto_wakes_blocked on explicit user submit (user takeover).
+            driver.auto_wakes_blocked = false;
+            self.emit(SessionEventWire::Steered {
+                text,
+                delivered: false,
+            });
             return;
         }
         if self.compact.is_some() {
@@ -2314,8 +2358,7 @@ impl SessionActor {
             };
             // Emit DriverTurnOutcome if an outcome was just set.
             if let Some(driver) = self.driver.as_ref() {
-                if driver.outcome.is_some() {
-                    let (outcome, _) = driver.outcome.as_ref().unwrap();
+                if let Some((outcome, _)) = &driver.outcome {
                     self.emit(SessionEventWire::DriverTurnOutcome {
                         outcome: *outcome,
                         selection: driver.selection.clone(),
