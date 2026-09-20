@@ -42,3 +42,15 @@ cargo check on bella failed with Permission denied on ~/.cargo/git/db for the
 axel/axel-memkoshi git deps (private repo). DARK: memory.backend=legacy default
 never spawns it. Sidecar binary located via config.executable or
 <current_exe_dir>/synaps-axel-memory-service.
+
+## Phase 9 — Wall 1: actor-owned context-head checkpoint persistence
+| commit | da74f413 |
+|--------|----------|
+| files  | `crates/agent-engine/src/engine/session.rs`, `crates/agent-engine/src/session/actor.rs` |
+| source | 8bdabd4a |
+| check  | ✅ `cargo check --workspace --all-targets --locked` |
+| engine | ✅ 2024 pass, 1 known (`static_table_and_wire_shape…`) |
+| core   | ✅ 732+ pass |
+| workspace | ✅ no new failures (known: autonomous_plugin, extensions_contract, shared_memory_migration, sidecar_manager_protocol, tools_export, memory_context_e2e, continuous_memory_adversarial, TUI lib) |
+| clippy | ✅ `-D warnings` clean (synaps-engine, synaps) |
+| two-sided | ✅ no conflict markers |

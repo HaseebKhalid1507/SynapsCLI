@@ -7,10 +7,83 @@ use crate::pricing::calculate_cost_optional_split;
 use crate::SharedMessage;
 use crate::{Runtime, Session};
 
+/// Session-scoped durability barrier state, shared by persistent frontends.
+/// A failed (or dropped in-flight) publication requires explicit reload/new
+/// session before saving or scheduling more inference. Never rollback-save an
+/// old head: `save_durable` can fail after publishing its replacement.
+#[derive(Default)]
+pub struct ContextHeadPersistence {
+    blocked_session: Option<String>,
+}
+
+impl ContextHeadPersistence {
+    pub fn is_blocked(&self, session: &Session) -> bool {
+        self.blocked_session.as_deref() == Some(session.id.as_str())
+    }
+
+    /// Candidate metadata must come from the host's current session, never
+    /// from message content. The event supplies only identity and messages.
+    pub async fn persist(
+        &mut self,
+        session: &mut Session,
+        messages: &mut Vec<SharedMessage>,
+        session_id: &str,
+        candidate: Session,
+    ) -> std::io::Result<()> {
+        self.persist_with(
+            session,
+            messages,
+            session_id,
+            candidate,
+            |candidate| async move { candidate.save_durable().await },
+        )
+        .await
+    }
+
+    async fn persist_with<F, Fut>(
+        &mut self,
+        session: &mut Session,
+        messages: &mut Vec<SharedMessage>,
+        session_id: &str,
+        candidate: Session,
+        save: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(Session) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<()>>,
+    {
+        if self.is_blocked(session) {
+            return Err(std::io::Error::other(
+                "context head is unverified; reload the session before continuing",
+            ));
+        }
+        // Latch before any await, including on identity rejection. Dropping
+        // this future cannot authorize a later ordinary save of the old head.
+        self.blocked_session = Some(session.id.clone());
+        if session_id != session.id || candidate.id != session.id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "context head checkpoint does not match the current session",
+            ));
+        }
+        let result = save(candidate.clone()).await;
+        // Success adopts the durable head. An attempted-save error adopts it
+        // ONLY as conservative recovery state (not a successful commit): a
+        // rename may already have happened. The latch remains set, so neither
+        // post-turn saves nor automatic inference can act on this ambiguity.
+        *messages = candidate.api_messages.clone();
+        *session = candidate;
+        if result.is_ok() {
+            self.blocked_session = None;
+        }
+        result
+    }
+}
+
 /// Conversation state tracked by the engine.
-#[derive(Clone)]
 pub struct ConversationState {
     pub session: Session,
+    pub context_head: ContextHeadPersistence,
     pub api_messages: Vec<SharedMessage>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -29,6 +102,7 @@ impl ConversationState {
     pub fn new(session: Session) -> Self {
         Self {
             session,
+            context_head: ContextHeadPersistence::default(),
             api_messages: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -54,12 +128,13 @@ impl ConversationState {
             queued_message: None,
             pending_events: Vec::new(),
             session,
+            context_head: ContextHeadPersistence::default(),
         }
     }
 
     /// Save the current conversation state to disk.
     pub async fn save(&mut self) {
-        if self.api_messages.is_empty() {
+        if self.context_head.is_blocked(&self.session) || self.api_messages.is_empty() {
             return;
         }
         self.session.api_messages = self.api_messages.clone();
@@ -74,9 +149,36 @@ impl ConversationState {
         }
     }
 
+    /// Persist a runtime-requested head using host metadata and latest usage.
+    /// The caller completes the receipt with this exact result and continues
+    /// consuming the runtime's typed terminal error on failure.
+    pub async fn persist_context_head(
+        &mut self,
+        session_id: &str,
+        messages: Vec<SharedMessage>,
+    ) -> std::io::Result<()> {
+        let mut candidate = self.session.clone();
+        candidate.api_messages = messages;
+        candidate.total_input_tokens = self.total_input_tokens;
+        candidate.total_output_tokens = self.total_output_tokens;
+        candidate.session_cost = self.session_cost;
+        candidate.abort_context = self.abort_context.clone();
+        candidate.updated_at = chrono::Utc::now();
+        candidate.auto_title();
+        self.context_head
+            .persist(
+                &mut self.session,
+                &mut self.api_messages,
+                session_id,
+                candidate,
+            )
+            .await
+    }
+
     /// Clear the current session and start fresh.
     pub async fn clear(&mut self, runtime: &Runtime) {
         self.save().await;
+        self.context_head = ContextHeadPersistence::default();
         self.api_messages.clear();
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
@@ -91,6 +193,7 @@ impl ConversationState {
             runtime.thinking_level(),
             runtime.system_prompt(),
         );
+        runtime.reset_context_continuation(&self.session.id, &[]);
     }
 
     /// Serializable mirror for clients (`SessionEventWire::Conversation`).
