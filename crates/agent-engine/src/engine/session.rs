@@ -11,7 +11,7 @@ use crate::{Runtime, Session};
 /// A failed (or dropped in-flight) publication requires explicit reload/new
 /// session before saving or scheduling more inference. Never rollback-save an
 /// old head: `save_durable` can fail after publishing its replacement.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct ContextHeadPersistence {
     blocked_session: Option<String>,
 }
@@ -81,7 +81,6 @@ impl ContextHeadPersistence {
 }
 
 /// Conversation state tracked by the engine.
-#[derive(Clone)]
 pub struct ConversationState {
     pub session: Session,
     pub context_head: ContextHeadPersistence,
