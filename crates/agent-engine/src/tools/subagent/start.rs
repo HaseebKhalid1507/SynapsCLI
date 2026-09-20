@@ -202,7 +202,7 @@ impl Tool for SubagentStartTool {
         .with_authorization(&decision);
         {
             let mut reg = registry.lock().unwrap();
-            reg.register(handle);
+            reg.register_with_cancellation(handle, ctx.capabilities.launch_cancel.as_ref());
         }
 
         let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();

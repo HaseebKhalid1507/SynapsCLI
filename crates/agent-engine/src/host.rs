@@ -264,7 +264,17 @@ impl EngineHost {
     /// `disabled_tools` is NOT re-applied: `boot()` did it once on the fresh
     /// registry, before skills/MCP registered, exactly where the old boot did.
     pub async fn foreground_runtime(&self) -> Result<Runtime> {
+        self.foreground_runtime_for(None).await
+    }
+
+    /// `foreground_runtime()` for a session whose cwd is not the process cwd
+    /// (daemon-hosted sessions). The cwd is set BEFORE `apply_config` so the
+    /// memory binding (`apply_memory_backend_config`, one-shot) scopes to the
+    /// session's project, not the daemon's — A-engine-merge §4. `None` =
+    /// process cwd, byte-identical to `foreground_runtime()`.
+    pub async fn foreground_runtime_for(&self, cwd: Option<std::path::PathBuf>) -> Result<Runtime> {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(self.parts.clone()));
+        runtime.set_cwd(cwd);
         runtime.apply_config_keep_tools(&self.config());
         Ok(runtime)
     }

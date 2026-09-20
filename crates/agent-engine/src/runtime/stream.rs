@@ -401,6 +401,16 @@ impl StreamMethods {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .update_advisory(None);
         }
+        // DARK (§7): the project forum lives in the Axel backend. Under the
+        // legacy backend every forum_* call errors in `require_forum`, so do
+        // not spend catalog tokens advertising tools the model can never use.
+        if !memory_backend.is_axel() {
+            prepare_or_cancel!(tools.write()).disable(&[
+                "forum_post".into(),
+                "forum_read".into(),
+                "forum_forget".into(),
+            ]);
+        }
         let system_prompt = if context_enabled {
             Some(format!(
                 "{}\n\n{}",
@@ -1326,7 +1336,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: None, memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -1664,7 +1674,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: None, memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks, errored) = match res {
@@ -2890,6 +2900,36 @@ mod rich_output_tests {
             .filter(|m| m["content"][0]["content"][1]["type"] == "image")
             .count();
         assert_eq!(images_in_history, 7);
+    }
+
+    /// DARK (§7): with the default (legacy) memory backend the forum_* tools
+    /// must not be advertised to the model — they can only error. The default
+    /// registry carries them; the per-turn gate in `run_stream_internal`
+    /// removes them from the request's tool list.
+    #[tokio::test]
+    async fn legacy_backend_does_not_advertise_forum_tools() {
+        let d = drive(
+            vec![
+                Arc::new(crate::tools::forum::ForumPostTool),
+                Arc::new(crate::tools::forum::ForumReadTool),
+                Arc::new(crate::tools::forum::ForumForgetTool),
+                Arc::new(crate::tools::bash::BashTool),
+            ],
+            &[("bash", r#"{"command":"true"}"#)],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let names: Vec<String> = d.bodies[0]["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(names.iter().any(|n| n == "bash"), "bash must be advertised: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("forum_")),
+            "forum tools must be hidden under the legacy backend: {names:?}"
+        );
     }
 
     #[test]

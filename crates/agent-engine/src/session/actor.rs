@@ -388,7 +388,9 @@ impl SessionActor {
         host: &Arc<EngineHost>,
         mut cfg: SessionConfig,
     ) -> Result<(SessionHandle, SessionTask)> {
-        let mut runtime = host.foreground_runtime().await?;
+        // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
+        // one-shot memory binding scopes to the session's project (§4).
+        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
@@ -909,7 +911,8 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            let mut runtime = host.foreground_runtime().await?;
+            // §4: cwd before apply_config — see `create`.
+            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
@@ -1065,6 +1068,17 @@ impl SessionActor {
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
     pub(crate) async fn submit(&mut self, text: String) {
+        // Wall 1 defense-in-depth: a latched (unverified) context head must
+        // not accept new inference. The stream would refuse via
+        // `durability_blocked` anyway, but that leaves the user message
+        // orphaned in history; refuse here, before it is pushed.
+        if self.conv.context_head.is_blocked(&self.conv.session) {
+            self.emit(SessionEventWire::SystemNotice(
+                "context head is unverified after a failed checkpoint; reload the session                  (`--continue`) or start a new one before continuing"
+                    .into(),
+            ));
+            return;
+        }
         if self.streaming {
             // A Submit while streaming is what the TUI calls StreamingInput.
             self.steer(text);
