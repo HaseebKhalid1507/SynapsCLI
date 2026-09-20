@@ -1049,6 +1049,22 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.driver.choices, plugin.defaults())
         self.assertEqual([p.name for p in self.root.iterdir()], ["prefs.json"])
 
+    def test_poll_accepts_session_id_field(self):
+        """session_id is an optional additive field; the plugin must not reject it."""
+        self.start()
+        req = poll_request(self.driver, session_id="test-session-42")
+        result = send_poll(self.driver, req)
+        # Must not error — any action is acceptable.
+        self.assertIn(result["action"], ("next", "stop"))
+
+    def test_poll_without_session_id_still_works(self):
+        """Backward compat: old hosts that omit session_id must still work."""
+        self.start()
+        req = poll_request(self.driver)
+        self.assertNotIn("session_id", req)
+        result = send_poll(self.driver, req)
+        self.assertIn(result["action"], ("next", "stop"))
+
 
 class WireTests(unittest.TestCase):
     def setUp(self):

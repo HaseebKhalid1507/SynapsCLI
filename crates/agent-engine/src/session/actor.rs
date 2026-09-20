@@ -311,6 +311,7 @@ fn is_input_command(cmd: &SessionCommand) -> bool {
             | SessionCommand::PluginCommand { .. }
             | SessionCommand::Resume { .. }
             | SessionCommand::KeepWarm { .. }
+            | SessionCommand::DriverStart { .. }
             | SessionCommand::End {
                 reason: EndReason::ClientQuit
             }
@@ -340,6 +341,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::KeepWarm { .. } => "keep_warm",
         SessionCommand::Park => "park",
         SessionCommand::HostEvent(_) => "host_event",
+        SessionCommand::DriverStart { .. } => "driver_start",
     }
 }
 
@@ -2243,6 +2245,12 @@ impl SessionActor {
                 }),
                 HostEvent::LoaderProgress(ev) => self.emit(SessionEventWire::LoaderProgress(ev)),
             },
+            // E-P0: stub — P3 implements the full DriverStart handler.
+            SessionCommand::DriverStart { .. } => {
+                self.emit(SessionEventWire::SystemNotice(
+                    "driver commands are not yet implemented".into(),
+                ));
+            }
         }
         ControlFlow::Continue(())
     }

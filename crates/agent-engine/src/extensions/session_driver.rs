@@ -63,7 +63,7 @@ fn deserialize_context_mode<'de, D: serde::Deserializer<'de>>(
     ContextMode::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     Start {
@@ -87,6 +87,11 @@ pub enum Reply {
         context_mode: Option<ContextMode>,
         #[serde(default)]
         notice: String,
+        /// (E-P0, §5 decision 3) Plugin-proposed cost cap; effective cap is
+        /// `min(this, config.driver.max_cost_usd)`. May only lower, never
+        /// raise the host-imposed limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_cost_usd: Option<f64>,
     },
     Next {
         run_id: String,
@@ -180,6 +185,7 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
             time_checkpoint_version,
             context_mode: _,
             notice,
+            max_cost_usd,
         } => {
             if !valid_id(run_id) {
                 return Err("session driver run_id must be 1..128 ASCII letters/digits/-/_".into());
@@ -202,6 +208,9 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
             }
             if time_checkpoint_version.is_some_and(|v| v != 1) {
                 return Err("unsupported session driver time checkpoint version".into());
+            }
+            if max_cost_usd.is_some_and(|c| !c.is_finite() || c <= 0.0) {
+                return Err("session driver max_cost_usd must be positive and finite".into());
             }
             validate_text(prompt, notice, *delay_ms)
         }
@@ -284,6 +293,9 @@ pub struct Grant {
     time_checkpoint_version: Option<u8>,
     context_mode: Option<ContextMode>,
     deadline: Option<Instant>,
+    /// (E-P0, §5 decision 3) Plugin-proposed per-run USD cap. The effective
+    /// cap is `min(this, config)` — enforced by P7.
+    pub max_cost_usd: Option<f64>,
 }
 
 impl Grant {
@@ -307,6 +319,7 @@ impl Grant {
             time_checkpoint_version,
             context_mode,
             notice,
+            max_cost_usd,
         } = reply
         else {
             return Err("session driver can only be armed by start".into());
@@ -334,6 +347,7 @@ impl Grant {
             run_id,
             models,
             deadline,
+            max_cost_usd,
         };
         grant.check_delay(proposal.delay)?;
         Ok((grant, proposal))
@@ -426,7 +440,7 @@ pub enum Outcome {
 
 /// Coarse host metadata only. `decision_id` is stable across transport retries;
 /// the independent command request_id is always fresh. Neither contains secrets.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollRequest {
     pub run_id: String,
     pub decision_id: String,
@@ -437,6 +451,10 @@ pub struct PollRequest {
     /// Only emitted for a grant explicitly opting into feedback v1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
+    /// (E-P0, §5 decision 2) Multi-session safety belt; additive, old
+    /// plugins ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 fn blocked() -> (Outcome, String) {
@@ -955,6 +973,7 @@ mod tests {
             model: selection().model,
             effort: selection().effort,
             feedback: None,
+            session_id: None,
         }
     }
 
@@ -1213,6 +1232,7 @@ mod tests {
             time_checkpoint_version: None,
             context_mode: None,
             notice: String::new(),
+            max_cost_usd: None,
         };
         assert!(Grant::from_start("p", "s", bad).is_err());
     }
@@ -1883,5 +1903,47 @@ while True:
             .unwrap_err()
             .contains("permission"));
         assert!(manager.session_driver_handler("driver").is_err());
+    }
+
+    #[test]
+    fn poll_request_session_id_is_optional_and_round_trips() {
+        let mut req = request();
+        // session_id absent → serialises without the field.
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("session_id"), "should be skipped when None: {json}");
+        let back: PollRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id, None);
+
+        // session_id present → round-trips.
+        req.session_id = Some("test-session-42".into());
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("session_id"), "{json}");
+        let back: PollRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id.as_deref(), Some("test-session-42"));
+    }
+
+    #[test]
+    fn reply_start_max_cost_usd_optional_and_validated() {
+        // Legacy start without max_cost_usd → None (backward-compat).
+        let value = start();
+        let reply = parse_reply(&value).unwrap().unwrap();
+        assert!(matches!(&reply, Reply::Start { max_cost_usd: None, .. }));
+
+        // Explicit max_cost_usd round-trips.
+        let mut value = start();
+        value["session_driver"]["max_cost_usd"] = json!(3.50);
+        let reply = parse_reply(&value).unwrap().unwrap();
+        assert!(matches!(&reply, Reply::Start { max_cost_usd: Some(c), .. } if (*c - 3.5).abs() < f64::EPSILON));
+        let (grant, _) = Grant::from_start("p", "s", reply).unwrap();
+        assert_eq!(grant.max_cost_usd, Some(3.50));
+
+        // Zero or negative rejected at parse_reply (validate_reply gate).
+        let mut value = start();
+        value["session_driver"]["max_cost_usd"] = json!(0.0);
+        assert!(parse_reply(&value).is_err());
+
+        let mut value = start();
+        value["session_driver"]["max_cost_usd"] = json!(-1.0);
+        assert!(parse_reply(&value).is_err());
     }
 }

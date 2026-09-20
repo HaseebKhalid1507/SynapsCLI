@@ -520,6 +520,15 @@ pub enum SessionCommand {
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
+    /// (E-P0) Start or re-arm the session driver for `plugin`.
+    /// `command` is the interactive command name (e.g. "auto");
+    /// `arg` is everything after the command ("start -- do X").
+    /// No `DriverStop` — `Cancel` handles that (§2).
+    DriverStart {
+        plugin: String,
+        command: String,
+        arg: String,
+    },
 }
 
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
@@ -605,6 +614,12 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::KeepWarm { on } => f.debug_struct("KeepWarm").field("on", on).finish(),
             Self::HostEvent(ev) => f.debug_tuple("HostEvent").field(ev).finish(),
+            Self::DriverStart { plugin, command, .. } => f
+                .debug_struct("DriverStart")
+                .field("plugin", plugin)
+                .field("command", command)
+                .field("arg", &format_args!("<redacted>"))
+                .finish(),
         }
     }
 }
@@ -798,6 +813,27 @@ pub enum SessionEventWire {
     Lifecycle(SessionLifecycle),
     /// (C3) daemon is about to exec itself; clients reconnect.
     Reloading { generation: u64, retry_after_ms: u64 },
+    /// (E-P0) Driver armed on this session.
+    DriverArmed {
+        plugin_id: String,
+        run_id: String,
+        models: Vec<crate::extensions::session_driver::Selection>,
+        selection: crate::extensions::session_driver::Selection,
+        /// Remaining ms, not absolute Instant.
+        deadline_ms: Option<u64>,
+        notice: String,
+    },
+    /// (E-P0) Driver revoked.
+    DriverRevoked {
+        reason: String,
+        undelivered_steering: Vec<String>,
+    },
+    /// (E-P0) One driver turn completed.
+    DriverTurnOutcome {
+        outcome: crate::extensions::session_driver::Outcome,
+        selection: crate::extensions::session_driver::Selection,
+        feedback: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -817,6 +853,8 @@ pub enum TurnTrigger {
     EventAuto,
     PluginCommand,
     Compaction,
+    /// (E-P0) Turn initiated by the session driver.
+    DriverAuto,
 }
 
 /// Per-session, gapless `seq` assigned at the single emit site
@@ -1067,6 +1105,7 @@ mod tests {
             SessionCommand::Checkpoint { reason: CheckpointReason::Reload },
             SessionCommand::KeepWarm { on: true },
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
+            SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
         ];
         for cmd in cmds {
             let json = serde_json::to_string(&cmd).unwrap();
@@ -1089,6 +1128,7 @@ mod tests {
             },
             SessionCommand::Answer { prompt_id: 1, value: Some(secret.into()) },
             SessionCommand::Resume { id: 1, query: secret.into() },
+            SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: secret.into() },
         ];
         for cmd in cmds {
             let d = format!("{cmd:?}");
