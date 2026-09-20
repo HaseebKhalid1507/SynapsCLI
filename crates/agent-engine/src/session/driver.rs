@@ -4,9 +4,6 @@
 //! actor already receives and issues the actor's own `start_turn`/`steer`/`cancel`.
 //! Nothing here touches a client, a terminal, or `App`. Clients see only
 //! `SessionEventWire::Driver*` events.
-//!
-//! Many items are consumed by P4 (driver_tick). Allow dead_code until then.
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -230,4 +227,189 @@ pub(crate) fn deadline_ms(grant: &Grant) -> Option<u64> {
             .as_millis()
             .min(u64::MAX as u128) as u64
     })
+}
+
+// ── F11: pure-fn unit tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn test_selection() -> Selection {
+        Selection {
+            model: "test/model".into(),
+            effort: "high".into(),
+        }
+    }
+
+    fn test_reply() -> Reply {
+        Reply::Start {
+            run_id: "test-run".into(),
+            models: vec![test_selection()],
+            prompt: "do the work".into(),
+            delay_ms: 2000,
+            max_duration_ms: Some(120_000),
+            feedback_version: Some(1),
+            time_checkpoint_version: Some(1),
+            context_mode: None,
+            notice: "test notice".into(),
+            max_cost_usd: None,
+        }
+    }
+
+    fn test_grant_and_state() -> (Grant, DriverState) {
+        let reply = test_reply();
+        let (grant, proposal) =
+            Grant::from_start("test-plugin", "test-session", reply).unwrap();
+        let state = DriverState {
+            selection: proposal.selection.clone(),
+            grant,
+            handler: std::sync::Arc::new(crate::extensions::runtime::tests::DummyHandler),
+            handler_generation: 0,
+            cancel: CancellationToken::new(),
+            workers: Arc::new(std::sync::Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            )),
+            worker_epoch: 0,
+            deadline_task: None,
+            proposal: Some(Scheduled { proposal, due: Instant::now() + Duration::from_secs(2) }),
+            awaiting_terminal: false,
+            outcome: None,
+            feedback: feedback::Tracker::default(),
+            completed_feedback: "unknown",
+            steering: VecDeque::new(),
+            auto_wakes_blocked: false,
+            cost_at_arm: 0.0,
+        };
+        let grant_copy = Grant::from_start(
+            "test-plugin",
+            "test-session",
+            test_reply(),
+        )
+        .unwrap()
+        .0;
+        (grant_copy, state)
+    }
+
+    // ── schedule tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn schedule_rejects_too_short_delay() {
+        let (_, mut state) = test_grant_and_state();
+        let proposal = crate::extensions::session_driver::Proposal {
+            selection: test_selection(),
+            prompt: "x".into(),
+            delay: Duration::from_millis(500),
+            notice: String::new(),
+        };
+        assert!(schedule(&mut state, proposal).is_err());
+    }
+
+    #[test]
+    fn schedule_rejects_past_deadline() {
+        let (_, mut state) = test_grant_and_state();
+        // Proposal delay exceeds the grant's max_duration_ms (120 s).
+        let proposal = crate::extensions::session_driver::Proposal {
+            selection: test_selection(),
+            prompt: "x".into(),
+            delay: Duration::from_secs(300),
+            notice: String::new(),
+        };
+        assert!(schedule(&mut state, proposal).is_err());
+    }
+
+    #[test]
+    fn schedule_accepts_valid_proposal() {
+        let (_, mut state) = test_grant_and_state();
+        let proposal = crate::extensions::session_driver::Proposal {
+            selection: Selection {
+                model: "other/model".into(),
+                effort: "low".into(),
+            },
+            prompt: "continue".into(),
+            delay: Duration::from_secs(2),
+            notice: "notice".into(),
+        };
+        assert!(schedule(&mut state, proposal).is_ok());
+        assert_eq!(state.selection.model, "other/model");
+        assert!(state.proposal.is_some());
+    }
+
+    // ── poll_request ────────────────────────────────────────────────────
+
+    #[test]
+    fn poll_request_includes_feedback_when_enabled() {
+        let (_, state) = test_grant_and_state();
+        let req = poll_request(
+            &state,
+            crate::extensions::session_driver::Outcome::Success,
+            "none".into(),
+        );
+        assert!(req.feedback.is_some());
+        assert_eq!(req.run_id, "test-run");
+        assert!(req.session_id.is_some());
+    }
+
+    // ── same_lifecycle ──────────────────────────────────────────────────
+
+    #[test]
+    fn same_lifecycle_matches_same_generation() {
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> =
+            Arc::new(crate::extensions::runtime::tests::DummyHandler);
+        let gen = live_generation(&handler).unwrap();
+        assert!(same_lifecycle(&handler, gen).is_ok());
+    }
+
+    #[test]
+    fn same_lifecycle_rejects_different_generation() {
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> =
+            Arc::new(crate::extensions::runtime::tests::DummyHandler);
+        assert!(same_lifecycle(&handler, 999).is_err());
+    }
+
+    // ── history_with_steering ───────────────────────────────────────────
+
+    #[test]
+    fn history_with_steering_appends_user_messages() {
+        let base: Vec<SharedMessage> =
+            vec![Arc::new(serde_json::json!({"role":"assistant","content":"hi"}))];
+        let mut steering = VecDeque::new();
+        steering.push_back("one".into());
+        steering.push_back("two".into());
+        let result = history_with_steering(&base, &steering);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[1]["role"], "user");
+        assert_eq!(result[1]["content"], "one");
+        assert_eq!(result[2]["content"], "two");
+    }
+
+    // ── commit_submission ───────────────────────────────────────────────
+
+    #[test]
+    fn commit_submission_drains_steering_and_appends_prompt() {
+        let mut messages: Vec<SharedMessage> = Vec::new();
+        let mut steering = VecDeque::new();
+        steering.push_back("steer1".into());
+        steering.push_back("steer2".into());
+        let mut abort = None;
+        commit_submission(&mut messages, &mut steering, "go", &mut abort);
+        assert!(steering.is_empty());
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], "steer1");
+        assert_eq!(messages[1]["content"], "steer2");
+        assert_eq!(messages[2]["content"], "go");
+    }
+
+    #[test]
+    fn commit_submission_prepends_abort_context() {
+        let mut messages: Vec<SharedMessage> = Vec::new();
+        let mut steering = VecDeque::new();
+        let mut abort = Some("aborted context".into());
+        commit_submission(&mut messages, &mut steering, "go", &mut abort);
+        assert!(abort.is_none());
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]["content"].as_str().unwrap().contains("aborted context"));
+        assert!(messages[0]["content"].as_str().unwrap().contains("go"));
+    }
 }

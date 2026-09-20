@@ -10,7 +10,11 @@
 //! sees today.
 //!
 //! Invariants:
-//! - `Runtime::clone()` resets TTL latches — the actor never clones it.
+//! - `Runtime::clone()` resets TTL latches. The actor clones it only for
+//!   driver stream-start (Prepared→Started) and compaction. The stream-start
+//!   clone shares the original's TTL atomics via `share_ttl_latches` so a
+//!   redundant 1h→5m downgrade notice per driver turn is avoided. The
+//!   compaction clone is read-only+discarded and needs no sharing.
 //! - `emit` is the ONLY `seq` increment site.
 //! - `Detach` never touches `stream`/`cancel`; only `End` (and `Cancel`)
 //!   stop a turn.
@@ -1120,13 +1124,10 @@ impl SessionActor {
 
         // ── 3. Idle conflict (only when driver is armed) ─────────────────
         if self.driver.is_some() {
-            if self.compact.is_some()
-                || self.conv.queued_message.is_some()
-                || !self.conv.pending_events.is_empty()
-                || self.ext_ready.is_some()
-                || self.conv.context_head.is_blocked(&self.conv.session)
-            {
-                self.driver_revoke("queued work or session/lifecycle change");
+            // F10/F14: use the full driver_idle_conflict() instead of an
+            // inline subset that was missing `completion_blocked`.
+            if let Some(reason) = self.driver_idle_conflict() {
+                self.driver_revoke(reason);
                 return;
             }
 
@@ -1192,6 +1193,33 @@ impl SessionActor {
                                 )
                             )
                         });
+                    // F7: emit plugin command output as SystemNotice so
+                    // `/auto start` output is visible to the user.
+                    for event in &report.events {
+                        if let crate::extensions::runtime::InvokeCommandEvent::Output(out) = event {
+                            let text = match out {
+                                crate::extensions::commands::CommandOutputEvent::Text { content } => {
+                                    Some(content.clone())
+                                }
+                                crate::extensions::commands::CommandOutputEvent::System { content } => {
+                                    Some(content.clone())
+                                }
+                                crate::extensions::commands::CommandOutputEvent::Error { content } => {
+                                    Some(format!("Error: {content}"))
+                                }
+                                _ => None,
+                            };
+                            if let Some(text) = text {
+                                self.emit(SessionEventWire::SystemNotice(text));
+                            }
+                        }
+                    }
+                    if let Some(notice) = report.limit_notice() {
+                        self.emit(SessionEventWire::SystemNotice(format!(
+                            "command output truncated: {}",
+                            notice.message,
+                        )));
+                    }
                     if let Ok(value) = result {
                         let result = match protocol::parse_reply(&value) {
                             Ok(Some(reply @ Reply::Start { .. })) => {
@@ -1314,24 +1342,18 @@ impl SessionActor {
                                 ));
                                 return;
                             }
-                            // Commit steering + prompt into api_messages.
-                            // (Inline to satisfy the borrow checker — conv has
-                            // api_messages and abort_context as separate fields.)
+                            // F3: commit steering + prompt via the
+                            // driver.rs helper (single call site).
+                            // Destructure to split borrows across conv fields.
                             {
                                 let driver = self.driver.as_mut().expect("driver present");
-                                for text in driver.steering.drain(..) {
-                                    self.conv.api_messages.push(Arc::new(
-                                        serde_json::json!({"role": "user", "content": text}),
-                                    ));
-                                }
-                                let prompt_text = if let Some(context) = self.conv.abort_context.take() {
-                                    format!("{context}\n\n{}", proposal.prompt)
-                                } else {
-                                    proposal.prompt.clone()
-                                };
-                                self.conv.api_messages.push(Arc::new(
-                                    serde_json::json!({"role": "user", "content": prompt_text}),
-                                ));
+                                let conv = &mut *self.conv;
+                                super::driver::commit_submission(
+                                    &mut conv.api_messages,
+                                    &mut driver.steering,
+                                    &proposal.prompt,
+                                    &mut conv.abort_context,
+                                );
                             }
                             // Apply the prepared runtime.
                             *self.runtime = candidate;
@@ -1383,7 +1405,11 @@ impl SessionActor {
                             self.cancel = Some(ct.clone());
                             let (tx, rx) = mpsc::unbounded_channel();
                             self.steer_tx = Some(tx);
-                            let runtime = self.runtime.clone();
+                            let mut runtime = self.runtime.clone();
+                            // F2: share the parent's TTL latches so the
+                            // driver turn doesn't fire a redundant 1h→5m
+                            // downgrade notice.
+                            runtime.share_ttl_latches(&self.runtime);
                             let history = self.conv.api_messages.clone();
                             let secret = self.secret_prompt_handle.clone();
                             let session_id = self.id.0.clone();
@@ -1460,7 +1486,15 @@ impl SessionActor {
                 generation,
                 session_id,
                 task: super::driver::Task(tokio::spawn(async move {
-                    super::driver::TaskResult::Poll(protocol::poll(handler, request).await)
+                    // F4: poll must not hang forever — 30 s timeout like
+                    // the prepare path's 5 s.
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        protocol::poll(handler, request),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("poll timed out (30s)".into()));
+                    super::driver::TaskResult::Poll(result)
                 })),
             });
         } else if driver
@@ -1474,6 +1508,8 @@ impl SessionActor {
             if let Some(context) = &self.conv.abort_context {
                 proposal.prompt = format!("{context}\n\n{}", proposal.prompt);
             }
+            // Clone is read-only (prepare never sends a request) and
+            // discarded — no TTL latch sharing needed.
             let runtime = self.runtime.clone();
             let history = super::driver::history_with_steering(
                 &self.conv.api_messages,
@@ -2015,7 +2051,11 @@ impl SessionActor {
         );
         match action {
             WakeAction::RunTurn => {
-                if self.stream.is_some() {
+                // F8: while a driver is armed, its tick owns turn scheduling.
+                // Starting a competing turn here would race the driver.
+                if self.driver.is_some() {
+                    tracing::debug!("on_queue_wake: RunTurn inhibited — driver armed");
+                } else if self.stream.is_some() {
                     tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
                 } else {
                     self.consecutive_auto_turns += 1;

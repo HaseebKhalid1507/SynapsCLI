@@ -259,3 +259,31 @@ mod lifecycle_tests {
         assert_eq!(handler.lifecycle_snapshot(), None);
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    /// Minimal handler for unit tests. Reports generation 0, Running health.
+    pub struct DummyHandler;
+
+    #[async_trait]
+    impl ExtensionHandler for DummyHandler {
+        fn id(&self) -> &str {
+            "dummy"
+        }
+
+        fn lifecycle_snapshot(&self) -> Option<ExtensionLifecycle> {
+            Some(ExtensionLifecycle {
+                health: ExtensionHealth::Running,
+                generation: 0,
+            })
+        }
+
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::default()
+        }
+
+        async fn shutdown(&self) {}
+    }
+}
