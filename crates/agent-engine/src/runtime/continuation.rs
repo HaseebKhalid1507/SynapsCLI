@@ -1319,7 +1319,6 @@ mod command_tests {
 
 /// Initial and stale-catalog replacement use the same opted-in core surface.
 /// Only existing builtin IDs are included; never resurrect a disabled tool.
-#[allow(dead_code)] // merge(112): consumed in phase 5
 pub(crate) fn context_tool_set(
     session: crate::tools::activation::SessionId,
     catalog: &crate::tools::catalog::ToolCatalog,

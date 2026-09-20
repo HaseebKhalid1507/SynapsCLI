@@ -1,4 +1,3 @@
-#![allow(dead_code)] // merge(112): consumed in phase 5
 //! Host Axel continuous-memory adapter. No extension fallback or new consent.
 use super::{
     capture_worker::{CaptureCommitState, CaptureFailure, CaptureProvider},
@@ -179,6 +178,7 @@ fn task_literal(prompt: &str) -> Option<String> {
     selected.map(str::to_owned)
 }
 
+#[allow(dead_code)] // merge(112): wired in phase 8 setup.rs
 pub(super) async fn recall(
     binding: MemoryBinding,
     lease: MemoryContextLease,
@@ -322,6 +322,7 @@ fn visible(value: &Value) -> bool {
 
 /// Summary sources must not contain any excluded nested evidence. Terminal
 /// capture can select clean text blocks individually; a derived summary cannot.
+#[allow(dead_code)] // merge(112): used by capture pipeline
 pub(super) fn capture_source_safe(value: &Value) -> bool {
     visible(value)
         && !value
@@ -359,6 +360,7 @@ fn screen_text(text: &str) -> String {
         .collect()
 }
 
+#[allow(dead_code)] // merge(112): used by capture pipeline
 pub(super) fn capture_text(message: &Value) -> Option<String> {
     if message.get("_synaps_context").is_some() || !visible(message) {
         return None;
