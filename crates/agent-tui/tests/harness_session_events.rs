@@ -304,3 +304,41 @@ fn slash_resync_reloads_transcript_from_engine_history() {
     assert!(after.contains("transcript resynced"), "{after}");
     assert!(!after.contains("stale live text"), "{after}");
 }
+
+#[test]
+fn response_reset_shrinks_transcript_preview() {
+    fn response_start() -> W {
+        W::Stream {
+            event: WireStreamEvent::Llm(WireLlmEvent::ResponseStart),
+        }
+    }
+    fn response_reset() -> W {
+        W::Stream {
+            event: WireStreamEvent::Llm(WireLlmEvent::ResponseReset),
+        }
+    }
+
+    let (frame, _) = frame_for(vec![
+        turn(TurnTrigger::User, None),
+        text("good text"),
+        response_start(),
+        text("failed continuation attempt"),
+        response_reset(),
+        text("clean retry"),
+        done(),
+        W::Idle,
+    ]);
+    // The failed continuation should be gone; the clean retry should render.
+    assert!(
+        !frame.contains("failed continuation attempt"),
+        "ResponseReset should have removed the failed preview: {frame}"
+    );
+    assert!(
+        frame.contains("clean retry"),
+        "Post-reset text should render: {frame}"
+    );
+    assert!(
+        frame.contains("good text"),
+        "Pre-start text should survive: {frame}"
+    );
+}

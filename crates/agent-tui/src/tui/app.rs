@@ -322,6 +322,11 @@ pub(crate) struct App {
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
+
+    /// Snapshot of `(transcript.messages().len(), last_msg)` captured on
+    /// `ResponseStart`. `ResponseReset` rolls the transcript preview back
+    /// to this position — pure render state, no actor interaction.
+    pub(crate) response_preview: Option<(usize, Option<ChatMessage>)>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -449,6 +454,7 @@ impl App {
             myx_last_live: None,
             theme_transition: None,
             keybinds: None,
+            response_preview: None,
             clock,
         }
     }
