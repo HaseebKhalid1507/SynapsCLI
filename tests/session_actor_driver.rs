@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_engine::session::{
-    AttachMode, ClientId, ClientKind, ClientMeta, ClientTransport, LocalTransport, SessionCommand,
+    ClientId, ClientKind, ClientMeta, ClientTransport, LocalTransport, SessionCommand,
     SessionConfig, SessionEventWire, SessionHandle,
 };
 use agent_engine::{EngineHost, HostOpts};
@@ -952,11 +952,11 @@ async fn stub_host(
     guard: &HomeGuard,
     script: Script,
     extra_config: &str,
-) -> (Arc<EngineHost>, tempfile::TempDir, support::Bodies) {
+) -> (Arc<EngineHost>, tempfile::TempDir) {
     if !extra_config.is_empty() {
         std::fs::write(guard.base_dir().join("config"), extra_config).unwrap();
     }
-    let (url, bodies, _) = spawn_stub(script).await;
+    let (url, _hits, _bodies) = spawn_stub(script).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
     let (temp, manifest) = plugin_copy();
@@ -979,7 +979,7 @@ async fn stub_host(
         .load_with_cwd("autonomous", &manifest, Some(temp.path().to_path_buf()))
         .await
         .unwrap();
-    (host, temp, bodies)
+    (host, temp)
 }
 
 /// A session created against `host` with a caller-tweaked `SessionConfig`, then
@@ -1160,7 +1160,7 @@ async fn s1_detach_nonlast_client_keeps_driver() {
     let (host, _temp) = host_with_plugin().await;
     let mut a = session(&host).await;
     // Attach a second client to A (owner stays ClientId(1)).
-    let (mut a2, _snap) =
+    let (a2, _snap) =
         LocalTransport::attach(a.handle.clone(), ClientMeta::new(ClientKind::Attach))
             .await
             .unwrap();
@@ -1223,7 +1223,7 @@ async fn s1_pending_prompt_fail_closed_on_last_detach() {
     // the turn once the (auto-denied) prompt resolves.
     let bodies: &'static [&'static str] =
         Box::leak(Box::new([sse_prompt_fixture("toolu_p7pf"), ANTHROPIC_SSE]));
-    let (host, _temp, _b) = stub_host(&guard, Script::SeqSse(bodies), "").await;
+    let (host, _temp) = stub_host(&guard, Script::SeqSse(bodies), "").await;
     host.parts().tools.write().await.register(Arc::new(PromptFixtureTool));
 
     let mut a = session_cfg(
@@ -1246,7 +1246,7 @@ async fn s1_pending_prompt_fail_closed_on_last_detach() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Re-attach: the prompt must be gone (drained), not stuck pending.
-    let (mut t2, snap) =
+    let (t2, snap) =
         LocalTransport::attach(a.handle.clone(), ClientMeta::new(ClientKind::Test))
             .await
             .unwrap();
@@ -1270,7 +1270,7 @@ async fn s1_pending_prompt_fail_closed_on_last_detach() {
 #[serial]
 async fn s3_session_cost_cap_breach_revokes_and_emits() {
     let guard = HomeGuard::new();
-    let (host, _temp, _b) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let (host, _temp) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
 
     // Tiny cap: one turn's usage (fable pricing) exceeds it immediately.
     let mut a = session_cfg(
@@ -1319,7 +1319,7 @@ async fn s3_session_cost_cap_breach_revokes_and_emits() {
 #[serial]
 async fn s3_high_cost_cap_still_runs_turns() {
     let guard = HomeGuard::new();
-    let (host, _temp, _b) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let (host, _temp) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
 
     let mut a = session_cfg(
         &host,
@@ -1449,7 +1449,7 @@ async fn s9_armed_driver_forces_gating_despite_auto_approve() {
     // Driver turn calls activate_tools with a valid id → the tool asks the host
     // to confirm (activation_confirm = prompt) UNLESS auto-approved.
     let sse = sse_tool_call_with_input("activate_tools", "toolu_p7at", r#"{"tools":["ns:fake"]}"#);
-    let (host, _temp, _b) = stub_host(
+    let (host, _temp) = stub_host(
         &guard,
         Script::Sse(sse),
         "tools.activation_confirm = prompt\n",
@@ -1501,7 +1501,7 @@ async fn s9_unarmed_auto_approve_bypasses_activation_gate() {
     let guard = HomeGuard::new();
     let sse = sse_tool_call_with_input("activate_tools", "toolu_p7c", r#"{"tools":["ns:fake"]}"#);
     let bodies: &'static [&'static str] = Box::leak(Box::new([sse, ANTHROPIC_SSE]));
-    let (host, _temp, _b) = stub_host(
+    let (host, _temp) = stub_host(
         &guard,
         Script::SeqSse(bodies),
         "tools.activation_confirm = prompt\n",
