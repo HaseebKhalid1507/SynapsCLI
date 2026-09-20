@@ -629,6 +629,15 @@ async fn handle_compact(
     // 1. Brief lock: snapshot what the transition needs, then drop guard.
     let (msgs, runtime, session) = {
         let st = state.lock().await;
+        if st.context_head.is_blocked(&st.session) {
+            let _ = writer_tx
+                .send(RpcEvent::Error {
+                    id: Some(id),
+                    message: "cannot compact while the context head is unverified".into(),
+                })
+                .await;
+            return;
+        }
         (
             st.api_messages.clone(),
             st.runtime.clone(),
@@ -1406,4 +1415,51 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod context_head_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn context_head_rejection_blocks_shutdown_save_and_auto_chain() {
+        let mut session = Session::new("synthetic", "medium", Some("host authority"));
+        session.id = "synthetic-rpc-context-head".into();
+        session.api_messages = vec![Arc::new(serde_json::json!({
+            "role":"user", "content":"original synthetic head"
+        }))];
+        let old_messages = session.api_messages.clone();
+        let mut st = RpcState {
+            runtime: Runtime::new_headless(),
+            session,
+            context_head: Default::default(),
+            api_messages: old_messages.clone(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            session_cost: 0.0,
+            in_flight: None,
+            pending_events: vec!["synthetic pending event".into()],
+            consecutive_auto_turns: 0,
+            auto_turn_pending: false,
+            events_auto_turn: true,
+            auto_turn_cap: 5,
+        };
+        let (receipt, acknowledged) = synaps_cli::core::context_head::ContextHeadReceipt::channel();
+        receipt.complete(st.persist_context_head("wrong-session", Vec::new()).await);
+        assert!(acknowledged.await.unwrap().is_err());
+        assert_eq!(st.api_messages, old_messages);
+        let state = Mutex::new(st);
+        assert!(terminal_flush(&state, true).await.is_none());
+        let mut st = state.lock().await;
+        assert!(!st.auto_turn_pending);
+        assert_eq!(st.consecutive_auto_turns, 0);
+        assert_eq!(st.api_messages.len(), 2); // buffered event retained, not inferred
+        st.save_session().await; // blocked, no real filesystem access
+        assert_eq!(st.session.api_messages, old_messages);
+        let (writer, mut frames) = mpsc::channel(8);
+        drop(st);
+        let state = Arc::new(state);
+        handle_compact("compact-test".into(), state, writer).await;
+        assert!(matches!(frames.recv().await, Some(RpcEvent::Error { .. })));
+    }
 }
