@@ -22,3 +22,23 @@
   - `user_binding_is_not_a_forum_even_with_user_notes_opt_in` (order-dependent flake, passes in isolation)
   - `continuous_memory_headless_lifecycle_captures_restarts_recalls_disables_and_imports` (pre-existing at 088ac939, memory_context_e2e integration test, intermittent)
 | 3-followup | synaps-engine | 2023 | 1† | 12 |
+| 6 | synaps-axel-memory-service | — | — | — |
+| 7 | synaps-engine | 2024 | 1† | 12 |
+| 8 | synaps-engine | 2024 | 1† | 12 |
+| 8 | synaps-core | 732 | 0 | 8 |
+| 8 | workspace | — | 6‡ | — |
+
+‡ Workspace failures (all pre-existing or env-dependent):
+  - `static_table_and_wire_shape_classifier_agree_for_known_models` (known — new model entry)
+  - `continuous_memory_headless_lifecycle…` (known AXEL fixture dep)
+  - `recall_once_consumes…` / `recall_each_prompt…` ×3 (AXEL fixture dep, memory_context_e2e)
+  - `stored_system_close_and_forged_tool_call_json…` (AXEL fixture dep, continuous_memory_adversarial)
+  - `contract_json_matches_rust_hook_and_permission_catalogs` (drift check, pre-existing)
+  - `export_pretty_matches_committed_docs_tools_json` / `drift_check…` (drift, pre-existing)
+  - `e_opens_expanded_provider_browser` (TUI flake)
+
+Phase 6 note: synaps-axel-memory-service is a standalone crate with own [workspace].
+cargo check on bella failed with Permission denied on ~/.cargo/git/db for the
+axel/axel-memkoshi git deps (private repo). DARK: memory.backend=legacy default
+never spawns it. Sidecar binary located via config.executable or
+<current_exe_dir>/synaps-axel-memory-service.
