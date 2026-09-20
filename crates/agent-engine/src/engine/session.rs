@@ -254,3 +254,173 @@ impl ConversationState {
         );
     }
 }
+#[cfg(test)]
+mod context_head_tests {
+    use super::*;
+    use agent_core::core::context_head::ContextHeadReceipt;
+    use agent_core::core::session_journal::{save_session_durable_in_dir, SessionPersistence};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn fixture() -> (Session, Vec<SharedMessage>, Session) {
+        let mut old = Session::new("synthetic-model", "medium", Some("host authority"));
+        old.id = "synthetic-context-head".into();
+        old.name = Some("synthetic-name".into());
+        old.title = "original title".into();
+        old.parent_session = Some("synthetic-parent".into());
+        old.api_messages = vec![Arc::new(json!({"role":"user","content":"old head"}))];
+        let messages = old.api_messages.clone();
+        let mut candidate = old.clone();
+        candidate.api_messages = vec![Arc::new(json!({"role":"user","content":"candidate"}))];
+        candidate.total_input_tokens = 23;
+        candidate.total_output_tokens = 7;
+        candidate.session_cost = 0.125;
+        candidate.abort_context = Some("latest synthetic abort context".into());
+        (old, messages, candidate)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn context_head_ack_follows_durable_write_and_adoption() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, mut messages, candidate) = fixture();
+            let id = session.id.clone();
+            let expected = serde_json::to_value(&candidate).unwrap();
+            let mut state = ContextHeadPersistence::default();
+            let (receipt, mut acknowledged) = ContextHeadReceipt::channel();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let path = dir.path().to_owned();
+            let result = {
+                let persist = state.persist_with(
+                    &mut session,
+                    &mut messages,
+                    &id,
+                    candidate,
+                    |candidate| async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        save_session_durable_in_dir(&path, &candidate, mode).map(|_| ())
+                    },
+                );
+                tokio::pin!(persist);
+                tokio::select! {
+                    result = &mut persist => panic!("write unexpectedly completed: {result:?}"),
+                    _ = started_rx => {}
+                }
+                assert!(matches!(
+                    acknowledged.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                release_tx.send(()).unwrap();
+                persist.await
+            };
+            assert!(result.is_ok());
+            receipt.complete(result);
+            assert_eq!(acknowledged.await.unwrap(), Ok(()));
+            assert_eq!(serde_json::to_value(&session).unwrap(), expected);
+            assert_eq!(messages, session.api_messages);
+            assert!(!state.is_blocked(&session));
+            let loaded = Session::load_from_dir(dir.path(), &id).unwrap();
+            assert_eq!(loaded.api_messages, messages);
+            assert_eq!(loaded.system_prompt.as_deref(), Some("host authority"));
+            assert_eq!(loaded.name, session.name);
+            assert_eq!(loaded.total_input_tokens, 23);
+            assert_eq!(loaded.total_output_tokens, 7);
+            assert_eq!(loaded.abort_context, session.abort_context);
+        }
+    }
+
+    #[tokio::test]
+    async fn context_head_identity_mismatch_never_writes_or_adopts() {
+        let (mut session, mut messages, candidate) = fixture();
+        let before = serde_json::to_value(&session).unwrap();
+        let mut state = ContextHeadPersistence::default();
+        let (receipt, acknowledged) = ContextHeadReceipt::channel();
+        let result = state
+            .persist_with(
+                &mut session,
+                &mut messages,
+                "another-session",
+                candidate,
+                |_| async { panic!("identity rejection must not reach persistence") },
+            )
+            .await;
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        receipt.complete(result);
+        assert!(acknowledged.await.unwrap().is_err());
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(messages, session.api_messages);
+        assert!(state.is_blocked(&session));
+        let mut other = session.clone();
+        other.id = "new-session".into();
+        assert!(!state.is_blocked(&other));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn context_head_post_publish_error_is_not_rollback_or_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, _, candidate) = fixture();
+        let mut conv = ConversationState::from_resumed(session);
+        let id = conv.session.id.clone();
+        let expected = candidate.api_messages.clone();
+        let path = dir.path().to_owned();
+        let (receipt, acknowledged) = ContextHeadReceipt::channel();
+        let result = conv
+            .context_head
+            .persist_with(
+                &mut conv.session,
+                &mut conv.api_messages,
+                &id,
+                candidate,
+                |candidate| async move {
+                    save_session_durable_in_dir(&path, &candidate, SessionPersistence::Journal)?;
+                    Err(std::io::Error::other("synthetic error after publication"))
+                },
+            )
+            .await;
+        receipt.complete(result);
+        assert!(acknowledged.await.unwrap().is_err());
+        assert!(conv.context_head.is_blocked(&conv.session));
+        assert_eq!(conv.api_messages, expected);
+        assert_eq!(
+            Session::load_from_dir(dir.path(), &id)
+                .unwrap()
+                .api_messages,
+            expected
+        );
+        // Simulate stale failure repair/UI data. save() must return before it
+        // even copies this old state into the conservatively adopted Session.
+        conv.api_messages.clear();
+        conv.api_messages
+            .push(Arc::new(json!({"role":"user","content":"stale"})));
+        conv.save().await;
+        assert_eq!(conv.session.api_messages, expected);
+        let loaded = Session::load_from_dir(dir.path(), &id).unwrap();
+        let resumed = ConversationState::from_resumed(loaded);
+        assert!(!resumed.context_head.is_blocked(&resumed.session));
+    }
+
+    #[tokio::test]
+    async fn context_head_dropped_write_future_latches_without_mutating_old_head() {
+        let (mut session, mut messages, candidate) = fixture();
+        let before = serde_json::to_value(&session).unwrap();
+        let id = session.id.clone();
+        let mut state = ContextHeadPersistence::default();
+        {
+            let persist = state.persist_with(&mut session, &mut messages, &id, candidate, |_| {
+                std::future::pending::<std::io::Result<()>>()
+            });
+            tokio::pin!(persist);
+            assert!(futures::poll!(&mut persist).is_pending());
+        }
+        assert!(state.is_blocked(&session));
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(messages, session.api_messages);
+    }
+}
