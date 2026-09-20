@@ -358,12 +358,13 @@ async fn unpark_missing_journal_restores_fresh_conversation() {
     end(&mut b).await;
 }
 
-/// H2: a session that never ran a turn has nothing on disk (`save` skips an
-/// empty conversation) → it must stay Live after the grace, not park into
-/// something that cannot be restored.
+/// H2 → F18: a session that never ran a turn has nothing on disk (`save`
+/// skips an empty conversation), so it must never park into something that
+/// cannot be restored. It must not stay Live forever either (Runtime
+/// resident, nobody attached): at the grace deadline it ENDS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn empty_session_never_parks() {
+async fn empty_session_never_parks_it_ends_idle() {
     let _h = Home::new();
     let _g = Grace::set("0");
     let (url, _) = stub(SSE_HI, false).await;
@@ -378,25 +379,11 @@ async fn empty_session_never_parks() {
         !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(2)).await,
         "never-saved session must not park"
     );
-    assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+    assert_ne!(handle.lifecycle(), SessionLifecycle::Parked);
+    tokio::time::timeout(Duration::from_secs(5), handle.closed())
+        .await
+        .expect("empty idle session must END at the grace deadline, not stay Live");
     assert!(agent_engine::core::session::Session::load(handle.id.as_str()).is_err());
-
-    // Re-attach is a plain attach (no unpark); a turn then parks normally.
-    let (mut b, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
-        .await
-        .unwrap();
-    assert!(snap.conversation.api_messages.is_empty());
-    b.send(submit("hi")).await.unwrap();
-    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
-    detach(&mut b).await;
-    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
-    handle
-        .send(SessionCommand::End {
-            reason: EndReason::HostShutdown,
-        })
-        .await
-        .unwrap();
-    handle.closed().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
