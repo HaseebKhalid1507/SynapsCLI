@@ -951,6 +951,7 @@ impl Runtime {
                 auth_type,
                 refresh_token,
                 token_expires,
+                bound_credential: None,
             })),
             model: crate::models::default_model().to_string(),
             tools: host.tools,
@@ -1074,6 +1075,7 @@ impl Runtime {
             auth_type: "api_key".to_string(),
             refresh_token: None,
             token_expires: None,
+            bound_credential: None,
         }));
         runtime
     }
@@ -2516,6 +2518,29 @@ impl Runtime {
                 AuthMethods::scrub_for_remote(&mut auth);
             }
         }
+        // Account switch (G5): if the in-memory Anthropic OAuth token is
+        // bound to a credential other than the one this config now selects
+        // (`auth.account.anthropic` / `SYNAPS_ACCOUNT_ANTHROPIC`, or a
+        // source change), drop it so the next turn re-vends through the
+        // broker — the previous account is never silently kept. Stateless:
+        // compares the token's recorded binding to the new selection.
+        if let Ok(mut auth) = self.auth.try_write() {
+            if auth.auth_type == "oauth" && !auth.auth_token.is_empty() {
+                let selector = config
+                    .auth
+                    .account_selector(crate::auth::OAuthProviderId::Anthropic);
+                let check = crate::runtime::auth::check_binding(
+                    &self.credential_source,
+                    &selector,
+                    auth.bound_credential.as_deref(),
+                    crate::runtime::auth::RefreshPoint::TurnStart,
+                );
+                if check != crate::runtime::auth::BindingCheck::Matches {
+                    AuthMethods::scrub_for_account_switch(&mut auth);
+                    self.token_cache.invalidate("anthropic");
+                }
+            }
+        }
         // Install the process-wide credential broker matching this source so
         // every request path (streams, pings, catalog, TUI status) resolves
         // credentials through the same boundary. Local sources get the
@@ -3381,6 +3406,8 @@ impl Runtime {
             &self.client,
             &self.credential_source,
             &self.token_cache,
+            Some(model),
+            crate::runtime::auth::RefreshPoint::TurnStart,
         )
         .await
     }

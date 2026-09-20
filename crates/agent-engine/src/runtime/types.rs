@@ -12,6 +12,14 @@ pub(super) struct AuthState {
     pub(super) auth_type: String,
     pub(super) refresh_token: Option<String>,
     pub(super) token_expires: Option<u64>,
+    /// Which credential `auth_token` was vended for:
+    /// `"<local|remote:<endpoint>>|<storage_key>"` (see
+    /// `runtime/auth.rs::anthropic_binding`). Never contains a token or the
+    /// machine token. `None` = unknown/legacy (api_key harnesses, scrubbed).
+    /// The pre-stream refresh refuses to serve a cached token whose binding
+    /// no longer matches the selected account, so a config/source switch can
+    /// never silently keep the previous account's token.
+    pub(super) bound_credential: Option<String>,
 }
 
 #[allow(dead_code)]
