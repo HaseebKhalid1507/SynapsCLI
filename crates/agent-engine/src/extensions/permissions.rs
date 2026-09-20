@@ -216,6 +216,21 @@ mod tests {
     }
 
     #[test]
+    fn session_drive_is_active_explicit_and_grants_no_hooks() {
+        assert_eq!(
+            Permission::parse("session.drive"),
+            Some(Permission::SessionDrive)
+        );
+        assert!(!Permission::SessionDrive.is_reserved());
+        let perms = PermissionSet::try_from_strings(&["session.drive".into()]).unwrap();
+        assert!(perms.has(Permission::SessionDrive));
+        assert!(!perms.has(Permission::SessionLifecycle));
+        assert!(!perms.allows_hook(HookKind::OnSessionStart));
+        assert!(!perms.allows_hook(HookKind::BeforeMessage));
+        assert_eq!(Permission::parse("session_drive"), None);
+    }
+
+    #[test]
     fn parse_invalid_returns_none() {
         assert_eq!(Permission::parse("invalid"), None);
         assert_eq!(Permission::parse(""), None);
@@ -280,21 +295,6 @@ mod tests {
         .unwrap();
         assert!(perms.has(Permission::MemoryRead));
         assert!(perms.has(Permission::MemoryWrite));
-    }
-
-    #[test]
-    fn session_drive_is_active_explicit_and_grants_no_hooks() {
-        assert_eq!(
-            Permission::parse("session.drive"),
-            Some(Permission::SessionDrive)
-        );
-        assert!(!Permission::SessionDrive.is_reserved());
-        let perms = PermissionSet::try_from_strings(&["session.drive".into()]).unwrap();
-        assert!(perms.has(Permission::SessionDrive));
-        assert!(!perms.has(Permission::SessionLifecycle));
-        assert!(!perms.allows_hook(HookKind::OnSessionStart));
-        assert!(!perms.allows_hook(HookKind::BeforeMessage));
-        assert_eq!(Permission::parse("session_drive"), None);
     }
 
     #[test]
@@ -368,6 +368,7 @@ mod tests {
                 | Permission::ToolsOverride
                 | Permission::LlmContent
                 | Permission::SessionLifecycle
+                | Permission::SessionDrive
                 | Permission::ToolsRegister
                 | Permission::ProvidersRegister
                 | Permission::ContextProvidersRegister
@@ -376,8 +377,7 @@ mod tests {
                 | Permission::ConfigWrite
                 | Permission::ConfigSubscribe
                 | Permission::AudioInput
-                | Permission::AudioOutput
-                | Permission::SessionDrive => {}
+                | Permission::AudioOutput => {}
             }
         }
         assert_eq!(
