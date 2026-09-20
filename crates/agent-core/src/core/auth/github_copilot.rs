@@ -984,13 +984,16 @@ pub mod testutil {
         Status(u16, String),
     }
 
+    type RecordedPost = (String, Vec<(String, String)>);
+    type RecordedGet = (String, String, Vec<(String, String)>);
+
     #[derive(Default)]
     pub struct FakeHttp {
         pub post_queue: Mutex<Vec<ScriptedResponse>>,
         pub get_queue: Mutex<Vec<ScriptedResponse>>,
-        pub posts: Mutex<Vec<(String, Vec<(String, String)>)>>,
+        pub posts: Mutex<Vec<RecordedPost>>,
         /// (url, bearer, headers)
-        pub gets: Mutex<Vec<(String, String, Vec<(String, String)>)>>,
+        pub gets: Mutex<Vec<RecordedGet>>,
     }
 
     impl FakeHttp {
@@ -1132,7 +1135,7 @@ mod tests {
         validate_verification_uri(DEFAULT_VERIFICATION_URI).unwrap();
         assert!(CONNECT_TIMEOUT.as_secs() > 0);
         assert!(REQUEST_TIMEOUT.as_secs() > 0);
-        assert!(MAX_RESPONSE_BODY_BYTES >= 1024);
+        const { assert!(MAX_RESPONSE_BODY_BYTES >= 1024) };
     }
 
     #[test]
