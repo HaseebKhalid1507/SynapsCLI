@@ -70,7 +70,7 @@ pub fn adopt_banner(
     let parked = others.iter().filter(|m| matches!(m.lifecycle, L::Parked)).count();
     let live = n - parked;
     let mut line = format!(
-        "{n} other session{} in this daemon ({live} live, {parked} parked) — `synaps --attach <ID>` to resume one:",
+        "{n} other session{} in this daemon ({live} live, {parked} parked) — `synaps --attach <ID>` joins a live one, `synaps --continue <ID>` resumes a parked one:",
         if n == 1 { "" } else { "s" }
     );
     for m in others.iter().take(5) {
