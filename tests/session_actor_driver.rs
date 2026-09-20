@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_engine::session::{
-    ClientId, ClientKind, ClientMeta, ClientTransport, LocalTransport, SessionCommand,
+    AttachMode, ClientId, ClientKind, ClientMeta, ClientTransport, LocalTransport, SessionCommand,
     SessionConfig, SessionEventWire, SessionHandle,
 };
 use agent_engine::{EngineHost, HostOpts};
@@ -930,4 +930,616 @@ async fn driver_runs_multiple_turns_end_to_end() {
         }
     })
     .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// E-P7 security gates: S1 (zero-client → no headless spend), S3 (cost caps),
+// S9 (no auto-approve under driver). 12 gate tests.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use agent_engine::extensions::session_driver::{
+    Grant, Outcome, PollRequest, Reply,
+};
+
+// ── shared stub setup (mirrors driver_runs_multiple_turns_end_to_end) ────────
+
+/// Boot a host under a temp HOME with the loopback Anthropic stub wired in, and
+/// load the autonomous plugin with a `prefs.json` proposing a REAL anthropic
+/// model so the driver turn actually hits the stub (fictional favorites would
+/// EOF → Blocked). `extra_config` is appended to the `~/.synaps-cli/config`
+/// file BEFORE boot (e.g. `tools.activation_confirm = prompt`).
+async fn stub_host(
+    guard: &HomeGuard,
+    script: Script,
+    extra_config: &str,
+) -> (Arc<EngineHost>, tempfile::TempDir, support::Bodies) {
+    if !extra_config.is_empty() {
+        std::fs::write(guard.base_dir().join("config"), extra_config).unwrap();
+    }
+    let (url, bodies, _) = spawn_stub(script).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (temp, manifest) = plugin_copy();
+    {
+        let prefs = temp.path().join("prefs.json");
+        std::fs::write(
+            &prefs,
+            br#"{"version":1,"favorites":[{"model":"anthropic/claude-fable-5-1","effort":"high"}]}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&prefs, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    host.ext_manager()
+        .write()
+        .await
+        .load_with_cwd("autonomous", &manifest, Some(temp.path().to_path_buf()))
+        .await
+        .unwrap();
+    (host, temp, bodies)
+}
+
+/// A session created against `host` with a caller-tweaked `SessionConfig`, then
+/// attached (returns the `TestActor` and its `SessionHandle`).
+async fn session_cfg(host: &Arc<EngineHost>, cfg: SessionConfig) -> TestActor {
+    let handle = host.create_session(cfg).await.expect("create_session");
+    let (t, _snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    TestActor { t, handle }
+}
+
+/// Anthropic SSE that calls a named tool WITH JSON arguments (input_json_delta),
+/// then stops with `tool_use` — needed to drive `activate_tools` (which requires
+/// a non-empty `tools` array before it raises the host confirmation).
+fn sse_tool_call_with_input(name: &str, id: &str, input_json: &str) -> &'static str {
+    let escaped = input_json.replace('\\', "\\\\").replace('"', "\\\"");
+    Box::leak(
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_p7\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-fable-5-1\",\"stop_reason\":null,",
+                "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{input}\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",",
+                "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            id = id,
+            name = name,
+            input = escaped,
+        )
+        .into_boxed_str(),
+    )
+}
+
+/// Anthropic SSE that calls `prompt_fixture` (raises a host prompt via the
+/// stream's `SecretPromptHandle`) then stops with `tool_use`.
+fn sse_prompt_fixture(id: &str) -> &'static str {
+    Box::leak(
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_pf\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-fable-5-1\",\"stop_reason\":null,",
+                "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"prompt_fixture\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",",
+                "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            id = id,
+        )
+        .into_boxed_str(),
+    )
+}
+
+/// Builtin tool that prompts through the stream's `SecretPromptHandle`. Copied
+/// from `session_actor_differential.rs::PromptFixtureTool`.
+struct PromptFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for PromptFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "prompts"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("stream passes Some(handle)");
+        Ok(match handle.prompt("Secret".into(), "enter secret".into()).await {
+            Some(v) => format!("answered:{}", v.len()),
+            None => "cancelled".to_string(),
+        })
+    }
+}
+
+// Build a Reply::Start from JSON (parse_reply is the public boundary).
+fn start_reply(max_cost_usd: Option<f64>) -> Reply {
+    let mut json = serde_json::json!({
+        "action": "start",
+        "run_id": "p7run",
+        "models": [{"model": "anthropic/claude-fable-5-1", "effort": "high"}],
+        "prompt": "go",
+        "delay_ms": 1000u64,
+    });
+    if let Some(c) = max_cost_usd {
+        json["max_cost_usd"] = serde_json::json!(c);
+    }
+    agent_engine::extensions::session_driver::parse_reply(&json)
+        .expect("valid reply")
+        .expect("some reply")
+}
+
+// ─────────────────────────── S1 ─────────────────────────────────────────────
+
+/// S1: detaching the LAST client revokes the driver grant, releasing the
+/// host-level single-tenancy claim so another session can arm. The revoke
+/// event cannot be observed on the detached client itself, so we prove it via
+/// the grant becoming available again.
+#[tokio::test]
+async fn s1_detach_last_client_revokes_driver_grant() {
+    let (host, _temp) = host_with_plugin().await;
+
+    // Session A arms and holds the single-tenancy grant.
+    let mut a = session(&host).await;
+    a.arm().await;
+
+    // Session B cannot arm while A holds the grant.
+    let mut b = session(&host).await;
+    b.driver_start().await;
+    let ev = b
+        .until(|e| {
+            matches!(
+                e,
+                SessionEventWire::SystemNotice(_) | SessionEventWire::DriverArmed { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(ev, SessionEventWire::SystemNotice(_)),
+        "second session should be refused while A holds the grant, got {ev:?}"
+    );
+
+    // Detach A's only client → S1 revokes A's driver, releasing the grant.
+    a.send(SessionCommand::Detach { client: ClientId(1) }).await;
+
+    // Now B can arm — proof the grant was released by the last-detach revoke.
+    let mut armed = false;
+    for _ in 0..40 {
+        b.driver_start().await;
+        let ev = b
+            .until(|e| {
+                matches!(
+                    e,
+                    SessionEventWire::SystemNotice(_) | SessionEventWire::DriverArmed { .. }
+                )
+            })
+            .await;
+        if matches!(ev, SessionEventWire::DriverArmed { .. }) {
+            armed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(armed, "grant was not released after last-client detach (S1)");
+    b.end().await;
+}
+
+/// S1: detaching a NON-last client leaves the driver armed (the gate fires only
+/// at the zero-clients transition). A second session stays refused because A
+/// still holds the grant.
+#[tokio::test]
+async fn s1_detach_nonlast_client_keeps_driver() {
+    let (host, _temp) = host_with_plugin().await;
+    let mut a = session(&host).await;
+    // Attach a second client to A (owner stays ClientId(1)).
+    let (mut a2, _snap) =
+        LocalTransport::attach(a.handle.clone(), ClientMeta::new(ClientKind::Attach))
+            .await
+            .unwrap();
+    a.arm().await;
+
+    // Detach the SECOND client (non-last) — a client remains, no revoke.
+    a2.send(SessionCommand::Detach { client: ClientId(2) })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A still holds the grant: a fresh session is refused.
+    let mut b = session(&host).await;
+    b.driver_start().await;
+    let ev = b
+        .until(|e| {
+            matches!(
+                e,
+                SessionEventWire::SystemNotice(_) | SessionEventWire::DriverArmed { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(ev, SessionEventWire::SystemNotice(_)),
+        "driver was wrongly revoked on a non-last detach (S1), B armed: {ev:?}"
+    );
+    b.end().await;
+    a.end().await;
+}
+
+/// S1: after a zero-client revoke, re-attaching and re-arming works cleanly.
+#[tokio::test]
+async fn s1_rearm_after_zero_client_revoke() {
+    let (host, _temp) = host_with_plugin().await;
+    let mut a = session(&host).await;
+    a.arm().await;
+
+    // Detach the only client → revoke.
+    a.send(SessionCommand::Detach { client: ClientId(1) }).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Re-attach a new client and arm again.
+    let (t2, _snap) = LocalTransport::attach(a.handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    let mut a2 = TestActor { t: t2, handle: a.handle.clone() };
+    a2.arm().await; // panics on timeout if re-arm failed
+    a2.end().await;
+}
+
+/// S1: a pending host confirmation is fail-closed answered `None` (deny) when
+/// the LAST client detaches, so the session does not zombie-block on a prompt
+/// with nobody to answer it. Verified via the re-attach snapshot showing the
+/// prompt was drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s1_pending_prompt_fail_closed_on_last_detach() {
+    let guard = HomeGuard::new();
+    // Turn calls prompt_fixture → raises a prompt; a follow-up SSE would end
+    // the turn once the (auto-denied) prompt resolves.
+    let bodies: &'static [&'static str] =
+        Box::leak(Box::new([sse_prompt_fixture("toolu_p7pf"), ANTHROPIC_SSE]));
+    let (host, _temp, _b) = stub_host(&guard, Script::SeqSse(bodies), "").await;
+    host.parts().tools.write().await.register(Arc::new(PromptFixtureTool));
+
+    let mut a = session_cfg(
+        &host,
+        SessionConfig {
+            model_override: Some("anthropic/claude-fable-5-1".into()),
+            persist: false,
+            ..SessionConfig::default()
+        },
+    )
+    .await;
+
+    // Normal (foreground) turn that raises a prompt.
+    a.send(SessionCommand::Submit { text: "go".into(), attachments: vec![] })
+        .await;
+    a.until(|e| matches!(e, SessionEventWire::Prompt(_))).await;
+
+    // Detach the only client → S1 fail-closed drains the prompt (None).
+    a.send(SessionCommand::Detach { client: ClientId(1) }).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Re-attach: the prompt must be gone (drained), not stuck pending.
+    let (mut t2, snap) =
+        LocalTransport::attach(a.handle.clone(), ClientMeta::new(ClientKind::Test))
+            .await
+            .unwrap();
+    assert!(
+        snap.pending_prompts.is_empty(),
+        "pending prompt was not fail-closed on last detach (S1): {:?}",
+        snap.pending_prompts
+    );
+    t2.send(SessionCommand::End {
+        reason: agent_engine::session::EndReason::ClientQuit,
+    })
+    .await
+    .ok();
+}
+
+// ─────────────────────────── S3 ─────────────────────────────────────────────
+
+/// S3: a session-cost breach cancels the turn, revokes the driver, and emits
+/// `CostCapReached{scope:"session"}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s3_session_cost_cap_breach_revokes_and_emits() {
+    let guard = HomeGuard::new();
+    let (host, _temp, _b) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+
+    // Tiny cap: one turn's usage (fable pricing) exceeds it immediately.
+    let mut a = session_cfg(
+        &host,
+        SessionConfig {
+            persist: false,
+            max_session_cost: Some(0.00001),
+            ..SessionConfig::default()
+        },
+    )
+    .await;
+    a.arm().await;
+
+    let mut saw_cap = false;
+    let mut saw_revoke = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while std::time::Instant::now() < deadline && !(saw_cap && saw_revoke) {
+        let env = match tokio::time::timeout(Duration::from_secs(20), a.t.next_event()).await {
+            Ok(Some(env)) => env,
+            _ => break,
+        };
+        match env.event {
+            SessionEventWire::CostCapReached { scope, cost, cap } => {
+                assert_eq!(scope, "session", "expected session-scope breach");
+                assert!(cost >= cap, "reported cost {cost} below cap {cap}");
+                saw_cap = true;
+            }
+            SessionEventWire::DriverRevoked { reason, .. } => {
+                assert!(
+                    reason.contains("cost cap"),
+                    "revoke reason not cost-related: {reason}"
+                );
+                saw_revoke = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_cap, "no CostCapReached emitted on session breach (S3)");
+    assert!(saw_revoke, "driver not revoked on cost breach (S3)");
+    a.end().await;
+}
+
+/// S3: an unbounded (very-high-cap) session keeps running driver turns — the
+/// circuit breaker does not trip on normal spend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s3_high_cost_cap_still_runs_turns() {
+    let guard = HomeGuard::new();
+    let (host, _temp, _b) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+
+    let mut a = session_cfg(
+        &host,
+        SessionConfig {
+            persist: false,
+            max_session_cost: Some(1_000.0), // effectively unbounded here
+            ..SessionConfig::default()
+        },
+    )
+    .await;
+    a.arm().await;
+
+    let mut outcomes = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while outcomes < 2 && std::time::Instant::now() < deadline {
+        let env = match tokio::time::timeout(Duration::from_secs(20), a.t.next_event()).await {
+            Ok(Some(env)) => env,
+            _ => break,
+        };
+        match env.event {
+            SessionEventWire::CostCapReached { .. } => {
+                panic!("cost cap tripped under a 1000-USD ceiling (S3)");
+            }
+            SessionEventWire::DriverTurnOutcome { outcome, .. } => {
+                assert!(matches!(outcome, Outcome::Success));
+                outcomes += 1;
+            }
+            SessionEventWire::DriverRevoked { reason, .. } => {
+                panic!("driver revoked unexpectedly under a high cap: {reason}");
+            }
+            _ => {}
+        }
+    }
+    assert!(outcomes >= 2, "high-cap driver did not complete >=2 turns, saw {outcomes}");
+    a.send(SessionCommand::Cancel).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        a.until(|e| matches!(e, SessionEventWire::DriverRevoked { .. })),
+    )
+    .await;
+    a.end().await;
+}
+
+/// S3: the effective per-run cap is `min(plugin proposal, host cap)` — the
+/// plugin may only lower, never raise, a host limit.
+#[test]
+fn s3_grant_effective_cost_cap_takes_minimum() {
+    // Plugin proposes 0.50.
+    let (grant, _p) = Grant::from_start("plugin", "sess", start_reply(Some(0.50))).unwrap();
+    assert_eq!(grant.max_cost_usd, Some(0.50));
+    assert_eq!(grant.effective_cost_cap(Some(0.20)), Some(0.20)); // host lower wins
+    assert_eq!(grant.effective_cost_cap(Some(1.00)), Some(0.50)); // plugin lower wins
+    assert_eq!(grant.effective_cost_cap(None), Some(0.50)); // plugin alone
+
+    // No plugin proposal: host cap stands alone; unbounded when both absent.
+    let (bare, _p2) = Grant::from_start("plugin", "sess", start_reply(None)).unwrap();
+    assert_eq!(bare.max_cost_usd, None);
+    assert_eq!(bare.effective_cost_cap(Some(0.30)), Some(0.30));
+    assert_eq!(bare.effective_cost_cap(None), None);
+}
+
+/// S3: a plugin-proposed `max_cost_usd` is captured onto the grant at arm.
+#[test]
+fn s3_grant_from_start_captures_plugin_max_cost() {
+    let (grant, _p) = Grant::from_start("plugin", "sess", start_reply(Some(2.5))).unwrap();
+    assert_eq!(grant.max_cost_usd, Some(2.5));
+}
+
+/// S3: `PollRequest` carries `session_cost_so_far` (present when set, omitted
+/// when `None` — additive/back-compatible on the wire).
+#[test]
+fn s3_pollrequest_serializes_session_cost_so_far() {
+    let with = PollRequest {
+        run_id: "r".into(),
+        decision_id: "d".into(),
+        outcome: Outcome::Success,
+        error_kind: "none".into(),
+        model: "m".into(),
+        effort: "high".into(),
+        feedback: None,
+        session_id: Some("s".into()),
+        session_cost_so_far: Some(1.5),
+    };
+    let v = serde_json::to_value(&with).unwrap();
+    assert_eq!(v["session_cost_so_far"], serde_json::json!(1.5));
+
+    let without = PollRequest { session_cost_so_far: None, ..with };
+    let v2 = serde_json::to_value(&without).unwrap();
+    assert!(
+        v2.get("session_cost_so_far").is_none(),
+        "None session_cost_so_far must be omitted from the wire"
+    );
+}
+
+/// S3: the new `CostCapReached` wire event survives the SessionEventWire ↔
+/// WireSessionEvent mirror (both `From` arms), preserving its fields.
+#[test]
+fn s3_costcapreached_wire_mirror_roundtrips() {
+    use agent_engine::session::wire::WireSessionEvent;
+    let ev = SessionEventWire::CostCapReached {
+        scope: "run".into(),
+        cost: 1.25,
+        cap: 0.75,
+    };
+    let wire: WireSessionEvent = ev.into();
+    let back: SessionEventWire = wire.into();
+    match back {
+        SessionEventWire::CostCapReached { scope, cost, cap } => {
+            assert_eq!(scope, "run");
+            assert_eq!(cost, 1.25);
+            assert_eq!(cap, 0.75);
+        }
+        other => panic!("CostCapReached did not survive the wire mirror: {other:?}"),
+    }
+}
+
+// ─────────────────────────── S9 ─────────────────────────────────────────────
+
+/// S9: even when the session config sets `auto_approve_confirms = true`, a
+/// driver-armed turn keeps ordinary tool-activation gates in force — the model's
+/// `activate_tools` request raises the host confirmation prompt instead of being
+/// silently auto-approved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s9_armed_driver_forces_gating_despite_auto_approve() {
+    let guard = HomeGuard::new();
+    // Driver turn calls activate_tools with a valid id → the tool asks the host
+    // to confirm (activation_confirm = prompt) UNLESS auto-approved.
+    let sse = sse_tool_call_with_input("activate_tools", "toolu_p7at", r#"{"tools":["ns:fake"]}"#);
+    let (host, _temp, _b) = stub_host(
+        &guard,
+        Script::Sse(sse),
+        "tools.activation_confirm = prompt\n",
+    )
+    .await;
+
+    let mut a = session_cfg(
+        &host,
+        SessionConfig {
+            persist: false,
+            auto_approve_confirms: true, // would bypass the gate on a normal turn
+            ..SessionConfig::default()
+        },
+    )
+    .await;
+    a.arm().await;
+
+    // The armed driver forces auto-approve off → a host prompt is raised.
+    let ev = tokio::time::timeout(
+        Duration::from_secs(40),
+        a.until(|e| {
+            matches!(
+                e,
+                SessionEventWire::Prompt(_) | SessionEventWire::DriverRevoked { .. }
+            )
+        }),
+    )
+    .await
+    .expect("no Prompt/revoke before deadline (S9)");
+    assert!(
+        matches!(ev, SessionEventWire::Prompt(_)),
+        "armed driver auto-approved tool activation (S9), got {ev:?}"
+    );
+    a.send(SessionCommand::Cancel).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        a.until(|e| matches!(e, SessionEventWire::DriverRevoked { .. })),
+    )
+    .await;
+    a.end().await;
+}
+
+/// S9 control: on an UNARMED session, `auto_approve_confirms = true` DOES bypass
+/// the activation gate (no host prompt), proving the armed case above is the
+/// override at work — not an environment quirk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn s9_unarmed_auto_approve_bypasses_activation_gate() {
+    let guard = HomeGuard::new();
+    let sse = sse_tool_call_with_input("activate_tools", "toolu_p7c", r#"{"tools":["ns:fake"]}"#);
+    let bodies: &'static [&'static str] = Box::leak(Box::new([sse, ANTHROPIC_SSE]));
+    let (host, _temp, _b) = stub_host(
+        &guard,
+        Script::SeqSse(bodies),
+        "tools.activation_confirm = prompt\n",
+    )
+    .await;
+
+    let mut a = session_cfg(
+        &host,
+        SessionConfig {
+            model_override: Some("anthropic/claude-fable-5-1".into()),
+            persist: false,
+            auto_approve_confirms: true,
+            ..SessionConfig::default()
+        },
+    )
+    .await;
+
+    // Foreground turn (no driver): auto-approve is honoured → no host prompt.
+    a.send(SessionCommand::Submit { text: "go".into(), attachments: vec![] })
+        .await;
+    let ev = tokio::time::timeout(
+        Duration::from_secs(40),
+        a.until(|e| {
+            matches!(
+                e,
+                SessionEventWire::Prompt(_)
+                    | SessionEventWire::Idle
+                    | SessionEventWire::Stream(agent_engine::StreamEvent::Session(
+                        agent_engine::SessionEvent::Done
+                    ))
+            )
+        }),
+    )
+    .await
+    .expect("turn neither prompted nor finished (S9 control)");
+    assert!(
+        !matches!(ev, SessionEventWire::Prompt(_)),
+        "unarmed auto-approve session raised a prompt — the gate was not bypassed (S9 control)"
+    );
+    a.end().await;
 }
