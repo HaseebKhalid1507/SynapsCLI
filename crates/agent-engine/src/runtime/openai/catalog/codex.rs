@@ -96,6 +96,21 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
         m.provider_kind = CatalogProviderKind::OpenAiCodex;
         m.label = Some(label.to_string());
         m.reasoning = codex_static_capability(id).unwrap_or(ReasoningSupport::Unknown);
+        // Exact input-modality evidence from the official local Codex cache,
+        // verified 2026-09-05. Do not infer from generation/family names:
+        // gpt-5.4 was not observed, and spark explicitly advertises text only.
+        if matches!(
+            id,
+            "gpt-6-astra"
+                | "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-5.6-luna"
+                | "gpt-5.5"
+                | "gpt-5.4-mini"
+        ) {
+            m.input_modalities.push(Modality::Image);
+        }
+        // No static row has observed File support.
         m.source = CatalogSource::StaticFallback;
         Some(m)
     })
@@ -139,6 +154,9 @@ struct CodexModelItem {
     supported_in_api: Option<bool>,
     #[serde(default)]
     context_window: Option<u64>,
+    /// Exact advertised inputs. Absence must not inherit static image support.
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
     /// Live catalog reasoning metadata.
     #[serde(default)]
     supported_reasoning_levels: Option<Vec<CodexReasoningLevelItem>>,
@@ -259,6 +277,11 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
             m.provider_kind = CatalogProviderKind::OpenAiCodex;
             m.label = item.display_name.filter(|name| !name.trim().is_empty());
             m.context_tokens = item.context_window;
+            if let Some(modalities) = item.input_modalities {
+                // Even an explicit empty/text-only list is authoritative. Unknown
+                // tokens remain Other and never authorize a supported modality.
+                m.input_modalities = modalities.iter().map(|m| Modality::from_str(m)).collect();
+            }
             m.reasoning = reasoning;
             m.source = CatalogSource::Live;
             Some(m)

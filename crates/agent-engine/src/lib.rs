@@ -4,10 +4,12 @@
 pub mod engine;
 pub mod events;
 pub mod extensions;
+pub mod attachments;
 pub mod daemon;
 pub mod help;
 pub mod host;
 pub mod mcp;
+pub mod memory_backend;
 pub mod runtime;
 pub mod session;
 pub mod sidecar;

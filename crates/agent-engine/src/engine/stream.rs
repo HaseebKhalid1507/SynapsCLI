@@ -207,6 +207,9 @@ pub fn process_stream_event_with_terminal_capture(
             EngineStreamEvent::ToolResult { tool_id, result },
             StreamCompletion::Continue,
         ),
+        // merge(112): handled in phase 3 (stream.rs integration)
+        StreamEvent::Llm(LlmEvent::ResponseStart) => (EngineStreamEvent::Noop, StreamCompletion::Continue),
+        StreamEvent::Llm(LlmEvent::ResponseReset) => (EngineStreamEvent::Noop, StreamCompletion::Continue),
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             *messages = history;
             (EngineStreamEvent::Noop, StreamCompletion::Continue)
@@ -349,6 +352,10 @@ pub fn process_stream_event_with_terminal_capture(
                 EngineStreamEvent::Error(err.message.clone()),
                 StreamCompletion::Error(err),
             )
+        }
+        // merge(112): handled in phase 9 (Wall 1 — actor-owned checkpoint persistence)
+        StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {
+            (EngineStreamEvent::Noop, StreamCompletion::Continue)
         }
     }
 }
