@@ -55,7 +55,7 @@ never spawns it. Sidecar binary located via config.executable or
 | clippy | ✅ `-D warnings` clean (synaps-engine, synaps) |
 | two-sided | ✅ no conflict markers |
 
-## Tests restore — JR dropped unit tests
+## Tests restore — upstream dropped unit tests
 | commit | 97b24617 |
 |--------|----------|
 | files  | `stream.rs`, `translate.rs`, `codex.rs` (unit); `turn_budget_stream.rs` (attempted, reverted) |
@@ -72,7 +72,7 @@ never spawns it. Sidecar binary located via config.executable or
 | files  | 57 auto-merged engine/src files taken from ref-merge; 16 residual (ours-only, justified) |
 | source | 8bdabd4a |
 | check  | ✅ `cargo check --workspace --all-targets --locked` |
-| engine | ✅ 2096 pass (+64 from JR), 12 ignored, 0 fail (lib only) |
+| engine | ✅ 2096 pass (+64 from upstream), 12 ignored, 0 fail (lib only) |
 | core   | ✅ 732 pass |
 | workspace | ✅ no new failures; known: autonomous_plugin (7, fixture), extensions_contract (1, updated), continuous_memory_adversarial (1, recall fixture) |
 | clippy | ✅ `-D warnings` clean (synaps-engine, synaps, synaps-core) |

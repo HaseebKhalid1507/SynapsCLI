@@ -2,7 +2,7 @@
 
 > **Wall 2 executable spec** for #112 `feat/context-continuation` onto daemon-mode dev.
 > Derived from code; every claim cites `path:line` on the build worktree
-> (`112-build/`) or `git show origin/feat/context-continuation:<path>` for JR's
+> (`112-build/`) or `git show origin/feat/context-continuation:<path>` for upstream's
 > TUI half. **FACT** = read in code. **INFERENCE** = judgment from code evidence.
 > Conventions follow A/B/D.
 
@@ -191,7 +191,7 @@ pub(crate) driver_suspend_deadline: Option<tokio::time::Instant>,
 | **Any non-driver command** | `driver_revoke("explicit user action")` | TUI dispatch.rs:141 |
 | **`NewSession`** | `driver_revoke("session replaced")` | TUI app.rs:575 |
 | **`End`** | `driver_revoke("session ending")` | TUI mod.rs:348 |
-| **`Checkpoint{Reload}`** | `driver_revoke("daemon reload")` BEFORE save | JR spec session-drivers.md:206-208, D-security S10 |
+| **`Checkpoint{Reload}`** | `driver_revoke("daemon reload")` BEFORE save | upstream spec session-drivers.md:206-208, D-security S10 |
 | **Park** | Never happens while armed — `can_park()` returns false (see §3) | actor.rs:763-776 + new guard |
 | **Detach (last client)** | Suspend-and-timeout — see §3 S1 gate | SYNTHESIS decision 4 |
 | **Grant expired** | `driver_revoke("grant deadline reached")` in `driver_tick()` | TUI :716 |
@@ -204,7 +204,7 @@ pub(crate) driver_suspend_deadline: Option<tokio::time::Instant>,
 `keep_warm`, `lifecycle`, `settings_replay`, `model`, `thinking_level`. It
 does NOT carry any driver state.
 
-**Decision (derived from D-security S10 + JR spec :206-208)**: Driver state is
+**Decision (derived from D-security S10 + upstream spec :206-208)**: Driver state is
 **never persisted in the reload record**. `checkpoint()` (`actor.rs:1978-2010`)
 explicitly revokes the driver (`driver_revoke("daemon reload")`) before saving.
 The new process starts clean — no driver, no grant. Plugin's `initialize()`
@@ -338,12 +338,12 @@ tick. No special handling needed.
 
 **Mechanism — detach with live driver**
 
-**Decision (derived from SYNTHESIS + S5 + JR spec)**: Driver **keeps the session warm** during the suspend window. Park is blocked.
+**Decision (derived from SYNTHESIS + S5 + upstream spec)**: Driver **keeps the session warm** during the suspend window. Park is blocked.
 
 - Add to `can_park()` (`actor.rs:763`): `&& self.driver.is_none()`.
 - **INFERENCE**: This is equivalent to implicit `keep_warm` while armed. When
   the driver is revoked (or the suspend timeout fires from S1), the park timer
-  can arm normally. JR's `keep_warm` field on `SessionConfig` (:161) already
+  can arm normally. upstream's `keep_warm` field on `SessionConfig` (:161) already
   exists for explicit pinning; the driver adds a dynamic equivalent via the
   `can_park()` guard.
 
@@ -368,7 +368,7 @@ nobody returns.
 
 - `session/types.rs:139`: `pub auto_approve_confirms: bool` on `SessionConfig`, default `false`.
 - `actor.rs:1044`: passed directly to `run_stream_with_messages`. When `true`, `runtime/stream.rs:28-41` returns `(ModelConfirmed, false)` — ALL tool activations auto-approved.
-- JR spec `session-drivers.md:25-26`: "Ordinary tool approval [...] gates still apply."
+- upstream spec `session-drivers.md:25-26`: "Ordinary tool approval [...] gates still apply."
 
 **SYNTHESIS (implicit from D-security S9)**: driver-armed sessions MUST NOT auto-approve.
 
@@ -435,9 +435,9 @@ importing it; the actor's `driver.rs` imports from the engine crate directly.
 
 ---
 
-## §5 — What we need from JR
+## §5 — What we need from upstream
 
-1. **`feedback.rs` crate placement**: It imports `synaps_cli::{LlmEvent, StreamEvent}` — types originating in `agent-core`. Moving it to `engine/extensions/feedback.rs` should be a pure re-path with no functional change. **Confirm no TUI-only types are used internally** (INFERENCE: none found, but JR may have an intent for crate boundaries).
+1. **`feedback.rs` crate placement**: It imports `synaps_cli::{LlmEvent, StreamEvent}` — types originating in `agent-core`. Moving it to `engine/extensions/feedback.rs` should be a pure re-path with no functional change. **Confirm no TUI-only types are used internally** (INFERENCE: none found, but upstream may have an intent for crate boundaries).
 
 2. **`PollRequest` extension with `session_id`**: D-security S2 says the poll must carry `session_id` for multi-session safety. Single-tenancy (SYNTHESIS decision 3) prevents concurrent runs, so `session_id` is belt-and-suspenders. **Should `session_id` land in the poll frame now (additive, backward-compatible) or wait for multi-tenancy B-phase?** Determines whether the plugin contract changes.
 

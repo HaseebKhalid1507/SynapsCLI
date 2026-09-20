@@ -301,7 +301,7 @@ pub struct Runtime {
     /// `models::context_window_for_model`. Lets users cap context at e.g.
     /// 200k even on models that natively support 1M.
     context_window_override: Option<u64>,
-    /// Opt-in context windows within a stable logical session (JR #112).
+    /// Opt-in context windows within a stable logical session (#112).
     /// DARK by default: `ContextManagementMode::Off`.
     pub(crate) continuation: continuation::SharedContinuation,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
@@ -359,7 +359,7 @@ pub struct Runtime {
     /// memory-context state from a parent runtime into a freshly
     /// constructed one.
     memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
-    /// Immutable host-owned note backend and captured project scope (JR #112).
+    /// Immutable host-owned note backend and captured project scope (#112).
     /// DARK by default: `MemoryBinding::legacy_current()`.
     memory_backend: crate::memory_backend::MemoryBinding,
     /// First explicit host selection; never replace the captured binding.
@@ -986,7 +986,7 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
-            // DARK defaults: legacy memory backend, continuation off (JR #112).
+            // DARK defaults: legacy memory backend, continuation off (#112).
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_backend_config: None,
             memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2355,7 +2355,7 @@ impl Runtime {
     }
 
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
-        // JR #112: apply memory backend config early (binding is immutable once set).
+        // #112: apply memory backend config early (binding is immutable once set).
         self.apply_memory_backend_config(&config.memory_backend);
         if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
             || self

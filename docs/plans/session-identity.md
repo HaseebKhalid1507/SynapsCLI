@@ -48,7 +48,7 @@ T10 --continue follows compacted_into; predecessor lock (F24)   independent
 T11 SO_PEERCRED uid check + SYNAPS_* split                       last
 ```
 
-Risk-first: T1–T3 first (the promise), then T5 (the only place secrets touch disk), then T6 (the protocol bump — JR in the loop).
+Risk-first: T1–T3 first (the promise), then T5 (the only place secrets touch disk), then T6 (the protocol bump — upstream in the loop).
 
 ---
 
@@ -117,7 +117,7 @@ Risk-first: T1–T3 first (the promise), then T5 (the only place secrets touch d
 
 ## Task 6: Extension protocol — per-call session env/cwd + manifest opt-in
 
-**Description:** Add `session: { id, cwd, env }` to the tool-call and hook frames sent to sidecars (`extensions/hooks/mod.rs:1117` currently sends `cwd: None`). Add manifest field `session_env: bool` (default false). Document in `docs/extensions/protocol.md` + a new `docs/extensions/session-env.md`: "if you spawn subprocesses, apply `session.env`/`session.cwd`; declare `session_env: true`." Bump protocol minor; additive, old sidecars ignore the field. Spec reviewed by JR before merge (touches every Praxis plugin).
+**Description:** Add `session: { id, cwd, env }` to the tool-call and hook frames sent to sidecars (`extensions/hooks/mod.rs:1117` currently sends `cwd: None`). Add manifest field `session_env: bool` (default false). Document in `docs/extensions/protocol.md` + a new `docs/extensions/session-env.md`: "if you spawn subprocesses, apply `session.env`/`session.cwd`; declare `session_env: true`." Bump protocol minor; additive, old sidecars ignore the field. Spec reviewed by upstream before merge (touches every Praxis plugin).
 
 **Acceptance criteria:**
 - [ ] A test sidecar that echoes `session.env.JT_MARK` returns the creator's value for two different sessions in one daemon (no bleed).
@@ -137,7 +137,7 @@ Risk-first: T1–T3 first (the promise), then T5 (the only place secrets touch d
 **Dependencies:** T6 · **Files:** `extensions/manager.rs`, `extensions/loader.rs`, plugin manifests, `cmd/daemon.rs` · **Scope:** M
 
 ### Checkpoint C (after T6–T7)
-- [ ] JR sign-off on the protocol addition; Praxis plugin inventory checked for subprocess spawners.
+- [ ] upstream sign-off on the protocol addition; Praxis plugin inventory checked for subprocess spawners.
 
 ## Task 8: Quit-while-streaming is loud (F27)
 
@@ -187,7 +187,7 @@ Risk-first: T1–T3 first (the promise), then T5 (the only place secrets touch d
 |---|---|---|
 | 1 | T1 → T2 → T3 | sequential, one implementer; T3 written *first* as a failing test if the implementer prefers TDD |
 | 2 | T4 ∥ T5 ∥ T8 ∥ T9 ∥ T10 | independent; five worktrees; all rebase on wave 1 |
-| 3 | T6 → T7 | protocol bump; spec to JR before code; SDK MR in `synaps-skills` |
+| 3 | T6 → T7 | protocol bump; spec to upstream before code; SDK MR in `synaps-skills` |
 | 4 | T11 | after everything else is stable |
 
 Every task: build on bella only; `cargo test --workspace --locked` + clippy `-D warnings` on touched crates; live re-run of the matching soak script (`/tmp/jt-h*.sh` family, to be checked into `scripts/soak/`).
