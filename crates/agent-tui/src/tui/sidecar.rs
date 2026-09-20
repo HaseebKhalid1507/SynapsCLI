@@ -23,8 +23,10 @@ use synaps_cli::sidecar::spawn::SidecarSpawnArgs;
 
 use super::app::{App, ChatMessage};
 
+#[allow(dead_code)]
 type ExtensionManager =
     std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>;
+#[allow(dead_code)]
 type CommandRegistry = synaps_cli::skills::registry::CommandRegistry;
 const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -32,6 +34,7 @@ const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Own the task rather than detaching it: shutdown, cancellation and a dropped
 /// completion all drop the manager, which kills the child and aborts readers.
+#[allow(dead_code)] // wired in mod.rs (next_startup arm); dispatch integration pending
 pub(crate) struct SidecarStartup {
     pub task: tokio::task::JoinHandle<Result<SidecarUiState, String>>,
     pub sidecar: DiscoveredSidecar,
@@ -45,6 +48,7 @@ impl Drop for SidecarStartup {
 }
 
 impl SidecarStartup {
+    #[allow(dead_code)]
     pub fn start(
         sidecar: DiscoveredSidecar,
         has_extension: bool,
@@ -88,6 +92,7 @@ impl SidecarStartup {
     }
 }
 
+#[allow(dead_code)]
 fn spawn_args_unsupported(error: &str) -> bool {
     matches!(
         error,
@@ -98,12 +103,14 @@ fn spawn_args_unsupported(error: &str) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn loading_message(label: &str) -> String {
     format!("{label}: still loading — try the toggle again when ready")
 }
 
 /// Non-blocking half of the toggle path. All filesystem discovery came from
 /// the filtered boot registry; lock waits, RPC and process startup run off-loop.
+#[allow(dead_code)]
 pub(crate) async fn toggle(
     app: &mut App,
     plugin_id: Option<String>,
@@ -276,6 +283,7 @@ fn drain_events(app: &mut App, pid: &str) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn retain_enabled(app: &mut App, registry: &CommandRegistry) {
     let enabled = registry.sidecars();
     app.sidecar_starts
@@ -284,6 +292,7 @@ pub(crate) fn retain_enabled(app: &mut App, registry: &CommandRegistry) {
         .retain(|_, state| enabled.contains(&state.sidecar));
 }
 
+#[allow(dead_code)]
 pub(crate) fn status(app: &App, plugin_id: Option<&str>, registry: &CommandRegistry) -> String {
     if app.sidecars_disabled {
         return "Sidecars are disabled (--no-extensions).".into();
@@ -883,6 +892,7 @@ for line in sys.stdin:
             Arc::new(tokio::sync::RwLock::new(manager))
         }
 
+        #[allow(dead_code)] // used by extended tests (slow_hello, etc.)
         async fn wait_for(mut condition: impl FnMut() -> bool) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !condition() {
@@ -892,6 +902,7 @@ for line in sys.stdin:
             .await
             .expect("fixture condition timed out");
         }
+        #[allow(dead_code)]
         fn text(path: &Path) -> String {
             std::fs::read_to_string(path).unwrap_or_default()
         }

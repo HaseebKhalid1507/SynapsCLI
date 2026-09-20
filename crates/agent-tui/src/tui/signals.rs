@@ -362,6 +362,6 @@ mod budget_tests {
         assert_eq!(actor_worst_case, 11);
         assert!(SESSION_END_TIMEOUT_SECS > actor_worst_case);
         assert!(SESSION_END_TIMEOUT_SECS >= actor_worst_case + SESSION_END_MARGIN_SECS);
-        assert!(SESSION_END_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS);
+        const { assert!(SESSION_END_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS) };
     }
 }
