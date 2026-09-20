@@ -263,6 +263,11 @@ pub(crate) struct App {
     /// Phase 8 8B: replaces the legacy single `Option<SidecarUiState>` so
     /// multiple plugin-claimed sidecars can be hosted concurrently.
     pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
+    /// Non-blocking sidecar startups in flight. Polled by `sidecar::next_startup()`
+    /// in the event loop (in-process path only; G Q1).
+    pub(crate) sidecar_starts: std::collections::HashMap<String, super::sidecar::SidecarStartup>,
+    /// True when `--no-extensions` was passed — sidecars are fully disabled.
+    pub(crate) sidecars_disabled: bool,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     /// Stored behind `Arc` so the per-frame snapshot is a refcount bump, not a deep clone.
     pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
@@ -439,6 +444,8 @@ impl App {
             model_list_rx: model_list_rx_init,
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
+            sidecar_starts: std::collections::HashMap::new(),
+            sidecars_disabled: false,
             active_tasks: std::sync::Arc::new(
                 synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             ),
