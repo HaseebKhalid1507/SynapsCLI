@@ -96,13 +96,16 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
+        super::attachments::validate_messages(model, messages).map_err(RuntimeError::Config)?;
+        let wire_messages = super::continuation::wire_messages(messages);
+        let messages = wire_messages.as_deref().unwrap_or(messages);
         // Route through OpenAI-compat provider if model resolves to one.
         // This synchronous facade consumes only the final response value, so
         // high-volume display deltas are suppressed at the provider boundary.
         let tools_schema = tools.tools_schema();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        if let Some(result) = crate::runtime::openai::try_route(
+        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
             model,
             client,
             &tools_schema,
@@ -120,6 +123,7 @@ impl ApiMethods {
             options.codex_request_role,
             options.tool_session_id.as_ref(),
             options.session_tool_set.as_ref(),
+            options.memory_backend.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )
@@ -533,7 +537,7 @@ impl ApiMethods {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let routed_system_prompt = Some(system_prompt.to_string());
-        if let Some(result) = crate::runtime::openai::try_route(
+        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
             model,
             client,
             &tools_schema,
@@ -557,6 +561,7 @@ impl ApiMethods {
             // default-core gate identity — never to ungated execution.
             None,
             None,
+            options.memory_backend.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )

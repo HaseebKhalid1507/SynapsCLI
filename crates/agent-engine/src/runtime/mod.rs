@@ -3399,6 +3399,7 @@ impl Runtime {
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
+                    memory_backend: None,
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -3918,6 +3919,7 @@ impl Runtime {
         let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
+            memory_backend: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),

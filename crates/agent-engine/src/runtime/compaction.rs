@@ -152,7 +152,9 @@ pub fn render_compaction_input(
     for msg in api_messages {
         match msg["role"].as_str() {
             Some("user") => {
-                if let Some(content) = msg["content"].as_str() {
+                if let Some(content) =
+                    agent_core::session::user_content_for_display(&msg["content"])
+                {
                     // Reactor-injected events carry the canonical
                     // `<event …>` envelope — that is the EventData class.
                     if content.trim_start().starts_with("<event") {
@@ -169,8 +171,10 @@ pub fn render_compaction_input(
                         present.insert(ContentClass::UserText);
                         parts.push(format!("[User]: {}", content));
                     }
-                } else if let Some(content) = msg["content"].as_array() {
-                    // Tool results are shaped as user messages with tool_result blocks.
+                }
+                if let Some(content) = msg["content"].as_array() {
+                    // Tool results remain separately classed even in a mixed
+                    // user turn. The user projection never descends into them.
                     if policy.excludes(ContentClass::ToolResults) {
                         continue;
                     }
@@ -182,7 +186,9 @@ pub fn render_compaction_input(
                                 .or_else(|| {
                                     block["content"]
                                         .as_array()
-                                        .and_then(|a| a.first())
+                                        .and_then(|a| {
+                                            a.iter().find(|b| b["type"].as_str() == Some("text"))
+                                        })
                                         .and_then(|b| b["text"].as_str())
                                 })
                                 .unwrap_or("");
@@ -449,19 +455,23 @@ fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolic
     let mut tail: Vec<String> = Vec::new();
 
     for msg in api_messages {
-        match (msg["role"].as_str(), msg["content"].as_str()) {
-            (Some("user"), Some(text)) => {
+        match msg["role"].as_str() {
+            Some("user") => {
+                let Some(text) = agent_core::session::user_content_for_display(&msg["content"])
+                else {
+                    continue;
+                };
                 if text.trim_start().starts_with("<event") {
                     continue;
                 }
                 if goal.is_empty() && !policy.excludes(ContentClass::UserText) {
-                    goal = excerpt(text, 600);
+                    goal = excerpt(&text, 600);
                 }
                 if !policy.excludes(ContentClass::UserText) {
-                    tail.push(format!("[User]: {}", excerpt(text, 300)));
+                    tail.push(format!("[User]: {}", excerpt(&text, 300)));
                 }
             }
-            (Some("assistant"), _) => {
+            Some("assistant") => {
                 if policy.excludes(ContentClass::AssistantText) {
                     continue;
                 }
@@ -920,6 +930,7 @@ pub async fn apply_compaction(
     );
 
     let api_messages = session.api_messages.clone();
+    runtime.reset_context_continuation(&session.id, &api_messages);
     // The transition is fully persisted — count the successful pass through
     // the ONE typed entry (runtime-observable architectural proof).
     TRANSITIONS_APPLIED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1611,6 +1622,96 @@ mod disclosure_tests {
             mode: CompactionMode::Remote,
             exclude: exclude.to_vec(),
         }
+    }
+
+    #[test]
+    fn attachment_projections_keep_user_text_and_labels_in_both_compaction_modes() {
+        let messages: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "early", "content": [
+                    {"type": "text", "text": "TOOL_RESULT_TEXT"},
+                    {"type": "document", "title": "NESTED_TITLE_SENTINEL",
+                     "source": {"type": "text", "data": "NESTED_TEXT_SENTINEL"}},
+                    {"type": "image", "source": {"type": "base64", "data": "NESTED_IMAGE_SENTINEL"}}
+                ]}
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "text", "text": "Review these"},
+                {"type": "image", "source": {"type": "base64", "data": "IMAGE_SENTINEL"}},
+                {"type": "document", "title": "notes.txt",
+                 "source": {"type": "text", "data": "TEXT_DOCUMENT_SENTINEL"}},
+                {"type": "document", "title": "report.pdf",
+                 "source": {"type": "base64", "data": "PDF_SENTINEL"}},
+                {"type": "text", "text": "then compare"},
+                {"type": "tool_result", "tool_use_id": "mixed", "content": [
+                    {"type": "document", "text": "EXTRACTED_SENTINEL",
+                     "source": {"type": "text", "data": "MIXED_DOCUMENT_SENTINEL"}},
+                    {"type": "text", "text": "MIXED_TOOL_RESULT_TEXT"}
+                ]}
+            ]})),
+        ];
+        let original = messages.clone();
+        let projection = "Review these\n[attached image]\n[attached document: notes.txt]\n[attached document: report.pdf]\nthen compare";
+        let rendered = render_compaction_input(&messages, None, &policy(&[]));
+        let local = local_summary(&messages, &policy(&[]));
+        assert!(rendered
+            .prompt_text
+            .contains(&format!("[User]: {projection}")));
+        assert!(local.contains(&format!("## Goal\n{projection}\n")));
+        for text in [&rendered.prompt_text, &local] {
+            assert!(
+                !text.contains("SENTINEL"),
+                "attachment source or nested label leaked"
+            );
+        }
+        assert!(rendered
+            .prompt_text
+            .contains("[Tool result #early]: TOOL_RESULT_TEXT"));
+        assert!(rendered
+            .prompt_text
+            .contains("[Tool result #mixed]: MIXED_TOOL_RESULT_TEXT"));
+        assert!(!rendered.prompt_text.contains("[User]: TOOL_RESULT_TEXT"));
+        assert!(!local.contains("TOOL_RESULT_TEXT"));
+        assert_eq!(
+            rendered.included_classes,
+            vec![ContentClass::UserText, ContentClass::ToolResults]
+        );
+        assert_eq!(messages, original);
+
+        // User and tool-result exclusions remain independent in mixed turns.
+        let no_tools =
+            render_compaction_input(&messages, None, &policy(&[ContentClass::ToolResults]));
+        assert!(no_tools.prompt_text.contains(projection));
+        assert!(!no_tools.prompt_text.contains("TOOL_RESULT_TEXT"));
+        assert_eq!(no_tools.included_classes, vec![ContentClass::UserText]);
+        let no_user = render_compaction_input(&messages, None, &policy(&[ContentClass::UserText]));
+        let local_no_user = local_summary(&messages, &policy(&[ContentClass::UserText]));
+        for text in [&no_user.prompt_text, &local_no_user] {
+            assert!(!text.contains("Review these"));
+            assert!(!text.contains("[attached"));
+            assert!(!text.contains("SENTINEL"));
+        }
+        assert!(no_user.prompt_text.contains("TOOL_RESULT_TEXT"));
+        assert_eq!(no_user.included_classes, vec![ContentClass::ToolResults]);
+    }
+
+    #[test]
+    fn attachment_only_compaction_is_not_dropped_or_classed_as_tool_output() {
+        let messages: Vec<crate::SharedMessage> = vec![Arc::new(json!({
+            "role": "user", "content": [
+                {"type": "image", "source": {"data": "IMAGE_SENTINEL"}},
+                {"type": "document", "title": "notes.txt",
+                 "source": {"type": "text", "data": "DOCUMENT_SENTINEL"}}
+            ]
+        }))];
+        let rendered =
+            render_compaction_input(&messages, None, &policy(&[ContentClass::ToolResults]));
+        let local = local_summary(&messages, &policy(&[]));
+        for text in [&rendered.prompt_text, &local] {
+            assert!(text.contains("[attached image]\n[attached document: notes.txt]"));
+            assert!(!text.contains("SENTINEL"));
+        }
+        assert_eq!(rendered.included_classes, vec![ContentClass::UserText]);
     }
 
     #[test]
