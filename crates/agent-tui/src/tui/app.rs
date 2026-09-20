@@ -169,6 +169,10 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// Transient status text shown in the header bar (auto-cleared when streaming starts)
     pub(crate) status_text: Option<String>,
+    /// (E-P8) Thin session-driver client state: "driver armed" mirror, set
+    /// purely from `DriverArmed`/`DriverRevoked` wire events. Gates Esc/Ctrl-C
+    /// routing and the status toast. The actor owns all driver lifecycle.
+    pub(crate) driver_ui: super::driver_client::DriverUiState,
     /// GamblersDen child process — spawned by /gamba, killed when streaming finishes
     pub(crate) gamba_child: Option<std::process::Child>,
     /// Active settings modal state (Some while /settings is open).
@@ -404,6 +408,7 @@ impl App {
             pasted_char_count: 0,
             spinner_frame: 0,
             status_text: None,
+            driver_ui: super::driver_client::DriverUiState::default(),
             gamba_child: None,
             settings: None,
             plugins: None,
