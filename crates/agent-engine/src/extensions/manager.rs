@@ -1369,7 +1369,16 @@ impl ExtensionManager {
         Ok(handler.clone())
     }
 
-    pub async fn sidecar_spawn_args(
+    /// (E-P8) Whether an eagerly-loaded extension holds the validated
+    /// `session.drive` permission. The TUI uses this to route a driver
+    /// plugin's slash command to `DriverStart` (the actor front door)
+    /// instead of a plain interactive invoke. Fails closed for deferred,
+    /// unknown, or permission-less extensions.
+    pub fn has_session_drive(&self, id: &str) -> bool {
+        self.eager_permissions
+            .get(id)
+            .is_some_and(|permissions| permissions.has(Permission::SessionDrive))
+    }
         &self,
         id: &str,
     ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {

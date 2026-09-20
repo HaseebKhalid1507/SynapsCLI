@@ -411,15 +411,35 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::PluginCommand { command, arg } => {
-                    if matches!(
-                        command.backend,
-                        synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
-                    ) {
-                        let manager = ext_mgr_shared.read().await;
-                        commands::execute_interactive_plugin_command_events(
-                            &command, &arg, &manager, app,
-                        )
-                        .await;
+                    if let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive {
+                        plugin_extension_id,
+                    } = &command.backend
+                    {
+                        // E-P8: a slash command from a plugin holding the
+                        // `session.drive` permission is the driver front door
+                        // (e.g. `/auto start -- do X`). Route it to the actor
+                        // via `DriverStart` — the actor runs the interactive
+                        // invoke, parses the `session_driver` reply, and arms
+                        // itself. The client owns none of that lifecycle.
+                        let is_driver = {
+                            let manager = ext_mgr_shared.read().await;
+                            manager.has_session_drive(plugin_extension_id)
+                        };
+                        if is_driver {
+                            let _ = link
+                                .send(agent_engine::session::SessionCommand::DriverStart {
+                                    plugin: plugin_extension_id.clone(),
+                                    command: command.name.clone(),
+                                    arg,
+                                })
+                                .await;
+                        } else {
+                            let manager = ext_mgr_shared.read().await;
+                            commands::execute_interactive_plugin_command_events(
+                                &command, &arg, &manager, app,
+                            )
+                            .await;
+                        }
                     } else {
                         commands::execute_command_action(
                             CommandAction::PluginCommand { command, arg },

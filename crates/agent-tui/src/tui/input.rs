@@ -348,9 +348,16 @@ fn handle_key(
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // E-P8: Ctrl-C while the driver is armed → stop automation
+            // (actor revokes on `Cancel`), not quit. Cancellation of the
+            // grant outranks the quit binding while armed.
+            if app.driver_ui.is_armed() {
+                return InputAction::Abort;
+            }
             return InputAction::Quit;
         }
-        (KeyCode::Esc, _) if streaming => {
+        // E-P8: Esc while armed (even when NOT streaming) → stop automation.
+        (KeyCode::Esc, _) if streaming || app.driver_ui.is_armed() => {
             return InputAction::Abort;
         }
         (KeyCode::Enter, KeyModifiers::SHIFT) if !streaming => {
