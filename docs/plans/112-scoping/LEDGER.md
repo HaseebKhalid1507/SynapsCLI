@@ -8,6 +8,10 @@
 | 2 | synaps-core | 731 | 0 | 8 |
 | baseline | synaps-engine | _(not captured at a576c597)_ | — | — |
 | 2 | synaps-engine | 1979 | 2† | 12 |
+| post-rebase | synaps-core | 732 | 0 | 8 |
+| post-rebase | synaps-engine | 1989 | 2† | 12 |
+| 3 | synaps-core | 732 | 0 | 8 |
+| 3 | synaps-engine | 1990 | 2† | 12 |
 
 † Pre-existing failures:
   - `static_table_and_wire_shape_classifier_agree_for_known_models` (anthropic.rs, confirmed at a576c597)
