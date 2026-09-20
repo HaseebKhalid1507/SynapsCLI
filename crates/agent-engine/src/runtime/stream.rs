@@ -2824,7 +2824,11 @@ mod rich_output_tests {
         // Give the mock a beat to finish recording the last body.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let bodies = mock.bodies.lock().unwrap().clone();
-        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        if rejected {
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "fail-closed: no provider round");
+        } else {
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        }
         Driven {
             history,
             ui_results,
