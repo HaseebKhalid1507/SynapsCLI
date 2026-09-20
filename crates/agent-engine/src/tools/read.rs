@@ -252,7 +252,11 @@ pub(crate) fn image_integrity_error(mime: &str, b: &[u8]) -> Option<&'static str
     None
 }
 
-fn image_output(path: &std::path::Path, mime: &'static str, bytes: &[u8]) -> Result<ToolOutput> {
+pub(crate) fn image_output(
+    path: &std::path::Path,
+    mime: &'static str,
+    bytes: &[u8],
+) -> Result<ToolOutput> {
     use base64::Engine as _;
     let kb = bytes.len().div_ceil(1024);
     if bytes.len() > MAX_IMAGE_BYTES {

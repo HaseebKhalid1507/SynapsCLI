@@ -388,7 +388,9 @@ impl SessionActor {
         host: &Arc<EngineHost>,
         mut cfg: SessionConfig,
     ) -> Result<(SessionHandle, SessionTask)> {
-        let mut runtime = host.foreground_runtime().await?;
+        // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
+        // one-shot memory binding scopes to the session's project (§4).
+        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
@@ -666,6 +668,49 @@ impl SessionActor {
         }
     }
 
+    /// Wall 1 — actor-owned context-head checkpoint persistence.
+    ///
+    /// The receipt stays in-process (actor task → runtime stream task).
+    /// It never crosses the wire — `SessionEventWire` maps this to `Done`.
+    ///
+    /// Park ordering: `can_park()` requires `!self.streaming`, and streaming
+    /// is only cleared on stream completion/error. The checkpoint event
+    /// arrives mid-stream, so park cannot race with a pending checkpoint.
+    /// No explicit drain is needed.
+    async fn handle_context_head_checkpoint(
+        &mut self,
+        session_id: String,
+        messages: Vec<crate::SharedMessage>,
+        receipt: agent_core::core::context_head::ContextHeadReceipt,
+    ) {
+        // Stale session id guard (compaction may have changed it).
+        if session_id != self.conv.session.id {
+            tracing::warn!(
+                event_id = %session_id,
+                actor_id = %self.conv.session.id,
+                "context head checkpoint: stale session id — ignoring"
+            );
+            receipt.complete(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "stale session id after compaction",
+            )));
+            return;
+        }
+
+        // Non-persistent sessions (tests / --no-persist): complete without I/O.
+        if !self.config.persist {
+            receipt.complete(Ok(()));
+            return;
+        }
+
+        let result = self.conv.persist_context_head(&session_id, messages).await;
+        if let Err(ref e) = result {
+            tracing::error!(session = %session_id, "context head checkpoint save failed: {e}");
+        }
+        receipt.complete(result);
+    }
+
+
     /// C3: the checkpoint reply payload (`SessionReloadRecord`).
     pub(crate) fn reload_record(&self) -> SessionReloadRecord {
         let view = self.view.load();
@@ -866,7 +911,8 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            let mut runtime = host.foreground_runtime().await?;
+            // §4: cwd before apply_config — see `create`.
+            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
@@ -1022,6 +1068,17 @@ impl SessionActor {
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
     pub(crate) async fn submit(&mut self, text: String) {
+        // Wall 1 defense-in-depth: a latched (unverified) context head must
+        // not accept new inference. The stream would refuse via
+        // `durability_blocked` anyway, but that leaves the user message
+        // orphaned in history; refuse here, before it is pushed.
+        if self.conv.context_head.is_blocked(&self.conv.session) {
+            self.emit(SessionEventWire::SystemNotice(
+                "context head is unverified after a failed checkpoint; reload the session                  (`--continue`) or start a new one before continuing"
+                    .into(),
+            ));
+            return;
+        }
         if self.streaming {
             // A Submit while streaming is what the TUI calls StreamingInput.
             self.steer(text);
@@ -1310,6 +1367,14 @@ impl SessionActor {
                 self.emit_conversation();
                 after = After::Failed;
             }
+            StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                session_id,
+                messages,
+                receipt,
+            }) => {
+                self.handle_context_head_checkpoint(session_id, messages, receipt)
+                    .await;
+            }
         }
 
         match after {
@@ -1490,6 +1555,12 @@ impl SessionActor {
                         self.journal_id.store(Arc::new(new_id.clone()));
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
+                        // Wall 1: reset continuation state for the new session id
+                        // so stale epoch checks in persist_head() don't reject
+                        // future checkpoints.
+                        self.conv.context_head = crate::engine::session::ContextHeadPersistence::default();
+                        self.runtime
+                            .reset_context_continuation(&new_id, &self.conv.api_messages);
                         self.emit(SessionEventWire::CompactionApplied {
                             previous_session_id: previous,
                             session_id: new_id,

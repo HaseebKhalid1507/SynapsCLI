@@ -380,6 +380,21 @@ pub(crate) fn import_history_from_dir(
     use std::io::BufRead;
     use std::time::{Duration, SystemTime};
 
+    if lease.provider_id.as_str() == super::axel_context::PROVIDER_ID {
+        // Axel stores durable capture receipts itself. Use the acknowledged
+        // resumable path; it never creates the legacy progress file in this mode.
+        return import_history_resumable_from_dir(
+            plan,
+            lease,
+            sessions_dir,
+            &sessions_dir.join("unused-axel-progress"),
+            batch_size,
+            worker,
+            provider,
+            &HistoryImportCancellation::new(),
+            &mut |_| {},
+        );
+    }
     if batch_size == 0 || batch_size > IMPORT_BATCH_MAX_RECORDS {
         return Err(HistoryImportError::InvalidBatchSize);
     }
@@ -438,7 +453,11 @@ pub(crate) fn import_history_from_dir(
         let mut ordinal = 0_u64;
         for message in &session.api_messages {
             let role = message.get("role").and_then(serde_json::Value::as_str);
-            let Some(text) = import_message_text(message) else {
+            let Some(text) = (if lease.provider_id.as_str() == super::axel_context::PROVIDER_ID {
+                super::axel_context::capture_text(message)
+            } else {
+                import_message_text(message)
+            }) else {
                 continue;
             };
             match role {
@@ -545,7 +564,14 @@ pub fn import_history_resumable_from_dir(
     let mut report = HistoryImportReport::default();
     let mut bytes_processed = 0_u64;
     let key = import_checkpoint_key(&plan.preview.project_id);
-    let mut committed = load_import_checkpoint(checkpoint_path, &key)?;
+    let axel_authority = lease.provider_id.as_str() == super::axel_context::PROVIDER_ID;
+    // Axel's transaction receipt/tombstone is the only committed authority.
+    // A host progress file from another brain must never suppress import.
+    let mut committed = if axel_authority {
+        Default::default()
+    } else {
+        load_import_checkpoint(checkpoint_path, &key)?
+    };
 
     let run = (|| {
         if batch_size == 0 || batch_size > IMPORT_BATCH_MAX_RECORDS {
@@ -607,7 +633,12 @@ pub fn import_history_resumable_from_dir(
                     return Err(HistoryImportError::Cancelled);
                 }
                 let role = message.get("role").and_then(serde_json::Value::as_str);
-                let Some(text) = import_message_text(message) else {
+                let Some(text) = (if lease.provider_id.as_str() == super::axel_context::PROVIDER_ID
+                {
+                    super::axel_context::capture_text(message)
+                } else {
+                    import_message_text(message)
+                }) else {
                     continue;
                 };
                 match role {
@@ -668,6 +699,26 @@ pub fn import_history_resumable_from_dir(
                             report.ranges_skipped += 1;
                             continue;
                         }
+                        if axel_authority {
+                            let capture_id = *capture.capture_id.as_bytes();
+                            let query_provider = provider.clone();
+                            let state = std::thread::spawn(move || {
+                                query_provider.contains_capture(&capture_id)
+                            })
+                            .join()
+                            .map_err(|_| HistoryImportError::ProviderCaptureFailed)?;
+                            match state {
+                                Ok(
+                                    crate::runtime::capture_worker::CaptureCommitState::Committed,
+                                ) => {
+                                    committed.insert(digest);
+                                    report.ranges_skipped += 1;
+                                    continue;
+                                }
+                                Ok(crate::runtime::capture_worker::CaptureCommitState::Absent) => {}
+                                Err(_) => return Err(HistoryImportError::ProviderCaptureFailed),
+                            }
+                        }
                         let capture_bytes = capture
                             .user
                             .content
@@ -707,7 +758,9 @@ pub fn import_history_resumable_from_dir(
                         }
 
                         committed.insert(digest);
-                        persist_import_checkpoint(checkpoint_path, &key, &committed)?;
+                        if !axel_authority {
+                            persist_import_checkpoint(checkpoint_path, &key, &committed)?;
+                        }
                         bytes_processed = bytes_processed.saturating_add(capture_bytes);
                         submitted_in_batch += 1;
                         if submitted_in_batch == batch_size {

@@ -1,7 +1,8 @@
 //! `memory_context` control tool (task A4, spec §7.2).
 //!
-//! Scope: only `disable`, `status`, and `recall_once` commit directly — they
-//! are always locally safe/revocable (spec §7.2 rules). `enable` requires
+//! Scope: `disable` and `status` are locally safe/revocable. `recall_once`
+//! additionally needs a host-authorized capability (Axel wires control-only).
+//! `enable` requires
 //! deterministic host-owned proof of user intent (`ExplicitCommand` from the
 //! `/memory` frontend command, task A5) that a model tool call cannot supply
 //! through JSON parameters alone, so it fails with the typed
@@ -45,8 +46,8 @@ enum MemoryContextRequest {
     Status,
     /// Grant a one-shot recall lease, optionally with a bounded expiry.
     RecallOnce { expires_minutes: Option<u32> },
-    /// Proposal to index prior history — always refused (host-only:
-    /// requires separate disclosure preview and consent, spec §7.2).
+    /// Metadata-only proposal to index prior history. Confirmation/import
+    /// require separate host-owned consent (spec §7.2).
     IndexHistory,
 }
 
@@ -80,9 +81,12 @@ fn parse_request(params: &Value) -> std::result::Result<MemoryContextRequest, St
         );
     }
 
-    // Validate every known property's type/range regardless of action.
+    // Optional fields may be explicit null: strict provider schemas can require
+    // every property, so null is the wire spelling of an omitted option. Only
+    // these three fields accept null; action/unknown keys still fail closed.
+    // Validate every non-null known property's type/range regardless of action.
     let mode_supplied = match object.get("mode") {
-        None => false,
+        None | Some(Value::Null) => false,
         Some(Value::String(mode))
             if matches!(
                 mode.as_str(),
@@ -94,12 +98,12 @@ fn parse_request(params: &Value) -> std::result::Result<MemoryContextRequest, St
         Some(_) => return Err("malformed 'mode': not a value from the schema enum".to_string()),
     };
     let capture_tools_supplied = match object.get("capture_tools") {
-        None => false,
+        None | Some(Value::Null) => false,
         Some(Value::Bool(_)) => true,
         Some(_) => return Err("malformed 'capture_tools': expected a boolean".to_string()),
     };
     let expires_minutes = match object.get("expires_minutes") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(value) => {
             let minutes = value
                 .as_u64()
@@ -231,11 +235,12 @@ impl Tool for MemoryContextTool {
     }
 
     fn description(&self) -> &str {
-        "Control the continuous-memory context of this session. 'status', 'disable', and 'recall_once' commit locally safe actions. 'enable' requires the deterministic /memory command. 'index_history' returns a host-computed metadata preview only; explicit frontend confirmation is still required and no import begins from a model tool call."
+        "Control continuous-memory consent, not context-window token usage (use /context status for that). For status, disable, or index_history send only action; if all fields are required, set mode, capture_tools, and expires_minutes to null. Never fill unused options with defaults. 'status' reads consent; 'disable' revokes it. 'recall_once' requires a host-authorized capability; use /memory once when denied. 'enable' requires the deterministic /memory command. 'index_history' returns a host-computed metadata preview only; explicit frontend confirmation is still required and no import begins from a model tool call."
     }
 
     fn parameters(&self) -> Value {
-        // Exact schema from spec §7.2.
+        // Flat schema stays compatible with provider strictification: optional
+        // fields explicitly accept null, and parse_request treats it as omission.
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -246,19 +251,19 @@ impl Tool for MemoryContextTool {
                     "description": "Memory-context action. index_history previews metadata only; import still requires explicit frontend confirmation."
                 },
                 "mode": {
-                    "type": "string",
-                    "enum": ["recall_each_prompt", "capture_only", "capture_and_recall"],
-                    "description": "Requested durable mode (enable proposals only)."
+                    "type": ["string", "null"],
+                    "enum": ["recall_each_prompt", "capture_only", "capture_and_recall", null],
+                    "description": "Enable proposals only. Omit or use null for every other action."
                 },
                 "capture_tools": {
-                    "type": "boolean",
-                    "description": "Whether tool activity is eligible for capture (enable proposals only)."
+                    "type": ["boolean", "null"],
+                    "description": "Whether tool activity is eligible for capture (enable proposals only). Omit or use null for every other action; false is still a supplied value."
                 },
                 "expires_minutes": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "minimum": 1,
                     "maximum": 1440,
-                    "description": "Bounded lease expiry in minutes."
+                    "description": "Bounded lease expiry for enable or recall_once only. Omit or use null otherwise."
                 }
             },
             "required": ["action"]
@@ -294,8 +299,31 @@ impl Tool for MemoryContextTool {
             // only a proposal: this branch never receives a confirmation proof
             // and cannot begin import.
             MemoryContextRequest::IndexHistory => {
-                let host = HistoryImportHostState::from_current_host()
-                    .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+                let host = match ctx
+                    .capabilities
+                    .memory_backend
+                    .as_ref()
+                    .filter(|b| b.exclusive())
+                {
+                    Some(binding) => {
+                        let scope = binding.scope().map_err(|_| {
+                            typed_failure(MemoryContextError::ProviderNotRegistered)
+                        })?;
+                        let brain = binding
+                            .brain_path()
+                            .filter(|_| binding.is_axel())
+                            .ok_or_else(|| {
+                                typed_failure(MemoryContextError::ProviderNotRegistered)
+                            })?;
+                        Ok(HistoryImportHostState {
+                            project_id: scope.key().to_owned(),
+                            project_root: scope.root().to_path_buf(),
+                            destination_r8_path: brain.to_path_buf(),
+                        })
+                    }
+                    None => HistoryImportHostState::from_current_host(),
+                }
+                .map_err(|error| RuntimeError::Tool(error.to_string()))?;
                 let mut io = CanonicalHistoryMetadataIo::new();
                 let preview = propose_history_import(&host, &mut io)
                     .map_err(|error| RuntimeError::Tool(error.to_string()))?;
@@ -359,6 +387,289 @@ mod tests {
 
     fn parsed(output: &str) -> Value {
         serde_json::from_str(output).expect("tool output is valid JSON")
+    }
+
+    // ── nullable optional parameters / provider interoperability ────────────
+
+    #[test]
+    fn null_options_are_equivalent_to_omission_for_every_action() {
+        for action in [
+            "status",
+            "disable",
+            "recall_once",
+            "index_history",
+            "enable",
+        ] {
+            assert_eq!(
+                parse_request(&json!({"action": action})),
+                parse_request(&json!({
+                    "action": action,
+                    "mode": null,
+                    "capture_tools": null,
+                    "expires_minutes": null
+                })),
+                "null options must mean omission for {action}"
+            );
+        }
+        assert_eq!(
+            parse_request(&json!({
+                "action": "recall_once", "mode": null,
+                "capture_tools": null, "expires_minutes": 5
+            })),
+            Ok(MemoryContextRequest::RecallOnce {
+                expires_minutes: Some(5)
+            })
+        );
+    }
+
+    #[test]
+    fn null_does_not_relax_required_or_unknown_fields() {
+        for params in [
+            json!({"action": null, "mode": null}),
+            json!({"mode": null, "capture_tools": null, "expires_minutes": null}),
+            json!({"action": "status", "surprise_grant": null}),
+        ] {
+            assert!(parse_request(&params).is_err());
+        }
+    }
+
+    #[test]
+    fn every_inapplicable_non_null_option_still_fails_closed() {
+        for action in ["status", "disable", "recall_once", "index_history"] {
+            for mode in ["recall_each_prompt", "capture_only", "capture_and_recall"] {
+                let error = parse_request(&json!({"action": action, "mode": mode})).unwrap_err();
+                assert!(error.contains("not applicable"), "{error}");
+            }
+            for capture_tools in [false, true] {
+                let error = parse_request(&json!({
+                    "action": action, "mode": null, "capture_tools": capture_tools
+                }))
+                .unwrap_err();
+                assert!(error.contains("not applicable"), "{error}");
+            }
+        }
+        for action in ["status", "disable", "index_history"] {
+            let error = parse_request(&json!({
+                "action": action, "mode": null, "capture_tools": null,
+                "expires_minutes": 60
+            }))
+            .unwrap_err();
+            assert!(error.contains("not applicable"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nullable_status_is_read_only_and_enable_still_needs_consent() {
+        let (ctx, capability) = wired_context();
+        // A pending one-shot must remain pending after status, not be consumed.
+        capability.recall_once(Some(5)).unwrap();
+        let before = capability.status();
+        let output = MemoryContextTool
+            .execute(
+                json!({
+                    "action": "status", "mode": null, "capture_tools": null,
+                    "expires_minutes": null
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(parsed(&output)["one_shot_recall"], "pending");
+        assert_eq!(capability.status(), before);
+
+        let (ctx, capability) = wired_context();
+        let error = MemoryContextTool
+            .execute(
+                json!({
+                    "action": "enable", "mode": null, "capture_tools": null,
+                    "expires_minutes": null
+                }),
+                ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("host confirmation"), "{error}");
+        assert_fully_off(&capability);
+    }
+
+    #[tokio::test]
+    async fn status_null_options_without_capability_remains_available() {
+        let output = MemoryContextTool
+            .execute(
+                json!({
+                    "action": "status", "mode": null, "capture_tools": null,
+                    "expires_minutes": null
+                }),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(parsed(&output)["mode"], "off");
+    }
+
+    #[tokio::test]
+    async fn nullable_options_cannot_grant_through_control_only_capability() {
+        for action in ["enable", "recall_once"] {
+            let state = test_state();
+            let capability = MemoryContextCapability::control_only(
+                state,
+                ProjectId::parse("proj-tool").unwrap(),
+                ContextProviderId::parse("axel-host").unwrap(),
+                Arc::new(|| panic!("a denied grant must not invoke host revocation")),
+            );
+            let mut ctx = create_tool_context();
+            ctx.capabilities.memory_context = Some(capability.clone());
+            let error = MemoryContextTool
+                .execute(
+                    json!({
+                        "action": action, "mode": null, "capture_tools": null,
+                        "expires_minutes": null
+                    }),
+                    ctx,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("host confirmation"), "{error}");
+            assert_fully_off(&capability);
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_invalid_status_calls_leave_active_consent_unchanged() {
+        let state = test_state();
+        state
+            .lock()
+            .unwrap()
+            .install(
+                MemoryContextLease::grant(
+                    MemoryLeaseId::parse("lease-status-regression").unwrap(),
+                    SessionId::parse("sess-tool").unwrap(),
+                    ProjectId::parse("proj-tool").unwrap(),
+                    ContextProviderId::parse("axel-memory").unwrap(),
+                    MemoryContextMode::CaptureAndRecall,
+                    CapturePolicy::default(),
+                    RecallPolicy::default(),
+                    UserIntentProof::ExplicitCommand {
+                        command_id: RequestId::parse("cmd-host").unwrap(),
+                    },
+                    SystemTime::now(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let capability = capability_over(state);
+        let before = capability.status();
+        for mode in ["capture_and_recall", "capture_only"] {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.memory_context = Some(capability.clone());
+            MemoryContextTool
+                .execute(
+                    json!({
+                        "action": "status", "capture_tools": false,
+                        "expires_minutes": 60, "mode": mode
+                    }),
+                    ctx,
+                )
+                .await
+                .expect_err("observed invalid status call must fail");
+            assert_eq!(capability.status(), before);
+        }
+        let mut ctx = create_tool_context();
+        ctx.capabilities.memory_context = Some(capability.clone());
+        let output = MemoryContextTool
+            .execute(
+                json!({
+                    "action": "status", "mode": null, "capture_tools": null,
+                    "expires_minutes": null
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(parsed(&output)["mode"], "capture_and_recall");
+        assert_eq!(capability.status(), before);
+    }
+
+    #[tokio::test]
+    async fn all_required_provider_shape_can_execute_status_through_registry() {
+        use crate::runtime::openai::translate::tools_to_oai;
+        use crate::tools::registry::ToolRegistry;
+
+        let mut registry = ToolRegistry::empty();
+        registry.register(Arc::new(MemoryContextTool));
+        let (mut tools, _) = tools_to_oai(&registry.tools_schema());
+        let tool = &mut tools[0].function;
+        // Simulate the all-required shape observed by the model. Each unused
+        // property must have a schema-valid omission representation (null).
+        let required: Vec<String> = tool.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        tool.parameters["required"] = json!(required);
+        let args: Value = serde_json::from_str(
+            r#"{"action":"status","mode":null,"capture_tools":null,"expires_minutes":null}"#,
+        )
+        .unwrap();
+        for name in required {
+            assert!(args.get(&name).is_some(), "missing required {name}");
+            if name != "action" {
+                let property = &tool.parameters["properties"][&name];
+                assert!(property["type"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("null")));
+                if let Some(values) = property.get("enum") {
+                    assert!(values.as_array().unwrap().contains(&Value::Null));
+                }
+            }
+        }
+        let args = registry.translate_input_for_api_tool(&tool.name, args);
+        let output = MemoryContextTool
+            .execute(args, create_tool_context())
+            .await
+            .unwrap();
+        assert_eq!(parsed(&output)["action"], "status");
+    }
+
+    #[test]
+    fn registry_and_provider_schemas_preserve_nullable_options() {
+        use crate::runtime::google_gemini::runtime::translate_tool_schemas;
+        use crate::runtime::openai::translate::tools_to_oai;
+        use crate::tools::registry::ToolRegistry;
+
+        let mut registry = ToolRegistry::empty();
+        registry.register(Arc::new(MemoryContextTool));
+        let schema = registry.tools_schema();
+        assert_eq!(schema.len(), 1);
+        let parameters = &schema[0]["input_schema"];
+        assert_eq!(parameters, &MemoryContextTool.parameters());
+        assert_eq!(parameters["required"], json!(["action"]));
+        assert_eq!(parameters["additionalProperties"], false);
+        let props = &parameters["properties"];
+        assert_eq!(props["action"]["type"], "string");
+        assert_eq!(props["mode"]["type"], json!(["string", "null"]));
+        assert!(props["mode"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::Null));
+        assert_eq!(props["capture_tools"]["type"], json!(["boolean", "null"]));
+        assert_eq!(props["expires_minutes"]["type"], json!(["integer", "null"]));
+        assert_eq!(props["expires_minutes"]["minimum"], 1);
+        assert_eq!(props["expires_minutes"]["maximum"], 1440);
+
+        // Chat Completions and both Responses routes share tools_to_oai.
+        let (oai_tools, _) = tools_to_oai(&schema);
+        assert_eq!(oai_tools[0].function.parameters, *parameters);
+        let gemini_tools = translate_tool_schemas(&schema);
+        assert_eq!(
+            gemini_tools[0].parameters_json_schema.as_ref(),
+            Some(parameters)
+        );
     }
 
     // ── forged enable / index_history ───────────────────────────────────────

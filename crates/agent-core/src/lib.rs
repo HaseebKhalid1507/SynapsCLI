@@ -63,3 +63,6 @@ pub mod prompt;
 pub mod text;
 
 pub use text::BoundedText;
+
+#[path = "core/context_archive.rs"]
+pub mod context_archive;

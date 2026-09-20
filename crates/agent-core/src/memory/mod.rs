@@ -6,5 +6,9 @@
 //! time-range and limit. Extensions access this via the `memory.append`
 //! and `memory.query` protocol methods (added in a follow-up step).
 
+pub mod forum;
 pub mod index;
+pub mod repository;
 pub mod store;
+
+pub use repository::RepositoryIdentity;

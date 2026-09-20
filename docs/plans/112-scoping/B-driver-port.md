@@ -173,7 +173,7 @@ Source: `jr-112/crates/agent-tui/src/tui/session_driver.rs` (1811 lines).
 
 ### 3.2 Escape/Ctrl-C: stop vs detach
 
-**FACT**: In JR's TUI, Esc/Ctrl-C while `is_active()` → `InputAction::Abort` → revoke grant + cancel stream (`input.rs:88-93`).
+**FACT**: In upstream's TUI, Esc/Ctrl-C while `is_active()` → `InputAction::Abort` → revoke grant + cancel stream (`input.rs:88-93`).
 **FACT**: In the thin client, Ctrl-C = detach from daemon session. Turn keeps running.
 **CHANGE**: Esc/Ctrl-C in the thin client with an armed driver must send `Cancel` to the actor (which revokes + cancels), NOT just detach.
 **Decision**: The thin client must detect "driver armed" (from `DriverArmed` state tracking) and route Esc as `SessionCommand::Cancel` rather than local disconnect. Already precedented: the TUI sends Cancel for Esc-while-streaming.
@@ -202,12 +202,12 @@ fn can_park(&self) -> bool {
 
 ### 3.5 Daemon reload while armed
 
-**FACT**: JR's spec: "Process restart must never restore an active run automatically" (`session-drivers.md:208`).
-**FACT**: JR's `Active.grant` and run state are in process memory only; no disk persistence. Plugin's `Run` state is also process-memory-only (`main.py:301`).
+**FACT**: upstream's spec: "Process restart must never restore an active run automatically" (`session-drivers.md:208`).
+**FACT**: upstream's `Active.grant` and run state are in process memory only; no disk persistence. Plugin's `Run` state is also process-memory-only (`main.py:301`).
 **FACT**: Daemon reload (`Checkpoint { reason: Reload }`) → cancel turn, abort compaction, save, close PTYs → exec self.
 **CHANGE**: On `Checkpoint{Reload}`, the actor must **revoke the driver** before saving. The new process loads the saved session with no driver state. Plugin process is restarted by the extension manager; its `initialize()` explicitly says "initialization/restart never resumes a run" (`main.py:339`).
-**FACT**: JR's identity checks: `handler_generation`, `same_lifecycle()`, `same_handler()` all verify the exact Arc pointer + generation. After reload, the extension manager creates a new handler with a new generation → any stale check fails.
-**Decision**: Add `revoke("daemon reload")` to the `Checkpoint` command handler. JR's identity checks already protect against a stale handler surviving — but explicit revocation is cleaner and matches the spec.
+**FACT**: upstream's identity checks: `handler_generation`, `same_lifecycle()`, `same_handler()` all verify the exact Arc pointer + generation. After reload, the extension manager creates a new handler with a new generation → any stale check fails.
+**Decision**: Add `revoke("daemon reload")` to the `Checkpoint` command handler. upstream's identity checks already protect against a stale handler surviving — but explicit revocation is cleaner and matches the spec.
 **INFERENCE**: The `generation` checks DO hold for N sessions because each session pins its own `handler: Arc<dyn ExtensionHandler>` + `handler_generation: u64`. Even with a shared ExtensionManager, each session's driver independently validates its pinned handler. Reload creates new handlers → all sessions' grants invalidate on the next tick.
 
 ### 3.6 `synaps send` while armed
@@ -217,22 +217,22 @@ fn can_park(&self) -> bool {
 **Decision**: Two options:
 - (a) `Submit` while driver is armed + idle → treat as steering (queue into FIFO). This requires the actor's submit path to check `driver.is_some()`.
 - (b) `Submit` while driver armed → revoke driver, process as normal user submit.
-**INFERENCE**: (a) matches JR's spec ("Submitting ordinary text while armed steers the same run" `session-drivers.md:72`). The actor's submit handler should check `driver.is_some()` and route to driver steering if armed. If not streaming, queue for next autonomous turn.
+**INFERENCE**: (a) matches upstream's spec ("Submitting ordinary text while armed steers the same run" `session-drivers.md:72`). The actor's submit handler should check `driver.is_some()` and route to driver steering if armed. If not streaming, queue for next autonomous turn.
 
 ### 3.7 Headless `synaps chat`, RPC, server gain the driver
 
-**FACT**: JR's spec says "local TUI sessions only" (`session-drivers.md:10`).
+**FACT**: upstream's spec says "local TUI sessions only" (`session-drivers.md:10`).
 **CHANGE**: Once the driver lives in the actor, ALL session types get it for free: headless chat, daemon attach, `synaps send`, RPC.
 **Decision**: **Enable it.** The spec's "local TUI sessions only" was an implementation constraint, not a security boundary. The driver's safety comes from: (1) explicit user command invocation, (2) permission gating, (3) fail-closed identity checks, (4) Grant lifetime model. All of these work in the actor. The only change: update `session-drivers.md` to remove the "local TUI sessions only" clause.
 **INFERENCE**: No reason NOT to enable it. The autonomous plugin already has no TUI-specific code — it's pure RPC. Headless chat could use `/auto start -- <goal>` directly.
 
 ---
 
-## Q4 — JR's fail-closed invariants: enforcement after port
+## Q4 — upstream's fail-closed invariants: enforcement after port
 
 Source: `jr-112/docs/extensions/session-drivers.md` "Host constraints" (lines 211-237) + tests in `jr-112/crates/agent-tui/src/tui/session_driver.rs` (lines 1050-1811).
 
-| Constraint (from spec) | Enforced by (JR) | Enforced by (after port) | Test disposition |
+| Constraint (from spec) | Enforced by (upstream) | Enforced by (after port) | Test disposition |
 |------------------------|------------------|--------------------------|-----------------|
 | **One outstanding callback/proposal; 5s timeout** | `spawn()` has `debug_assert!(pending.is_none())` (line 142); `POLL_TIMEOUT=5s` (engine `session_driver.rs:33`) | Actor's `driver_tick()` serializes tasks identically; poll timeout unchanged (engine crate unchanged) | Engine tests stay verbatim; TUI spawn tests → actor integration tests |
 | **Replies bounded 64 KiB, prompts 16 KiB, notices 2 KiB, models ≤16** | `validate_reply()` (engine `session_driver.rs:169-222`) | **Unchanged** — engine crate's validation is host-agnostic | Engine tests stay verbatim (`parser_rejects_unknown_fields_types_and_noncanonical_efforts`, `parser_enforces_all_byte_count_and_time_bounds`) |
@@ -273,7 +273,7 @@ Source: `jr-112/docs/extensions/session-drivers.md` "Host constraints" (lines 21
 2. The `decision_id` — unique per decision, deduped by the plugin (`main.py:472-481`).
 3. The `handler_generation` pinned at arm time — validated at every tick and before accepting results (`TUI session_driver.rs:722-728`).
 
-**FACT**: Identity checks JR does:
+**FACT**: Identity checks upstream does:
 - `live_generation(handler)` — reads `handler.lifecycle_snapshot().generation` (line 482-493)
 - `same_lifecycle(handler, generation)` — generation must match (line 495-500)
 - `same_handler(manager, owner, handler, generation)` — Arc::ptr_eq + same_lifecycle (line 503-518)
@@ -287,7 +287,7 @@ Source: `jr-112/docs/extensions/session-drivers.md` "Host constraints" (lines 21
 - Each has a different `run_id` (plugin generates uuid per start)
 - **But**: the plugin has only ONE `self.run` (`main.py:326`). The second session's `start` would replace the first session's run state in the plugin.
 
-**RISK**: **The plugin is single-tenant by design.** JR's spec says "local TUI sessions only" — one TUI, one session. With N sessions in a daemon, two concurrent grants would corrupt the plugin's `self.run` state. The host-side identity checks don't prevent this because the handler is the same object.
+**RISK**: **The plugin is single-tenant by design.** upstream's spec says "local TUI sessions only" — one TUI, one session. With N sessions in a daemon, two concurrent grants would corrupt the plugin's `self.run` state. The host-side identity checks don't prevent this because the handler is the same object.
 
 **DECISION NEEDED**: Either:
 - (a) **One driver grant per plugin process-wide** — the actor checks a shared `Arc<AtomicBool>` or similar before arming. Second arm attempt → error "plugin already driving session X".

@@ -226,6 +226,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "status",
     "stats",
     "context",
+    "budget",
     "trace",
     "memory",
     "ping",

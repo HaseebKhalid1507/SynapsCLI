@@ -1,8 +1,8 @@
 # D-security.md — Security review: autonomous driver under daemon semantics
 
-> **Scope**: JR's session-driver (PR #112 `feat/context-continuation` @ 8bdabd4a) as it would behave once moved into the daemon's `SessionActor` (dev `a0b2b390` + soak-fixes). Read-only review — no code edits, no builds, no live testing.
+> **Scope**: upstream's session-driver (PR #112 `feat/context-continuation` @ 8bdabd4a) as it would behave once moved into the daemon's `SessionActor` (dev `a0b2b390` + soak-fixes). Read-only review — no code edits, no builds, no live testing.
 >
-> **Threat model shift**: JR designed for "a human at a local TUI"; daemon semantics add: actor-resident driver, N concurrent sessions, shared `ExtensionManager`, park/unpark, `synaps send` injection, SocketTransport with no `SO_PEERCRED` check (T11 pending), per-session journal flock, env frozen at daemon spawn (F25).
+> **Threat model shift**: upstream designed for "a human at a local TUI"; daemon semantics add: actor-resident driver, N concurrent sessions, shared `ExtensionManager`, park/unpark, `synaps send` injection, SocketTransport with no `SO_PEERCRED` check (T11 pending), per-session journal flock, env frozen at daemon spawn (F25).
 
 ---
 
@@ -63,7 +63,7 @@ When a model-initiated tool requires host confirmation (`tools.activation_confir
 ### Fix
 
 **Actor-level (must-have)**: When the driver is armed and `attached.len() == 0`, the actor MUST either:
-1. **Revoke the grant** — cancel the stream, revoke the driver, park normally. This is the conservative choice and matches JR's "local TUI only" intent.
+1. **Revoke the grant** — cancel the stream, revoke the driver, park normally. This is the conservative choice and matches upstream's "local TUI only" intent.
 2. **Auto-answer pending prompts with `None`** (deny) when the last client detaches. `tools/discovery.rs:194` already treats `None` as `Unauthorized` — this is the fail-closed path. Combined with a "driver paused: no client attached" notice on next attach.
 
 **Plugin contract (should-have)**: Document that an actor-resident driver MUST NOT run turns while `clients == 0` unless an explicit headless/daemon policy flag is set. The driver's idle-conflict check must include a "no clients" gate:

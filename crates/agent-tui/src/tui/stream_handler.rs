@@ -188,6 +188,9 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             );
             // History repair is the actor's (mirrored by `Conversation`).
         }
+        // merge(112): handled in phase 3 (stream.rs) / phase 9 (Wall 1)
+        StreamEvent::Llm(LlmEvent::ResponseStart | LlmEvent::ResponseReset) => {}
+        StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
     }
 }
 

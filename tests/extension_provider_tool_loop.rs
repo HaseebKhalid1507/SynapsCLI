@@ -99,6 +99,8 @@ fn test_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: synaps_cli::tools::ToolCapabilities {
+            launch_cancel: None,
+            memory_backend: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,

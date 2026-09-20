@@ -80,11 +80,36 @@ mod health_tests {
     }
 }
 
+/// A point-in-time lifecycle observation, not a lease on future execution.
+///
+/// Generations are opaque and local to one handler instance. A caller must pin
+/// both the handler identity and generation before dispatch, then require the
+/// same generation with `Running` or `Degraded` health when accepting a reply
+/// and before executing any deferred work. All other health states fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionLifecycle {
+    pub generation: u64,
+    pub health: ExtensionHealth,
+}
+
 /// Trait for extension runtimes that can handle hook events.
 #[async_trait]
 pub trait ExtensionHandler: Send + Sync {
     /// Unique identifier for this extension.
     fn id(&self) -> &str;
+
+    /// Observe the actual serving runtime without waiting for locks or RPC I/O.
+    ///
+    /// `None` means unsupported or temporarily unavailable, never "healthy".
+    /// Implementations must invalidate the generation on runtime/transport loss
+    /// and before replacement, even if the handler itself remains the same Arc.
+    /// Consumers retaining authority must fail closed on `None`, non-live health,
+    /// or a changed generation, including while a previously valid reply waits
+    /// to execute. Recheck at dispatch, reply acceptance, and each frontend tick;
+    /// this snapshot cannot eliminate exit races after the final observation.
+    fn lifecycle_snapshot(&self) -> Option<ExtensionLifecycle> {
+        None
+    }
 
     /// Handle a hook event. Returns the handler's decision.
     async fn handle(&self, event: &HookEvent) -> HookResult;
@@ -206,5 +231,31 @@ pub trait ExtensionHandler: Send + Sync {
     /// Number of transport restarts observed by this handler.
     async fn restart_count(&self) -> usize {
         0
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    struct UnsupportedHandler;
+
+    #[async_trait]
+    impl ExtensionHandler for UnsupportedHandler {
+        fn id(&self) -> &str {
+            "unsupported-lifecycle"
+        }
+
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            unreachable!("snapshot must not dispatch a hook")
+        }
+
+        async fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn default_lifecycle_snapshot_is_unavailable_through_trait_object() {
+        let handler: &dyn ExtensionHandler = &UnsupportedHandler;
+        assert_eq!(handler.lifecycle_snapshot(), None);
     }
 }

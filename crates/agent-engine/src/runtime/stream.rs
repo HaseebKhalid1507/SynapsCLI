@@ -42,6 +42,15 @@ pub fn activation_policy(
 }
 
 pub(super) struct StreamSession {
+    // Context continuation
+    pub(super) memory_backend: crate::memory_backend::MemoryBinding,
+    pub(super) memory_context: Option<super::memory_context::MemoryContextCapability>,
+    /// Set only at a successful, non-cancelled terminal assistant boundary.
+    /// Error/budget/cancel paths leave this empty, even when they return Ok.
+    pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
+    pub(super) context_window: u64,
+    pub(super) continuation: super::continuation::SharedContinuation,
+
     // Auth & network
     pub(super) auth: Arc<RwLock<AuthState>>,
     pub(super) client: Client,
@@ -272,6 +281,11 @@ impl StreamMethods {
         initial_messages: Vec<SharedMessage>,
     ) -> Result<()> {
         let StreamSession {
+            memory_backend,
+            memory_context,
+            final_capture_history,
+            context_window,
+            continuation,
             auth,
             client,
             credential_source,
@@ -323,6 +337,96 @@ impl StreamMethods {
         );
         let mut messages = initial_messages;
 
+        // Only request preparation may use this early exit. Tool execution and
+        // durable head publication must finish their own history/commit cleanup.
+        macro_rules! prepare_or_cancel {
+            ($future:expr) => {
+                match super::api::await_or_cancel(&cancel, $future).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        let _ =
+                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        return Ok(());
+                    }
+                }
+            };
+        }
+        if cancel.is_cancelled() {
+            let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+            return Ok(());
+        }
+
+        // ═══ CONTEXT CONTINUATION: initial setup ═══
+        let context_enabled = {
+            let state = continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.durability_blocked {
+                return Err(crate::RuntimeError::Session(
+                    "context head save is unresolved; reload the session before further inference"
+                        .into(),
+                ));
+            }
+            state.enabled()
+        };
+        prepare_or_cancel!(super::continuation::validate_restored_history(
+            &messages,
+            &continuation,
+            &memory_backend
+        ))?;
+        if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
+            return Err(crate::RuntimeError::Config(
+                "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
+            ));
+        }
+        if context_enabled {
+            if !memory_backend.exclusive() {
+                super::continuation::restore_window(&messages, &continuation);
+            }
+            let mut registry = prepare_or_cancel!(tools.write());
+            registry.register(Arc::new(
+                crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
+            ));
+            for name in ["memory_search", "memory_fetch"] {
+                if registry.get(name).map_or(true, |tool| {
+                    tool.origin() != crate::tools::ToolOrigin::Builtin
+                }) {
+                    return Err(crate::RuntimeError::Config("automatic context management requires builtin memory_search and memory_fetch; history unchanged".into()));
+                }
+            }
+        } else {
+            prepare_or_cancel!(tools.write()).disable(&["context_checkpoint".into()]);
+            continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .update_advisory(None);
+        }
+        // DARK (§7): the project forum lives in the Axel backend. Under the
+        // legacy backend every forum_* call errors in `require_forum`, so do
+        // not spend catalog tokens advertising tools the model can never use.
+        if !memory_backend.is_axel() {
+            prepare_or_cancel!(tools.write()).disable(&[
+                "forum_post".into(),
+                "forum_read".into(),
+                "forum_forget".into(),
+            ]);
+        }
+        let system_prompt = if context_enabled {
+            Some(format!(
+                "{}\n\n{}",
+                system_prompt.as_deref().unwrap_or_default(),
+                super::continuation::GUIDANCE
+            ))
+        } else {
+            system_prompt
+        };
+        // Tracks whether this context segment has made at least one provider
+        // call (wall-clock checkpoint skips an un-exercised segment).
+        let mut segment_has_provider_round = false;
+        // Time-checkpoint: the budget meter has tripped ProviderRounds once
+        // and a context-management assessment is needed.
+        let mut time_checkpoint;
+
         // One retained `SessionToolSet` per stream session (Task 16), held
         // behind ONE shared handle (Task 17): the same set the execution
         // gate authorizes against is mutated in place by confirmed
@@ -334,17 +438,12 @@ impl StreamMethods {
         // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            let set = if progressive_tool_disclosure {
-                crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
-                    tool_session_id.clone(),
-                    registry.catalog(),
-                )
-            } else {
-                crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                    tool_session_id.clone(),
-                    registry.catalog(),
-                )
-            };
+            let set = super::continuation::context_tool_set(
+                tool_session_id.clone(),
+                registry.catalog(),
+                progressive_tool_disclosure,
+                context_enabled,
+            );
             std::sync::Arc::new(std::sync::RwLock::new(set))
         };
         // Thread the RETAINED handle into the extension-provider route so
@@ -422,6 +521,11 @@ impl StreamMethods {
                 return Ok(());
             }
 
+            // Steering accepted while async stream setup was connecting must
+            // reach the FIRST request, not wait until its tools have executed.
+            // Subsequent rounds use the same path and normal request validation.
+            HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+
             // Budget pre-flight: wall clock, then the exact round cap —
             // BEFORE any provider call is spent. History is valid here
             // (round boundaries always end on paired tool_results).
@@ -433,43 +537,68 @@ impl StreamMethods {
             // going; wall-clock (re-checked by begin_round) and the finite
             // renewal cap still bound any true runaway. Every other dimension
             // remains a hard stop.
-            match budget_meter.begin_round() {
-                Ok(()) => {}
-                Err(agent_core::BudgetDimension::ProviderRounds) => {
-                    match budget_meter.try_renew_rounds() {
-                        Some(remaining) => match budget_meter.begin_round() {
-                            Ok(()) => {
-                                // Soft checkpoint: the turn self-healed. Logged
-                                // so renewal frequency is measurable rather
-                                // than inferred from user reports.
-                                tracing::info!(
-                                    event = "turn_budget_round_renewed",
-                                    dimension =
-                                        agent_core::BudgetDimension::ProviderRounds.as_str(),
-                                    renewals_used = budget_meter.round_renewals_used(),
-                                    renewals_remaining = remaining,
-                                    elapsed_secs = budget_meter.elapsed().as_secs(),
-                                    max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
-                                    tool_calls_used = budget_meter.tool_calls_used(),
-                                    "provider-round checkpoint: renewed, continuing automatically"
-                                );
-                                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
-                                    format!(
-                                        "Reached a provider-round checkpoint — work preserved, continuing automatically ({remaining} extension(s) left)."
-                                    ),
-                                )));
+            //
+            // Context-aware time checkpoints: when context management is
+            // enabled, a wall-clock expiry doesn't immediately kill the turn —
+            // it sets `time_checkpoint` so the context assessment can archive
+            // the head and start a fresh context segment with renewed time.
+            // An un-exercised segment (no provider round yet) still hard-stops.
+            time_checkpoint = context_enabled
+                && !budget_meter.budget().max_elapsed.is_zero()
+                && budget_meter.wall_clock_exceeded();
+            if time_checkpoint && !segment_has_provider_round {
+                finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
+            }
+            if !time_checkpoint {
+                match budget_meter.begin_round() {
+                    Ok(()) => {}
+                    Err(agent_core::BudgetDimension::ProviderRounds) => {
+                        match budget_meter.try_renew_rounds() {
+                            Some(remaining) => match budget_meter.begin_round() {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        event = "turn_budget_round_renewed",
+                                        dimension =
+                                            agent_core::BudgetDimension::ProviderRounds.as_str(),
+                                        renewals_used = budget_meter.round_renewals_used(),
+                                        renewals_remaining = remaining,
+                                        elapsed_secs = budget_meter.elapsed().as_secs(),
+                                        max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                                        tool_calls_used = budget_meter.tool_calls_used(),
+                                        "provider-round checkpoint: renewed, continuing automatically"
+                                    );
+                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                        format!(
+                                            "Reached a provider-round checkpoint — work preserved, continuing automatically ({remaining} extension(s) left)."
+                                        ),
+                                    )));
+                                }
+                                // Renewal granted but wall-clock expired: if context is
+                                // enabled, treat as a time checkpoint instead of hard stop.
+                                Err(agent_core::BudgetDimension::WallClock)
+                                    if context_enabled
+                                        && segment_has_provider_round
+                                        && !budget_meter.budget().max_elapsed.is_zero() =>
+                                {
+                                    time_checkpoint = true;
+                                }
+                                Err(dimension) => finish_budget_exceeded!(dimension),
+                            },
+                            None => {
+                                finish_budget_exceeded!(agent_core::BudgetDimension::ProviderRounds)
                             }
-                            // Renewal granted but wall-clock (or another
-                            // dimension) now bars the round: hard-stop on that.
-                            Err(dimension) => finish_budget_exceeded!(dimension),
-                        },
-                        // Renewal budget exhausted: this is the real hard stop.
-                        None => {
-                            finish_budget_exceeded!(agent_core::BudgetDimension::ProviderRounds)
                         }
                     }
+                    Err(agent_core::BudgetDimension::WallClock)
+                        if context_enabled && !budget_meter.budget().max_elapsed.is_zero() =>
+                    {
+                        if !segment_has_provider_round {
+                            finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
+                        }
+                        time_checkpoint = true;
+                    }
+                    Err(dimension) => finish_budget_exceeded!(dimension),
                 }
-                Err(dimension) => finish_budget_exceeded!(dimension),
             }
 
             // Refresh token before each API call in the tool loop — fixes stale
@@ -519,17 +648,12 @@ impl StreamMethods {
                             }
                             *set = next;
                         } else {
-                            *set = if progressive_tool_disclosure {
-                            crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
+                            *set = super::continuation::context_tool_set(
                                 tool_session_id.clone(),
                                 registry.catalog(),
-                            )
-                        } else {
-                            crate::tools::activation::SessionToolSet::default_core_for_catalog(
-                                tool_session_id.clone(),
-                                registry.catalog(),
-                            )
-                        };
+                                progressive_tool_disclosure,
+                                context_enabled,
+                            );
                         }
                     }
                 }
@@ -684,6 +808,198 @@ impl StreamMethods {
                 &metered_options
             };
 
+            // ═══ CONTEXT CONTINUATION: pre-request assessment ═══
+            let mut context_advisory = None;
+            if context_enabled {
+                use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
+                use agent_core::core::context_policy::{
+                    assess_context, ContextAction, ContextBudget,
+                };
+                let fallback_schema = tools_snapshot.tools_schema();
+                let schema = round_options
+                    .request_tools_schema
+                    .as_deref()
+                    .map(|s| s.as_slice())
+                    .unwrap_or(&fallback_schema);
+                let assessment = super::context::assess(&super::context::ContextBudgetInputs {
+                    model: &model,
+                    provider_window: context_window,
+                    system_prompt: injected_system.as_deref(),
+                    tools_schema: schema,
+                    messages: request_messages,
+                    skill_contents: &[],
+                    memory_contents: &[],
+                    thinking_budget_tokens: thinking_budget as u64,
+                    next_tool_result_bytes: max_tool_output as u64,
+                    output_reserve_tokens: HelperMethods::max_tokens_for_model(&model),
+                });
+                let decision = {
+                    let mut s = continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let d = assess_context(
+                        &s.config,
+                        &s.policy,
+                        ContextBudget {
+                            context_window_tokens: context_window,
+                            used_tokens: assessment.used_tokens(),
+                            hard_remaining_tokens: context_window
+                                .saturating_sub(assessment.used_tokens()),
+                            required_next_round_tokens: assessment
+                                .reserves
+                                .total()
+                                .saturating_add(ADVISORY_RESERVE_TOKENS),
+                        },
+                    );
+                    s.policy = d.next_state;
+                    d
+                };
+                let current_advisory;
+                if time_checkpoint
+                    || matches!(
+                        decision.action,
+                        ContextAction::Rollover | ContextAction::HardStop
+                    )
+                {
+                    let readable = {
+                        let current = prepare_or_cancel!(tools.read());
+                        let admitted = session_tool_set
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        ["memory_search", "memory_fetch"].iter().all(|name| {
+                            schema.iter().any(|s| s["name"] == *name)
+                                && crate::tools::activation::ExecutionGate::authorize_wire_call(
+                                    &current, &admitted, name,
+                                )
+                                .is_ok_and(|a| {
+                                    a.implementation().origin() == crate::tools::ToolOrigin::Builtin
+                                })
+                        })
+                    };
+                    if !readable {
+                        let _ =
+                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
+                    }
+                    let workers_pending = orchestration
+                        .as_ref()
+                        .is_some_and(|o| !o.unreconciled_runtime_handles().is_empty())
+                        || subagent_registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .list_active()
+                            .iter()
+                            .any(|(_, _, status)| {
+                                matches!(status, super::subagent::SubagentStatus::Running)
+                            });
+                    if workers_pending {
+                        if time_checkpoint {
+                            finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
+                        }
+                        if decision.action == ContextAction::HardStop {
+                            let _ = tx
+                                .send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                            return Err(crate::RuntimeError::Config("context hard limit reached with pending workers; collect/reconcile before continuing; history retained".into()));
+                        }
+                        current_advisory = Some(ContextAdvisory::WorkersPending);
+                    } else {
+                        let minimum_reserve = continuation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .config
+                            .reserve_tokens;
+                        let history_budget =
+                            context_window.saturating_sub(
+                                assessment
+                                    .reserves
+                                    .total()
+                                    .saturating_add(ADVISORY_RESERVE_TOKENS)
+                                    .max(minimum_reserve)
+                                    .saturating_add(assessment.used_tokens().saturating_sub(
+                                        super::context::estimate_history(&messages),
+                                    )),
+                            );
+                        match super::continuation::rollover_for_boundary(
+                            &messages,
+                            &continuation,
+                            &memory_backend,
+                            history_budget,
+                            &cancel,
+                            time_checkpoint,
+                        )
+                        .await
+                        {
+                            Ok(super::continuation::RolloverPreparation::Unproductive)
+                                if !time_checkpoint
+                                    && decision.action != ContextAction::HardStop =>
+                            {
+                                let mut state = continuation
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                state
+                                    .policy
+                                    .defer_unproductive_rollover(assessment.used_tokens());
+                                current_advisory = Some(ContextAdvisory::Unproductive);
+                            }
+                            Ok(super::continuation::RolloverPreparation::Unproductive) => {
+                                let _ = tx.send(StreamEvent::Session(
+                                    SessionEvent::MessageHistory(messages),
+                                ));
+                                return Err(super::continuation::unproductive_rollover_error());
+                            }
+                            Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
+                                super::continuation::persist_head(&prepared, &continuation, &tx)
+                                    .await?;
+                                messages = prepared.commit(&continuation)?;
+                                budget_meter.start_context_segment();
+                                segment_has_provider_round = false;
+                                let window = continuation
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .window;
+                                let _ = tx.send(StreamEvent::Session(
+                                    SessionEvent::MessageHistory(messages.clone()),
+                                ));
+                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction."))));
+                                continue;
+                            }
+                            Err(error) => {
+                                let _ = tx.send(StreamEvent::Session(
+                                    SessionEvent::MessageHistory(messages),
+                                ));
+                                return Err(error);
+                            }
+                        }
+                    }
+                } else {
+                    current_advisory = ContextAdvisory::from_assessment(&decision);
+                }
+                context_advisory = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .update_advisory(current_advisory);
+                if let Some(advisory) = context_advisory {
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                        advisory.notice(assessment.used_tokens()),
+                    )));
+                }
+            }
+
+            // Request-only pressure message, once per state transition.
+            let pressure_request;
+            let request_messages = if let Some(advisory) = context_advisory {
+                pressure_request = request_messages
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(Arc::new(json!({
+                        "role": "user", "content": advisory.message()
+                    }))))
+                    .collect::<Vec<_>>();
+                pressure_request.as_slice()
+            } else {
+                request_messages
+            };
+
             let response = match ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
@@ -691,7 +1007,7 @@ impl StreamMethods {
                 &tools_snapshot,
                 &injected_system,
                 thinking_budget,
-                session.reasoning_level,
+                reasoning_level,
                 request_messages,
                 tx.clone(),
                 &cancel,
@@ -712,6 +1028,7 @@ impl StreamMethods {
 
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
+            segment_has_provider_round = true;
             if let Err(dimension) = budget_meter.check_usage(&usage_counters, &model) {
                 finish_budget_exceeded!(dimension);
             }
@@ -729,7 +1046,24 @@ impl StreamMethods {
                 // returns empty content, and that is a clean stop — not an
                 // error. Surfacing the scary message there would make every
                 // cancel look like a crash.
+                //
+                // F19: after a tool_result round (round > 0), an empty end_turn
+                // is a legitimate "nothing more to add" — the model already
+                // emitted text before the tool_use. Commit history cleanly
+                // instead of dropping the entire turn as an error.
                 if content.is_empty() {
+                    let after_tool_result = budget_meter.rounds_used() > 1;
+                    if after_tool_result && !cancel.is_cancelled() {
+                        // Legitimate empty end_turn after tool results — clean finish.
+                        // A clean finish is a terminal completion: publish the
+                        // history for memory capture like the normal end_turn path.
+                        *final_capture_history
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(messages.clone());
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        return Ok(());
+                    }
                     if !cancel.is_cancelled() {
                         let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                             agent_core::TurnError::provider(
@@ -759,6 +1093,17 @@ impl StreamMethods {
                     "role": "assistant",
                     "content": content
                 })));
+
+                // Batched context_checkpoint rejection: if the model called
+                // context_checkpoint alongside other tools, reject the batch
+                // so the host can assess rollover before more work.
+                if context_enabled
+                    && tool_uses.len() > 1
+                    && tool_uses.iter().any(|t| t["name"] == "context_checkpoint")
+                {
+                    messages.push(Arc::new(json!({"role":"user","content":tool_uses.iter().map(|t|json!({"type":"tool_result","tool_use_id":t["id"],"is_error":true,"content":"No tools executed: context_checkpoint must be called alone so the host can assess rollover before more work."})).collect::<Vec<_>>()})));
+                    continue;
+                }
 
                 let assistant_text = assistant_text_from_content(content);
                 let hook_event = HookEvent::on_message_complete(
@@ -802,6 +1147,12 @@ impl StreamMethods {
                                     )));
                                 }
                             }
+                        }
+                        if !cancel.is_cancelled() {
+                            *final_capture_history
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(messages.clone());
                         }
                         let _ =
                             tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
@@ -985,7 +1336,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -1241,6 +1592,8 @@ impl StreamMethods {
                         let env_inner = env.clone();
                         let env_stripped_inner = env_stripped.clone();
                         let env_warned_inner = env_warned.clone();
+                        let memory_backend_inner = memory_backend.clone();
+                        let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
@@ -1321,7 +1674,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks, errored) = match res {
@@ -1524,10 +1877,10 @@ impl StreamMethods {
 
                 // Add tool results to conversation — always, so the assistant's tool_use
                 // blocks have matching tool_result blocks even on cancellation.
-                messages.push(Arc::new(json!({
-                    "role": "user",
-                    "content": tool_results
-                })));
+                let round_result_bytes: usize = tool_results.iter().map(tool_result_bytes).sum();
+                let tool_batch =
+                    super::attachments::bounded_tool_results(&model, &messages, tool_results);
+                messages.push(Arc::new(tool_batch));
 
                 if canceled {
                     // Send final history on cancellation so session can be saved
@@ -1550,7 +1903,6 @@ impl StreamMethods {
                 if tool_call_budget_hit {
                     finish_budget_exceeded!(agent_core::BudgetDimension::ToolCalls);
                 }
-                let round_result_bytes: usize = tool_results.iter().map(tool_result_bytes).sum();
                 if let Err(dimension) = budget_meter.charge_tool_result_bytes(round_result_bytes) {
                     finish_budget_exceeded!(dimension);
                 }
@@ -1979,12 +2331,19 @@ mod rich_output_tests {
     const PNG_B64_PREFIX: &str = "iVBORw0KGgo";
 
     fn fake_b64(len: usize) -> String {
-        let mut s = String::with_capacity(len);
-        while s.len() < len {
-            s.push_str(PNG_B64_PREFIX);
-        }
-        s.truncate(len);
-        s
+        use base64::Engine as _;
+        // Synthetic structurally valid PNG with exact encoded length. The old
+        // repeated prefix was invalid base64/image data and must not pass the
+        // production attachment validator. These tests exercise bytes, not decoding.
+        assert_eq!(len % 4, 0);
+        let mut bytes = vec![0u8; len / 4 * 3];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&1u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_be_bytes());
+        let end = bytes.len();
+        bytes[end - 8..].copy_from_slice(b"IEND\xAE\x42\x60\x82");
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
     /// Rich stub: `[text, image]` blocks + summary, like `read` on a PNG.
@@ -2064,7 +2423,7 @@ mod rich_output_tests {
 
     fn sse_tool_use_round(tool_uses: &[(&str, &str)]) -> String {
         let mut s = String::new();
-        s.push_str(r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#);
+        s.push_str(r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#);
         s.push_str("\n\n");
         for (i, (id, name)) in tool_uses.iter().enumerate() {
             s.push_str(&format!(
@@ -2181,6 +2540,13 @@ mod rich_output_tests {
         .unwrap();
 
         let session = StreamSession {
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_context: None,
+            final_capture_history: Arc::new(Mutex::new(None)),
+            context_window: 200_000,
+            continuation: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::runtime::continuation::ContinuationState::default(),
+            )),
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token: "test-token".into(),
                 auth_type: "api_key".into(),
@@ -2196,7 +2562,7 @@ mod rich_output_tests {
             },
             api_retries: 0,
             refusal_retries: 0,
-            model: "claude-haiku-4-5".into(),
+            model: "claude-sonnet-4-6".into(),
             tools,
             system_prompt: None,
             thinking_budget: 0,
@@ -2536,6 +2902,36 @@ mod rich_output_tests {
         assert_eq!(images_in_history, 7);
     }
 
+    /// DARK (§7): with the default (legacy) memory backend the forum_* tools
+    /// must not be advertised to the model — they can only error. The default
+    /// registry carries them; the per-turn gate in `run_stream_internal`
+    /// removes them from the request's tool list.
+    #[tokio::test]
+    async fn legacy_backend_does_not_advertise_forum_tools() {
+        let d = drive(
+            vec![
+                Arc::new(crate::tools::forum::ForumPostTool),
+                Arc::new(crate::tools::forum::ForumReadTool),
+                Arc::new(crate::tools::forum::ForumForgetTool),
+                Arc::new(RichTool),
+            ],
+            &[("toolu_1", "rich_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let names: Vec<String> = d.bodies[0]["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(names.iter().any(|n| n == "rich_stub"), "registered tool must be advertised: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("forum_")),
+            "forum tools must be hidden under the legacy backend: {names:?}"
+        );
+    }
+
     #[test]
     fn select_content_prefers_rich_then_bounded_then_truncated() {
         let blocks = vec![json!({"type":"text","text":"s"})];
@@ -2547,6 +2943,191 @@ mod rich_output_tests {
         assert_eq!(
             select_tool_result_content(None, None, "short", 10),
             Value::String("short".into())
+        );
+    }
+
+    /// F19 regression: an empty end_turn AFTER a tool_result round is a
+    /// legitimate "nothing more to add" — the model already spoke before the
+    /// tool_use. History must be intact (text + tool_use + tool_result), and
+    /// no error must be emitted.
+    #[tokio::test]
+    async fn f19_empty_end_turn_after_tool_result_is_clean_finish() {
+        // SSE round 1: text "pre-tool text" + tool_use(bash)
+        let round1 = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre-tool text"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_f19","name":"bash"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        // SSE round 2: empty end_turn (no content blocks)
+        let round2 = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_02","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let r1 = Arc::new(round1.to_string());
+        let r2 = Arc::new(round2.to_string());
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let cc = cc.clone();
+                    let r1 = r1.clone();
+                    let r2 = r2.clone();
+                    async move {
+                        let n = cc.fetch_add(1, Ordering::SeqCst);
+                        let sse = if n == 0 { r1.as_str() } else { r2.as_str() };
+                        (StatusCode::OK, [("content-type", "text/event-stream")], sse.to_string())
+                            .into_response()
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TextTool));
+        let tools = Arc::new(RwLock::new(registry));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let hook_bus = Arc::new(crate::extensions::hooks::HookBus::new());
+
+        let session = StreamSession {
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_context: None,
+            final_capture_history: Arc::new(Mutex::new(None)),
+            context_window: 200_000,
+            continuation: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::runtime::continuation::ContinuationState::default(),
+            )),
+            auth: Arc::new(RwLock::new(AuthState {
+                auth_token: "test-token".into(),
+                auth_type: "api_key".into(),
+                refresh_token: None,
+                token_expires: Some(9_999_999_999_999),
+            })),
+            client: reqwest::Client::new(),
+            credential_source: crate::auth::CredentialSource::Local,
+            token_cache: crate::auth::TokenCache::new(),
+            options: ApiOptions {
+                anthropic_base_url: Some(base_url),
+                ..Default::default()
+            },
+            api_retries: 0,
+            refusal_retries: 0,
+            model: "claude-sonnet-4-6".into(),
+            tools,
+            system_prompt: None,
+            thinking_budget: 0,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            tx,
+            cancel: CancellationToken::new(),
+            steering_rx: None,
+            watcher_exit_path: None,
+            max_tool_output: 30_000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            session_manager,
+            subagent_registry: Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            )),
+            event_queue: Arc::new(crate::events::EventQueue::new(100)),
+            hook_bus,
+            session_id: None,
+            cwd: None,
+            env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
+            secret_prompt: None,
+            auto_approve_confirms: true,
+            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            orchestration: None,
+            delegation_parent: None,
+            turn_correlation_id: "turn-f19".into(),
+            progressive_tool_disclosure: false,
+            activation_confirm: agent_core::config::ActivationConfirm::default(),
+            tool_session_id,
+            mcp_runtime: None,
+            mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
+        };
+
+        let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            StreamMethods::run_stream_internal(session, messages),
+        )
+        .await
+        .expect("stream loop must finish");
+        run.expect("stream loop ok — F19: empty end_turn after tool_result is not an error");
+
+        let mut history = Vec::new();
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Session(SessionEvent::Error(_)) => saw_error = true,
+                _ => {}
+            }
+        }
+
+        assert!(!saw_error, "F19: empty end_turn after tool_result must NOT emit an error");
+        // History: user + assistant(text + tool_use) + user(tool_result)
+        assert!(
+            history.len() >= 3,
+            "F19: history must contain user + assistant + tool_result, got {} messages",
+            history.len()
+        );
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[1]["role"], "assistant");
+        let content = history[1]["content"].as_array().expect("assistant content");
+        assert!(
+            content.iter().any(|b| b["type"] == "text"),
+            "F19: assistant message must contain the pre-tool text"
+        );
+        assert!(
+            content.iter().any(|b| b["type"] == "tool_use"),
+            "F19: assistant message must contain the tool_use"
+        );
+        assert_eq!(history[2]["role"], "user");
+        assert!(
+            history[2]["content"][0]["type"] == "tool_result",
+            "F19: third message must be tool_result"
         );
     }
 }

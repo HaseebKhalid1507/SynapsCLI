@@ -29,7 +29,7 @@
 3. **Project agent forum.** Subagents can post to a persistent project forum (`agent-forum.md:1-22`), so a compacted window's insights survive as structured durable notes, not ephemeral tool output.
 4. **Unproductive rollover recovery.** If the candidate can't meaningfully shrink, it continues with the current context instead of erroring (`context-rollover-recovery.md:1-40`). jcode's compaction can triple-fire without reducing size because it undercounts images (`jcode-compaction-core/src/lib.rs:47-58`).
 
-**Honest weak spot (JR's own words):**
+**Honest weak spot (upstream's own words):**
 - "No claim of a measured 2× end-to-end token reduction" — `context-continuation.md:249-250`: "No cost/quality improvement claim is inferred from that smoke." The live test used synthetic low thresholds, not a real 350k-token session.
 - The archive index is "a bounded scan, not a large-corpus search engine" (`context-continuation.md:205-206`). Retrieval quality over many windows is unproven.
 - "The prototype intentionally retains every real user turn; instruction-heavy histories may stop instead of shrinking" (`context-continuation.md:253-254`).
@@ -71,7 +71,7 @@ A controlled benchmark: N-window coding task (e.g., refactor a 50-file module), 
 | **Runs survive terminal close** | NOT YET — driver is TUI-only (`autonomous-plugin.md:7`: "local TUI sessions only"). Moving driver → actor is the goal. | ✓ if done. jcode overnight headless survives, but interactive doesn't. Claude Code/Codex/Goose don't. | The play. |
 | **Steerable from any client** (`synaps send`) | Partially works — `send` delivers messages to daemon sessions today (`soak note F-series verified`). But driver grant is TUI-bound — `send` can't steer a driven session yet. | ✓ if driver moves to actor. Phone `attach --observe` + `send` from another terminal = remote steering. | Requires driver grant to live on the actor, not the TUI. |
 | **Observable from phone** (`attach --observe`) | Works today for non-driven sessions. | Table stakes for daemon runtimes, but no CLI agent has it yet. | |
-| **Resumable across daemon reload** | JR says "never restore a run" — grant lives in process memory only, no persistence. Reload checkpoints abort context. | Both sides have merit. FOR: long overnight run survives an upgrade. AGAINST: restoring a stale grant with potentially changed env/tools/permissions is dangerous; a driver that was mid-turn when killed has unknown partial side effects. **Recommendation: don't restore. A reloaded session with abort context offers `/auto start` again; the human decides.** | `autonomous-plugin.md:66`: "Process restart must never restore an active run automatically." |
+| **Resumable across daemon reload** | upstream says "never restore a run" — grant lives in process memory only, no persistence. Reload checkpoints abort context. | Both sides have merit. FOR: long overnight run survives an upgrade. AGAINST: restoring a stale grant with potentially changed env/tools/permissions is dangerous; a driver that was mid-turn when killed has unknown partial side effects. **Recommendation: don't restore. A reloaded session with abort context offers `/auto start` again; the human decides.** | `autonomous-plugin.md:66`: "Process restart must never restore an active run automatically." |
 | **N concurrent autonomous sessions** | Daemon already runs N sessions (`soak note: 10 simultaneous adopts → 10 sessions`). Each could have its own driver grant. | ✓ genuinely new. jcode overnight runs one coordinator + N headless workers but they're not independently steerable autonomous sessions. | Shared sidecar set means N sessions don't spawn N×M MCP processes (`daemon-mode.md: sidecars per daemon, not per session`). |
 
 ### Safety: new failure modes with no human at the terminal
@@ -222,7 +222,7 @@ Additionally, the TUI session_driver.rs (1811 lines) is deeply entangled with Ap
 | F19 empty-response fix | S | 6-10 | None |
 | Session-identity T4-T5 (--system by content, journal env) | S+S | 8-12 | T1-T3 |
 | Driver → actor | L | 40-56 | Engine half + T1-T3 + F19 |
-| Session-identity T6-T7 (extension protocol + built-in opt-in) | M | 16-24 | T1-T3, JR spec review |
+| Session-identity T6-T7 (extension protocol + built-in opt-in) | M | 16-24 | T1-T3, upstream spec review |
 
 ### Open decisions for Haseeb
 

@@ -509,6 +509,8 @@ pub enum WireLlmEvent {
     ToolUse { tool_name: String, tool_id: String, input: serde_json::Value },
     ToolResult { tool_id: String, result: String },
     ToolResultDelta { tool_id: String, delta: String },
+    ResponseStart,
+    ResponseReset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +612,8 @@ impl From<StreamEvent> for WireStreamEvent {
                 LlmEvent::ToolUse { tool_name, tool_id, input } => WireLlmEvent::ToolUse { tool_name, tool_id, input },
                 LlmEvent::ToolResult { tool_id, result } => WireLlmEvent::ToolResult { tool_id, result },
                 LlmEvent::ToolResultDelta { tool_id, delta } => WireLlmEvent::ToolResultDelta { tool_id, delta },
+                LlmEvent::ResponseStart => WireLlmEvent::ResponseStart,
+                LlmEvent::ResponseReset => WireLlmEvent::ResponseReset,
             }),
             StreamEvent::Session(s) => Self::Session(match s {
                 SessionEvent::MessageHistory(messages) => WireSessionStreamEvent::MessageHistory { messages },
@@ -633,6 +637,9 @@ impl From<StreamEvent> for WireStreamEvent {
                 SessionEvent::Done => WireSessionStreamEvent::Done,
                 SessionEvent::Error(TurnError { message, outcome }) => WireSessionStreamEvent::Error { message, outcome },
                 SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text },
+                // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire.
+                // Drop it silently — the actor handles persistence before forwarding.
+                SessionEvent::ContextHeadCheckpoint { .. } => WireSessionStreamEvent::Done,
             }),
             StreamEvent::Agent(a) => Self::Agent(match a {
                 AgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
@@ -661,6 +668,8 @@ impl From<WireStreamEvent> for StreamEvent {
                 WireLlmEvent::ToolUse { tool_name, tool_id, input } => LlmEvent::ToolUse { tool_name, tool_id, input },
                 WireLlmEvent::ToolResult { tool_id, result } => LlmEvent::ToolResult { tool_id, result },
                 WireLlmEvent::ToolResultDelta { tool_id, delta } => LlmEvent::ToolResultDelta { tool_id, delta },
+                WireLlmEvent::ResponseStart => LlmEvent::ResponseStart,
+                WireLlmEvent::ResponseReset => LlmEvent::ResponseReset,
             }),
             WireStreamEvent::Session(s) => Self::Session(match s {
                 WireSessionStreamEvent::MessageHistory { messages } => SessionEvent::MessageHistory(messages),

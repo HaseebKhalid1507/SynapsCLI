@@ -96,6 +96,21 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
         m.provider_kind = CatalogProviderKind::OpenAiCodex;
         m.label = Some(label.to_string());
         m.reasoning = codex_static_capability(id).unwrap_or(ReasoningSupport::Unknown);
+        // Exact input-modality evidence from the official local Codex cache,
+        // verified 2026-09-05. Do not infer from generation/family names:
+        // gpt-5.4 was not observed, and spark explicitly advertises text only.
+        if matches!(
+            id,
+            "gpt-6-astra"
+                | "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-5.6-luna"
+                | "gpt-5.5"
+                | "gpt-5.4-mini"
+        ) {
+            m.input_modalities.push(Modality::Image);
+        }
+        // No static row has observed File support.
         m.source = CatalogSource::StaticFallback;
         Some(m)
     })
@@ -139,6 +154,9 @@ struct CodexModelItem {
     supported_in_api: Option<bool>,
     #[serde(default)]
     context_window: Option<u64>,
+    /// Exact advertised inputs. Absence must not inherit static image support.
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
     /// Live catalog reasoning metadata.
     #[serde(default)]
     supported_reasoning_levels: Option<Vec<CodexReasoningLevelItem>>,
@@ -259,6 +277,11 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
             m.provider_kind = CatalogProviderKind::OpenAiCodex;
             m.label = item.display_name.filter(|name| !name.trim().is_empty());
             m.context_tokens = item.context_window;
+            if let Some(modalities) = item.input_modalities {
+                // Even an explicit empty/text-only list is authoritative. Unknown
+                // tokens remain Other and never authorize a supported modality.
+                m.input_modalities = modalities.iter().map(|m| Modality::from_str(m)).collect();
+            }
             m.reasoning = reasoning;
             m.source = CatalogSource::Live;
             Some(m)
@@ -702,6 +725,70 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
+
+    #[test]
+    fn input_modalities_use_only_exact_observed_static_and_fixture_rows() {
+        for models in [
+            codex_static_catalog_models(),
+            parse_codex_catalog_models(FIXTURE).unwrap(),
+        ] {
+            for model in models {
+                let expected = match model.id.as_str() {
+                    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+                    | "gpt-5.5" | "gpt-5.4-mini" => vec![Modality::Text, Modality::Image],
+                    // 5.4 unobserved; spark explicitly text-only.
+                    "gpt-5.4" | "gpt-5.3-codex-spark" => vec![Modality::Text],
+                    _ => panic!("unexpected selectable fixture row"),
+                };
+                assert_eq!(model.input_modalities, expected, "{}", model.id);
+                assert!(!model.input_modalities.contains(&Modality::File));
+            }
+        }
+    }
+
+    #[test]
+    fn live_input_modalities_never_backfill_static_images() {
+        for (field, expected) in [
+            ("", vec![Modality::Text]),
+            (r#", "input_modalities": null"#, vec![Modality::Text]),
+            (r#", "input_modalities": ["text"]"#, vec![Modality::Text]),
+            (r#", "input_modalities": []"#, vec![]),
+            (r#", "input_modalities": ["image"]"#, vec![Modality::Image]),
+            (
+                r#", "input_modalities": ["text", "file"]"#,
+                vec![Modality::Text, Modality::File],
+            ),
+            (
+                r#", "input_modalities": ["Image", "image/png", "future"]"#,
+                vec![
+                    Modality::Other("Image".into()),
+                    Modality::Other("image/png".into()),
+                    Modality::Other("future".into()),
+                ],
+            ),
+        ] {
+            let body = format!(r#"{{"models":[{{"slug":"gpt-6-astra"{field}}}]}}"#);
+            let models = parse_codex_catalog_models(&body).unwrap();
+            assert_eq!(models[0].input_modalities, expected);
+            assert_eq!(models[0].source, CatalogSource::Live);
+        }
+    }
+
+    #[test]
+    fn malformed_input_modalities_reject_catalog_instead_of_authorizing_static() {
+        for value in [
+            r#""image""#,
+            "true",
+            "{}",
+            "[null]",
+            "[1]",
+            r#"["text", {}]"#,
+        ] {
+            let body =
+                format!(r#"{{"models":[{{"slug":"gpt-6-astra","input_modalities":{value}}}]}}"#);
+            assert!(parse_codex_catalog_models(&body).is_err());
+        }
+    }
 
     fn ultra_test_row(
         id: &str,

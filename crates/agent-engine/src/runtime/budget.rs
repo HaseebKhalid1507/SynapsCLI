@@ -27,7 +27,7 @@ pub struct TurnBudget {
     /// Bounded auto-renewals of the provider-round allowance (spec §8.1).
     /// On exhaustion the stream loop may reset the round counter this many
     /// times so a long, legitimate task continues instead of hard-failing.
-    /// Wall-clock is NEVER renewed, so total turn time is still bounded; a
+    /// Round renewal never resets wall-clock (durable context successors do); a
     /// value of `0` means no graceful continuation (immediate hard stop).
     pub max_round_renewals: u32,
 }
@@ -57,8 +57,8 @@ impl TurnBudget {
                 max_context_tokens: None,
                 max_cost_usd: None,
                 // A human is watching and can interrupt; let long agentic
-                // tasks continue through several checkpoints, bounded overall
-                // by the 2h wall-clock.
+                // tasks continue through several checkpoints. Each time segment
+                // is bounded by 2h; durable context successors start fresh time.
                 max_round_renewals: 8,
             },
             TurnRole::Autonomous => Self {
@@ -193,8 +193,15 @@ impl TurnBudgetMeter {
         &self.budget
     }
 
-    fn wall_clock_exceeded(&self) -> bool {
+    pub(crate) fn wall_clock_exceeded(&self) -> bool {
         self.started.elapsed() >= self.budget.max_elapsed
+    }
+
+    /// A successfully committed durable context successor starts a new time
+    /// segment. Never call on an attempted/failed save or a model checkpoint.
+    /// Cumulative resource/cost limits and round renewals remain unchanged.
+    pub(crate) fn start_context_segment(&mut self) {
+        self.started = Instant::now();
     }
 
     /// Charge one provider round. Checked BEFORE the provider call:
@@ -235,6 +242,25 @@ impl TurnBudgetMeter {
     /// enforcement path uses [`Self::wall_clock_exceeded`].
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// Metadata-only diagnostic; preserve the typed outcome for every frontend
+    /// and autonomous driver. Exhaustion is a local stop, not provider fallback.
+    pub fn exhaustion_error(&self, dimension: BudgetDimension) -> agent_core::TurnError {
+        let mut error = agent_core::TurnError::budget(dimension);
+        if dimension == BudgetDimension::WallClock {
+            error.message = format!(
+                "turn budget exhausted (wall_clock): elapsed {}s / limit {}s. \
+                 This is a local per-turn time limit, not a provider error. \
+                 History retained. An authorized auto driver can continue; otherwise send a new prompt for a fresh turn budget. \
+                 For longer turns, use /budget status and /budget time <duration> (e.g. 4h) in the foreground, \
+                 or configure turn_budget.<role>.max_elapsed_secs before restarting the host. \
+                 In context auto, a committed rollover starts a fresh time allowance.",
+                self.elapsed().as_secs(),
+                self.budget.max_elapsed.as_secs(),
+            );
+        }
+        error
     }
 
     /// Provider rounds charged since the last renewal (reset by
@@ -330,6 +356,56 @@ mod tests {
             budget.max_tool_calls,
             TurnBudget::for_role(TurnRole::Autonomous).max_tool_calls
         );
+    }
+
+    #[test]
+    fn committed_context_segment_resets_only_time() {
+        let mut meter = TurnBudgetMeter::new(TurnBudget::for_role(TurnRole::Foreground));
+        meter.started = Instant::now() - Duration::from_secs(7201);
+        meter.charge_tool_calls(3);
+        meter.charge_tool_result_bytes(1234).unwrap();
+        meter.try_renew_rounds();
+        let original = meter.budget().clone();
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+        meter.start_context_segment();
+        assert!(meter.begin_round().is_ok());
+        assert_eq!(meter.budget(), &original);
+        assert_eq!(meter.tool_calls_used(), 3);
+        assert_eq!(meter.tool_result_bytes_used(), 1234);
+        assert_eq!(meter.round_renewals_used(), 1);
+    }
+
+    #[test]
+    fn exhaustion_diagnostic_keeps_typed_outcome_and_reports_metadata() {
+        let meter = TurnBudgetMeter::new(TurnBudget::for_role(TurnRole::Foreground));
+        let error = meter.exhaustion_error(BudgetDimension::WallClock);
+        assert_eq!(
+            error.outcome,
+            agent_core::TurnOutcome::BudgetExceeded {
+                dimension: BudgetDimension::WallClock
+            }
+        );
+        assert!(error.message.contains("elapsed "));
+        assert!(error.message.contains("/ limit 7200s"));
+        assert!(error.message.contains("History retained"));
+        assert!(error.message.contains("/budget time <duration>"));
+        assert!(error
+            .message
+            .contains("committed rollover starts a fresh time allowance"));
+        // Other dimensions keep the existing diagnostic and exact typed label.
+        for dimension in [
+            BudgetDimension::ToolCalls,
+            BudgetDimension::ProviderRounds,
+            BudgetDimension::ToolResultBytes,
+            BudgetDimension::InputTokens,
+            BudgetDimension::OutputTokens,
+            BudgetDimension::CostUsd,
+        ] {
+            assert_eq!(
+                meter.exhaustion_error(dimension),
+                agent_core::TurnError::budget(dimension)
+            );
+        }
     }
 
     #[test]
