@@ -318,8 +318,21 @@ impl EngineHost {
                 return tpl.clone();
             }
         }
-        let fresh = ToolRegistry::without_subagent_with_extensions(&shared);
+        let mut fresh = ToolRegistry::without_subagent_with_extensions(&shared);
         drop(shared);
+        // #112: apply after the merge too — a shared registry must not
+        // reintroduce a forum tool the operator disabled. Other worker policy
+        // is preserved.
+        let disabled_forum: Vec<String> = self
+            .config()
+            .disabled_tools
+            .iter()
+            .filter(|name| matches!(name.as_str(), "forum_post" | "forum_read" | "forum_forget"))
+            .cloned()
+            .collect();
+        if !disabled_forum.is_empty() {
+            fresh.disable(&disabled_forum);
+        }
         *self.worker_registry.lock().unwrap() = Some((gen, fresh.clone()));
         fresh
     }

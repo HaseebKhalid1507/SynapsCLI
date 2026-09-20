@@ -243,7 +243,7 @@ impl Tool for SubagentResumeTool {
                     // write premium (~2× input price) on them is unrecoverable waste
                     // (~$0.23 per 10-spawn fan-out). (#110)
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
-                    runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
+                    runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model_a.clone());
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
 

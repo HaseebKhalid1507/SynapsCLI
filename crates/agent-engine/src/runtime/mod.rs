@@ -2329,6 +2329,12 @@ impl Runtime {
 
     /// True when legacy note/history/provider access is forbidden by the host
     /// selection, including invalid or unavailable backend configuration.
+    /// Whether the project forum is live for this runtime (Axel backend).
+    /// Workers use it to decide whether forum guidance belongs in the prompt.
+    pub fn memory_backend_is_axel(&self) -> bool {
+        self.memory_backend.is_axel()
+    }
+
     pub fn memory_backend_exclusive(&self) -> bool {
         self.memory_backend.exclusive()
     }
