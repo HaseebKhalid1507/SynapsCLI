@@ -235,7 +235,7 @@ async fn reload_lock_held_keeps_same_id_parked_and_refuses_attach() {
     // 7. RECOVERY: the next attach retries the real create under the same id —
     //    the placeholder is replaced and the journal's history comes back.
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (mut t, snap) = SocketTransport::attach(
+    let (t, snap) = SocketTransport::attach(
         conn,
         Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror },
     )
