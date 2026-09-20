@@ -8,11 +8,21 @@ compiled into Synaps.
 
 ## Scope and authorization
 
-The first implementation supports **local TUI sessions only**. Headless chat,
-stdio RPC, WebSocket server and subagents do not activate drivers. Existing
-extensions remain protocol v1; this is an additive permission and response
-contract. Older hosts reject the unknown permission rather than silently enabling
-unsupported automation.
+The driver lives in the **session actor**, not in any one client. Whatever is
+attached — the TUI, `synaps attach`, `synaps send` — can arm, observe and steer
+it through the actor's protocol; a headless run is the feature, not an accident
+(see [Front doors](#front-doors) and the daemon notes in
+[daemon-mode.md](../daemon-mode.md#autonomous-driver-in-the-session-actor)).
+Subagents still do not activate drivers. Existing extensions remain protocol v1;
+this is an additive permission and response contract. Older hosts reject the
+unknown permission rather than silently enabling unsupported automation.
+
+The grant is **single-tenant, process-wide**: at most one concurrent grant per
+plugin across the whole daemon. Two sessions cannot arm the same plugin at once —
+the host keeps a `plugin → session` grant map and refuses a second claim with
+`plugin '<id>' already driving session <id>` (see the `already driving` notice
+and the `driver_start_second_session_refused` test). Grants do not survive a
+daemon reload.
 
 Merely installing the plugin does not run the model. The host accepts a start
 proposal only from the successful response to an explicit interactive command of
@@ -25,6 +35,48 @@ start proposal become the run's immutable allowlist; later responses cannot add
 providers or change effort. Choose favorites accordingly. Ordinary tool approval,
 model capability, context durability, attachment and subagent-completion gates
 still apply. Model/effort changes are session-only, not new global defaults.
+
+## Front doors
+
+Both interactive clients arm the actor through the same command. `/auto <args>`
+in the **TUI** (`dispatch.rs`, gated on `ExtensionManager::has_session_drive`)
+and `/auto <args>` in **`synaps attach`** (the thin line client, `cmd/attach.rs`)
+each send a `DriverStart { plugin, command, arg }` to the session actor. The
+actor — not the client — is the authority: it resolves the handler via
+`session_driver_handler`, which fails closed unless the extension is eagerly
+loaded and holds a validated `session.drive` permission. There is no separate
+"local" and "remote" path; the client only formats the `/auto` line into the
+`DriverStart` triple.
+
+## Security gates
+
+Moving the driver into the actor removed the "a human is always at the TUI"
+assumption, so the host enforces three actor-level safety gates (E-P7).
+
+**Zero-client revoke (S1).** When the last client detaches from a driver-armed
+session, the grant is revoked with the reason `no clients attached` — no
+unwatched headless spend. Detach is also fail-closed for confirmation prompts:
+any pending host-confirmation prompt is answered `None` (deny; the tool
+discovery path treats `None` as `Unauthorized`) so a prompt with nobody to
+answer it can never block a turn open or stall parking.
+
+**Cost caps (S3).** `SessionConfig.max_session_cost` is a host-owned USD ceiling
+on the session. It is checked after **every** `Usage` event; on breach the actor
+emits `CostCapReached { scope, cost, cap }`, revokes any armed driver (so it
+cannot re-poll and keep spending), and cancels the in-flight turn. The plugin
+may additionally propose `max_cost_usd` on its Start reply; the host enforces the
+effective per-run cap via `Grant::effective_cost_cap(host_cap)`, which is the
+**lower** of the plugin proposal and any host cap — the plugin may only lower,
+never raise, the limit (`None` on both sides means unbounded). Run cost is
+measured from the grant's `cost_at_arm`. So the plugin can see spend, the poll
+request carries `session_cost_so_far`.
+
+**No auto-approve under a driver (S9).** While a grant is armed, the actor forces
+`auto_approve_confirms` to `false` regardless of the session config
+(`auto_approve = self.config.auto_approve_confirms && self.driver.is_none()`).
+Model-initiated tool activation stays gated behind ordinary confirmation even if
+the session was created with auto-approve on — the contract's "ordinary tool
+approval gates still apply" holds under automation.
 
 ## Foreground context selection
 
@@ -210,7 +262,8 @@ in process memory.
 ## Host constraints
 
 - One outstanding callback/proposal; callbacks have a five-second timeout and run
-  outside the TUI event handler. Delays are 1–300 seconds.
+  on the session actor's own tick, off the request path — never blocking the
+  actor's select loop or another client. Delays are 1–300 seconds.
 - Replies are bounded to 64 KiB, prompts to 16 KiB, notices to 2 KiB and favorites
   to 16 unique qualified model identities. Invalid/unknown fields fail closed.
 - Checked model/effort mutation and complete proposed-history validation precede
