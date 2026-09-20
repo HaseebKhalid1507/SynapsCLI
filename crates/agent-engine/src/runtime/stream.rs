@@ -41,6 +41,44 @@ pub fn activation_policy(
     }
 }
 
+/// Pre-cancellation guard for provider IO. If `cancel.is_cancelled()` before
+/// the call, return `Err(Canceled)` without polling — no billed request.
+async fn await_provider_call<F>(cancel: &CancellationToken, call: F) -> Result<Value>
+where
+    F: std::future::Future<Output = Result<Value>>,
+{
+    if cancel.is_cancelled() {
+        return Err(RuntimeError::Canceled);
+    }
+    tokio::select! {
+        biased;
+        result = call => result,
+        _ = cancel.cancelled() => Err(RuntimeError::Canceled),
+    }
+}
+
+/// Cancellation wins over a ready tool, and the last precheck is inside the
+/// execution future, immediately before its first poll. Track whether it was
+/// polled: an unstarted non-idempotent tool is NOT an interrupted side effect.
+async fn await_tool_call<F: std::future::Future>(
+    cancel: &CancellationToken,
+    call: F,
+) -> (Option<F::Output>, bool) {
+    let mut started = false;
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = async {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            started = true;
+            Some(call.await)
+        } => result,
+    };
+    (result, started)
+}
+
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
@@ -1000,7 +1038,7 @@ impl StreamMethods {
                 request_messages
             };
 
-            let response = match ApiMethods::call_api_stream_inner(
+            let response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
                 &model,
@@ -1015,7 +1053,7 @@ impl StreamMethods {
                 refusal_retries,
                 round_options,
                 telemetry_level,
-            )
+            ))
             .await
             {
                 Ok(r) => r,
@@ -1333,12 +1371,12 @@ impl StreamMethods {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
-                                    tokio::select! {
-                                        res = tool.execute_rich(input, crate::ToolContext {
+                                    match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        }) => {
+                                        })).await {
+                                        (Some(res), _) => {
                                             let (output, rich_blocks) = match res {
                                                 Ok(o) => o.into_parts(),
                                                 Err(e) => {
@@ -1364,7 +1402,7 @@ impl StreamMethods {
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
                                             (hooked_output, rich_blocks)
                                         }
-                                        _ = cancel.cancelled() => {
+                                        (None, started) => {
                                             canceled = true;
                                             // Ledger: this call STARTED but
                                             // never recorded a result. A
@@ -1372,7 +1410,7 @@ impl StreamMethods {
                                             // interrupted side effect (unknown
                                             // commit status) and must not be
                                             // auto-rerun (Task 25, §8.3).
-                                            if crate::tools::ledger::CallLedger::interrupted_started(
+                                            if started && crate::tools::ledger::CallLedger::interrupted_started(
                                                 &tool_id,
                                                 tool.effect(),
                                             )
@@ -1671,12 +1709,12 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    tokio::select! {
-                                        res = t.execute_rich(input, crate::ToolContext {
+                                    match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        }) => {
+                                        })).await {
+                                        (Some(res), _) => {
                                             let (output, rich_blocks, errored) = match res {
                                                 Ok(o) => { let (t, b) = o.into_parts(); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
@@ -1697,8 +1735,8 @@ impl StreamMethods {
                                             let history_handle = if errored { None } else { Some(output_handle) };
                                             (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
-                                        _ = cancel_token.cancelled() => {
-                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
+                                        (None, started) => {
+                                            (true, started.then_some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }
                                     } // close else from Block check
@@ -2048,6 +2086,10 @@ fn tool_result_bytes(r: &Value) -> usize {
 mod tests {
     use super::*;
     use crate::core::config::CacheTtl;
+    use std::cell::Cell;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+    use std::time::Duration;
 
     fn user_msg(content: Value) -> SharedMessage {
         Arc::new(json!({"role": "user", "content": content}))
@@ -2055,6 +2097,139 @@ mod tests {
 
     fn assistant_msg(text: &str) -> SharedMessage {
         Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": text}]}))
+    }
+
+    // ── await_provider_call / await_tool_call cancellation tests ─────────
+
+    #[tokio::test]
+    async fn provider_pre_cancellation_never_polls_ready_future() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polls = Cell::new(0);
+        let provider = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready(Ok(json!({"content": []})))
+        });
+
+        assert!(matches!(
+            await_provider_call(&cancel, provider).await,
+            Err(RuntimeError::Canceled)
+        ));
+        assert_eq!(polls.get(), 0, "pre-cancellation must prevent dispatch");
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_preserves_cooperative_partial_cleanup() {
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let partial = json!({
+            "content": [{"type": "text", "text": "partial response"}],
+            "stop_reason": "end_turn"
+        });
+        let provider = async {
+            cancel.cancelled().await;
+            tx.send(StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 3,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }))
+            .unwrap();
+            Ok(partial.clone())
+        };
+        let mut waiting = Box::pin(await_provider_call(&cancel, provider));
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("cooperative cancellation must finish promptly")
+            .expect("provider cleanup must win over the cancellation fallback");
+        assert_eq!(result, partial);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 3,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 0,
+                ..
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "cleanup must emit usage only once");
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_bounds_and_drops_uncooperative_pending_future() {
+        struct DropFlag<'a>(&'a Cell<bool>);
+        impl Drop for DropFlag<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let dropped = Cell::new(false);
+        let polls = Cell::new(0);
+        let guard = DropFlag(&dropped);
+        let provider = async {
+            let _guard = guard;
+            poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                Poll::<Result<Value>>::Pending
+            })
+            .await
+        };
+        let mut waiting = Box::pin(await_provider_call(&cancel, provider));
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(polls.get(), 1);
+        assert!(!dropped.get());
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("a provider ignoring cancellation must not stall cleanup");
+        assert!(matches!(result, Err(RuntimeError::Canceled)));
+        assert_eq!(polls.get(), 2, "allow just one cooperative cleanup poll");
+        assert!(
+            dropped.get(),
+            "cancelled provider resources must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_pre_cancellation_never_polls_or_marks_ready_call_started() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polls = Cell::new(0);
+        let tool = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready("side effect completed")
+        });
+
+        let (result, started) = await_tool_call(&cancel, tool).await;
+        assert!(result.is_none());
+        assert!(
+            !started,
+            "an unpolled tool is not an interrupted side effect"
+        );
+        assert_eq!(
+            polls.get(),
+            0,
+            "pre-cancellation must prevent tool dispatch"
+        );
     }
 
     // ── guard framing: single source for both injection placements ────────
