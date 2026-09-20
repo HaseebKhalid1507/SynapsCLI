@@ -720,7 +720,6 @@ fn memory_provider_id() -> memory_context::ContextProviderId {
         .expect("static provider id is always valid")
 }
 
-#[allow(dead_code)] // merge(112): consumed in phase 3
 fn terminal_capture_start(messages: &[crate::SharedMessage]) -> Option<crate::SharedMessage> {
     messages
         .iter()
@@ -734,7 +733,6 @@ fn terminal_capture_start(messages: &[crate::SharedMessage]) -> Option<crate::Sh
         .cloned()
 }
 
-#[allow(dead_code)] // merge(112): consumed in phase 3
 fn terminal_capture_messages<'a>(
     messages: &'a [crate::SharedMessage],
     start: &crate::SharedMessage,
@@ -750,7 +748,6 @@ fn terminal_capture_messages<'a>(
 
 /// The stream publishes history only after a valid terminal completion. Consume
 /// it once, never capture the pre-inference prompt or reselect a changed lease.
-#[allow(dead_code)] // merge(112): consumed in phase 3
 fn dispatch_completed_terminal_capture(
     completed: bool,
     final_history: &std::sync::Mutex<Option<Vec<crate::SharedMessage>>>,
@@ -2991,6 +2988,25 @@ impl Runtime {
         &self,
         lease: &memory_context::MemoryContextLease,
     ) -> Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        if self.memory_backend.is_axel() {
+            if lease.provider_id.as_str() != axel_context::PROVIDER_ID
+                || lease.project_id != self.memory_context_project_id()
+            {
+                return None;
+            }
+            return Some(Arc::new(axel_context::AxelCaptureProvider {
+                binding: self.memory_backend.clone(),
+                state: self.memory_context_state.clone(),
+                lease: lease.clone(),
+            }));
+        }
         let manager = self.extension_runtime.clone()?;
         let mut parts = lease.provider_id.as_str().splitn(3, ':');
         let (Some("extension"), Some(plugin), Some(_)) = (parts.next(), parts.next(), parts.next())
@@ -3854,6 +3870,7 @@ impl Runtime {
         // extension calls. Every recall failure fails OPEN: the turn itself
         // is never blocked or failed by memory.
         let capture_started_at = std::time::SystemTime::now();
+        let capture_turn_start = terminal_capture_start(&messages);
         // Snapshot the full prompt-time lease: terminal dispatch must never
         // reselect a provider after the user changes memory state.
         let capture_lease = self
@@ -3890,8 +3907,10 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
-        let capture_runtime = self.extension_runtime.clone();
-        let capture_session = self.host_tool_session.clone();
+        let capture_provider = capture_lease
+            .as_ref()
+            .and_then(|lease| self.extension_capture_provider(lease));
+        let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
@@ -3971,7 +3990,6 @@ impl Runtime {
         };
 
         tokio::spawn(async move {
-            let capture_messages = messages.clone();
             let completed = match StreamMethods::run_stream_internal(session, messages).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -3981,37 +3999,16 @@ impl Runtime {
                     false
                 }
             };
-            if completed {
-                if let (Some(lease), Some(manager)) = (capture_lease, capture_runtime) {
-                    let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                    if let (Some("extension"), Some(plugin), Some(_)) =
-                        (parts.next(), parts.next(), parts.next())
-                    {
-                        if let Some(digest) = manager
-                            .declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)
-                        {
-                            let provider = std::sync::Arc::new(ExtensionCaptureProvider {
-                                manager,
-                                session: capture_session,
-                                plugin: plugin.to_owned(),
-                                digest,
-                                handle: tokio::runtime::Handle::current(),
-                            });
-                            let history = terminal_capture_history(
-                                &lease,
-                                &capture_messages,
-                                capture_started_at,
-                            );
-                            let _ = memory_capture_worker().submit_terminal(
-                                &lease,
-                                history,
-                                memory_context::RetentionClass::Standard,
-                                provider,
-                            );
-                        }
-                    }
-                }
-            }
+            // The stream publishes its FINAL history only on a valid terminal
+            // completion; capture that, never the pre-inference prompt.
+            dispatch_completed_terminal_capture(
+                completed,
+                &final_capture_history,
+                &capture_state,
+                capture_lease.zip(capture_provider),
+                capture_started_at,
+                capture_turn_start.as_ref(),
+            );
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
             // caller becomes async.  Poison-safe via reap_finished internals.

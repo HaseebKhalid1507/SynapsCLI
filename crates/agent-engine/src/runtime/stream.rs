@@ -511,6 +511,11 @@ impl StreamMethods {
                 return Ok(());
             }
 
+            // Steering accepted while async stream setup was connecting must
+            // reach the FIRST request, not wait until its tools have executed.
+            // Subsequent rounds use the same path and normal request validation.
+            HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+
             // Budget pre-flight: wall clock, then the exact round cap —
             // BEFORE any provider call is spent. History is valid here
             // (round boundaries always end on paired tool_results).
@@ -1040,6 +1045,12 @@ impl StreamMethods {
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
+                        // A clean finish is a terminal completion: publish the
+                        // history for memory capture like the normal end_turn path.
+                        *final_capture_history
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(messages.clone());
                         let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Ok(());
                     }
