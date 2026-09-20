@@ -4184,6 +4184,100 @@ impl Clone for Runtime {
 }
 
 #[cfg(test)]
+mod rich_output_validation_tests {
+    use super::*;
+
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+
+    fn rich_output(summary: &str) -> crate::ToolOutput {
+        crate::ToolOutput::Blocks {
+            summary: summary.to_string(),
+            // Deliberately omit leading text to exercise into_parts normalization.
+            blocks: vec![json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l+QAAAAASUVORK5CYII="
+                }
+            })],
+        }
+    }
+
+    #[test]
+    fn unchanged_summary_retains_rich_array_without_text_truncation() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image"));
+        assert_eq!(summary, "image");
+        let expected = blocks.clone().expect("supported image");
+        assert_eq!(expected[0], json!({"type": "text", "text": summary}));
+        assert_eq!(expected[1]["type"], "image");
+        let retained = retain_single_tool_blocks(blocks, &summary, &summary);
+        assert_eq!(
+            single_tool_result_content(&summary, retained, summary.len()),
+            Value::Array(expected)
+        );
+    }
+
+    #[test]
+    fn rewritten_or_truncated_summary_drops_rich_blocks() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image summary"));
+        assert!(blocks.is_some());
+        for hooked in [
+            "redacted".to_string(),
+            String::new(),
+            helpers::HelperMethods::truncate_tool_result(&summary, 5),
+        ] {
+            let retained = retain_single_tool_blocks(blocks.clone(), &summary, &hooked);
+            assert!(retained.is_none());
+            assert_eq!(
+                single_tool_result_content(&hooked, retained, 5),
+                Value::String(helpers::HelperMethods::truncate_tool_result(&hooked, 5))
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_malformed_media_becomes_explicit_text() {
+        let mut malformed = rich_output("private summary");
+        if let crate::ToolOutput::Blocks { blocks, .. } = &mut malformed {
+            blocks[0]["source"]["data"] = json!("private invalid payload");
+        }
+        for (model, output) in [
+            (
+                "google-gemini/unsupported-rich-test",
+                rich_output("private summary"),
+            ),
+            (MODEL, malformed),
+        ] {
+            let (summary, blocks) = validated_single_tool_output(model, output);
+            assert!(summary.starts_with("Attachment not sent: "), "{summary}");
+            assert!(!summary.contains("private"));
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 1024),
+                Value::String(summary)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_and_errors_keep_legacy_truncation() {
+        for text in ["plain output", "tool error", "Unknown tool: missing"] {
+            let (summary, blocks) = validated_single_tool_output(
+                "google-gemini/unsupported-rich-test",
+                crate::ToolOutput::Text(text.to_string()),
+            );
+            assert_eq!(summary, text);
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 5),
+                Value::String(helpers::HelperMethods::truncate_tool_result(text, 5))
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

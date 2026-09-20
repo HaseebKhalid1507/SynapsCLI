@@ -79,6 +79,18 @@ async fn await_tool_call<F: std::future::Future>(
     (result, started)
 }
 
+/// Reject unsupported/malformed media while it is still a tool result, so a
+/// text-only model can recover rather than accumulating an unsendable history.
+fn validated_tool_output(model: &str, output: crate::ToolOutput) -> (String, Option<Vec<Value>>) {
+    let (summary, blocks) = output.into_parts();
+    if let Some(ref blocks) = blocks {
+        if let Err(error) = super::attachments::validate_tool_blocks(model, blocks) {
+            return (format!("Attachment not sent: {error}"), None);
+        }
+    }
+    (summary, blocks)
+}
+
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
@@ -1378,7 +1390,7 @@ impl StreamMethods {
                                         })).await {
                                         (Some(res), _) => {
                                             let (output, rich_blocks) = match res {
-                                                Ok(o) => o.into_parts(),
+                                                Ok(o) => validated_tool_output(&model, o),
                                                 Err(e) => {
                                                     // F28: the delta lane only saw stdout/stderr;
                                                     // the exit status (and any T5 notice) lives in
@@ -1626,6 +1638,7 @@ impl StreamMethods {
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
                         let prompt_inner = secret_prompt.clone();
+                        let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
                         let env_inner = env.clone();
                         let env_stripped_inner = env_stripped.clone();
@@ -1716,7 +1729,7 @@ impl StreamMethods {
                                         })).await {
                                         (Some(res), _) => {
                                             let (output, rich_blocks, errored) = match res {
-                                                Ok(o) => { let (t, b) = o.into_parts(); (t, b, false) }
+                                                Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
                                             };
                                             let hooked_output = emit_after_tool_call(
@@ -3106,6 +3119,11 @@ mod rich_output_tests {
             "forum tools must be hidden under the legacy backend: {names:?}"
         );
     }
+
+    // history_media_limit_rejects_before_lossy_pruning: FINDING — requires
+    // validate_messages early rejection in the stream loop (not on dev).
+    // The test asserts d.bodies.is_empty() but dev allows oversized history
+    // through to the provider, relying on cap_history_image_bytes lossy pruning.
 
     #[test]
     fn select_content_prefers_rich_then_bounded_then_truncated() {
