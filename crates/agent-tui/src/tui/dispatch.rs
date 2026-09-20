@@ -1227,7 +1227,14 @@ pub(crate) async fn handle_input_action(
         InputAction::Submit(input) => {
             // Queue input during compaction — the actor queues it (B2) and
             // answers `Steered{delivered:false}` → "queued: …".
+            // Reject attachments during compaction; the actor would ignore them.
             if app.compacting {
+                if !app.pending_attachments.is_empty() {
+                    app.push_msg(ChatMessage::System(
+                        "cannot submit attachments while compacting — /detach or wait".into(),
+                    ));
+                    return ControlFlow::Continue(());
+                }
                 let _ = link
                     .send(agent_engine::session::SessionCommand::Submit {
                         text: input,
@@ -1236,6 +1243,19 @@ pub(crate) async fn handle_input_action(
                     .await;
                 return ControlFlow::Continue(());
             }
+
+            // Build attachment blocks (consumed on submit).
+            let attachment_blocks = if app.pending_attachments.is_empty() {
+                Vec::new()
+            } else {
+                // Display attachment summaries in the transcript.
+                let summaries = app.pending_attachments.summaries();
+                for s in &summaries {
+                    app.push_msg(ChatMessage::System(format!("📎 {s}")));
+                }
+                app.pending_attachments.take_blocks()
+            };
+
             let display_text = app.user_display_text_for_submission(&input);
             app.push_msg(ChatMessage::User(display_text));
             app.input_before_paste = None;
@@ -1250,7 +1270,7 @@ pub(crate) async fn handle_input_action(
             let _ = link
                 .send(agent_engine::session::SessionCommand::Submit {
                     text: input,
-                    attachments: Vec::new(),
+                    attachments: attachment_blocks,
                 })
                 .await;
         }
