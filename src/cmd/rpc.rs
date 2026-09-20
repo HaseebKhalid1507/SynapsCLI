@@ -62,6 +62,11 @@ struct InFlight {
 struct RpcState {
     runtime: Runtime,
     session: Session,
+    /// Wall 1 for the headless bridge: rpc drives `Runtime` directly (no
+    /// `SessionActor`), so IT must answer `ContextHeadCheckpoint` and honour
+    /// the durability latch — otherwise a rollover latches `durability_blocked`
+    /// with nobody to complete the receipt.
+    context_head: synaps_cli::engine::session::ContextHeadPersistence,
     api_messages: Vec<synaps_cli::SharedMessage>,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -88,7 +93,7 @@ impl RpcState {
     /// Persist the current conversation to the session file. No-op if the
     /// message list is empty.
     async fn save_session(&mut self) {
-        if self.api_messages.is_empty() {
+        if self.context_head.is_blocked(&self.session) || self.api_messages.is_empty() {
             return;
         }
         self.session.api_messages = self.api_messages.clone();
@@ -103,6 +108,31 @@ impl RpcState {
         if let Err(e) = self.session.save().await {
             tracing::error!(error = %e, "failed to save session");
         }
+    }
+
+    async fn persist_context_head(
+        &mut self,
+        session_id: &str,
+        messages: Vec<synaps_cli::SharedMessage>,
+    ) -> std::io::Result<()> {
+        let mut candidate = self.session.clone();
+        candidate.api_messages = messages;
+        candidate.total_input_tokens = self.total_input_tokens;
+        candidate.total_output_tokens = self.total_output_tokens;
+        candidate.session_cost = self.session_cost;
+        candidate.model = self.runtime.model().to_string();
+        candidate.system_prompt = self.runtime.system_prompt().map(str::to_string);
+        candidate.thinking_level = self.runtime.thinking_level().to_string();
+        candidate.updated_at = chrono::Utc::now();
+        candidate.auto_title();
+        self.context_head
+            .persist(
+                &mut self.session,
+                &mut self.api_messages,
+                session_id,
+                candidate,
+            )
+            .await
     }
 
     /// Returns `true` if the session is busy — either a streaming task is
@@ -190,6 +220,7 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
     if allow_chain
         && had_buffered
         && st.events_auto_turn
+        && !st.context_head.is_blocked(&st.session)
         && !auto_turn_cap_reached(st.consecutive_auto_turns, st.auto_turn_cap)
         && st
             .api_messages
@@ -281,6 +312,17 @@ async fn spawn_prompt(
             st.auto_turn_pending = false;
             return;
         }
+        if st.context_head.is_blocked(&st.session) {
+            st.auto_turn_pending = false;
+            let _ = wtx
+                .send(RpcEvent::Error {
+                    id: Some(prompt_id.clone()),
+                    message: "context head is unverified — start a new session or restart/resume"
+                        .into(),
+                })
+                .await;
+            return;
+        }
         st.api_messages.clone()
     };
 
@@ -316,6 +358,16 @@ async fn spawn_prompt(
         };
 
         while let Some(ev) = stream.next().await {
+            if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                session_id,
+                messages,
+                receipt,
+            }) = ev
+            {
+                let mut st = state.lock().await;
+                receipt.complete(st.persist_context_head(&session_id, messages).await);
+                continue;
+            }
             // Peel off MessageHistory first so we can MOVE the payload into
             // state instead of cloning it (the vec can be several MB).
             if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
@@ -577,6 +629,15 @@ async fn handle_compact(
     // 1. Brief lock: snapshot what the transition needs, then drop guard.
     let (msgs, runtime, session) = {
         let st = state.lock().await;
+        if st.context_head.is_blocked(&st.session) {
+            let _ = writer_tx
+                .send(RpcEvent::Error {
+                    id: Some(id),
+                    message: "cannot compact while the context head is unverified".into(),
+                })
+                .await;
+            return;
+        }
         (
             st.api_messages.clone(),
             st.runtime.clone(),
@@ -678,7 +739,9 @@ async fn handle_new_session(
         );
         let sid = new_sess.id.clone();
         st.session = new_sess;
+        st.context_head = Default::default();
         st.api_messages.clear();
+        st.runtime.reset_context_continuation(&sid, &[]);
         st.total_input_tokens = 0;
         st.total_output_tokens = 0;
         st.session_cost = 0.0;
@@ -954,6 +1017,7 @@ pub async fn run(
     let state = Arc::new(Mutex::new(RpcState {
         runtime,
         session,
+        context_head: Default::default(),
         api_messages: initial_messages,
         total_input_tokens: initial_in,
         total_output_tokens: initial_out,
@@ -1351,4 +1415,51 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod context_head_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn context_head_rejection_blocks_shutdown_save_and_auto_chain() {
+        let mut session = Session::new("synthetic", "medium", Some("host authority"));
+        session.id = "synthetic-rpc-context-head".into();
+        session.api_messages = vec![Arc::new(serde_json::json!({
+            "role":"user", "content":"original synthetic head"
+        }))];
+        let old_messages = session.api_messages.clone();
+        let mut st = RpcState {
+            runtime: Runtime::new_headless(),
+            session,
+            context_head: Default::default(),
+            api_messages: old_messages.clone(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            session_cost: 0.0,
+            in_flight: None,
+            pending_events: vec!["synthetic pending event".into()],
+            consecutive_auto_turns: 0,
+            auto_turn_pending: false,
+            events_auto_turn: true,
+            auto_turn_cap: 5,
+        };
+        let (receipt, acknowledged) = synaps_cli::core::context_head::ContextHeadReceipt::channel();
+        receipt.complete(st.persist_context_head("wrong-session", Vec::new()).await);
+        assert!(acknowledged.await.unwrap().is_err());
+        assert_eq!(st.api_messages, old_messages);
+        let state = Mutex::new(st);
+        assert!(terminal_flush(&state, true).await.is_none());
+        let mut st = state.lock().await;
+        assert!(!st.auto_turn_pending);
+        assert_eq!(st.consecutive_auto_turns, 0);
+        assert_eq!(st.api_messages.len(), 2); // buffered event retained, not inferred
+        st.save_session().await; // blocked, no real filesystem access
+        assert_eq!(st.session.api_messages, old_messages);
+        let (writer, mut frames) = mpsc::channel(8);
+        drop(st);
+        let state = Arc::new(state);
+        handle_compact("compact-test".into(), state, writer).await;
+        assert!(matches!(frames.recv().await, Some(RpcEvent::Error { .. })));
+    }
 }
