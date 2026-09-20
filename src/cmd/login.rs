@@ -43,12 +43,30 @@ const LOGIN_BANNER: &[&str] = &[
 ];
 const LOGIN_PICKER_PADDING: &str = "  ";
 
-pub async fn run(profile: Option<String>, provider_key: Option<String>) -> Result<(), String> {
+pub async fn run(
+    profile: Option<String>,
+    provider_key: Option<String>,
+    account: Option<String>,
+) -> Result<(), String> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
     let _log_guard = synaps_cli::logging::init_logging();
+
+    // Validate the account label at the CLI boundary, before any provider
+    // flow starts. `--account` only applies to OAuth providers.
+    let account = match account.as_deref() {
+        None => None,
+        Some(raw) => Some(auth::Account::parse(raw).map_err(|e| {
+            eprintln!("error: invalid --account: {e}");
+            format!("invalid --account: {e}")
+        })?),
+    };
+    if account.is_some() && provider_key.is_none() {
+        eprintln!("error: --account requires --provider <oauth-provider>");
+        return Err("--account requires --provider".into());
+    }
 
     let providers = login_providers();
     let selected = if let Some(ref key) = provider_key {
@@ -74,15 +92,25 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) -> Resul
     };
 
     match selected.target {
-        LoginTarget::OAuth(id) => run_oauth_login(selected, id, profile).await,
-        LoginTarget::Cloud(id) => run_cloud_login(selected, id, profile).await,
-        LoginTarget::Static(_) => run_api_key_login(selected, profile),
+        LoginTarget::OAuth(id) => {
+            let cred = auth::CredentialRef::new(id, account.unwrap_or_default());
+            run_oauth_login(selected, cred, profile).await
+        }
+        LoginTarget::Cloud(id) if account.is_none() => run_cloud_login(selected, id, profile).await,
+        LoginTarget::Static(_) if account.is_none() => run_api_key_login(selected, profile),
+        LoginTarget::Cloud(_) | LoginTarget::Static(_) => {
+            eprintln!(
+                "error: --account applies to OAuth providers only ({} is not one)",
+                selected.key()
+            );
+            Err("--account applies to OAuth providers only".into())
+        }
     }
 }
 
 async fn run_oauth_login(
     provider: LoginProvider,
-    id: auth::OAuthProviderId,
+    cred: auth::CredentialRef,
     profile: Option<String>,
 ) -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════╗");
@@ -90,42 +118,86 @@ async fn run_oauth_login(
     eprintln!("╠══════════════════════════════════════╣");
     eprintln!("║  Sign in with {:<20}║", provider.name);
     eprintln!("║  {:<36}║", provider.description);
+    eprintln!("║  Account: {:<25}║", cred.account.label_str());
     eprintln!("╚══════════════════════════════════════╝");
 
-    if let Ok(Some(existing)) = auth::load_provider_auth(oauth_storage_key(provider)) {
+    if let Ok(Some(existing)) = auth::load_credential(&cred) {
         if !auth::is_token_expired(&existing) {
-            eprintln!("\n\x1b[33m⚠ Already logged in with a valid token.\x1b[0m");
+            eprintln!("\n\x1b[33m⚠ Already logged in ({cred}) with a valid token.\x1b[0m");
             eprintln!("  Expires: {}", format_expiry(existing.expires));
-            eprintln!("  Continuing will replace your current credentials.\n");
+            eprintln!("  Continuing will replace the credential in that slot only.\n");
         } else {
-            eprintln!("\n\x1b[33m⚠ Existing token is expired. Logging in fresh.\x1b[0m\n");
+            eprintln!("\n\x1b[33m⚠ Existing token for {cred} is expired. Logging in fresh.\x1b[0m\n");
         }
     }
 
-    let result = auth::provider::login(id).await;
-
-    match result {
-        Ok(creds) => {
-            eprintln!("\n\x1b[32m✓ Login successful!\x1b[0m");
-            eprintln!("  Token saved to: {}", auth::auth_file_path().display());
-            eprintln!("  Expires: {}", format_expiry(creds.expires));
-            eprintln!("\n  You can now use SynapsCLI.\n");
-            continue_to_main_app(profile);
-            Ok(())
-        }
+    // The provider flow returns the credential UNSAVED; the duplicate-seat
+    // scan and the write then happen inside one locked read-modify-write of
+    // auth.json, so a login into a named slot never touches the default slot
+    // and two slots can never end up owning the same seat.
+    let creds = match auth::provider::login_unsaved(cred.provider).await {
+        Ok(creds) => creds,
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             eprintln!("  Please try again.\n");
-            Err(e)
+            return Err(e);
         }
+    };
+    let metadata = auth::AccountMetadata {
+        identity: match cred.provider {
+            auth::OAuthProviderId::OpenAiCodex => auth::extract_codex_email(&creds.access),
+            _ => None,
+        },
+        added_at: Some(synaps_cli::epoch_millis() / 1000),
+    };
+    let outcome = match auth::save_credential_unless_duplicate(&cred, &creds, &metadata) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("\n\x1b[31m✗ Login succeeded at the provider but could not be stored: {}\x1b[0m", e);
+            eprintln!("  Nothing was written.\n");
+            return Err(e);
+        }
+    };
+    match outcome.evidence {
+        auth::IdentityEvidence::Duplicate(existing) => {
+            eprintln!(
+                "\n\x1b[31m✗ Not stored: this {} seat is already connected as account '{}'.\x1b[0m",
+                provider.name, existing
+            );
+            eprintln!(
+                "  Two slots for one seat would spend its quota twice and rotate one refresh token from two owners."
+            );
+            eprintln!(
+                "  Use `synaps auth use --provider {} --account {}` instead, or remove that slot first.\n",
+                cred.provider, existing
+            );
+            return Err(format!("duplicate seat: already connected as '{existing}'"));
+        }
+        auth::IdentityEvidence::NoEvidence => {
+            eprintln!(
+                "\n\x1b[33m⚠ {} exposes no trustworthy account identity: a duplicate of another slot cannot be detected.\x1b[0m",
+                provider.name
+            );
+        }
+        auth::IdentityEvidence::NoDuplicate => {}
     }
-}
-
-fn oauth_storage_key(provider: LoginProvider) -> &'static str {
-    match provider.target {
-        LoginTarget::OAuth(id) => id.as_str(),
-        _ => provider.key(),
+    eprintln!("\n\x1b[32m✓ Login successful!\x1b[0m");
+    eprintln!("  Account: {cred}");
+    if let Some(identity) = &metadata.identity {
+        eprintln!("  Identity: {identity}");
     }
+    eprintln!("  Token saved to: {}", auth::auth_file_path().display());
+    eprintln!("  Expires: {}", format_expiry(creds.expires));
+    if !cred.account.is_default() {
+        eprintln!(
+            "  Select it with: synaps auth use --provider {} --account {}",
+            cred.provider,
+            cred.account.label_str()
+        );
+    }
+    eprintln!("\n  You can now use SynapsCLI.\n");
+    continue_to_main_app(profile);
+    Ok(())
 }
 
 struct TerminalCloudLoginUi;
@@ -393,6 +465,16 @@ fn save_api_key(_config_key: &str, provider: LoginProvider, api_key: &str) -> Re
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             Err(e)
         }
+    }
+}
+
+/// Canonical storage key of a login target's DEFAULT slot (OAuth providers
+/// use the typed id, never the CLI alias). Named slots append `@<label>`.
+#[cfg(test)]
+fn oauth_storage_key(provider: LoginProvider) -> &'static str {
+    match provider.target {
+        LoginTarget::OAuth(id) => id.as_str(),
+        _ => provider.key(),
     }
 }
 

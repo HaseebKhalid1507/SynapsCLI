@@ -234,9 +234,15 @@ fn refresh_lock_path(auth_path: &Path, storage_key: &str) -> PathBuf {
     auth_path.with_file_name(format!("{file_name}.refresh.{storage_key}.lock"))
 }
 
+/// Hard deadline for one provider refresh HTTP exchange while the
+/// per-credential lock is held. Bounds the lock hold time regardless of the
+/// caller's HTTP client configuration.
+const REFRESH_HTTP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Bounded wait for the cross-process refresh lock (another process may be
-/// mid-rotation with a slow provider). Well above any single refresh HTTP
-/// timeout so a healthy peer always finishes first.
+/// mid-rotation). Strictly longer than `REFRESH_HTTP_DEADLINE` plus the
+/// persistence step, so a healthy peer always finishes before a waiter
+/// gives up; a wedged peer cannot hang this process forever.
 const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Guard holding the exclusive `flock`; dropping it releases the lock.
@@ -355,7 +361,10 @@ where
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
 {
-    let _gate = gate.lock_owned().await;
+    // In-process waiters are bounded like cross-process ones.
+    let _gate = tokio::time::timeout(REFRESH_LOCK_WAIT, gate.lock_owned())
+        .await
+        .map_err(|_| "timed out waiting for an in-flight token refresh".to_string())?;
     let _file_lock = match lock_path {
         Some(path) => Some(acquire_refresh_lock(path).await?),
         None => None,
@@ -368,7 +377,11 @@ where
             return Ok(creds);
         }
         let old_refresh = creds.refresh.clone();
-        let mut fresh = refresh(old_refresh.clone()).await?;
+        // The provider exchange is deadline-bounded so the lock hold time is
+        // bounded too (a slow-drip response cannot block every other process).
+        let mut fresh = tokio::time::timeout(REFRESH_HTTP_DEADLINE, refresh(old_refresh.clone()))
+            .await
+            .map_err(|_| "token refresh timed out".to_string())??;
         if fresh.account_id.is_none() {
             fresh.account_id = creds.account_id.clone();
         }

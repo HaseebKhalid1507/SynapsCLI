@@ -625,6 +625,16 @@ pub trait CredentialBroker: Send + Sync {
         })
     }
 
+    /// Typed, read-only usage snapshot for one credential. The token is
+    /// resolved and used behind the boundary; callers receive normalized,
+    /// secret-free data only. Default: unsupported.
+    async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        Err(BrokerError::UnsupportedCapability {
+            provider: cred.provider.as_str().to_string(),
+            capability: "usage".into(),
+        })
+    }
+
     /// Report that `cred` hit a provider limit so automatic selection stops
     /// advertising it until `until_ms` (epoch ms; `None` = a short default).
     /// Best effort; default implementation is a no-op.
@@ -1579,6 +1589,8 @@ pub struct LocalBroker {
     anthropic_usage_url: Option<String>,
     /// Test seam: overrides the pinned cloudcode-pa base URL.
     google_gemini_base_url: Option<String>,
+    /// Test seam: overrides the pinned ChatGPT backend base URL.
+    openai_codex_base_url: Option<String>,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
@@ -1593,7 +1605,21 @@ pub struct LocalBroker {
     usage_endpoint_override: Option<String>,
     /// Max age of a usage observation that still counts as capacity.
     max_snapshot_age: Duration,
+    /// Short-lived cache of the last usage snapshot per storage key so
+    /// automatic selection does not re-poll every provider on every token
+    /// vend. Entries older than `max_snapshot_age` are never reused.
+    snapshots: SharedMap<super::usage::UsageSnapshot>,
+    /// Single-flight gates for usage fetches, per storage key.
+    snapshot_gates: SharedMap<Arc<tokio::sync::Mutex<()>>>,
+    /// Cached account policy keyed by the config file's modification time
+    /// (env overlay is applied on every read; it is cheap and has no I/O).
+    policy_cache: Arc<std::sync::Mutex<Option<CachedPolicy>>>,
 }
+
+/// Process-shared map keyed by storage key.
+type SharedMap<T> = Arc<std::sync::Mutex<BTreeMap<String, T>>>;
+/// Config-derived policy tagged with the config file mtime it was read at.
+type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
 
 /// A reported provider limit for one account (non-secret).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1604,9 +1630,12 @@ struct Cooldown {
 
 /// Cooldown applied when a limit is reported without a reset hint.
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-/// Default staleness bound for automatic selection (matches the keeper's
-/// `--stale-after` default).
-pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(30 * 60);
+/// Longest cooldown a client report may impose (a weekly window plus slack);
+/// anything longer is clamped so a bad report cannot bench a seat forever.
+const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
+/// Default staleness bound for automatic selection. Short on purpose: a
+/// selection is a spend decision and should rest on a fresh reading.
+pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
@@ -1616,6 +1645,7 @@ impl LocalBroker {
             local_base_url: None,
             anthropic_usage_url: None,
             google_gemini_base_url: None,
+            openai_codex_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
@@ -1623,6 +1653,9 @@ impl LocalBroker {
             cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             usage_endpoint_override: None,
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
+            snapshots: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            snapshot_gates: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            policy_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1635,6 +1668,30 @@ impl LocalBroker {
     pub fn with_account_policy(mut self, policy: AccountPolicy) -> Self {
         self.account_policy = Some(policy);
         self
+    }
+
+    /// Test seam: point the pinned ChatGPT backend host at a loopback fake.
+    /// Only relaxes the base URL; allowlists, bearer/header pairing and
+    /// redirect denial are unchanged.
+    #[doc(hidden)]
+    pub fn with_openai_codex_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
+        self.openai_codex_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Capacity-based selection for `provider` regardless of the configured
+    /// selector (used by the broker daemon when a remote client's own policy
+    /// is `auto`). Fails closed like [`access_token_pinned_for`].
+    ///
+    /// [`access_token_pinned_for`]: CredentialBroker::access_token_pinned_for
+    pub async fn access_token_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let credential = self.select_auto(provider, model).await?;
+        let token = self.access_token_for(&credential).await?;
+        Ok(PinnedToken { credential, token })
     }
 
     /// Test seam: point typed usage fetches at a fake server.
@@ -1650,11 +1707,28 @@ impl LocalBroker {
         self
     }
 
-    /// Effective policy: injected, else env > config > default.
+    /// Effective policy: injected, else env > config > default. The config
+    /// file is re-parsed only when its modification time changes, so a vend
+    /// never re-reads config (and never re-emits warnings) needlessly.
     fn policy(&self) -> AccountPolicy {
-        self.account_policy
-            .clone()
-            .unwrap_or_else(AccountPolicy::from_environment)
+        if let Some(policy) = &self.account_policy {
+            return policy.clone();
+        }
+        let mtime = std::fs::metadata(crate::config::resolve_read_path("config"))
+            .and_then(|m| m.modified())
+            .ok();
+        let mut cache = self.policy_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let config_policy = match cache.as_ref() {
+            Some((cached_mtime, policy)) if *cached_mtime == mtime => policy.clone(),
+            _ => {
+                let (policy, _warnings) = AccountPolicy::from_config_map(
+                    &crate::config::load_config().auth.accounts,
+                );
+                *cache = Some((mtime, policy.clone()));
+                policy
+            }
+        };
+        config_policy.with_env_overlay()
     }
 
     /// Active cooldown for a storage key (expired entries are dropped).
@@ -1710,22 +1784,62 @@ impl LocalBroker {
         }
     }
 
-    /// Capacity view for one account from a fresh, read-only usage snapshot.
-    /// Anything that is not a well-formed, fresh reading is NOT capacity.
-    async fn capacity_for(
+    fn cached_snapshot(&self, key: &str) -> Option<super::usage::UsageSnapshot> {
+        let max_age_ms = self.max_snapshot_age.as_millis() as u64;
+        let now_ms = crate::epoch_millis();
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .filter(|s| !s.is_stale(now_ms, max_age_ms))
+            .cloned()
+    }
+
+    fn snapshot_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.snapshot_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Fresh usage snapshot for `cred`: the short-lived cache is consulted
+    /// first (never past `max_snapshot_age`), otherwise ONE read-only fetch
+    /// per credential at a time (single-flight; concurrent vends share it).
+    async fn fresh_usage(
         &self,
         cred: &CredentialRef,
-        now_ms: u64,
-    ) -> super::quota_policy::AccountCapacity {
-        use super::quota_policy::{AccountCapacity, QuotaObservation};
-        let _ = now_ms;
-        // Typed usage adapters are wired in `usage()`; until that lands every
-        // account is reported as `Unsupported`, which the policy rejects.
-        AccountCapacity {
-            credential: cred.clone(),
-            observed_at_ms: None,
-            observation: QuotaObservation::Unsupported,
-            cooldown_until_ms: None,
+    ) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        let key = cred.storage_key();
+        if let Some(cached) = self.cached_snapshot(&key) {
+            return Ok(cached);
+        }
+        let gate = self.snapshot_gate(&key);
+        let _held = gate.lock().await;
+        if let Some(cached) = self.cached_snapshot(&key) {
+            return Ok(cached);
+        }
+        let snapshot = self.usage(cred).await?;
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// Capacity view for one account from a fresh, read-only usage snapshot.
+    /// Anything that is not a well-formed, fresh reading is NOT capacity.
+    async fn capacity_for(&self, cred: &CredentialRef) -> super::quota_policy::AccountCapacity {
+        use super::quota_policy::AccountCapacity;
+        match self.fresh_usage(cred).await {
+            Ok(snapshot) => capacity_from_snapshot(cred, &snapshot),
+            Err(err) => AccountCapacity {
+                credential: cred.clone(),
+                observed_at_ms: None,
+                observation: observation_from_error(&err),
+                cooldown_until_ms: None,
+            },
         }
     }
 
@@ -1738,7 +1852,6 @@ impl LocalBroker {
         model: Option<&str>,
     ) -> Result<CredentialRef, BrokerError> {
         use super::quota_policy::{select, Selection, SelectionRequest, Strategy};
-        let now_ms = crate::epoch_millis();
         let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
         if summaries.is_empty() {
             return Err(BrokerError::NoAccountAvailable {
@@ -1751,9 +1864,14 @@ impl LocalBroker {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
-            let mut capacity = self.capacity_for(&cred, now_ms).await;
-            capacity.cooldown_until_ms = self.cooldown_until(&cred.storage_key(), now_ms);
-            candidates.push(capacity);
+            candidates.push(self.capacity_for(&cred).await);
+        }
+        // Evaluation clock is taken AFTER the (sequential) fetches so the
+        // freshest observation is never judged "in the future".
+        let now_ms = crate::epoch_millis();
+        for capacity in &mut candidates {
+            capacity.cooldown_until_ms =
+                self.cooldown_until(&capacity.credential.storage_key(), now_ms);
         }
         let preference: Vec<String> = summaries.iter().map(|s| s.label.clone()).collect();
         let request = SelectionRequest {
@@ -1926,7 +2044,11 @@ impl LocalBroker {
         } else if provider_key == "openai-codex" {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
-            (bearer(&pinned)?, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
+            let base = self
+                .openai_codex_base_url
+                .clone()
+                .unwrap_or_else(|| OPENAI_CODEX_BACKEND_BASE_URL.to_string());
+            (bearer(&pinned)?, base)
         } else if provider_key == "kimi-code" {
             // Managed Kimi Code OAuth proxy: short-lived (~15 min) access
             // token resolved broker-side; the rotating refresh token never
@@ -2056,6 +2178,92 @@ impl LocalBroker {
                 BrokerError::Transport(format!("request to {} failed: {e}", request.provider))
             }
         })
+    }
+}
+
+// ── Usage → capacity mapping (fail closed) ───────────────────────────────────
+
+/// Map a typed usage snapshot onto the pure capacity policy's input. Only
+/// account-wide and model-scoped quota windows constrain inference;
+/// feature-scoped windows (e.g. code review) are not inference limits.
+pub fn capacity_from_snapshot(
+    cred: &CredentialRef,
+    snapshot: &super::usage::UsageSnapshot,
+) -> super::quota_policy::AccountCapacity {
+    use super::quota_policy::{
+        AccountCapacity, ModelAvailability, ModelState, QuotaObservation, WindowLimit,
+    };
+    use super::usage::{Availability, WindowScope};
+    let mut windows: Vec<WindowLimit> = snapshot
+        .windows
+        .iter()
+        .filter_map(|w| {
+            let models = match &w.scope {
+                WindowScope::Account => None,
+                WindowScope::Model { model } => Some(vec![model.clone()]),
+                WindowScope::Feature { .. } => return None,
+            };
+            Some(WindowLimit {
+                id: w.id.clone(),
+                duration_ms: w.duration_secs.map(|s| s.saturating_mul(1000)),
+                used_percent: w.used_percent.valid(),
+                limit_reached: w.limit_reached,
+                resets_at_ms: w.reset_at,
+                models,
+            })
+        })
+        .collect();
+    if snapshot.limit_reached == Some(true) {
+        // Provider-asserted overall exhaustion applies to every model.
+        windows.push(WindowLimit {
+            id: "limit_reached".into(),
+            duration_ms: None,
+            used_percent: None,
+            limit_reached: Some(true),
+            resets_at_ms: snapshot.earliest_reset_at(),
+            models: None,
+        });
+    }
+    let models = if snapshot.model_availability.is_empty() {
+        None
+    } else {
+        Some(
+            snapshot
+                .model_availability
+                .iter()
+                .map(|m| ModelAvailability {
+                    model: m.model.clone(),
+                    state: match m.availability {
+                        Availability::Available => ModelState::Available,
+                        Availability::Exhausted => ModelState::Exhausted,
+                        Availability::Unknown => ModelState::Unknown,
+                    },
+                })
+                .collect(),
+        )
+    };
+    AccountCapacity {
+        credential: cred.clone(),
+        observed_at_ms: Some(snapshot.observed_at),
+        observation: QuotaObservation::Ok { windows, models },
+        cooldown_until_ms: None,
+    }
+}
+
+/// A usage failure is never capacity; classify it for the policy's report.
+fn observation_from_error(err: &BrokerError) -> super::quota_policy::QuotaObservation {
+    use super::quota_policy::QuotaObservation;
+    match err {
+        BrokerError::UnsupportedCapability { .. } | BrokerError::UnsupportedAccount { .. } => {
+            QuotaObservation::Unsupported
+        }
+        BrokerError::Credential(_) | BrokerError::Unauthorized | BrokerError::UnknownAccount { .. } => {
+            QuotaObservation::AuthError
+        }
+        BrokerError::Transport(msg) if msg.contains("malformed") || msg.contains("body_too_large") => {
+            QuotaObservation::Malformed
+        }
+        _ => QuotaObservation::Unknown,
     }
 }
 
@@ -2295,6 +2503,34 @@ impl CredentialBroker for LocalBroker {
         Ok(rows)
     }
 
+    async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
+        if !supports_usage(cred.provider) {
+            return Err(UsageError::UnsupportedProvider {
+                provider: cred.provider.as_str().to_string(),
+            }
+            .into_broker_error());
+        }
+        // Token resolution happens HERE, behind the boundary, for exactly
+        // this credential; the usage helper pairs any account header with
+        // the same token.
+        let token = self.access_token_for(cred).await?;
+        let client = UsageClient::new().map_err(UsageError::into_broker_error)?;
+        let opts = UsageFetchOptions {
+            endpoint_override: self.usage_endpoint_override.clone(),
+            ..UsageFetchOptions::default()
+        };
+        fetch_usage(
+            &client,
+            cred.provider,
+            cred.account.label_str(),
+            &token.token,
+            &opts,
+        )
+        .await
+        .map_err(UsageError::into_broker_error)
+    }
+
     async fn report_cooldown(
         &self,
         cred: &CredentialRef,
@@ -2302,15 +2538,24 @@ impl CredentialBroker for LocalBroker {
         reason: &str,
     ) -> Result<(), BrokerError> {
         let now_ms = crate::epoch_millis();
+        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
         let until_ms = until_ms
             .filter(|t| *t > now_ms)
-            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64);
+            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
+            .min(max_until);
         let reason = crate::truncate_str(reason, 64).to_string();
         tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
+        let key = cred.storage_key();
         self.cooldowns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(cred.storage_key(), Cooldown { until_ms, reason });
+            .insert(key.clone(), Cooldown { until_ms, reason });
+        // The cached reading predates the limit report; drop it so the next
+        // selection re-reads instead of trusting stale headroom.
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
         Ok(())
     }
 
@@ -2687,6 +2932,50 @@ impl CredentialBroker for RemoteBroker {
             .find(|c| c.key == provider.as_str())
             .map(|c| c.accounts)
             .unwrap_or_default())
+    }
+
+    async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        let resp = self
+            .http
+            .get(format!("{}/usage/snapshot", self.endpoint))
+            .query(&[
+                ("provider", cred.provider.as_str()),
+                ("account", cred.account.label_str()),
+            ])
+            .bearer_auth(&self.machine_token)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            404 => {
+                drop(resp);
+                Err(BrokerError::UnknownAccount {
+                    provider: cred.provider.as_str().to_string(),
+                    label: cred.account.label_str().to_string(),
+                })
+            }
+            s if !(200..300).contains(&s) => {
+                // Broker-controlled error body: dropped unread (spec §5.1).
+                drop(resp);
+                Err(BrokerError::Transport(format!(
+                    "broker usage snapshot returned HTTP {s}"
+                )))
+            }
+            _ => {
+                let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+                let snapshot: super::usage::UsageSnapshot = serde_json::from_str(&body)
+                    .map_err(|e| BrokerError::Transport(format!("invalid usage snapshot: {e}")))?;
+                if snapshot.provider != cred.provider.as_str()
+                    || snapshot.account != cred.account.label_str()
+                {
+                    return Err(BrokerError::Transport(
+                        "broker returned a usage snapshot for a different account".into(),
+                    ));
+                }
+                Ok(snapshot)
+            }
+        }
     }
 
     async fn report_cooldown(

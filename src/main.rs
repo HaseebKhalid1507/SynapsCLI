@@ -185,6 +185,11 @@ enum Command {
         /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
         #[arg(long)]
         provider: Option<String>,
+        /// Store the OAuth credential in a named account slot (`<provider>@<label>`)
+        /// instead of the default slot. Label: a-z, 0-9, '.', '_', '-' (max 32).
+        /// Requires --provider. The default slot is never touched.
+        #[arg(long, requires = "provider", value_name = "LABEL")]
+        account: Option<String>,
     },
     /// Authentication management
     Auth {
@@ -197,13 +202,25 @@ enum Command {
         /// instead of account usage. Linux only.
         #[arg(long)]
         memory: bool,
-        /// With --memory: emit JSON instead of a table.
-        #[arg(long, requires = "memory")]
+        /// Emit JSON instead of a table (usage or --memory mode).
+        #[arg(long)]
         json: bool,
         /// With --memory: walk this pid's tree instead of the live sessions.
         #[arg(long, requires = "memory")]
         pid: Option<u32>,
+        /// Usage for one OAuth provider (e.g. openai-codex, claude, kimi-code, xai-auth).
+        #[arg(long, conflicts_with = "memory")]
+        provider: Option<String>,
+        /// Usage for one stored account of --provider (label or `default`); never falls back.
+        #[arg(long, requires = "provider", conflicts_with = "memory", value_name = "LABEL")]
+        account: Option<String>,
+        /// Usage for every stored account of every usage-capable provider (or of --provider).
+        #[arg(long, conflicts_with_all = ["memory", "account"])]
+        all: bool,
     },
+    /// Quota keeper: poll per-account usage (read-only by default) and, only for
+    /// explicitly opted-in Codex accounts, run one minimal activation per reset.
+    QuotaKeeper(cmd::quota_keeper::QuotaKeeperArgs),
     /// Credential broker — serve short-lived access tokens to client machines
     /// over HTTP/HTTPS so they can share one OAuth credential without storing it.
     ///
@@ -312,6 +329,40 @@ enum AuthAction {
         /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
         #[arg(long)]
         provider: Option<String>,
+        /// Store the OAuth credential in a named account slot (`<provider>@<label>`).
+        /// Requires --provider. The default slot is never touched.
+        #[arg(long, requires = "provider", value_name = "LABEL")]
+        account: Option<String>,
+    },
+    /// List stored OAuth accounts (labels and non-secret metadata only)
+    List {
+        /// Restrict to one OAuth provider (e.g. openai-codex, claude, kimi-code)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select which stored account a provider uses (writes auth.account.<provider>)
+    Use {
+        /// OAuth provider (e.g. openai-codex, claude)
+        #[arg(long)]
+        provider: String,
+        /// Account label, `default`, or `auto` (opt-in capacity-based selection)
+        #[arg(long, value_name = "LABEL|default|auto")]
+        account: String,
+    },
+    /// Remove one stored account slot (never touches other slots)
+    Remove {
+        /// OAuth provider (e.g. openai-codex, claude)
+        #[arg(long)]
+        provider: String,
+        /// Account label or `default`
+        #[arg(long, value_name = "LABEL|default")]
+        account: String,
+        /// Skip confirmation (required for the default slot and non-interactive use)
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -719,24 +770,59 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
-        Some(Command::Login { provider }) => {
-            cmd::login::run(cli.profile, provider)
+        Some(Command::Login { provider, account }) => {
+            cmd::login::run(cli.profile, provider, account)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
         Some(Command::Auth { action }) => match action {
-            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider)
-                .await
-                .map_err(anyhow::Error::msg)?,
+            AuthAction::Login { provider, account } => {
+                cmd::login::run(cli.profile, provider, account)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            }
+            AuthAction::List { provider, json } => {
+                cmd::auth_accounts::list(cmd::auth_accounts::ListOptions { provider, json })
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            }
+            AuthAction::Use { provider, account } => {
+                cmd::auth_accounts::use_account(provider, account)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            }
+            AuthAction::Remove {
+                provider,
+                account,
+                yes,
+            } => cmd::auth_accounts::remove(provider, account, yes).map_err(anyhow::Error::msg)?,
         },
-        Some(Command::Status { memory, json, pid }) => {
+        Some(Command::Status {
+            memory,
+            json,
+            pid,
+            provider,
+            account,
+            all,
+        }) => {
             if memory {
                 cmd::status::run_memory(json, pid).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             } else {
-                cmd::status::run()
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                // No flags == legacy `synaps status` (StatusOptions::default()).
+                cmd::status::run_usage(cmd::status::StatusOptions {
+                    provider,
+                    account,
+                    all,
+                    json,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             }
+        }
+        Some(Command::QuotaKeeper(args)) => {
+            cmd::quota_keeper::run(args)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
         Some(Command::AuthBroker {
             bind,

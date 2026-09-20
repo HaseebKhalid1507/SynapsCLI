@@ -62,12 +62,42 @@ pub fn load_credential(
 
 /// Persist a credential into exactly one account slot. Other slots (including
 /// the provider's default slot) and any non-secret metadata already stored in
-/// this slot are preserved.
+/// this slot are preserved. A corrupt store is an error — the account path
+/// never resets the file (that would wipe every other slot); only the legacy
+/// single-credential [`save_provider_auth`] keeps the recovery behaviour.
 pub fn save_credential(
     cred: &CredentialRef,
     creds: &OAuthCredentials,
 ) -> std::result::Result<(), String> {
-    save_provider_auth(&cred.storage_key(), creds)
+    let path = crate::config::resolve_write_path("auth.json");
+    save_credential_at(&path, cred, creds)
+}
+
+pub(crate) fn save_credential_at(
+    path: &Path,
+    cred: &CredentialRef,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), String> {
+    let encoded =
+        serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    let fields = encoded
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "credential did not serialize to an object".to_string())?;
+    let key = cred.storage_key();
+    with_locked_root(path, false, |root| {
+        let mut slot = root
+            .remove(&key)
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(target) = slot.as_object_mut() {
+            for (k, v) in &fields {
+                target.insert(k.clone(), v.clone());
+            }
+        }
+        root.insert(key.clone(), slot);
+        Ok((true, ()))
+    })
 }
 
 /// Remove one account slot. Returns `true` if a key was removed. Never leaves
@@ -94,6 +124,9 @@ pub fn remove_credential(cred: &CredentialRef) -> std::result::Result<bool, Stri
 }
 
 pub(crate) fn remove_key_at(path: &Path, key: &str) -> std::result::Result<bool, String> {
+    // NOTE: the per-credential refresh lock file (`<auth>.refresh.<key>.lock`)
+    // is deliberately NOT unlinked here: unlinking a lock file another
+    // process may hold defeats flock (a re-created file is a new inode).
     if !path.exists() {
         return Ok(false);
     }
@@ -210,6 +243,9 @@ pub(crate) fn save_provider_auth_if_refresh_matches_at(
 pub struct AccountInventory {
     pub accounts: Vec<AccountSummary>,
     pub malformed_keys: Vec<String>,
+    /// Storage keys of slots that share a provider `accountId` with another
+    /// slot of the same provider (two refresh owners for one seat).
+    pub duplicate_identity_keys: Vec<String>,
 }
 
 /// Enumerate stored OAuth accounts for `provider` (non-secret rows;
@@ -303,6 +339,32 @@ pub(crate) fn list_accounts_detailed_at(
     inventory
         .accounts
         .sort_by(|a, b| (&a.provider, a.label != "default", &a.label).cmp(&(&b.provider, b.label != "default", &b.label)));
+    // Duplicate seats: same provider + same full accountId in two slots.
+    let mut seen: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (key, entry) in &root {
+        let Some(cred) = CredentialRef::parse_storage_key(key) else {
+            continue;
+        };
+        if let Some(id) = entry
+            .get("accountId")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if provider.map_or(true, |p| p == cred.provider) {
+                seen.entry((cred.provider.as_str().to_string(), id.to_string()))
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+    }
+    for keys in seen.into_values() {
+        if keys.len() > 1 {
+            inventory.duplicate_identity_keys.extend(keys);
+        }
+    }
+    inventory.duplicate_identity_keys.sort();
     Ok(inventory)
 }
 
@@ -321,6 +383,164 @@ pub fn any_oauth_credential_present() -> std::result::Result<bool, String> {
 
 pub(crate) fn any_oauth_credential_present_at(path: &Path) -> std::result::Result<bool, String> {
     Ok(!list_accounts_detailed_at(path, None)?.accounts.is_empty())
+}
+
+/// What the duplicate-identity guard could establish for a new login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityEvidence {
+    /// The provider exposes no trustworthy identity for this credential, so
+    /// a duplicate seat under another label CANNOT be detected.
+    NoEvidence,
+    /// Identity known; no other slot of this provider holds the same seat.
+    NoDuplicate,
+    /// Another slot of this provider already holds this seat.
+    Duplicate(Account),
+}
+
+/// Outcome of [`save_credential_unless_duplicate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginPersistOutcome {
+    pub evidence: IdentityEvidence,
+    /// False iff a duplicate was found (nothing was written).
+    pub saved: bool,
+}
+
+/// Login persistence: duplicate scan and write happen inside ONE locked
+/// read-modify-write of auth.json, so two concurrent logins (or a login
+/// racing a remove/re-login) can never create two slots owning the same
+/// seat. A duplicate is another slot of the same provider with the same
+/// non-empty `accountId`, or with an identical refresh token.
+///
+/// Metadata is rewritten atomically with the credential: `label` follows the
+/// slot, `identity` is set or CLEARED (a re-login with a different seat never
+/// keeps the old identity), `addedAt` is set to `metadata.added_at`.
+///
+/// A corrupt store is an error (never reset: that would wipe every other
+/// slot). With an active profile that has no own auth.json while the base
+/// store exists, the write is REFUSED: creating a profile file would hide
+/// every inherited account from that profile, and tokens are never copied.
+pub fn save_credential_unless_duplicate(
+    cred: &CredentialRef,
+    creds: &OAuthCredentials,
+    metadata: &AccountMetadata,
+) -> std::result::Result<LoginPersistOutcome, String> {
+    let read_path = auth_file_path();
+    let write_path = crate::config::resolve_write_path("auth.json");
+    if read_path != write_path && read_path.exists() {
+        return Err(format!(
+            "the active profile has no auth.json of its own and inherits {}; logging in here would \
+             create a profile store that hides every inherited account (tokens are never copied). \
+             Re-run without --profile to add the account to the shared store.",
+            read_path.display()
+        ));
+    }
+    save_credential_unless_duplicate_at(&write_path, cred, creds, metadata)
+}
+
+pub(crate) fn save_credential_unless_duplicate_at(
+    path: &Path,
+    cred: &CredentialRef,
+    creds: &OAuthCredentials,
+    metadata: &AccountMetadata,
+) -> std::result::Result<LoginPersistOutcome, String> {
+    let encoded =
+        serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    let fields = encoded
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "credential did not serialize to an object".to_string())?;
+    let key = cred.storage_key();
+    let account_id = creds
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    with_locked_root(path, false, |root| {
+        // Scan sibling slots of the same provider under the lock.
+        let mut duplicate: Option<Account> = None;
+        for (other_key, entry) in root.iter() {
+            if other_key == &key {
+                continue;
+            }
+            let Some(other) = CredentialRef::parse_storage_key(other_key) else {
+                continue;
+            };
+            if other.provider != cred.provider {
+                continue;
+            }
+            let stored_id = entry
+                .get("accountId")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            let stored_refresh = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
+            let same_seat = account_id.is_some_and(|id| id == stored_id)
+                || (!creds.refresh.is_empty() && creds.refresh == stored_refresh);
+            if same_seat {
+                duplicate = Some(other.account);
+                break;
+            }
+        }
+        if let Some(account) = duplicate {
+            return Ok((
+                false,
+                LoginPersistOutcome {
+                    evidence: IdentityEvidence::Duplicate(account),
+                    saved: false,
+                },
+            ));
+        }
+        let mut slot = root
+            .remove(&key)
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(target) = slot.as_object_mut() {
+            for (k, v) in &fields {
+                target.insert(k.clone(), v.clone());
+            }
+            if account_id.is_none() {
+                // The new credential carries no identity: never keep a stale
+                // one from a previous login into this slot.
+                target.remove("accountId");
+            }
+            match &cred.account {
+                Account::Default => {
+                    target.remove("label");
+                }
+                Account::Named(label) => {
+                    target.insert("label".into(), serde_json::Value::String(label.as_str().into()));
+                }
+            }
+            match metadata.identity.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(identity) => {
+                    target.insert("identity".into(), serde_json::Value::String(identity.into()));
+                }
+                None => {
+                    target.remove("identity");
+                }
+            }
+            match metadata.added_at {
+                Some(added_at) => {
+                    target.insert("addedAt".into(), serde_json::Value::from(added_at));
+                }
+                None => {
+                    target.remove("addedAt");
+                }
+            }
+        }
+        root.insert(key.clone(), slot);
+        Ok((
+            true,
+            LoginPersistOutcome {
+                evidence: if account_id.is_some() {
+                    IdentityEvidence::NoDuplicate
+                } else {
+                    IdentityEvidence::NoEvidence
+                },
+                saved: true,
+            },
+        ))
+    })
 }
 
 /// Duplicate-identity guard for login: returns the account (of the same
@@ -1225,6 +1445,77 @@ mod tests {
             CasOutcome::Removed
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn locked_login_persist_refuses_duplicate_seat_and_writes_metadata_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        save_provider_auth_at(&path, "openai-codex", &creds("r0", Some("acct-A"))).unwrap();
+        let astra2 = named(OAuthProviderId::OpenAiCodex, "astra2");
+        let meta = AccountMetadata {
+            identity: Some("a@example.com".into()),
+            added_at: Some(100),
+        };
+        // Same seat under a new label: refused, nothing written.
+        let out = save_credential_unless_duplicate_at(&path, &astra2, &creds("rx", Some("acct-A")), &meta)
+            .unwrap();
+        assert_eq!(out.evidence, IdentityEvidence::Duplicate(Account::Default));
+        assert!(!out.saved);
+        assert!(read_root(&path).get("openai-codex@astra2").is_none());
+        // Same refresh token (identical login) under a new label: refused too.
+        let out = save_credential_unless_duplicate_at(&path, &astra2, &creds("r0", None), &meta).unwrap();
+        assert_eq!(out.evidence, IdentityEvidence::Duplicate(Account::Default));
+        assert!(!out.saved);
+        // Distinct seat: saved with label/identity/addedAt.
+        let out = save_credential_unless_duplicate_at(&path, &astra2, &creds("r2", Some("acct-B")), &meta)
+            .unwrap();
+        assert_eq!(out.evidence, IdentityEvidence::NoDuplicate);
+        assert!(out.saved);
+        let root = read_root(&path);
+        assert_eq!(root["openai-codex@astra2"]["label"], "astra2");
+        assert_eq!(root["openai-codex@astra2"]["identity"], "a@example.com");
+        assert_eq!(root["openai-codex@astra2"]["addedAt"], 100);
+        assert_eq!(root["openai-codex"]["refresh"], "r0", "default slot untouched");
+        // Re-login into the same slot with a different seat and no identity:
+        // stale identity/accountId are cleared, addedAt updated.
+        let out = save_credential_unless_duplicate_at(
+            &path,
+            &astra2,
+            &creds("r3", None),
+            &AccountMetadata {
+                identity: None,
+                added_at: Some(200),
+            },
+        )
+        .unwrap();
+        assert_eq!(out.evidence, IdentityEvidence::NoEvidence);
+        assert!(out.saved);
+        let root = read_root(&path);
+        assert!(root["openai-codex@astra2"].get("identity").is_none());
+        assert!(root["openai-codex@astra2"].get("accountId").is_none());
+        assert_eq!(root["openai-codex@astra2"]["addedAt"], 200);
+        assert_eq!(root["openai-codex@astra2"]["refresh"], "r3");
+        // Corrupt store: refused, never reset.
+        std::fs::write(&path, "{{not json").unwrap();
+        assert!(save_credential_unless_duplicate_at(&path, &astra2, &creds("r4", None), &meta).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{{not json");
+        assert!(save_credential_at(&path, &astra2, &creds("r4", None)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{{not json");
+    }
+
+    #[test]
+    fn inventory_flags_duplicate_seats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        save_provider_auth_at(&path, "openai-codex", &creds("r0", Some("acct-A"))).unwrap();
+        save_provider_auth_at(&path, "openai-codex@b", &creds("rb", Some("acct-A"))).unwrap();
+        save_provider_auth_at(&path, "openai-codex@c", &creds("rc", Some("acct-C"))).unwrap();
+        let inv = list_accounts_detailed_at(&path, Some(OAuthProviderId::OpenAiCodex)).unwrap();
+        assert_eq!(
+            inv.duplicate_identity_keys,
+            vec!["openai-codex".to_string(), "openai-codex@b".to_string()]
+        );
     }
 
     #[test]
