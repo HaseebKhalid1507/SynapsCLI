@@ -662,8 +662,36 @@ pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
     if registry::is_alive(&paths) {
         return Ok(Ensured::Running);
     }
-    spawn_detached(opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
+    // An auto-spawned daemon exits on its own once the last client is gone
+    // and no turn is running (parked sessions are journaled; `--continue`
+    // brings them back). A daemon started by hand (`synaps daemon`) keeps
+    // whatever its caller asked for.
+    let mut opts = opts.clone();
+    if opts.idle_exit.is_none() {
+        opts.idle_exit = autospawn_idle_exit();
+    }
+    spawn_detached(&opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
 }
+
+/// `SYNAPS_DAEMON_IDLE_EXIT_SECS` for auto-spawned daemons: default 10 s —
+/// when the last client disconnects and no turn is running, the daemon is
+/// holding ~100 MB for one reason only: a re-launch inside the window skips
+/// extension boot. Ten seconds covers "oops, wrong window"; `0`/`never` →
+/// never exit on idle.
+pub fn autospawn_idle_exit() -> Option<Duration> {
+    autospawn_idle_exit_from(std::env::var("SYNAPS_DAEMON_IDLE_EXIT_SECS").ok().as_deref())
+}
+
+fn autospawn_idle_exit_from(v: Option<&str>) -> Option<Duration> {
+    match v.map(str::trim) {
+        Some("0" | "never" | "off") => None,
+        Some(n) => n.parse::<u64>().ok().map(Duration::from_secs).or(Some(AUTOSPAWN_IDLE_EXIT)),
+        None => Some(AUTOSPAWN_IDLE_EXIT),
+    }
+}
+
+/// Default idle grace for auto-spawned daemons.
+pub const AUTOSPAWN_IDLE_EXIT: Duration = Duration::from_secs(10);
 
 
 /// `synaps daemon --foreground` body: gate → boot host → extension discovery
@@ -727,6 +755,19 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod flag_tests {
     use super::*;
+
+    #[test]
+    fn autospawn_idle_exit_defaults_to_10s_and_honours_never() {
+        assert_eq!(autospawn_idle_exit_from(None), Some(AUTOSPAWN_IDLE_EXIT));
+        assert_eq!(AUTOSPAWN_IDLE_EXIT, Duration::from_secs(10));
+        assert_eq!(autospawn_idle_exit_from(Some("15")), Some(Duration::from_secs(15)));
+        assert_eq!(autospawn_idle_exit_from(Some(" 300 ")), Some(Duration::from_secs(300)));
+        for never in ["0", "never", "off"] {
+            assert_eq!(autospawn_idle_exit_from(Some(never)), None, "{never:?}");
+        }
+        // garbage → the default, never "no exit"
+        assert_eq!(autospawn_idle_exit_from(Some("soon")), Some(AUTOSPAWN_IDLE_EXIT));
+    }
 
     #[test]
     fn enabled_env_matrix() {

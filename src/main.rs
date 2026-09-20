@@ -344,11 +344,11 @@ enum ThinClient {
     Tui { profile: Option<String> },
     Line { profile: Option<String> },
     /// Plain `synaps [--system ..] [--continue ..]` with **no** `--attach`:
-    /// adopt a daemon that is *already* running (fresh session, exactly
-    /// `--attach --new` semantics) — never spawn one. Only becomes a thin
-    /// client after [`probe_daemon`] says somebody holds the flock;
-    /// otherwise the ordinary in-process boot. `SYNAPS_DAEMON_ADOPT=0`
-    /// turns this off; `--no-extensions` skips it (daemon extensions are
+    /// adopt the daemon (fresh session, exactly `--attach --new` semantics),
+    /// **spawning it first if none is running** — the jcode model, same as
+    /// `--attach`. A failed spawn falls back to the ordinary in-process boot
+    /// with a notice. `SYNAPS_DAEMON_ADOPT=0` turns this off (always
+    /// in-process); `--no-extensions` skips it (daemon extensions are
     /// shared, so the flag cannot be honoured over the socket).
     Adopt { profile: Option<String> },
 }
@@ -444,16 +444,6 @@ fn thin_client_from<I: IntoIterator<Item = String>>(
     }
 }
 
-/// Adopt probe: is a daemon for this profile already holding the flock?
-/// Reaps stale socket/json/pid first (same as `ensure_running`), never
-/// spawns, never touches a live daemon. Cheap: one `flock` attempt.
-fn probe_daemon(profile: Option<String>) -> bool {
-    use agent_engine::daemon::{registry, DaemonOpts};
-    let paths = DaemonOpts { profile, ..Default::default() }.paths();
-    registry::reap_stale(&paths);
-    registry::is_alive(&paths)
-}
-
 /// Set by `main` when a plain `synaps` found a running daemon: the clap
 /// branch runs the socket client with `--attach --new` semantics.
 static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -465,9 +455,8 @@ static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn ensure_daemon(kind: &ThinClient) -> Option<String> {
     use agent_engine::daemon::{self, EnsureError, Ensured, EXIT_REFUSED};
     let (profile, line) = match kind {
-        ThinClient::Tui { profile } => (profile.clone(), false),
+        ThinClient::Tui { profile } | ThinClient::Adopt { profile } => (profile.clone(), false),
         ThinClient::Line { profile } => (profile.clone(), true),
-        ThinClient::Adopt { .. } => unreachable!("Adopt never spawns — probed in main"),
     };
     let opts = daemon::DaemonOpts { profile, ..Default::default() };
     match daemon::ensure_running(&opts) {
@@ -477,6 +466,12 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
             None
         }
         Err(EnsureError::AutospawnDisabled) => {
+            // Plain `synaps` with autospawn off is simply the in-process
+            // boot, quietly. An explicit `--attach` asked for a daemon and
+            // must say why there is none.
+            if matches!(kind, ThinClient::Adopt { .. }) {
+                return Some("SYNAPS_DAEMON_AUTOSPAWN=0".into());
+            }
             let msg = cmd::attach::no_daemon_message(opts.profile.as_deref());
             eprintln!("{msg}");
             std::process::exit(EXIT_REFUSED);
@@ -578,21 +573,19 @@ fn scrub_reexec_env() {
 fn main() -> anyhow::Result<()> {
     let mut thin = false;
     if let Some(kind) = thin_client() {
-        if let ThinClient::Adopt { profile } = &kind {
-            // Attach only if somebody is already running; otherwise the
-            // ordinary in-process boot, byte-for-byte as before.
-            if probe_daemon(profile.clone()) {
-                ADOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Adopt and --attach share one path: a running daemon or a freshly
+        // spawned one; a failed spawn falls back to the in-process boot.
+        match ensure_daemon(&kind) {
+            None => {
+                if matches!(kind, ThinClient::Adopt { .. }) {
+                    ADOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 thin = true;
             }
-        } else {
-            match ensure_daemon(&kind) {
-                None => thin = true,
-                Some(reason) => {
-                    eprintln!("daemon unavailable: {reason} — running in-process");
-                    tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
-                    std::env::set_var(ATTACH_FALLBACK, "1");
-                }
+            Some(reason) => {
+                eprintln!("daemon unavailable: {reason} — running in-process");
+                tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+                std::env::set_var(ATTACH_FALLBACK, "1");
             }
         }
     }

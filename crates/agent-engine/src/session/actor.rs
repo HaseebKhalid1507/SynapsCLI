@@ -194,6 +194,36 @@ impl<T> std::ops::DerefMut for Live<T> {
     }
 }
 
+/// `SYNAPS_DAEMON_PARKED_EVICT_SECS`: how long a PARKED session stays in the
+/// daemon's map before it is evicted (`EndReason::Evicted`). Its state is on
+/// disk; `--continue <id>` rebuilds it exactly as after a daemon restart. The
+/// row only exists so `--attach <id>` / the adopt banner can find it quickly.
+/// Default 1 h; `never` → keep forever.
+pub fn parked_evict_after() -> Option<std::time::Duration> {
+    parked_evict_after_from(std::env::var("SYNAPS_DAEMON_PARKED_EVICT_SECS").ok().as_deref())
+}
+
+fn parked_evict_after_from(v: Option<&str>) -> Option<std::time::Duration> {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(3600);
+    match v.map(str::trim) {
+        Some("never" | "0" | "off") => None,
+        Some(n) => n.parse::<u64>().ok().map(std::time::Duration::from_secs).or(Some(DEFAULT)),
+        None => Some(DEFAULT),
+    }
+}
+
+/// `SYNAPS_DAEMON_IDLE_END_GRACE_SECS`: how long a ZERO-turn session with no
+/// clients lingers before it ends (F18). Default 5 s — long enough for a
+/// client that disconnected mid-reconnect, short enough that open-and-close
+/// does not pin a Runtime for a minute.
+pub fn idle_end_grace() -> std::time::Duration {
+    std::env::var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(5))
+}
+
 /// `SYNAPS_DAEMON_PARK_GRACE_SECS`: `never` → `None` (Parked disabled);
 /// `n` → n seconds after the last detach once idle; default 60.
 pub fn park_grace() -> Option<std::time::Duration> {
@@ -798,7 +828,39 @@ impl SessionActor {
         }
     }
 
+    /// F18: a session with NO history can never park (nothing to journal),
+    /// so with no clients it would stay Live — Runtime resident — forever.
+    /// Same gates as `can_park` minus the history requirement: at the park
+    /// deadline such a session ends instead.
+    pub(crate) fn can_end_idle(&self) -> bool {
+        self.attached.is_empty()
+            && !self.streaming
+            && self.compact.is_none()
+            && self.pending_prompts.is_empty()
+            && self.conv.is_live()
+            && self.conv.api_messages.is_empty()
+            && self.conv.queued_message.is_none()
+            && !self.keep_warm
+            && !self.is_parked()
+    }
+
     fn rearm_park(&mut self) {
+        if self.is_parked() {
+            // Eviction deadline is owned by `park()`; the attach path unparks
+            // (which rebuilds the runtime and clears the deadline).
+            return;
+        }
+        if self.can_end_idle() {
+            // F18: nothing to keep warm — a zero-turn session with no
+            // clients ends after a short grace, not the full park grace
+            // (which exists to keep a runtime WITH history warm for a
+            // quick reconnect).
+            if self.park_deadline.is_none() {
+                self.park_deadline =
+                    Some(tokio::time::Instant::now() + idle_end_grace());
+            }
+            return;
+        }
         if !self.can_park() {
             self.park_deadline = None;
             return;
@@ -822,10 +884,21 @@ impl SessionActor {
     /// Save, close PTYs, drop `conv` THEN `runtime`. `background` (inbox
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
-    pub(crate) async fn park(&mut self) {
+    pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
         self.park_deadline = None;
+        if self.is_parked() {
+            if self.attached.is_empty() {
+                tracing::info!(session = %self.id, "parked past the eviction age — leaving the map (journal kept)");
+                return std::ops::ControlFlow::Break(EndReason::Evicted);
+            }
+            return std::ops::ControlFlow::Continue(());
+        }
+        if self.can_end_idle() {
+            tracing::info!(session = %self.id, "idle with no history — ending instead of parking (F18)");
+            return std::ops::ControlFlow::Break(EndReason::Idle);
+        }
         if !self.can_park() {
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         self.state = AttachState::Parking;
         self.set_lifecycle(SessionLifecycle::Parking);
@@ -836,14 +909,14 @@ impl SessionActor {
             tracing::warn!(session = %self.id, "park: save timed out — staying live");
             self.state = AttachState::Detached { running: false };
             self.set_lifecycle(SessionLifecycle::Live);
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         if !self.journal_exists() {
             // Never park what cannot be restored (H2).
             tracing::warn!(session = %self.id, "park: no journal on disk — staying live");
             self.state = AttachState::Detached { running: false };
             self.set_lifecycle(SessionLifecycle::Live);
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         if self.runtime.session_manager().active_count() > 0 {
             self.emit(SessionEventWire::SystemNotice(
@@ -869,6 +942,11 @@ impl SessionActor {
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
+        // The park timer is reused as the eviction timer: a session nobody
+        // re-attaches to within `parked_evict_after` leaves the map (its
+        // journal stays; `--continue` brings it back).
+        self.park_deadline = parked_evict_after().map(|d| tokio::time::Instant::now() + d);
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Rebuild `runtime` + `conv` from the journal (`load_session_in_dir`
@@ -877,6 +955,8 @@ impl SessionActor {
     /// stays Parked (nothing is half-built).
     pub(crate) async fn unpark(&mut self) -> Result<()> {
         let started = std::time::Instant::now();
+        // Somebody came back: the eviction deadline armed by `park()` is void.
+        self.park_deadline = None;
         let journal_id = (**self.journal_id.load()).clone();
 
         // F10: re-acquire the journal lock before rebuilding the runtime.
@@ -2138,7 +2218,11 @@ impl SessionActor {
             } => self.plugin_command(id, plugin, name, arg).await,
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
-            SessionCommand::Park => self.park().await,
+            SessionCommand::Park => {
+                if let std::ops::ControlFlow::Break(reason) = self.park().await {
+                    return ControlFlow::Break(reason);
+                }
+            }
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.rearm_park();
@@ -2320,7 +2404,11 @@ impl SessionTask {
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 _ = queue.notified() => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
-                _ = park_timer(actor.park_deadline) => actor.park().await,
+                _ = park_timer(actor.park_deadline) => {
+                    if let std::ops::ControlFlow::Break(reason) = actor.park().await {
+                        break reason;
+                    }
+                }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
                 _ = ext_ready(&mut actor.ext_ready) => {
                     actor.ext_ready = None;
@@ -2343,5 +2431,21 @@ impl SessionTask {
             }
         };
         self.0.finish(reason).await;
+    }
+}
+
+#[cfg(test)]
+mod parked_evict_tests {
+    use super::parked_evict_after_from;
+    use std::time::Duration;
+
+    #[test]
+    fn parked_evict_defaults_to_one_hour_and_honours_never() {
+        assert_eq!(parked_evict_after_from(None), Some(Duration::from_secs(3600)));
+        assert_eq!(parked_evict_after_from(Some("120")), Some(Duration::from_secs(120)));
+        for never in ["never", "0", "off"] {
+            assert_eq!(parked_evict_after_from(Some(never)), None, "{never:?}");
+        }
+        assert_eq!(parked_evict_after_from(Some("junk")), Some(Duration::from_secs(3600)));
     }
 }
