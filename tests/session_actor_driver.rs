@@ -1196,10 +1196,20 @@ async fn s1_detach_nonlast_client_keeps_driver() {
 #[tokio::test]
 async fn s1_rearm_after_zero_client_revoke() {
     let (host, _temp) = host_with_plugin().await;
-    // Keep the (empty-history) session from idle-ENDING the instant its last
-    // client leaves, so we can re-attach and prove the revoke left clean state.
-    std::env::set_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS", "60");
-    let mut a = session(&host).await;
+    // `keep_warm` keeps the (empty-history) session resident with zero clients
+    // so it neither parks nor idle-ends — we can re-attach and prove the
+    // last-client revoke left clean, re-armable state. (Avoids racing on the
+    // idle-end grace env var with other tests.)
+    let mut a = session_cfg(
+        &host,
+        SessionConfig {
+            model_override: Some(MODEL.into()),
+            persist: false,
+            keep_warm: true,
+            ..SessionConfig::default()
+        },
+    )
+    .await;
     a.arm().await;
 
     // Detach the only client → revoke.
@@ -1212,7 +1222,6 @@ async fn s1_rearm_after_zero_client_revoke() {
         .unwrap();
     let mut a2 = TestActor { t: t2, handle: a.handle.clone() };
     a2.arm().await; // panics on timeout if re-arm failed
-    std::env::remove_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS");
     a2.end().await;
 }
 
