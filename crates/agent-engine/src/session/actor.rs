@@ -2159,7 +2159,11 @@ impl SessionActor {
             } => self.plugin_command(id, plugin, name, arg).await,
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
-            SessionCommand::Park => self.park().await,
+            SessionCommand::Park => {
+                if let std::ops::ControlFlow::Break(reason) = self.park().await {
+                    return ControlFlow::Break(reason);
+                }
+            }
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.rearm_park();
