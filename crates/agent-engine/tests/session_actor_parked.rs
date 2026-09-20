@@ -495,3 +495,50 @@ async fn idle_exit_fires_once_all_sessions_parked() {
     assert!(!handle.is_alive(), "shutdown_all ended the parked session");
     assert_eq!(host.sessions().len(), 0);
 }
+
+/// Parked sessions leave the daemon's map after `SYNAPS_DAEMON_PARKED_EVICT_SECS`
+/// (Ended(Evicted)); the journal stays and `--continue <id>` rebuilds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parked_session_is_evicted_after_age_and_continue_rebuilds_it() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    std::env::set_var("SYNAPS_DAEMON_PARKED_EVICT_SECS", "1");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let id = handle.id.clone();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut a).await;
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+
+    // Evicted after the age: handle closes, journal remains.
+    tokio::time::timeout(Duration::from_secs(5), handle.closed())
+        .await
+        .expect("parked session must be evicted after SYNAPS_DAEMON_PARKED_EVICT_SECS");
+    assert!(agent_engine::core::session::Session::load(id.as_str()).is_ok(), "journal kept");
+    std::env::remove_var("SYNAPS_DAEMON_PARKED_EVICT_SECS");
+
+    // --continue rebuilds it from disk with history intact.
+    let handle2 = host
+        .create_session(SessionConfig {
+            continue_session: Some(Some(id.as_str().to_string())),
+            ..pcfg()
+        })
+        .await
+        .unwrap();
+    let (mut b, snap) = LocalTransport::attach(handle2.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    assert!(snap.conversation.api_messages.len() >= 2, "history rebuilt: {}", snap.conversation.api_messages.len());
+    handle2
+        .send(SessionCommand::End { reason: EndReason::HostShutdown })
+        .await
+        .unwrap();
+    let _ = b.next_event().await;
+}
