@@ -2700,6 +2700,8 @@ mod rich_output_tests {
         ui_results: Vec<String>,
         /// Request bodies the mock saw, in order.
         bodies: Vec<Value>,
+        /// The stream loop returned `Err` (fail-closed) instead of `Ok`.
+        rejected: bool,
     }
 
     async fn drive(
@@ -2805,7 +2807,10 @@ mod rich_output_tests {
         )
         .await
         .expect("stream loop must finish");
-        run.expect("stream loop ok");
+        // A fail-closed rejection (e.g. invalid original media) is a valid
+        // outcome: the harness records it instead of unwrapping so tests can
+        // assert on `bodies.is_empty()` / `rejected`.
+        let rejected = run.is_err();
 
         let mut history = Vec::new();
         let mut ui_results = Vec::new();
@@ -2824,6 +2829,7 @@ mod rich_output_tests {
             history,
             ui_results,
             bodies,
+            rejected,
         }
     }
 
@@ -3131,6 +3137,7 @@ mod rich_output_tests {
             Arc::new(crate::extensions::hooks::HookBus::new()),
         )
         .await;
+        assert!(d.rejected, "invalid original media must stop inference");
         assert!(d.bodies.is_empty(), "oversized history must never reach the provider");
         assert_eq!(serde_json::to_string(&history).unwrap(), original);
     }
