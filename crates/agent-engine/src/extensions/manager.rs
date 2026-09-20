@@ -1379,6 +1379,8 @@ impl ExtensionManager {
             .get(id)
             .is_some_and(|permissions| permissions.has(Permission::SessionDrive))
     }
+
+    pub async fn sidecar_spawn_args(
         &self,
         id: &str,
     ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
