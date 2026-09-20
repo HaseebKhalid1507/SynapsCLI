@@ -1527,6 +1527,8 @@ impl ApiMethods {
                                         client,
                                         &options.credential_source,
                                         &options.token_cache,
+                                        Some(model),
+                                        super::auth::RefreshPoint::WithinTurn,
                                     ),
                                 )
                                 .await??;
@@ -3945,6 +3947,7 @@ mod on401_tests {
             auth_type: "api_key".to_string(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            bound_credential: None,
         }))
     }
 
@@ -4338,6 +4341,7 @@ mod cloud_capability_tests {
             auth_type: "api_key".into(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            bound_credential: None,
         }));
         let client = Client::new();
         let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
@@ -4395,6 +4399,7 @@ mod cancellation_tests {
             auth_type: "api_key".into(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            bound_credential: None,
         }))
     }
 
