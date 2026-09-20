@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use reqwest::Client;
 
-use super::account::CredentialRef;
+use super::account::{CredentialRef, SeatIdentity};
 use super::storage::{
     auth_file_path, load_provider_auth_at, save_provider_auth_if_refresh_matches_at, CasOutcome,
 };
@@ -192,11 +192,63 @@ pub async fn ensure_fresh_credential(
     ensure_fresh_credential_at(client, cred, &path).await
 }
 
+/// Why a seat-pinned vend ([`ensure_fresh_credential_for_seat`]) produced no
+/// token.
+#[derive(Debug)]
+pub enum SeatVendError {
+    /// The slot no longer holds the seat the caller's evidence was about
+    /// (re-login, removal, or rotation by another party). Nothing was vended.
+    SeatChanged,
+    Other(String),
+}
+
+impl std::fmt::Display for SeatVendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeatChanged => f.write_str(SEAT_CHANGED),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+const SEAT_CHANGED: &str = "credential changed since its capacity was read; nothing vended";
+
+/// [`ensure_fresh_credential`] for a slot whose stored credential the caller
+/// already inspected (e.g. read its usage): the slot must still hold the same
+/// [`SeatIdentity`], checked under the same locks as the refresh, so the
+/// returned token is derived from exactly that seat — never from a
+/// credential that replaced it in between.
+pub async fn ensure_fresh_credential_for_seat(
+    client: &Client,
+    cred: &CredentialRef,
+    expected: &SeatIdentity,
+) -> std::result::Result<OAuthCredentials, SeatVendError> {
+    let path = auth_file_path();
+    ensure_fresh_credential_checked_at(client, cred, &path, Some(expected))
+        .await
+        .map_err(|e| {
+            if e == SEAT_CHANGED {
+                SeatVendError::SeatChanged
+            } else {
+                SeatVendError::Other(e)
+            }
+        })
+}
+
 /// Path-explicit core of [`ensure_fresh_credential`] (tests use temp dirs).
 pub(crate) async fn ensure_fresh_credential_at(
     client: &Client,
     cred: &CredentialRef,
     path: &Path,
+) -> std::result::Result<OAuthCredentials, String> {
+    ensure_fresh_credential_checked_at(client, cred, path, None).await
+}
+
+pub(crate) async fn ensure_fresh_credential_checked_at(
+    client: &Client,
+    cred: &CredentialRef,
+    path: &Path,
+    expected_seat: Option<&SeatIdentity>,
 ) -> std::result::Result<OAuthCredentials, String> {
     let key = cred.storage_key();
     let provider = cred.provider;
@@ -205,7 +257,7 @@ pub(crate) async fn ensure_fresh_credential_at(
     let load_path = path.to_path_buf();
     let load_key = key.clone();
     let load = move || {
-        load_provider_auth_at(&load_path, &load_key)?.ok_or_else(|| {
+        let creds = load_provider_auth_at(&load_path, &load_key)?.ok_or_else(|| {
             format!(
                 "No credentials for {} at {}. Run `synaps login --provider {} --account {}`.",
                 cred,
@@ -213,7 +265,16 @@ pub(crate) async fn ensure_fresh_credential_at(
                 provider,
                 cred.account
             )
-        })
+        })?;
+        // Seat pairing is re-checked on every load, including the re-load
+        // after a CAS `Replaced` (re-login mid-refresh): the replacement is
+        // a different seat and was never proven.
+        if let Some(expected) = expected_seat {
+            if SeatIdentity::of(provider, &creds) != *expected {
+                return Err(SEAT_CHANGED.to_string());
+            }
+        }
+        Ok(creds)
     };
     let refresh = |refresh: String| async move {
         super::provider::refresh(client, provider, &refresh).await
@@ -891,6 +952,63 @@ mod tests {
         assert_eq!(
             load_provider_auth_at(&path, "openai-codex@a").unwrap().unwrap().account_id.as_deref(),
             Some("acct-keep")
+        );
+    }
+
+    /// Seat-pinned vend: the slot must still hold the inspected seat. A
+    /// re-login (different refresh material / account id) yields the typed
+    /// `SeatChanged` error and no token; the check never needs the network
+    /// for a fresh credential.
+    #[tokio::test]
+    async fn seat_pinned_vend_refuses_a_replaced_slot() {
+        use super::super::account::SeatIdentity;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut stored = fresh_creds("a-r");
+        stored.account_id = Some("acct-a".into());
+        save_provider_auth_at(&path, "openai-codex@a", &stored).unwrap();
+        let client = reqwest::Client::new();
+        let seat = SeatIdentity::of(OAuthProviderId::OpenAiCodex, &stored);
+        let ok = super::ensure_fresh_credential_checked_at(&client, &named("a"), &path, Some(&seat))
+            .await
+            .unwrap();
+        assert_eq!(ok.refresh, "a-r");
+        // Same seat, rotated refresh token (another process refreshed): the
+        // account id anchors the identity, so the vend still pairs.
+        let mut rotated = fresh_creds("a-r2");
+        rotated.account_id = Some("acct-a".into());
+        save_provider_auth_at(&path, "openai-codex@a", &rotated).unwrap();
+        assert!(
+            super::ensure_fresh_credential_checked_at(&client, &named("a"), &path, Some(&seat))
+                .await
+                .is_ok()
+        );
+        // Re-login with another seat under the same alias: refused.
+        let mut other = fresh_creds("b-r");
+        other.account_id = Some("acct-b".into());
+        save_provider_auth_at(&path, "openai-codex@a", &other).unwrap();
+        let err = super::ensure_fresh_credential_checked_at(&client, &named("a"), &path, Some(&seat))
+            .await
+            .unwrap_err();
+        assert_eq!(err, super::SEAT_CHANGED);
+        assert!(!err.contains("b-r") && !err.contains("acct"));
+        // Unchecked vend of the same slot still works (explicit selection).
+        assert_eq!(
+            super::ensure_fresh_credential_checked_at(&client, &named("a"), &path, None)
+                .await
+                .unwrap()
+                .refresh,
+            "b-r"
+        );
+        // Removed slot: the ordinary load-miss error, not a seat mismatch.
+        assert!(remove_key_at(&path, "openai-codex@a").unwrap());
+        let err = super::ensure_fresh_credential_checked_at(&client, &named("a"), &path, Some(&seat))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("No credentials for "), "{err}");
+        assert_eq!(
+            super::SeatVendError::SeatChanged.to_string(),
+            super::SEAT_CHANGED
         );
     }
 

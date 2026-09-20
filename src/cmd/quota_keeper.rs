@@ -16,6 +16,15 @@
 //!   (`access_token_for`), derives the account header from THAT token, hits
 //!   the pinned Codex responses URL, sends no tools/MCP/context, reads a
 //!   bounded body under a timeout, and never retries by itself.
+//! * Seat identity is established from the credential itself, not from
+//!   metadata: every `--activate` account vends its pinned token at startup
+//!   and the FULL provider account id is digested into a strong seat
+//!   fingerprint (the state key; canonical across aliases). Immediately
+//!   before the POST the activator re-vends the token and re-verifies the
+//!   seat; a mismatch (re-login under the same label mid-run) is a typed
+//!   `NotSent` and disables activation for that account until restart, so
+//!   usage evidence from seat A can never authorize inference on seat B.
+//!   An 8-character metadata prefix is only a read-only discriminator.
 //! * The wire body mirrors the production Codex builder (which deliberately
 //!   omits `max_output_tokens` — the ChatGPT backend may reject it), with the
 //!   lowest reasoning effort the model supports, validated through
@@ -181,10 +190,19 @@ impl Clock for SystemClock {
 }
 
 /// Performs the bounded activation request. Tests inject a fake.
+///
+/// `expected_seat` is the strong seat fingerprint the keeper tracks for
+/// `cred`; the implementation MUST verify the freshly vended token against
+/// it before anything leaves the process.
 #[async_trait]
 pub(crate) trait Activator: Send + Sync {
-    async fn activate(&self, cred: &CredentialRef, model: &str, timeout: Duration)
-        -> qk::AttemptOutcome;
+    async fn activate(
+        &self,
+        cred: &CredentialRef,
+        expected_seat: &str,
+        model: &str,
+        timeout: Duration,
+    ) -> qk::AttemptOutcome;
 }
 
 /// Production activator: pinned Codex responses POST, no tools, bounded.
@@ -263,11 +281,23 @@ pub(crate) fn activation_body(
 
 #[async_trait]
 impl Activator for CodexActivator {
-    async fn activate(&self, cred: &CredentialRef, model: &str, timeout: Duration) -> qk::AttemptOutcome {
+    async fn activate(
+        &self,
+        cred: &CredentialRef,
+        expected_seat: &str,
+        model: &str,
+        timeout: Duration,
+    ) -> qk::AttemptOutcome {
         if cred.provider != OAuthProviderId::OpenAiCodex {
             return qk::AttemptOutcome::NotSent {
                 stage: qk::NotSentStage::Unsupported,
                 reason: "activation is only implemented for openai-codex".into(),
+            };
+        }
+        if !expected_seat.starts_with(qk::SEAT_FP_PREFIX) {
+            return qk::AttemptOutcome::NotSent {
+                stage: qk::NotSentStage::IdentityMismatch,
+                reason: "no strong seat identity for this account".into(),
             };
         }
         // Same credential the keeper tracks; header derived from THIS token.
@@ -286,6 +316,18 @@ impl Activator for CodexActivator {
                 reason: "token carries no chatgpt account id".into(),
             };
         };
+        // Verify the seat NOW, from the token that will carry the request:
+        // the usage evidence that authorized this attempt belongs to
+        // `expected_seat`, and a re-login under the same label must not
+        // spend it on another account.
+        let seat = qk::AccountIdentity::seat_fingerprint(cred.provider, &account_id);
+        if seat.as_deref() != Some(expected_seat) {
+            return qk::AttemptOutcome::NotSent {
+                stage: qk::NotSentStage::IdentityMismatch,
+                reason: "the vended token belongs to a different provider seat than the tracked one"
+                    .into(),
+            };
+        }
         let plan = match activation_plan(model) {
             Ok(p) => p,
             Err(e) => {
@@ -532,30 +574,103 @@ pub(crate) fn parse_account_arg(raw: &str) -> Result<CredentialRef, String> {
 /// One account the keeper tracks.
 #[derive(Debug, Clone)]
 pub(crate) struct KeptAccount {
+    /// Strong seat identity for opted-in accounts (established from the
+    /// vended token); weak metadata preview for read-only ones.
     pub identity: qk::AccountIdentity,
     pub credential: CredentialRef,
     pub opted_in: bool,
     /// Operator asked for one explicit extra attempt (`--rearm`).
     pub rearm: bool,
+    /// Provider account-id prefix (≤ 8 chars) used ONLY to pair usage
+    /// responses with the tracked seat and to spot alias duplicates. Not an
+    /// identity.
+    pub account_id_prefix: Option<String>,
 }
 
-fn identity_for(source: &str, cred: &CredentialRef, summary: &AccountSummary) -> qk::AccountIdentity {
-    qk::AccountIdentity {
-        source: source.to_string(),
-        credential: cred.storage_key(),
-        identity_fp: qk::AccountIdentity::fingerprint(
+impl KeptAccount {
+    /// Whether two kept accounts are the same provider seat, as far as the
+    /// available evidence shows: strong fingerprints when both have one,
+    /// otherwise the metadata prefix (a prefix collision is treated as a
+    /// duplicate — fail closed).
+    fn same_seat(&self, other: &Self) -> bool {
+        if self.credential.provider != other.credential.provider {
+            return false;
+        }
+        if self.identity.is_strong() && other.identity.is_strong() {
+            return self.identity.identity_fp == other.identity.identity_fp;
+        }
+        match (&self.account_id_prefix, &other.account_id_prefix) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Identity of a listed row: strong when the broker lists a seat
+/// fingerprint (full-id digest), otherwise a weak metadata preview.
+fn listed_identity_for(source: &str, cred: &CredentialRef, summary: &AccountSummary) -> qk::AccountIdentity {
+    let identity_fp = match summary.seat_fingerprint.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        Some(listed) => qk::AccountIdentity::strong_from_listed(listed),
+        None => qk::AccountIdentity::fingerprint(
             summary.account_id_prefix.as_deref(),
             summary.identity.as_deref(),
             summary.added_at,
         ),
+    };
+    qk::AccountIdentity {
+        source: source.to_string(),
+        credential: cred.storage_key(),
+        identity_fp,
     }
+}
+
+/// Establish the STRONG seat identity of an opted-in Codex account from the
+/// token the broker vends for exactly this credential — not from the listing.
+/// Returns the seat fingerprint and the full id's prefix (for usage
+/// pairing). Fails closed when the token carries no account id or disagrees
+/// with the listed fingerprint/prefix.
+async fn establish_seat_identity(
+    broker: &dyn CredentialBroker,
+    cred: &CredentialRef,
+    summary: &AccountSummary,
+) -> Result<(String, String), String> {
+    let token = broker
+        .access_token_for(cred)
+        .await
+        .map_err(|e| format!("--activate {cred}: cannot establish seat identity (token vend failed: {e})"))?;
+    let Some(account_id) = synaps_cli::auth::extract_codex_account_id(&token.token) else {
+        return Err(format!(
+            "--activate {cred}: cannot establish seat identity (token carries no provider account id); \
+             activation refused"
+        ));
+    };
+    let Some(fp) = qk::AccountIdentity::seat_fingerprint(cred.provider, &account_id) else {
+        return Err(format!("--activate {cred}: cannot establish seat identity (empty account id)"));
+    };
+    let prefix: String = account_id.chars().take(8).collect();
+    let listed = listed_identity_for("", cred, summary);
+    let disagree = (listed.is_strong() && listed.identity_fp != fp)
+        || summary
+            .account_id_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| p != prefix);
+    if disagree {
+        return Err(format!(
+            "--activate {cred}: the listed account metadata and the vended token name different seats; \
+             re-login this account before activating"
+        ));
+    }
+    Ok((fp, prefix))
 }
 
 /// Enumerate accounts through the broker and apply the CLI filters/opt-ins.
 ///
-/// Returns the kept accounts plus non-fatal warnings (e.g. two aliases that
-/// resolve to the same provider seat). Opting in two aliases of one seat is
-/// an error: it would spend two activations on one quota.
+/// Returns the kept accounts plus non-fatal warnings. Two aliases that
+/// resolve to one provider seat are a warning while everything is read-only
+/// and an ERROR as soon as either alias is opted in: the seat would have two
+/// labels racing for one activation ledger.
 pub(crate) async fn resolve_accounts(
     broker: &dyn CredentialBroker,
     source: &str,
@@ -614,35 +729,34 @@ pub(crate) async fn resolve_accounts(
                 continue;
             }
             let key = cred.storage_key();
+            let opted_in = opt_in.contains(&key);
+            let (identity, account_id_prefix) = if opted_in {
+                let (fp, prefix) = establish_seat_identity(broker, &cred, &s).await?;
+                (
+                    qk::AccountIdentity {
+                        source: source.to_string(),
+                        credential: key.clone(),
+                        identity_fp: fp,
+                    },
+                    Some(prefix),
+                )
+            } else {
+                (
+                    listed_identity_for(source, &cred, &s),
+                    s.account_id_prefix
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string),
+                )
+            };
             kept.push(KeptAccount {
-                identity: identity_for(source, &cred, &s),
-                opted_in: opt_in.contains(&key),
+                identity,
+                opted_in,
                 rearm: rearm_set.contains(&key),
                 credential: cred,
+                account_id_prefix,
             });
-        }
-    }
-    // Alias dedupe: two labels naming the same provider seat.
-    let mut warnings = Vec::new();
-    for (i, a) in kept.iter().enumerate() {
-        if !a.identity.identity_fp.starts_with("id:") {
-            continue;
-        }
-        for b in kept.iter().skip(i + 1) {
-            if a.credential.provider == b.credential.provider
-                && a.identity.identity_fp == b.identity.identity_fp
-            {
-                if a.opted_in && b.opted_in {
-                    return Err(format!(
-                        "--activate: '{}' and '{}' are the same provider seat; opt in only one",
-                        a.credential, b.credential
-                    ));
-                }
-                warnings.push(format!(
-                    "'{}' and '{}' resolve to the same provider seat ({})",
-                    a.credential, b.credential, a.identity.identity_fp
-                ));
-            }
         }
     }
     for want in &only {
@@ -657,8 +771,36 @@ pub(crate) async fn resolve_accounts(
             ));
         }
     }
-    kept.sort_by(|a, b| a.identity.key().cmp(&b.identity.key()));
-    Ok((kept, warnings))
+    // Alias dedupe: two labels naming the same provider seat. Fail closed
+    // when either is opted in; otherwise track the seat once (first label in
+    // deterministic order) and warn.
+    kept.sort_by(|a, b| {
+        a.identity
+            .key()
+            .cmp(&b.identity.key())
+            .then_with(|| a.credential.storage_key().cmp(&b.credential.storage_key()))
+    });
+    let mut warnings = Vec::new();
+    let mut deduped: Vec<KeptAccount> = Vec::new();
+    for a in kept {
+        if let Some(b) = deduped.iter().find(|b| b.same_seat(&a)) {
+            if a.opted_in || b.opted_in {
+                return Err(format!(
+                    "--activate: '{}' and '{}' are the same provider seat; a seat with two labels \
+                     cannot be activated — remove one alias (`synaps auth remove`) or exclude it \
+                     with --account",
+                    b.credential, a.credential
+                ));
+            }
+            warnings.push(format!(
+                "'{}' and '{}' resolve to the same provider seat; tracked once as '{}'",
+                b.credential, a.credential, b.credential
+            ));
+            continue;
+        }
+        deduped.push(a);
+    }
+    Ok((deduped, warnings))
 }
 
 // ── Runtime ──────────────────────────────────────────────────────────────────
@@ -738,10 +880,21 @@ impl KeeperRuntime {
         )?];
         let lock_dir = canonical_dir.join(qk::ACCOUNT_LOCK_DIR);
         for a in &accounts {
-            let name = qk::account_lock_name(&a.credential.storage_key());
-            locks.push(qk::KeeperLock::acquire(&lock_dir, &name, &holder).map_err(|e| {
-                format!("account '{}' is already kept by another keeper: {e}", a.credential)
-            })?);
+            // Label lock (always) plus, for a strong identity, the seat lock
+            // shared by every alias of that seat.
+            let mut names = vec![qk::account_lock_name(&a.credential.storage_key())];
+            if a.identity.is_strong() {
+                names.push(qk::account_lock_name(&format!(
+                    "{}.{}",
+                    a.identity.ledger_scope(),
+                    a.identity.identity_fp
+                )));
+            }
+            for name in names {
+                locks.push(qk::KeeperLock::acquire(&lock_dir, &name, &holder).map_err(|e| {
+                    format!("account '{}' is already kept by another keeper: {e}", a.credential)
+                })?);
+            }
         }
         let store = qk::StateStore::new(state_dir);
         let mut state = store.load()?;
@@ -812,20 +965,42 @@ impl KeeperRuntime {
         let Some(acct) = self.account(key).cloned() else {
             return Ok(());
         };
-        let now = self.clock.now_ms();
         let timeout = Duration::from_millis(self.cfg.usage_timeout_ms);
-        let obs = match tokio::time::timeout(timeout, self.broker.usage(&acct.credential)).await {
+        let fetched = tokio::time::timeout(timeout, self.broker.usage(&acct.credential)).await;
+        // Evaluate against the clock AFTER the fetch: the snapshot's
+        // observed_at is stamped on receipt, so a `now` taken before the
+        // await would make every reading look future-dated.
+        let now = self.clock.now_ms();
+        let obs = match fetched {
             Ok(Ok(snapshot)) => {
                 let mut obs = observation_from_snapshot(&snapshot);
                 // Identity pairing: the snapshot must name the seat we track.
-                if let (Some(p), true) = (
-                    snapshot.identity_prefix.as_deref(),
-                    acct.identity.identity_fp.starts_with("id:"),
-                ) {
-                    if acct.identity.identity_fp != format!("id:{p}") {
+                // (A differing prefix is proof of a different seat; an equal
+                // prefix is not proof of the same one — activation re-checks
+                // the full id from the token.)
+                if let (Some(p), Some(tracked)) =
+                    (snapshot.identity_prefix.as_deref(), acct.account_id_prefix.as_deref())
+                {
+                    if p != tracked {
                         obs.outcome = qk::ObservationOutcome::Malformed {
                             detail: "usage response names a different account than the tracked seat"
                                 .into(),
+                        };
+                    }
+                }
+                // Match the full seat, not only its eight-character preview.
+                // This also prevents another occupant's usage from falsely
+                // verifying a reset on the old ledger after re-login. Older
+                // brokers can still be polled read-only, but cannot authorize
+                // activation without paired identity evidence.
+                if acct.identity.is_strong() {
+                    let observed = snapshot.seat_fingerprint.as_deref()
+                        .map(qk::AccountIdentity::strong_from_listed);
+                    if observed.as_deref().is_some_and(|fp| fp != acct.identity.identity_fp)
+                        || (acct.opted_in && observed.is_none())
+                    {
+                        obs.outcome = qk::ObservationOutcome::Malformed {
+                            detail: "usage has no matching full seat identity".into(),
                         };
                     }
                 }
@@ -883,7 +1058,12 @@ impl KeeperRuntime {
                     let timeout = Duration::from_millis(self.cfg.attempt_timeout_ms);
                     let outcome = match tokio::time::timeout(
                         timeout + Duration::from_secs(5),
-                        self.activator.activate(&acct.credential, &model, timeout),
+                        self.activator.activate(
+                            &acct.credential,
+                            &acct.identity.identity_fp,
+                            &model,
+                            timeout,
+                        ),
                     )
                     .await
                     {
@@ -892,6 +1072,13 @@ impl KeeperRuntime {
                             reason: "activation exceeded its deadline".into(),
                         },
                     };
+                    let identity_mismatch = matches!(
+                        outcome,
+                        qk::AttemptOutcome::NotSent {
+                            stage: qk::NotSentStage::IdentityMismatch,
+                            ..
+                        }
+                    );
                     let events = qk::finish_attempt(
                         &mut self.state,
                         &self.cfg,
@@ -901,6 +1088,20 @@ impl KeeperRuntime {
                     )?;
                     self.store.save(&self.state)?;
                     self.emit(&events);
+                    if identity_mismatch {
+                        // The label now vends a different seat: its usage
+                        // evidence is not this ledger's. Fail closed for the
+                        // rest of the process; a restart re-establishes the
+                        // identity (and a new ledger) from the current token.
+                        if let Some(a) = self.accounts.iter_mut().find(|a| a.identity.key() == key) {
+                            a.opted_in = false;
+                        }
+                        self.note(&format!(
+                            "{}: provider seat changed since the identity was established; \
+                             activation DISABLED for this account until the keeper is restarted",
+                            acct.credential
+                        ));
+                    }
                     // Verify only from fresh usage.
                     self.poll(&key).await?;
                 }
@@ -1169,9 +1370,10 @@ fn describe_event(e: &qk::KeeperEvent) -> String {
             expiring_soon,
         } => format!(
             "{key}: ALERT {available_count} banked weekly reset(s) available{}{} (inventory only; nothing is redeemed)",
-            earliest_expiry_ms
-                .map(|e| format!(", earliest expiry {}", fmt_ts(e)))
-                .unwrap_or_default(),
+            match earliest_expiry_ms {
+                Some(e) => format!(", earliest expiry {}", fmt_ts(*e)),
+                None => ", expiry not exposed by the usage endpoint".to_string(),
+            },
             if *expiring_soon { " — EXPIRING SOON" } else { "" }
         ),
     }
@@ -1361,12 +1563,22 @@ mod tests {
         }
     }
 
+    /// Deterministic full provider account id for a mock label (one seat
+    /// per label unless aliased). The first 8 chars are the prefix.
+    fn seat_id(label: &str) -> String {
+        format!("{label:0<8}-0000-4000-8000-000000000000")
+    }
+    fn seat_prefix(label: &str) -> String {
+        seat_id(label).chars().take(8).collect()
+    }
+
     fn snapshot(label: &str, observed: u64, weekly_used: f64, reset: Option<u64>) -> UsageSnapshot {
         let mut s: UsageSnapshot = serde_json::from_value(serde_json::json!({
             "schema_version": 1, "provider": "openai-codex", "account": label,
             "observed_at": observed, "plan": "plus", "limit_reached": weekly_used >= 100.0,
             "windows": [], "model_availability": [], "credits": null, "banked_resets": null,
-            "identity_prefix": "2b2f1234", "notes": []
+            "identity_prefix": seat_prefix(label),
+            "seat_fingerprint": synaps_cli::auth::seat_fingerprint(OAuthProviderId::OpenAiCodex, &seat_id(label)), "notes": []
         }))
         .unwrap();
         s.windows = vec![
@@ -1399,9 +1611,18 @@ mod tests {
     }
 
     /// Mock broker: scripted usage snapshots per account, fake tokens, no
-    /// network, no auth.json.
+    /// network, no auth.json. Each label is its own seat unless `alias`ed.
+    /// The LISTED seat (metadata: prefix + fingerprint) and the TOKEN seat
+    /// (claim in the vended JWT) are tracked separately so tests can make
+    /// them disagree (re-login, stale metadata).
     struct MockBroker {
-        accounts: Vec<AccountSummary>,
+        labels: Vec<String>,
+        /// label → full account id carried by the vended token ("" = no claim)
+        seats: Mutex<HashMap<String, String>>,
+        /// label → full account id the listing reports
+        listed: Mutex<HashMap<String, String>>,
+        /// labels listed WITHOUT prefix/fingerprint metadata
+        hidden: Mutex<Vec<String>>,
         usage: Mutex<HashMap<String, VecDeque<Result<UsageSnapshot, BrokerError>>>>,
         usage_calls: Mutex<Vec<String>>,
         token_calls: Mutex<Vec<String>>,
@@ -1409,24 +1630,28 @@ mod tests {
 
     impl MockBroker {
         fn new(labels: &[&str]) -> Self {
+            let seats: HashMap<String, String> =
+                labels.iter().map(|l| (l.to_string(), seat_id(l))).collect();
             Self {
-                accounts: labels
-                    .iter()
-                    .map(|l| AccountSummary {
-                        provider: "openai-codex".into(),
-                        label: l.to_string(),
-                        identity: Some(format!("{l}@example.test")),
-                        account_id_prefix: Some("2b2f1234".into()),
-                        expires: 0,
-                        added_at: Some(1),
-                        selected: *l == "default",
-                        cooldown_until: None,
-                    })
-                    .collect(),
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                listed: Mutex::new(seats.clone()),
+                seats: Mutex::new(seats),
+                hidden: Mutex::new(Vec::new()),
                 usage: Mutex::new(HashMap::new()),
                 usage_calls: Mutex::new(Vec::new()),
                 token_calls: Mutex::new(Vec::new()),
             }
+        }
+        fn summary(&self, label: &str) -> AccountSummary {
+            let listed = self.listed.lock().unwrap().get(label).cloned();
+            let hidden = self.hidden.lock().unwrap().iter().any(|h| h == label);
+            let account = Account::parse(label).unwrap();
+            let mut s = AccountSummary::new(OAuthProviderId::OpenAiCodex, &account)
+                .with_account_id(if hidden { None } else { listed.as_deref() });
+            s.identity = Some(format!("{label}@example.test"));
+            s.added_at = Some(1);
+            s.selected = label == "default";
+            s
         }
         fn script(&self, key: &str, items: Vec<Result<UsageSnapshot, BrokerError>>) {
             self.usage
@@ -1435,6 +1660,28 @@ mod tests {
                 .entry(key.to_string())
                 .or_default()
                 .extend(items);
+        }
+        /// Make `label` a second alias of `of`'s seat (token AND listing).
+        fn alias(&self, label: &str, of: &str) {
+            self.seats.lock().unwrap().insert(label.to_string(), seat_id(of));
+            self.listed.lock().unwrap().insert(label.to_string(), seat_id(of));
+        }
+        /// Re-login `label` to seat `new_seat` WITHOUT touching the listing
+        /// (the keeper must notice from the token itself).
+        fn relogin_token_only(&self, label: &str, new_seat: &str) {
+            self.seats.lock().unwrap().insert(label.to_string(), seat_id(new_seat));
+        }
+        /// Vend a token with no account-id claim for `label`.
+        fn drop_token_claim(&self, label: &str) {
+            self.seats.lock().unwrap().insert(label.to_string(), String::new());
+        }
+        /// Listing names `other`'s seat while the token is unchanged.
+        fn set_listed_seat(&self, label: &str, other: &str) {
+            self.listed.lock().unwrap().insert(label.to_string(), seat_id(other));
+        }
+        /// List `label` without prefix/fingerprint metadata.
+        fn hide_metadata(&self, label: &str) {
+            self.hidden.lock().unwrap().push(label.to_string());
         }
     }
 
@@ -1445,20 +1692,26 @@ mod tests {
         }
         async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
             self.token_calls.lock().unwrap().push(cred.storage_key());
-            if !self.accounts.iter().any(|a| a.label == cred.account.label_str()) {
+            let label = cred.account.label_str();
+            if !self.labels.iter().any(|l| l == label) {
                 return Err(BrokerError::UnknownAccount {
                     provider: cred.provider.as_str().into(),
-                    label: cred.account.label_str().into(),
+                    label: label.into(),
                 });
             }
+            let seat = self.seats.lock().unwrap().get(label).cloned();
             Ok(AccessToken {
-                token: fake_codex_token("2b2f1234-0000"),
+                token: match seat.as_deref() {
+                    Some("") => "no.claims.here".to_string(),
+                    Some(id) => fake_codex_token(id),
+                    None => fake_codex_token(&seat_id(label)),
+                },
                 expires: u64::MAX,
             })
         }
         async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
             if provider == OAuthProviderId::OpenAiCodex {
-                Ok(self.accounts.clone())
+                Ok(self.labels.iter().map(|l| self.summary(l)).collect())
             } else {
                 Ok(Vec::new())
             }
@@ -1499,7 +1752,17 @@ mod tests {
     }
     #[async_trait]
     impl Activator for FakeActivator {
-        async fn activate(&self, cred: &CredentialRef, model: &str, _t: Duration) -> qk::AttemptOutcome {
+        async fn activate(
+            &self,
+            cred: &CredentialRef,
+            expected_seat: &str,
+            model: &str,
+            _t: Duration,
+        ) -> qk::AttemptOutcome {
+            assert!(
+                expected_seat.starts_with(qk::SEAT_FP_PREFIX),
+                "runner must never activate without a strong seat identity"
+            );
             self.calls
                 .lock()
                 .unwrap()
@@ -1704,7 +1967,7 @@ mod tests {
         let b = banked.unwrap();
         assert_eq!(b.available_count, None);
         assert_eq!(b.earliest_expiry_ms, Some(NOW + DAY));
-        assert_eq!(identity_prefix.as_deref(), Some("2b2f1234"));
+        assert_eq!(identity_prefix.as_deref(), Some(seat_prefix("a").as_str()));
         assert_eq!(obs.observed_at_ms, NOW);
     }
 
@@ -1746,9 +2009,23 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|a| !a.opted_in));
-        assert!(all.iter().all(|a| a.identity.identity_fp == "id:2b2f1234"));
-        // both mock labels carry the same seat id → warning, not an error
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // read-only rows take the LISTED seat fingerprint (strong, seat-canonical
+        // key) and never vend a token
+        assert!(all.iter().all(|a| a.identity.is_strong()));
+        assert!(all.iter().all(|a| a.account_id_prefix.as_deref()
+            == Some(seat_prefix(a.credential.account.label_str()).as_str())));
+        assert!(h.broker.token_calls.lock().unwrap().is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // a listing without metadata yields a weak, label-scoped identity
+        h.broker.hide_metadata("default");
+        let (all, _) = resolve_accounts(h.broker.as_ref(), "local:x", &[], &[], &[], &[])
+            .await
+            .unwrap();
+        let d = all.iter().find(|a| a.credential.storage_key() == "openai-codex").unwrap();
+        assert!(!d.identity.is_strong());
+        assert!(d.identity.identity_fp.starts_with("who:"), "{}", d.identity.identity_fp);
+        assert_eq!(d.account_id_prefix, None);
+        h.broker.hidden.lock().unwrap().clear();
         let (only, _) = resolve_accounts(
             h.broker.as_ref(),
             "local:x",
@@ -1761,17 +2038,42 @@ mod tests {
         .unwrap();
         assert_eq!(only.len(), 1);
         assert!(only[0].opted_in);
-        // opting in two aliases of one seat → error
+        // an opted-in row has a STRONG identity from the vended token (digest, not the id)
+        assert!(only[0].identity.is_strong());
+        assert!(!only[0].identity.identity_fp.contains(&seat_prefix("astra2")));
+        assert_eq!(only[0].account_id_prefix.as_deref(), Some(seat_prefix("astra2").as_str()));
+        assert_eq!(h.broker.token_calls.lock().unwrap().as_slice(), ["openai-codex@astra2"]);
+        // two labels on ONE seat: warning + tracked once while read-only …
+        h.broker.alias("default", "astra2");
+        let (kept, warnings) = resolve_accounts(h.broker.as_ref(), "local:x", &[], &[], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(kept.len(), 1, "one seat is tracked once");
+        assert!(warnings[0].contains("tracked once"));
+        // … an error as soon as EITHER alias is opted in, and for both
+        for activate in [
+            vec!["openai-codex@astra2".to_string()],
+            vec!["openai-codex".to_string()],
+            vec!["openai-codex@astra2".to_string(), "openai-codex".to_string()],
+        ] {
+            let err = resolve_accounts(h.broker.as_ref(), "local:x", &[], &[], &activate, &[])
+                .await
+                .err()
+                .unwrap_or_default();
+            assert!(err.contains("same provider seat"), "{activate:?}: {err}");
+        }
+        // excluding the alias with --account makes activation possible again
         assert!(resolve_accounts(
             h.broker.as_ref(),
             "local:x",
             &[],
-            &[],
-            &["openai-codex@astra2".into(), "openai-codex".into()],
+            &["openai-codex@astra2".into()],
+            &["openai-codex@astra2".into()],
             &[]
         )
         .await
-        .is_err());
+        .is_ok());
         // unknown explicit account → error, never fallback
         assert!(resolve_accounts(
             h.broker.as_ref(),
@@ -1831,6 +2133,30 @@ mod tests {
         assert!(h.broker.token_calls.lock().unwrap().is_empty(), "read-only never vends a token");
         assert!(h.sink.joined().contains("ALERT window idle since reset"));
         assert!(h.sink.joined().contains("[read-only]"));
+    }
+
+    #[tokio::test]
+    async fn usage_requires_full_paired_identity_not_a_matching_prefix() {
+        for missing_identity in [false, true] {
+            let h = Harness::new(&["astra2"]);
+            let g1 = NOW + HOUR;
+            let t = g1 + 60_000;
+            let mut wrong = snapshot("astra2", t, 0.0, Some(g1));
+            // Display prefix still matches. Missing or another full identity
+            // must fail closed, even if the activation token is correct.
+            wrong.seat_fingerprint = if missing_identity { None } else {
+                synaps_cli::auth::seat_fingerprint(OAuthProviderId::OpenAiCodex, "different-full-seat")
+            };
+            h.broker.script("openai-codex@astra2", vec![
+                Ok(snapshot("astra2", NOW, 100.0, Some(g1))), Ok(wrong),
+            ]);
+            let mut rt = h.runtime(&["openai-codex@astra2"], Some(MODEL)).await;
+            rt.pass().await.unwrap();
+            h.set_time(t);
+            rt.pass().await.unwrap();
+            assert!(h.activator.calls.lock().unwrap().is_empty());
+            assert!(rt.rows()[0].phase.starts_with("unknown"), "{}", rt.rows()[0].phase);
+        }
     }
 
     #[tokio::test]
@@ -2240,12 +2566,13 @@ mod tests {
         .await;
         let act = CodexActivator::new(h.broker.clone(), url).unwrap();
         let cred = parse_account_arg("openai-codex@astra2").unwrap();
-        let outcome = act.activate(&cred, "gpt-5.4-mini", Duration::from_secs(5)).await;
+        let seat = qk::AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, &seat_id("astra2")).unwrap();
+        let outcome = act.activate(&cred, &seat, "gpt-5.4-mini", Duration::from_secs(5)).await;
         assert_eq!(outcome, qk::AttemptOutcome::Sent { http_status: 200 });
         let (path, head, body) = server.await.unwrap();
         assert!(path.starts_with("POST /codex/responses "), "{path}");
         let lower = head.to_ascii_lowercase();
-        assert!(lower.contains("chatgpt-account-id: 2b2f1234-0000"));
+        assert!(lower.contains(&format!("chatgpt-account-id: {}", seat_id("astra2"))));
         assert!(lower.contains("authorization: bearer "));
         assert!(lower.contains("openai-beta: responses=experimental"));
         assert!(lower.contains("originator: synaps"));
@@ -2261,11 +2588,12 @@ mod tests {
     async fn codex_activator_treats_oversized_body_as_ambiguous() {
         let h = Harness::new(&["astra2"]);
         let cred = parse_account_arg("openai-codex@astra2").unwrap();
+        let seat = qk::AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, &seat_id("astra2")).unwrap();
         let big: &'static str = Box::leak("x".repeat(ACTIVATION_MAX_BODY_BYTES + 1).into_boxed_str());
         let (url, server) = one_shot_server(200, big).await;
         let act = CodexActivator::new(h.broker.clone(), url).unwrap();
         assert!(matches!(
-            act.activate(&cred, "gpt-5.4-mini", Duration::from_secs(5)).await,
+            act.activate(&cred, &seat, "gpt-5.4-mini", Duration::from_secs(5)).await,
             qk::AttemptOutcome::Ambiguous { reason } if reason.contains("drain cap")
         ));
         server.await.unwrap();
@@ -2349,6 +2677,7 @@ mod tests {
     async fn codex_activator_classifies_statuses_and_pre_send_failures() {
         let h = Harness::new(&["astra2"]);
         let cred = parse_account_arg("openai-codex@astra2").unwrap();
+        let seat = qk::AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, &seat_id("astra2")).unwrap();
         for (status, expect) in [
             (401u16, qk::AttemptOutcome::Rejected { http_status: 401 }),
             (429, qk::AttemptOutcome::Rejected { http_status: 429 }),
@@ -2356,13 +2685,13 @@ mod tests {
         ] {
             let (url, server) = one_shot_server(status, "{}").await;
             let act = CodexActivator::new(h.broker.clone(), url).unwrap();
-            assert_eq!(act.activate(&cred, "gpt-5.4-mini", Duration::from_secs(5)).await, expect);
+            assert_eq!(act.activate(&cred, &seat, "gpt-5.4-mini", Duration::from_secs(5)).await, expect);
             server.await.unwrap();
         }
         let (url, server) = one_shot_server(503, "busy").await;
         let act = CodexActivator::new(h.broker.clone(), url).unwrap();
         assert!(matches!(
-            act.activate(&cred, "gpt-5.4-mini", Duration::from_secs(5)).await,
+            act.activate(&cred, &seat, "gpt-5.4-mini", Duration::from_secs(5)).await,
             qk::AttemptOutcome::Ambiguous { .. }
         ));
         server.await.unwrap();
@@ -2372,7 +2701,7 @@ mod tests {
         drop(listener);
         let act = CodexActivator::new(h.broker.clone(), dead).unwrap();
         assert!(matches!(
-            act.activate(&cred, "gpt-5.4-mini", Duration::from_secs(2)).await,
+            act.activate(&cred, &seat, "gpt-5.4-mini", Duration::from_secs(2)).await,
             qk::AttemptOutcome::NotSent { .. }
         ));
         // Unknown account → token vend fails → NotSent, no request.
@@ -2380,8 +2709,8 @@ mod tests {
         let (url, server) = one_shot_server(200, "").await;
         let act = CodexActivator::new(h.broker.clone(), url).unwrap();
         assert!(matches!(
-            act.activate(&ghost, "gpt-5.4-mini", Duration::from_secs(2)).await,
-            qk::AttemptOutcome::NotSent { .. }
+            act.activate(&ghost, &seat, "gpt-5.4-mini", Duration::from_secs(2)).await,
+            qk::AttemptOutcome::NotSent { stage: qk::NotSentStage::TokenVend, .. }
         ));
         server.abort();
         // Non-Codex provider → NotSent without any token vend.
@@ -2389,9 +2718,317 @@ mod tests {
         let anthropic = parse_account_arg("anthropic").unwrap();
         let act = CodexActivator::new(h.broker.clone(), "http://127.0.0.1:9/x".into()).unwrap();
         assert!(matches!(
-            act.activate(&anthropic, "gpt-5.4-mini", Duration::from_secs(1)).await,
-            qk::AttemptOutcome::NotSent { .. }
+            act.activate(&anthropic, &seat, "gpt-5.4-mini", Duration::from_secs(1)).await,
+            qk::AttemptOutcome::NotSent { stage: qk::NotSentStage::Unsupported, .. }
         ));
         assert_eq!(h.broker.token_calls.lock().unwrap().len(), before);
+        // Weak/absent expected seat → NotSent before any token vend.
+        let act = CodexActivator::new(h.broker.clone(), "http://127.0.0.1:9/x".into()).unwrap();
+        assert!(matches!(
+            act.activate(&cred, "id:astra200", "gpt-5.4-mini", Duration::from_secs(1)).await,
+            qk::AttemptOutcome::NotSent { stage: qk::NotSentStage::IdentityMismatch, .. }
+        ));
+        assert_eq!(h.broker.token_calls.lock().unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn codex_activator_refuses_a_token_from_another_seat_before_any_bytes_leave() {
+        let h = Harness::new(&["astra2"]);
+        let cred = parse_account_arg("openai-codex@astra2").unwrap();
+        let tracked = qk::AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, &seat_id("astra2")).unwrap();
+        // Re-login under the same label to another seat: the listing is
+        // unchanged, only the token differs.
+        h.broker.relogin_token_only("astra2", "other");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+        let act = CodexActivator::new(h.broker.clone(), url).unwrap();
+        let outcome = act.activate(&cred, &tracked, "gpt-5.4-mini", Duration::from_secs(2)).await;
+        assert!(
+            matches!(outcome, qk::AttemptOutcome::NotSent { stage: qk::NotSentStage::IdentityMismatch, .. }),
+            "{outcome:?}"
+        );
+        // Nothing connected to the server.
+        let waited = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(waited.is_err(), "no request may reach the provider on a seat mismatch");
+        // A token with no account-id claim is also refused before sending.
+        h.broker.drop_token_claim("astra2");
+        let outcome = act.activate(&cred, &tracked, "gpt-5.4-mini", Duration::from_secs(2)).await;
+        assert!(matches!(outcome, qk::AttemptOutcome::NotSent { stage: qk::NotSentStage::AccountId, .. }));
+    }
+
+    #[tokio::test]
+    async fn activation_requires_seat_identity_from_the_token_and_matching_metadata() {
+        // Token without an account-id claim → opt-in refused at startup,
+        // even though the LISTING carries a fingerprint.
+        let h = Harness::new(&["astra2"]);
+        h.broker.drop_token_claim("astra2");
+        let err = h
+            .runtime_in(&h.dir.path().join("s"), &["openai-codex@astra2"], Some(MODEL))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("seat identity"), "{err}");
+        // Listed metadata names another seat than the token → refused.
+        let h = Harness::new(&["astra2"]);
+        h.broker.set_listed_seat("astra2", "stale");
+        let err = h
+            .runtime_in(&h.dir.path().join("s"), &["openai-codex@astra2"], Some(MODEL))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("different seats"), "{err}");
+        // A listing without metadata is tolerated: the token is authoritative
+        // and the identity is still strong (token-derived).
+        let h = Harness::new(&["astra2"]);
+        h.broker.hide_metadata("astra2");
+        let rt = h.runtime(&["openai-codex@astra2"], Some(MODEL)).await;
+        assert!(rt.accounts[0].identity.is_strong());
+        assert_eq!(
+            rt.accounts[0].identity.identity_fp,
+            qk::AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, &seat_id("astra2")).unwrap()
+        );
+        assert_eq!(rt.accounts[0].account_id_prefix.as_deref(), Some(seat_prefix("astra2").as_str()));
+    }
+
+    #[tokio::test]
+    async fn mid_run_relogin_to_another_seat_never_spends_and_disables_activation() {
+        let h = Harness::new(&["astra2"]);
+        let g1 = NOW + HOUR;
+        let t = g1 + 60_000;
+        h.broker.script(
+            "openai-codex@astra2",
+            vec![
+                Ok(snapshot("astra2", NOW, 100.0, Some(g1))),
+                Ok(snapshot("astra2", t, 0.0, Some(g1))), // due (seat A evidence)
+            ],
+        );
+        // Real activator against a loopback listener that must stay silent.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+        let activator: Arc<dyn Activator> = Arc::new(CodexActivator::new(h.broker.clone(), url).unwrap());
+        let (accounts, _) = resolve_accounts(
+            h.broker.as_ref(),
+            "local:/tmp/test-auth.json",
+            &[],
+            &[],
+            &["openai-codex@astra2".into()],
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut rt = KeeperRuntime::new(
+            qk::KeeperConfig::default().bounded(),
+            &h.dir.path().join("state"),
+            &h.dir.path().join("canonical"),
+            accounts,
+            h.broker.clone(),
+            activator,
+            h.clock.clone(),
+            h.sink.clone(),
+            false,
+            Some(MODEL.into()),
+        )
+        .unwrap();
+        rt.pass().await.unwrap();
+        // Operator re-logs the label into seat B between the poll and the attempt.
+        h.broker.relogin_token_only("astra2", "seatb");
+        h.set_time(t);
+        rt.pass().await.unwrap();
+        let out = h.sink.joined();
+        assert!(out.contains("identity_mismatch") || out.contains("IdentityMismatch"), "{out}");
+        assert!(out.contains("activation DISABLED"), "{out}");
+        assert!(!rt.accounts[0].opted_in, "opt-in dropped for the rest of the process");
+        let row = &rt.rows()[0];
+        assert_eq!(row.attempts_in_generation, 0, "nothing sent → refunded");
+        assert!(row.phase.starts_with("due"), "{}", row.phase);
+        // Nothing ever reached the listener, and later passes stay silent.
+        for _ in 0..5 {
+            h.clock.0.fetch_add(rt.cfg.poll_interval_ms, Ordering::SeqCst);
+            h.broker.script(
+                "openai-codex@astra2",
+                vec![Ok(snapshot("astra2", h.clock.now_ms(), 0.0, Some(g1)))],
+            );
+            rt.pass().await.unwrap();
+        }
+        let waited = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(waited.is_err(), "no bytes may reach the provider for another seat");
+        assert!(h.sink.joined().contains("[read-only]"));
+    }
+
+    #[tokio::test]
+    async fn sequential_alias_switch_shares_one_ledger() {
+        // Run 1: `astra2` opted in, attempt ambiguous → generation spent.
+        let h = Harness::new(&["default", "astra2"]);
+        h.broker.alias("default", "astra2");
+        let g1 = NOW + HOUR;
+        let t = g1 + 60_000;
+        h.broker.script(
+            "openai-codex@astra2",
+            vec![
+                Ok(snapshot("astra2", NOW, 100.0, Some(g1))),
+                Ok(snapshot("astra2", t, 0.0, Some(g1))),
+            ],
+        );
+        h.activator.outcomes.lock().unwrap().push_back(qk::AttemptOutcome::Ambiguous {
+            reason: "request timed out".into(),
+        });
+        let state_dir = h.dir.path().join("state");
+        let mut now = t;
+        let key_a;
+        {
+            // The alias must be excluded with --account for activation to be allowed.
+            let (accounts, _) = resolve_accounts(
+                h.broker.as_ref(),
+                "local:/tmp/test-auth.json",
+                &[],
+                &["openai-codex@astra2".into()],
+                &["openai-codex@astra2".into()],
+                &[],
+            )
+            .await
+            .unwrap();
+            key_a = accounts[0].identity.key();
+            let mut rt = KeeperRuntime::new(
+                qk::KeeperConfig::default().bounded(),
+                &state_dir,
+                &h.dir.path().join("canonical"),
+                accounts,
+                h.broker.clone(),
+                h.activator.clone(),
+                h.clock.clone(),
+                h.sink.clone(),
+                false,
+                Some(MODEL.into()),
+            )
+            .unwrap();
+            rt.pass().await.unwrap();
+            h.set_time(t);
+            for _ in 0..60 {
+                rt.pass().await.unwrap();
+                now += rt.cfg.verify_poll_ms;
+                h.set_time(now);
+            }
+            assert_eq!(h.activator.calls.lock().unwrap().len(), 1);
+            assert!(rt.rows()[0].phase.starts_with("unverified"));
+        }
+        // Run 2: the SAME seat under its other alias `default`, opted in.
+        // The seat-canonical key finds the spent generation.
+        h.broker.script(
+            "openai-codex",
+            vec![Ok(snapshot("astra2", now, 0.0, Some(g1)))],
+        );
+        let (accounts, _) = resolve_accounts(
+            h.broker.as_ref(),
+            "local:/tmp/test-auth.json",
+            &[],
+            &["openai-codex".into()],
+            &["openai-codex".into()],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(accounts[0].identity.key(), key_a, "alias shares the seat ledger");
+        let mut rt = KeeperRuntime::new(
+            qk::KeeperConfig::default().bounded(),
+            &state_dir,
+            &h.dir.path().join("canonical"),
+            accounts,
+            h.broker.clone(),
+            h.activator.clone(),
+            h.clock.clone(),
+            h.sink.clone(),
+            false,
+            Some(MODEL.into()),
+        )
+        .unwrap();
+        for _ in 0..5 {
+            rt.pass().await.unwrap();
+            now += rt.cfg.poll_interval_ms;
+            h.set_time(now);
+            h.broker.script("openai-codex", vec![Ok(snapshot("astra2", now, 0.0, Some(g1)))]);
+        }
+        assert_eq!(h.activator.calls.lock().unwrap().len(), 1, "no second burn via the other alias");
+        assert_eq!(rt.state.accounts.len(), 1, "one ledger for one seat");
+        let row = &rt.rows()[0];
+        assert_eq!(row.account, "openai-codex");
+        assert!(row.phase.starts_with("unverified"), "{}", row.phase);
+        // The persisted entry now names the alias in use, still secret-free.
+        let raw = std::fs::read_to_string(rt.store.path()).unwrap();
+        let persisted: qk::KeeperState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.accounts[&key_a].identity.credential, "openai-codex");
+        assert!(!raw.contains(&seat_id("astra2")));
+    }
+
+    #[tokio::test]
+    async fn poll_evaluates_with_the_clock_after_the_fetch() {
+        // The broker's snapshot is stamped when received; the clock advances
+        // during the fetch. With the pre-fetch clock the reading would be
+        // "in the future" (> skew) and rejected; after the fetch it is fresh.
+        struct SlowBroker {
+            inner: Arc<MockBroker>,
+            clock: Arc<FakeClock>,
+        }
+        #[async_trait]
+        impl CredentialBroker for SlowBroker {
+            async fn access_token(&self, p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
+                self.inner.access_token(p).await
+            }
+            async fn access_token_for(&self, c: &CredentialRef) -> Result<AccessToken, BrokerError> {
+                self.inner.access_token_for(c).await
+            }
+            async fn accounts(&self, p: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+                self.inner.accounts(p).await
+            }
+            async fn usage(&self, c: &CredentialRef) -> Result<UsageSnapshot, BrokerError> {
+                // The fetch "takes" 10 minutes; the body is stamped on receipt.
+                self.clock.0.fetch_add(10 * 60_000, Ordering::SeqCst);
+                let mut s = self.inner.usage(c).await?;
+                s.observed_at = self.clock.now_ms();
+                Ok(s)
+            }
+            async fn proxy(&self, r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+                self.inner.proxy(r).await
+            }
+            async fn proxy_stream(&self, r: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+                self.inner.proxy_stream(r).await
+            }
+            async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+                self.inner.anthropic_usage().await
+            }
+            async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
+                self.inner.capabilities().await
+            }
+        }
+        let h = Harness::new(&["astra2"]);
+        h.broker
+            .script("openai-codex@astra2", vec![Ok(snapshot("astra2", NOW, 5.0, Some(NOW + 3 * DAY)))]);
+        let slow = Arc::new(SlowBroker {
+            inner: h.broker.clone(),
+            clock: h.clock.clone(),
+        });
+        let (accounts, _) = resolve_accounts(slow.as_ref(), "local:x", &[], &[], &[], &[])
+            .await
+            .unwrap();
+        let mut rt = KeeperRuntime::new(
+            qk::KeeperConfig::default().bounded(),
+            &h.dir.path().join("s"),
+            &h.dir.path().join("c"),
+            accounts,
+            slow.clone(),
+            h.activator.clone(),
+            h.clock.clone(),
+            h.sink.clone(),
+            false,
+            None,
+        )
+        .unwrap();
+        rt.pass().await.unwrap();
+        let st = rt.state.accounts.values().next().unwrap();
+        assert!(st.last_poll_ok, "reading must not be rejected as future-dated: {:?}", st.last_error);
+        assert_eq!(st.last_poll_ms, Some(h.clock.now_ms()), "evaluated at the post-fetch clock");
+        assert_eq!(st.last_ok_observation_ms, Some(h.clock.now_ms()));
+        assert!(rt.rows()[0].phase.starts_with("active"), "{}", rt.rows()[0].phase);
     }
 }

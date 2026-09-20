@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::account::{
-    account_id_prefix, Account, AccountSummary, CredentialRef,
-};
+use super::account::{Account, AccountSummary, CredentialRef};
 use super::provider::OAuthProviderId;
 use super::{AuthFile, OAuthCredentials};
 
@@ -319,21 +317,15 @@ pub(crate) fn list_accounts_detailed_at(
             continue;
         }
         inventory.accounts.push(AccountSummary {
-            provider: cred.provider.as_str().to_string(),
-            label: cred.account.label_str().to_string(),
             identity: obj
                 .get("identity")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_string()),
-            account_id_prefix: obj
-                .get("accountId")
-                .and_then(|v| v.as_str())
-                .and_then(account_id_prefix),
             expires: obj.get("expires").and_then(|v| v.as_u64()).unwrap_or(0),
             added_at: obj.get("addedAt").and_then(|v| v.as_u64()),
-            selected: false,
-            cooldown_until: None,
+            ..AccountSummary::new(cred.provider, &cred.account)
+                .with_account_id(obj.get("accountId").and_then(|v| v.as_str()))
         });
     }
     inventory
@@ -1307,6 +1299,11 @@ mod tests {
         assert_eq!(inv.accounts.len(), 2, "{:?}", inv.accounts);
         assert_eq!(inv.accounts[0].label, "default");
         assert_eq!(inv.accounts[0].account_id_prefix.as_deref(), Some("2b2f0000"));
+        assert_eq!(
+            inv.accounts[0].seat_fingerprint,
+            super::super::account::seat_fingerprint(OAuthProviderId::OpenAiCodex, "2b2f0000-1111")
+        );
+        assert_ne!(inv.accounts[0].seat_fingerprint, inv.accounts[1].seat_fingerprint);
         assert_eq!(inv.accounts[0].expires, 10);
         assert_eq!(inv.accounts[1].label, "astra2");
         assert_eq!(inv.accounts[1].identity.as_deref(), Some("a@example.com"));

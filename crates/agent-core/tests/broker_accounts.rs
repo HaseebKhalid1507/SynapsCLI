@@ -527,3 +527,70 @@ async fn auto_selection_uses_fresh_usage_and_honours_cooldowns() {
         Err(BrokerError::NoAccountAvailable { .. })
     ));
 }
+
+/// A fresh cached reading for A must not authorize B after re-login under the
+/// same label, including replacement while the usage request is in flight.
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_selection_discards_replaced_seats_and_removed_slots() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for replace_during_read in [false, true] {
+        let home = install_store();
+        let path = home.path().join("auth.json");
+        let replace = Arc::new(AtomicBool::new(replace_during_read));
+        let handler_path = path.clone();
+        let app = Router::new().route(
+            "/usage",
+            get(move |headers: HeaderMap| {
+                let path = handler_path.clone();
+                let replace = replace.clone();
+                async move {
+                    let auth = headers.get("authorization").unwrap().to_str().unwrap();
+                    let original_b = auth.ends_with("anthropic-b-access");
+                    if original_b && replace.swap(false, Ordering::SeqCst) {
+                        let mut data: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                        data["anthropic@b"] =
+                            oauth("replacement-access", "replacement-refresh", None);
+                        std::fs::write(&path, data.to_string()).unwrap();
+                    }
+                    let used = if original_b { 20.0 } else { 100.0 };
+                    Json(
+                        json!({"five_hour":{"utilization":used,"resets_at":"2099-01-01T00:00:00Z"},
+                    "seven_day":{"utilization":used,"resets_at":"2099-01-01T00:00:00Z"}}),
+                    )
+                }
+            }),
+        );
+        let upstream = spawn(app).await;
+        let broker = LocalBroker::new(reqwest::Client::new())
+            .with_account_policy(
+                AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto),
+            )
+            .with_usage_endpoint_override(format!("{upstream}/usage"));
+        if !replace_during_read {
+            let pinned = broker
+                .access_token_pinned(OAuthProviderId::Anthropic)
+                .await
+                .unwrap();
+            assert_eq!(pinned.token.token, "anthropic-b-access");
+            // Same alias now holds an exhausted, independently identified seat.
+            let mut data: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            data["anthropic@b"] = oauth("replacement-access", "replacement-refresh", None);
+            std::fs::write(&path, data.to_string()).unwrap();
+        }
+        assert!(matches!(
+            broker.access_token_pinned(OAuthProviderId::Anthropic).await,
+            Err(BrokerError::NoAccountAvailable { .. })
+        ));
+        let mut data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        data.as_object_mut().unwrap().remove("anthropic@b");
+        std::fs::write(&path, data.to_string()).unwrap();
+        assert!(matches!(
+            broker.access_token_pinned(OAuthProviderId::Anthropic).await,
+            Err(BrokerError::NoAccountAvailable { .. })
+        ));
+    }
+}

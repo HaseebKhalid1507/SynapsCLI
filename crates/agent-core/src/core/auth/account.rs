@@ -410,7 +410,11 @@ impl AccountPolicy {
 
 /// Non-secret listing row for one stored account. Never carries token
 /// material; `account_id_prefix` is at most 8 characters.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Construct with [`AccountSummary::new`] and set the optional fields you
+/// know; new optional fields are added with serde defaults so older brokers
+/// and clients keep interoperating.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSummary {
     pub provider: String,
     pub label: String,
@@ -418,6 +422,13 @@ pub struct AccountSummary {
     pub identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id_prefix: Option<String>,
+    /// Stable, opaque fingerprint of the provider seat this slot holds
+    /// ([`seat_fingerprint`] over the FULL provider account id). Two aliases
+    /// of one seat share it; a re-login with another seat changes it. `None`
+    /// when the provider exposes no account id — consumers that must act on
+    /// exactly one seat (activation, spending) fail closed on `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_fingerprint: Option<String>,
     /// Access-token expiry (epoch ms); `0` when unknown.
     #[serde(default)]
     pub expires: u64,
@@ -432,10 +443,103 @@ pub struct AccountSummary {
 }
 
 impl AccountSummary {
+    /// Row for one slot with every optional field unset.
+    pub fn new(provider: OAuthProviderId, account: &Account) -> Self {
+        Self {
+            provider: provider.as_str().to_string(),
+            label: account.label_str().to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// Set both identity views derived from the provider's account id: the
+    /// short display prefix and the full-id fingerprint.
+    pub fn with_account_id(mut self, account_id: Option<&str>) -> Self {
+        self.account_id_prefix = account_id.and_then(account_id_prefix);
+        self.seat_fingerprint = self
+            .provider
+            .parse::<OAuthProviderId>()
+            .ok()
+            .zip(account_id)
+            .and_then(|(provider, id)| seat_fingerprint(provider, id));
+        self
+    }
+
     pub fn credential_ref(&self) -> Option<CredentialRef> {
         let provider: OAuthProviderId = self.provider.parse().ok()?;
         let account = Account::parse(&self.label).ok()?;
         Some(CredentialRef::new(provider, account))
+    }
+}
+
+/// Stable, opaque seat fingerprint: hex SHA-256 over a domain tag, the
+/// provider id and the provider's FULL account id (e.g. the Codex
+/// `chatgpt_account_id` claim). Deterministic across processes and hosts, so
+/// a consumer holding a vended token can derive the same value from that
+/// token's claim and compare it with [`AccountSummary::seat_fingerprint`]
+/// before spending on the listed seat. Never derived from token material.
+pub fn seat_fingerprint(provider: OAuthProviderId, account_id: &str) -> Option<String> {
+    let id = account_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(hex_digest(&[b"synaps-seat-v1", provider.as_str().as_bytes(), id.as_bytes()]))
+}
+
+fn hex_digest(parts: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Identity of the credential material currently stored in one slot. Scopes
+/// per-slot caches and pairs a proven-capacity reading with the token vended
+/// for it: the provider seat (via [`seat_fingerprint`]) when the credential
+/// carries an account id — stable across token rotation — otherwise a digest
+/// of the refresh material, which changes on re-login and on rotation. An
+/// opaque digest: not reversible, never logged with token material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SeatIdentity(String);
+
+impl SeatIdentity {
+    pub fn of(provider: OAuthProviderId, creds: &super::OAuthCredentials) -> Self {
+        if let Some(fp) = creds
+            .account_id
+            .as_deref()
+            .and_then(|id| seat_fingerprint(provider, id))
+        {
+            return Self(format!("id:{fp}"));
+        }
+        let material = if creds.refresh.is_empty() {
+            creds.access.as_bytes()
+        } else {
+            creds.refresh.as_bytes()
+        };
+        Self(format!(
+            "cred:{}",
+            hex_digest(&[b"synaps-cred-v1", provider.as_str().as_bytes(), material])
+        ))
+    }
+
+    /// Seat fingerprint when this identity is a provider account id.
+    pub fn seat_fingerprint(&self) -> Option<&str> {
+        self.0.strip_prefix("id:")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SeatIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Short preview only: enough to tell two identities apart in a trace.
+        let (kind, digest) = self.0.split_once(':').unwrap_or(("?", &self.0));
+        write!(f, "SeatIdentity({kind}:{}…)", &digest[..digest.len().min(8)])
     }
 }
 
@@ -685,14 +789,12 @@ mod tests {
     #[test]
     fn summary_has_no_secret_fields() {
         let summary = AccountSummary {
-            provider: "openai-codex".into(),
-            label: "astra2".into(),
             identity: Some("user@example.com".into()),
-            account_id_prefix: account_id_prefix("2b2f0000-aaaa-bbbb"),
             expires: 1,
             added_at: Some(2),
             selected: true,
-            cooldown_until: None,
+            ..AccountSummary::new(OAuthProviderId::OpenAiCodex, &Account::named("astra2").unwrap())
+                .with_account_id(Some("2b2f0000-aaaa-bbbb"))
         };
         let json = serde_json::to_value(&summary).unwrap();
         let keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
@@ -701,5 +803,60 @@ mod tests {
         }
         assert_eq!(json["account_id_prefix"], "2b2f0000");
         assert_eq!(summary.credential_ref().unwrap().storage_key(), "openai-codex@astra2");
+        // Full-id fingerprint: opaque, stable, and not the id itself.
+        let fp = summary.seat_fingerprint.clone().unwrap();
+        assert_eq!(fp.len(), 64);
+        assert!(!fp.contains("2b2f0000"));
+        assert_eq!(
+            Some(fp),
+            seat_fingerprint(OAuthProviderId::OpenAiCodex, "2b2f0000-aaaa-bbbb")
+        );
+        // Older peers without the field still deserialize (serde default).
+        let legacy: AccountSummary =
+            serde_json::from_str(r#"{"provider":"openai-codex","label":"x"}"#).unwrap();
+        assert_eq!(legacy.seat_fingerprint, None);
+    }
+
+    #[test]
+    fn seat_fingerprint_is_stable_per_provider_and_full_id() {
+        let a = seat_fingerprint(OAuthProviderId::OpenAiCodex, "acct_1").unwrap();
+        assert_eq!(seat_fingerprint(OAuthProviderId::OpenAiCodex, " acct_1 ").unwrap(), a);
+        assert_ne!(seat_fingerprint(OAuthProviderId::OpenAiCodex, "acct_10").unwrap(), a);
+        assert_ne!(seat_fingerprint(OAuthProviderId::Anthropic, "acct_1").unwrap(), a);
+        assert_eq!(seat_fingerprint(OAuthProviderId::OpenAiCodex, "  "), None);
+        // Same seat under another alias: same fingerprint.
+        let alias = AccountSummary::new(OAuthProviderId::OpenAiCodex, &Account::Default)
+            .with_account_id(Some("acct_1"));
+        assert_eq!(alias.seat_fingerprint.as_deref(), Some(a.as_str()));
+        assert_eq!(alias.account_id_prefix.as_deref(), Some("acct_1"));
+    }
+
+    #[test]
+    fn seat_identity_prefers_account_id_and_never_prints_material() {
+        let creds = |refresh: &str, id: Option<&str>| super::super::OAuthCredentials {
+            auth_type: "oauth".into(),
+            refresh: refresh.into(),
+            access: "access-SECRET".into(),
+            expires: 0,
+            account_id: id.map(str::to_string),
+        };
+        let p = OAuthProviderId::OpenAiCodex;
+        // Account id present: rotation of the refresh token keeps the seat.
+        let a1 = SeatIdentity::of(p, &creds("r1-SECRET", Some("acct_1")));
+        let a2 = SeatIdentity::of(p, &creds("r2-SECRET", Some("acct_1")));
+        assert_eq!(a1, a2);
+        assert_eq!(a1.seat_fingerprint(), seat_fingerprint(p, "acct_1").as_deref());
+        // Different seat under the same slot → different identity.
+        assert_ne!(a1, SeatIdentity::of(p, &creds("r1-SECRET", Some("acct_2"))));
+        // No account id: the refresh material decides (re-login changes it).
+        let b1 = SeatIdentity::of(p, &creds("r1-SECRET", None));
+        let b2 = SeatIdentity::of(p, &creds("r2-SECRET", None));
+        assert_ne!(b1, b2);
+        assert_eq!(b1, SeatIdentity::of(p, &creds("r1-SECRET", None)));
+        assert_eq!(b1.seat_fingerprint(), None);
+        for id in [&a1, &b1] {
+            let shown = format!("{id:?}{}", id.as_str());
+            assert!(!shown.contains("SECRET") && !shown.contains("acct_1"), "{shown}");
+        }
     }
 }
