@@ -2086,7 +2086,17 @@ impl Runtime {
     /// address plus the plugin's declared recall tool digest — an unroutable
     /// provider fails open as `provider_unavailable` without ever spawning.
     async fn apply_turn_memory_recall(&self, messages: &mut Vec<crate::SharedMessage>) {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.clear_memory_contribution();
+            tracing::debug!("memory recall unavailable for the selected host backend");
+            return;
+        }
         let extension_runtime = self.extension_runtime.clone();
+        let binding = self.memory_backend.clone();
         let session = self.host_tool_session.clone();
         let outcome = memory_context::resolve_turn_recall(
             &self.memory_context_state,
@@ -2097,11 +2107,14 @@ impl Runtime {
             memory_context::RECALL_HARD_TIMEOUT,
             move |lease: memory_context::MemoryContextLease,
                   request: memory_context::RecallRequest| async move {
+                if binding.is_axel() {
+                    return axel_context::recall(binding, lease, request).await;
+                }
                 let Some(manager) = extension_runtime else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
                 let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                let (Some("extension"), Some(plugin), Some(_local)) =
+                let (Some("extension"), Some(plugin), Some(local)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
@@ -2111,15 +2124,25 @@ impl Runtime {
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
-                crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
-                    .call_exact(
-                        plugin,
-                        memory_context::MEMORY_RECALL_TOOL_NAME,
-                        &digest,
-                        memory_context::recall_request_wire(&request),
-                    )
-                    .await
-                    .map_err(|_| memory_context::RecallCallError::CallFailed)
+                let mut response =
+                    crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
+                        .call_exact(
+                            plugin,
+                            memory_context::MEMORY_RECALL_TOOL_NAME,
+                            &digest,
+                            memory_context::recall_request_wire(&request),
+                        )
+                        .await
+                        .map_err(|_| memory_context::RecallCallError::CallFailed)?;
+                // Legacy extension wire names the local declared provider;
+                // bind it to the exact host-qualified lease after validation.
+                if response["provider_id"] != local
+                    && response["provider_id"] != lease.provider_id.as_str()
+                {
+                    return Err(memory_context::RecallCallError::CallFailed);
+                }
+                response["provider_id"] = json!(lease.provider_id.as_str());
+                Ok(response)
             },
         )
         .await;
@@ -2760,6 +2783,23 @@ impl Runtime {
     ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
     {
         use crate::extensions::context_provider as ext_cp;
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Invalid exclusive configurations never fall back to extensions.
+            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+        }
+        if self.memory_backend.is_axel() {
+            self.memory_backend
+                .validate_axel_config()
+                .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?;
+            if requested.is_some_and(|id| id != axel_context::PROVIDER_ID) {
+                return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+            }
+            return memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID);
+        }
         let Some(extension_runtime) = &self.extension_runtime else {
             return Ok(memory_provider_id());
         };
