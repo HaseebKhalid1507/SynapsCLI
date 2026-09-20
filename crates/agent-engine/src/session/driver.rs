@@ -203,6 +203,7 @@ pub(crate) fn poll_request(
     active: &DriverState,
     outcome: Outcome,
     error_kind: String,
+    session_cost_so_far: f64,
 ) -> PollRequest {
     PollRequest {
         run_id: active.grant.run_id.clone(),
@@ -220,6 +221,8 @@ pub(crate) fn poll_request(
             .into()
         }),
         session_id: Some(active.grant.session_id.clone()),
+        // (E-P7, §S3) let the plugin see the running spend.
+        session_cost_so_far: Some(session_cost_so_far),
     }
 }
 
@@ -429,10 +432,13 @@ mod tests {
             &state,
             crate::extensions::session_driver::Outcome::Success,
             "none".into(),
+            1.25,
         );
         assert!(req.feedback.is_some());
         assert_eq!(req.run_id, "test-run");
         assert!(req.session_id.is_some());
+        // (E-P7, §S3) running spend is reported to the plugin.
+        assert_eq!(req.session_cost_so_far, Some(1.25));
     }
 
     // ── same_lifecycle ──────────────────────────────────────────────────

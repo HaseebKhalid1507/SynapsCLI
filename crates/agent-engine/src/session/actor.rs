@@ -842,9 +842,34 @@ impl SessionActor {
             && self.driver.is_none()
     }
 
+    /// (E-P7, §S3) Return the first breached spend ceiling, if any, as
+    /// `(scope, cost_observed, cap)`. Checks the host-owned per-session cap
+    /// (`config.max_session_cost`) and, when a driver is armed, the effective
+    /// per-run cap (`min(plugin grant, host)`) measured from `cost_at_arm`.
+    /// `None` means every configured ceiling still has headroom.
+    fn cost_cap_breach(&self) -> Option<(&'static str, f64, f64)> {
+        let total = self.conv.session_cost;
+        if let Some(cap) = self.config.max_session_cost {
+            if cap.is_finite() && total >= cap {
+                return Some(("session", total, cap));
+            }
+        }
+        if let Some(driver) = &self.driver {
+            // Host cap for the run is not yet a config field (S3 should-have
+            // #4, daemon-level); pass `None` so the plugin's proposal stands
+            // alone until the daemon cap lands.
+            if let Some(cap) = driver.grant.effective_cost_cap(None) {
+                let run_cost = total - driver.cost_at_arm;
+                if cap.is_finite() && run_cost >= cap {
+                    return Some(("run", run_cost, cap));
+                }
+            }
+        }
+        None
+    }
+
     /// `<sessions>/<id>.json` — written by both persistence modes.
-    fn journal_exists(&self) -> bool {
-        let id = (**self.journal_id.load()).clone();
+    fn journal_exists(&self) -> bool {        let id = (**self.journal_id.load()).clone();
         crate::config::resolve_write_path("sessions")
             .join(format!("{id}.json"))
             .is_file()
@@ -1134,6 +1159,13 @@ impl SessionActor {
 
         // ── 3. Idle conflict (only when driver is armed) ─────────────────
         if self.driver.is_some() {
+            // (E-P7, §S1) No clients → no headless spend. `detach()` revokes on
+            // the last-client transition; this is the belt-and-suspenders check
+            // for any path that leaves a grant armed with zero clients.
+            if self.attached.is_empty() {
+                self.driver_revoke("no clients attached");
+                return;
+            }
             // F10/F14: use the full driver_idle_conflict() instead of an
             // inline subset that was missing `completion_blocked`.
             if let Some(reason) = self.driver_idle_conflict() {
@@ -1494,11 +1526,12 @@ impl SessionActor {
             self.driver_revoke(reason);
             return;
         }
+        let session_cost = self.conv.session_cost;
         let Some(driver) = self.driver.as_mut() else {
             return;
         };
         if let Some((outcome, error_kind)) = driver.outcome.take() {
-            let request = super::driver::poll_request(driver, outcome, error_kind);
+            let request = super::driver::poll_request(driver, outcome, error_kind, session_cost);
             let handler = driver.handler.clone();
             let session_id = self.id.0.clone();
             let generation = self.driver_generation;
@@ -1870,6 +1903,13 @@ impl SessionActor {
             user_text,
         });
         // Blocks command processing during setup exactly like the TUI loop.
+        // (E-P7, §S9) An armed driver MUST NOT auto-approve tool activation —
+        // the session-driver contract keeps ordinary tool-approval gates in
+        // force. Override the session config to false whenever a grant is
+        // armed, regardless of what the client requested. (Driver-initiated
+        // turns already pass `false` from the tick's Prepared arm; this guards
+        // any foreground turn that starts while armed.)
+        let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
         let stream = self
             .runtime
             .run_stream_with_messages(
@@ -1877,7 +1917,7 @@ impl SessionActor {
                 ct.clone(),
                 Some(s_rx),
                 Some(self.secret_prompt_handle.clone()),
-                self.config.auto_approve_confirms,
+                auto_approve,
             )
             .await;
         self.stream = Some(stream);
@@ -2250,6 +2290,22 @@ impl SessionActor {
                     cache_creation_1h,
                     &model_for_pricing,
                 );
+                // (E-P7, §S3) Host-owned spend circuit breaker. Checked after
+                // every Usage event — a breach cancels the in-flight turn,
+                // revokes any armed driver (so it cannot re-poll and keep
+                // spending), and tells clients why.
+                if let Some((scope, cost, cap)) = self.cost_cap_breach() {
+                    self.emit(SessionEventWire::CostCapReached {
+                        scope: scope.to_string(),
+                        cost,
+                        cap,
+                    });
+                    if self.driver.is_some() || self.driver_pending.is_some() {
+                        self.driver_revoke(&format!("{scope} cost cap reached (${cost:.4} ≥ ${cap:.4})"));
+                    }
+                    self.cancel_turn().await;
+                    return;
+                }
             }
             StreamEvent::Session(SessionEvent::Notice(_)) => {}
             StreamEvent::Session(SessionEvent::Done) => {
@@ -2920,6 +2976,31 @@ impl SessionActor {
                 reason: OwnerChangeReason::OwnerDetached,
             });
             self.publish_presence();
+        }
+        // (E-P7, §S1) The last client just left. Two fail-closed gates:
+        //
+        //  1. Any pending host confirmation is answered `None` (deny). A prompt
+        //     with no client to answer it blocks the turn forever AND blocks
+        //     parking (`can_park` requires `pending_prompts` empty) — the
+        //     zombie cost stream. `tools/discovery.rs` treats `None` as
+        //     Unauthorized, so this denies rather than approves.
+        //  2. An armed driver is revoked: it must never run turns headless with
+        //     nobody watching and no way to answer a confirmation. Conservative
+        //     choice matching the "local TUI only" upstream intent — cancelling
+        //     the driver stream (via `DriverState` drop) and releasing the host
+        //     grant so the session can park normally.
+        if self.attached.is_empty() {
+            let had_prompts = !self.pending_prompts.is_empty();
+            while let Some((pr, tx)) = self.pending_prompts.pop_front() {
+                let _ = tx.send(None);
+                self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+            }
+            if had_prompts {
+                self.publish_presence();
+            }
+            if self.driver.is_some() || self.driver_pending.is_some() {
+                self.driver_revoke("no clients attached");
+            }
         }
     }
 

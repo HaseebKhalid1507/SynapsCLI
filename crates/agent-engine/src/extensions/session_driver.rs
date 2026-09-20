@@ -383,6 +383,18 @@ impl Grant {
         &self.models
     }
 
+    /// (E-P7, §S3 decision 3) The effective per-run cost ceiling: the *lower* of
+    /// the plugin-proposed `max_cost_usd` and a host-imposed cap. The plugin may
+    /// only lower, never raise, the host limit. `None` on either side means "no
+    /// limit from that side"; the result is `None` only when both are absent.
+    pub fn effective_cost_cap(&self, host_cap: Option<f64>) -> Option<f64> {
+        match (self.max_cost_usd, host_cap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
+    }
+
     fn check_delay(&self, delay: Duration) -> Result<(), String> {
         if self.deadline.is_some_and(|deadline| {
             Instant::now()
@@ -459,6 +471,10 @@ pub struct PollRequest {
     /// plugins ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// (E-P7, §S3) Total USD spent on this session so far, so the plugin can
+    /// make cost-aware next-turn decisions. Additive; old plugins ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_cost_so_far: Option<f64>,
 }
 
 fn blocked() -> (Outcome, String) {

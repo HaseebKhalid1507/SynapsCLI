@@ -326,6 +326,14 @@ async fn armed_session_does_not_park() {
         LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
             .await
             .unwrap();
+    // Second client: under E-P7 §S1 detaching the LAST client revokes the
+    // driver (no headless spend). To exercise the can_park/can_end_idle driver
+    // guards (F6) a client must stay attached so the zero-client revoke never
+    // fires and the driver stays armed across the park deadline.
+    let (mut keeper, _snap2) =
+        LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+            .await
+            .unwrap();
 
     // Arm the driver.
     t.send(SessionCommand::DriverStart {
@@ -347,7 +355,8 @@ async fn armed_session_does_not_park() {
 
     // Force the idle/park deadline to fire immediately: without the driver
     // guards on can_park AND can_end_idle (F6), a zero-turn armed session
-    // would be idle-ENDED here, killing the run mid-arm.
+    // would be idle-ENDED here, killing the run mid-arm. The keeper client
+    // stays attached, so E-P7 §S1's last-client revoke does not fire.
     std::env::set_var("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
     std::env::set_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS", "0");
     t.send(SessionCommand::Detach {
@@ -359,25 +368,23 @@ async fn armed_session_does_not_park() {
     std::env::remove_var("SYNAPS_DAEMON_PARK_GRACE_SECS");
     std::env::remove_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS");
 
-    // The session must be alive (not Ended, not Parked) — re-attach proves it.
+    // The session must be alive (not Ended, not Parked) — the keeper client
+    // and the armed driver both hold it warm.
     assert!(
         tokio::time::timeout(Duration::from_millis(200), handle.closed())
             .await
             .is_err(),
         "armed session was ended by the idle deadline (F6)"
     );
-    let (mut t2, _snap2) =
-        LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
-            .await
-            .unwrap();
-    // Revoke + end to clean up.
-    t2.send(SessionCommand::Cancel).await.unwrap();
-    t2.send(SessionCommand::End {
-        reason: agent_engine::session::EndReason::ClientQuit,
-    })
-    .await
-    .unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), t2.next_event()).await;
+    // Revoke + end to clean up via the still-attached keeper.
+    keeper.send(SessionCommand::Cancel).await.unwrap();
+    keeper
+        .send(SessionCommand::End {
+            reason: agent_engine::session::EndReason::ClientQuit,
+        })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), keeper.next_event()).await;
 }
 
 // ── P4 tick tests ────────────────────────────────────────────────────────────

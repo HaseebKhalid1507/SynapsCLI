@@ -164,6 +164,12 @@ pub struct SessionConfig {
     /// entry is written so `synaps send --session <name>` resolves at once.
     #[serde(default)]
     pub name: Option<String>,
+    /// (E-P7, §S3) Hard per-session spend ceiling in USD. `None` = unbounded.
+    /// Checked after every `Usage` stream event; a breach cancels the turn,
+    /// revokes any armed driver, and emits `CostCapReached`. This is the
+    /// host-owned circuit breaker for an actor-resident autonomous driver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_session_cost: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -205,6 +211,7 @@ impl Default for SessionConfig {
             await_extensions: true,
             keep_warm: false,
             name: None,
+            max_session_cost: None,
         }
     }
 }
@@ -833,6 +840,15 @@ pub enum SessionEventWire {
         outcome: crate::extensions::session_driver::Outcome,
         selection: crate::extensions::session_driver::Selection,
         feedback: Option<String>,
+    },
+    /// (E-P7, §S3) A spend ceiling was breached: the turn was cancelled and any
+    /// armed driver revoked. `scope` is "session" (config cap) or "run" (the
+    /// driver grant's per-run cap). Additive v3 driver event — old clients skip
+    /// it via `#[serde(other)]`.
+    CostCapReached {
+        scope: String,
+        cost: f64,
+        cap: f64,
     },
 }
 

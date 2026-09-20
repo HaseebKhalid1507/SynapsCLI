@@ -512,6 +512,12 @@ pub enum WireSessionEvent {
         #[serde(default)]
         feedback: Option<String>,
     },
+    /// (E-P7) Spend ceiling breached; turn cancelled and driver revoked.
+    CostCapReached {
+        scope: String,
+        cost: f64,
+        cap: f64,
+    },
     /// Forward-compat: an additive variant from a newer daemon.
     #[serde(other)]
     Unknown,
@@ -789,6 +795,9 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::DriverTurnOutcome { outcome, selection, feedback } => {
                 Self::DriverTurnOutcome { outcome, selection, feedback }
             }
+            S::CostCapReached { scope, cost, cap } => {
+                Self::CostCapReached { scope, cost, cap }
+            }
         }
     }
 }
@@ -850,6 +859,9 @@ impl From<WireSessionEvent> for SessionEventWire {
             }
             W::DriverTurnOutcome { outcome, selection, feedback } => {
                 Self::DriverTurnOutcome { outcome, selection, feedback }
+            }
+            W::CostCapReached { scope, cost, cap } => {
+                Self::CostCapReached { scope, cost, cap }
             }
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }

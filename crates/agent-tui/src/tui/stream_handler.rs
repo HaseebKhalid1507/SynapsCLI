@@ -570,6 +570,13 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::DriverArmed { .. }
         | SessionEventWire::DriverRevoked { .. }
         | SessionEventWire::DriverTurnOutcome { .. } => {}
+        // E-P7: spend ceiling breached — surface it loudly.
+        SessionEventWire::CostCapReached { scope, cost, cap } => {
+            app.push_msg(ChatMessage::Error(format!(
+                "{scope} cost cap reached (${cost:.4} ≥ ${cap:.4}) — turn cancelled, driver revoked"
+            )));
+            app.request_redraw();
+        }
     }
     ArmFlow::Continue
 }
