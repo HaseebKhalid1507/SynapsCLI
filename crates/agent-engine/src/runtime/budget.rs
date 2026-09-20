@@ -193,8 +193,15 @@ impl TurnBudgetMeter {
         &self.budget
     }
 
-    fn wall_clock_exceeded(&self) -> bool {
+    pub(crate) fn wall_clock_exceeded(&self) -> bool {
         self.started.elapsed() >= self.budget.max_elapsed
+    }
+
+    /// A successfully committed durable context successor starts a new time
+    /// segment. Never call on an attempted/failed save or a model checkpoint.
+    /// Cumulative resource/cost limits and round renewals remain unchanged.
+    pub(crate) fn start_context_segment(&mut self) {
+        self.started = Instant::now();
     }
 
     /// Charge one provider round. Checked BEFORE the provider call:

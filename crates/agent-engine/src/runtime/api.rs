@@ -907,6 +907,17 @@ pub(super) async fn begin_anthropic_tracer(
     tracer
 }
 
+pub(super) async fn await_or_cancel<F: std::future::Future>(
+    cancel: &CancellationToken,
+    future: F,
+) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(RuntimeError::Canceled),
+        output = future => Ok(output),
+    }
+}
+
 pub(super) struct ApiMethods;
 
 impl ApiMethods {

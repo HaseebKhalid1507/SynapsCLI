@@ -15,7 +15,6 @@ pub type SharedContinuation = Arc<Mutex<ContinuationState>>;
 pub const ARCHIVE_NAMESPACE: &str = "context-windows-v1";
 
 /// User-facing notice; task-phase guidance belongs only in model context.
-#[allow(dead_code)] // merge(112): consumed in phase 3
 pub(crate) fn pressure_notice(used_tokens: u64) -> String {
     format!("Context pressure: ~{used_tokens} tokens.")
 }
@@ -25,13 +24,11 @@ pub const GUIDANCE: &str = "The host manages context automatically. Work normall
 
 /// Bound every request-only advisory, including its message framing. The
 /// admission path reserves this even on rounds that need no advisory.
-#[allow(dead_code)] // merge(112): consumed in phase 3
 pub(crate) const ADVISORY_RESERVE_TOKENS: u64 = 512;
 
 /// Model guidance and UI notices are edge-triggered by the CURRENT assessment,
 /// never by the presence of a sticky string left by an earlier warning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // merge(112): consumed in phase 3
 pub(super) enum ContextAdvisory {
     Pressure,
     FinishBounded,
@@ -39,7 +36,6 @@ pub(super) enum ContextAdvisory {
     Unproductive,
 }
 
-#[allow(dead_code)] // merge(112): consumed in phase 3
 impl ContextAdvisory {
     pub(super) fn from_assessment(decision: &ContextAssessment) -> Option<Self> {
         if decision.reason == ContextReason::UnproductiveRollover {
@@ -63,7 +59,6 @@ impl ContextAdvisory {
         }
     }
 
-    #[allow(dead_code)] // merge(112): consumed in phase 3
     pub(super) fn notice(self, used_tokens: u64) -> String {
         match self {
             Self::Pressure | Self::FinishBounded => pressure_notice(used_tokens),
@@ -114,7 +109,6 @@ impl ContinuationState {
     }
     /// Return a notice only on a transition. Normal/disabled assessments clear
     /// stale pressure; phase reports and repeated admissions do not re-arm it.
-    #[allow(dead_code)] // merge(112): consumed in phase 3
     pub(super) fn update_advisory(
         &mut self,
         current: Option<ContextAdvisory>,
@@ -276,7 +270,6 @@ impl PreparedRollover {
 
 /// Persist-before-inference barrier. Cancellation is deliberately not raced
 /// against an atomic frontend save that may already have published its head.
-#[allow(dead_code)] // merge(112): consumed in phase 3
 pub(crate) async fn persist_head(
     prepared: &PreparedRollover,
     state: &SharedContinuation,
@@ -612,7 +605,6 @@ impl crate::Runtime {
 }
 
 /// Host continuation metadata never goes onto any provider wire.
-#[allow(dead_code)] // merge(112): consumed in phase 3
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
     if !messages.iter().any(|m| m.get("_synaps_context").is_some()) {
         return None;

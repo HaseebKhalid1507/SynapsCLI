@@ -3913,7 +3913,13 @@ impl Runtime {
             usage_counters: None,
         };
 
+        let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
         let session = crate::runtime::stream::StreamSession {
+            memory_backend: self.memory_backend.clone(),
+            memory_context: self.memory_tool_capability(),
+            final_capture_history: final_capture_history.clone(),
+            context_window: self.context_window(),
+            continuation: self.continuation.clone(),
             auth,
             client,
             credential_source,

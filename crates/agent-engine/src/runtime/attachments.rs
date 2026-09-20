@@ -80,7 +80,6 @@ pub fn validate_tool_blocks(model: &str, blocks: &[Value]) -> Result<(), String>
 /// Strip only rich results introduced by this batch, newest first, preserving
 /// every correlation ID/order and returning explicit tool errors. Previously
 /// committed history is never rewritten. Its validity is checked before tools.
-#[allow(dead_code)] // merge(112): consumed in phase 3
 pub(crate) fn bounded_tool_results(
     model: &str,
     history: &[crate::SharedMessage],
