@@ -28,12 +28,15 @@ impl Tool for SubagentStartTool {
 
     fn description(&self) -> &str {
         "Dispatch a reactive subagent and return immediately with a handle_id. \
-         The subagent runs in the background — poll with subagent_status until it \
-         reports a terminal status, use subagent_steer to inject guidance mid-run, \
-         then call subagent_collect once with reconciled=true to retrieve the result \
-         and attest reconciliation in the same call. Use this for parallel execution \
-         or when you want to continue working while the subagent runs. For simple sequential \
-         delegation, use subagent instead. Provide either an agent name (resolves \
+         The subagent runs in the background and is REACTIVE: when it finishes, a \
+         completion event is pushed into your queue and you are woken with its \
+         status — do NOT sleep, busy-wait, or poll in a loop waiting for it. After \
+         dispatching, end your turn or keep doing other work; on the completion \
+         event call subagent_collect once with reconciled=true. subagent_status is \
+         for an occasional progress peek, and subagent_steer injects guidance \
+         mid-run. Use this for parallel execution or when you want to continue \
+         working while the subagent runs. For simple sequential delegation that \
+         must block, use subagent instead. Provide either an agent name (resolves \
          from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
     }
 
