@@ -149,6 +149,107 @@ fn default_removal_requires_confirmation_and_selection_does_not_copy_tokens() {
     assert!(!config.contains("synthetic-access") && !config.contains("refresh-synthetic"));
 }
 
+#[test]
+fn empty_inventory_status_and_keeper_are_safe_without_login() {
+    let sandbox = Sandbox::new();
+    std::fs::write(sandbox.dir.path().join("auth.json"), "{}").unwrap();
+    let status = sandbox.run(&["status", "--all", "--json"]);
+    assert_ok(&status);
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["accounts"], json!([]));
+    let keeper = sandbox.run(&["quota-keeper", "--once", "--json"]);
+    assert!(!keeper.status.success());
+    assert!(String::from_utf8_lossy(&keeper.stderr).contains("no connected accounts"));
+    assert!(!sandbox.dir.path().join("quota-keeper/state.json").exists());
+}
+
+#[test]
+fn keeper_requires_explicit_model_and_canonical_local_ledger_before_any_network() {
+    let sandbox = Sandbox::new();
+    let before = sandbox.auth();
+    let invalid: &[&[&str]] = &[
+        &[
+            "quota-keeper",
+            "--once",
+            "--activate",
+            "openai-codex@second",
+        ],
+        &[
+            "quota-keeper",
+            "--once",
+            "--activate",
+            "openai-codex@second",
+            "--model",
+            "gpt-5.4-mini",
+            "--state-dir",
+            "/unused-test-ledger",
+        ],
+        &[
+            "quota-keeper",
+            "--once",
+            "--activate",
+            "openai-codex@second",
+            "--model",
+            "gpt-imaginary-model",
+        ],
+        &["quota-keeper", "--once", "--rearm", "openai-codex@second"],
+    ];
+    for args in invalid {
+        let output = sandbox.run(args);
+        assert!(!output.status.success(), "unexpected success for {args:?}");
+        assert_eq!(sandbox.auth(), before);
+        assert!(!sandbox.dir.path().join("quota-keeper/state.json").exists());
+    }
+    // The unreachable endpoint would fail differently if activation tried to
+    // list or vend remotely. It must reject the mode before touching network.
+    let remote = sandbox
+        .command()
+        .env("SYNAPS_AUTH_ENDPOINT", "http://127.0.0.1:1")
+        .env("SYNAPS_MACHINE_TOKEN", "synthetic-machine-auth")
+        .args([
+            "quota-keeper",
+            "--once",
+            "--activate",
+            "openai-codex@second",
+            "--model",
+            "gpt-5.4-mini",
+        ])
+        .output()
+        .unwrap();
+    assert!(!remote.status.success());
+    assert!(String::from_utf8_lossy(&remote.stderr)
+        .contains("activation is only permitted on the broker host"));
+    assert_eq!(sandbox.auth(), before);
+}
+
+#[test]
+fn account_policy_env_overrides_selection_without_moving_credentials() {
+    let sandbox = Sandbox::new();
+    let before = sandbox.auth();
+    assert_ok(&sandbox.run(&[
+        "auth",
+        "use",
+        "--provider",
+        "openai-codex",
+        "--account",
+        "auto",
+    ]));
+    let auto = sandbox.run(&["auth", "list", "--provider", "openai-codex", "--json"]);
+    assert_ok(&auto);
+    let report: Value = serde_json::from_slice(&auto.stdout).unwrap();
+    assert_eq!(report["selectors"]["openai-codex"]["kind"], "auto");
+    let selected = sandbox
+        .command()
+        .env("SYNAPS_ACCOUNT_OPENAI_CODEX", "second")
+        .args(["auth", "list", "--provider", "openai-codex", "--json"])
+        .output()
+        .unwrap();
+    assert_ok(&selected);
+    let report: Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(report["selectors"]["openai-codex"]["account"], "second");
+    assert_eq!(sandbox.auth(), before);
+}
+
 struct BrokerProcess(Child);
 impl Drop for BrokerProcess {
     fn drop(&mut self) {

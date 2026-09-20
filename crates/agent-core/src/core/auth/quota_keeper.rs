@@ -15,9 +15,16 @@
 //!
 //! * No I/O, no clock, no network in the state machine: every function takes
 //!   `now_ms`. Persistence and locking are separate helpers.
-//! * State is keyed by broker source + `provider@label` + provider identity
-//!   fingerprint, so a re-login of the same alias with a different seat never
-//!   inherits an activation ticket.
+//! * State is keyed by broker source + provider seat identity. For an
+//!   opted-in account the identity is a **strong** seat fingerprint (digest
+//!   of the full provider account id carried by the credential itself), so
+//!   the key is canonical across aliases: two labels for one seat share one
+//!   attempt ledger and a sequential alias switch cannot spend twice. A
+//!   read-only account may carry only a weak metadata preview (label-scoped
+//!   key). A metadata prefix is **not** an identity: activation is refused
+//!   without a strong fingerprint, and the runner re-verifies the seat from
+//!   the freshly vended token immediately before the request. Re-login of
+//!   the same alias with a different seat never inherits a ticket.
 //! * An attempt is recorded and must be **persisted before** the request is
 //!   sent ([`begin_attempt`]); ambiguous outcomes (timeout, crash between
 //!   begin and finish, 5xx) consume the per-generation budget of exactly
@@ -43,6 +50,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::account::CredentialRef;
+use super::OAuthProviderId;
 use super::quota_policy::{
     self, weekly_window, AccountCapacity, ModelAvailability, QuotaObservation, SelectionRequest,
     Strategy, WindowLimit, WindowVerdict, DEFAULT_EXHAUSTED_AT_PERCENT,
@@ -162,6 +170,9 @@ impl KeeperConfig {
 
 // ── Identity ─────────────────────────────────────────────────────────────────
 
+/// Prefix of a *strong* seat fingerprint (see [`AccountIdentity::seat_fingerprint`]).
+pub const SEAT_FP_PREFIX: &str = "seat:";
+
 /// Namespace of one kept account. Every field is non-secret display text.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AccountIdentity {
@@ -169,20 +180,66 @@ pub struct AccountIdentity {
     pub source: String,
     /// Storage key: `provider` or `provider@label`.
     pub credential: String,
-    /// Provider-side identity fingerprint (see [`AccountIdentity::fingerprint`]).
+    /// Provider-side identity fingerprint: a strong `seat:<digest>` (see
+    /// [`AccountIdentity::seat_fingerprint`]) or a weak preview from
+    /// [`AccountIdentity::fingerprint`]. Only a strong fingerprint is an
+    /// identity; a weak one is a discriminator for read-only tracking.
     pub identity_fp: String,
 }
 
 impl AccountIdentity {
     /// Map key. Changing any component yields a fresh state entry.
+    ///
+    /// With a **strong** seat fingerprint the key is canonical across
+    /// aliases (`source|provider|seat:…`, the label is not part of it), so
+    /// two labels pointing at one provider seat share ONE attempt ledger and
+    /// a sequential alias switch can never spend a second activation on the
+    /// same generation. With a weak fingerprint the key stays label-scoped.
     pub fn key(&self) -> String {
-        format!("{}|{}|{}", self.source, self.credential, self.identity_fp)
+        format!("{}|{}|{}", self.source, self.ledger_scope(), self.identity_fp)
     }
 
-    /// Fingerprint from non-secret provider metadata. Prefers the provider
-    /// account-id prefix, then a hash of the identity string, then the
-    /// login time. Providers exposing none of these yield `unknown`, which
-    /// is reported so the operator knows re-login inheritance is possible.
+    /// The credential component of the key: the provider alone for a strong
+    /// seat identity, the full `provider@label` otherwise.
+    pub fn ledger_scope(&self) -> String {
+        if self.is_strong() {
+            self.credential
+                .split_once('@')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| self.credential.clone())
+        } else {
+            self.credential.clone()
+        }
+    }
+
+    /// Whether this identity is a full provider seat identity (established
+    /// from the credential itself), as opposed to a metadata preview.
+    pub fn is_strong(&self) -> bool {
+        self.identity_fp.starts_with(SEAT_FP_PREFIX)
+    }
+
+    /// Strong seat fingerprint from the FULL provider account id carried by
+    /// the credential (e.g. the Codex `chatgpt_account_id` claim of the token
+    /// the broker vends for exactly this slot). Same recipe as the broker's
+    /// listed [`AccountSummary::seat_fingerprint`](super::AccountSummary)
+    /// ([`super::seat_fingerprint`]), so a listing value and a token-derived
+    /// value compare equal. Digest only — the state file never stores the
+    /// id itself. `None` for an empty id.
+    pub fn seat_fingerprint(provider: OAuthProviderId, account_id: &str) -> Option<String> {
+        super::account::seat_fingerprint(provider, account_id).map(Self::strong_from_listed)
+    }
+
+    /// Wrap a broker-listed seat fingerprint as a strong identity value.
+    pub fn strong_from_listed(listed: impl AsRef<str>) -> String {
+        format!("{SEAT_FP_PREFIX}{}", listed.as_ref().trim())
+    }
+
+    /// WEAK fingerprint from non-secret provider metadata. Prefers the
+    /// provider account-id prefix, then a hash of the identity string, then
+    /// the login time. Providers exposing none of these yield `unknown`,
+    /// which is reported so the operator knows re-login inheritance is
+    /// possible. A prefix is not an identity: activation requires
+    /// [`seat_fingerprint`](Self::seat_fingerprint).
     pub fn fingerprint(
         account_id_prefix: Option<&str>,
         identity: Option<&str>,
@@ -336,6 +393,12 @@ pub enum NotSentStage {
     TokenVend,
     /// The token carries no provider account id to pair with the bearer.
     AccountId,
+    /// The token vended immediately before the request belongs to a
+    /// DIFFERENT provider seat than the one the keeper tracks (re-login
+    /// under the same label). The stale usage evidence must never authorize
+    /// inference on the new seat; the runner disables activation for the
+    /// account until it is restarted and the identity re-established.
+    IdentityMismatch,
     /// The request body could not be built.
     RequestBuild,
     /// TCP/TLS connect failed; no bytes were sent.
@@ -565,11 +628,18 @@ impl Default for KeeperState {
 }
 
 impl KeeperState {
-    /// Fetch or create the entry for `identity`.
+    /// Fetch or create the entry for `identity`. An existing entry (same
+    /// key) adopts the caller's identity so that, for a seat-canonical key,
+    /// the recorded `credential` names the alias currently in use.
     pub fn entry(&mut self, identity: &AccountIdentity) -> &mut AccountState {
-        self.accounts
+        let st = self
+            .accounts
             .entry(identity.key())
-            .or_insert_with(|| AccountState::new(identity.clone()))
+            .or_insert_with(|| AccountState::new(identity.clone()));
+        if st.identity != *identity {
+            st.identity = identity.clone();
+        }
+        st
     }
 
     /// Prune entries that are NOT in `keep`, carry no attempt history, are
@@ -713,6 +783,8 @@ pub enum KeeperError {
     UnknownAccount(String),
     /// `begin_attempt` called while the account is not awaiting activation.
     NotDue { key: String, phase: String },
+    /// `begin_attempt` called for an account without a strong seat identity.
+    IdentityRequired { key: String },
     /// Persisted state could not be read/parsed. Fail closed — never activate.
     CorruptState { path: PathBuf, detail: String },
     /// Persisted state has a newer schema than this binary understands.
@@ -729,6 +801,10 @@ impl std::fmt::Display for KeeperError {
             Self::NotDue { key, phase } => {
                 write!(f, "account '{key}' is not awaiting activation (phase {phase})")
             }
+            Self::IdentityRequired { key } => write!(
+                f,
+                "account '{key}' has no established seat identity; activation refused"
+            ),
             Self::CorruptState { path, detail } => write!(
                 f,
                 "keeper state at {} is unreadable ({detail}); refusing to run — move it aside to reset",
@@ -1251,7 +1327,8 @@ pub fn capacity_view(st: &AccountState) -> Option<AccountCapacity> {
 
 /// Whether the runner may start an activation attempt now.
 ///
-/// Read-only unless `opted_in`. Requires: an awaiting phase with budget, the
+/// Read-only unless `opted_in`. Requires: a **strong** seat identity (a
+/// metadata prefix is not an identity), an awaiting phase with budget, the
 /// **latest** poll successful and fresh, no overall limit assertion, and
 /// headroom on every window applicable to `model` (5h, weekly and
 /// model-scoped alike) with the model not listed exhausted/unknown — the
@@ -1272,6 +1349,9 @@ pub fn activation_decision(
     };
     if !opted_in {
         return skip("not opted in (read-only)");
+    }
+    if !st.identity.is_strong() {
+        return skip("seat identity not established (a metadata prefix is not an identity)");
     }
     let generation = match &st.phase {
         Phase::AwaitingActivation { generation, .. } => *generation,
@@ -1331,6 +1411,11 @@ pub fn begin_attempt(
         .accounts
         .get_mut(key)
         .ok_or_else(|| KeeperError::UnknownAccount(key.to_string()))?;
+    if !st.identity.is_strong() {
+        return Err(KeeperError::IdentityRequired {
+            key: key.to_string(),
+        });
+    }
     let generation = match &st.phase {
         Phase::AwaitingActivation { generation, .. } => *generation,
         other => {
@@ -1722,7 +1807,22 @@ mod tests {
     const WEEK: u64 = 7 * DAY;
     const MODEL: &str = "gpt-5.4-mini";
 
+    /// Strong seat identity (what the runner establishes for an opted-in
+    /// account from the vended token). One seat per label in these tests.
     fn ident(label: &str) -> AccountIdentity {
+        AccountIdentity {
+            source: "local:/tmp/auth.json".into(),
+            credential: format!("openai-codex@{label}"),
+            identity_fp: AccountIdentity::seat_fingerprint(
+                OAuthProviderId::OpenAiCodex,
+                &format!("2b2f1234-seat-{label}"),
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Weak metadata-only identity (read-only accounts).
+    fn weak_ident(label: &str) -> AccountIdentity {
         AccountIdentity {
             source: "local:/tmp/auth.json".into(),
             credential: format!("openai-codex@{label}"),
@@ -1858,8 +1958,8 @@ mod tests {
         assert!(a.starts_with("who:") && b.starts_with("who:") && a != b);
         assert_eq!(AccountIdentity::fingerprint(None, None, Some(7)), "added:7");
         assert_eq!(AccountIdentity::fingerprint(None, None, None), "unknown");
-        let mut i1 = ident("x");
-        let mut i2 = ident("x");
+        let mut i1 = weak_ident("x");
+        let mut i2 = weak_ident("x");
         i1.identity_fp = "id:aaaa".into();
         i2.identity_fp = "id:bbbb".into();
         assert_ne!(i1.key(), i2.key());
@@ -1867,13 +1967,126 @@ mod tests {
         // does not carry over.
         let (mut s, k, _g, _t) = make_due("x");
         let relogged = AccountIdentity {
-            identity_fp: "id:other".into(),
+            identity_fp: AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, "another-seat").unwrap(),
             ..ident("x")
         };
         s.entry(&relogged);
         assert!(matches!(s.accounts[&relogged.key()].phase, Phase::Unknown { .. }));
         assert!(matches!(s.accounts[&k].phase, Phase::AwaitingActivation { .. }));
         assert_eq!(s.accounts.len(), 2);
+    }
+
+    #[test]
+    fn strong_seat_identity_is_canonical_across_aliases_and_weak_is_label_scoped() {
+        // Strong: digest of provider + FULL account id; label not in the key.
+        let codex = OAuthProviderId::OpenAiCodex;
+        let fp = AccountIdentity::seat_fingerprint(codex, "2b2f1234-full-id").unwrap();
+        assert!(fp.starts_with(SEAT_FP_PREFIX));
+        assert!(!fp.contains("2b2f1234"), "state never carries the id itself");
+        assert_ne!(fp, AccountIdentity::seat_fingerprint(codex, "2b2f1234-other").unwrap());
+        assert_ne!(fp, AccountIdentity::seat_fingerprint(OAuthProviderId::Anthropic, "2b2f1234-full-id").unwrap());
+        assert_eq!(fp, AccountIdentity::seat_fingerprint(codex, "  2b2f1234-full-id ").unwrap());
+        assert_eq!(AccountIdentity::seat_fingerprint(codex, "  "), None);
+        // Byte-for-byte the broker's listed recipe, so listing ⇔ token compare.
+        let listed = super::super::account::seat_fingerprint(codex, "2b2f1234-full-id").unwrap();
+        assert_eq!(fp, AccountIdentity::strong_from_listed(&listed));
+        assert_eq!(fp, format!("seat:{listed}"));
+        let a = AccountIdentity {
+            source: "local:/tmp/auth.json".into(),
+            credential: "openai-codex@a".into(),
+            identity_fp: fp.clone(),
+        };
+        let b = AccountIdentity {
+            credential: "openai-codex@b".into(),
+            ..a.clone()
+        };
+        let default = AccountIdentity {
+            credential: "openai-codex".into(),
+            ..a.clone()
+        };
+        assert!(a.is_strong());
+        assert_eq!(a.key(), b.key(), "aliases of one seat share one ledger");
+        assert_eq!(a.key(), default.key());
+        assert_eq!(a.ledger_scope(), "openai-codex");
+        assert_eq!(a.key(), format!("local:/tmp/auth.json|openai-codex|{fp}"));
+        // Weak: label-scoped, never strong.
+        let wa = weak_ident("a");
+        let wb = weak_ident("b");
+        assert!(!wa.is_strong());
+        assert_ne!(wa.key(), wb.key());
+        assert_eq!(wa.ledger_scope(), "openai-codex@a");
+        // Sequential alias switch keeps the spent generation: run 1 spends
+        // under alias `a`, run 2 comes back under alias `b` (same seat).
+        let c = cfg();
+        let mut s = KeeperState::default();
+        s.entry(&a);
+        let g1 = NOW + HOUR;
+        observe(&mut s, &c, NOW, &a.key(), &ok_obs(NOW, 100.0, Some(g1))).unwrap();
+        let t = g1 + MIN;
+        observe(&mut s, &c, t, &a.key(), &ok_obs(t, 0.0, Some(g1))).unwrap();
+        let (ticket, _) = begin_attempt(&mut s, t, &a.key()).unwrap();
+        finish_attempt(&mut s, &c, t, &ticket, AttemptOutcome::Ambiguous { reason: "timeout".into() }).unwrap();
+        let st = s.entry(&b);
+        assert_eq!(st.identity.credential, "openai-codex@b", "entry adopts the alias in use");
+        assert_eq!(st.attempts_in_generation, 1);
+        assert_eq!(s.accounts.len(), 1);
+        assert!(matches!(decide(&s, t + SEC, &b.key(), true), ActivationDecision::Skip { .. }));
+        assert!(begin_attempt(&mut s, t + SEC, &b.key()).is_err());
+    }
+
+    #[test]
+    fn activation_requires_a_strong_seat_identity() {
+        // Same journey as make_due, but the account only has a metadata prefix.
+        let c = cfg();
+        let mut s = KeeperState::default();
+        let w = weak_ident("w");
+        s.entry(&w);
+        let k = w.key();
+        let g1 = NOW + HOUR;
+        observe(&mut s, &c, NOW, &k, &ok_obs(NOW, 100.0, Some(g1))).unwrap();
+        let t = g1 + MIN;
+        observe(&mut s, &c, t, &k, &ok_obs(t, 0.0, Some(g1))).unwrap();
+        assert!(matches!(s.accounts[&k].phase, Phase::AwaitingActivation { .. }), "due, alerts");
+        match decide(&s, t, &k, true) {
+            ActivationDecision::Skip { reason } => assert!(reason.contains("identity"), "{reason}"),
+            other => panic!("weak identity must never activate: {other:?}"),
+        }
+        assert!(matches!(
+            begin_attempt(&mut s, t, &k),
+            Err(KeeperError::IdentityRequired { .. })
+        ));
+        assert_eq!(s.accounts[&k].attempts_in_generation, 0);
+        // The strong twin is allowed.
+        let (s2, k2, _g, t2) = make_due("s");
+        assert!(matches!(decide(&s2, t2, &k2, true), ActivationDecision::Activate { .. }));
+    }
+
+    #[test]
+    fn identity_mismatch_before_send_is_refunded_and_recorded() {
+        let c = cfg();
+        let (mut s, k, g1, t) = make_due("m");
+        let (ticket, _) = begin_attempt(&mut s, t, &k).unwrap();
+        let ev = finish_attempt(
+            &mut s,
+            &c,
+            t + SEC,
+            &ticket,
+            AttemptOutcome::NotSent {
+                stage: NotSentStage::IdentityMismatch,
+                reason: "token belongs to another seat".into(),
+            },
+        )
+        .unwrap();
+        let st = &s.accounts[&k];
+        assert_eq!(st.attempts_in_generation, 0, "nothing was sent → refunded");
+        assert_eq!(st.not_sent_in_generation, 1);
+        assert!(matches!(st.phase, Phase::AwaitingActivation { generation, .. } if generation == g1));
+        assert!(st.last_error.as_deref().unwrap().contains("IdentityMismatch"));
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            KeeperEvent::AttemptFinished { refunded: true, outcome: AttemptOutcome::NotSent { stage: NotSentStage::IdentityMismatch, .. }, .. }
+        )));
+        assert!(st.history.last().unwrap().outcome.is_some());
     }
 
     #[test]
@@ -2482,7 +2695,7 @@ mod tests {
         let mut s = KeeperState::default();
         let a = ident("a");
         let mut b = ident("a");
-        b.identity_fp = "id:other".into();
+        b.identity_fp = AccountIdentity::seat_fingerprint(OAuthProviderId::OpenAiCodex, "other-seat").unwrap();
         s.entry(&a);
         s.entry(&b);
         s.accounts.get_mut(&a.key()).unwrap().next_action_at_ms = NOW + 10;

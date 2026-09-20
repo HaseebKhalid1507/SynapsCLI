@@ -39,8 +39,9 @@ mod xai;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use account::{
-    account_config_key, account_env_var, Account, AccountLabel, AccountPolicy, AccountSelector,
-    AccountSummary, CredentialRef, AUTO_ACCOUNT_NAME, DEFAULT_ACCOUNT_NAME,
+    account_config_key, account_env_var, seat_fingerprint, Account, AccountLabel, AccountPolicy,
+    AccountSelector, AccountSummary, CredentialRef, SeatIdentity, AUTO_ACCOUNT_NAME,
+    DEFAULT_ACCOUNT_NAME,
 };
 pub use broker::{
     broker_from_source, global_broker, global_broker_install_count, preflight_cloud_capability,

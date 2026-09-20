@@ -28,14 +28,17 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
-use super::account::{Account, AccountPolicy, AccountSelector, AccountSummary, CredentialRef};
+use super::account::{
+    seat_fingerprint, Account, AccountPolicy, AccountSelector, AccountSummary, CredentialRef,
+    SeatIdentity,
+};
 use super::cloud::{CloudProviderId, InvokeRequest};
 use super::provider::OAuthProviderId;
 use super::static_providers::{
     allowed_proxy_paths, static_provider, StaticProviderSpec, LOCAL_DEFAULT_BASE_URL,
     LOCAL_PROVIDER_KEY, STATIC_PROVIDERS,
 };
-use super::{load_provider_auth, storage};
+use super::storage;
 
 // ── Buffering / time limits ──────────────────────────────────────────────────
 //
@@ -266,6 +269,21 @@ pub struct AccessToken {
 pub struct PinnedToken {
     pub credential: CredentialRef,
     pub token: AccessToken,
+}
+
+impl PinnedToken {
+    /// Seat fingerprint derived from THIS token's own identity claim (Codex:
+    /// the JWT `chatgpt_account_id`), comparable with
+    /// [`AccountSummary::seat_fingerprint`]. `None` when the token carries no
+    /// account identity — callers that must spend on exactly one listed seat
+    /// treat `None` or a mismatch as "do not send".
+    pub fn seat_fingerprint(&self) -> Option<String> {
+        match self.credential.provider {
+            OAuthProviderId::OpenAiCodex => super::extract_codex_account_id(&self.token.token)
+                .and_then(|id| seat_fingerprint(self.credential.provider, &id)),
+            _ => None,
+        }
+    }
 }
 
 /// HTTP method subset the proxy protocol supports.
@@ -1605,18 +1623,21 @@ pub struct LocalBroker {
     usage_endpoint_override: Option<String>,
     /// Max age of a usage observation that still counts as capacity.
     max_snapshot_age: Duration,
-    /// Short-lived cache of the last usage snapshot per storage key so
+    /// Short-lived cache of the last usage snapshot per *seat key* (credential
+    /// file + storage key + [`SeatIdentity`] of the stored credential) so
     /// automatic selection does not re-poll every provider on every token
-    /// vend. Entries older than `max_snapshot_age` are never reused.
+    /// vend. A re-login, removal or profile switch changes the key, so a
+    /// reading can never be attributed to a different seat than the one it
+    /// was taken from. Entries older than `max_snapshot_age` are never reused.
     snapshots: SharedMap<super::usage::UsageSnapshot>,
-    /// Single-flight gates for usage fetches, per storage key.
+    /// Single-flight gates for usage fetches, per seat key.
     snapshot_gates: SharedMap<Arc<tokio::sync::Mutex<()>>>,
     /// Cached account policy keyed by the config file's modification time
     /// (env overlay is applied on every read; it is cheap and has no I/O).
     policy_cache: Arc<std::sync::Mutex<Option<CachedPolicy>>>,
 }
 
-/// Process-shared map keyed by storage key.
+/// Process-shared map keyed by storage key or seat key.
 type SharedMap<T> = Arc<std::sync::Mutex<BTreeMap<String, T>>>;
 /// Config-derived policy tagged with the config file mtime it was read at.
 type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
@@ -1689,9 +1710,7 @@ impl LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<PinnedToken, BrokerError> {
-        let credential = self.select_auto(provider, model).await?;
-        let token = self.access_token_for(&credential).await?;
-        Ok(PinnedToken { credential, token })
+        self.vend_auto(provider, model).await
     }
 
     /// Test seam: point typed usage fetches at a fake server.
@@ -1764,23 +1783,92 @@ impl LocalBroker {
         Ok(())
     }
 
-    /// Resolve the credential for a request: explicit account (validated,
-    /// never a fallback) or the policy (`auto` → capacity selection).
-    async fn resolve_request_credential(
+    /// Resolve and vend for a request: explicit account (validated, never a
+    /// fallback) or the policy; `auto` goes through capacity selection with
+    /// the token paired to the proven seat.
+    async fn resolve_and_vend(
         &self,
         provider: OAuthProviderId,
         explicit: Option<Account>,
         model: Option<&str>,
-    ) -> Result<CredentialRef, BrokerError> {
-        if let Some(account) = explicit {
-            return Ok(CredentialRef::new(provider, account));
-        }
-        match self.policy().selector(provider) {
-            AccountSelector::Account(account) => Ok(CredentialRef::new(provider, account)),
-            AccountSelector::Auto => self.select_auto(provider, model).await,
+    ) -> Result<PinnedToken, BrokerError> {
+        let selector = match explicit {
+            Some(account) => AccountSelector::Account(account),
+            None => self.policy().selector(provider),
+        };
+        match selector {
+            AccountSelector::Account(account) => {
+                let credential = CredentialRef::new(provider, account);
+                let token = self.access_token_for(&credential).await?;
+                Ok(PinnedToken { credential, token })
+            }
+            AccountSelector::Auto => self.vend_auto(provider, model).await,
             AccountSelector::Invalid { source, reason } => {
                 Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
             }
+        }
+    }
+
+    /// Bound on select → seat-pinned vend rounds when the chosen slot is
+    /// replaced underneath us (re-login storm / rotation by another process).
+    const MAX_AUTO_VEND_ROUNDS: usize = 2;
+
+    /// `auto`: select on fresh usage, then vend a token for exactly the seat
+    /// that usage was read from. If the slot changed in between (re-login,
+    /// removal, rotation by another party) the reading is discarded and the
+    /// selection re-runs once on the new content; never a token for a seat
+    /// whose capacity was not proven.
+    async fn vend_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        use super::token::{ensure_fresh_credential_for_seat, SeatVendError};
+        for _ in 0..Self::MAX_AUTO_VEND_ROUNDS {
+            let (credential, seat) = self.select_auto(provider, model).await?;
+            match ensure_fresh_credential_for_seat(&self.http, &credential, &seat).await {
+                Ok(creds) => {
+                    return Ok(PinnedToken {
+                        credential,
+                        token: AccessToken {
+                            token: creds.access,
+                            expires: creds.expires,
+                        },
+                    })
+                }
+                Err(SeatVendError::SeatChanged) => {
+                    tracing::info!(credential = %credential, "slot changed after selection; re-selecting");
+                    self.forget_snapshots(&credential);
+                    continue;
+                }
+                Err(SeatVendError::Other(e)) => return Err(BrokerError::Credential(e)),
+            }
+        }
+        Err(BrokerError::NoAccountAvailable {
+            provider: provider.as_str().to_string(),
+            reason: "selected credential kept changing while its capacity was being proven".into(),
+        })
+    }
+
+    /// Cache key for one stored seat: credential file + slot + identity of
+    /// the material stored there. Never contains token material.
+    fn seat_key(cred: &CredentialRef, seat: &SeatIdentity) -> String {
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            cred.storage_key(),
+            seat.as_str()
+        )
+    }
+
+    /// Identity of the credential currently stored in `cred`'s slot.
+    fn stored_seat(&self, cred: &CredentialRef) -> Result<SeatIdentity, BrokerError> {
+        match storage::load_credential(cred).map_err(BrokerError::Credential)? {
+            Some(creds) => Ok(SeatIdentity::of(cred.provider, &creds)),
+            None => Err(BrokerError::UnknownAccount {
+                provider: cred.provider.as_str().to_string(),
+                label: cred.account.label_str().to_string(),
+            }),
         }
     }
 
@@ -1804,53 +1892,120 @@ impl LocalBroker {
             .clone()
     }
 
-    /// Fresh usage snapshot for `cred`: the short-lived cache is consulted
-    /// first (never past `max_snapshot_age`), otherwise ONE read-only fetch
-    /// per credential at a time (single-flight; concurrent vends share it).
+    /// Drop every cached reading and gate for `cred`'s slot (any seat).
+    fn forget_snapshots(&self, cred: &CredentialRef) {
+        let prefix = format!("|{}|", cred.storage_key());
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.contains(&prefix));
+        self.snapshot_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.contains(&prefix));
+    }
+
+    /// Fresh usage snapshot for `cred` plus the seat it was read from: the
+    /// short-lived cache is consulted first (never past `max_snapshot_age`,
+    /// and only for the seat currently stored in the slot), otherwise ONE
+    /// read-only fetch per seat at a time (single-flight; concurrent vends
+    /// share it). The token for the read and the reported seat come from the
+    /// same load, so the pair is exact even if the slot changes concurrently.
     async fn fresh_usage(
         &self,
         cred: &CredentialRef,
-    ) -> Result<super::usage::UsageSnapshot, BrokerError> {
-        let key = cred.storage_key();
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), BrokerError> {
+        let seat = self.stored_seat(cred)?;
+        let key = Self::seat_key(cred, &seat);
         if let Some(cached) = self.cached_snapshot(&key) {
-            return Ok(cached);
+            return Ok((cached, seat));
         }
         let gate = self.snapshot_gate(&key);
         let _held = gate.lock().await;
         if let Some(cached) = self.cached_snapshot(&key) {
-            return Ok(cached);
+            return Ok((cached, seat));
         }
-        let snapshot = self.usage(cred).await?;
+        let (snapshot, used) = self.usage_with_seat(cred).await?;
+        // One slot holds one seat: a reading for its current content
+        // supersedes anything cached for a previous occupant.
+        self.forget_snapshots(cred);
+        let used_key = Self::seat_key(cred, &used);
         self.snapshots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, snapshot.clone());
-        Ok(snapshot)
+            .insert(used_key, snapshot.clone());
+        Ok((snapshot, used))
     }
 
-    /// Capacity view for one account from a fresh, read-only usage snapshot.
-    /// Anything that is not a well-formed, fresh reading is NOT capacity.
-    async fn capacity_for(&self, cred: &CredentialRef) -> super::quota_policy::AccountCapacity {
+    /// Read-only usage for `cred`, reporting the seat whose token made the
+    /// request. Token resolution happens HERE, behind the boundary, for
+    /// exactly this credential; the usage helper pairs any account header
+    /// with the same token.
+    async fn usage_with_seat(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), BrokerError> {
+        use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
+        if !supports_usage(cred.provider) {
+            return Err(UsageError::UnsupportedProvider {
+                provider: cred.provider.as_str().to_string(),
+            }
+            .into_broker_error());
+        }
+        self.check_slot_exists(cred)?;
+        let creds = super::ensure_fresh_credential(&self.http, cred)
+            .await
+            .map_err(BrokerError::Credential)?;
+        let seat = SeatIdentity::of(cred.provider, &creds);
+        let client = UsageClient::new().map_err(UsageError::into_broker_error)?;
+        let opts = UsageFetchOptions {
+            endpoint_override: self.usage_endpoint_override.clone(),
+            ..UsageFetchOptions::default()
+        };
+        let snapshot = fetch_usage(
+            &client,
+            cred.provider,
+            cred.account.label_str(),
+            &creds.access,
+            &opts,
+        )
+        .await
+        .map_err(UsageError::into_broker_error)?;
+        Ok((snapshot, seat))
+    }
+
+    /// Capacity view for one account from a fresh, read-only usage snapshot,
+    /// with the seat it was read from. Anything that is not a well-formed,
+    /// fresh reading is NOT capacity.
+    async fn capacity_for(
+        &self,
+        cred: &CredentialRef,
+    ) -> (super::quota_policy::AccountCapacity, Option<SeatIdentity>) {
         use super::quota_policy::AccountCapacity;
         match self.fresh_usage(cred).await {
-            Ok(snapshot) => capacity_from_snapshot(cred, &snapshot),
-            Err(err) => AccountCapacity {
-                credential: cred.clone(),
-                observed_at_ms: None,
-                observation: observation_from_error(&err),
-                cooldown_until_ms: None,
-            },
+            Ok((snapshot, seat)) => (capacity_from_snapshot(cred, &snapshot), Some(seat)),
+            Err(err) => (
+                AccountCapacity {
+                    credential: cred.clone(),
+                    observed_at_ms: None,
+                    observation: observation_from_error(&err),
+                    cooldown_until_ms: None,
+                },
+                None,
+            ),
         }
     }
 
     /// Automatic selection: fresh, read-only usage for every stored account
     /// of `provider`, fed to the pure capacity policy. Fails closed — no
-    /// account is advertised without proven capacity for `model`.
+    /// account is advertised without proven capacity for `model`. Returns
+    /// the seat the winning reading was taken from so the vend can be pinned
+    /// to it.
     async fn select_auto(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
-    ) -> Result<CredentialRef, BrokerError> {
+    ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{select, Selection, SelectionRequest, Strategy};
         let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
         if summaries.is_empty() {
@@ -1860,11 +2015,16 @@ impl LocalBroker {
             });
         }
         let mut candidates = Vec::with_capacity(summaries.len());
+        let mut seats: BTreeMap<String, SeatIdentity> = BTreeMap::new();
         for summary in &summaries {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
-            candidates.push(self.capacity_for(&cred).await);
+            let (capacity, seat) = self.capacity_for(&cred).await;
+            if let Some(seat) = seat {
+                seats.insert(cred.storage_key(), seat);
+            }
+            candidates.push(capacity);
         }
         // Evaluation clock is taken AFTER the (sequential) fetches so the
         // freshest observation is never judged "in the future".
@@ -1881,7 +2041,17 @@ impl LocalBroker {
             ..SelectionRequest::new(provider, now_ms, self.max_snapshot_age.as_millis() as u64)
         };
         match select(&request, &candidates) {
-            Selection::Selected { credential, .. } => Ok(credential),
+            Selection::Selected { credential, .. } => {
+                // The policy only selects proven capacity, and proven
+                // capacity always came with its seat.
+                let seat = seats.remove(&credential.storage_key()).ok_or_else(|| {
+                    BrokerError::NoAccountAvailable {
+                        provider: provider.as_str().to_string(),
+                        reason: "selected account has no paired seat identity".into(),
+                    }
+                })?;
+                Ok((credential, seat))
+            }
             Selection::NoCapacity {
                 rejections,
                 earliest_reset_ms,
@@ -2008,14 +2178,7 @@ impl LocalBroker {
         let mut pinned: Option<PinnedToken> = None;
         if let Some(provider) = oauth_provider {
             if provider_key != LOCAL_PROVIDER_KEY && static_provider(provider_key).is_none() {
-                let cred = self
-                    .resolve_request_credential(provider, explicit_account, None)
-                    .await?;
-                let token = self.access_token_for(&cred).await?;
-                pinned = Some(PinnedToken {
-                    credential: cred,
-                    token,
-                });
+                pinned = Some(self.resolve_and_vend(provider, explicit_account, None).await?);
             }
         }
         let bearer = |pinned: &Option<PinnedToken>| -> Result<String, BrokerError> {
@@ -2429,26 +2592,49 @@ pub fn local_model_ids() -> Vec<String> {
 }
 
 /// True if any Anthropic credential is available through the broker
-/// (OAuth login or `ANTHROPIC_API_KEY`). Non-secret answer for first-run UX.
+/// (OAuth login under the active account policy, or `ANTHROPIC_API_KEY`).
+/// Non-secret answer for first-run UX.
 pub fn anthropic_credential_available() -> bool {
-    let oauth = load_provider_auth(OAuthProviderId::Anthropic.as_str())
-        .ok()
-        .flatten()
-        .map(|c| c.auth_type == "oauth" && !c.access.is_empty())
-        .unwrap_or(false);
-    oauth || std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty())
+    oauth_provider_logged_in(OAuthProviderId::Anthropic)
+        || std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty())
 }
 
-/// True if the OAuth provider has stored refreshable credentials. This is a
-/// non-secret availability query for UI surfaces; an expired access token is
-/// still a valid login when the broker can refresh it on first use.
+/// True if the OAuth provider has a stored, refreshable credential the
+/// active account policy (env > config > default) can reach. Non-secret
+/// availability query for UI surfaces; an expired access token is still a
+/// valid login when the broker can refresh it on first use.
+///
+/// * An explicitly selected named account counts only if THAT slot exists
+///   (explicit selection never falls back, so neither does this answer).
+/// * Otherwise any usable slot of the provider counts — a named-only
+///   installation is logged in, not hidden. Which slot a vend uses, and
+///   whether a malformed selector fails it, is reported by the vend itself.
 pub fn oauth_provider_logged_in(provider: OAuthProviderId) -> bool {
-    load_provider_auth(provider.as_str())
-        .ok()
-        .flatten()
-        .is_some_and(|creds| {
-            creds.auth_type == "oauth" && (!creds.refresh.is_empty() || !creds.access.is_empty())
-        })
+    oauth_provider_logged_in_at(
+        &storage::auth_file_path(),
+        &AccountPolicy::from_environment(),
+        provider,
+    )
+}
+
+/// Path/policy-explicit core of [`oauth_provider_logged_in`].
+pub(crate) fn oauth_provider_logged_in_at(
+    path: &std::path::Path,
+    policy: &AccountPolicy,
+    provider: OAuthProviderId,
+) -> bool {
+    let Ok(inventory) = storage::list_accounts_detailed_at(path, Some(provider)) else {
+        return false;
+    };
+    match policy.selector(provider) {
+        AccountSelector::Account(Account::Named(label)) => inventory
+            .accounts
+            .iter()
+            .any(|row| row.label == label.as_str()),
+        AccountSelector::Account(Account::Default)
+        | AccountSelector::Auto
+        | AccountSelector::Invalid { .. } => !inventory.accounts.is_empty(),
+    }
 }
 
 #[async_trait]
@@ -2485,9 +2671,7 @@ impl CredentialBroker for LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<PinnedToken, BrokerError> {
-        let credential = self.resolve_request_credential(provider, None, model).await?;
-        let token = self.access_token_for(&credential).await?;
-        Ok(PinnedToken { credential, token })
+        self.resolve_and_vend(provider, None, model).await
     }
 
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
@@ -2504,31 +2688,7 @@ impl CredentialBroker for LocalBroker {
     }
 
     async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
-        use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
-        if !supports_usage(cred.provider) {
-            return Err(UsageError::UnsupportedProvider {
-                provider: cred.provider.as_str().to_string(),
-            }
-            .into_broker_error());
-        }
-        // Token resolution happens HERE, behind the boundary, for exactly
-        // this credential; the usage helper pairs any account header with
-        // the same token.
-        let token = self.access_token_for(cred).await?;
-        let client = UsageClient::new().map_err(UsageError::into_broker_error)?;
-        let opts = UsageFetchOptions {
-            endpoint_override: self.usage_endpoint_override.clone(),
-            ..UsageFetchOptions::default()
-        };
-        fetch_usage(
-            &client,
-            cred.provider,
-            cred.account.label_str(),
-            &token.token,
-            &opts,
-        )
-        .await
-        .map_err(UsageError::into_broker_error)
+        self.usage_with_seat(cred).await.map(|(snapshot, _seat)| snapshot)
     }
 
     async fn report_cooldown(
@@ -2552,10 +2712,7 @@ impl CredentialBroker for LocalBroker {
             .insert(key.clone(), Cooldown { until_ms, reason });
         // The cached reading predates the limit report; drop it so the next
         // selection re-reads instead of trusting stale headroom.
-        self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
+        self.forget_snapshots(cred);
         Ok(())
     }
 
@@ -3316,6 +3473,33 @@ pub fn static_key_status_map() -> BTreeMap<String, StaticKeyStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_availability_handles_named_only_and_explicit_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let provider = OAuthProviderId::Anthropic;
+        let empty = AccountPolicy::new();
+        assert!(!oauth_provider_logged_in_at(&path, &empty, provider));
+        std::fs::write(&path, serde_json::json!({
+            "anthropic@work": {"type":"oauth", "access":"synthetic-access",
+                "refresh":"synthetic-refresh", "expires":1}
+        }).to_string()).unwrap();
+        // This is login inventory for UI, not an authorization/capacity check.
+        assert!(oauth_provider_logged_in_at(&path, &empty, provider));
+        for selector in [AccountSelector::Auto,
+            AccountSelector::parse_or_invalid("../bad", "test"),
+            AccountSelector::Account(Account::named("work").unwrap())] {
+            let policy = AccountPolicy::new().with(provider, selector);
+            assert!(oauth_provider_logged_in_at(&path, &policy, provider));
+        }
+        let missing = AccountPolicy::new().with(provider,
+            AccountSelector::Account(Account::named("missing").unwrap()));
+        assert!(!oauth_provider_logged_in_at(&path, &missing, provider));
+        assert!(!oauth_provider_logged_in_at(&path, &empty, OAuthProviderId::OpenAiCodex));
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(!oauth_provider_logged_in_at(&path, &empty, provider));
+    }
 
     /// Spec §5.5: the pre-flight capability check is a pure function — it can
     /// be (and is) called before any credential lookup or network access. A

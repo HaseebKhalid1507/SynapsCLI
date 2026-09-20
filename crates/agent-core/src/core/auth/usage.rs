@@ -429,6 +429,10 @@ pub struct UsageSnapshot {
     pub banked_resets: Option<BankedResets>,
     /// First 8 chars of a provider account id when the response carries one.
     pub identity_prefix: Option<String>,
+    /// Opaque full seat identity paired with the bearer used for this reading.
+    /// Currently supplied by the Codex adapter; absent on older brokers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_fingerprint: Option<String>,
     /// Fixed-vocabulary parse notes (never raw keys or values).
     pub notes: Vec<String>,
 }
@@ -448,6 +452,7 @@ impl UsageSnapshot {
             credits: None,
             banked_resets: None,
             identity_prefix: None,
+            seat_fingerprint: None,
             notes: Vec::new(),
         }
     }
@@ -1003,6 +1008,11 @@ pub fn parse_codex_usage(
     } else if let Some(expected) = expected_account_id {
         snap.identity_prefix = Some(identity_prefix(expected));
     }
+
+    // Only the caller-paired credential identity authorizes spending. A body
+    // claiming an id without an expected token identity is display-only.
+    snap.seat_fingerprint = expected_account_id
+        .and_then(|id| super::seat_fingerprint(OAuthProviderId::OpenAiCodex, id));
 
     snap.plan = string_from_value(map.get("plan_type"));
 
@@ -1861,6 +1871,10 @@ mod tests {
         assert_eq!(s.account, "astra2");
         assert_eq!(s.plan.as_deref(), Some("pro"));
         assert_eq!(s.identity_prefix.as_deref(), Some("acct_123"));
+        assert_eq!(s.seat_fingerprint,
+            super::super::seat_fingerprint(OAuthProviderId::OpenAiCodex, "acct_1234567890"));
+        let unpaired = parse_codex_usage(&codex_fixture("null"), "astra2", T0, None).unwrap();
+        assert!(unpaired.seat_fingerprint.is_none());
         assert_eq!(s.limit_reached, Some(false));
         let p = s.window("primary").unwrap();
         assert_eq!(p.duration_secs, Some(604800), "primary is weekly, not assumed 5h");
