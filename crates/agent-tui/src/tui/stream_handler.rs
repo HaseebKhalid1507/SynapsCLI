@@ -188,8 +188,23 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             );
             // History repair is the actor's (mirrored by `Conversation`).
         }
-        // merge(112): handled in phase 3 (stream.rs) / phase 9 (Wall 1)
-        StreamEvent::Llm(LlmEvent::ResponseStart | LlmEvent::ResponseReset) => {}
+        // ResponseStart: snapshot the transcript position for rollback on reset.
+        StreamEvent::Llm(LlmEvent::ResponseStart) => {
+            app.drop_empty_thinking();
+            app.response_preview = Some((
+                app.transcript.messages().len(),
+                app.transcript.messages().last().map(|m| m.msg.clone()),
+            ));
+        }
+        // ResponseReset: roll the in-flight response preview back to the
+        // ResponseStart snapshot. Orphaned resets (no prior start) are
+        // silently ignored (G Q2).
+        StreamEvent::Llm(LlmEvent::ResponseReset) => {
+            if let Some((start, last)) = app.response_preview.take() {
+                app.transcript.reset_response_preview(start, last);
+                app.invalidate();
+            }
+        }
         StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
     }
 }

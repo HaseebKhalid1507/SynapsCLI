@@ -459,7 +459,7 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
-        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+        let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
         let raw_cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
         let commands = super::commands::all_commands_with_skills(registry);
