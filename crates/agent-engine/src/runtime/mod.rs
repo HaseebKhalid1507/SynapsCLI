@@ -1768,6 +1768,17 @@ impl Runtime {
         model: &str,
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
+        // A denied memory-backend reconfiguration poisons the runtime: the
+        // live binding no longer matches config, so no request may be sent
+        // until restart. (#112; upstream `validate_request_preflight_for`.)
+        if self
+            .memory_backend_reconfigure_denied
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RuntimeError::Config(
+                "memory backend cannot be reconfigured at runtime (including live legacy extension processes); restart required; request denied".into(),
+            ));
+        }
         let level = self.reasoning_level();
         if model.starts_with("anthropic/")
             && level == agent_core::reasoning::ReasoningLevel::UltraCode
@@ -5848,15 +5859,69 @@ mod memory_context_provider_tests {
         }
     }
 
-    // FINDING: memory_backend_first_config_is_immutable_and_changes_require_restart
-    // Fails on dev: validate_request_preflight() returns Ok(()) after a
-    // backend change — the reconfigure-denied guard does not wire into the
-    // preflight check on dev. Possible LOST hunk in apply_config or
-    // validate_request_preflight.
+    #[tokio::test]
+    async fn memory_backend_first_config_is_immutable_and_changes_require_restart() {
+        for (first, different) in [("legacy", "axel"), ("axel", "legacy")] {
+            let mut runtime = Runtime::new_headless();
+            let config =
+                agent_core::config::load_config_from_str(&format!("memory.backend = {first}\n"));
+            runtime.apply_config(&config);
+            let binding = runtime.memory_backend.clone();
+            runtime.apply_config(&config);
+            assert!(!runtime
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst));
+            if let (Ok(a), Ok(b)) = (binding.scope(), runtime.memory_backend.scope()) {
+                assert!(std::ptr::eq(a, b));
+            }
+            let clone = runtime.clone();
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {different}\n"
+            )));
+            assert_eq!(runtime.memory_backend.exclusive(), binding.exclusive());
+            assert_eq!(
+                runtime.memory_backend_config.as_ref(),
+                Some(&config.memory_backend)
+            );
+            for denied in [&runtime, &clone] {
+                let error = denied
+                    .validate_request_preflight()
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("restart required"), "{error}");
+                assert!(denied.resolve_memory_provider(None).is_err());
+            }
+            runtime.apply_config(&config);
+            assert!(runtime.validate_request_preflight().await.is_err());
+        }
+    }
 
-    // FINDING: memory_backend_path_changes_also_require_restart
-    // Same root cause as above — validate_request_preflight does not check
-    // the memory_backend_reconfigure_denied flag on dev.
+    #[tokio::test]
+    async fn memory_backend_path_changes_also_require_restart() {
+        for field in ["executable", "brain"] {
+            let mut runtime = Runtime::new_headless();
+            let config = crate::config::MemoryBackendConfig::default();
+            runtime.apply_memory_backend_config(&config);
+            let mut different = config.clone();
+            let path = std::env::temp_dir().join("synaps-memory-config-test");
+            if field == "executable" {
+                different.executable = Some(path);
+            } else {
+                different.brain = Some(path);
+            }
+            runtime.apply_memory_backend_config(&different);
+            assert_eq!(runtime.memory_backend_config.as_ref(), Some(&config));
+            assert!(!runtime.memory_backend.exclusive());
+            let error = runtime
+                .validate_request_preflight()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("restart required"), "{error}");
+            assert!(runtime.resolve_memory_provider(None).is_err());
+        }
+    }
 
     #[test]
     fn memory_backend_apply_config_revokes_preexisting_legacy_lease() {

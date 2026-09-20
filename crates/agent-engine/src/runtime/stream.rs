@@ -803,6 +803,13 @@ impl StreamMethods {
                 None => &messages,
             };
 
+            // Validate original media before any request-local pruning. A
+            // resumed/oversized history must fail visibly, not lose
+            // attachments first and accidentally pass the check on the reduced
+            // request. (`call_api_stream_inner` re-validates the capped copy.)
+            super::attachments::validate_messages(&model, request_messages)
+                .map_err(RuntimeError::Config)?;
+
             // History image byte cap: the per-turn byte budget resets every
             // turn but base64 images live in history forever. Bound the wire
             // by degrading the OLDEST image blocks to a text label once the
@@ -3120,10 +3127,21 @@ mod rich_output_tests {
         );
     }
 
-    // history_media_limit_rejects_before_lossy_pruning: FINDING — requires
-    // validate_messages early rejection in the stream loop (not on dev).
-    // The test asserts d.bodies.is_empty() but dev allows oversized history
-    // through to the provider, relying on cap_history_image_bytes lossy pruning.
+    /// Invalid original histories fail closed BEFORE pruning, with zero sends.
+    #[tokio::test]
+    async fn history_media_limit_rejects_before_lossy_pruning() {
+        let history = image_history(7, 3_670_016);
+        let original = serde_json::to_string(&history).unwrap();
+        let d = drive_with_history(
+            history.clone(),
+            vec![Arc::new(TextTool)],
+            &[("toolu_z", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert!(d.bodies.is_empty(), "oversized history must never reach the provider");
+        assert_eq!(serde_json::to_string(&history).unwrap(), original);
+    }
 
     #[test]
     fn select_content_prefers_rich_then_bounded_then_truncated() {
