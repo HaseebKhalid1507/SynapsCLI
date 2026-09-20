@@ -39,6 +39,11 @@ impl PendingAttachments {
     pub fn clear(&mut self) {
         self.items.clear();
     }
+    pub fn remove(&mut self, idx: usize) {
+        if idx < self.items.len() {
+            self.items.remove(idx);
+        }
+    }
     pub fn summaries(&self) -> Vec<String> {
         self.items.iter().map(|a| a.summary.clone()).collect()
     }
@@ -63,6 +68,13 @@ impl PendingAttachments {
         blocks.extend(self.items.iter().map(|a| a.block.clone()));
         Value::Array(blocks)
     }
+    /// Return the attachment content blocks for the wire (no text block).
+    /// Used by the TUI Submit path where the actor prepends the text block.
+    pub fn take_blocks(&mut self) -> Vec<Value> {
+        let blocks: Vec<Value> = self.items.iter().map(|a| a.block.clone()).collect();
+        self.items.clear();
+        blocks
+    }
 }
 
 /// Asynchronous bounded read on an opened regular-file handle. On Unix,
@@ -84,6 +96,14 @@ pub async fn build_user_content(text: &str, paths: &[PathBuf]) -> Result<Value, 
         pending.add(load_attachment(path).await?)?;
     }
     Ok(pending.build_content(text))
+}
+
+/// Synchronous variant of [`load_attachment`] for use in non-async contexts
+/// (TUI command handlers). Calls the blocking I/O directly on the current
+/// thread — acceptable for the TUI, which already blocks on user input.
+pub fn load_attachment_sync(path: &Path) -> Result<LoadedAttachment, String> {
+    let path = crate::tools::expand_path(&path.to_string_lossy());
+    load_blocking(&path)
 }
 
 fn load_blocking(path: &Path) -> Result<LoadedAttachment, String> {
