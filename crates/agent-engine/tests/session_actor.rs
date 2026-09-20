@@ -1160,7 +1160,7 @@ async fn zero_turn_session_ends_idle_at_park_deadline_while_one_turn_parks() {
     b.send(SessionCommand::Detach { client: b.client_id() }).await.unwrap();
     drop(b);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked, "one-turn session parks");
+    assert_eq!(handle.lifecycle(), agent_engine::session::SessionLifecycle::Parked, "one-turn session parks");
     let (mut c, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
         .await
         .unwrap();
