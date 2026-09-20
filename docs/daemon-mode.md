@@ -318,7 +318,6 @@ thing: the daemon itself.
 
 ### What is NOT yet covered (wave 2+)
 
-- **Journal persistence of env minus secrets** (T5) — env does not survive daemon restart today.
 - **Extension protocol: per-call env/cwd** (T6) — sidecars still get the daemon's env.
 - **`SO_PEERCRED` uid check** (T11) — no auth boundary on the socket yet.
 
@@ -346,7 +345,9 @@ Path-like + missing → non-zero exit with `--system <val>: no such file
 
 `SessionConfig.env` and `SessionConfig.env_stripped` are persisted in the
 session journal (as part of the `Session` struct, BEFORE `api_messages` so
-`read_session_header` sees them).
+`read_session_header` sees them). Both artifacts carry them — the `.json`
+snapshot a fresh daemon reads and the journal meta tail — and a fresh client
+env on `--continue` is written back so the next restart sees the latest.
 
 **Rehydration precedence** (`--continue`/unpark after daemon restart):
 1. An explicit `Hello.env` from the continuing client wins (the user is
@@ -360,8 +361,9 @@ session journal (as part of the `Session` struct, BEFORE `api_messages` so
 client forgets to strip.  The `env_stripped` list records **names only**.
 
 **Loud notices:** when a bash command exits non-zero AND the script text
-references a name from `env_stripped` (by `$NAME`, `${NAME}`, `$env:NAME`,
-or `NAME=`), a system notice is appended to the tool output, once per name
+references a name from `env_stripped` as a whole identifier (`$NAME`,
+`${NAME:?}`, `$env:NAME`, `NAME=`… — `GH_TOKEN_FILE` does not match
+`GH_TOKEN`), a system notice is appended to the tool output, once per name
 per session:
 ```
 note: $GH_TOKEN was stripped from the session env as a secret; reattach from a shell that has it (synaps --system … from that shell) — the daemon never receives credentials.
