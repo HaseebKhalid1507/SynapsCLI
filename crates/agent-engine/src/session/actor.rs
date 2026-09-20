@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -29,7 +29,7 @@ use crate::engine::reactor::{
 use crate::engine::session::ConversationState;
 use crate::engine::setup::BackgroundTasks;
 use crate::extensions::invoke_output::{invoke_event_channel, InvokeOutputBudget};
-use crate::extensions::session_driver::{Grant, Reply};
+use crate::extensions::session_driver::{self as protocol, Grant, Reply};
 use crate::runtime::compaction::{
     apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
     CompactionTransition,
@@ -419,6 +419,8 @@ pub struct SessionActor {
     pub(crate) driver_generation: u64,
     /// Interrupted owner (for generic stop commands across revocation).
     pub(crate) driver_interrupted_owner: Option<String>,
+    /// 200 ms cadence for `driver_tick()`, always present.
+    pub(crate) driver_tick_interval: tokio::time::Interval,
 }
 
 impl SessionActor {
@@ -652,6 +654,11 @@ impl SessionActor {
             driver_pending: None,
             driver_generation: 0,
             driver_interrupted_owner: None,
+            driver_tick_interval: {
+                let mut interval = tokio::time::interval(Duration::from_millis(200));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval
+            },
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -1028,6 +1035,474 @@ impl SessionActor {
         });
 
         Ok(())
+    }
+
+    // ── E-P4: driver_tick ────────────────────────────────────────────────
+
+    /// Actor-equivalent of the TUI's `idle_conflict()` (TUI :437-463).
+    /// Returns `Some(reason)` when the driver must defer or revoke.
+    fn driver_idle_conflict(&self) -> Option<&'static str> {
+        if self.conv.queued_message.is_some() || !self.conv.pending_events.is_empty() {
+            return Some("other queued work");
+        }
+        if self.compact.is_some() {
+            return Some("compaction");
+        }
+        if self.ext_ready.is_some() {
+            return Some("extensions loading or reloading");
+        }
+        if self.conv.context_head.is_blocked(&self.conv.session) {
+            return Some("unverified context head");
+        }
+        if self.driver_completion_blocked() {
+            return Some("outstanding workers require collection/reconciliation");
+        }
+        None
+    }
+
+    /// Actor-equivalent of the TUI's `completion_blocked()` (TUI :465-480).
+    fn driver_completion_blocked(&self) -> bool {
+        use agent_core::orchestration::CompletionGate;
+        self.runtime.orchestration().is_some_and(|o| {
+            !matches!(o.completion_gate(), CompletionGate::Allowed)
+        }) || self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .map(|r| {
+                r.list_active().iter().any(|(_, _, status)| {
+                    *status == crate::runtime::subagent::SubagentStatus::Running
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    /// 200 ms timer arm — the core driver loop. Every invocation performs only
+    /// bounded state transitions; all plugin and provider IO is in abort-on-drop
+    /// spawned tasks. Mirrors the TUI's `tick()` (TUI :695-1027).
+    pub(crate) async fn driver_tick(&mut self) {
+        use crate::extensions::session_driver::Outcome;
+
+        // ── 1. Cleanup cancelled stream setup ────────────────────────────
+        if self.stream.is_none()
+            && self
+                .cancel
+                .as_ref()
+                .is_some_and(|ct| ct.is_cancelled())
+        {
+            self.clear_stream();
+            self.emit(SessionEventWire::Idle);
+        }
+
+        // ── 2. Validate lifecycle ────────────────────────────────────────
+        if let Some(driver) = &self.driver {
+            let invalid = if driver.grant.session_id != self.id.0 {
+                Some("session replaced".to_string())
+            } else if driver.grant.expired() {
+                Some("grant deadline reached".into())
+            } else if driver.cancel.is_cancelled() {
+                Some("canceled".into())
+            } else {
+                let manager = self.host.ext_manager().clone();
+                super::driver::same_handler(
+                    &manager,
+                    &driver.grant.plugin_id,
+                    &driver.handler,
+                    driver.handler_generation,
+                )
+                .err()
+            };
+            if let Some(reason) = invalid {
+                self.driver_revoke(&reason);
+                return;
+            }
+        }
+
+        // ── 3. Idle conflict (only when driver is armed) ─────────────────
+        if self.driver.is_some() {
+            if self.compact.is_some()
+                || self.conv.queued_message.is_some()
+                || !self.conv.pending_events.is_empty()
+                || self.ext_ready.is_some()
+                || self.conv.context_head.is_blocked(&self.conv.session)
+            {
+                self.driver_revoke("queued work or session/lifecycle change");
+                return;
+            }
+
+            // Let the reactor classify queued events before deciding whether they
+            // are competing work or steering within this owned turn.
+            if !self.runtime.event_queue().is_empty() {
+                return;
+            }
+        }
+
+        // ── 4. Process finished pending task ─────────────────────────────
+        if self
+            .driver_pending
+            .as_ref()
+            .is_some_and(|p| p.task.0.is_finished())
+        {
+            let mut pending = self.driver_pending.take().expect("checked pending");
+            if pending.generation != self.driver_generation
+                || pending.session_id != self.id.0
+            {
+                return;
+            }
+            let result = match (&mut pending.task.0).await {
+                Ok(result) => result,
+                Err(error) => {
+                    self.driver_revoke("driver task failed");
+                    self.emit(SessionEventWire::SystemNotice(format!(
+                        "Session driver task failed: {error}"
+                    )));
+                    return;
+                }
+            };
+            match result {
+                super::driver::TaskResult::Command {
+                    owner,
+                    command: _,
+                    handler,
+                    handler_generation,
+                    result,
+                    report,
+                } => {
+                    let current = self
+                        .host
+                        .ext_manager()
+                        .try_read()
+                        .ok()
+                        .and_then(|m| m.user_action_handler(&owner).ok());
+                    if !current
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &handler))
+                    {
+                        self.driver_revoke(
+                            "command owner unloaded, replaced, or unavailable",
+                        );
+                        return;
+                    }
+                    let output_failed = report.is_limited()
+                        || report.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                crate::extensions::runtime::InvokeCommandEvent::Output(
+                                    crate::extensions::commands::CommandOutputEvent::Error { .. }
+                                )
+                            )
+                        });
+                    if let Ok(value) = result {
+                        let result = match protocol::parse_reply(&value) {
+                            Ok(Some(reply @ Reply::Start { .. })) => {
+                                if output_failed {
+                                    Err("command reported an error or exceeded its output budget"
+                                        .into())
+                                } else if self.streaming || self.stream.is_some() {
+                                    Err("foreground turn still active".into())
+                                } else if let Some(reason) = self.driver_idle_conflict() {
+                                    Err(reason.into())
+                                } else {
+                                    match handler_generation {
+                                        Some(generation) => {
+                                            self.driver_arm(
+                                                owner, handler, generation, reply,
+                                            )
+                                        }
+                                        None => Err(
+                                            "command owner did not expose a live lifecycle at dispatch"
+                                                .into(),
+                                        ),
+                                    }
+                                }
+                            }
+                            Ok(Some(
+                                Reply::Stop { notice: text }
+                                | Reply::Status { notice: text },
+                            )) => {
+                                self.emit(SessionEventWire::SystemNotice(text));
+                                Ok(())
+                            }
+                            Ok(Some(Reply::Next { .. })) => Err(
+                                "next requires an armed poll, not an interactive command"
+                                    .into(),
+                            ),
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
+                            self.emit(SessionEventWire::SystemNotice(format!(
+                                "Session driver rejected: {error}"
+                            )));
+                        }
+                    }
+                }
+                super::driver::TaskResult::Poll(result) => {
+                    let Some(driver) = self.driver.as_mut() else {
+                        return;
+                    };
+                    let stop_notice = match &result {
+                        Ok(Reply::Stop { notice }) => Some(notice.clone()),
+                        _ => None,
+                    };
+                    match result.and_then(|reply| driver.grant.accept(reply)) {
+                        Ok(Some(proposal)) => {
+                            let text = proposal.notice.clone();
+                            if let Err(error) =
+                                super::driver::schedule(driver, proposal)
+                            {
+                                self.driver_revoke(&error);
+                            } else {
+                                self.emit(SessionEventWire::SystemNotice(text));
+                            }
+                        }
+                        Ok(None) => {
+                            self.driver_revoke("owner requested stop");
+                            if let Some(text) = stop_notice {
+                                self.emit(SessionEventWire::SystemNotice(text));
+                            }
+                        }
+                        Err(error) => {
+                            self.driver_revoke(&format!("invalid poll response: {error}"))
+                        }
+                    }
+                }
+                super::driver::TaskResult::Prepared { proposal, result } => {
+                    if self.streaming || self.stream.is_some() {
+                        self.driver_revoke("foreground work took priority");
+                        return;
+                    }
+                    if let Some(reason) = self.driver_idle_conflict() {
+                        self.driver_revoke(reason);
+                        return;
+                    }
+                    match *result {
+                        Err(protocol::PrepareError::Selection(error)) => {
+                            self.emit(SessionEventWire::SystemNotice(format!(
+                                "Session driver selection rejected (nothing sent): {error}"
+                            )));
+                            if let Some(driver) = self.driver.as_mut() {
+                                driver.outcome = Some((
+                                    Outcome::SelectionRejected,
+                                    "unknown".into(),
+                                ));
+                            }
+                        }
+                        Err(protocol::PrepareError::Blocked(error)) => {
+                            self.driver_revoke(&format!("preflight blocked: {error}"));
+                        }
+                        Ok(candidate) => {
+                            let mut validated = proposal.clone();
+                            if let Some(context) = &self.conv.abort_context {
+                                validated.prompt =
+                                    format!("{context}\n\n{}", proposal.prompt);
+                            }
+                            let history = super::driver::history_with_steering(
+                                &self.conv.api_messages,
+                                &self
+                                    .driver
+                                    .as_ref()
+                                    .map(|d| &d.steering)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            );
+                            if let Err(error) = protocol::validate_prepared(
+                                &candidate, &validated, &history,
+                            ) {
+                                self.driver_revoke(&format!(
+                                    "prepared selection changed before commit: {error}"
+                                ));
+                                return;
+                            }
+                            // Commit steering + prompt into api_messages.
+                            // (Inline to satisfy the borrow checker — conv has
+                            // api_messages and abort_context as separate fields.)
+                            {
+                                let driver = self.driver.as_mut().expect("driver present");
+                                for text in driver.steering.drain(..) {
+                                    self.conv.api_messages.push(Arc::new(
+                                        serde_json::json!({"role": "user", "content": text}),
+                                    ));
+                                }
+                                let prompt_text = if let Some(context) = self.conv.abort_context.take() {
+                                    format!("{context}\n\n{}", proposal.prompt)
+                                } else {
+                                    proposal.prompt.clone()
+                                };
+                                self.conv.api_messages.push(Arc::new(
+                                    serde_json::json!({"role": "user", "content": prompt_text}),
+                                ));
+                            }
+                            // Apply the prepared runtime.
+                            *self.runtime = candidate;
+                            self.conv.session.model = self.runtime.model().to_owned();
+                            self.conv.session.thinking_level =
+                                self.runtime.thinking_level().to_owned();
+                            self.consecutive_auto_turns = 0;
+                            self.turn_baseline = self.conv.api_messages.len();
+                            self.turn_log.clear();
+                            self.turn_replay.clear();
+                            self.streaming = true;
+                            self.update_attach_state();
+                            self.emit(SessionEventWire::TurnStarted {
+                                turn_baseline: self.turn_baseline,
+                                trigger: TurnTrigger::DriverAuto,
+                                user_text: Some(proposal.prompt.clone()),
+                            });
+
+                            // Set up the driver's awaiting_terminal.
+                            if let Some(driver) = self.driver.as_mut() {
+                                driver.awaiting_terminal = true;
+                                driver.completed_feedback = "unknown";
+                                if driver.grant.feedback_enabled() {
+                                    driver.feedback.begin_turn(
+                                        &driver.selection.model,
+                                        &driver.selection.effort,
+                                    );
+                                }
+                            }
+
+                            // Spawn stream start as a task (never block tick).
+                            let handler = self
+                                .driver
+                                .as_ref()
+                                .expect("driver")
+                                .handler
+                                .clone();
+                            let handler_generation = self
+                                .driver
+                                .as_ref()
+                                .expect("driver")
+                                .handler_generation;
+                            let ct = self
+                                .driver
+                                .as_ref()
+                                .expect("driver")
+                                .cancel
+                                .child_token();
+                            self.cancel = Some(ct.clone());
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            self.steer_tx = Some(tx);
+                            let runtime = self.runtime.clone();
+                            let history = self.conv.api_messages.clone();
+                            let secret = self.secret_prompt_handle.clone();
+                            let session_id = self.id.0.clone();
+                            let generation = self.driver_generation;
+                            self.driver_pending = Some(super::driver::DriverPending {
+                                generation,
+                                session_id,
+                                task: super::driver::Task(tokio::spawn(async move {
+                                    if ct.is_cancelled() {
+                                        return super::driver::TaskResult::Started(
+                                            Err("canceled before stream setup".into()),
+                                        );
+                                    }
+                                    if let Err(error) =
+                                        super::driver::same_lifecycle(
+                                            &handler,
+                                            handler_generation,
+                                        )
+                                    {
+                                        return super::driver::TaskResult::Started(
+                                            Err(error),
+                                        );
+                                    }
+                                    tokio::select! {
+                                        biased;
+                                        _ = ct.cancelled() => super::driver::TaskResult::Started(Err("canceled during stream setup".into())),
+                                        started = runtime.run_stream_with_messages(history, ct.clone(), Some(rx), Some(secret), false) => super::driver::TaskResult::Started(Ok(started)),
+                                    }
+                                })),
+                            });
+
+                            // Start subagent tick (same as normal start_turn).
+                            let mut tick = tokio::time::interval(
+                                std::time::Duration::from_secs(1),
+                            );
+                            tick.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Delay,
+                            );
+                            tick.reset();
+                            self.subagent_tick = Some(tick);
+                            self.save().await;
+                        }
+                    }
+                }
+                super::driver::TaskResult::Started(started) => match started {
+                    Ok(started) if self.driver.is_some() => {
+                        self.stream = Some(started);
+                    }
+                    Err(error) => {
+                        self.driver_revoke(&error);
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        // ── 5. Idle scheduling ───────────────────────────────────────────
+        if self.streaming || self.stream.is_some() || self.driver_pending.is_some() {
+            return;
+        }
+        if let Some(reason) = self.driver_idle_conflict() {
+            self.driver_revoke(reason);
+            return;
+        }
+        let Some(driver) = self.driver.as_mut() else {
+            return;
+        };
+        if let Some((outcome, error_kind)) = driver.outcome.take() {
+            let request = super::driver::poll_request(driver, outcome, error_kind);
+            let handler = driver.handler.clone();
+            let session_id = self.id.0.clone();
+            let generation = self.driver_generation;
+            self.driver_pending = Some(super::driver::DriverPending {
+                generation,
+                session_id,
+                task: super::driver::Task(tokio::spawn(async move {
+                    super::driver::TaskResult::Poll(protocol::poll(handler, request).await)
+                })),
+            });
+        } else if driver
+            .proposal
+            .as_ref()
+            .is_some_and(|p| Instant::now() >= p.due)
+        {
+            let mut proposal =
+                driver.proposal.take().expect("checked proposal").proposal;
+            let original_prompt = proposal.prompt.clone();
+            if let Some(context) = &self.conv.abort_context {
+                proposal.prompt = format!("{context}\n\n{}", proposal.prompt);
+            }
+            let runtime = self.runtime.clone();
+            let history = super::driver::history_with_steering(
+                &self.conv.api_messages,
+                &driver.steering,
+            );
+            let session_id = self.id.0.clone();
+            let generation = self.driver_generation;
+            self.driver_pending = Some(super::driver::DriverPending {
+                generation,
+                session_id,
+                task: super::driver::Task(tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        protocol::prepare(&runtime, &proposal, &history),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(protocol::PrepareError::Blocked(
+                            "preparation timed out (5s)".into(),
+                        ))
+                    });
+                    proposal.prompt = original_prompt;
+                    super::driver::TaskResult::Prepared {
+                        proposal,
+                        result: Box::new(result),
+                    }
+                })),
+            });
+        }
     }
 
     /// F10: release the old lock, acquire on `new_id`. Best-effort (log on failure).
@@ -2616,6 +3091,19 @@ async fn park_timer(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// 200 ms cadence, gated on driver state — `None` driver+pending → pending forever.
+async fn driver_tick_timer(
+    has_driver: bool,
+    has_pending: bool,
+    interval: &mut tokio::time::Interval,
+) {
+    if has_driver || has_pending {
+        interval.tick().await;
+    } else {
+        std::future::pending().await
+    }
+}
+
 async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
     match rx {
         Some(r) => {
@@ -2663,6 +3151,9 @@ impl SessionTask {
                         actor.publish_view().await;
                     }
                 },
+                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval) => {
+                    actor.driver_tick().await;
+                }
                 ev = next_stream_event(&mut actor.stream) => match ev {
                     Some(ev) => actor.on_stream_event(ev).await,
                     None => {

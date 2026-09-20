@@ -1,4 +1,4 @@
-#![allow(dead_code)] // consumed by P4 driver_tick
+#![allow(dead_code)] // observe/finish consumed by P5 stream hooks
 
 //! Bounded, process-local feedback for one caller-owned foreground turn.
 //!
