@@ -28,6 +28,8 @@ use super::app::{App, ChatMessage};
 pub(crate) enum SidecarUiStatus {
     /// Sidecar is not currently doing plugin-defined work.
     Idle,
+    /// Sidecar process is spawning / waiting for `ready_after_init`.
+    Loading,
     /// Sidecar is doing plugin-defined work and supplied a display label.
     Active { label: String },
     /// Sidecar reported an error; user should `/sidecar toggle` to retry.
@@ -170,6 +172,7 @@ fn format_status_line(
     let label = display_name.unwrap_or("sidecar");
     let state = match status {
         SidecarUiStatus::Idle => "idle".to_string(),
+        SidecarUiStatus::Loading => "loading".to_string(),
         SidecarUiStatus::Active { label } => label.clone(),
         SidecarUiStatus::Error(msg) => return format!("{label}: error — {msg}"),
     };
@@ -453,6 +456,19 @@ mod tests {
             None,
         );
         assert_eq!(line, "Sensor: error — oops");
+    }
+
+    #[test]
+    fn status_line_shows_loading() {
+        let line = format_status_line(
+            Some("Voice"),
+            &SidecarUiStatus::Loading,
+            "voice-plugin",
+            "/opt/voice/bin/sidecar",
+            None,
+        );
+        assert!(line.contains("loading"), "got: {line}");
+        assert!(line.starts_with("Voice:"), "got: {line}");
     }
 }
 
