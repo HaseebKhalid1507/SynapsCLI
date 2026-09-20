@@ -98,6 +98,20 @@ async fn wait_stream_retry(
 
 pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection interrupted before response completed (stream retry budget exhausted)";
 
+/// The endpoint one `send_with_retries` call talks to: its log label, the
+/// URL (for the localhost-refusal fast-fail) and whether its 429 responses
+/// carry Codex quota semantics worth probing. Static per call site; the
+/// retry budget and trace clock are threaded separately because they mutate.
+#[derive(Clone, Copy)]
+struct SendTarget<'a> {
+    label: &'a str,
+    url: &'a str,
+    /// Codex only: read a bounded slice of a 429 body to distinguish proven
+    /// quota exhaustion (fail fast → account failover) from a generic 429
+    /// (normal transport retry). Every other endpoint drops the body unread.
+    quota_probe: bool,
+}
+
 /// Send a provider streaming request, retrying transient failures.
 ///
 /// Parity fix: the Anthropic path retries transient errors with backoff
@@ -118,19 +132,22 @@ pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection i
 /// re-send. Terminal failures emit their final record here; on success the
 /// caller finishes the attempt after consuming the stream.
 async fn send_with_retries(
-    label: &str,
-    url: &str,
+    target: SendTarget<'_>,
     build: impl Fn() -> reqwest::RequestBuilder,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
     retries_used: &mut u32,
     trace_attempt: &mut tr::StreamAttempt,
-    quota_probe: bool,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     use super::account_routing::{
         classify_codex_429, read_body_for_classification, Codex429, CodexQuotaExhausted,
         QUOTA_PROBE_BODY_CAP,
     };
+    let SendTarget {
+        label,
+        url,
+        quota_probe,
+    } = target;
     loop {
         if cancel.is_cancelled() {
             return Err("request canceled".into());
@@ -598,6 +615,21 @@ pub(crate) async fn call_codex_stream_inner(
     .await
 }
 
+/// What the failover gate judges: the recognized exhaustion on the current
+/// attempt and the two runtime facts that can veto a switch. Built at each
+/// of the two detection sites (429 probe, in-stream terminal error) so both
+/// go through the identical invariant check.
+#[derive(Clone, Copy)]
+struct FailoverRequest<'a> {
+    evidence: &'a super::account_routing::CodexQuotaEvidence,
+    /// Any content-bearing model event reached the decoder on this attempt
+    /// (text, tool, reasoning — forwarded or not). Always false on the 429
+    /// path: no response body was streamed.
+    output_started: bool,
+    /// Account switches already spent on this logical request.
+    prior_failovers: u32,
+}
+
 /// Attempt a single bounded account failover after recognized quota
 /// exhaustion on `failed`. Always reports the exhaustion to the router
 /// (cooldown sink, best effort) — even when the runtime then refuses to
@@ -611,18 +643,21 @@ async fn try_codex_account_failover(
     router: &dyn super::account_routing::CodexAccountRouter,
     model: &str,
     failed: &super::account_routing::PinnedAccount,
-    evidence: &super::account_routing::CodexQuotaEvidence,
-    output_started: bool,
-    failovers_so_far: u32,
+    request: FailoverRequest<'_>,
     tx: &mpsc::UnboundedSender<StreamEvent>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<super::account_routing::PinnedAccount>, super::net::BoxedProviderError> {
     use super::account_routing::failover_gate;
     use crate::runtime::api::await_or_cancel;
+    let FailoverRequest {
+        evidence,
+        output_started,
+        prior_failovers,
+    } = request;
     await_or_cancel(cancel, router.report_exhausted(failed, evidence))
         .await
         .map_err(|_| "request canceled")?;
-    if let Err(blocked) = failover_gate(failed.auto, output_started, failovers_so_far) {
+    if let Err(blocked) = failover_gate(failed.auto, output_started, prior_failovers) {
         tracing::info!(
             account = %failed.credential,
             reason = blocked.as_str(),
@@ -632,7 +667,7 @@ async fn try_codex_account_failover(
     }
     let candidate = await_or_cancel(
         cancel,
-        router.failover(model, failed, evidence, failovers_so_far),
+        router.failover(model, failed, evidence, prior_failovers),
     )
     .await
     .map_err(|_| "request canceled")?;
@@ -826,8 +861,11 @@ pub(crate) async fn call_codex_stream_with_router(
             return Err("request canceled".into());
         }
         let sent = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || {
                 client
                     .post(&url)
@@ -843,7 +881,6 @@ pub(crate) async fn call_codex_stream_with_router(
             max_retries,
             &mut stream_retry,
             &mut attempt,
-            true,
         )
         .await;
         let resp = match sent {
@@ -857,9 +894,11 @@ pub(crate) async fn call_codex_stream_with_router(
                         router,
                         &cfg.model,
                         &pinned,
-                        &quota.evidence,
-                        false,
-                        failovers,
+                        FailoverRequest {
+                            evidence: &quota.evidence,
+                            output_started: false,
+                            prior_failovers: failovers,
+                        },
                         tx,
                         cancel,
                     )
@@ -976,9 +1015,11 @@ pub(crate) async fn call_codex_stream_with_router(
                     router,
                     &cfg.model,
                     &pinned,
-                    &evidence,
-                    output_started,
-                    failovers,
+                    FailoverRequest {
+                        evidence: &evidence,
+                        output_started,
+                        prior_failovers: failovers,
+                    },
                     tx,
                     cancel,
                 )
@@ -5762,14 +5803,16 @@ mod send_retry_tests {
         let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
 
         let err = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             3,
             &mut 0,
             &mut tr::StreamAttempt::new(None),
-            true,
         )
         .await
         .expect_err("400 must fail fast");
@@ -5794,14 +5837,16 @@ mod send_retry_tests {
         let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
 
         let err = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             1,
             &mut 0,
             &mut tr::StreamAttempt::new(None),
-            true,
         )
         .await
         .expect_err("persistent 503 must exhaust the budget");
