@@ -774,7 +774,7 @@ async fn cancel_captures_abort_context() {
     let dequeued = o.abort().await;
     assert_eq!(dequeued.as_deref(), Some("queued-then-dropped"));
     let o_ctx = o.r.abort_context.clone().expect("oracle captured context");
-    assert!(o_ctx.contains("[response]: partial"), "{o_ctx}");
+    assert!(o_ctx.contains("you had started writing: partial"), "{o_ctx}");
     o.submit("second".into()).await;
     pump_until_text(&mut o).await;
     o.abort().await;
