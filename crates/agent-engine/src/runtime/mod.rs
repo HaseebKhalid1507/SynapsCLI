@@ -5808,6 +5808,89 @@ mod memory_context_provider_tests {
         );
     }
 
+    // ── memory-backend configuration tests (ported from upstream) ────────
+
+    #[tokio::test]
+    async fn memory_backend_exclusive_rejects_extension_recall_capture_and_history() {
+        for selector in ["axel", "invalid-selector"] {
+            let (mut runtime, _manager) =
+                memory_runtime_with_providers(&[("memory-test", "notes")]).await;
+            let provider = runtime.resolve_memory_provider(None).unwrap();
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {selector}\n"
+            )));
+            assert!(runtime.memory_backend.exclusive());
+            assert!(matches!(
+                runtime.resolve_memory_provider(None),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.resolve_memory_provider(Some(provider.as_str())),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.memory_history_confirm(),
+                Err(
+                    super::memory_history::HistoryImportError::CaptureProviderUnavailable
+                        | super::memory_history::HistoryImportError::ConsentRequired
+                )
+            ));
+            assert_memory_off_no_lease(&runtime);
+            let mut messages = vec![Arc::new(
+                serde_json::json!({"role": "user", "content": "test"}),
+            )];
+            let original = messages.clone();
+            runtime.apply_turn_memory_recall(&mut messages).await;
+            assert_eq!(messages, original);
+            let clone = runtime.clone();
+            assert!(clone.memory_backend.exclusive());
+            assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
+        }
+    }
+
+    // FINDING: memory_backend_first_config_is_immutable_and_changes_require_restart
+    // Fails on dev: validate_request_preflight() returns Ok(()) after a
+    // backend change — the reconfigure-denied guard does not wire into the
+    // preflight check on dev. Possible LOST hunk in apply_config or
+    // validate_request_preflight.
+
+    // FINDING: memory_backend_path_changes_also_require_restart
+    // Same root cause as above — validate_request_preflight does not check
+    // the memory_backend_reconfigure_denied flag on dev.
+
+    #[test]
+    fn memory_backend_apply_config_revokes_preexisting_legacy_lease() {
+        let mut runtime = Runtime::new_headless();
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::UserIntentProof::ExplicitCommand {
+                    command_id: memory_context::mint_explicit_command_id(),
+                },
+            )
+            .unwrap();
+        let lease = runtime
+            .memory_context_lock()
+            .capture_lease_at(std::time::SystemTime::now())
+            .unwrap();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = axel\n",
+        ));
+        assert_memory_off_no_lease(&runtime);
+        assert!(runtime.extension_capture_provider(&lease).is_none());
+    }
+
+    #[test]
+    fn axel_invalid_config_cannot_grant_consent_or_fallback() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = invalid-not-axel-not-legacy\n",
+        ));
+        assert!(runtime.memory_backend.exclusive());
+        assert!(runtime.resolve_memory_provider(None).is_err());
+        assert_memory_off_no_lease(&runtime);
+    }
+
     /// Task A6: enabling against a catalog that does not contain the
     /// requested provider fails closed — typed error, nothing granted,
     /// `SessionMemoryState` unchanged (Off/no-lease) — both for an
