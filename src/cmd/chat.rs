@@ -1008,6 +1008,7 @@ mod actor {
             ended: false,
             pending_confirm: None,
         };
+        let mut pending_attachments = agent_engine::attachments::PendingAttachments::default();
         let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
         let mut next_query: u64 = 1;
         let mut prompt_shown = false;
@@ -1053,11 +1054,90 @@ mod actor {
             }
 
             let trimmed = line.trim_end_matches('\r').trim();
+            // Blank-line attachment-only submit.
             if trimmed.is_empty() {
+                if !pending_attachments.is_empty() {
+                    let summaries = pending_attachments.summaries();
+                    for s in &summaries {
+                        eprintln!("📎 {s}");
+                    }
+                    let blocks = pending_attachments.take_blocks();
+                    r.idle = false;
+                    if t.send(SessionCommand::Submit {
+                        text: String::new(),
+                        attachments: blocks,
+                    }).await.is_err() {
+                        break;
+                    }
+                }
                 continue;
             }
 
             if let Some((cmd, arg)) = commands::parse_command(trimmed) {
+                // Client-side attachment commands — never reach the actor.
+                match cmd {
+                    "attach" => {
+                        if arg.is_empty() {
+                            eprintln!("usage: /attach <path>");
+                            continue;
+                        }
+                        let path_str = arg.trim_matches(|c| c == '"' || c == '\'');
+                        let path = std::path::PathBuf::from(path_str);
+                        match agent_engine::attachments::load_attachment_sync(&path) {
+                            Ok(loaded) => match pending_attachments.add(loaded) {
+                                Ok(()) => {
+                                    let s = pending_attachments.summaries();
+                                    eprintln!("📎 staged: {}", s.last().unwrap_or(&String::new()));
+                                }
+                                Err(e) => eprintln!("error: {e}"),
+                            },
+                            Err(e) => {
+                                eprintln!("error: {path_str}: {e}");
+                                if !r.is_tty {
+                                    // Piped: fail-stop.
+                                    return Err(synaps_cli::RuntimeError::Session(
+                                        format!("attachment failed: {path_str}: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    "attachments" => {
+                        let summaries = pending_attachments.summaries();
+                        if summaries.is_empty() {
+                            eprintln!("no pending attachments");
+                        } else {
+                            for (i, s) in summaries.iter().enumerate() {
+                                eprintln!("  [{i}] {s}");
+                            }
+                        }
+                        continue;
+                    }
+                    "detach" => {
+                        let n = pending_attachments.len();
+                        if arg.is_empty() || arg == "all" || arg == "clear" {
+                            pending_attachments.clear();
+                            if n > 0 {
+                                eprintln!("detached {n} file(s)");
+                            } else {
+                                eprintln!("no pending attachments");
+                            }
+                        } else if let Ok(idx) = arg.parse::<usize>() {
+                            if idx < n {
+                                pending_attachments.remove(idx);
+                                eprintln!("detached [{idx}]");
+                            } else {
+                                eprintln!("no attachment at index {idx}");
+                            }
+                        } else {
+                            eprintln!("usage: /detach [n|all]");
+                        }
+                        continue;
+                    }
+                    _ => {} // fall through to EngineCommand
+                }
+
                 let id = next_query;
                 next_query += 1;
                 let _ = t
@@ -1145,7 +1225,7 @@ mod actor {
                             );
                         }
                         "help" => {
-                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
+                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
                             eprintln!("quitting (or EOF) mid-turn cancels the turn and saves an abort context for the next --continue");
                         }
                         _ => eprintln!("unknown command: /{} (try /help)", cmd),
@@ -1156,11 +1236,20 @@ mod actor {
             }
 
             // Regular user message.
+            let attachment_blocks = if pending_attachments.is_empty() {
+                Vec::new()
+            } else {
+                let summaries = pending_attachments.summaries();
+                for s in &summaries {
+                    eprintln!("📎 {s}");
+                }
+                pending_attachments.take_blocks()
+            };
             r.idle = false;
             if t
                 .send(SessionCommand::Submit {
                     text: trimmed.to_string(),
-                    attachments: Vec::new(),
+                    attachments: attachment_blocks,
                 })
                 .await
                 .is_err()
@@ -1182,6 +1271,13 @@ mod actor {
                     None => break,
                 }
             }
+        }
+
+        if !pending_attachments.is_empty() {
+            eprintln!(
+                "warning: {} unsent attachment(s) discarded",
+                pending_attachments.len()
+            );
         }
 
         eprintln!(
