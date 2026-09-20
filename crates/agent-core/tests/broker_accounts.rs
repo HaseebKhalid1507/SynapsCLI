@@ -277,7 +277,7 @@ fn fake_broker(hits: Arc<Mutex<Vec<String>>>) -> Router {
                 if auth != "Bearer machine-A" && auth != "Bearer machine-B" {
                     return (StatusCode::UNAUTHORIZED, Json(json!({"error":"bad machine auth"})));
                 }
-                let account = q.account.clone().unwrap_or_else(|| "default".into());
+                let account = q.account.clone().expect("explicit slot requests always carry account");
                 hits.lock().unwrap().push(format!("{auth}|{}|{account}", q.provider));
                 match account.as_str() {
                     "default" | "astra2" => (
@@ -350,12 +350,118 @@ async fn remote_broker_selects_accounts_independently_with_principal_scoped_cach
     // Wire log shows no machine token in the cache key material.
     let dbg = format!("{cache:?}");
     assert!(!dbg.contains("machine-A") && !dbg.contains("machine-B"), "{dbg}");
-    // Default-slot requests never send an `account` parameter (old brokers).
+    // Explicit default-slot requests always carry `account=default`.
     assert!(hits
         .lock()
         .unwrap()
         .iter()
         .any(|h| h == "Bearer machine-A|openai-codex|default"));
+}
+
+/// Broker whose HOST policy points at a named slot (or an old broker that
+/// ignores the `account` parameter): an explicit default request must never
+/// end up caching another slot's token under `default`, and a named request
+/// against a broker that cannot honour it is rejected, not served.
+fn policy_broker(mode: &'static str, hits: Arc<Mutex<Vec<String>>>) -> Router {
+    #[derive(serde::Deserialize)]
+    struct Q {
+        provider: String,
+        account: Option<String>,
+    }
+    Router::new().route(
+        "/token",
+        get(move |Query(q): Query<Q>| {
+            let hits = hits.clone();
+            async move {
+                hits.lock()
+                    .unwrap()
+                    .push(format!("{}|{}", q.provider, q.account.clone().unwrap_or_default()));
+                let token = |slot: &str| json!({ "access_token": format!("tok-{slot}"), "expires": FAR_FUTURE, "ttl_ms": 3_600_000u64 });
+                match mode {
+                    // New broker: host policy selects `astra2` when no account is given.
+                    "host-named" => {
+                        let slot = q.account.clone().unwrap_or_else(|| "astra2".into());
+                        let mut body = token(&slot);
+                        body["account"] = json!(slot);
+                        (StatusCode::OK, Json(body))
+                    }
+                    // Old broker: ignores `account`, always the bare slot, no `account` field.
+                    "old" => (StatusCode::OK, Json(token("default"))),
+                    // Misbehaving broker: says it served another slot than asked.
+                    _ => {
+                        let mut body = token("astra2");
+                        body["account"] = json!("astra2");
+                        (StatusCode::OK, Json(body))
+                    }
+                }
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn remote_explicit_default_is_never_served_from_host_policy_or_mismatched_slot() {
+    // Host policy = named: explicit default still gets the default slot, and
+    // the wire request always carries `account=default`.
+    let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let endpoint = spawn(policy_broker("host-named", hits.clone())).await;
+    let client = RemoteBroker::new(&endpoint, "m", reqwest::Client::new(), TokenCache::new())
+        .with_account_policy(AccountPolicy::new());
+    let tok = client
+        .access_token_for(&CredentialRef::default_for(OAuthProviderId::OpenAiCodex))
+        .await
+        .unwrap();
+    assert_eq!(tok.token, "tok-default");
+    assert_eq!(client.access_token(OAuthProviderId::OpenAiCodex).await.unwrap().token, "tok-default");
+    assert!(hits.lock().unwrap().iter().all(|h| h == "openai-codex|default"), "{:?}", hits.lock().unwrap());
+    // Legacy policy-free fetch (bare provider) is the only call that lets the host decide.
+    let fetcher = agent_core::auth::BrokerClient::new(&endpoint, "m");
+    let legacy = agent_core::auth::resolve_remote(&fetcher, &TokenCache::new(), "openai-codex", 0)
+        .await
+        .unwrap();
+    assert_eq!(legacy.access_token, "tok-astra2");
+
+    // Old broker (ignores account, no `account` in response): default OK, named REJECTED and not cached.
+    let endpoint = spawn(policy_broker("old", Arc::new(Mutex::new(Vec::new())))).await;
+    let cache = TokenCache::new();
+    let client = RemoteBroker::new(&endpoint, "m", reqwest::Client::new(), cache.clone())
+        .with_account_policy(AccountPolicy::new());
+    assert_eq!(
+        client
+            .access_token_for(&CredentialRef::default_for(OAuthProviderId::OpenAiCodex))
+            .await
+            .unwrap()
+            .token,
+        "tok-default"
+    );
+    let err = client
+        .access_token_for(&named(OAuthProviderId::OpenAiCodex, "astra2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BrokerError::Transport(_)), "{err:?}");
+    assert!(err.to_string().contains("different account"), "{err}");
+    let dbg = format!("{cache:?}");
+    assert!(!dbg.contains("openai-codex@astra2"), "mismatched token must not be cached: {dbg}");
+    // Same via the pinned/policy path.
+    let policy = AccountPolicy::new().with(
+        OAuthProviderId::OpenAiCodex,
+        AccountSelector::Account(Account::named("astra2").unwrap()),
+    );
+    let client = RemoteBroker::new(&endpoint, "m", reqwest::Client::new(), TokenCache::new())
+        .with_account_policy(policy);
+    assert!(client.access_token(OAuthProviderId::OpenAiCodex).await.is_err());
+
+    // Misbehaving broker answering `default` with another slot: rejected.
+    let endpoint = spawn(policy_broker("mismatch", Arc::new(Mutex::new(Vec::new())))).await;
+    let cache = TokenCache::new();
+    let client = RemoteBroker::new(&endpoint, "m", reqwest::Client::new(), cache.clone())
+        .with_account_policy(AccountPolicy::new());
+    let err = client
+        .access_token_for(&CredentialRef::default_for(OAuthProviderId::OpenAiCodex))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("different account"), "{err}");
+    assert!(!format!("{cache:?}").contains("openai-codex"));
 }
 
 /// `auto`: fresh read-only usage picks the account with headroom; exhausted,

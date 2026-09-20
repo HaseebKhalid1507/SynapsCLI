@@ -1516,14 +1516,42 @@ mod tests {
         let caps: serde_json::Value = resp.json().await.unwrap();
         for row in caps.as_array().expect("array") {
             let obj = row.as_object().unwrap();
-            let mut fields: Vec<&str> = obj.keys().map(String::as_str).collect();
-            fields.sort_unstable();
-            assert_eq!(
-                fields,
-                vec!["configured", "key", "kind", "name"],
-                "capability rows carry status only — no credential fields"
-            );
+            for field in obj.keys() {
+                assert!(
+                    matches!(
+                        field.as_str(),
+                        "configured" | "key" | "kind" | "name" | "accounts"
+                    ),
+                    "capability rows carry status only — unexpected field {field}"
+                );
+            }
             assert!(obj["configured"].is_boolean());
+            // Account rows (OAuth providers only) are non-secret listing rows.
+            if let Some(accounts) = obj.get("accounts").and_then(|a| a.as_array()) {
+                for account in accounts {
+                    for field in account.as_object().unwrap().keys() {
+                        assert!(
+                            matches!(
+                                field.as_str(),
+                                "provider"
+                                    | "label"
+                                    | "identity"
+                                    | "account_id_prefix"
+                                    | "expires"
+                                    | "added_at"
+                                    | "selected"
+                                    | "cooldown_until"
+                            ),
+                            "account rows must never carry credential fields: {field}"
+                        );
+                    }
+                    let prefix = account
+                        .get("account_id_prefix")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    assert!(prefix.len() <= 8, "account id must be a short prefix");
+                }
+            }
         }
     }
 
