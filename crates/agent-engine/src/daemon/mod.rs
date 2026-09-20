@@ -32,6 +32,9 @@ use registry::{DaemonInfo, DaemonLock, DaemonPaths};
 pub const EXIT_REFUSED: i32 = 3;
 /// Exit code for a protocol/version refusal on the client side.
 pub const EXIT_VERSION: i32 = 2;
+/// The daemon was lost (SIGKILL / crash) and reconnection failed within the
+/// budget (`SYNAPS_TUI_ATTACH_RECONNECT_SECS`).
+pub const EXIT_DAEMON_LOST: i32 = 4;
 /// Env var carrying the write end of the ready pipe to a spawned daemon.
 pub const READY_FD_ENV: &str = "SYNAPS_DAEMON_READY_FD";
 /// How long `spawn_detached` waits for the child's ready byte.

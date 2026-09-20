@@ -312,6 +312,54 @@ impl SocketTransport {
         self.last_error.as_ref()
     }
 
+    /// `true` if the daemon announced a reload before EOF (graceful); `false`
+    /// means a crash/SIGKILL (unexpected).
+    pub fn is_reload_pending(&self) -> bool {
+        self.reload_pending.is_some()
+    }
+
+    /// The pid the daemon reported in `Welcome`.
+    pub fn daemon_pid(&self) -> u32 {
+        self.welcome.pid
+    }
+
+    /// The reconnect budget from `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60).
+    pub fn reconnect_budget() -> Duration {
+        std::env::var("SYNAPS_TUI_ATTACH_RECONNECT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60))
+    }
+
+    /// One attempt at reconnecting (Hello + Attach). On success replaces
+    /// `self` and returns the snapshot. On `Refused` / `Version` the error is
+    /// terminal (caller should stop retrying). Other errors are transient.
+    pub async fn reconnect_once(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        let was_owner = self.input_owner == Some(self.client);
+        let generation = self.reload_pending.unwrap_or(self.welcome.generation);
+        let mut hello = self.hello.clone();
+        hello.reconnect_of = Some(ClientReconnect {
+            previous_client: self.client,
+            session_id: self.session.clone(),
+            was_owner,
+            generation,
+        });
+        let mode = if was_owner { AttachMode::Takeover } else { mode };
+        match Connected::connect(&self.path, hello).await {
+            Ok(conn) => {
+                match Self::attach(conn, Attach::Existing { session_id: self.session.clone(), mode }).await {
+                    Ok((t, snap)) => {
+                        *self = t;
+                        Ok(snap)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     // ── control fast path helpers (fresh connection each) ──
 
     pub async fn ping(path: &Path) -> Result<Pong, TransportError> {
@@ -618,6 +666,19 @@ impl ClientTransport for SocketTransport {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
         }
+    }
+
+    async fn reconnect_once(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        // Delegate to the inherent method (same name, not trait-dispatched).
+        SocketTransport::reconnect_once(self, mode).await
+    }
+
+    fn is_reload_pending(&self) -> bool {
+        SocketTransport::is_reload_pending(self)
+    }
+
+    fn daemon_pid(&self) -> u32 {
+        SocketTransport::daemon_pid(self)
     }
 }
 

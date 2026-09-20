@@ -48,8 +48,11 @@ impl From<&str> for SessionId {
 /// daemon cannot inherit from its own process (cwd, env overlay).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// `EngineOpts.continue_session`.
-    #[serde(default)]
+    /// `EngineOpts.continue_session`. `Some(None)` = bare `--continue` (most
+    /// recent journal). Plain serde encodes `Some(None)` as `null` and decodes
+    /// that as `None`, so the daemon could never receive a bare `--continue`
+    /// (soak F21) — `double_option` keeps the two levels apart on the wire.
+    #[serde(default, with = "double_option", skip_serializing_if = "Option::is_none")]
     pub continue_session: Option<Option<String>>,
     /// `EngineOpts.system`.
     #[serde(default)]
@@ -971,5 +974,64 @@ mod tests {
             crate::extensions::loader::ExtensionLoaderEvent::Started,
         ));
         assert!(serde_json::to_string(&cmd).is_err());
+    }
+}
+
+/// `Option<Option<String>>` on the wire without collapsing `Some(None)`:
+/// absent → `None`; `{"latest": true}` → `Some(None)`; `"id"` → `Some(Some(id))`.
+/// Older daemons/clients that sent a bare string or `null` still decode.
+mod double_option {
+    use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Latest { latest: bool },
+        Id(String),
+    }
+
+    pub fn serialize<S: Serializer>(v: &Option<Option<String>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            None => s.serialize_none(),
+            Some(None) => Wire::Latest { latest: true }.serialize(s),
+            Some(Some(id)) => Wire::Id(id.clone()).serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+        match Option::<Wire>::deserialize(d)? {
+            None => Ok(None),
+            Some(Wire::Latest { latest: true }) => Ok(Some(None)),
+            Some(Wire::Latest { latest: false }) => Err(de::Error::custom("continue_session: latest must be true")),
+            Some(Wire::Id(id)) => Ok(Some(Some(id))),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::SessionConfig;
+
+        fn rt(v: Option<Option<String>>) -> Option<Option<String>> {
+            let cfg = SessionConfig { continue_session: v, ..Default::default() };
+            let j = serde_json::to_string(&cfg).unwrap();
+            serde_json::from_str::<SessionConfig>(&j).unwrap().continue_session
+        }
+
+        #[test]
+        fn continue_session_round_trips_all_three_states() {
+            assert_eq!(rt(None), None);
+            assert_eq!(rt(Some(None)), Some(None), "bare --continue must survive the wire");
+            assert_eq!(rt(Some(Some("abc".into()))), Some(Some("abc".into())));
+        }
+
+        #[test]
+        fn continue_session_accepts_legacy_encodings() {
+            let old_null: SessionConfig = serde_json::from_str(r#"{"continue_session":null}"#).unwrap();
+            assert_eq!(old_null.continue_session, None);
+            let old_id: SessionConfig = serde_json::from_str(r#"{"continue_session":"xyz"}"#).unwrap();
+            assert_eq!(old_id.continue_session, Some(Some("xyz".into())));
+            let absent: SessionConfig = serde_json::from_str(r#"{}"#).unwrap();
+            assert_eq!(absent.continue_session, None);
+        }
     }
 }

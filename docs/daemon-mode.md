@@ -73,6 +73,25 @@ With no ID: attaches to the single live session, creates one if none, lists if s
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
 | `daemon.pid` | 0600 | pid |
 
+## Per-session journal lock (F10)
+
+Each session with an active `Runtime` holds an exclusive advisory `flock` on
+`<sessions_dir>/<session_id>.lock` (0600). This prevents two runtimes (e.g.
+a daemon actor and an in-process `synaps --continue X` with `SYNAPS_DAEMON=0`)
+from writing to the same journal — the second writer would silently erase the
+first's turns (last-writer-wins).
+
+| File | Scope | Purpose |
+|---|---|---|
+| `<sessions_dir>/<id>.lock` | 0600, per session | **flock = journal ownership.** Body: `<pid>\n<kind>\n` (`kind` = `daemon` or `tui`). Acquired on `SessionActor::create`; released on `Park` (no `Runtime`); re-acquired on `unpark`. Compaction (`LinkedSuccessor`) and `NewSession` re-acquire on the new id. |
+
+**Behaviour:**
+- `--continue X` when the lock is held → error: `session X is live in another process (pid N, kind) — use synaps --attach X, or synaps daemon sessions`.
+- Fresh sessions: best-effort lock (warn on failure, e.g. read-only fs).
+- Stale locks from dead processes never block (`flock` is released on fd close / process death).
+- `unpark` failure (lock held by another process) → error surfaced to the attaching client: `cannot unpark session X: journal locked by another process`.
+- **Windows:** `fs4` maps to `LockFileEx` — same semantics, no feature-gate needed.
+
 ## Protocol summary (line-JSON over UDS, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
 
 ```
@@ -174,6 +193,12 @@ C: bye | socket close = Detach (turn keeps running)
   pre-actor TUI/chat only cancelled the token. Defensible (the model is told the previous answer was cut);
   `/clear` or a fresh session discards it. Documented in `synaps chat /help` too.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
+- Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
+  within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
+  and could not reconnect within M s — session <id>; resume with synaps --attach <id> / --continue <id>`.
+  Both TUI (`--attach`) and line client (`synaps attach`) exit this way; the in-process TUI is unaffected.
+  During the reconnect window the client shows `daemon connection lost — reconnecting (Ns left)…` and
+  clears streaming/compacting state. A successful reconnect prints a notice and resumes normally.
 
 ## Reload (`synaps daemon reload`, phase 3 C3)
 
