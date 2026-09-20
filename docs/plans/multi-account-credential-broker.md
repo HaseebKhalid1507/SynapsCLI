@@ -2,6 +2,8 @@
 
 **Status:** draft for JR review · **Origin:** quota-juggling research 2026-09-20 (several ChatGPT/Codex "Astra" seats hit their weekly cap in ~24h; the broker can only hold one refresh token per provider) · **Branch:** `feat/multi-account-broker` off `dev @ 7bd33e07`
 
+> Execution update: the complete, goal-based scope and safety acceptance criteria are in [multi-account-broker-goals.md](multi-account-broker-goals.md). That plan supersedes draft details below, particularly cross-process refresh serialization, source/principal-scoped token caches, fail-closed invalid selectors, and bounded opt-in activation with provider verification. The initial Phase A-only PR scope is no longer the full task.
+
 ## Problem
 
 `auth.json` is a flat map keyed by provider id (`"openai-codex"`, `"anthropic"`, `"kimi-code"`, `"xai-auth"`, …). Every layer above it — `load_provider_auth(key)`, the per-provider refresh gate, `CredentialBroker::access_token(OAuthProviderId)`, `GET /token?provider=X` — assumes **exactly one credential per provider**. Holding a second ChatGPT seat today means a second profile directory (`~/.synaps-cli/<profile>/auth.json`) and a second broker process, and nothing can rotate between them.
