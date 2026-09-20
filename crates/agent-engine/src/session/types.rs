@@ -462,8 +462,11 @@ pub enum SessionCommand {
     /// abort_context, push user msg, start turn.
     Submit {
         text: String,
+        /// Pre-built canonical user content blocks (images, documents)
+        /// produced by `PendingAttachments::build_content` on the client.
+        /// Empty ⇔ text-only (backward compatible).
         #[serde(default)]
-        attachments: Vec<agent_core::core::rpc_protocol::RpcAttachment>,
+        attachments: Vec<serde_json::Value>,
     },
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
@@ -540,11 +543,16 @@ pub struct SessionReloadRecord {
 impl std::fmt::Debug for SessionCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Submit { attachments, .. } => f
-                .debug_struct("Submit")
-                .field("text", &format_args!("<redacted>"))
-                .field("attachments", &attachments.len())
-                .finish(),
+            Self::Submit { attachments, .. } => {
+                let kinds: Vec<&str> = attachments
+                    .iter()
+                    .filter_map(|b| b.get("type").and_then(|v| v.as_str()))
+                    .collect();
+                f.debug_struct("Submit")
+                    .field("text", &format_args!("<redacted>"))
+                    .field("attachments", &format_args!("{}:{:?}", attachments.len(), kinds))
+                    .finish()
+            }
             Self::Steer { .. } => f
                 .debug_struct("Steer")
                 .field("text", &format_args!("<redacted>"))
@@ -1053,6 +1061,27 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // Submit with content blocks round-trips.
+        let blocks = vec![
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}),
+            serde_json::json!({"type":"text","text":"hello"}),
+        ];
+        let submit_with = SessionCommand::Submit {
+            text: "describe".into(),
+            attachments: blocks.clone(),
+        };
+        let json = serde_json::to_string(&submit_with).unwrap();
+        let back: SessionCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            SessionCommand::Submit { text, attachments } => {
+                assert_eq!(text, "describe");
+                assert_eq!(attachments.len(), 2);
+                assert_eq!(attachments[0]["type"], "image");
+                assert_eq!(attachments[1]["type"], "text");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -1099,6 +1128,19 @@ mod tests {
         }
         let d = format!("{:?}", SessionCommand::Set { id: 4, setting: SessionSetting::ReloadPrompt });
         assert_eq!(d, "Set { id: 4, setting: ReloadPrompt }");
+
+        // Submit debug shows count+kinds, never base64.
+        let b64_secret = "aHVudGVyMi12ZXJ5LXNlY3JldA==";
+        let cmd = SessionCommand::Submit {
+            text: "x".into(),
+            attachments: vec![
+                serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":b64_secret}}),
+                serde_json::json!({"type":"document","title":"x.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBER"}}),
+            ],
+        };
+        let d = format!("{cmd:?}");
+        assert!(d.contains(r#"2:["image", "document"]"#), "{d}");
+        assert!(!d.contains(b64_secret), "base64 leaked: {d}");
     }
 
     #[test]
