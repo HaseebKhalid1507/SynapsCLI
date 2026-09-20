@@ -32,6 +32,14 @@ const MAX_DELAY_MS: u64 = 300_000;
 const MAX_DURATION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
+// merge(112): stream.rs constants not yet on this branch — local stubs until
+// the stream.rs merge lands these in their canonical location.
+const RESPONSES_AUTH_SUFFIX: &str =
+    " authentication rejected in stream. Sign in again or switch to an available account.";
+const RESPONSES_QUOTA_SUFFIX: &str =
+    " usage quota exhausted in stream. Add credit, wait for reset, or switch models.";
+const STREAM_INTERRUPTED: &str = "openai request failed: connection interrupted before response completed (stream retry budget exhausted)";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
@@ -536,7 +544,7 @@ fn status_kind(status: u16) -> (Outcome, String) {
 /// are not copied into the return value. Prefer `classify_turn_error` externally.
 pub fn classify_error(error: &str) -> (Outcome, String) {
     if error.strip_prefix("API error: ").unwrap_or(error)
-        == crate::runtime::openai::stream::STREAM_INTERRUPTED
+        == STREAM_INTERRUPTED
     {
         return provider_error("transient");
     }
@@ -617,8 +625,8 @@ pub fn classify_error(error: &str) -> (Outcome, String) {
     }
     for label in ["Codex", "OpenAI", "xAI"] {
         use crate::runtime::openai::stream::{
-            RESPONSES_AUTH_SUFFIX, RESPONSES_CAPACITY_SUFFIX, RESPONSES_EMPTY_SUFFIX,
-            RESPONSES_MISSING_TERMINAL_SUFFIX, RESPONSES_QUOTA_SUFFIX,
+            RESPONSES_CAPACITY_SUFFIX, RESPONSES_EMPTY_SUFFIX,
+            RESPONSES_MISSING_TERMINAL_SUFFIX,
         };
         for (suffix, kind) in [
             (RESPONSES_AUTH_SUFFIX, "auth"),

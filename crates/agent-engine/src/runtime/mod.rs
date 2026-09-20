@@ -1760,6 +1760,12 @@ impl Runtime {
             .await
     }
 
+    /// Session-driver preflight: same validation as request preflight.
+    /// merge(112): added for session_driver.rs; thin delegation.
+    pub(crate) async fn validate_session_driver_preflight(&self) -> Result<()> {
+        self.validate_request_preflight().await
+    }
+
     async fn validate_request_preflight_for(
         &self,
         model: &str,
@@ -2266,7 +2272,6 @@ impl Runtime {
     /// Inherit storage authority only, with a fresh worker execution author.
     /// Oneshot, start, and resume share this path; even resume must not reuse
     /// a prior actor. Off/no-lease context state and tool grants stay untouched.
-    #[allow(dead_code)] // merge(112): consumed in phase 5
     pub(crate) fn inherit_memory_backend(&mut self, binding: crate::memory_backend::MemoryBinding) {
         self.memory_backend = binding.fork_for_worker();
     }

@@ -34,10 +34,19 @@ pub use steer::SubagentSteerTool;
 pub(crate) fn apply_subagent_runtime_policy(
     runtime: &mut crate::Runtime,
     config: &crate::config::SynapsConfig,
+    memory_backend: Option<&crate::memory_backend::MemoryBinding>,
 ) {
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
     // path re-applies auth config there. (#158 A3 → engine-host B2)
+
+    // Parent runtime capability wins over reloaded global config. The common
+    // inherit path forks execution authorship, not authority: never copy
+    // session recall/capture leases or expand the worker tool registry.
+    runtime.inherit_memory_backend(memory_backend.cloned().unwrap_or_else(|| {
+        crate::memory_backend::MemoryBinding::from_config(&config.memory_backend)
+    }));
+
     runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
@@ -53,6 +62,17 @@ pub(crate) fn apply_subagent_runtime_policy(
         crate::runtime::budget::TurnRole::Worker,
         &config.turn_budgets,
     ));
+}
+
+/// Exact Fable 5.1 worker default requested for this harness. Do not infer
+/// capability or effort for sibling IDs, other providers, or foreground calls.
+#[allow(dead_code)] // merge(112): consumed when Fable model reaches the spawn paths
+pub(crate) fn apply_anthropic_worker_reasoning(runtime: &mut crate::Runtime) {
+    if runtime.codex_request_role() == crate::runtime::openai::catalog::CodexRequestRole::Worker
+        && runtime.model() == "anthropic/claude-fable-5-1"
+    {
+        runtime.set_reasoning_level(agent_core::reasoning::ReasoningLevel::XHigh);
+    }
 }
 
 /// Called after model selection by start, oneshot AND resume. Only inherit
@@ -190,7 +210,7 @@ mod cache_ttl_policy_tests {
         );
 
         // Apply the subagent runtime policy — this is what the spawn paths call.
-        apply_subagent_runtime_policy(&mut runtime, &parent_config);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None);
 
         // Post-condition: TTL must be FiveMinutes regardless of parent config.
         assert_eq!(
@@ -221,7 +241,7 @@ mod cache_ttl_policy_tests {
             "pre-condition: must be Hybrid"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None);
 
         assert_eq!(
             runtime.cache_ttl(),
@@ -245,7 +265,7 @@ mod cache_ttl_policy_tests {
             "pre-condition: Runtime::new() must default to 5m"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None);
 
         assert_eq!(
             runtime.cache_ttl(),
@@ -261,7 +281,7 @@ mod cache_ttl_policy_tests {
             .await
             .expect("Runtime::new() must succeed in test environment");
 
-        apply_subagent_runtime_policy(&mut runtime, &config);
+        apply_subagent_runtime_policy(&mut runtime, &config, None);
 
         assert_eq!(
             runtime.codex_request_role(),
@@ -347,7 +367,7 @@ mod cache_ttl_policy_tests {
 
         // ...and STAYS Off/no-lease after the subagent runtime policy runs.
         let config = crate::config::SynapsConfig::default();
-        apply_subagent_runtime_policy(&mut subagent, &config);
+        apply_subagent_runtime_policy(&mut subagent, &config, None);
         let after_policy = subagent.memory_context_status();
         assert_eq!(
             after_policy.durable,
@@ -411,7 +431,7 @@ mod codex_ultra_worker_tests {
         let parent = parent("openai-codex/gpt-6-astra", ReasoningLevel::Ultra).unwrap();
         assert_eq!(parent.wire_effort, Some(CodexWireEffort::XHigh));
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default());
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
         runtime.set_model(parent.qualified_model.clone());
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
         apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -442,7 +462,7 @@ mod codex_ultra_worker_tests {
             "openrouter/openai/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default());
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
             runtime.set_model(model.into());
             let default = runtime.reasoning_level();
             apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -483,7 +503,7 @@ mod codex_ultra_worker_tests {
             .is_none());
         }
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default());
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
         runtime.set_model("openai-codex/gpt-6-astra".into());
         apply_codex_worker_reasoning(&mut runtime, None);
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);

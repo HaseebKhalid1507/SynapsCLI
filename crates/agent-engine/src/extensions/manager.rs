@@ -258,6 +258,7 @@ pub(crate) type SharedDeferredRecords =
 /// acquisition stays inside the manager/lease lifecycle API.
 #[derive(Clone)]
 pub(crate) struct DeferredExtensionRecord {
+    #[allow(dead_code)] // merge(112): read by lease lifecycle (phase 6+)
     pub(crate) exclusive_memory: bool,
     pub(crate) manifest: ExtensionManifest,
     pub(crate) cwd: Option<std::path::PathBuf>,

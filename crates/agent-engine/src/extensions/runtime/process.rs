@@ -2842,6 +2842,7 @@ mod invoke_command_dispatch_tests {
 #[cfg(test)]
 mod exclusive_memory_tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn exclusive_memory_rejects_legacy_rpc() {

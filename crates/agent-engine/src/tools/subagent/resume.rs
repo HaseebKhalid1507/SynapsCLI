@@ -141,6 +141,7 @@ impl Tool for SubagentResumeTool {
             .map_err(|error| RuntimeError::Tool(error.to_string()))?;
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
+        let memory_backend = ctx.capabilities.memory_backend.clone();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -241,7 +242,7 @@ impl Tool for SubagentResumeTool {
                     // turn budget. Subagents are short-lived one-shots — paying the 1h
                     // write premium (~2× input price) on them is unrecoverable waste
                     // (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
+                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model_a.clone());
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
@@ -262,6 +263,7 @@ impl Tool for SubagentResumeTool {
                     ).await;
 
                     let mut tool_count = 0u32;
+                    let mut response_baseline = (0usize, 0usize, 0u32);
                     let mut total_input_tokens = 0u64;
                     let mut total_output_tokens = 0u64;
                     let mut total_cache_read = 0u64;
@@ -286,6 +288,16 @@ impl Tool for SubagentResumeTool {
                                                 status: "💭 thinking...".to_string(),
                                             }));
                                         }
+                                    }
+                                    crate::StreamEvent::Llm(LlmEvent::ResponseStart) => {
+                                        let s = state_a.read().unwrap();
+                                        response_baseline = (s.partial_text.len(), s.tool_log.len(), tool_count);
+                                    }
+                                    crate::StreamEvent::Llm(LlmEvent::ResponseReset) => {
+                                        let mut s = state_a.write().unwrap();
+                                        s.partial_text.truncate(response_baseline.0);
+                                        s.tool_log.truncate(response_baseline.1);
+                                        tool_count = response_baseline.2;
                                     }
                                     crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                         state_a.write().unwrap().partial_text.push_str(&text);
