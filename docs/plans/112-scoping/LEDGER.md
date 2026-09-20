@@ -83,3 +83,4 @@ never spawns it. Sidecar binary located via config.executable or
 | 10-live | daemon (bella, release) | DARK: no context/forum tools, survives reload; auto+tiny thresholds: "Context rollover deferred" advisory reached thin client | — | — |
 | workspace | all | 4438+7 (autonomous fixture) | 6 pre-existing (4× memory_context_e2e need SYNAPS_AXEL_TEST_BIN, continuous_memory order-flake, tui client_diet flake) | — |
 | fix-recall | synaps-engine | 2390 | 0 | 12 |
+| audit | workspace (on #121) | 4459 | 0 | — |
