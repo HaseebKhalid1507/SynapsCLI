@@ -508,7 +508,7 @@ impl StreamMethods {
                 );
                 let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                    agent_core::TurnError::budget(dimension),
+                    budget_meter.exhaustion_error(dimension),
                 )));
                 return Ok(());
             }};
