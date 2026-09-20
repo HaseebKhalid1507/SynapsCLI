@@ -343,44 +343,120 @@ fn worker_threads_from(raw: Option<&str>, ncpu: usize) -> Option<usize> {
 enum ThinClient {
     Tui { profile: Option<String> },
     Line { profile: Option<String> },
+    /// Plain `synaps [--system ..] [--continue ..]` with **no** `--attach`:
+    /// adopt a daemon that is *already* running (fresh session, exactly
+    /// `--attach --new` semantics) — never spawn one. Only becomes a thin
+    /// client after [`probe_daemon`] says somebody holds the flock;
+    /// otherwise the ordinary in-process boot. `SYNAPS_DAEMON_ADOPT=0`
+    /// turns this off; `--no-extensions` skips it (daemon extensions are
+    /// shared, so the flag cannot be honoured over the socket).
+    Adopt { profile: Option<String> },
+}
+
+/// `SYNAPS_DAEMON_ADOPT`: ON unless `0`/`false`/`off`/`no`. Off means a
+/// plain `synaps` never looks for a running daemon (always in-process).
+fn adopt_enabled() -> bool {
+    !matches!(
+        std::env::var("SYNAPS_DAEMON_ADOPT").ok().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
 }
 
 fn thin_client() -> Option<ThinClient> {
-    thin_client_from(std::env::args().skip(1), agent_engine::daemon::enabled())
+    thin_client_from(std::env::args().skip(1), agent_engine::daemon::enabled(), adopt_enabled())
 }
 
-fn thin_client_from<I: IntoIterator<Item = String>>(args: I, daemon_enabled: bool) -> Option<ThinClient> {
+/// Top-level `Cli` options that always take a value (`--system FILE`,
+/// `-s FILE`, `--name NAME`, `--prompt-manifest PATH`). Their value must
+/// not be mistaken for a subcommand positional, or `synaps --attach --new
+/// --system x.md` silently boots as a fat in-process-shaped client on the
+/// socket (no auto-spawn, no allocator diet, multi-thread runtime).
+const VALUE_OPTS: &[&str] = &["--system", "-s", "--name", "--prompt-manifest"];
+/// Top-level options with an optional value (`num_args = 0..=1`): the next
+/// token is their value iff it does not start with `-`, exactly as clap
+/// parses `synaps --attach abc` / `synaps --continue foo`.
+const OPT_VALUE_OPTS: &[&str] = &["--attach", "--continue"];
+
+fn thin_client_from<I: IntoIterator<Item = String>>(
+    args: I,
+    daemon_enabled: bool,
+    adopt: bool,
+) -> Option<ThinClient> {
     if !daemon_enabled {
         return None;
     }
     let mut want_profile = false;
+    let mut want_value = false;
+    let mut maybe_value = false;
     let mut profile: Option<String> = None;
     let mut first_positional: Option<String> = None;
     let mut attach_flag = false;
+    // Any flag outside the plain-TUI set (`--system/-s`, `--continue`,
+    // `--prompt-manifest`, `--profile`): `--help`, `--version`,
+    // `--no-extensions`, attach modifiers, typos — never adopt, let clap
+    // decide exactly as before.
+    let mut other_flag = false;
     for a in args {
         if want_profile {
             want_profile = false;
             profile = Some(a);
             continue;
         }
+        if want_value {
+            want_value = false;
+            continue;
+        }
+        if maybe_value {
+            maybe_value = false;
+            if !a.starts_with('-') {
+                continue;
+            }
+        }
         if a == "--attach" || a.starts_with("--attach=") {
             attach_flag = true;
+            maybe_value = a == "--attach";
         } else if a == "--profile" {
             want_profile = true;
         } else if let Some(p) = a.strip_prefix("--profile=") {
             profile = Some(p.to_string());
-        } else if !a.starts_with('-') && first_positional.is_none() {
-            first_positional = Some(a);
+        } else if VALUE_OPTS.contains(&a.as_str()) {
+            want_value = true;
+            // `--name` requires `--attach` (clap): not part of the plain-TUI set.
+            other_flag |= a == "--name";
+        } else if OPT_VALUE_OPTS.contains(&a.as_str()) {
+            maybe_value = true;
+        } else if !a.starts_with('-') {
+            if first_positional.is_none() {
+                first_positional = Some(a);
+            }
+        } else {
+            other_flag = true;
         }
     }
     if first_positional.as_deref() == Some("attach") {
         Some(ThinClient::Line { profile })
     } else if attach_flag && first_positional.is_none() {
         Some(ThinClient::Tui { profile })
+    } else if adopt && first_positional.is_none() && !other_flag {
+        Some(ThinClient::Adopt { profile })
     } else {
         None
     }
 }
+
+/// Adopt probe: is a daemon for this profile already holding the flock?
+/// Reaps stale socket/json/pid first (same as `ensure_running`), never
+/// spawns, never touches a live daemon. Cheap: one `flock` attempt.
+fn probe_daemon(profile: Option<String>) -> bool {
+    use agent_engine::daemon::{registry, DaemonOpts};
+    let paths = DaemonOpts { profile, ..Default::default() }.paths();
+    registry::reap_stale(&paths);
+    registry::is_alive(&paths)
+}
+
+/// Set by `main` when a plain `synaps` found a running daemon: the clap
+/// branch runs the socket client with `--attach --new` semantics.
+static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Auto-spawn (jcode model) before the runtime exists: a live daemon or a
 /// freshly spawned one. Runs BEFORE the thin re-exec/diet so a failed spawn
@@ -391,6 +467,7 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
     let (profile, line) = match kind {
         ThinClient::Tui { profile } => (profile.clone(), false),
         ThinClient::Line { profile } => (profile.clone(), true),
+        ThinClient::Adopt { .. } => unreachable!("Adopt never spawns — probed in main"),
     };
     let opts = daemon::DaemonOpts { profile, ..Default::default() };
     match daemon::ensure_running(&opts) {
@@ -501,12 +578,21 @@ fn scrub_reexec_env() {
 fn main() -> anyhow::Result<()> {
     let mut thin = false;
     if let Some(kind) = thin_client() {
-        match ensure_daemon(&kind) {
-            None => thin = true,
-            Some(reason) => {
-                eprintln!("daemon unavailable: {reason} — running in-process");
-                tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
-                std::env::set_var(ATTACH_FALLBACK, "1");
+        if let ThinClient::Adopt { profile } = &kind {
+            // Attach only if somebody is already running; otherwise the
+            // ordinary in-process boot, byte-for-byte as before.
+            if probe_daemon(profile.clone()) {
+                ADOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                thin = true;
+            }
+        } else {
+            match ensure_daemon(&kind) {
+                None => thin = true,
+                Some(reason) => {
+                    eprintln!("daemon unavailable: {reason} — running in-process");
+                    tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+                    std::env::set_var(ATTACH_FALLBACK, "1");
+                }
             }
         }
     }
@@ -543,7 +629,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if ADOPTED.load(std::sync::atomic::Ordering::SeqCst) && cli.command.is_none() && cli.attach.is_none() {
+        cli.attach = Some(None);
+        cli.new_session = true;
+    }
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
             return cmd::prompt::run(action);
@@ -582,6 +672,7 @@ async fn async_main() -> anyhow::Result<()> {
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
                     name: cli.session_name,
+                    adopted: ADOPTED.load(std::sync::atomic::Ordering::SeqCst),
                 })
                 .await?;
             }
@@ -741,19 +832,83 @@ mod worker_threads_tests {
     #[test]
     fn thin_client_requires_daemon_flag() {
         use super::ThinClient::{Line, Tui};
-        assert_eq!(thin_client_from(v(&["--attach"]), false), None);
-        assert_eq!(thin_client_from(v(&["attach"]), false), None);
-        assert_eq!(thin_client_from(v(&["--attach"]), true), Some(Tui { profile: None }));
-        assert_eq!(thin_client_from(v(&["--attach=abc"]), true), Some(Tui { profile: None }));
-        assert_eq!(thin_client_from(v(&["attach"]), true), Some(Line { profile: None }));
-        assert_eq!(thin_client_from(v(&["--profile", "x", "attach"]), true), Some(Line { profile: Some("x".into()) }));
-        assert_eq!(thin_client_from(v(&["--profile=x", "--attach", "--new"]), true), Some(Tui { profile: Some("x".into()) }));
+        assert_eq!(thin_client_from(v(&["--attach"]), false, false), None);
+        assert_eq!(thin_client_from(v(&["attach"]), false, false), None);
+        assert_eq!(thin_client_from(v(&["--attach"]), true, false), Some(Tui { profile: None }));
+        assert_eq!(thin_client_from(v(&["--attach=abc"]), true, false), Some(Tui { profile: None }));
+        assert_eq!(thin_client_from(v(&["attach"]), true, false), Some(Line { profile: None }));
+        assert_eq!(thin_client_from(v(&["--profile", "x", "attach"]), true, false), Some(Line { profile: Some("x".into()) }));
+        assert_eq!(thin_client_from(v(&["--profile=x", "--attach", "--new"]), true, false), Some(Tui { profile: Some("x".into()) }));
         // bare `attach` is only the subcommand position, not a value elsewhere
-        assert_eq!(thin_client_from(v(&["send", "attach"]), true), None);
-        assert_eq!(thin_client_from(v(&["--profile", "attach"]), true), None);
+        assert_eq!(thin_client_from(v(&["send", "attach"]), true, false), None);
+        assert_eq!(thin_client_from(v(&["--profile", "attach"]), true, false), None);
         // `--attach` next to a subcommand is not the TUI attach path
-        assert_eq!(thin_client_from(v(&["daemon", "status", "--attach"]), true), None);
-        assert_eq!(thin_client_from(v(&[]), true), None);
+        assert_eq!(thin_client_from(v(&["daemon", "status", "--attach"]), true, false), None);
+        assert_eq!(thin_client_from(v(&[]), true, false), None);
+    }
+
+    #[test]
+    fn thin_client_sniff_skips_option_values() {
+        use super::ThinClient::{Line, Tui};
+        let t = Some(Tui { profile: None });
+        // value-taking options: their value is not a subcommand positional
+        assert_eq!(thin_client_from(v(&["--attach", "--new", "--system", "/tmp/id.md"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--new", "-s", "you are x"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--new", "--name", "ambient"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--prompt-manifest", "m.toml"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--system", "/tmp/id.md", "--attach", "--new"]), true, false), t);
+        // optional-value options: next non-dash token is the value (clap num_args 0..=1)
+        assert_eq!(thin_client_from(v(&["--attach", "abc"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--attach", "--continue", "foo"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--continue", "--attach"]), true, false), t);
+        // a real positional after the option values still means "not the TUI attach path"
+        assert_eq!(thin_client_from(v(&["--attach", "abc", "status"]), true, false), None);
+        assert_eq!(thin_client_from(v(&["--system", "x", "daemon", "status"]), true, false), None);
+        assert_eq!(thin_client_from(v(&["--system", "x", "attach"]), true, false), Some(Line { profile: None }));
+        // the value itself may be a subcommand name — still a value
+        assert_eq!(thin_client_from(v(&["--attach", "--name", "attach"]), true, false), t);
+        assert_eq!(thin_client_from(v(&["--system", "attach"]), true, false), None);
+    }
+
+    #[test]
+    fn thin_client_adopt_only_for_plain_tui_argv() {
+        use super::ThinClient::{Adopt, Line, Tui};
+        let a = Some(Adopt { profile: None });
+        // plain TUI invocations adopt a running daemon
+        assert_eq!(thin_client_from(v(&[]), true, true), a);
+        assert_eq!(thin_client_from(v(&["--system", "/tmp/id.md"]), true, true), a);
+        assert_eq!(thin_client_from(v(&["-s", "you are x"]), true, true), a);
+        assert_eq!(thin_client_from(v(&["--continue"]), true, true), a);
+        assert_eq!(thin_client_from(v(&["--continue", "foo", "--system", "x"]), true, true), a);
+        assert_eq!(thin_client_from(v(&["--prompt-manifest", "m.toml"]), true, true), a);
+        assert_eq!(
+            thin_client_from(v(&["--profile", "x", "--system", "y"]), true, true),
+            Some(Adopt { profile: Some("x".into()) })
+        );
+        // adopt off (SYNAPS_DAEMON_ADOPT=0) or daemon off → ordinary boot
+        assert_eq!(thin_client_from(v(&[]), true, false), None);
+        assert_eq!(thin_client_from(v(&[]), false, true), None);
+        // explicit attach paths are unchanged by the adopt flag
+        assert_eq!(thin_client_from(v(&["--attach", "--new"]), true, true), Some(Tui { profile: None }));
+        assert_eq!(thin_client_from(v(&["attach"]), true, true), Some(Line { profile: None }));
+        // any subcommand, or any flag outside the plain-TUI set, never adopts
+        for argv in [
+            &["daemon", "status"][..],
+            &["chat", "-s", "x"],
+            &["run"],
+            &["--version"],
+            &["-V"],
+            &["--help"],
+            &["--no-extensions"],
+            &["--system", "x", "--no-extensions"],
+            &["--observe"],
+            &["--keep-warm"],
+            &["--new"],
+            &["--name", "n"],
+            &["--bogus"],
+        ] {
+            assert_eq!(thin_client_from(v(argv), true, true), None, "{argv:?}");
+        }
     }
 
     #[test]

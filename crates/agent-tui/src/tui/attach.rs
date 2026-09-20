@@ -40,6 +40,56 @@ pub struct AttachOpts {
     /// `--name`: name the created session (`synaps send --session <name>`
     /// resolves it at once).
     pub name: Option<String>,
+    /// A plain `synaps` adopted a running daemon (no explicit `--attach`):
+    /// after attaching, show what else lives in this daemon so parked
+    /// work stays discoverable (F1).
+    pub adopted: bool,
+}
+
+/// One-line inventory of the daemon's other sessions, shown when a plain
+/// `synaps` adopts the daemon (F1): the lid-close user must be able to
+/// *see* their parked task, without being surprise-attached to it.
+/// `None` when nothing else is there.
+pub fn adopt_banner(
+    sessions: &[agent_engine::session::SessionMeta],
+    ours: &SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    use agent_engine::session::SessionLifecycle as L;
+    let mut others: Vec<&agent_engine::session::SessionMeta> =
+        sessions.iter().filter(|m| &m.id != ours).collect();
+    if others.is_empty() {
+        return None;
+    }
+    others.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+    let n = others.len();
+    let parked = others.iter().filter(|m| matches!(m.lifecycle, L::Parked)).count();
+    let live = n - parked;
+    let mut line = format!(
+        "{n} other session{} in this daemon ({live} live, {parked} parked) — `synaps --attach <ID>` to resume one:",
+        if n == 1 { "" } else { "s" }
+    );
+    for m in others.iter().take(5) {
+        let age = now.signed_duration_since(m.created_at);
+        let age = if age.num_hours() >= 1 {
+            format!("{}h ago", age.num_hours())
+        } else {
+            format!("{}m ago", age.num_minutes().max(0))
+        };
+        let state = match m.lifecycle {
+            L::Parked => "parked",
+            _ if m.clients > 0 => "live, attached",
+            _ => "live",
+        };
+        let short = m.id.as_str();
+        let name = m.name.as_deref().map(|n| format!(" \"{n}\"")).unwrap_or_default();
+        let cwd = m.cwd.as_ref().map(|c| format!(" {}", c.display())).unwrap_or_default();
+        line.push_str(&format!("\n  {short}{name}  {state}  {age}{cwd}"));
+    }
+    if n > 5 {
+        line.push_str(&format!("\n  … and {} more (`synaps daemon sessions`)", n - 5));
+    }
+    Some(line)
 }
 
 /// The slice of `Welcome.sessions` the attach decision needs.
@@ -198,6 +248,7 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
             clients: m.clients,
         })
         .collect();
+    let welcome_sessions = conn.welcome.sessions.clone();
     let (attach, notice) = choose_attach(&opts, &live, cwd).map_err(cfg_err)?;
     if let Some(n) = notice {
         // Before the TUI takes the terminal, so it survives on the scrollback.
@@ -241,6 +292,19 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
+    // Notices queued before boot go first.
+    for n in super::run_setup::take_boot_notices() {
+        app.push_msg(ChatMessage::System(n));
+    }
+    if opts.adopted {
+        let how = if opts.continue_session.is_some() { "continued session" } else { "fresh session" };
+        app.push_msg(ChatMessage::System(format!(
+            "adopted the running daemon ({how}) — SYNAPS_DAEMON_ADOPT=0 or `synaps daemon stop` for in-process"
+        )));
+        if let Some(b) = adopt_banner(&welcome_sessions, &snapshot.meta.id, chrono::Utc::now()) {
+            app.push_msg(ChatMessage::System(b));
+        }
+    }
     for w in &config.warnings {
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
     }
@@ -324,7 +388,52 @@ mod tests {
             keep_warm: false,
             new_session,
             name: None,
+            adopted: false,
         }
+    }
+
+    fn meta(id: &str, lifecycle: agent_engine::session::SessionLifecycle, clients: usize, mins_ago: i64) -> agent_engine::session::SessionMeta {
+        agent_engine::session::SessionMeta {
+            id: SessionId::from(id.to_string()),
+            name: None,
+            model: "m".into(),
+            cwd: Some(std::path::PathBuf::from("/w")),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(mins_ago),
+            continued: false,
+            continue_info: None,
+            host_pid: 1,
+            lifecycle,
+            clients,
+            input_owner: None,
+            awaiting_input: 0,
+            journal_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn adopt_banner_lists_other_sessions_only() {
+        use agent_engine::session::SessionLifecycle as L;
+        let ours = SessionId::from("20260919-000000-ours".to_string());
+        let now = chrono::Utc::now();
+        // alone in the daemon → nothing to say
+        assert!(adopt_banner(&[meta("20260919-000000-ours", L::Live, 1, 0)], &ours, now).is_none());
+        let sessions = vec![
+            meta("20260919-000000-ours", L::Live, 1, 0),
+            meta("20260919-010000-aaaa", L::Parked, 0, 125),
+            meta("20260919-020000-bbbb", L::Live, 1, 3),
+        ];
+        let b = adopt_banner(&sessions, &ours, now).unwrap();
+        assert!(b.starts_with("2 other sessions in this daemon (1 live, 1 parked)"), "{b}");
+        assert!(!b.contains("ours"), "{b}");
+        // newest first, state + age + cwd per row
+        let rows: Vec<&str> = b.lines().skip(1).collect();
+        assert!(rows[0].contains("20260919-020000-bbbb") && rows[0].contains("live, attached") && rows[0].contains("m ago") && rows[0].contains("/w"), "{b}");
+        assert!(rows[1].contains("20260919-010000-aaaa") && rows[1].contains("parked") && rows[1].contains("2h ago"), "{b}");
+        // capped at 5 rows + overflow line
+        let many: Vec<_> = (0..8).map(|i| meta(&format!("20260919-00000{i}-xxxx"), L::Parked, 0, i)).collect();
+        let b = adopt_banner(&many, &ours, now).unwrap();
+        assert_eq!(b.lines().count(), 1 + 5 + 1, "{b}");
+        assert!(b.contains("and 3 more"), "{b}");
     }
 
     fn live(id: &str) -> LiveSession {
