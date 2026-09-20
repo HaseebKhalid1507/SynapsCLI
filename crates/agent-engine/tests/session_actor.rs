@@ -1225,10 +1225,16 @@ async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model(
     handle.closed().await;
 
     // (b) image-capable model → turn starts with the block in the user message.
-    // Fresh stub: the first one served its single scripted response.
-    let (url, _) = stub(SSE_HI, false).await;
-    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
-    let handle = host.create_session(cfg()).await.unwrap();
+    // Provider-prefixed id: the validator's static modality table is keyed
+    // that way (an unprefixed `claude-sonnet-4-5` has no image evidence in a
+    // test process with an empty capability cache and is refused too).
+    let handle = host
+        .create_session(SessionConfig {
+            model_override: Some("anthropic/claude-sonnet-4-6".into()),
+            ..cfg()
+        })
+        .await
+        .unwrap();
     let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
         .await
         .unwrap();
