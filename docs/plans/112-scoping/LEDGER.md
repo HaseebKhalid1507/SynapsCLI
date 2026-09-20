@@ -80,3 +80,5 @@ never spawns it. Sidecar binary located via config.executable or
 | docs   | ✅ docs/tools.json regenerated (28 tools), contract.json updated (session.drive) |
 | checkpoint-B | synaps-engine | 2110 | 0 (1 order-flake: malformed_scope_fails_closed…, passes 3/3 alone) | 12 |
 | checkpoint-B | synaps-core | 732 | 0 | 8 |
+| 10-live | daemon (bella, release) | DARK: no context/forum tools, survives reload; auto+tiny thresholds: "Context rollover deferred" advisory reached thin client | — | — |
+| workspace | all | 4438+7 (autonomous fixture) | 6 pre-existing (4× memory_context_e2e need SYNAPS_AXEL_TEST_BIN, continuous_memory order-flake, tui client_diet flake) | — |
