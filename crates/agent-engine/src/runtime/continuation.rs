@@ -605,6 +605,7 @@ impl crate::Runtime {
 }
 
 /// Host continuation metadata never goes onto any provider wire.
+#[allow(dead_code)] // merge(112): consumed in phase 5
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
     if !messages.iter().any(|m| m.get("_synaps_context").is_some()) {
         return None;

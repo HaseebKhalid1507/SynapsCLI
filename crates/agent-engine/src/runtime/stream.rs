@@ -1031,7 +1031,18 @@ impl StreamMethods {
                 // returns empty content, and that is a clean stop — not an
                 // error. Surfacing the scary message there would make every
                 // cancel look like a crash.
+                //
+                // F19: after a tool_result round (round > 0), an empty end_turn
+                // is a legitimate "nothing more to add" — the model already
+                // emitted text before the tool_use. Commit history cleanly
+                // instead of dropping the entire turn as an error.
                 if content.is_empty() {
+                    let after_tool_result = budget_meter.rounds_used() > 1;
+                    if after_tool_result && !cancel.is_cancelled() {
+                        // Legitimate empty end_turn after tool results — clean finish.
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        return Ok(());
+                    }
                     if !cancel.is_cancelled() {
                         let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                             agent_core::TurnError::provider(
@@ -2881,6 +2892,191 @@ mod rich_output_tests {
         assert_eq!(
             select_tool_result_content(None, None, "short", 10),
             Value::String("short".into())
+        );
+    }
+
+    /// F19 regression: an empty end_turn AFTER a tool_result round is a
+    /// legitimate "nothing more to add" — the model already spoke before the
+    /// tool_use. History must be intact (text + tool_use + tool_result), and
+    /// no error must be emitted.
+    #[tokio::test]
+    async fn f19_empty_end_turn_after_tool_result_is_clean_finish() {
+        // SSE round 1: text "pre-tool text" + tool_use(bash)
+        let round1 = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre-tool text"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_f19","name":"bash"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        // SSE round 2: empty end_turn (no content blocks)
+        let round2 = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_02","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let r1 = Arc::new(round1.to_string());
+        let r2 = Arc::new(round2.to_string());
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let cc = cc.clone();
+                    let r1 = r1.clone();
+                    let r2 = r2.clone();
+                    async move {
+                        let n = cc.fetch_add(1, Ordering::SeqCst);
+                        let sse = if n == 0 { r1.as_str() } else { r2.as_str() };
+                        (StatusCode::OK, [("content-type", "text/event-stream")], sse.to_string())
+                            .into_response()
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TextTool));
+        let tools = Arc::new(RwLock::new(registry));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let hook_bus = Arc::new(crate::extensions::hooks::HookBus::new());
+
+        let session = StreamSession {
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_context: None,
+            final_capture_history: Arc::new(Mutex::new(None)),
+            context_window: 200_000,
+            continuation: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::runtime::continuation::ContinuationState::default(),
+            )),
+            auth: Arc::new(RwLock::new(AuthState {
+                auth_token: "test-token".into(),
+                auth_type: "api_key".into(),
+                refresh_token: None,
+                token_expires: Some(9_999_999_999_999),
+            })),
+            client: reqwest::Client::new(),
+            credential_source: crate::auth::CredentialSource::Local,
+            token_cache: crate::auth::TokenCache::new(),
+            options: ApiOptions {
+                anthropic_base_url: Some(base_url),
+                ..Default::default()
+            },
+            api_retries: 0,
+            refusal_retries: 0,
+            model: "claude-sonnet-4-6".into(),
+            tools,
+            system_prompt: None,
+            thinking_budget: 0,
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
+            tx,
+            cancel: CancellationToken::new(),
+            steering_rx: None,
+            watcher_exit_path: None,
+            max_tool_output: 30_000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            session_manager,
+            subagent_registry: Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            )),
+            event_queue: Arc::new(crate::events::EventQueue::new(100)),
+            hook_bus,
+            session_id: None,
+            cwd: None,
+            env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
+            secret_prompt: None,
+            auto_approve_confirms: true,
+            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            orchestration: None,
+            delegation_parent: None,
+            turn_correlation_id: "turn-f19".into(),
+            progressive_tool_disclosure: false,
+            activation_confirm: agent_core::config::ActivationConfirm::default(),
+            tool_session_id,
+            mcp_runtime: None,
+            mcp_session_scope: None,
+            extension_runtime: None,
+            extension_session_scope: None,
+            turn_budget: crate::runtime::budget::TurnBudget::for_role(
+                crate::runtime::budget::TurnRole::Foreground,
+            ),
+        };
+
+        let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            StreamMethods::run_stream_internal(session, messages),
+        )
+        .await
+        .expect("stream loop must finish");
+        run.expect("stream loop ok — F19: empty end_turn after tool_result is not an error");
+
+        let mut history = Vec::new();
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Session(SessionEvent::Error(_)) => saw_error = true,
+                _ => {}
+            }
+        }
+
+        assert!(!saw_error, "F19: empty end_turn after tool_result must NOT emit an error");
+        // History: user + assistant(text + tool_use) + user(tool_result)
+        assert!(
+            history.len() >= 3,
+            "F19: history must contain user + assistant + tool_result, got {} messages",
+            history.len()
+        );
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[1]["role"], "assistant");
+        let content = history[1]["content"].as_array().expect("assistant content");
+        assert!(
+            content.iter().any(|b| b["type"] == "text"),
+            "F19: assistant message must contain the pre-tool text"
+        );
+        assert!(
+            content.iter().any(|b| b["type"] == "tool_use"),
+            "F19: assistant message must contain the tool_use"
+        );
+        assert_eq!(history[2]["role"], "user");
+        assert!(
+            history[2]["content"][0]["type"] == "tool_result",
+            "F19: third message must be tool_result"
         );
     }
 }
