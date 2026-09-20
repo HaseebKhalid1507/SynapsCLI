@@ -736,7 +736,7 @@
     }
   },
   {
-    "description": "Retrieve a reactive subagent's result. Non-blocking — returns immediately (status + partial output if still running). Standard flow: poll with subagent_status while the subagent runs; when subagent_status reports a terminal status (completed/failed/timed_out/cancelled), call this ONCE with reconciled=true — that single call both collects the result and attests reconciliation, clearing the completion gate. Calling without reconciled=true is an inspection-only read: it leaves the completion gate blocked and forces a second call. reconciled=true is idempotent and safe on repeats.",
+    "description": "Retrieve a reactive subagent's result. Non-blocking — returns immediately (status + partial output if still running). Standard flow: dispatch with subagent_start, carry on (or end your turn) — the subagent's completion event wakes you with a terminal status (completed/failed/timed_out/cancelled); then call this ONCE with reconciled=true — that single call both collects the result and attests reconciliation, clearing the completion gate. Calling without reconciled=true is an inspection-only read: it leaves the completion gate blocked and forces a second call. reconciled=true is idempotent and safe on repeats.",
     "name": "subagent_collect",
     "parameters": {
       "properties": {
@@ -805,7 +805,7 @@
     }
   },
   {
-    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — poll with subagent_status until it reports a terminal status, use subagent_steer to inject guidance mid-run, then call subagent_collect once with reconciled=true to retrieve the result and attest reconciliation in the same call. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background and is REACTIVE: when it finishes, a completion event is pushed into your queue and you are woken with its status — do NOT sleep, busy-wait, or poll in a loop waiting for it. After dispatching, end your turn or keep doing other work; on the completion event call subagent_collect once with reconciled=true. subagent_status is for an occasional progress peek, and subagent_steer injects guidance mid-run. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation that must block, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
     "name": "subagent_start",
     "parameters": {
       "properties": {
@@ -894,7 +894,7 @@
     }
   },
   {
-    "description": "Poll the current state of a reactive subagent. Returns status (running/completed/cancelled/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. If the status is 'failed', an 'error' field contains the failure reason. Non-blocking — returns immediately.",
+    "description": "Poll the current state of a reactive subagent. Returns status (running/completed/cancelled/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. If the status is 'failed', an 'error' field contains the failure reason. Non-blocking — returns immediately. Use for an occasional progress peek only: subagents are reactive and push a completion event that wakes you when they finish, so never call this in a sleep/poll loop.",
     "name": "subagent_status",
     "parameters": {
       "properties": {
