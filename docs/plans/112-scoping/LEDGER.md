@@ -146,3 +146,11 @@ never spawns it. Sidecar binary located via config.executable or
 - `attachment` (rpc.rs fn): helper merged into `load_rpc_user_content`
 
 All production symbols ported. Test name differences are deliberate.
+## Track G — TUI context-sidecar UX (feat/112-tui-context-sidecar)
+| phase | crate | passed | failed | ignored | notes |
+|-------|-------|--------|--------|---------|-------|
+| G1 | synaps-tui | 3 (response_reset filter) | 0 | 0 | reset_response_preview_basic_truncation, reset_discards_only_current_response_and_keeps_steering, response_reset_shrinks_transcript_preview |
+| G2 | synaps-tui | 49 (sidecar filter) | 0 | 0 | pill_loading_state_shows_label, status_line_shows_loading + existing |
+| G3 | synaps-tui | 3 (async_startup filter) | 0 | 0 | delayed_completion_drains_loading, disable_cancels, disabled_sidecars_never_start |
+| G7 | synaps-tui | 599 (full) | 1 (client_diet flake) | 5 | splitn whitespace fix + command result refactor |
+| G-gate | workspace | all green | 1 (client_diet flake) | — | clippy --all-targets clean |

@@ -204,6 +204,19 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
         .invoke_command_collected(plugin_extension_id, command_name, args, &request_id)
         .await;
 
+    // Settings editors also use this helper. They are NOT driver activation
+    // surfaces; only the explicit slash-command task consumes the return value.
+    let _ =
+        apply_interactive_command_result(plugin_extension_id, command_name, result, report, app);
+}
+
+pub(crate) fn apply_interactive_command_result(
+    plugin_extension_id: &str,
+    command_name: &str,
+    result: Result<serde_json::Value, String>,
+    report: synaps_cli::extensions::invoke_output::InvokeOutputReport,
+    app: &mut App,
+) -> Option<serde_json::Value> {
     let notice = report.limit_notice();
     for event in report.events {
         match event {
@@ -218,8 +231,6 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
         }
     }
     if let Some(notice) = notice {
-        // Preserve error visibility: dropped Error events surface the
-        // notice on the error channel.
         if notice.severity_error {
             app.push_msg(ChatMessage::Error(notice.message));
         } else {
@@ -227,11 +238,15 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
         }
     }
 
-    if let Err(err) = result {
-        app.push_msg(ChatMessage::Error(format!(
-            "interactive plugin command {}:{} failed: {}",
-            plugin_extension_id, command_name, err
-        )));
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            app.push_msg(ChatMessage::Error(format!(
+                "interactive plugin command {}:{} failed: {}",
+                plugin_extension_id, command_name, err
+            )));
+            None
+        }
     }
 }
 
