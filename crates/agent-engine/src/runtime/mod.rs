@@ -2033,7 +2033,7 @@ impl Runtime {
         // only baseline model-visible records are accepted back.
         memory_context::validate_contribution(
             &contribution,
-            &memory_project_id(),
+            &self.memory_context_project_id(),
             budget,
             &memory_context::DisclosureGrantSet::model_visible_only(),
         )?;
@@ -2091,7 +2091,7 @@ impl Runtime {
         let outcome = memory_context::resolve_turn_recall(
             &self.memory_context_state,
             &self.retained_recall_turn,
-            &memory_project_id(),
+            &self.memory_context_project_id(),
             self.context_window(),
             messages,
             memory_context::RECALL_HARD_TIMEOUT,
@@ -2702,7 +2702,7 @@ impl Runtime {
         memory_context::emit_memory_observability_event(
             &memory_context::MemoryObservabilityEvent::context_disabled(
                 &session,
-                &memory_project_id(),
+                &self.memory_context_project_id(),
             ),
         );
         // State mutex released before touching the lease manager: the
@@ -2875,7 +2875,7 @@ impl Runtime {
         memory_context::MemoryContextLease::grant(
             memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
             state.session_id().clone(),
-            memory_project_id(),
+            self.memory_context_project_id(),
             provider_id,
             mode,
             memory_context::CapturePolicy::default(),
