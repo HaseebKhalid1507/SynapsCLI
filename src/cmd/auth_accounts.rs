@@ -142,8 +142,8 @@ pub async fn list(opts: ListOptions) -> Result<(), String> {
         );
     } else {
         println!(
-            "{:<16} {:<12} {:<30} {:<10} {:<22} {}",
-            "PROVIDER", "ACCOUNT", "IDENTITY", "ID", "EXPIRES", "SELECTED"
+            "{:<16} {:<12} {:<30} {:<10} {:<22} SELECTED",
+            "PROVIDER", "ACCOUNT", "IDENTITY", "ID", "EXPIRES"
         );
         for row in &rows {
             let mut flags = Vec::new();
