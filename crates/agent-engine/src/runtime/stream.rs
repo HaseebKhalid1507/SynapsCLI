@@ -85,6 +85,10 @@ pub(super) struct StreamSession {
     /// Per-session environment snapshot forwarded as `ToolCapabilities.env`.
     /// `None` = inherit process env (in-process hosts).
     pub(super) env: Option<crate::session::types::SessionEnv>,
+    /// Names of env vars stripped as secrets (T5).
+    pub(super) env_stripped: Vec<String>,
+    /// Shared per-session "already warned" set (T5 dedup fix).
+    pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
@@ -295,6 +299,8 @@ impl StreamMethods {
             session_id,
             cwd,
             env,
+            env_stripped,
+            env_warned,
             secret_prompt,
             auto_approve_confirms,
             telemetry_level,
@@ -979,7 +985,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd.clone(), env: env.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -1227,6 +1233,8 @@ impl StreamMethods {
                         let prompt_inner = secret_prompt.clone();
                         let cwd_inner = cwd.clone();
                         let env_inner = env.clone();
+                        let env_stripped_inner = env_stripped.clone();
+                        let env_warned_inner = env_warned.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let orchestration_inner = orchestration.clone();
@@ -1307,7 +1315,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd_inner.clone(), env: env_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let (output, rich_blocks) = match res {
@@ -2201,6 +2209,8 @@ mod rich_output_tests {
             session_id: None,
             cwd: None,
             env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,

@@ -342,6 +342,31 @@ Path-like + missing → non-zero exit with `--system <val>: no such file
 > but the launcher `~/Jawz/tools/jawz` already passes `--system /tmp/jawz-identity.md`
 > unchanged, so the heuristic must accept bare paths.
 
+### Journal env persistence and secret notices (T5)
+
+`SessionConfig.env` and `SessionConfig.env_stripped` are persisted in the
+session journal (as part of the `Session` struct, BEFORE `api_messages` so
+`read_session_header` sees them).
+
+**Rehydration precedence** (`--continue`/unpark after daemon restart):
+1. An explicit `Hello.env` from the continuing client wins (the user is
+   sitting in a shell *now*).
+2. If the client sent `env: None` (in-process/legacy), the journal's
+   persisted env fills in.
+3. The daemon's own process env is **never** used for a daemon-hosted session.
+
+**Belt-and-braces:** the journal-side write runs every env pair through
+`is_secret_key` — a value for a denylisted key is dropped even if a future
+client forgets to strip.  The `env_stripped` list records **names only**.
+
+**Loud notices:** when a bash command exits non-zero AND the script text
+references a name from `env_stripped` (by `$NAME`, `${NAME}`, `$env:NAME`,
+or `NAME=`), a system notice is appended to the tool output, once per name
+per session:
+```
+note: $GH_TOKEN was stripped from the session env as a secret; reattach from a shell that has it (synaps --system … from that shell) — the daemon never receives credentials.
+```
+
 ## What changes on the default (in-process) path — read before merging
 
 Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):

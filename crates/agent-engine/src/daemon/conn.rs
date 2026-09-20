@@ -300,6 +300,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             if config.env.is_none() {
                 config.env = hello.env.clone();
             }
+            if config.env_stripped.is_empty() {
+                config.env_stripped = hello.env_stripped.clone();
+            }
             if let Some(cwd) = &config.cwd {
                 if !cwd.is_absolute() || !cwd.is_dir() {
                     let _ = tx

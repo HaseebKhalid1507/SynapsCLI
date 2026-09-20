@@ -285,6 +285,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             SessionConfig {
                 cwd: meta.cwd.clone(),
                 env: None,
+            env_stripped: Vec::new(),
                 ..SessionConfig::default()
             },
             false,

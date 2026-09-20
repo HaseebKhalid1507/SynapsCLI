@@ -60,9 +60,9 @@ pub fn looks_path_like(val: &str) -> bool {
 /// user's home directory.
 fn resolve_against(val: &str, client_cwd: &Path) -> PathBuf {
     let trimmed = val.trim();
-    if trimmed.starts_with('~') {
+    if let Some(rest) = trimmed.strip_prefix('~') {
         if let Some(home) = dirs::home_dir() {
-            return home.join(trimmed.strip_prefix("~/").unwrap_or(&trimmed[1..]));
+            return home.join(rest.strip_prefix('/').unwrap_or(rest));
         }
     }
     let p = Path::new(trimmed);
