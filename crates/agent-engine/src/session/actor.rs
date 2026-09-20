@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -27,6 +28,8 @@ use crate::engine::reactor::{
 };
 use crate::engine::session::ConversationState;
 use crate::engine::setup::BackgroundTasks;
+use crate::extensions::invoke_output::{invoke_event_channel, InvokeOutputBudget};
+use crate::extensions::session_driver::{Grant, Reply};
 use crate::runtime::compaction::{
     apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
     CompactionTransition,
@@ -409,6 +412,13 @@ pub struct SessionActor {
     pub(crate) name: Arc<arc_swap::ArcSwap<Option<String>>>,
     /// F10: per-session journal ownership lock. Held while Live, released on Park.
     pub(crate) session_lock: Option<agent_core::session_lock::SessionLock>,
+    // ── E: session driver (actor-side, behind `session.drive` permission) ──
+    pub(crate) driver: Option<super::driver::DriverState>,
+    pub(crate) driver_pending: Option<super::driver::DriverPending>,
+    /// Generation counter for invalidating stale pending results.
+    pub(crate) driver_generation: u64,
+    /// Interrupted owner (for generic stop commands across revocation).
+    pub(crate) driver_interrupted_owner: Option<String>,
 }
 
 impl SessionActor {
@@ -638,6 +648,10 @@ impl SessionActor {
             presence,
             name,
             session_lock,
+            driver: None,
+            driver_pending: None,
+            driver_generation: 0,
+            driver_interrupted_owner: None,
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -803,6 +817,7 @@ impl SessionActor {
             && !self.keep_warm
             && self.config.persist
             && !self.is_parked()
+            && self.driver.is_none()
     }
 
     /// `<sessions>/<id>.json` — written by both persistence modes.
@@ -811,6 +826,208 @@ impl SessionActor {
         crate::config::resolve_write_path("sessions")
             .join(format!("{id}.json"))
             .is_file()
+    }
+
+    // ── E: driver arm/revoke ─────────────────────────────────────────────
+
+    /// Invalidate the driver: drop `DriverState`, cancel pending work, emit
+    /// `DriverRevoked` with any undelivered steering, and release the host grant.
+    pub(crate) fn driver_revoke(&mut self, reason: &str) {
+        let undelivered = self
+            .driver
+            .as_mut()
+            .map(|d| d.steering.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let was_active = self.driver.is_some() || self.driver_pending.is_some();
+        if let Some(driver) = &self.driver {
+            self.driver_interrupted_owner = Some(driver.grant.plugin_id.clone());
+            self.host
+                .release_driver(&driver.grant.plugin_id, &self.id);
+        }
+        self.driver_generation = self.driver_generation.wrapping_add(1);
+        self.driver_pending = None;
+        self.driver = None;
+        if was_active {
+            self.emit(SessionEventWire::DriverRevoked {
+                reason: reason.to_string(),
+                undelivered_steering: undelivered,
+            });
+        }
+        self.rearm_park();
+    }
+
+    /// Spawn the plugin's start command as an async task; the result is
+    /// processed in `driver_tick()` (P4). Invokes the command via the
+    /// extension manager, just like the TUI's `start_command`.
+    pub(crate) fn driver_start(&mut self, plugin: String, command: String, arg: String) {
+        // Revoke any existing driver first (TUI :369).
+        if self.driver.is_some() || self.driver_pending.is_some() {
+            self.driver_revoke("explicit command");
+        }
+
+        let manager = self.host.ext_manager().clone();
+        let session_id = self.id.0.clone();
+
+        // Resolve handler + check permissions synchronously.
+        let (handler, timeout) = match manager.try_read() {
+            Ok(mgr) => {
+                let handler = match mgr.user_action_handler(&plugin) {
+                    Ok(h) => h,
+                    Err(error) => {
+                        self.emit(SessionEventWire::SystemNotice(error));
+                        return;
+                    }
+                };
+                let timeout = if mgr.session_driver_handler(&plugin).is_ok() {
+                    5
+                } else {
+                    self.emit(SessionEventWire::SystemNotice(
+                        "session driver extension lacks validated session.drive permission".into(),
+                    ));
+                    return;
+                };
+                (handler, timeout)
+            }
+            Err(_) => {
+                self.emit(SessionEventWire::SystemNotice(
+                    "extensions are loading or busy — try again shortly".into(),
+                ));
+                return;
+            }
+        };
+
+        let handler_generation = super::driver::live_generation(&handler).ok();
+
+        let owner = plugin.clone();
+        let cmd = command.clone();
+        let args: Vec<String> = arg.split_whitespace().map(str::to_owned).collect();
+
+        let generation = self.driver_generation;
+        let task_handler = handler.clone();
+        self.driver_pending = Some(super::driver::DriverPending {
+            generation,
+            session_id: session_id.clone(),
+            task: super::driver::Task(tokio::spawn(async move {
+                let (sink, collector) =
+                    invoke_event_channel(InvokeOutputBudget::default());
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let (result, report) =
+                    tokio::time::timeout(Duration::from_secs(timeout), async {
+                        tokio::join!(
+                            task_handler.invoke_command(&cmd, args, &request_id, sink),
+                            collector.collect()
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        (
+                            Err(format!("interactive command timed out ({timeout}s)")),
+                            crate::extensions::invoke_output::InvokeOutputReport {
+                                events: Vec::new(),
+                                counters: Default::default(),
+                            },
+                        )
+                    });
+                super::driver::TaskResult::Command {
+                    owner,
+                    command,
+                    handler: task_handler,
+                    handler_generation,
+                    result,
+                    report,
+                }
+            })),
+        });
+    }
+
+    /// Arm the driver after a successful start command result. Mirrors
+    /// the TUI's `arm()` (:538-602). Called from P4's `driver_tick()`.
+    #[allow(dead_code)] // consumed by P4 driver_tick
+    pub(crate) fn driver_arm(
+        &mut self,
+        owner: String,
+        handler: Arc<dyn crate::extensions::runtime::ExtensionHandler>,
+        handler_generation: u64,
+        reply: Reply,
+    ) -> std::result::Result<(), String> {
+        let manager = self.host.ext_manager().clone();
+        super::driver::same_handler(&manager, &owner, &handler, handler_generation)?;
+
+        if self.driver.is_some() {
+            return Err("cannot replace an armed grant".into());
+        }
+
+        let session_id = self.id.0.clone();
+        let (grant, proposal) = Grant::from_start(&owner, &session_id, reply)?;
+
+        // Claim the host-level single-tenancy grant.
+        self.host
+            .claim_driver(&owner, &self.id)
+            .map_err(|e| e.to_string())?;
+
+        let cancel = CancellationToken::new();
+        let workers = self.runtime.subagent_registry().clone();
+        let worker_epoch = workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_spawn_cancellation(Some(cancel.clone()));
+        let deadline_task = grant.deadline().map(|deadline| {
+            let c = cancel.clone();
+            let w = workers.clone();
+            super::driver::Task(tokio::spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                c.cancel();
+                super::driver::cancel_workers(&w, worker_epoch);
+            }))
+        });
+
+        let models = grant.models().to_vec();
+        let proposal_notice = proposal.notice.clone();
+        let selection = proposal.selection.clone();
+        let deadline_ms = super::driver::deadline_ms(&grant);
+        let run_id = grant.run_id.clone();
+        let cost_at_arm = self.conv.session_cost;
+
+        let mut state = super::driver::DriverState {
+            selection: proposal.selection.clone(),
+            grant,
+            handler,
+            handler_generation,
+            cancel,
+            workers,
+            worker_epoch,
+            deadline_task,
+            proposal: None,
+            awaiting_terminal: false,
+            outcome: None,
+            feedback: crate::extensions::feedback::Tracker::default(),
+            completed_feedback: "unknown",
+            steering: VecDeque::new(),
+            auto_wakes_blocked: false,
+            cost_at_arm,
+        };
+
+        super::driver::schedule(&mut state, proposal)?;
+
+        // Apply context mode (session-only, like /context auto/off).
+        let context_notice = state.grant.apply_context_mode(&self.runtime)?;
+        if let Some(text) = context_notice {
+            self.emit(SessionEventWire::SystemNotice(text));
+        }
+
+        self.driver_interrupted_owner = None;
+        self.driver = Some(state);
+
+        self.emit(SessionEventWire::DriverArmed {
+            plugin_id: owner,
+            run_id,
+            models,
+            selection,
+            deadline_ms,
+            notice: proposal_notice,
+        });
+
+        Ok(())
     }
 
     /// F10: release the old lock, acquire on `new_id`. Best-effort (log on failure).
@@ -2058,6 +2275,10 @@ impl SessionActor {
     /// pending prompts `None`, save, close PTYs. Replies on
     /// `CHECKPOINT_QUERY_ID` so `reload.rs` can await it per session.
     pub(crate) async fn checkpoint(&mut self, reason: CheckpointReason) {
+        // E-P3: driver does NOT survive reload (§3 S2/S5).
+        if self.driver.is_some() {
+            self.driver_revoke("daemon reloaded");
+        }
         if self.streaming {
             self.cancel_turn().await;
         }
@@ -2176,7 +2397,12 @@ impl SessionActor {
                     self.submit(text).await
                 }
             }
-            SessionCommand::Cancel => self.cancel_turn().await,
+            SessionCommand::Cancel => {
+                if self.driver.is_some() {
+                    self.driver_revoke("canceled");
+                }
+                self.cancel_turn().await;
+            }
             SessionCommand::Answer { prompt_id, value } => self.answer(prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
             // `CompactionStarted` is the contract; no notice before it.
@@ -2184,6 +2410,9 @@ impl SessionActor {
                 self.compact(instructions, "manual").await;
             }
             SessionCommand::NewSession => {
+                if self.driver.is_some() {
+                    self.driver_revoke("session replaced");
+                }
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .set_session_id(Some(self.conv.session.id.clone()));
@@ -2202,7 +2431,12 @@ impl SessionActor {
             }
             SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
             SessionCommand::Detach { client } => self.detach(client),
-            SessionCommand::End { reason } => return ControlFlow::Break(reason),
+            SessionCommand::End { reason } => {
+                if self.driver.is_some() {
+                    self.driver_revoke("session ending");
+                }
+                return ControlFlow::Break(reason);
+            }
             SessionCommand::Resync { .. } => self.emit(SessionEventWire::SystemNotice(
                 "resync not supported yet".into(),
             )),
@@ -2245,11 +2479,9 @@ impl SessionActor {
                 }),
                 HostEvent::LoaderProgress(ev) => self.emit(SessionEventWire::LoaderProgress(ev)),
             },
-            // E-P0: stub — P3 implements the full DriverStart handler.
-            SessionCommand::DriverStart { .. } => {
-                self.emit(SessionEventWire::SystemNotice(
-                    "driver commands are not yet implemented".into(),
-                ));
+            // E-P3: driver start handler.
+            SessionCommand::DriverStart { plugin, command, arg } => {
+                self.driver_start(plugin, command, arg);
             }
         }
         ControlFlow::Continue(())
@@ -2262,6 +2494,10 @@ impl SessionActor {
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
         );
+        // E-P3: clean up driver before teardown.
+        if self.driver.is_some() {
+            self.driver_revoke("session ending");
+        }
         if self.streaming {
             self.cancel_turn().await;
         }

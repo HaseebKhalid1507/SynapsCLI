@@ -379,6 +379,10 @@ impl Grant {
         self.deadline
     }
 
+    pub fn models(&self) -> &[Selection] {
+        &self.models
+    }
+
     fn check_delay(&self, delay: Duration) -> Result<(), String> {
         if self.deadline.is_some_and(|deadline| {
             Instant::now()
