@@ -144,6 +144,10 @@ impl Client {
             SessionEventWire::Lifecycle(l) => self.out(&format!("[session {l:?}]\n")),
             SessionEventWire::Reloading { generation, .. } => self.out(&format!("[daemon reloading → generation {generation}]\n")),
             SessionEventWire::SubagentRows(_) | SessionEventWire::Resumed { .. } => {}
+            // E-P0: stub rendering; P9 replaces.
+            SessionEventWire::DriverArmed { plugin_id, .. } => self.out(&format!("[driver armed: {plugin_id}]\n")),
+            SessionEventWire::DriverRevoked { reason, .. } => self.out(&format!("[driver revoked: {reason}]\n")),
+            SessionEventWire::DriverTurnOutcome { .. } => {}
         }
     }
 

@@ -116,7 +116,7 @@ fn fake_older_binary(dir: &Path) -> PathBuf {
     let p = dir.join("synaps-old");
     std::fs::write(
         &p,
-        "#!/bin/sh\nif [ \"$2\" = \"--print-version\" ]; then echo '{\"binary_version\":\"0.0.1\",\"protocol_version\":2}'; exit 0; fi\nexit 1\n",
+        "#!/bin/sh\nif [ \"$2\" = \"--print-version\" ]; then echo '{\"binary_version\":\"0.0.1\",\"protocol_version\":3}'; exit 0; fi\nexit 1\n",
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;

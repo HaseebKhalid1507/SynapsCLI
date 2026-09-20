@@ -366,7 +366,7 @@ pub(super) async fn handle_session_event_arm(
                 app.status_text = None;
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
             }
-            TurnTrigger::EventAuto | TurnTrigger::Compaction => {
+            TurnTrigger::EventAuto | TurnTrigger::Compaction | TurnTrigger::DriverAuto => {
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.spinner_frame = 0;
@@ -584,6 +584,10 @@ pub(super) async fn handle_session_event_arm(
             );
             app.request_redraw();
         }
+        // E-P0: driver events — stub rendering; P8 replaces with full UX.
+        SessionEventWire::DriverArmed { .. }
+        | SessionEventWire::DriverRevoked { .. }
+        | SessionEventWire::DriverTurnOutcome { .. } => {}
     }
     ArmFlow::Continue
 }

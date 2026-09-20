@@ -75,6 +75,7 @@ async fn real_plugin_explicit_start_limits_and_host_revocation() {
         error_kind: "none".into(),
         model: initial.selection.model.clone(),
         effort: initial.selection.effort.clone(),
+        session_id: None,
     };
     let next = poll(handler.clone(), request).await.unwrap();
     let next = grant.accept(next).unwrap().unwrap();
@@ -90,6 +91,7 @@ async fn real_plugin_explicit_start_limits_and_host_revocation() {
             error_kind: "none".into(),
             model: next.selection.model,
             effort: next.selection.effort,
+            session_id: None,
         },
     )
     .await
@@ -121,6 +123,7 @@ async fn real_plugin_exact_failover_and_restart_never_resurrects() {
             error_kind: "auth".into(),
             model: first.selection.model,
             effort: first.selection.effort,
+            session_id: None,
         },
     )
     .await
@@ -144,6 +147,7 @@ async fn real_plugin_exact_failover_and_restart_never_resurrects() {
             error_kind: "none".into(),
             model: second.selection.model,
             effort: second.selection.effort,
+            session_id: None,
         },
     )
     .await
@@ -184,6 +188,7 @@ async fn real_plugin_time_checkpoint_continues_same_model_with_context_off() {
         error_kind: "wall_clock".into(),
         model: initial.selection.model.clone(),
         effort: initial.selection.effort.clone(),
+        session_id: None,
     };
     let response = poll(handler.clone(), request.clone()).await.unwrap();
     assert_eq!(
@@ -206,6 +211,7 @@ async fn real_plugin_time_checkpoint_continues_same_model_with_context_off() {
             error_kind: "none".into(),
             model: next.selection.model,
             effort: next.selection.effort,
+            session_id: None,
         },
     )
     .await
@@ -279,6 +285,7 @@ async fn real_plugin_repeated_completed_turns_advance_exact_favorite_once() {
             model: first.selection.model.clone(),
             effort: first.selection.effort.clone(),
             feedback: Some((*feedback).into()),
+            session_id: None,
         };
         let reply = poll(handler.clone(), request.clone()).await.unwrap();
         let duplicate = poll(handler.clone(), request).await.unwrap();
@@ -321,6 +328,7 @@ async fn real_plugin_repeated_completed_turns_advance_exact_favorite_once() {
             model: selected.model,
             effort: selected.effort,
             feedback: Some("unknown".into()),
+            session_id: None,
         },
     )
     .await
@@ -365,6 +373,7 @@ async fn real_plugin_context_default_and_explicit_override_are_start_only() {
                 model: p.selection.model,
                 effort: p.selection.effort,
                 feedback: Some("changed".into()),
+                session_id: None,
             },
         )
         .await

@@ -442,7 +442,8 @@ class Driver:
                 raise Invalid("one JSON poll argument required")
             request = strict_json(text(args[0], 4096, "poll"))
             keys = {"run_id", "decision_id", "outcome", "error_kind", "model", "effort"}
-            if not isinstance(request, dict) or set(request) not in (keys, keys | {"feedback"}):
+            optional_keys = {"feedback", "session_id"}
+            if not isinstance(request, dict) or not (keys <= set(request) <= keys | optional_keys):
                 raise Invalid("invalid poll fields")
             if any(not isinstance(value, str) for value in request.values()):
                 raise Invalid("poll fields must be strings")
