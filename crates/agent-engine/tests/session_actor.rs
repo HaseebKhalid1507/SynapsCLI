@@ -1103,3 +1103,68 @@ async fn env_survives_park_unpark() {
     end(&mut b).await;
     handle.closed().await;
 }
+
+/// F18: a session with zero turns and zero clients cannot park (nothing to
+/// journal), so at the park deadline it must END — not sit Live with a
+/// Runtime resident forever. A session WITH history parks as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn zero_turn_session_ends_idle_at_park_deadline_while_one_turn_parks() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    std::env::set_var("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
+    let host = host().await;
+
+    // (a) zero turns → Ended(Idle), handle closes.
+    let handle = host
+        .create_session(SessionConfig { persist: true, ..cfg() })
+        .await
+        .unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(SessionCommand::Detach { client: a.client_id() }).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match a.next_event().await {
+                Some(e) => {
+                    if let SessionEventWire::Ended { reason } = e.event {
+                        break Some(reason);
+                    }
+                }
+                None => break None,
+            }
+        }
+    })
+    .await
+    .expect("zero-turn session must end at the park deadline");
+    assert!(
+        matches!(ended, Some(EndReason::Idle) | None),
+        "expected Ended(Idle) (or the stream closing on end), got {ended:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), handle.closed())
+        .await
+        .expect("handle must close — the actor must not stay Live");
+
+    // (b) one turn → Parked, still resumable.
+    let handle = host
+        .create_session(SessionConfig { persist: true, ..cfg() })
+        .await
+        .unwrap();
+    let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    b.send(submit("hi")).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    b.send(SessionCommand::Detach { client: b.client_id() }).await.unwrap();
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked, "one-turn session parks");
+    let (mut c, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    assert!(snap.conversation.api_messages.len() >= 2, "history survived park");
+    end(&mut c).await;
+    handle.closed().await;
+}

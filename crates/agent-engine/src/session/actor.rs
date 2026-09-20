@@ -798,8 +798,24 @@ impl SessionActor {
         }
     }
 
+    /// F18: a session with NO history can never park (nothing to journal),
+    /// so with no clients it would stay Live — Runtime resident — forever.
+    /// Same gates as `can_park` minus the history requirement: at the park
+    /// deadline such a session ends instead.
+    pub(crate) fn can_end_idle(&self) -> bool {
+        self.attached.is_empty()
+            && !self.streaming
+            && self.compact.is_none()
+            && self.pending_prompts.is_empty()
+            && self.conv.is_live()
+            && self.conv.api_messages.is_empty()
+            && self.conv.queued_message.is_none()
+            && !self.keep_warm
+            && !self.is_parked()
+    }
+
     fn rearm_park(&mut self) {
-        if !self.can_park() {
+        if !self.can_park() && !self.can_end_idle() {
             self.park_deadline = None;
             return;
         }
@@ -822,10 +838,14 @@ impl SessionActor {
     /// Save, close PTYs, drop `conv` THEN `runtime`. `background` (inbox
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
-    pub(crate) async fn park(&mut self) {
+    pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
         self.park_deadline = None;
+        if self.can_end_idle() {
+            tracing::info!(session = %self.id, "idle with no history — ending instead of parking (F18)");
+            return std::ops::ControlFlow::Break(EndReason::Idle);
+        }
         if !self.can_park() {
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         self.state = AttachState::Parking;
         self.set_lifecycle(SessionLifecycle::Parking);
@@ -836,14 +856,14 @@ impl SessionActor {
             tracing::warn!(session = %self.id, "park: save timed out — staying live");
             self.state = AttachState::Detached { running: false };
             self.set_lifecycle(SessionLifecycle::Live);
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         if !self.journal_exists() {
             // Never park what cannot be restored (H2).
             tracing::warn!(session = %self.id, "park: no journal on disk — staying live");
             self.state = AttachState::Detached { running: false };
             self.set_lifecycle(SessionLifecycle::Live);
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         if self.runtime.session_manager().active_count() > 0 {
             self.emit(SessionEventWire::SystemNotice(
@@ -869,6 +889,7 @@ impl SessionActor {
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Rebuild `runtime` + `conv` from the journal (`load_session_in_dir`
@@ -2320,7 +2341,11 @@ impl SessionTask {
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 _ = queue.notified() => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
-                _ = park_timer(actor.park_deadline) => actor.park().await,
+                _ = park_timer(actor.park_deadline) => {
+                    if let std::ops::ControlFlow::Break(reason) = actor.park().await {
+                        break reason;
+                    }
+                }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
                 _ = ext_ready(&mut actor.ext_ready) => {
                     actor.ext_ready = None;

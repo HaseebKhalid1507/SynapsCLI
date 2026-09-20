@@ -698,6 +698,10 @@ pub enum EndReason {
     HostShutdown,
     Evicted,
     Error,
+    /// F18: zero turns, zero clients, park grace elapsed. There is nothing
+    /// to journal, so the session cannot park; it ends instead of holding a
+    /// Runtime resident forever.
+    Idle,
 }
 
 // ── events + envelope ─────────────────────────────────────────────────────────
