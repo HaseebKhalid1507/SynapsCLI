@@ -386,6 +386,7 @@ impl ReferenceReactorExt {
                 }
                 StreamEvent::Agent(_) => {}
                 StreamEvent::Session(SessionEvent::Notice(_)) => {}
+                StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {} // merge(112): handled in phase 3
                 StreamEvent::Session(SessionEvent::Done) => {
                     self.r.streaming = false;
                     let had_pending = !self.r.pending_events.is_empty();

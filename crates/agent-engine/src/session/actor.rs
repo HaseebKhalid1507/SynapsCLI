@@ -1310,6 +1310,8 @@ impl SessionActor {
                 self.emit_conversation();
                 after = After::Failed;
             }
+            // merge(112): handled in phase 9 (Wall 1 — actor-owned checkpoint persistence)
+            StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
         }
 
         match after {
