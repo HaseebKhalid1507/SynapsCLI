@@ -504,6 +504,7 @@ fn live_reactive_subagent_end_to_end() {
                 tx_events: None,
             },
             capabilities: ToolCapabilities {
+                launch_cancel: None,
                 memory_backend: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,
@@ -587,6 +588,7 @@ fn live_reactive_subagent_end_to_end() {
                 tx_events: None,
             },
             capabilities: ToolCapabilities {
+                launch_cancel: None,
                 memory_backend: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,

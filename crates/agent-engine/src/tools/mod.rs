@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 // ── Module declarations ──────────────────────────────────────────────────────────
 
 mod bash;
+pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
-pub(crate) mod context_checkpoint;
 mod find;
 pub mod forum;
 mod grep;
@@ -94,13 +94,17 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
-    // merge(112) §4: MemoryBinding built from session cwd via from_config_with_cwd
-    // in apply_memory_backend_config (runtime/mod.rs).
+    /// Host-owned note storage binding. Runtime contexts always provide the
+    /// same binding; `None` is reserved for manually constructed contexts.
+    /// A present binding is exclusive: errors never permit legacy fallback.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
+    /// Originating turn cancellation, pinned before tool dispatch. A late
+    /// registration cannot inherit a later user's renewed launch authority.
+    pub launch_cancel: Option<crate::CancellationToken>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
     /// Current worker handle when this context belongs to a delegated
     /// runtime. `None` denotes the foreground root.

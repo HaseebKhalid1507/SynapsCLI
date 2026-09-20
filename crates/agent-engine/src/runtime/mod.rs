@@ -3505,6 +3505,7 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
@@ -3674,6 +3675,7 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,

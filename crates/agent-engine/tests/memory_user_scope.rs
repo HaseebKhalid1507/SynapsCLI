@@ -46,6 +46,7 @@ fn context(binding: &MemoryBinding) -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            launch_cancel: None,
             memory_backend: Some(binding.clone()),
             watcher_exit_path: None,
             tool_register_tx: None,

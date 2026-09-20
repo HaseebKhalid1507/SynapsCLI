@@ -3,7 +3,6 @@ use crate::runtime::continuation::SharedContinuation;
 use agent_core::core::context_policy::WorkPhase;
 use serde_json::{json, Value};
 
-#[allow(dead_code)] // merge(112): consumed in phase 5
 pub struct ContextCheckpointTool(pub SharedContinuation);
 #[async_trait::async_trait]
 impl Tool for ContextCheckpointTool {

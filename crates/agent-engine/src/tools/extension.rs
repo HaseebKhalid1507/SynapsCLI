@@ -46,7 +46,14 @@ impl crate::tools::Tool for ExtensionTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let binding = ctx
+            .capabilities
+            .memory_backend
+            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
+        if binding.exclusive() && crate::memory_backend::competing_note_tool(&self.tool_name) {
+            return Err(RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
+        }
         let value = self
             .handler
             .call_tool(&self.tool_name, params)
