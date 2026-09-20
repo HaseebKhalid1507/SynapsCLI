@@ -54,3 +54,14 @@ never spawns it. Sidecar binary located via config.executable or
 | workspace | ✅ no new failures (known: autonomous_plugin, extensions_contract, shared_memory_migration, sidecar_manager_protocol, tools_export, memory_context_e2e, continuous_memory_adversarial, TUI lib) |
 | clippy | ✅ `-D warnings` clean (synaps-engine, synaps) |
 | two-sided | ✅ no conflict markers |
+
+## Tests restore — JR dropped unit tests
+| commit | 97b24617 |
+|--------|----------|
+| files  | `stream.rs`, `translate.rs`, `codex.rs` (unit); `turn_budget_stream.rs` (attempted, reverted) |
+| source | 8bdabd4a |
+| check  | ✅ `cargo test -p synaps-engine --locked` |
+| engine | ✅ 2032 pass, 1 known (`static_table_and_wire_shape…`) |
+| clippy | ✅ no NEW warnings from restored tests |
+| ported | 4 Class A tests |
+| skipped | 6 Class B, ~86 Class C (see report) |

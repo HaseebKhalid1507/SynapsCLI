@@ -586,4 +586,32 @@ mod tests {
             "sanitized wire name must map back to the executable tool name"
         );
     }
+
+    fn shared(messages: Vec<Value>) -> Vec<crate::SharedMessage> {
+        messages.into_iter().map(std::sync::Arc::new).collect()
+    }
+
+    #[test]
+    fn text_only_translation_keeps_legacy_wire_including_separator() {
+        let messages = shared(vec![
+            json!({"role":"user","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}),
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{}}]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},
+                {"type":"text","text":"next"}
+            ]}),
+        ]);
+        let out = messages_to_oai(&messages, &Some("system".into()), &ToolNameMap::default());
+        assert_eq!(
+            serde_json::to_value(out).unwrap(),
+            json!([
+                {"role":"system","content":"system"},
+                {"role":"user","content":"onetwo"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"read","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"t1","name":"read","content":"ab"},
+                {"role":"assistant","content":" "},
+                {"role":"user","content":"next"}
+            ])
+        );
+    }
 }

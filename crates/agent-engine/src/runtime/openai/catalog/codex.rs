@@ -1781,4 +1781,49 @@ mod tests {
     fn missing_models_key_returns_error() {
         assert!(parse_codex_catalog_models(r#"{"data":[]}"#).is_err());
     }
+
+
+    #[test]
+    fn live_input_modalities_never_backfill_static_images() {
+        for (field, expected) in [
+            ("", vec![Modality::Text]),
+            (r#", "input_modalities": null"#, vec![Modality::Text]),
+            (r#", "input_modalities": ["text"]"#, vec![Modality::Text]),
+            (r#", "input_modalities": []"#, vec![]),
+            (r#", "input_modalities": ["image"]"#, vec![Modality::Image]),
+            (
+                r#", "input_modalities": ["text", "file"]"#,
+                vec![Modality::Text, Modality::File],
+            ),
+            (
+                r#", "input_modalities": ["Image", "image/png", "future"]"#,
+                vec![
+                    Modality::Other("Image".into()),
+                    Modality::Other("image/png".into()),
+                    Modality::Other("future".into()),
+                ],
+            ),
+        ] {
+            let body = format!(r#"{{"models":[{{"slug":"gpt-6-astra"{field}}}]}}"#);
+            let models = parse_codex_catalog_models(&body).unwrap();
+            assert_eq!(models[0].input_modalities, expected);
+            assert_eq!(models[0].source, CatalogSource::Live);
+        }
+    }
+
+    #[test]
+    fn malformed_input_modalities_reject_catalog_instead_of_authorizing_static() {
+        for value in [
+            r#""image""#,
+            "true",
+            "{}",
+            "[null]",
+            "[1]",
+            r#"["text", {}]"#,
+        ] {
+            let body =
+                format!(r#"{{"models":[{{"slug":"gpt-6-astra","input_modalities":{value}}}]}}"#);
+            assert!(parse_codex_catalog_models(&body).is_err());
+        }
+    }
 }

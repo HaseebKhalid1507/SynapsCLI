@@ -2216,6 +2216,25 @@ mod codex_decoder_tests {
         let (_decoder, text_acc, _events) = drive(&lines);
         assert_eq!(text_acc, "hi");
     }
+
+    const STREAM_INTERRUPTED: &str = "openai request failed: connection interrupted before response completed (stream retry budget exhausted)";
+
+    #[test]
+    fn exhaustion_is_transient_for_auto_driver_but_not_arbitrary_error_prose() {
+        use crate::extensions::session_driver::{classify_error, Outcome};
+        assert_eq!(
+            classify_error(STREAM_INTERRUPTED),
+            (Outcome::ProviderError, "transient".into())
+        );
+        assert_eq!(
+            classify_error(&format!("API error: {STREAM_INTERRUPTED}")),
+            (Outcome::ProviderError, "transient".into())
+        );
+        assert_eq!(
+            classify_error(&format!("denied: {STREAM_INTERRUPTED}")).0,
+            Outcome::Blocked
+        );
+    }
 }
 
 #[cfg(test)]
