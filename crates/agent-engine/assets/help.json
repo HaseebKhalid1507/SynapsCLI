@@ -562,6 +562,27 @@
     "related": ["/help"]
   },
   {
+    "id": "budget-command",
+    "command": "/budget",
+    "title": "Turn time budget",
+    "summary": "Inspect turn limits or explicitly change the wall-clock allowance for future turns.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["budget", "wall_clock", "time", "exhausted", "timeout", "continue"],
+    "lines": [
+      "/budget status shows configured limits, not live usage.",
+      "/budget time 4h sets a four-hour time allowance for future turns in this runtime only. Use a positive whole number with s, m or h (maximum 24h).",
+      "This does not persist to config/session storage, start inference, reset context, modify running turns or alter worker budgets and other limits. The local TUI accepts this command while idle, not during streaming.",
+      "After time exhaustion, history is retained. Send a new prompt to continue with a fresh budget. In /context auto, committed context rollovers start a fresh elapsed-time segment; time expiry forces a durable rollover. Provider-round renewals alone do not reset time.",
+      "For a persistent foreground limit, set turn_budget.foreground.max_elapsed_secs = 14400 in your active profile config and restart Synaps. Autonomous/watcher and worker config roles remain separate.",
+      "Local /auto turns use this foreground runtime's budget; /budget is an explicit control command and revokes an active autonomous driver grant. Reauthorize /auto start if needed. With an opted-in driver, wall-clock exhaustion continues retained work on the same model; other budget failures still stop. It never triggers provider fallback."
+    ],
+    "related": ["/context", "/help sessions"]
+  },
+  {
     "id": "context-command",
     "command": "/context",
     "title": "Context report",
