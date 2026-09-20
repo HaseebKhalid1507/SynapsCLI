@@ -94,7 +94,8 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
-    // TODO(session-identity T1/§4): MemoryBinding must be built from the SESSION cwd under the daemon
+    // merge(112) §4: MemoryBinding built from session cwd via from_config_with_cwd
+    // in apply_memory_backend_config (runtime/mod.rs).
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,

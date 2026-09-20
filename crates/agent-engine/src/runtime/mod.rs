@@ -2288,8 +2288,13 @@ impl Runtime {
         if config.kind != crate::config::MemoryBackendKind::Legacy {
             self.memory_context_disable();
         }
-        // TODO(session-identity T1/§4): must take session cwd under the daemon
-        self.memory_backend = crate::memory_backend::MemoryBinding::from_config(config);
+        // merge(112) §4: under the daemon the session cwd differs from
+        // process cwd; use it when available so project-scope resolution
+        // lands in the right repo.
+        self.memory_backend = crate::memory_backend::MemoryBinding::from_config_with_cwd(
+            config,
+            self.cwd.clone().or_else(|| std::env::current_dir().ok()),
+        );
         self.memory_backend_config = Some(config.clone());
     }
 

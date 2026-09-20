@@ -191,6 +191,9 @@ pub(crate) fn resolve_session_and_prompt(
     // policy. Continuing a session may replace the configured model.
     let sb = resolve_or_create_session(runtime, continue_session)?;
     runtime.set_session_id(Some(sb.session.id.clone()));
+    // merge(112): seed continuation state from the resolved session so a
+    // --continue resume picks up the context-continuation high-water mark.
+    runtime.reset_context_continuation(&sb.session.id, &sb.api_messages);
 
     // Validate and compile an opted-in manifest before any session/network work.
     let legacy_prompt = crate::config::resolve_system_prompt(system);
@@ -537,5 +540,28 @@ mod tests {
             runtime.set_reasoning_level_explicit(level);
         }
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Off);
+    }
+
+    /// merge(112) DARK test: default config boots with legacy memory and no
+    /// context_checkpoint tool — Axel features are invisible until opted in.
+    #[test]
+    fn default_config_is_dark_no_checkpoint_tool_legacy_binding() {
+        let runtime = Runtime::new_headless();
+        // Default memory backend must be legacy (no Axel sidecar spawn).
+        assert!(
+            !runtime.memory_backend_exclusive(),
+            "default config must NOT be exclusive (Axel); it must be legacy"
+        );
+        // The tool registry must not contain context_checkpoint.
+        let tools = runtime.tools_shared();
+        let registry = tools.blocking_read();
+        let has_checkpoint = registry
+            .iter_tools_sorted()
+            .iter()
+            .any(|t| t.name() == "context_checkpoint");
+        assert!(
+            !has_checkpoint,
+            "context_checkpoint must not appear in the default tool set"
+        );
     }
 }

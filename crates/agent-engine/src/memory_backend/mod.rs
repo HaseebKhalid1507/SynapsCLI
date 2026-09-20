@@ -75,11 +75,18 @@ impl MemoryBinding {
         Self::from_config(&MemoryBackendConfig::default())
     }
     pub fn from_config(config: &MemoryBackendConfig) -> Self {
+        Self::from_config_with_cwd(config, std::env::current_dir().ok())
+    }
+    /// Same as [`from_config`](Self::from_config) but with an explicit cwd
+    /// (daemon sessions run with a per-session working directory that may
+    /// differ from the process cwd).
+    pub fn from_config_with_cwd(
+        config: &MemoryBackendConfig,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
         let base = agent_core::config::base_dir();
-        let cwd = std::env::current_dir();
         let repository = if config.kind == MemoryBackendKind::Axel {
             cwd.as_ref()
-                .ok()
                 .map(|cwd| ProjectScope::discover_repository(cwd))
         } else {
             None
@@ -90,7 +97,7 @@ impl MemoryBinding {
                 Err("repository memory identity unavailable; no path-scope fallback".into())
             }
             None => cwd
-                .map_err(|_| "workspace unavailable".to_owned())
+                .ok_or_else(|| "workspace unavailable".to_owned())
                 .and_then(|cwd| {
                     ProjectScope::discover(&cwd).map_err(|_| "project scope unavailable".to_owned())
                 }),
