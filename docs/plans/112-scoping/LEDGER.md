@@ -123,3 +123,5 @@ never spawns it. Sidecar binary located via config.executable or
    backend changes after first config are not caught. 2 tests fail on dev because of this.
 3. `await_provider_call`/`await_tool_call` restored as free fns (not the upstream fn names
    verbatim — same semantics, same names). No helper resurrection needed.
+| H7 | synaps-engine | 2414 | 0 | 12 |
+| H | workspace | 4481 | 0 (+client_diet flake) | — |
