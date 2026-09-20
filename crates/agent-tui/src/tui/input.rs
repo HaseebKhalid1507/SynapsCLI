@@ -1221,6 +1221,39 @@ mod tests {
         assert_eq!(app.cursor_char_pos(), 0);
     }
 
+    /// E-P8 T2: Ctrl-C while the driver is armed → Abort (→ Cancel), NOT Quit.
+    #[test]
+    fn ctrl_c_while_driver_armed_aborts_not_quits() {
+        let mut app = make_app();
+        // Not armed → Ctrl-C quits.
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputAction::Quit
+        ));
+        app.driver_ui.armed = true;
+        // Armed → Ctrl-C stops the driver (Abort → SessionCommand::Cancel).
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputAction::Abort
+        ));
+    }
+
+    /// E-P8 T2: Esc while armed (even when NOT streaming) → Abort (→ Cancel).
+    #[test]
+    fn esc_while_driver_armed_aborts_even_when_idle() {
+        let mut app = make_app();
+        // Not armed, not streaming → Esc is a no-op.
+        assert!(matches!(
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        app.driver_ui.armed = true;
+        assert!(matches!(
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            InputAction::Abort
+        ));
+    }
+
     /// Backspace / word-delete route through the editor.
     #[test]
     fn editing_keys_forward_to_editor() {

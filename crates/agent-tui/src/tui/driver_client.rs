@@ -38,6 +38,17 @@ impl DriverUiState {
     pub(crate) fn is_armed(&self) -> bool {
         self.armed
     }
+
+    /// One-line status for the driver indicator: `plugin · model · deadline`.
+    /// This is the single source of truth for the armed status render.
+    pub(crate) fn status_line(&self) -> String {
+        format!(
+            "{} · {} · {}",
+            self.plugin_id,
+            self.model,
+            fmt_deadline(self.deadline_ms)
+        )
+    }
 }
 
 fn fmt_deadline(deadline_ms: Option<u64>) -> String {
@@ -67,25 +78,17 @@ pub(crate) fn on_armed(
 ) {
     app.driver_ui = DriverUiState {
         armed: true,
-        plugin_id: plugin_id.clone(),
-        model: selection.model.clone(),
+        plugin_id,
+        model: selection.model,
         deadline_ms,
     };
     if !notice.is_empty() {
         app.push_msg(ChatMessage::System(notice));
     }
     app.toasts.upsert(
-        super::toast::Toast::new(
-            STATUS_TOAST_ID,
-            format!(
-                "{} · {} · {}",
-                plugin_id,
-                selection.model,
-                fmt_deadline(deadline_ms)
-            ),
-        )
-        .titled("Driver armed")
-        .ttl(None),
+        super::toast::Toast::new(STATUS_TOAST_ID, app.driver_ui.status_line())
+            .titled("Driver armed")
+            .ttl(None),
     );
     app.request_redraw();
 }
@@ -131,4 +134,88 @@ pub(crate) fn on_turn_outcome(
     }
     app.push_msg(ChatMessage::System(line));
     app.request_redraw();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_engine::extensions::session_driver::{Outcome, Selection};
+
+    fn test_app() -> App {
+        App::new(synaps_cli::Session::new("test", "medium", None))
+    }
+
+    fn sel(model: &str) -> Selection {
+        Selection {
+            model: model.to_string(),
+            effort: "medium".to_string(),
+        }
+    }
+
+    #[test]
+    fn armed_event_arms_client_and_pins_status_toast() {
+        let mut app = test_app();
+        assert!(!app.driver_ui.is_armed());
+        on_armed(
+            &mut app,
+            "autonomous".to_string(),
+            "run-1".to_string(),
+            vec![sel("anthropic/claude")],
+            sel("anthropic/claude"),
+            Some(90_000),
+            "driver armed: go".to_string(),
+        );
+        assert!(app.driver_ui.is_armed());
+        assert_eq!(app.driver_ui.plugin_id, "autonomous");
+        assert_eq!(app.driver_ui.model, "anthropic/claude");
+        assert!(app.driver_ui.status_line().contains("autonomous"));
+        assert!(app.driver_ui.status_line().contains("1m30s"));
+        // Status toast pinned (ttl None → persistent).
+        assert!(app.toasts.visible().any(|t| t.id() == STATUS_TOAST_ID));
+    }
+
+    #[test]
+    fn revoked_event_disarms_dismisses_toast_and_restores_steering() {
+        let mut app = test_app();
+        on_armed(
+            &mut app,
+            "autonomous".to_string(),
+            "run-1".to_string(),
+            vec![sel("m")],
+            sel("m"),
+            None,
+            String::new(),
+        );
+        assert!(app.driver_ui.is_armed());
+        on_revoked(
+            &mut app,
+            "explicit user action".to_string(),
+            vec!["keep this".to_string(), "and this".to_string()],
+        );
+        assert!(!app.driver_ui.is_armed());
+        // Toast gone.
+        assert!(!app.toasts.visible().any(|t| t.id() == STATUS_TOAST_ID));
+        // Undelivered steering restored to the input draft.
+        let draft = app.input_text();
+        assert!(draft.contains("keep this"));
+        assert!(draft.contains("and this"));
+    }
+
+    #[test]
+    fn revoked_prepends_steering_before_existing_draft() {
+        let mut app = test_app();
+        app.set_input_text("my half-typed line");
+        on_revoked(&mut app, "stopped".to_string(), vec!["undelivered".to_string()]);
+        let draft = app.input_text();
+        assert!(draft.starts_with("undelivered"));
+        assert!(draft.contains("my half-typed line"));
+    }
+
+    #[test]
+    fn turn_outcome_event_renders_without_arming() {
+        let mut app = test_app();
+        on_turn_outcome(&mut app, Outcome::Success, sel("m"), Some("changed".to_string()));
+        // Reacting to an outcome never changes armed state.
+        assert!(!app.driver_ui.is_armed());
+    }
 }
