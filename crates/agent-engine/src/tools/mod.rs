@@ -136,6 +136,14 @@ pub struct ToolCapabilities {
     /// inherit process env. When `Some`, tools call `env_clear().envs()`
     /// so no daemon env leaks into session subprocesses.
     pub env: Option<crate::session::types::SessionEnv>,
+    /// Names of env vars stripped as secrets (T5). Tools use this for
+    /// loud notices when a command fails referencing a stripped var.
+    pub env_stripped: Vec<String>,
+    /// Per-name "already warned" guard (T5): prevents duplicate notices
+    /// within a single session. Shared via `Arc<Mutex<…>>` so the same
+    /// set survives across tool calls (caps are rebuilt per call in
+    /// stream.rs). Poisoned-mutex recovery via `into_inner`.
+    pub env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Configuration limits and timeouts.

@@ -355,6 +355,10 @@ struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compacted_into: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    env: Option<Vec<(String, String)>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    env_stripped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt_provenance: Option<crate::prompt::PromptProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction: Option<crate::core::compaction::CompactionRecord>,
@@ -362,6 +366,10 @@ struct SessionMeta {
 
 impl SessionMeta {
     fn of(s: &Session) -> Self {
+        // Belt-and-braces: scrub any secret values from the env on the
+        // write path so the journal on disk NEVER contains a credential,
+        // even if a future client forgets to strip.
+        let env = scrub_secret_env(s.env.as_ref());
         Self {
             id: s.id.clone(),
             title: s.title.clone(),
@@ -378,6 +386,8 @@ impl SessionMeta {
             abort_context: s.abort_context.clone(),
             parent_session: s.parent_session.clone(),
             compacted_into: s.compacted_into.clone(),
+            env,
+            env_stripped: s.env_stripped.clone(),
             prompt_provenance: s.prompt_provenance.clone(),
             compaction: s.compaction.clone(),
         }
@@ -398,6 +408,8 @@ impl SessionMeta {
         s.abort_context = self.abort_context;
         s.parent_session = self.parent_session;
         s.compacted_into = self.compacted_into;
+        s.env = self.env;
+        s.env_stripped = self.env_stripped;
         s.prompt_provenance = self.prompt_provenance;
         s.compaction = self.compaction;
     }
@@ -630,6 +642,12 @@ struct SessionSnapshotRef<'a> {
     parent_session: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compacted_into: &'a Option<String>,
+    /// Owned (not borrowed) because secret keys are scrubbed on the write
+    /// path — the `.json` snapshot must never carry a credential (T5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env: Option<Vec<(String, String)>>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    env_stripped: &'a [String],
     api_messages: &'a [SharedMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     abort_context: &'a Option<String>,
@@ -656,6 +674,8 @@ impl<'a> SessionSnapshotRef<'a> {
             message_count: s.api_messages.len(),
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
+            env: scrub_secret_env(s.env.as_ref()),
+            env_stripped: &s.env_stripped,
             api_messages: &s.api_messages,
             abort_context: &s.abort_context,
             prompt_provenance: &s.prompt_provenance,
@@ -665,6 +685,20 @@ impl<'a> SessionSnapshotRef<'a> {
 }
 
 /// Full-snapshot JSON with a fresh `message_count`, without cloning.
+/// Drop every pair whose key matches the secret denylist. Shared by the
+/// `.json` snapshot and the journal meta tail so neither artifact can carry
+/// a credential value, whatever the client sent.
+fn scrub_secret_env(env: Option<&Vec<(String, String)>>) -> Option<Vec<(String, String)>> {
+    use crate::core::config::is_secret_key;
+    env.map(|pairs| {
+        pairs
+            .iter()
+            .filter(|(k, _)| !is_secret_key(k))
+            .cloned()
+            .collect()
+    })
+}
+
 fn snapshot_json(session: &Session) -> std::io::Result<String> {
     serde_json::to_string(&SessionSnapshotRef::of(session)).map_err(std::io::Error::other)
 }
@@ -876,6 +910,48 @@ mod tests {
         assert_eq!(b.total_input_tokens, 7);
         assert_eq!(b.session_cost, 0.5);
         assert_eq!(b.updated_at, a.updated_at);
+    }
+
+    #[test]
+    fn env_roundtrip_and_secret_scrub() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", None);
+        // Set env with a normal var and a secret-looking var.
+        s.env = Some(vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("GH_TOKEN".into(), "ghp_supersecret42".into()),
+        ]);
+        s.env_stripped = vec!["GH_TOKEN".into()];
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        // Load back.
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        // Non-secret survives.
+        let env = loaded.env.as_ref().expect("env must round-trip");
+        assert!(
+            env.iter().any(|(k, v)| k == "PATH" && v == "/usr/bin"),
+            "non-secret key must survive"
+        );
+        // Secret value MUST be absent from the on-disk bytes.
+        let snap_bytes =
+            std::fs::read_to_string(dir.join(format!("{}.json", s.id))).unwrap();
+        assert!(
+            !snap_bytes.contains("ghp_supersecret42"),
+            "secret VALUE must never appear on disk"
+        );
+        // …and the non-secret env IS in the `.json` snapshot itself (not only
+        // the journal meta tail) — the snapshot is what a fresh daemon reads.
+        assert!(
+            snap_bytes.contains("\"env\"") && snap_bytes.contains("/usr/bin"),
+            "snapshot must carry the scrubbed env: {snap_bytes}"
+        );
+        // Secret name IS present in env_stripped.
+        assert_eq!(loaded.env_stripped, vec!["GH_TOKEN".to_string()]);
+        // The secret KEY should not appear in the env pairs.
+        assert!(
+            !env.iter().any(|(k, _)| k == "GH_TOKEN"),
+            "secret key must be scrubbed from env pairs"
+        );
     }
 
     /// Private modes (spec §5.4): journal-mode saves keep the 0700 dir and

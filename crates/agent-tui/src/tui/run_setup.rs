@@ -151,6 +151,7 @@ pub(crate) async fn run_setup(
             prompt_manifest,
             cwd: None,
             env: None,
+            env_stripped: Vec::new(),
             auto_approve_confirms: false,
             model_override: None,
             persist: true,

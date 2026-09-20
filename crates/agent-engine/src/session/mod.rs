@@ -9,6 +9,7 @@
 pub mod actor;
 pub mod actor_cmds;
 pub mod budgets;
+pub mod client_args;
 pub mod display;
 pub mod handle;
 pub mod socket_transport;

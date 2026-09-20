@@ -132,6 +132,10 @@ pub struct Hello {
     /// (inherit process env). Legacy frames without this field decode as `None`.
     #[serde(default)]
     pub env: Option<super::types::SessionEnv>,
+    /// Names of env vars stripped as secrets at the client (T5). Names only,
+    /// never values. `serde(default)` → legacy frames decode as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_stripped: Vec<String>,
     /// Set when re-connecting after `Reloading`/EOF (C3/A4).
     #[serde(default)]
     pub reconnect_of: Option<ClientReconnect>,
@@ -149,6 +153,7 @@ pub struct ClientReconnect {
 
 impl Hello {
     pub fn new(kind: ClientKind) -> Self {
+        let (env, env_stripped) = super::types::capture_client_env();
         Self {
             protocol_version: PROTOCOL_VERSION,
             client: ClientMeta {
@@ -157,7 +162,8 @@ impl Hello {
             },
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             client_version: binary_version(),
-            env: Some(super::types::capture_client_env()),
+            env: Some(env),
+            env_stripped,
             reconnect_of: None,
         }
     }

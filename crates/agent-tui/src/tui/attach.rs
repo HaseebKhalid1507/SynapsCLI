@@ -209,7 +209,7 @@ pub fn daemon_not_running_message(profile: Option<&str>, detail: Option<&str>) -
     )
 }
 
-pub async fn run_attached(opts: AttachOpts) -> Result<()> {
+pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     ladder("attach:enter", &"");
     let paths = agent_engine::daemon::registry::daemon_paths(opts.profile.as_deref());
     if !agent_engine::daemon::registry::is_alive(&paths) {
@@ -243,6 +243,27 @@ pub async fn run_attached(opts: AttachOpts) -> Result<()> {
     );
 
     let cwd = std::env::current_dir().ok();
+
+    // T4: resolve path-like args (--system, --prompt-manifest) against the
+    // client's cwd before shipping them to the daemon.
+    if let Some(ref cwd_path) = cwd {
+        let mut probe_cfg = SessionConfig {
+            system: opts.system.clone(),
+            prompt_manifest: opts.prompt_manifest.clone(),
+            ..Default::default()
+        };
+        if let Err(e) = agent_engine::session::client_args::resolve_client_session_args(
+            &mut probe_cfg,
+            cwd_path,
+        ) {
+            // Print to stderr before entering raw mode so it survives.
+            eprintln!("synaps: {e}");
+            return Err(cfg_err(e));
+        }
+        opts.system = probe_cfg.system;
+        opts.prompt_manifest = probe_cfg.prompt_manifest;
+    }
+
     let live: Vec<LiveSession> = conn
         .welcome
         .sessions

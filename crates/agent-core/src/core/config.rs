@@ -1384,6 +1384,20 @@ pub fn is_favorite_model(id: &str) -> bool {
     load_config().favorite_models.iter().any(|v| v == id.trim())
 }
 
+/// Whether a key matches the secret denylist (case-insensitive).
+/// Used by the journal save path to ensure secret values never reach disk,
+/// and by the client env capture to strip secrets before `Hello`.
+pub fn is_secret_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.ends_with("_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_CREDENTIALS")
+        || upper.ends_with("_API_KEY")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
+}
+
 /// Resolve the system prompt from CLI flag, config file, or default.
 /// Priority: explicit value > ~/.synaps-cli/system.md > built-in default.
 pub fn resolve_system_prompt(explicit: Option<&str>) -> String {

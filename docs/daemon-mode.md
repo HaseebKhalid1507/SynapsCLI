@@ -318,10 +318,56 @@ thing: the daemon itself.
 
 ### What is NOT yet covered (wave 2+)
 
-- **Journal persistence of env minus secrets** (T5) — env does not survive daemon restart today.
 - **Extension protocol: per-call env/cwd** (T6) — sidecars still get the daemon's env.
-- **`--system` by content** (T4) — path-like args still resolved against daemon cwd.
 - **`SO_PEERCRED` uid check** (T11) — no auth boundary on the socket yet.
+
+### Path-like arg resolution — `--system` by content (T4, F26)
+
+Thin clients resolve path-like `--system` and `--prompt-manifest` arguments
+against the **client's** cwd before sending `Hello`, so
+`cd /tmp/proj && synaps --system ./prompt.md` works identically over adopt
+and in-process.
+
+**Heuristic** (`session::client_args::looks_path_like`): a value is path-like
+when it starts with `/`, `./`, `../`, or `~`, **or** ends with `.md`/`.txt`
+(case-insensitive) — AND contains no newlines or runs of double-spaces (prose
+guard).  Path-like + readable → replaced with the file's **contents**.
+Path-like + missing → non-zero exit with `--system <val>: no such file
+(resolved <abs>)`.  Non-path-like → passed through as literal prompt text.
+
+`--prompt-manifest` is canonicalized against client cwd; missing → error.
+
+> **Design note:** a cleaner signal would be `--system @file` (like curl),
+> but the launcher `~/Jawz/tools/jawz` already passes `--system /tmp/jawz-identity.md`
+> unchanged, so the heuristic must accept bare paths.
+
+### Journal env persistence and secret notices (T5)
+
+`SessionConfig.env` and `SessionConfig.env_stripped` are persisted in the
+session journal (as part of the `Session` struct, BEFORE `api_messages` so
+`read_session_header` sees them). Both artifacts carry them — the `.json`
+snapshot a fresh daemon reads and the journal meta tail — and a fresh client
+env on `--continue` is written back so the next restart sees the latest.
+
+**Rehydration precedence** (`--continue`/unpark after daemon restart):
+1. An explicit `Hello.env` from the continuing client wins (the user is
+   sitting in a shell *now*).
+2. If the client sent `env: None` (in-process/legacy), the journal's
+   persisted env fills in.
+3. The daemon's own process env is **never** used for a daemon-hosted session.
+
+**Belt-and-braces:** the journal-side write runs every env pair through
+`is_secret_key` — a value for a denylisted key is dropped even if a future
+client forgets to strip.  The `env_stripped` list records **names only**.
+
+**Loud notices:** when a bash command exits non-zero AND the script text
+references a name from `env_stripped` as a whole identifier (`$NAME`,
+`${NAME:?}`, `$env:NAME`, `NAME=`… — `GH_TOKEN_FILE` does not match
+`GH_TOKEN`), a system notice is appended to the tool output, once per name
+per session:
+```
+note: $GH_TOKEN was stripped from the session env as a secret; reattach from a shell that has it (synaps --system … from that shell) — the daemon never receives credentials.
+```
 
 ## What changes on the default (in-process) path — read before merging
 

@@ -1282,6 +1282,8 @@ mod tests {
                 abort_context: None,
                 parent_session: None,
                 compacted_into: None,
+                env: None,
+                env_stripped: Vec::new(),
                 prompt_provenance: None,
                 compaction: None,
             }

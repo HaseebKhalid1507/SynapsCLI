@@ -32,6 +32,16 @@ pub struct Session {
     /// Declared before `api_messages` so `read_session_header` sees it (F24).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted_into: Option<String>,
+    /// Session environment snapshot (names+values, secrets stripped).
+    /// Declared before `api_messages` so `read_session_header` sees it.
+    /// Belt-and-braces: values for secret keys are scrubbed on save even
+    /// if a future client forgets to strip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<Vec<(String, String)>>,
+    /// Names of env vars stripped as secrets (T5, names only, never values).
+    /// Declared before `api_messages` so `read_session_header` sees it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_stripped: Vec<String>,
     pub api_messages: Vec<SharedMessage>,
     /// Saved abort context — injected into the next user message on /continue
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,6 +93,8 @@ impl Session {
             abort_context: None,
             parent_session: None,
             compacted_into: None,
+            env: None,
+            env_stripped: Vec::new(),
             prompt_provenance: None,
             compaction: None,
         }
@@ -132,6 +144,8 @@ impl Session {
             abort_context: None,
             parent_session: Some(parent.id.clone()),
             compacted_into: None,
+            env: parent.env.clone(),
+            env_stripped: parent.env_stripped.clone(),
             prompt_provenance: None,
             compaction: Some(record),
         }

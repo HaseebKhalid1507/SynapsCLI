@@ -386,7 +386,7 @@ impl SessionActor {
     /// `on_session_start` (keyed injection).
     pub(crate) async fn create(
         host: &Arc<EngineHost>,
-        cfg: SessionConfig,
+        mut cfg: SessionConfig,
     ) -> Result<(SessionHandle, SessionTask)> {
         let mut runtime = host.foreground_runtime().await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
@@ -413,7 +413,26 @@ impl SessionActor {
             }
         }
         runtime.set_cwd(cfg.cwd.clone());
+        // T5: rehydrate env from journal when the client sent none.
+        // Precedence: explicit Hello.env from the continuing client > journal > None.
+        // Never fall back to the daemon's own process env.
+        if cfg.env.is_none() {
+            if let Some(ref journal_env) = sb.session.env {
+                cfg.env = Some(journal_env.clone());
+            }
+            if cfg.env_stripped.is_empty() && !sb.session.env_stripped.is_empty() {
+                cfg.env_stripped = sb.session.env_stripped.clone();
+            }
+        }
+        // Always persist the latest env on the session so the next
+        // restart/continue sees it — a fresh client env supersedes
+        // whatever was journaled previously.
+        if cfg.env.is_some() {
+            sb.session.env = cfg.env.clone();
+            sb.session.env_stripped = cfg.env_stripped.clone();
+        }
         runtime.set_env(cfg.env.clone());
+        runtime.set_env_stripped(cfg.env_stripped.clone());
         // CLI `--model` overrides whatever was persisted (rpc.rs precedent).
         if let Some(ref m) = cfg.model_override {
             runtime.set_model(m.clone());
@@ -876,6 +895,7 @@ impl SessionActor {
             };
             runtime.set_cwd(cfg.cwd.clone());
             runtime.set_env(cfg.env.clone());
+            runtime.set_env_stripped(cfg.env_stripped.clone());
             // The CURRENT model/thinking (the last published view), not
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());

@@ -450,6 +450,12 @@ pub struct Runtime {
     /// inherit process env (in-process hosts). Daemon sessions carry the
     /// creator client's env; tools apply `env_clear().envs()` when `Some`.
     env: Option<crate::session::types::SessionEnv>,
+    /// Names of env vars stripped as secrets (T5).
+    env_stripped: Vec<String>,
+    /// Shared per-session "already warned" set for env-stripped notices (T5).
+    /// Cloned into every `ToolCapabilities` so the dedup survives across
+    /// tool calls within the same session.
+    env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -892,6 +898,8 @@ impl Runtime {
             session_id: None,
             cwd: None,
             env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
         };
         // Lease managers are installed through the same seams boot used, so
         // the per-runtime durable session-scope guards are minted exactly as
@@ -1355,8 +1363,16 @@ impl Runtime {
         self.env = env;
     }
 
+    pub fn set_env_stripped(&mut self, stripped: Vec<String>) {
+        self.env_stripped = stripped;
+    }
+
     pub fn env(&self) -> Option<&crate::session::types::SessionEnv> {
         self.env.as_ref()
+    }
+
+    pub fn env_stripped(&self) -> &[String] {
+        &self.env_stripped
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -3252,6 +3268,8 @@ impl Runtime {
                                         memory_context: None,
                                         cwd: self.cwd.clone(),
                                         env: self.env.clone(),
+                                        env_stripped: self.env_stripped.clone(),
+                                        env_warned: self.env_warned.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3353,6 +3371,8 @@ impl Runtime {
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
                             let env_inner = cfg_env.clone();
+                            let env_stripped_inner = self.env_stripped.clone();
+                            let env_warned_inner = self.env_warned.clone();
                             let session_id_inner = cfg_session_id.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
@@ -3408,6 +3428,8 @@ impl Runtime {
                                                     memory_context: None,
                                                     cwd: cwd_inner,
                                                     env: env_inner,
+                                                    env_stripped: env_stripped_inner,
+                                                    env_warned: env_warned_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -3658,6 +3680,8 @@ impl Runtime {
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
+            env_stripped: self.env_stripped.clone(),
+            env_warned: self.env_warned.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
@@ -3824,6 +3848,8 @@ impl Clone for Runtime {
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
+            env_stripped: self.env_stripped.clone(),
+            env_warned: self.env_warned.clone(),
         }
     }
 }

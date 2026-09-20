@@ -57,13 +57,25 @@ const ENV_STRIP_PREFIXES: &[&str] = &[
 /// Secret patterns (case-insensitive suffix/infix) stripped at the client.
 /// Secrets never reach the daemon — the broker owns credentials.
 /// Build a [`SessionEnv`] from the current process environment, stripping
-/// client-only prefixes and secrets. Used by thin clients before `Hello`.
-pub fn capture_client_env() -> SessionEnv {
-    let mut env: SessionEnv = std::env::vars()
-        .filter(|(k, _)| !should_strip_env(k))
-        .collect();
+/// client-only prefixes and secrets. Returns `(kept_env, stripped_secret_names)`.
+/// The stripped names are ONLY the secrets (not `SYNAPS_*` prefixes, those are noise).
+/// Used by thin clients before `Hello`.
+pub fn capture_client_env() -> (SessionEnv, Vec<String>) {
+    let mut env: SessionEnv = Vec::new();
+    let mut stripped: Vec<String> = Vec::new();
+    for (k, v) in std::env::vars() {
+        if should_strip_env(&k) {
+            // Only record secret names, not SYNAPS_* prefix noise.
+            if is_secret_key(&k) {
+                stripped.push(k);
+            }
+        } else {
+            env.push((k, v));
+        }
+    }
     env.sort_by(|(a, _), (b, _)| a.cmp(b));
-    env
+    stripped.sort();
+    (env, stripped)
 }
 
 /// Whether a key should be stripped from the client env snapshot.
@@ -78,18 +90,9 @@ pub fn should_strip_env(key: &str) -> bool {
 }
 
 /// Whether a key matches the secret denylist (case-insensitive).
+/// Delegates to the canonical implementation in `agent_core::core::config`.
 pub fn is_secret_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    // Suffix-anchored so `_TOKEN` matches `GH_TOKEN` but not `TOKENBUCKET_SIZE`;
-    // `*SECRET*` / `*PASSWORD*` / `*_CREDENTIALS` / `AWS_SECRET_*` stay substring
-    // because they name the thing wherever they sit (`SECRET_KEY_BASE`).
-    upper.ends_with("_KEY")
-        || upper.ends_with("_TOKEN")
-        || upper.ends_with("_CREDENTIALS")
-        || upper.ends_with("_API_KEY")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.contains("PASSWD")
+    agent_core::core::config::is_secret_key(key)
 }
 
 /// Everything `EngineHost::create_session` needs. Serializable: it is the
@@ -121,6 +124,13 @@ pub struct SessionConfig {
     /// change the creator's env.
     #[serde(default)]
     pub env: Option<SessionEnv>,
+    /// Names of environment variables stripped as secrets at the client
+    /// (e.g. `GH_TOKEN`, `AWS_SECRET_ACCESS_KEY`). NOT the `SYNAPS_*`
+    /// prefixes (those are noise). Used for loud notices when a tool fails
+    /// referencing a stripped secret. Persisted in the journal (names only,
+    /// never values).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_stripped: Vec<String>,
     /// `Confirm` hook results auto-approved (server `--auto-approve-confirms`).
     /// Interactive hosts: false.
     #[serde(default)]
@@ -186,6 +196,7 @@ impl Default for SessionConfig {
             prompt_manifest: None,
             cwd: None,
             env: None,
+            env_stripped: Vec::new(),
             auto_approve_confirms: false,
             model_override: None,
             persist: true,
@@ -989,7 +1000,13 @@ mod tests {
     fn capture_client_env_is_sorted_and_stripped() {
         // We can't fully control the process env in a unit test, but we can
         // verify the output is sorted and that known strip-list vars are absent.
-        let env = capture_client_env();
+        let (env, stripped) = capture_client_env();
+        // Every stripped name is a secret by our own rule, and none of them
+        // survived into the kept env.
+        for name in &stripped {
+            assert!(is_secret_key(name), "stripped non-secret: {name}");
+            assert!(env.iter().all(|(k, _)| k != name), "stripped name leaked: {name}");
+        }
         // Sorted
         for w in env.windows(2) {
             assert!(w[0].0 <= w[1].0, "not sorted: {:?} > {:?}", w[0].0, w[1].0);

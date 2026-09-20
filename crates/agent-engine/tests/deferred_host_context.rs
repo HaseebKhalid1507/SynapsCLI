@@ -111,6 +111,8 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
             memory_context: None,
             cwd: None,
             env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
         },
         limits: ToolLimits {
             max_tool_output: 30000,
