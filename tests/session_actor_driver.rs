@@ -12,6 +12,14 @@ use agent_engine::session::{
 use agent_engine::{EngineHost, HostOpts};
 use synaps_cli::extensions::manifest::ExtensionManifest;
 
+use serial_test::serial;
+
+// Shared loopback-stub fixtures (same module the differential test uses to make
+// turns actually COMPLETE): `spawn_stub`, `Script`, `ANTHROPIC_SSE`, `HomeGuard`.
+#[path = "support/phase2/mod.rs"]
+mod support;
+use support::{spawn_stub, HomeGuard, Script, ANTHROPIC_SSE};
+
 const MODEL: &str = "claude-sonnet-4-5";
 
 // ── plugin helpers ───────────────────────────────────────────────────────────
@@ -766,4 +774,153 @@ async fn revocation_restores_undelivered_steering() {
         _ => unreachable!(),
     }
     actor.end().await;
+}
+
+// ── E2E: full driver loop across multiple turns ─────────────────────────────
+
+/// The gate for the driver branch: prove the SessionActor driver loop runs the
+/// FULL cycle more than once — arm → turn1 → terminal(Done) → poll → turn2 →
+/// terminal(Done) — not just that a single turn starts.
+///
+/// The mechanism (copied from `tests/session_actor_differential.rs`): stand up a
+/// local HTTP stub answering the Anthropic API with canned SSE so each driver
+/// turn actually COMPLETES (Terminal::Success → `DriverTurnOutcome{Success}`).
+/// The `autonomous` plugin is armed with NO `--turns`, so it proposes UNBOUNDED
+/// turns and keeps re-polling after every success (MIN_DELAY_MS ≈ 1s cadence).
+///
+/// Env isolation matches the differential file exactly: `#[serial]` +
+/// `HomeGuard` (temp HOME + synthetic auth.json, provider keys scrubbed,
+/// `SYNAPS_ANTHROPIC_BASE_URL` guarded and restored on drop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn driver_runs_multiple_turns_end_to_end() {
+    let _guard = HomeGuard::new();
+    // Every request → canned Anthropic SSE that ends the turn (end_turn), so the
+    // driver's turn reaches a Success terminal instead of dying at preflight.
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    // The driver turn runs under the PLUGIN's proposed selection, NOT the
+    // session `model_override`. The plugin's DEFAULT_FAVORITES are fictional
+    // non-Anthropic models, which would never hit our Anthropic stub (the turn
+    // would EOF → Blocked). Seed a plugin-local `prefs.json` BEFORE the plugin
+    // initializes so it proposes a real anthropic `claude-*` model — one the
+    // stub answers via the Anthropic Messages wire (synthetic OAuth from HomeGuard).
+    let host = host().await;
+    let (temp, manifest) = plugin_copy();
+    {
+        let prefs = temp.path().join("prefs.json");
+        std::fs::write(
+            &prefs,
+            br#"{"version":1,"favorites":[{"model":"anthropic/claude-fable-5-1","effort":"high"}]}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&prefs, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    host.ext_manager()
+        .write()
+        .await
+        .load_with_cwd("autonomous", &manifest, Some(temp.path().to_path_buf()))
+        .await
+        .unwrap();
+    let _temp = temp; // keep the plugin dir (and prefs.json) alive for the run
+
+    let mut actor = session(&host).await;
+    actor.arm().await;
+
+    // Watch the loop until we have observed >= 2 completed turns. Each cycle is
+    // TurnStarted … DriverTurnOutcome{Success}; the driver must NOT revoke
+    // between them (that would mean the poll never re-fired / the loop died).
+    use agent_engine::extensions::session_driver::Outcome;
+    let target = 2usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+
+    let mut outcomes = 0usize; // DriverTurnOutcome count
+    let mut turn_starts = 0usize; // TurnStarted count
+    let mut pairs = 0usize; // start-then-terminal cycles
+    let mut pending_start = false; // a TurnStarted is awaiting its terminal
+    let mut early_revoke: Option<String> = None;
+
+    while outcomes < target {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        assert!(
+            !remaining.is_zero(),
+            "timed out before seeing {target} DriverTurnOutcome events \
+             (saw {outcomes} outcomes, {turn_starts} turn starts, {pairs} pairs)"
+        );
+        let env = tokio::time::timeout(remaining, actor.t.next_event())
+            .await
+            .expect("driver loop stalled — no event before 60s deadline")
+            .expect("actor alive");
+        match env.event {
+            SessionEventWire::TurnStarted { .. } => {
+                turn_starts += 1;
+                pending_start = true;
+            }
+            SessionEventWire::DriverTurnOutcome { outcome, .. } => {
+                // A completed driver turn against the SSE stub is a success.
+                assert!(
+                    matches!(outcome, Outcome::Success),
+                    "expected a successful/continued turn outcome, got {outcome:?}"
+                );
+                outcomes += 1;
+                if pending_start {
+                    pairs += 1;
+                    pending_start = false;
+                }
+            }
+            SessionEventWire::DriverRevoked { reason, .. } => {
+                // Any revoke before we've seen 2 clean cycles is a loop failure.
+                early_revoke = Some(reason);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        early_revoke.is_none(),
+        "driver revoked mid-loop before completing {target} turns: {:?}",
+        early_revoke
+    );
+    assert!(
+        outcomes >= target,
+        "expected >= {target} DriverTurnOutcome events, saw {outcomes}"
+    );
+    assert!(
+        turn_starts >= target,
+        "expected >= {target} TurnStarted events, saw {turn_starts}"
+    );
+    assert!(
+        pairs >= target,
+        "expected >= {target} arm→turn→Done cycles (TurnStarted then terminal), saw {pairs}"
+    );
+
+    // Clean shutdown: Cancel revokes the driver, then End drains to Ended.
+    actor.send(SessionCommand::Cancel).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        actor.until(|e| matches!(e, SessionEventWire::DriverRevoked { .. })),
+    )
+    .await;
+    actor.end().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match actor.t.next_event().await {
+                None => break,
+                Some(env) => {
+                    if matches!(env.event, SessionEventWire::Ended { .. }) {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
 }
