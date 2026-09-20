@@ -9,6 +9,7 @@ mod clock;
 mod commands;
 mod dispatch;
 mod draw;
+mod driver_client;
 mod effort;
 mod focus;
 mod gamba;

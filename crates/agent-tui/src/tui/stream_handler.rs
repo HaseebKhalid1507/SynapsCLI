@@ -584,10 +584,39 @@ pub(super) async fn handle_session_event_arm(
             );
             app.request_redraw();
         }
-        // E-P0: driver events — stub rendering; P8 replaces with full UX.
-        SessionEventWire::DriverArmed { .. }
-        | SessionEventWire::DriverRevoked { .. }
-        | SessionEventWire::DriverTurnOutcome { .. } => {}
+        // E-P8: driver wire events → thin client render (react, never compute).
+        SessionEventWire::DriverArmed {
+            plugin_id,
+            run_id,
+            models,
+            selection,
+            deadline_ms,
+            notice,
+        } => {
+            super::driver_client::on_armed(
+                app, plugin_id, run_id, models, selection, deadline_ms, notice,
+            );
+        }
+        SessionEventWire::DriverRevoked {
+            reason,
+            undelivered_steering,
+        } => {
+            super::driver_client::on_revoked(app, reason, undelivered_steering);
+        }
+        SessionEventWire::DriverTurnOutcome {
+            outcome,
+            selection,
+            feedback,
+        } => {
+            super::driver_client::on_turn_outcome(app, outcome, selection, feedback);
+        }
+        // E-P7: spend ceiling breached — surface it loudly.
+        SessionEventWire::CostCapReached { scope, cost, cap } => {
+            app.push_msg(ChatMessage::Error(format!(
+                "{scope} cost cap reached (${cost:.4} ≥ ${cap:.4}) — turn cancelled, driver revoked"
+            )));
+            app.request_redraw();
+        }
     }
     ArmFlow::Continue
 }

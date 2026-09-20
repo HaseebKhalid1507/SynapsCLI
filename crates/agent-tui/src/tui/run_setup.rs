@@ -160,6 +160,7 @@ pub(crate) async fn run_setup(
             await_extensions: false,
             keep_warm: false,
             name: None,
+            max_session_cost: None,
         })
         .await?;
     let (transport, snapshot) =

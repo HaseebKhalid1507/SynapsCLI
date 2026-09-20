@@ -227,6 +227,42 @@ C: bye | socket close = Detach (turn keeps running)
   During the reconnect window the client shows `daemon connection lost — reconnecting (Ns left)…` and
   clears streaming/compacting state. A successful reconnect prints a notice and resumes normally.
 
+## Autonomous driver (in the session actor)
+
+The autonomous session driver (`session.drive` permission; see
+[session-drivers.md](extensions/session-drivers.md)) runs **inside the session
+actor**, not in any client process. That changes its lifecycle relative to the
+old "local TUI only" world:
+
+- **The grant survives detach.** Headless runs are the feature: a client can arm
+  a driver with `/auto …`, disconnect, and the actor keeps driving. The **safety
+  floor** is the S1 zero-client revoke — when the *last* client detaches, the
+  actor revokes the grant (`no clients attached`) and fail-closed-denies any
+  pending host-confirmation prompt (`None`). So a run persists across detach only
+  while at least one client remains attached; it never spends fully unwatched.
+- **Park is blocked while armed.** `can_park()` requires no active driver
+  (`self.driver.is_none()`), so an armed session stays **Live** — the idle
+  monitor and park deadline will not put a driving session to sleep underneath a
+  running or delayed driver turn.
+- **Reload revokes the driver.** `Checkpoint{Reload}` revokes any armed grant
+  (`daemon reloaded`) before saving, and the client is notified. Grants are not
+  part of the `SessionReloadRecord` and are never rehydrated — consistent with
+  "process restart must never restore an active run automatically."
+- **Remote steering.** `synaps send` is a dumb pipe: it delivers an `Event` to
+  the session's per-session event queue, **not** a `SessionCommand`. The actor's
+  `on_queue_wake` path owns the routing: while a driver turn is streaming the
+  event is **`Steered`** into the live stream (steer a driven session from
+  another terminal); idle-and-armed injects it without a competing turn
+  (`WakeAction::RunTurn` inhibited); idle-and-unarmed runs a normal Submit-like
+  turn. Pair `synaps attach --observe` (watch the stream) with `synaps send`
+  from a second terminal for remote observe-and-steer.
+- **Follow-up (not yet done):** `SessionQuery::Status` does not expose a
+  `driver_armed` flag (its payload is `{session, model, tokens, cost, streaming,
+  auto_turns, attached, pending_prompts}`), and `synaps send` does not speak
+  `SessionCommand`. Armed-state routing is entirely the actor's job today, so no
+  client needs to branch on it. Exposing `driver_armed` would be a one-line
+  addition if explicit client-side steer/submit branching is ever wanted.
+
 ## Reload (`synaps daemon reload`, phase 3 C3)
 
 Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control connection:

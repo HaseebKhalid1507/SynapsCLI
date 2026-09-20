@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by P4 driver_tick
-
 //! Bounded, process-local feedback for one caller-owned foreground turn.
 //!
 //! The caller must filter ownership, call `begin_turn` before observing, and call

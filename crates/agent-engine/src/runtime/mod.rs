@@ -3341,6 +3341,14 @@ impl Runtime {
         self.cache_ttl
     }
 
+    /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
+    /// that a driver-owned turn shares the session's single downgrade latch
+    /// instead of firing a redundant 1h→5m notice.
+    pub fn share_ttl_latches(&mut self, parent: &Runtime) {
+        self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
+        self.saw_1h_honored = parent.saw_1h_honored.clone();
+    }
+
     /// Change the cache TTL strategy mid-session. The next request re-marks
     /// with the new TTL; the old prefix expires naturally (single-last
     /// strategy never prunes old markers, so no invalidation logic needed).
