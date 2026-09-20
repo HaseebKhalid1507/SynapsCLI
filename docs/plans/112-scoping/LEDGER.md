@@ -125,3 +125,24 @@ never spawns it. Sidecar binary located via config.executable or
    verbatim — same semantics, same names). No helper resurrection needed.
 | H7 | synaps-engine | 2414 | 0 | 12 |
 | H | workspace | 4481 | 0 (+client_diet flake) | — |
+
+## Track F — multimodal attachments (feat/112-attachments)
+| phase | crate | passed | failed | ignored | notes |
+|-------|-------|--------|--------|---------|-------|
+| F1 | synaps-engine (types+actor) | 43 | 0 | 0 | wire Vec<Value>, actor validates, Debug shows count+kinds |
+| F2 | synaps-tui | 592 | 0 (+client_diet,models flake) | 5 | PendingAttachments on App, /attach /attachments /detach |
+| F3 | synaps-tui | 592 | 0 (+client_diet,models flake) | 5 | Submit ships blocks, summaries, compaction guard |
+| F4 | synaps (chat) | — | — | — | headless /attach /attachments /detach, blank-line submit, piped fail-stop |
+| F5 | synaps (rpc) | 5 | 0 | 0 | rpc_attachment_paths + load_rpc_user_content + disclosure; 4 new tests |
+| F6 | docs | — | — | — | multimodal.md daemon note, daemon-mode.md paragraph, LEDGER |
+
+### Symbol audit residue (Track F)
+- `append_user_submission` (chat.rs): deliberate — handled inline in actor-mode chat
+- `list_pending_attachments` (chat.rs): deliberate — inline eprintln in /attachments handler
+- `rejected_attachment_submission_retains_bytes_and_abort_context` (chat.rs test): upstream-specific test; dev consumes on submit
+- `rpc_attachment_paths_require_absolute_without_parent_components` (rpc.rs test): renamed to `rpc_attachment_paths_validates_absolute_and_no_parent`
+- `rpc_attachment_failure_does_not_append_or_reserve_a_turn` (rpc.rs test): covered by `load_rpc_user_content_missing_file_fails`
+- `rpc_loads_bytes_and_ignores_mime_and_name_hints` (rpc.rs test): covered by `load_rpc_user_content_real_text_file`
+- `attachment` (rpc.rs fn): helper merged into `load_rpc_user_content`
+
+All production symbols ported. Test name differences are deliberate.

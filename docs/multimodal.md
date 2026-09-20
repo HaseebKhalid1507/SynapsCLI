@@ -128,6 +128,20 @@ lifecycle. Native Gemini Code Assist, explicit cloud invokes and extension
 providers currently reject attachments. Clipboard image decoding and WebSocket
 binary uploads are not implemented; use `/attach` or local stdio RPC.
 
+### Daemon mode
+
+Under the daemon (`synaps --daemon`), attachment paths are resolved on the
+**client** (TUI or `synaps chat`), not the daemon process. The client calls
+`load_attachment` on its own filesystem, builds canonical content blocks, and
+ships them as `Vec<serde_json::Value>` inside `SessionCommand::Submit`. The
+daemon's `SessionActor` validates the blocks structurally
+(`validate_attachment`) and against the session's model (`validate_messages`)
+before appending to history. A validation failure emits a `SystemNotice` and
+does not push the message. Per-frame size is bounded by
+`DAEMON_MAX_FRAME_BYTES` (64 MiB); per-history size by
+`HISTORY_IMAGE_BYTE_CAP` (20 MiB). The RPC stdio path (`synaps rpc`) runs
+in-process and loads files directly — no daemon filesystem boundary.
+
 For `/trace next content`, binary media is structurally redacted. OpenAI requests
 containing text-document attachments explicitly withhold the content capture
 bundle (reported by trace status), because lowering to ordinary input text loses

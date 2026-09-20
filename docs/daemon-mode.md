@@ -312,6 +312,17 @@ thing: the daemon itself.
 
 ### `SYNAPS_*` split (stub — T11 will formalize)
 
+### Multimodal attachments
+
+Attachment file paths are resolved on the **client** side, following the same
+principle as `--system` path resolution (T4): the daemon's filesystem is not
+the client's. The client loads bytes via `load_attachment` (with `O_NOFOLLOW`
+and regular-file checks), builds canonical content blocks via
+`PendingAttachments::build_content`, and ships them as `Vec<serde_json::Value>`
+inside `SessionCommand::Submit`. The actor validates structurally and per-model
+before appending. Rejection emits `SystemNotice`; the message is not pushed.
+See `docs/multimodal.md` for full details.
+
 | Category | Prefixes | Read by | In session env? |
 |---|---|---|---|
 | Client-only | `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*` | Thin TUI client | No (stripped) |
