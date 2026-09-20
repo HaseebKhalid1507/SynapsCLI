@@ -80,10 +80,7 @@ impl PendingAttachments {
         self.items.clear();
         blocks
     }
-    /// Drop every draft (turn accepted, or the user asked).
-    pub fn clear(&mut self) {
-        self.items.clear();
-    }
+
 }
 
 /// Asynchronous bounded read on an opened regular-file handle. On Unix,
