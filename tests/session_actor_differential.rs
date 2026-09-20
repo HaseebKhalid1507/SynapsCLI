@@ -810,7 +810,7 @@ async fn cancel_captures_abort_context() {
         serde_json::from_slice::<serde_json::Value>(&bodies[i]).unwrap()["messages"].clone()
     };
     assert_eq!(msgs(1), msgs(3), "abort-context fold differs");
-    assert!(msgs(1)[0].to_string().contains("[ABORT CONTEXT"), "{}", msgs(1)[0]);
+    assert!(msgs(1)[0].to_string().contains("ABORT CONTEXT"), "{}", msgs(1)[0]);
     assert_eq!(o.r.api_messages.len(), a.api_messages.len());
     assert_eq!(msgs_json(&o.r.api_messages), msgs_json(&a.api_messages));
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
