@@ -990,7 +990,13 @@ impl StreamMethods {
                                         }) => {
                                             let (output, rich_blocks) = match res {
                                                 Ok(o) => o.into_parts(),
-                                                Err(e) => (e.to_string(), None),
+                                                Err(e) => {
+                                                    // F28: the delta lane only saw stdout/stderr;
+                                                    // the exit status (and any T5 notice) lives in
+                                                    // the error summary. Never let the lane win.
+                                                    production_output = None;
+                                                    (e.to_string(), None)
+                                                }
                                             };
                                             let hooked_output = emit_after_tool_call(
                                                 &hook_bus,
@@ -1318,9 +1324,9 @@ impl StreamMethods {
                                             capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: None /* TODO(task A5): host wiring of MemoryContextCapability */, cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
-                                            let (output, rich_blocks) = match res {
-                                                Ok(o) => o.into_parts(),
-                                                Err(e) => (e.to_string(), None),
+                                            let (output, rich_blocks, errored) = match res {
+                                                Ok(o) => { let (t, b) = o.into_parts(); (t, b, false) }
+                                                Err(e) => (e.to_string(), None, true),
                                             };
                                             let hooked_output = emit_after_tool_call(
                                                 &hook_bus_inner,
@@ -1333,7 +1339,10 @@ impl StreamMethods {
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
-                                            (false, Some(call_effect), hooked_output, Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
+                                            // F28: an errored tool's summary carries the exit
+                                            // status; drop the delta-lane handle so it can't win.
+                                            let history_handle = if errored { None } else { Some(output_handle) };
+                                            (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         _ = cancel_token.cancelled() => {
                                             (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
