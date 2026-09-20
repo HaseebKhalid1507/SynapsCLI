@@ -42,6 +42,16 @@ pub struct SessionLock {
 }
 
 impl SessionLock {
+    /// Release the lock AND remove the lock file. For a session that never
+    /// journaled (ended `Idle`, F18) the `.lock` next to no `.json` is pure
+    /// litter; a session WITH a journal keeps its file (harmless, reaped on
+    /// the next acquire). Best effort: a failed unlink is not an error.
+    pub fn release_and_remove(self) {
+        let path = self.path.clone();
+        drop(self);
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Try to acquire an exclusive `flock` on `<dir>/<id>.lock`.
     ///
     /// Returns `Ok(lock)` on success; `Err` with an actionable message if
