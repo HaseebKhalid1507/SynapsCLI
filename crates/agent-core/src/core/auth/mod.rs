@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+pub mod account;
 pub mod aws_bedrock;
 pub mod azure_openai;
 pub mod broker;
@@ -27,6 +28,7 @@ mod openai_codex;
 mod pkce;
 pub mod provider;
 pub mod providers;
+pub mod quota_policy;
 pub mod static_providers;
 mod storage;
 mod token;
@@ -34,13 +36,16 @@ mod xai;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
+pub use account::{
+    account_config_key, account_env_var, Account, AccountLabel, AccountPolicy, AccountSelector,
+    AccountSummary, CredentialRef, AUTO_ACCOUNT_NAME, DEFAULT_ACCOUNT_NAME,
+};
 pub use broker::{
     broker_from_source, global_broker, global_broker_install_count, preflight_cloud_capability,
-    set_global_broker, AccessToken,
-    BrokerError, CredentialBroker, CredentialKind, LocalBroker, ProviderStatus, ProxyByteStream,
-    ProxyMethod, ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus,
-    MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES,
-    PROXY_REQUEST_TIMEOUT,
+    set_global_broker, AccessToken, BrokerError, CredentialBroker, CredentialKind, LocalBroker,
+    PinnedToken, ProviderStatus, ProxyByteStream, ProxyMethod, ProxyRequest, ProxyResponse,
+    RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES,
+    MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
 };
 pub use browser::open_browser;
 pub use callback::{
@@ -65,11 +70,15 @@ pub use provider::{
 };
 pub use static_providers::{static_provider, StaticProviderSpec, LOCAL_PROVIDER_KEY};
 pub use storage::{
-    auth_file_path, load_auth, load_cloud_state, load_provider_auth, load_static_key, save_auth,
-    save_cloud_state, save_provider_auth, save_static_key,
+    any_oauth_credential_present, auth_file_path, find_duplicate_identity, list_accounts,
+    list_accounts_detailed, list_all_accounts, load_auth, load_cloud_state, load_credential,
+    load_provider_auth, load_static_key, remove_credential, save_account_metadata, save_auth,
+    save_cloud_state, save_credential, save_provider_auth, save_static_key, AccountInventory,
+    AccountMetadata,
 };
 pub use token::{
-    ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
+    ensure_fresh_credential, ensure_fresh_provider_token, ensure_fresh_token,
+    exchange_code_for_tokens, refresh_token,
 };
 pub use xai::login as login_xai;
 

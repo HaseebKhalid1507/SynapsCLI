@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use super::account::{Account, AccountPolicy, AccountSelector, AccountSummary, CredentialRef};
 use super::cloud::{CloudProviderId, InvokeRequest};
 use super::provider::OAuthProviderId;
 use super::static_providers::{
@@ -189,6 +190,14 @@ pub enum BrokerError {
     Transport(String),
     /// Credential storage/refresh failure (message is already secret-free).
     Credential(String),
+    /// An explicitly requested account slot does not exist. Never a fallback.
+    UnknownAccount { provider: String, label: String },
+    /// This broker implementation cannot address named account slots.
+    UnsupportedAccount { provider: String, label: String },
+    /// An account label failed validation (CLI/env/config/HTTP boundary).
+    InvalidAccount(String),
+    /// Automatic selection found no account with proven capacity.
+    NoAccountAvailable { provider: String, reason: String },
 }
 
 impl std::fmt::Display for BrokerError {
@@ -217,6 +226,19 @@ impl std::fmt::Display for BrokerError {
             ),
             Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
+            Self::UnknownAccount { provider, label } => write!(
+                f,
+                "unknown account '{label}' for provider '{provider}' (no fallback; run \
+                 `synaps auth list` or `synaps login --provider {provider} --account {label}`)"
+            ),
+            Self::UnsupportedAccount { provider, label } => write!(
+                f,
+                "this credential broker cannot address account '{label}' for provider '{provider}'"
+            ),
+            Self::InvalidAccount(msg) => write!(f, "invalid account: {msg}"),
+            Self::NoAccountAvailable { provider, reason } => {
+                write!(f, "no account with proven capacity for '{provider}': {reason}")
+            }
         }
     }
 }
@@ -236,6 +258,16 @@ pub struct AccessToken {
     pub expires: u64,
 }
 
+/// The selected/pinned pair a runtime works with for one attempt: the
+/// credential the broker chose and the token vended for exactly that
+/// credential. Account-specific headers (e.g. the Codex account id) must be
+/// derived from `token`, never from a second lookup.
+#[derive(Debug, Clone)]
+pub struct PinnedToken {
+    pub credential: CredentialRef,
+    pub token: AccessToken,
+}
+
 /// HTTP method subset the proxy protocol supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -253,7 +285,11 @@ pub enum ProxyMethod {
 /// provider, so a key can never be coaxed toward an attacker-chosen host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
-    /// Static provider key (e.g. `groq`) or `local`.
+    /// Static provider key (e.g. `groq`), `local`, or an OAuth-proxied
+    /// provider. For OAuth providers an explicit account slot may be pinned
+    /// as `<provider>@<label>` or `<provider>@default`; a bare provider means
+    /// "the broker's account policy". Validated by [`validate`](Self::validate);
+    /// an explicit unknown slot is an error, never a fallback.
     pub provider: String,
     pub method: ProxyMethod,
     /// Relative path joined onto the pinned base URL, e.g. `/chat/completions`.
@@ -280,14 +316,16 @@ impl ProxyRequest {
     /// Validate provider identity and path shape. Fail closed on anything
     /// that could redirect a broker-owned credential.
     pub fn validate(&self) -> Result<(), BrokerError> {
-        if self.provider != LOCAL_PROVIDER_KEY
-            && self.provider != "xai-auth"
-            && self.provider != "github-copilot"
-            && self.provider != "google-gemini"
-            && self.provider != "openai-codex"
-            && self.provider != "anthropic"
-            && self.provider != "kimi-code"
-            && static_provider(&self.provider).is_none()
+        let (provider, _account) = self.split_provider()?;
+        let provider = provider.as_str();
+        if provider != LOCAL_PROVIDER_KEY
+            && provider != "xai-auth"
+            && provider != "github-copilot"
+            && provider != "google-gemini"
+            && provider != "openai-codex"
+            && provider != "anthropic"
+            && provider != "kimi-code"
+            && static_provider(provider).is_none()
         {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
         }
@@ -302,27 +340,26 @@ impl ProxyRequest {
         // Per-provider endpoint allowlist: a signed proxy request can only
         // reach the cataloged inference/model paths, never other same-host
         // endpoints (key management, billing, admin, …).
-        let oauth_path_allowed = self.provider == "xai-auth" && self.path == "/responses"
-            || self.provider == "github-copilot"
+        let oauth_path_allowed = provider == "xai-auth" && self.path == "/responses"
+            || provider == "github-copilot"
                 && matches!(
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
                 )
-            || self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
+            || provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
             // Managed Kimi Code endpoint allowlist: chat inference plus the
             // read-only catalog/profile/quota surfaces the official CLI uses.
-            || self.provider == "kimi-code"
+            || provider == "kimi-code"
                 && (self.path == "/chat/completions"
                     || self.method == ProxyMethod::Get
                         && matches!(self.path.as_str(), "/models" | "/me" | "/usages"))
-            || self.provider == "openai-codex"
+            || provider == "openai-codex"
                 && self.method == ProxyMethod::Get
                 && is_allowed_openai_codex_path(&self.path)
-            || self.provider == "anthropic"
+            || provider == "anthropic"
                 && self.method == ProxyMethod::Get
                 && is_allowed_anthropic_path(&self.path);
-        if !oauth_path_allowed && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
-        {
+        if !oauth_path_allowed && !allowed_proxy_paths(provider).contains(&self.path.as_str()) {
             return Err(BrokerError::Denied(format!(
                 "proxy path '{}' is not in the provider's endpoint allowlist",
                 self.path
@@ -395,6 +432,43 @@ impl ProxyRequest {
         };
         Ok((request, bytes))
     }
+
+    /// Pin the request to an explicit account slot (`<provider>@<label>` /
+    /// `<provider>@default`), replacing any previous pin.
+    pub fn with_account(mut self, account: &Account) -> Self {
+        let base = self
+            .provider
+            .split_once('@')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| self.provider.clone());
+        self.provider = format!("{base}@{}", account.label_str());
+        self
+    }
+
+    /// Split `provider` into the base provider key and the explicit account
+    /// pin, validating the label. Static/local providers never carry a pin.
+    pub fn split_provider(&self) -> Result<(String, Option<Account>), BrokerError> {
+        match self.provider.split_once('@') {
+            None => Ok((self.provider.clone(), None)),
+            Some((base, account)) => {
+                if base.parse::<OAuthProviderId>().is_err() {
+                    return Err(BrokerError::UnknownProvider(self.provider.clone()));
+                }
+                let account = Account::parse(account).map_err(BrokerError::InvalidAccount)?;
+                Ok((base.to_string(), Some(account)))
+            }
+        }
+    }
+
+    /// Base provider key without any account pin (after validation).
+    pub fn base_provider(&self) -> Result<String, BrokerError> {
+        Ok(self.split_provider()?.0)
+    }
+
+    /// The explicit account pin, if any. `None` → the policy decides.
+    pub fn explicit_account(&self) -> Result<Option<Account>, BrokerError> {
+        Ok(self.split_provider()?.1)
+    }
 }
 
 /// Buffered (non-streaming) proxy result: upstream status + body text.
@@ -422,8 +496,12 @@ pub struct ProviderStatus {
     pub key: String,
     pub name: String,
     pub kind: CredentialKind,
-    /// Whether a credential is available through the broker.
+    /// Whether a credential is available through the broker (for OAuth rows:
+    /// the policy-selected account exists, or any account under `auto`).
     pub configured: bool,
+    /// Stored account slots (OAuth providers only; non-secret rows).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountSummary>,
 }
 
 /// Non-secret display status for one static key (settings UI).
@@ -486,8 +564,79 @@ pub type CloudEventStream = Pin<Box<dyn Stream<Item = Result<CloudEvent, BrokerE
 /// remote `synaps auth-broker` over authenticated HTTP(S) ([`RemoteBroker`]).
 #[async_trait]
 pub trait CredentialBroker: Send + Sync {
-    /// Vend a fresh OAuth access token (token + expiry ONLY).
+    /// Vend a fresh OAuth access token (token + expiry ONLY) for the
+    /// policy-selected account of `provider`.
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError>;
+
+    /// Effective account selector for `provider` (env > config > injected
+    /// policy). No I/O beyond reading configuration; no secrets.
+    fn account_selector(&self, provider: OAuthProviderId) -> AccountSelector {
+        let _ = provider;
+        AccountSelector::Account(Account::Default)
+    }
+
+    /// Vend a token for an explicitly addressed credential. The default
+    /// implementation serves only the default slot (via [`access_token`]);
+    /// a named slot is an error — NEVER a fallback to another account.
+    ///
+    /// [`access_token`]: Self::access_token
+    async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        match &cred.account {
+            Account::Default => self.access_token(cred.provider).await,
+            Account::Named(label) => Err(BrokerError::UnsupportedAccount {
+                provider: cred.provider.as_str().to_string(),
+                label: label.as_str().to_string(),
+            }),
+        }
+    }
+
+    /// Policy-resolved pair: the credential the broker selected for
+    /// `provider` and its token. Default implementation: the default slot.
+    async fn access_token_pinned(
+        &self,
+        provider: OAuthProviderId,
+    ) -> Result<PinnedToken, BrokerError> {
+        let token = self.access_token(provider).await?;
+        Ok(PinnedToken {
+            credential: CredentialRef::default_for(provider),
+            token,
+        })
+    }
+
+    /// Model-aware variant of [`access_token_pinned`]: under an `auto`
+    /// selector only accounts with proven capacity *for `model`* are
+    /// eligible. Default implementation ignores the model.
+    ///
+    /// [`access_token_pinned`]: Self::access_token_pinned
+    async fn access_token_pinned_for(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let _ = model;
+        self.access_token_pinned(provider).await
+    }
+
+    /// Non-secret account listing for `provider`. Default: unsupported.
+    async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+        Err(BrokerError::UnsupportedCapability {
+            provider: provider.as_str().to_string(),
+            capability: "accounts".into(),
+        })
+    }
+
+    /// Report that `cred` hit a provider limit so automatic selection stops
+    /// advertising it until `until_ms` (epoch ms; `None` = a short default).
+    /// Best effort; default implementation is a no-op.
+    async fn report_cooldown(
+        &self,
+        cred: &CredentialRef,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let _ = (cred, until_ms, reason);
+        Ok(())
+    }
 
     /// Execute a non-streaming provider request with the broker-owned key.
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError>;
@@ -1435,7 +1584,29 @@ pub struct LocalBroker {
     /// Buffered response size cap.
     max_response_bytes: usize,
     cloud_backend: Option<Arc<dyn CloudBackend>>,
+    /// Injected account policy. `None` → resolved from env + config on every
+    /// selection (no global mutation, picks up `synaps auth use` changes).
+    account_policy: Option<AccountPolicy>,
+    /// In-memory cooldowns for automatic selection, keyed by storage key.
+    cooldowns: Arc<std::sync::Mutex<BTreeMap<String, Cooldown>>>,
+    /// Test seam: overrides the usage endpoint for typed usage snapshots.
+    usage_endpoint_override: Option<String>,
+    /// Max age of a usage observation that still counts as capacity.
+    max_snapshot_age: Duration,
 }
+
+/// A reported provider limit for one account (non-secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cooldown {
+    until_ms: u64,
+    reason: String,
+}
+
+/// Cooldown applied when a limit is reported without a reset hint.
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// Default staleness bound for automatic selection (matches the keeper's
+/// `--stale-after` default).
+pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(30 * 60);
 
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
@@ -1448,12 +1619,168 @@ impl LocalBroker {
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
+            account_policy: None,
+            cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            usage_endpoint_override: None,
+            max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
         }
     }
 
     pub fn with_cloud_backend(mut self, backend: Arc<dyn CloudBackend>) -> Self {
         self.cloud_backend = Some(backend);
         self
+    }
+
+    /// Pin the account policy instead of reading env + config per call.
+    pub fn with_account_policy(mut self, policy: AccountPolicy) -> Self {
+        self.account_policy = Some(policy);
+        self
+    }
+
+    /// Test seam: point typed usage fetches at a fake server.
+    #[doc(hidden)]
+    pub fn with_usage_endpoint_override(mut self, url: impl Into<String>) -> Self {
+        self.usage_endpoint_override = Some(url.into());
+        self
+    }
+
+    /// Bound on usage-snapshot age for automatic selection.
+    pub fn with_max_snapshot_age(mut self, age: Duration) -> Self {
+        self.max_snapshot_age = age;
+        self
+    }
+
+    /// Effective policy: injected, else env > config > default.
+    fn policy(&self) -> AccountPolicy {
+        self.account_policy
+            .clone()
+            .unwrap_or_else(AccountPolicy::from_environment)
+    }
+
+    /// Active cooldown for a storage key (expired entries are dropped).
+    fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
+        let mut map = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(storage_key) {
+            Some(c) if c.until_ms > now_ms => Some(c.until_ms),
+            Some(_) => {
+                map.remove(storage_key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Verify an explicitly addressed slot exists. Named slots that are
+    /// missing are `UnknownAccount` (never a fallback); the default slot
+    /// keeps the historical load-miss `Credential` error from the refresh
+    /// path so existing "not logged in" classifiers keep working.
+    fn check_slot_exists(&self, cred: &CredentialRef) -> Result<(), BrokerError> {
+        if let Account::Named(label) = &cred.account {
+            match storage::load_credential(cred) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(BrokerError::UnknownAccount {
+                        provider: cred.provider.as_str().to_string(),
+                        label: label.as_str().to_string(),
+                    })
+                }
+                Err(e) => return Err(BrokerError::Credential(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the credential for a request: explicit account (validated,
+    /// never a fallback) or the policy (`auto` → capacity selection).
+    async fn resolve_request_credential(
+        &self,
+        provider: OAuthProviderId,
+        explicit: Option<Account>,
+        model: Option<&str>,
+    ) -> Result<CredentialRef, BrokerError> {
+        if let Some(account) = explicit {
+            return Ok(CredentialRef::new(provider, account));
+        }
+        match self.policy().selector(provider) {
+            AccountSelector::Account(account) => Ok(CredentialRef::new(provider, account)),
+            AccountSelector::Auto => self.select_auto(provider, model).await,
+            AccountSelector::Invalid { source, reason } => {
+                Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
+            }
+        }
+    }
+
+    /// Capacity view for one account from a fresh, read-only usage snapshot.
+    /// Anything that is not a well-formed, fresh reading is NOT capacity.
+    async fn capacity_for(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> super::quota_policy::AccountCapacity {
+        use super::quota_policy::{AccountCapacity, QuotaObservation};
+        let _ = now_ms;
+        // Typed usage adapters are wired in `usage()`; until that lands every
+        // account is reported as `Unsupported`, which the policy rejects.
+        AccountCapacity {
+            credential: cred.clone(),
+            observed_at_ms: None,
+            observation: QuotaObservation::Unsupported,
+            cooldown_until_ms: None,
+        }
+    }
+
+    /// Automatic selection: fresh, read-only usage for every stored account
+    /// of `provider`, fed to the pure capacity policy. Fails closed — no
+    /// account is advertised without proven capacity for `model`.
+    async fn select_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<CredentialRef, BrokerError> {
+        use super::quota_policy::{select, Selection, SelectionRequest, Strategy};
+        let now_ms = crate::epoch_millis();
+        let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
+        if summaries.is_empty() {
+            return Err(BrokerError::NoAccountAvailable {
+                provider: provider.as_str().to_string(),
+                reason: "no stored accounts".into(),
+            });
+        }
+        let mut candidates = Vec::with_capacity(summaries.len());
+        for summary in &summaries {
+            let Some(cred) = summary.credential_ref() else {
+                continue;
+            };
+            let mut capacity = self.capacity_for(&cred, now_ms).await;
+            capacity.cooldown_until_ms = self.cooldown_until(&cred.storage_key(), now_ms);
+            candidates.push(capacity);
+        }
+        let preference: Vec<String> = summaries.iter().map(|s| s.label.clone()).collect();
+        let request = SelectionRequest {
+            model,
+            preference: &preference,
+            strategy: Strategy::LowestUtilization,
+            ..SelectionRequest::new(provider, now_ms, self.max_snapshot_age.as_millis() as u64)
+        };
+        match select(&request, &candidates) {
+            Selection::Selected { credential, .. } => Ok(credential),
+            Selection::NoCapacity {
+                rejections,
+                earliest_reset_ms,
+            } => {
+                let detail: Vec<String> = rejections
+                    .iter()
+                    .map(|r| format!("{}: {:?}", r.credential.account, r.reason))
+                    .collect();
+                let reset = earliest_reset_ms
+                    .map(|t| format!("; earliest reset at {t}"))
+                    .unwrap_or_default();
+                Err(BrokerError::NoAccountAvailable {
+                    provider: provider.as_str().to_string(),
+                    reason: format!("{}{reset}", detail.join(", ")),
+                })
+            }
+        }
     }
 
     /// Test/embedding seam: pin the `local` provider endpoint explicitly.
@@ -1554,55 +1881,74 @@ impl LocalBroker {
 
     async fn send(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
-        let (key, base) = if request.provider == "xai-auth" {
-            let token = self.access_token(OAuthProviderId::Xai).await?;
-            (token.token, "https://api.x.ai/v1".to_string())
-        } else if request.provider == "github-copilot" {
+        let (provider_key, explicit_account) = request.split_provider()?;
+        let provider_key = provider_key.as_str();
+        // OAuth-proxied providers: resolve ONE credential (explicit account
+        // or policy) and derive both the bearer and any account-specific
+        // header from that same credential.
+        let oauth_provider: Option<OAuthProviderId> = provider_key.parse().ok();
+        let mut pinned: Option<PinnedToken> = None;
+        if let Some(provider) = oauth_provider {
+            if provider_key != LOCAL_PROVIDER_KEY && static_provider(provider_key).is_none() {
+                let cred = self
+                    .resolve_request_credential(provider, explicit_account, None)
+                    .await?;
+                let token = self.access_token_for(&cred).await?;
+                pinned = Some(PinnedToken {
+                    credential: cred,
+                    token,
+                });
+            }
+        }
+        let bearer = |pinned: &Option<PinnedToken>| -> Result<String, BrokerError> {
+            pinned
+                .as_ref()
+                .map(|p| p.token.token.clone())
+                .ok_or_else(|| BrokerError::UnknownProvider(request.provider.clone()))
+        };
+        let (key, base) = if provider_key == "xai-auth" {
+            (bearer(&pinned)?, "https://api.x.ai/v1".to_string())
+        } else if provider_key == "github-copilot" {
             // Catalog-only OAuth proxy: short-lived Copilot session token only.
             // Never attach the GitHub user token (stored as OAuth refresh).
-            let token = self.access_token(OAuthProviderId::GitHubCopilot).await?;
             (
-                token.token,
+                bearer(&pinned)?,
                 super::github_copilot_models_base_url().to_string(),
             )
-        } else if request.provider == "google-gemini" {
+        } else if provider_key == "google-gemini" {
             // Google Gemini (Code Assist) is broker-proxy-only. Refresh stays
             // broker-owned; runtime never receives it.
-            let token = self.access_token(OAuthProviderId::GoogleGemini).await?;
             let base = self
                 .google_gemini_base_url
                 .clone()
                 .unwrap_or_else(|| GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string());
-            (token.token, base)
-        } else if request.provider == "openai-codex" {
+            (bearer(&pinned)?, base)
+        } else if provider_key == "openai-codex" {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
-            let token = self.access_token(OAuthProviderId::OpenAiCodex).await?;
-            (token.token, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
-        } else if request.provider == "kimi-code" {
+            (bearer(&pinned)?, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
+        } else if provider_key == "kimi-code" {
             // Managed Kimi Code OAuth proxy: short-lived (~15 min) access
             // token resolved broker-side; the rotating refresh token never
             // leaves the boundary. Base is pinned to the managed endpoint.
-            let token = self.access_token(OAuthProviderId::KimiCode).await?;
-            (token.token, super::kimi_code::API_BASE_URL.to_string())
-        } else if request.provider == "anthropic" {
+            (bearer(&pinned)?, super::kimi_code::API_BASE_URL.to_string())
+        } else if provider_key == "anthropic" {
             // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
             // Keeps the access token broker-owned (no runtime token vending).
-            let token = self.access_token(OAuthProviderId::Anthropic).await?;
-            (token.token, "https://api.anthropic.com".to_string())
+            (bearer(&pinned)?, "https://api.anthropic.com".to_string())
         } else {
             (
-                self.resolve_static_key(&request.provider)?,
-                self.base_url_for(&request.provider)?,
+                self.resolve_static_key(provider_key)?,
+                self.base_url_for(provider_key)?,
             )
         };
         let url = format!("{base}{}", request.path);
         // Deny redirects for credential-bearing OAuth catalog traffic and
         // google-gemini: a 3xx must not replay the bearer token off-origin.
-        let mut builder = if request.provider == "google-gemini"
-            || request.provider == "openai-codex"
-            || request.provider == "anthropic"
-            || request.provider == "kimi-code"
+        let mut builder = if provider_key == "google-gemini"
+            || provider_key == "openai-codex"
+            || provider_key == "anthropic"
+            || provider_key == "kimi-code"
         {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -1620,15 +1966,22 @@ impl LocalBroker {
             }
         };
         builder = builder.bearer_auth(&key);
-        if request.provider == "openai-codex" {
-            // ChatGPT backend requires the account id. Prefer the stored
-            // credential claim; fall back to JWT extraction. Never silently omit.
-            let account_id = super::load_provider_auth("openai-codex")
-                .ok()
-                .flatten()
-                .and_then(|c| c.account_id)
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| super::extract_codex_account_id(&key))
+        if provider_key == "openai-codex" {
+            // ChatGPT backend requires the account id. Derive it from the SAME
+            // credential that produced the bearer: the JWT claim first, then
+            // that slot's stored `accountId`. Never another slot, never omitted.
+            let cred = pinned
+                .as_ref()
+                .map(|p| p.credential.clone())
+                .unwrap_or_else(|| CredentialRef::default_for(OAuthProviderId::OpenAiCodex));
+            let account_id = super::extract_codex_account_id(&key)
+                .or_else(|| {
+                    storage::load_credential(&cred)
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.account_id)
+                        .filter(|s| !s.trim().is_empty())
+                })
                 .ok_or_else(|| {
                     BrokerError::Credential(
                         "openai-codex credential is missing chatgpt account id".into(),
@@ -1640,14 +1993,14 @@ impl LocalBroker {
                 .header("OpenAI-Beta", "responses=experimental")
                 .header("accept", "application/json");
         }
-        if request.provider == "anthropic" {
+        if provider_key == "anthropic" {
             // OAuth catalog: Bearer + anthropic-version + anthropic-beta.
             // Do NOT send the OAuth token as x-api-key.
             for (name, value) in anthropic_oauth_catalog_request_headers() {
                 builder = builder.header(*name, *value);
             }
         }
-        if request.provider == "github-copilot" {
+        if provider_key == "github-copilot" {
             for (name, value) in super::github_copilot_models_request_headers() {
                 builder = builder.header(*name, *value);
             }
@@ -1657,7 +2010,7 @@ impl LocalBroker {
                     .header("X-Initiator", "agent");
             }
         }
-        if request.provider == "google-gemini" {
+        if provider_key == "google-gemini" {
             // The Code Assist reference client uses `?alt=sse` for streaming.
             // Match that so upstream returns line-delimited SSE frames rather
             // than JSON-in-one-response.
@@ -1666,7 +2019,7 @@ impl LocalBroker {
             }
             builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
-        if request.provider == "kimi-code" {
+        if provider_key == "kimi-code" {
             // Conventional Kimi device-identity surface (mirrors the official
             // CLI's `X-Msh-*` headers). Values are non-secret; the User-Agent
             // identifies Synaps honestly.
@@ -1694,7 +2047,7 @@ impl LocalBroker {
             builder = builder.timeout(self.request_timeout);
         }
         builder.send().await.map_err(|e| {
-            if e.is_connect() && request.provider == LOCAL_PROVIDER_KEY {
+            if e.is_connect() && provider_key == LOCAL_PROVIDER_KEY {
                 BrokerError::Transport(format!(
                     "can't reach local endpoint at {url} — is Ollama/LM Studio running?"
                 ))
@@ -1893,7 +2246,16 @@ pub fn oauth_provider_logged_in(provider: OAuthProviderId) -> bool {
 #[async_trait]
 impl CredentialBroker for LocalBroker {
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError> {
-        let creds = super::ensure_fresh_provider_token(&self.http, provider)
+        Ok(self.access_token_pinned(provider).await?.token)
+    }
+
+    fn account_selector(&self, provider: OAuthProviderId) -> AccountSelector {
+        self.policy().selector(provider)
+    }
+
+    async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        self.check_slot_exists(cred)?;
+        let creds = super::ensure_fresh_credential(&self.http, cred)
             .await
             .map_err(BrokerError::Credential)?;
         // Strip to token + expiry: the refresh token stays behind the boundary.
@@ -1901,6 +2263,55 @@ impl CredentialBroker for LocalBroker {
             token: creds.access,
             expires: creds.expires,
         })
+    }
+
+    async fn access_token_pinned(
+        &self,
+        provider: OAuthProviderId,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.access_token_pinned_for(provider, None).await
+    }
+
+    async fn access_token_pinned_for(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let credential = self.resolve_request_credential(provider, None, model).await?;
+        let token = self.access_token_for(&credential).await?;
+        Ok(PinnedToken { credential, token })
+    }
+
+    async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+        let mut rows = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
+        let selector = self.policy().selector(provider);
+        let now_ms = crate::epoch_millis();
+        for row in &mut rows {
+            row.selected = matches!(&selector, AccountSelector::Account(a) if a.label_str() == row.label);
+            if let Some(cred) = row.credential_ref() {
+                row.cooldown_until = self.cooldown_until(&cred.storage_key(), now_ms);
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn report_cooldown(
+        &self,
+        cred: &CredentialRef,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let now_ms = crate::epoch_millis();
+        let until_ms = until_ms
+            .filter(|t| *t > now_ms)
+            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64);
+        let reason = crate::truncate_str(reason, 64).to_string();
+        tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cred.storage_key(), Cooldown { until_ms, reason });
+        Ok(())
     }
 
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
@@ -2007,15 +2418,22 @@ impl CredentialBroker for LocalBroker {
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
         let mut out = Vec::new();
+        let policy = self.policy();
         for descriptor in super::provider::registry().iter() {
+            let accounts = self.accounts(descriptor.id).await.unwrap_or_default();
+            let configured = match policy.selector(descriptor.id) {
+                AccountSelector::Account(account) => accounts
+                    .iter()
+                    .any(|a| a.label == account.label_str()),
+                AccountSelector::Auto => !accounts.is_empty(),
+                AccountSelector::Invalid { .. } => false,
+            };
             out.push(ProviderStatus {
                 key: descriptor.id.as_str().to_string(),
                 name: descriptor.display_name.to_string(),
                 kind: CredentialKind::OAuth,
-                configured: load_provider_auth(descriptor.id.as_str())
-                    .ok()
-                    .flatten()
-                    .is_some(),
+                configured,
+                accounts,
             });
         }
         for spec in STATIC_PROVIDERS {
@@ -2024,6 +2442,7 @@ impl CredentialBroker for LocalBroker {
                 name: spec.name.to_string(),
                 kind: CredentialKind::StaticKey,
                 configured: static_key_configured(spec.key),
+                accounts: Vec::new(),
             });
         }
         out.push(ProviderStatus {
@@ -2031,6 +2450,7 @@ impl CredentialBroker for LocalBroker {
             name: "Local endpoint".to_string(),
             kind: CredentialKind::LocalEndpoint,
             configured: true,
+            accounts: Vec::new(),
         });
         Ok(out)
     }
@@ -2046,6 +2466,8 @@ pub struct RemoteBroker {
     endpoint: String,
     machine_token: String,
     cache: super::TokenCache,
+    /// Injected account policy; `None` → env + config per call.
+    account_policy: Option<AccountPolicy>,
 }
 
 impl RemoteBroker {
@@ -2069,7 +2491,125 @@ impl RemoteBroker {
             endpoint,
             machine_token: machine_token.into(),
             cache,
+            account_policy: None,
         }
+    }
+
+    /// Pin the account policy instead of reading env + config per call.
+    pub fn with_account_policy(mut self, policy: AccountPolicy) -> Self {
+        self.account_policy = Some(policy);
+        self
+    }
+
+    fn policy(&self) -> AccountPolicy {
+        self.account_policy
+            .clone()
+            .unwrap_or_else(AccountPolicy::from_environment)
+    }
+
+    fn fetcher(&self) -> super::BrokerClient {
+        super::BrokerClient::with_client(
+            self.endpoint.clone(),
+            self.machine_token.clone(),
+            self.http.clone(),
+        )
+    }
+
+    /// Cache scope: endpoint + machine-principal digest (never the token).
+    fn scope(&self) -> String {
+        super::credential_source::source_scope(&self.endpoint, &self.machine_token)
+    }
+
+    /// Resolve the credential for a token request on the client side. An
+    /// `auto` selector is delegated to the broker daemon (`account=auto`),
+    /// which holds the usage/cooldown state; the daemon reports which slot
+    /// it chose.
+    async fn resolve_pinned(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        match self.policy().selector(provider) {
+            AccountSelector::Account(account) => {
+                let credential = CredentialRef::new(provider, account);
+                let token = self.access_token_for(&credential).await?;
+                Ok(PinnedToken { credential, token })
+            }
+            AccountSelector::Auto => self.fetch_auto(provider, model).await,
+            AccountSelector::Invalid { source, reason } => {
+                Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
+            }
+        }
+    }
+
+    /// `GET /token?provider=X&account=auto[&model=M]` — the daemon selects;
+    /// the response's `account` field names the chosen slot. Never cached
+    /// (the selection is the daemon's, per call).
+    async fn fetch_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let mut query: Vec<(&str, &str)> = vec![
+            ("provider", provider.as_str()),
+            ("account", super::account::AUTO_ACCOUNT_NAME),
+        ];
+        if let Some(model) = model {
+            query.push(("model", model));
+        }
+        let resp = self
+            .http
+            .get(format!("{}/token", self.endpoint))
+            .query(&query)
+            .bearer_auth(&self.machine_token)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => return Err(BrokerError::Unauthorized),
+            503 => {
+                drop(resp);
+                return Err(BrokerError::NoAccountAvailable {
+                    provider: provider.as_str().to_string(),
+                    reason: "broker reported no account with proven capacity".into(),
+                });
+            }
+            s if !(200..300).contains(&s) => {
+                drop(resp);
+                return Err(BrokerError::Transport(format!("broker returned HTTP {s}")));
+            }
+            _ => {}
+        }
+        #[derive(Deserialize)]
+        struct AutoToken {
+            access_token: String,
+            expires: u64,
+            #[serde(default)]
+            ttl_ms: Option<u64>,
+            account: Option<String>,
+        }
+        let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+        let tok: AutoToken = serde_json::from_str(&body)
+            .map_err(|e| BrokerError::Transport(format!("invalid broker token response: {e}")))?;
+        let account = tok
+            .account
+            .as_deref()
+            .ok_or_else(|| BrokerError::Transport("broker did not report the selected account".into()))
+            .and_then(|a| Account::parse(a).map_err(BrokerError::InvalidAccount))?;
+        if tok.access_token.is_empty() {
+            return Err(BrokerError::Transport("broker returned an empty access_token".into()));
+        }
+        let expires = match tok.ttl_ms {
+            Some(ttl) => crate::epoch_millis().saturating_add(ttl),
+            None => tok.expires,
+        };
+        Ok(PinnedToken {
+            credential: CredentialRef::new(provider, account),
+            token: AccessToken {
+                token: tok.access_token,
+                expires,
+            },
+        })
     }
 
     async fn post_proxy(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
@@ -2101,23 +2641,80 @@ impl RemoteBroker {
 #[async_trait]
 impl CredentialBroker for RemoteBroker {
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError> {
-        let fetcher = super::BrokerClient::with_client(
-            self.endpoint.clone(),
-            self.machine_token.clone(),
-            self.http.clone(),
-        );
-        let tok = super::resolve_remote(
+        Ok(self.access_token_pinned(provider).await?.token)
+    }
+
+    fn account_selector(&self, provider: OAuthProviderId) -> AccountSelector {
+        self.policy().selector(provider)
+    }
+
+    async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        let fetcher = self.fetcher();
+        let tok = super::credential_source::resolve_remote_credential(
             &fetcher,
             &self.cache,
-            provider.as_str(),
+            &self.scope(),
+            cred,
             super::DEFAULT_MARGIN_MS,
         )
         .await
-        .map_err(BrokerError::Transport)?;
+        .map_err(|e| e.into_broker_error(cred))?;
         Ok(AccessToken {
             token: tok.access_token,
             expires: tok.expires,
         })
+    }
+
+    async fn access_token_pinned(
+        &self,
+        provider: OAuthProviderId,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_pinned(provider, None).await
+    }
+
+    async fn access_token_pinned_for(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_pinned(provider, model).await
+    }
+
+    async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+        let caps = self.capabilities().await?;
+        Ok(caps
+            .into_iter()
+            .find(|c| c.key == provider.as_str())
+            .map(|c| c.accounts)
+            .unwrap_or_default())
+    }
+
+    async fn report_cooldown(
+        &self,
+        cred: &CredentialRef,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let resp = self
+            .http
+            .post(format!("{}/accounts/cooldown", self.endpoint))
+            .bearer_auth(&self.machine_token)
+            .json(&serde_json::json!({
+                "provider": cred.provider.as_str(),
+                "account": cred.account.label_str(),
+                "until_ms": until_ms,
+                "reason": crate::truncate_str(reason, 64),
+            }))
+            .send()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            s if !(200..300).contains(&s) => {
+                Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {

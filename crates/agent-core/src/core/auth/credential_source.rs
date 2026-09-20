@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::account::{Account, CredentialRef};
+
 /// Where a client gets its provider credentials.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub enum CredentialSource {
@@ -115,12 +117,50 @@ pub const DEFAULT_MARGIN_MS: u64 = 5 * 60 * 1000;
 
 // ── In-memory token cache ────────────────────────────────────────────────────
 
-/// Thread-safe, per-provider cache of broker access tokens. Cloneable handle
-/// over shared state. Holds ONLY short-lived access tokens, never a refresh
-/// token, never persisted to disk.
+/// Thread-safe cache of broker access tokens. Cloneable handle over shared
+/// state. Holds ONLY short-lived access tokens, never a refresh token, never
+/// persisted to disk.
+///
+/// Keys are either a bare provider id (legacy callers) or a scoped key built
+/// by [`TokenCache::scoped_key`]: `"<storage_key>|<source scope>"`, where
+/// the scope identifies the broker endpoint AND the machine principal (a
+/// digest of the machine token — never the token itself) so a re-pointed or
+/// re-keyed client can never reuse another principal's cached token.
 #[derive(Clone, Default)]
 pub struct TokenCache {
     inner: Arc<RwLock<HashMap<String, BrokerToken>>>,
+}
+
+/// Opaque, log-safe identity of a remote credential source.
+pub fn source_scope(endpoint: &str, machine_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let principal = if machine_token.is_empty() {
+        "anon".to_string()
+    } else {
+        let digest = Sha256::digest(machine_token.as_bytes());
+        hex_prefix(&digest, 16)
+    };
+    format!("{}#{principal}", endpoint.trim_end_matches('/'))
+}
+
+fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+    let mut out = String::with_capacity(chars);
+    for b in bytes {
+        if out.len() >= chars {
+            break;
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    out.truncate(chars);
+    out
+}
+
+/// Provider id component of a cache key (bare provider or scoped key).
+fn key_provider(key: &str) -> Option<String> {
+    let storage_key = key.split_once('|').map(|(k, _)| k).unwrap_or(key);
+    CredentialRef::parse_storage_key(storage_key)
+        .map(|c| c.provider.as_str().to_string())
+        .or_else(|| Some(storage_key.to_string()))
 }
 
 /// Redacting Debug — print only the cached provider names, never the tokens.
@@ -160,9 +200,24 @@ impl TokenCache {
         }
     }
 
+    /// Drop every cached token for `provider` — the legacy bare key and every
+    /// scoped `(account, source)` key of that provider — so a 401 or a source
+    /// switch can never leave an account's stale token behind.
     pub fn invalidate(&self, provider: &str) {
         if let Ok(mut map) = self.inner.write() {
-            map.remove(provider);
+            map.retain(|key, _| key_provider(key).as_deref() != Some(provider));
+        }
+    }
+
+    /// Cache key for one credential fetched from one source scope.
+    pub fn scoped_key(scope: &str, cred: &CredentialRef) -> String {
+        format!("{}|{scope}", cred.storage_key())
+    }
+
+    /// Drop the cached token for exactly one scoped credential.
+    pub fn invalidate_credential(&self, scope: &str, cred: &CredentialRef) {
+        if let Ok(mut map) = self.inner.write() {
+            map.remove(&Self::scoped_key(scope, cred));
         }
     }
 
@@ -182,11 +237,76 @@ impl TokenCache {
 
 // ── Fetcher abstraction + resolver ───────────────────────────────────────────
 
+/// Typed failure of an account-addressed token fetch. Display is secret-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenFetchError {
+    /// Broker rejected machine auth (401).
+    Unauthorized,
+    /// Broker reports the explicit account slot does not exist (404).
+    UnknownAccount,
+    /// Broker rejected the account label (400).
+    InvalidAccount,
+    /// Fetcher/broker cannot address named slots.
+    UnsupportedAccount,
+    /// Any other HTTP status.
+    Http(u16),
+    /// Transport or response-shape failure (message already secret-free).
+    Other(String),
+}
+
+impl std::fmt::Display for TokenFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized => write!(f, "broker rejected machine auth (401)"),
+            Self::UnknownAccount => write!(f, "broker reports unknown account (404)"),
+            Self::InvalidAccount => write!(f, "broker rejected account label (400)"),
+            Self::UnsupportedAccount => write!(f, "named accounts are not supported by this fetcher"),
+            Self::Http(status) => write!(f, "broker returned HTTP {status}"),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl TokenFetchError {
+    pub fn into_broker_error(self, cred: &CredentialRef) -> super::broker::BrokerError {
+        use super::broker::BrokerError;
+        match self {
+            Self::Unauthorized => BrokerError::Unauthorized,
+            Self::UnknownAccount => BrokerError::UnknownAccount {
+                provider: cred.provider.as_str().to_string(),
+                label: cred.account.label_str().to_string(),
+            },
+            Self::InvalidAccount => {
+                BrokerError::InvalidAccount(format!("broker rejected '{}'", cred.account))
+            }
+            Self::UnsupportedAccount => BrokerError::UnsupportedAccount {
+                provider: cred.provider.as_str().to_string(),
+                label: cred.account.label_str().to_string(),
+            },
+            Self::Http(status) => BrokerError::Transport(format!("broker returned HTTP {status}")),
+            Self::Other(msg) => BrokerError::Transport(msg),
+        }
+    }
+}
+
 /// "Get a fresh access token from somewhere." Abstracted so the cache/resolve
 /// logic is unit-testable without real HTTP. The real impl is `BrokerClient`.
 #[allow(async_fn_in_trait)]
 pub trait TokenFetcher {
     async fn fetch_token(&self, provider: &str) -> Result<BrokerToken, String>;
+
+    /// Account-addressed fetch. Default: the default slot goes through
+    /// [`fetch_token`](Self::fetch_token); a named slot is unsupported (never
+    /// silently served from the default slot).
+    async fn fetch_credential(&self, cred: &CredentialRef) -> Result<BrokerToken, TokenFetchError> {
+        match &cred.account {
+            Account::Default => self
+                .fetch_token(cred.provider.as_str())
+                .await
+                .map_err(TokenFetchError::Other),
+            Account::Named(_) => Err(TokenFetchError::UnsupportedAccount),
+        }
+    }
 }
 
 /// Resolve a provider token via cache-or-fetch, returning the full
@@ -214,6 +334,42 @@ pub async fn resolve_remote<F: TokenFetcher>(
                 return Ok(tok);
             }
             Err(e)
+        }
+    }
+}
+
+/// Account- and source-scoped variant of [`resolve_remote`]: the cache key
+/// carries the storage key plus the source scope, so tokens for different
+/// accounts, endpoints or machine principals never alias. Same degraded-mode
+/// rule (serve an unexpired cached token when the broker is unreachable),
+/// except that typed rejections (401/404/400) are never masked by the cache.
+pub async fn resolve_remote_credential<F: TokenFetcher>(
+    fetcher: &F,
+    cache: &TokenCache,
+    scope: &str,
+    cred: &CredentialRef,
+    margin_ms: u64,
+) -> Result<BrokerToken, TokenFetchError> {
+    let key = TokenCache::scoped_key(scope, cred);
+    if let Some(tok) = cache.get_fresh(&key, margin_ms) {
+        return Ok(tok);
+    }
+    match fetcher.fetch_credential(cred).await {
+        Ok(tok) => {
+            cache.put(&key, tok.clone());
+            Ok(tok)
+        }
+        Err(e @ TokenFetchError::Other(_)) | Err(e @ TokenFetchError::Http(_)) => {
+            if let Some(tok) = cache.get_unexpired(&key) {
+                return Ok(tok);
+            }
+            Err(e)
+        }
+        Err(rejected) => {
+            // The broker positively rejected this credential/principal: a
+            // cached token must not paper over it.
+            cache.invalidate_credential(scope, cred);
+            Err(rejected)
         }
     }
 }
@@ -301,28 +457,44 @@ pub async fn resolve_access_token(
         .map_err(|e| e.to_string())
 }
 
-impl TokenFetcher for BrokerClient {
-    async fn fetch_token(&self, provider: &str) -> Result<BrokerToken, String> {
+impl BrokerClient {
+    /// Source scope for cache keys (endpoint + machine-principal digest).
+    pub fn scope(&self) -> String {
+        source_scope(&self.endpoint, &self.machine_token)
+    }
+
+    /// `GET /token?provider=X[&account=Y]`. The `account` parameter is sent
+    /// only for named slots so older brokers keep serving the default slot.
+    async fn fetch_token_query(
+        &self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<BrokerToken, TokenFetchError> {
         let url = format!("{}/token", self.endpoint);
+        let mut query: Vec<(&str, &str)> = vec![("provider", provider)];
+        if let Some(account) = account {
+            query.push(("account", account));
+        }
         let resp = self
             .http
             .get(&url)
-            .query(&[("provider", provider)])
+            .query(&query)
             .bearer_auth(&self.machine_token)
             .send()
             .await
-            .map_err(|e| format!("broker request failed: {e}"))?;
+            .map_err(|e| TokenFetchError::Other(format!("broker request failed: {e}")))?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("broker rejected machine auth (401)".to_string());
-        }
-        if !status.is_success() {
-            return Err(format!("broker returned HTTP {status}"));
+        match status.as_u16() {
+            401 => return Err(TokenFetchError::Unauthorized),
+            404 if account.is_some() => return Err(TokenFetchError::UnknownAccount),
+            400 if account.is_some() => return Err(TokenFetchError::InvalidAccount),
+            s if !status.is_success() => return Err(TokenFetchError::Http(s)),
+            _ => {}
         }
         let mut tok = resp
             .json::<BrokerToken>()
             .await
-            .map_err(|e| format!("invalid broker token response: {e}"))?;
+            .map_err(|e| TokenFetchError::Other(format!("invalid broker token response: {e}")))?;
         // C3: prefer the broker's relative TTL over its absolute clock.
         if let Some(ttl) = tok.ttl_ms {
             tok.expires = now_millis().saturating_add(ttl);
@@ -330,12 +502,32 @@ impl TokenFetcher for BrokerClient {
         // C2: reject a malformed/dead token rather than caching it (which would
         // cause a permanent refetch storm or a dud bearer).
         if tok.access_token.is_empty() {
-            return Err("broker returned an empty access_token".to_string());
+            return Err(TokenFetchError::Other(
+                "broker returned an empty access_token".to_string(),
+            ));
         }
         if tok.expires <= now_millis() {
-            return Err("broker returned an already-expired token".to_string());
+            return Err(TokenFetchError::Other(
+                "broker returned an already-expired token".to_string(),
+            ));
         }
         Ok(tok)
+    }
+}
+
+impl TokenFetcher for BrokerClient {
+    async fn fetch_token(&self, provider: &str) -> Result<BrokerToken, String> {
+        self.fetch_token_query(provider, None)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn fetch_credential(&self, cred: &CredentialRef) -> Result<BrokerToken, TokenFetchError> {
+        let account = match &cred.account {
+            Account::Default => None,
+            Account::Named(label) => Some(label.as_str()),
+        };
+        self.fetch_token_query(cred.provider.as_str(), account).await
     }
 }
 
