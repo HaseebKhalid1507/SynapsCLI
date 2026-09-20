@@ -229,6 +229,87 @@ pub(crate) fn deadline_ms(grant: &Grant) -> Option<u64> {
     })
 }
 
+// ── P5: terminal classification ─────────────────────────────────────────────
+
+/// Classified end of a driver-owned turn. Only a final `Done` is `Success`.
+#[derive(Debug)]
+pub(crate) enum Terminal {
+    Success,
+    Failure(Outcome, String),
+    /// Cancel/unexpected-EOF: revoke WITHOUT producing an outcome for polling.
+    Canceled,
+}
+
+/// Capture the terminal before the stream handler consumes it. Called for
+/// `Done`, `Error`, or `None` (EOF / stream dropped).
+pub(crate) fn capture_terminal(
+    event: Option<&crate::StreamEvent>,
+    canceled: bool,
+) -> Option<Terminal> {
+    use crate::{SessionEvent, StreamEvent};
+    use crate::extensions::session_driver::{classify_turn_error, Outcome as O};
+    if canceled {
+        return Some(Terminal::Canceled);
+    }
+    match event {
+        Some(StreamEvent::Session(SessionEvent::Done)) => Some(Terminal::Success),
+        Some(StreamEvent::Session(SessionEvent::Error(error))) => {
+            if matches!(error.outcome, agent_core::TurnOutcome::Canceled) {
+                return Some(Terminal::Canceled);
+            }
+            let (outcome, kind) = classify_turn_error(error);
+            Some(Terminal::Failure(outcome, kind))
+        }
+        None => Some(Terminal::Failure(O::Blocked, "unknown".into())),
+        _ => None,
+    }
+}
+
+/// Apply the terminal to the driver state. Sets `outcome` for Success /
+/// classified failure. Revokes on Blocked, Canceled, or idle conflict.
+/// Returns `Some(reason)` if the caller must revoke.
+pub(crate) fn observe_terminal(
+    driver: &mut DriverState,
+    runtime: &crate::Runtime,
+    terminal: Terminal,
+) -> Option<String> {
+    if !driver.awaiting_terminal {
+        return None;
+    }
+    driver.awaiting_terminal = false;
+    match terminal {
+        Terminal::Canceled => {
+            return Some("canceled".into());
+        }
+        Terminal::Success => {
+            driver.completed_feedback = if driver.grant.feedback_enabled() {
+                driver.feedback.finish()
+            } else {
+                "unknown"
+            };
+            driver.outcome = Some((Outcome::Success, "none".into()));
+        }
+        Terminal::Failure(Outcome::TimeCheckpoint, kind)
+            if driver.grant.time_checkpoints_enabled()
+                && !runtime.turn_budget().max_elapsed.is_zero() =>
+        {
+            driver.completed_feedback = "unknown";
+            driver.feedback = feedback::Tracker::default();
+            driver.outcome = Some((Outcome::TimeCheckpoint, kind));
+        }
+        Terminal::Failure(Outcome::TimeCheckpoint, _) => {
+            return Some("blocked or unexpected end of stream; explicit user action required".into());
+        }
+        Terminal::Failure(outcome, kind) => {
+            if matches!(outcome, Outcome::Blocked) {
+                return Some("blocked or unexpected end of stream; explicit user action required".into());
+            }
+            driver.outcome = Some((outcome, kind));
+        }
+    }
+    None
+}
+
 // ── F11: pure-fn unit tests ────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -411,5 +492,148 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0]["content"].as_str().unwrap().contains("aborted context"));
         assert!(messages[0]["content"].as_str().unwrap().contains("go"));
+    }
+
+    // ── capture_terminal / observe_terminal ─────────────────────────────
+
+    #[test]
+    fn capture_terminal_done_is_success() {
+        let event = crate::StreamEvent::Session(crate::SessionEvent::Done);
+        match capture_terminal(Some(&event), false) {
+            Some(Terminal::Success) => {}
+            other => panic!("expected Success, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_terminal_canceled_flag() {
+        let event = crate::StreamEvent::Session(crate::SessionEvent::Done);
+        match capture_terminal(Some(&event), true) {
+            Some(Terminal::Canceled) => {}
+            other => panic!("expected Canceled, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_terminal_eof_is_blocked() {
+        match capture_terminal(None, false) {
+            Some(Terminal::Failure(Outcome::Blocked, _)) => {}
+            other => panic!("expected Blocked, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_terminal_error_with_canceled_outcome() {
+        let error = agent_core::TurnError {
+            message: "canceled".into(),
+            outcome: agent_core::TurnOutcome::Canceled,
+        };
+        let event = crate::StreamEvent::Session(crate::SessionEvent::Error(error));
+        match capture_terminal(Some(&event), false) {
+            Some(Terminal::Canceled) => {}
+            other => panic!("expected Canceled from TurnOutcome::Canceled, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_terminal_llm_event_is_none() {
+        let event = crate::StreamEvent::Llm(crate::LlmEvent::Text("hi".into()));
+        assert!(capture_terminal(Some(&event), false).is_none());
+    }
+
+    #[test]
+    fn observe_terminal_success_sets_outcome() {
+        let (_, mut state) = test_grant_and_state();
+        state.awaiting_terminal = true;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let rt = crate::Runtime::new().await.unwrap();
+            let result = observe_terminal(&mut state, &rt, Terminal::Success);
+            assert!(result.is_none(), "success should not revoke");
+            assert!(state.outcome.is_some());
+            let (outcome, _) = state.outcome.clone().unwrap();
+            assert_eq!(outcome, Outcome::Success);
+        });
+    }
+
+    #[test]
+    fn observe_terminal_canceled_returns_revoke_reason() {
+        let (_, mut state) = test_grant_and_state();
+        state.awaiting_terminal = true;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let rt = crate::Runtime::new().await.unwrap();
+            let result = observe_terminal(&mut state, &rt, Terminal::Canceled);
+            assert!(result.is_some());
+            assert!(result.unwrap().contains("canceled"));
+            assert!(state.outcome.is_none());
+        });
+    }
+
+    #[test]
+    fn observe_terminal_blocked_returns_revoke_reason() {
+        let (_, mut state) = test_grant_and_state();
+        state.awaiting_terminal = true;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let rt = crate::Runtime::new().await.unwrap();
+            let result = observe_terminal(
+                &mut state,
+                &rt,
+                Terminal::Failure(Outcome::Blocked, "unknown".into()),
+            );
+            assert!(result.is_some());
+            assert!(result.unwrap().contains("blocked"));
+        });
+    }
+
+    #[test]
+    fn observe_terminal_provider_error_sets_outcome() {
+        let (_, mut state) = test_grant_and_state();
+        state.awaiting_terminal = true;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let rt = crate::Runtime::new().await.unwrap();
+            let result = observe_terminal(
+                &mut state,
+                &rt,
+                Terminal::Failure(Outcome::ProviderError, "transient".into()),
+            );
+            assert!(result.is_none(), "provider error should not revoke");
+            let (outcome, kind) = state.outcome.clone().unwrap();
+            assert_eq!(outcome, Outcome::ProviderError);
+            assert_eq!(kind, "transient");
+        });
+    }
+
+    #[test]
+    fn observe_terminal_not_awaiting_is_noop() {
+        let (_, mut state) = test_grant_and_state();
+        state.awaiting_terminal = false;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let rt = crate::Runtime::new().await.unwrap();
+            let result = observe_terminal(&mut state, &rt, Terminal::Success);
+            assert!(result.is_none());
+            assert!(state.outcome.is_none());
+        });
+    }
+
+    #[test]
+    fn observe_terminal_only_fires_once() {
+        let (_, mut state) = test_grant_and_state();
+        state.awaiting_terminal = true;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let rt = crate::Runtime::new().await.unwrap();
+            let r1 = observe_terminal(&mut state, &rt, Terminal::Success);
+            assert!(r1.is_none());
+            assert!(state.outcome.is_some());
+            // Second call should be no-op (awaiting_terminal is false now).
+            state.outcome = None;
+            let r2 = observe_terminal(&mut state, &rt, Terminal::Success);
+            assert!(r2.is_none());
+            assert!(state.outcome.is_none());
+        });
     }
 }

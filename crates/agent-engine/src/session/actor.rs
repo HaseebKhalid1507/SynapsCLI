@@ -764,7 +764,18 @@ impl SessionActor {
         if let Err(ref e) = result {
             tracing::error!(session = %session_id, "context head checkpoint save failed: {e}");
         }
+        let succeeded = result.is_ok();
         receipt.complete(result);
+
+        // P5: observe_checkpoint — revoke driver on failure or mismatch.
+        if let Some(driver) = &self.driver {
+            if !succeeded
+                || driver.grant.session_id != session_id
+                || session_id != self.conv.session.id
+            {
+                self.driver_revoke("context checkpoint failed or session replaced");
+            }
+        }
     }
 
 
@@ -953,7 +964,6 @@ impl SessionActor {
 
     /// Arm the driver after a successful start command result. Mirrors
     /// the TUI's `arm()` (:538-602). Called from P4's `driver_tick()`.
-    #[allow(dead_code)] // consumed by P4 driver_tick
     pub(crate) fn driver_arm(
         &mut self,
         owner: String,
@@ -2035,6 +2045,22 @@ impl SessionActor {
             self.emit_conversation();
         }
 
+        // P5: observe_events — if non-steering events arrive during a
+        // driver-OWNED turn, revoke (competing work). Coordinates with F8.
+        if self.streaming
+            && self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.awaiting_terminal)
+        {
+            let competing = drained
+                .iter()
+                .any(|d| !matches!(d.disposition, EventDisposition::Steered | EventDisposition::DisplayOnly));
+            if competing {
+                self.driver_revoke("event-bus work took priority");
+            }
+        }
+
         // `events.auto_turn = false` opts the session out of event-driven
         // turns (events are still injected/forwarded; the spend governor
         // for an ambient session). Read live from host config, like the
@@ -2081,6 +2107,28 @@ impl SessionActor {
         // Forward first: clients see the same order they see today.
         self.emit(SessionEventWire::Stream(event.clone()));
 
+        // P5: observe_feedback — feed opted-in driver turns.
+        if let Some(driver) = self.driver.as_mut() {
+            if driver.awaiting_terminal && driver.grant.feedback_enabled() {
+                driver.feedback.observe(&event);
+            }
+        }
+
+        // P5: capture_terminal BEFORE Done/Error handlers modify state.
+        let is_canceled = self
+            .cancel
+            .as_ref()
+            .is_some_and(|ct| ct.is_cancelled());
+        let terminal = if self
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.awaiting_terminal)
+        {
+            super::driver::capture_terminal(Some(&event), is_canceled)
+        } else {
+            None
+        };
+
         enum After {
             Continue,
             AutoSendQueued(String),
@@ -2117,6 +2165,12 @@ impl SessionActor {
                 if self.conv.queued_message.as_ref() == Some(&message) {
                     self.conv.queued_message = None;
                     self.emit_conversation();
+                }
+                // P5/P6: pop the driver's steering FIFO on delivery ack.
+                if let Some(driver) = self.driver.as_mut() {
+                    if driver.steering.front() == Some(&message) {
+                        driver.steering.pop_front();
+                    }
                 }
             }
             StreamEvent::Agent(_) => {}
@@ -2248,6 +2302,31 @@ impl SessionActor {
                     self.emit(SessionEventWire::AutoTurnCapReached { cap: auto_turn_cap });
                     self.emit(SessionEventWire::Idle);
                 }
+            }
+        }
+
+        // P5: observe_terminal — set driver outcome or revoke.
+        if let Some(terminal) = terminal {
+            let revoke_reason = if let Some(driver) = self.driver.as_mut() {
+                super::driver::observe_terminal(driver, &self.runtime, terminal)
+            } else {
+                None
+            };
+            // Emit DriverTurnOutcome if an outcome was just set.
+            if let Some(driver) = self.driver.as_ref() {
+                if driver.outcome.is_some() {
+                    let (outcome, _) = driver.outcome.as_ref().unwrap();
+                    self.emit(SessionEventWire::DriverTurnOutcome {
+                        outcome: *outcome,
+                        selection: driver.selection.clone(),
+                        feedback: driver.grant.feedback_enabled().then(|| {
+                            driver.completed_feedback.to_string()
+                        }),
+                    });
+                }
+            }
+            if let Some(reason) = revoke_reason {
+                self.driver_revoke(&reason);
             }
         }
     }
@@ -3204,6 +3283,17 @@ impl SessionTask {
                     Some(ev) => actor.on_stream_event(ev).await,
                     None => {
                         // Stream ended without a terminal event: defensive reset.
+                        // P5: capture_terminal(None) = EOF → revoke driver.
+                        if actor.driver.as_ref().is_some_and(|d| d.awaiting_terminal) {
+                            let terminal = super::driver::capture_terminal(None, false);
+                            if let Some(terminal) = terminal {
+                                if let Some(driver) = actor.driver.as_mut() {
+                                    if let Some(reason) = super::driver::observe_terminal(driver, &actor.runtime, terminal) {
+                                        actor.driver_revoke(&reason);
+                                    }
+                                }
+                            }
+                        }
                         actor.clear_stream();
                         actor.emit_conversation();
                         actor.emit(SessionEventWire::Idle);
