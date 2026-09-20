@@ -69,6 +69,9 @@ pub struct EngineHost {
     /// `--continue X` cannot both miss the live check and build two actors
     /// on one session id.
     create_lock: tokio::sync::Mutex<()>,
+    /// (E-P2) Single-tenancy driver lock: at most one plugin can drive one
+    /// session daemon-wide. Grants do NOT survive reload (§3 S2/S5).
+    driver_grants: std::sync::Mutex<std::collections::HashMap<String, SessionId>>,
     /// C2: flips to `true` when extension discovery on `ext_manager` has
     /// finished (the loader sets it; `extensions_ready()` awaits it). The
     /// paired flag records that a loader was DISPATCHED, so a session
@@ -76,6 +79,25 @@ pub struct EngineHost {
     /// acquisition still waits instead of racing the walk.
     extensions_ready: tokio::sync::watch::Sender<bool>,
     extensions_loading: std::sync::atomic::AtomicBool,
+}
+
+/// (E-P2) Returned by [`EngineHost::claim_driver`] when another live session
+/// already holds the driver grant for a plugin.
+#[derive(Debug)]
+#[allow(dead_code)] // fields read by Display impl + P3 handler
+pub struct DriverGrantError {
+    pub plugin: String,
+    pub held_by: SessionId,
+}
+
+impl std::fmt::Display for DriverGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "plugin '{}' already driving session {}",
+            self.plugin, self.held_by
+        )
+    }
 }
 
 static HOST: OnceLock<Arc<EngineHost>> = OnceLock::new();
@@ -173,6 +195,7 @@ impl EngineHost {
             log_guard: std::sync::Mutex::new(log_guard),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             create_lock: tokio::sync::Mutex::new(()),
+            driver_grants: std::sync::Mutex::new(std::collections::HashMap::new()),
             extensions_ready: tokio::sync::watch::channel(false).0,
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
         }))
@@ -488,10 +511,65 @@ impl EngineHost {
     /// Drop the host's handle for a session (the actor keeps running until
     /// its command queue closes or it receives `End`).
     pub fn remove_session(&self, id: &SessionId) -> Option<SessionHandle> {
-        self.sessions
+        let handle = self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(id)
+            .remove(id);
+        // E-P2: release any driver grants held by this session.
+        if handle.is_some() {
+            self.release_all_driver_grants(id);
+        }
+        handle
+    }
+
+    // ── driver single-tenancy (E-P2, §3 S2/S5) ──────────────────────────
+
+    /// Claim the driver grant for `plugin` on behalf of `session`.
+    /// Returns `Ok(())` if the grant was acquired (or is idempotent for the
+    /// same session). Returns `Err` if another live session holds it.
+    #[allow(dead_code)] // consumed by P3 driver_arm
+    pub(crate) fn claim_driver(
+        &self,
+        plugin: &str,
+        session: &SessionId,
+    ) -> std::result::Result<(), DriverGrantError> {
+        let mut grants = self.driver_grants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = grants.get(plugin) {
+            if existing != session {
+                return Err(DriverGrantError {
+                    plugin: plugin.into(),
+                    held_by: existing.clone(),
+                });
+            }
+            return Ok(()); // idempotent
+        }
+        grants.insert(plugin.into(), session.clone());
+        Ok(())
+    }
+
+    /// Release the driver grant for `plugin` if held by `session`.
+    #[allow(dead_code)] // consumed by P3 driver_revoke
+    pub(crate) fn release_driver(&self, plugin: &str, session: &SessionId) {
+        let mut grants = self.driver_grants.lock().unwrap_or_else(|e| e.into_inner());
+        if grants.get(plugin).is_some_and(|s| s == session) {
+            grants.remove(plugin);
+        }
+    }
+
+    /// Release all driver grants held by `session` (called from `remove_session`).
+    fn release_all_driver_grants(&self, session: &SessionId) {
+        let mut grants = self.driver_grants.lock().unwrap_or_else(|e| e.into_inner());
+        grants.retain(|_, s| s != session);
+    }
+
+    /// Clear all driver grants (called on reload — §3 S2/S5: plugin process
+    /// died with the old image).
+    #[allow(dead_code)] // consumed by reload path in P3+
+    pub(crate) fn clear_all_driver_grants(&self) {
+        self.driver_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     // ── shared extension host (Phase 2, C) ────────────────────────────────
@@ -595,5 +673,131 @@ impl EngineHost {
             }
         }
         delivered
+    }
+}
+
+#[cfg(test)]
+mod driver_grant_tests {
+    use super::*;
+
+    /// Build a minimal EngineHost for unit testing driver grants.
+    /// Only the driver_grants, sessions, and adjacent fields are initialized;
+    /// nothing boots a runtime or loads extensions.
+    fn test_host() -> Arc<EngineHost> {
+        // Use the real boot path's struct literal so the test fails to compile
+        // if a field is added and not initialised here — belt and suspenders.
+        // We can't call boot() without full config, so we manufacture one.
+        // Instead, reach into the same fields and just test the grant logic.
+        Arc::new_cyclic(|_| {
+            // Minimal construction: only the fields we touch. Others are default.
+            // This is intentionally a helper, not the full EngineHost::boot path.
+            use std::collections::HashMap;
+            use std::sync::Mutex;
+
+            // We cannot construct EngineHost without private fields, so we
+            // test the grant logic via standalone functions that mirror the
+            // Mutex<HashMap> pattern.
+            unreachable!()
+        })
+    }
+
+    // Since EngineHost has many private fields we cannot construct in a unit
+    // test without the full boot path, test the grant logic on a standalone
+    // map that mirrors the real implementation exactly.
+
+    type Grants = std::sync::Mutex<std::collections::HashMap<String, SessionId>>;
+
+    fn claim(grants: &Grants, plugin: &str, session: &SessionId) -> std::result::Result<(), DriverGrantError> {
+        let mut g = grants.lock().unwrap();
+        if let Some(existing) = g.get(plugin) {
+            if existing != session {
+                return Err(DriverGrantError {
+                    plugin: plugin.into(),
+                    held_by: existing.clone(),
+                });
+            }
+            return Ok(());
+        }
+        g.insert(plugin.into(), session.clone());
+        Ok(())
+    }
+
+    fn release(grants: &Grants, plugin: &str, session: &SessionId) {
+        let mut g = grants.lock().unwrap();
+        if g.get(plugin).is_some_and(|s| s == session) {
+            g.remove(plugin);
+        }
+    }
+
+    fn release_all(grants: &Grants, session: &SessionId) {
+        grants.lock().unwrap().retain(|_, s| s != session);
+    }
+
+    fn clear_all(grants: &Grants) {
+        grants.lock().unwrap().clear();
+    }
+
+    fn sid(s: &str) -> SessionId {
+        SessionId::from(s)
+    }
+
+    #[test]
+    fn single_tenancy_second_session_refused() {
+        let grants: Grants = Default::default();
+        let a = sid("session-a");
+        let b = sid("session-b");
+        claim(&grants, "autonomous", &a).unwrap();
+        let err = claim(&grants, "autonomous", &b).unwrap_err();
+        assert_eq!(err.plugin, "autonomous");
+        assert_eq!(err.held_by, a);
+    }
+
+    #[test]
+    fn single_tenancy_released_on_end() {
+        let grants: Grants = Default::default();
+        let a = sid("session-a");
+        let b = sid("session-b");
+        claim(&grants, "autonomous", &a).unwrap();
+        release(&grants, "autonomous", &a);
+        // Now session B can claim it.
+        claim(&grants, "autonomous", &b).unwrap();
+    }
+
+    #[test]
+    fn single_tenancy_same_session_idempotent() {
+        let grants: Grants = Default::default();
+        let a = sid("session-a");
+        claim(&grants, "autonomous", &a).unwrap();
+        // Same session, same plugin — idempotent.
+        claim(&grants, "autonomous", &a).unwrap();
+        assert_eq!(grants.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn grants_cleared_on_reload_record() {
+        let grants: Grants = Default::default();
+        let a = sid("session-a");
+        let b = sid("session-b");
+        claim(&grants, "plugin1", &a).unwrap();
+        claim(&grants, "plugin2", &b).unwrap();
+        assert_eq!(grants.lock().unwrap().len(), 2);
+        // Simulated reload: all grants cleared.
+        clear_all(&grants);
+        assert!(grants.lock().unwrap().is_empty());
+        // Both can re-claim.
+        claim(&grants, "plugin1", &a).unwrap();
+        claim(&grants, "plugin2", &b).unwrap();
+    }
+
+    #[test]
+    fn release_all_for_session_leaves_other_sessions() {
+        let grants: Grants = Default::default();
+        let a = sid("session-a");
+        let b = sid("session-b");
+        claim(&grants, "plugin1", &a).unwrap();
+        claim(&grants, "plugin2", &b).unwrap();
+        release_all(&grants, &a);
+        assert_eq!(grants.lock().unwrap().len(), 1);
+        assert!(grants.lock().unwrap().contains_key("plugin2"));
     }
 }

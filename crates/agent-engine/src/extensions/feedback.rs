@@ -323,7 +323,7 @@ fn write_canonical_json(writer: &mut HashWriter, value: &Value) -> io::Result<()
         Value::Object(values) => {
             // Do not depend on whether serde_json's preserve_order is enabled.
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            entries.sort_unstable_by_key(|(a, _)| *a);
             writer.write_all(b"{")?;
             for (index, (key, value)) in entries.into_iter().enumerate() {
                 if index != 0 {
