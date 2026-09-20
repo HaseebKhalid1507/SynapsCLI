@@ -24,13 +24,17 @@
 //! token per request and never store the credential on their own disk.
 //!
 //! Endpoints:
-//!   GET  /healthz            -> { status }                 (no secret, non-200 if cred missing)
-//!   GET  /token?provider=X   -> { access_token, expires }  (machine-auth, OAuth providers ONLY)
-//!   POST /proxy              -> typed broker proxy         (machine-auth, static-key providers;
-//!                               the key is applied broker-side and never vended)
-//!   GET  /usage              -> Anthropic usage JSON       (machine-auth, typed operation; the
-//!                               OAuth token is resolved broker-side and never vended)
-//!   GET  /capabilities       -> provider status list       (machine-auth, no secret values)
+//!   GET  /healthz                         -> { status }   (no secret; 503 until ANY OAuth slot exists)
+//!   GET  /token?provider=X[&account=Y]    -> { access_token, expires, ttl_ms, account }
+//!                                            (machine-auth, OAuth providers ONLY; `account` is a
+//!                                            label, `default`, or `auto`; unknown → 404, malformed
+//!                                            → 400, no capacity → 503; never a fallback)
+//!   POST /proxy                           -> typed broker proxy (machine-auth; OAuth providers may
+//!                                            pin a slot as `provider@label`; keys never vended)
+//!   GET  /usage                           -> legacy raw Anthropic usage JSON (machine-auth)
+//!   GET  /usage/snapshot?provider&account -> normalized UsageSnapshot (machine-auth)
+//!   POST /accounts/cooldown               -> { provider, account, until_ms?, reason } (machine-auth)
+//!   GET  /capabilities                    -> provider status list incl. account rows (no secrets)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -160,10 +164,9 @@ struct BrokerState {
     /// Token clients must present as `Authorization: Bearer <token>`. `None`
     /// disables auth (only safe on loopback or with explicit `--insecure-no-auth`).
     machine_token: Option<String>,
-    /// HTTP client used for the (central, single) token refresh to the provider.
-    client: reqwest::Client,
-    /// The in-process broker that owns static keys and executes proxied
-    /// requests. Raw keys never leave this boundary.
+    /// The in-process broker that owns every credential (all providers and
+    /// account slots), refreshes them, and executes proxied requests. Raw
+    /// keys and refresh tokens never leave this boundary.
     local: Arc<auth::LocalBroker>,
 }
 
@@ -183,6 +186,26 @@ fn machine_auth_ok(st: &BrokerState, headers: &HeaderMap) -> bool {
 #[derive(Deserialize)]
 struct TokenQuery {
     provider: Option<String>,
+    /// `default`, a label, or `auto`. Absent → the broker host's policy.
+    account: Option<String>,
+    /// Model hint for capacity-aware `auto` selection.
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageSnapshotQuery {
+    provider: Option<String>,
+    account: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CooldownReport {
+    provider: String,
+    account: String,
+    #[serde(default)]
+    until_ms: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Constant-time byte comparison — avoids a timing oracle on the machine token.
@@ -290,11 +313,13 @@ pub async fn run(
         );
     }
 
-    // D1: fail fast if the credential isn't present/readable.
-    match auth::load_auth() {
-        Ok(Some(_)) => {}
-        Ok(None) => anyhow::bail!(
-            "no credential at {}. Run `synaps login` on the broker host first.",
+    // D1: fail fast if no OAuth credential of ANY provider/account is
+    // present or the store is unreadable. Codex-only, Kimi-only, or
+    // named-slot-only installations are valid broker hosts.
+    match auth::any_oauth_credential_present() {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "no OAuth credential at {}. Run `synaps login --provider <id> [--account <label>]` on the broker host first.",
             auth::auth_file_path().display()
         ),
         Err(e) => anyhow::bail!("credential unreadable/corrupt: {e}"),
@@ -309,19 +334,32 @@ pub async fn run(
 
     let state = BrokerState {
         machine_token: machine_token.clone(),
-        client: client.clone(),
         local: Arc::new(auth::LocalBroker::new(client.clone())),
     };
 
-    // Proactive refresh, SUPERVISED.
+    // Proactive refresh of EVERY stored OAuth slot, SUPERVISED. Each slot
+    // refreshes independently (own gate + cross-process lock); one failing
+    // account never blocks the others. Log lines carry labels only.
     {
         let refresh_client = client;
         let handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                if let Err(e) = auth::ensure_fresh_token(&refresh_client).await {
-                    eprintln!("[auth-broker] proactive refresh failed: {e}");
+                let accounts = match auth::list_all_accounts() {
+                    Ok(list) => list,
+                    Err(e) => {
+                        eprintln!("[auth-broker] proactive refresh: cannot list accounts: {e}");
+                        continue;
+                    }
+                };
+                for summary in accounts {
+                    let Some(cred) = summary.credential_ref() else {
+                        continue;
+                    };
+                    if let Err(e) = auth::ensure_fresh_credential(&refresh_client, &cred).await {
+                        eprintln!("[auth-broker] proactive refresh failed for {cred}: {e}");
+                    }
                 }
             }
         });
@@ -399,11 +437,9 @@ fn build_router_with_cloud_backend(
     machine_token: Option<String>,
     backend: Arc<dyn auth::broker::CloudBackend>,
 ) -> Router {
-    let client = reqwest::Client::new();
-    let local = auth::LocalBroker::new(client.clone()).with_cloud_backend(backend);
+    let local = auth::LocalBroker::new(reqwest::Client::new()).with_cloud_backend(backend);
     build_router(BrokerState {
         machine_token,
-        client,
         local: Arc::new(local),
     })
 }
@@ -415,6 +451,8 @@ fn build_router(state: BrokerState) -> Router {
         .route("/token", get(token))
         .route("/proxy", post(proxy))
         .route("/usage", get(usage))
+        .route("/usage/snapshot", get(usage_snapshot))
+        .route("/accounts/cooldown", post(accounts_cooldown))
         .route("/cloud/catalog", post(cloud_catalog))
         .route("/cloud/invoke", post(cloud_invoke))
         .route("/capabilities", get(capabilities))
@@ -454,9 +492,9 @@ async fn shutdown_signal() {
 /// Liveness + credential readiness. Returns non-200 when the credential is
 /// missing/corrupt so monitors actually catch it.
 async fn healthz() -> impl IntoResponse {
-    match auth::load_auth() {
-        Ok(Some(_)) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
-        Ok(None) => (
+    match auth::any_oauth_credential_present() {
+        Ok(true) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Ok(false) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "no_credential" })),
         ),
@@ -499,41 +537,84 @@ async fn token(
             .into_response();
     };
 
-    let creds = if provider_id == auth::OAuthProviderId::Anthropic {
-        auth::ensure_fresh_token(&st.client).await
-    } else {
-        auth::ensure_fresh_provider_token(&st.client, provider_id).await
+    // ── account selection ──
+    // Absent → this host's policy. `auto` → capacity selection here (the
+    // client's own policy said auto). Anything else must be `default` or a
+    // valid label; an unknown slot is 404 — never served from another slot.
+    use synaps_cli::auth::CredentialBroker;
+    let model = q.model.as_deref().filter(|m| !m.trim().is_empty());
+    let pinned = match q.account.as_deref() {
+        None => st.local.access_token_pinned_for(provider_id, model).await,
+        Some(auth::AUTO_ACCOUNT_NAME) => st.local.access_token_auto(provider_id, model).await,
+        Some(raw) => match auth::Account::parse(raw) {
+            Ok(account) => {
+                let cred = auth::CredentialRef::new(provider_id, account);
+                st.local
+                    .access_token_for(&cred)
+                    .await
+                    .map(|token| auth::PinnedToken {
+                        credential: cred,
+                        token,
+                    })
+            }
+            Err(e) => Err(auth::BrokerError::InvalidAccount(e)),
+        },
     };
 
-    match creds {
-        Ok(c) => {
+    match pinned {
+        Ok(p) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let ttl_ms = c.expires.saturating_sub(now);
+            let ttl_ms = p.token.expires.saturating_sub(now);
             eprintln!(
-                "[auth-broker] issued {provider} token to {} (expires {})",
+                "[auth-broker] issued {} token to {} (expires {})",
+                p.credential,
                 peer.ip(),
-                c.expires
+                p.token.expires
             );
             (
                 StatusCode::OK,
-                Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })),
+                Json(json!({
+                    "access_token": p.token.token,
+                    "expires": p.token.expires,
+                    "ttl_ms": ttl_ms,
+                    "account": p.credential.account.label_str(),
+                })),
             )
                 .into_response()
         }
         Err(e) => {
+            // BrokerError Display is secret-free by contract; the wire body
+            // stays generic for credential failures.
             eprintln!(
-                "[auth-broker] refresh failed for {provider} from {}: {}",
+                "[auth-broker] token request for {provider} from {} failed: {}",
                 peer.ip(),
                 e
             );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "token refresh failed" })),
-            )
-                .into_response()
+            match e {
+                auth::BrokerError::InvalidAccount(_) | auth::BrokerError::UnsupportedAccount { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid account" })),
+                )
+                    .into_response(),
+                auth::BrokerError::UnknownAccount { .. } => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "unknown account" })),
+                )
+                    .into_response(),
+                auth::BrokerError::NoAccountAvailable { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "no account available" })),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "token refresh failed" })),
+                )
+                    .into_response(),
+            }
         }
     }
 }
@@ -602,6 +683,99 @@ async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::respo
     use synaps_cli::auth::CredentialBroker;
     match st.local.anthropic_usage().await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(e) => broker_error_response(e),
+    }
+}
+
+/// Normalized, secret-free usage snapshot for one `(provider, account)`.
+/// The token is resolved broker-side. `account` absent → this host's
+/// explicit policy selection (an `auto` policy is not a snapshot target).
+async fn usage_snapshot(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Query(q): Query<UsageSnapshotQuery>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
+    let Some(provider_id) = broker_provider(&provider) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown provider" })),
+        )
+            .into_response();
+    };
+    let account = match q.account.as_deref() {
+        Some(raw) => match auth::Account::parse(raw) {
+            Ok(account) => account,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid account" })),
+                )
+                    .into_response()
+            }
+        },
+        None => match st.local.account_selector(provider_id) {
+            auth::AccountSelector::Account(account) => account,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "account required" })),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let cred = auth::CredentialRef::new(provider_id, account);
+    match st.local.usage(&cred).await {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(e) => broker_error_response(e),
+    }
+}
+
+/// A client reports a provider limit for one account so `auto` selection on
+/// this host stops advertising it. Machine-auth; labels only.
+async fn accounts_cooldown(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Json(report): Json<CooldownReport>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "bad machine auth" })),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    let Some(provider_id) = broker_provider(&report.provider) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown provider" })),
+        )
+            .into_response();
+    };
+    let account = match auth::Account::parse(&report.account) {
+        Ok(account) => account,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid account" })),
+            )
+                .into_response()
+        }
+    };
+    let cred = auth::CredentialRef::new(provider_id, account);
+    let reason = report.reason.as_deref().unwrap_or("client_report");
+    match st.local.report_cooldown(&cred, report.until_ms, reason).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
         Err(e) => broker_error_response(e),
     }
 }
@@ -717,8 +891,12 @@ fn broker_error_response(e: auth::BrokerError) -> axum::response::Response {
     let status = match e {
         auth::BrokerError::UnknownProvider(_)
         | auth::BrokerError::Denied(_)
+        | auth::BrokerError::InvalidAccount(_)
+        | auth::BrokerError::UnsupportedAccount { .. }
         | auth::BrokerError::UnsupportedCapability { .. } => StatusCode::BAD_REQUEST,
         auth::BrokerError::NotConfigured(_) => StatusCode::FORBIDDEN,
+        auth::BrokerError::UnknownAccount { .. } => StatusCode::NOT_FOUND,
+        auth::BrokerError::NoAccountAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         auth::BrokerError::Unauthorized => StatusCode::UNAUTHORIZED,
         _ => StatusCode::BAD_GATEWAY,
     };
@@ -1206,7 +1384,6 @@ mod tests {
         };
         let state = BrokerState {
             machine_token,
-            client,
             local: Arc::new(local),
         };
         let app = build_router(state);

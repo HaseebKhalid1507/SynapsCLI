@@ -701,13 +701,31 @@ pub struct LoginHooks<'a, B> {
     pub on_user_code: Option<UserCodeHook<'a>>,
 }
 
-/// Device start → user prompt → poll → mint → atomic persist.
+/// Device start → user prompt → poll → mint → atomic persist (default slot).
 pub async fn login_with<H, C, B, X>(
     http: &H,
     clock: &C,
     hooks: LoginHooks<'_, B>,
     cancel: &X,
     persist: bool,
+) -> Result<OAuthCredentials, CopilotAuthError>
+where
+    H: CopilotHttp,
+    C: CopilotClock,
+    B: CopilotBrowser,
+    X: CopilotCancel + ?Sized,
+{
+    login_with_into(http, clock, hooks, cancel, persist.then_some(PROVIDER)).await
+}
+
+/// Like [`login_with`] but persists ONLY into `persist_key` when given
+/// (`github-copilot` or `github-copilot@<label>`).
+pub async fn login_with_into<H, C, B, X>(
+    http: &H,
+    clock: &C,
+    hooks: LoginHooks<'_, B>,
+    cancel: &X,
+    persist_key: Option<&str>,
 ) -> Result<OAuthCredentials, CopilotAuthError>
 where
     H: CopilotHttp,
@@ -729,19 +747,25 @@ where
 
     let github_token = wait_for_device_authorization(http, clock, &authz, cancel).await?;
     let creds = mint_credentials(http, clock, &github_token).await?;
-    if persist {
-        save_provider_auth(PROVIDER, &creds).map_err(|_| CopilotAuthError::Persist)?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds).map_err(|_| CopilotAuthError::Persist)?;
     }
     Ok(creds)
 }
 
 /// Production login entry (real network + system browser + auth.json).
 pub async fn login() -> Result<OAuthCredentials, String> {
+    login_into(Some(PROVIDER)).await
+}
+
+/// Production login; `Some(key)` persists ONLY into that slot, `None`
+/// returns the credential unsaved.
+pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
     let http = ProductionHttp::new().map_err(|e| e.to_string())?;
     let clock = ProductionClock;
     let browser = ProductionBrowser;
     let cancel = AtomicBool::new(false);
-    login_with(
+    login_with_into(
         &http,
         &clock,
         LoginHooks {
@@ -749,7 +773,7 @@ pub async fn login() -> Result<OAuthCredentials, String> {
             on_user_code: None,
         },
         &cancel,
-        true,
+        persist_key,
     )
     .await
     .map_err(|e| e.to_string())
