@@ -2913,9 +2913,9 @@ mod rich_output_tests {
                 Arc::new(crate::tools::forum::ForumPostTool),
                 Arc::new(crate::tools::forum::ForumReadTool),
                 Arc::new(crate::tools::forum::ForumForgetTool),
-                Arc::new(crate::tools::BashTool),
+                Arc::new(RichTool),
             ],
-            &[("bash", r#"{"command":"true"}"#)],
+            &[("toolu_1", "rich_stub")],
             Arc::new(crate::extensions::hooks::HookBus::new()),
         )
         .await;
@@ -2925,7 +2925,7 @@ mod rich_output_tests {
             .flatten()
             .filter_map(|t| t["name"].as_str().map(str::to_owned))
             .collect();
-        assert!(names.iter().any(|n| n == "bash"), "bash must be advertised: {names:?}");
+        assert!(names.iter().any(|n| n == "rich_stub"), "registered tool must be advertised: {names:?}");
         assert!(
             !names.iter().any(|n| n.starts_with("forum_")),
             "forum tools must be hidden under the legacy backend: {names:?}"
