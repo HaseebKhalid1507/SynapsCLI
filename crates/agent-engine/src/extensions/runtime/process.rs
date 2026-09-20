@@ -580,6 +580,7 @@ struct Inbox {
     inbound_stdin: Mutex<Option<Arc<Mutex<ChildStdin>>>>,
     /// Extension id, used for namespace policy and diagnostics.
     extension_id: String,
+    exclusive_memory: bool,
 }
 
 impl Inbox {
@@ -591,6 +592,8 @@ impl Inbox {
             closed: std::sync::atomic::AtomicBool::new(false),
             permissions: RwLock::new(None),
             inbound_stdin: Mutex::new(None),
+            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
+                .exclusive(),
             extension_id,
         }
     }
@@ -678,7 +681,25 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let inbox = Arc::new(Inbox::new(id.to_string()));
+        let exclusive = crate::memory_backend::MemoryBinding::configured_current().exclusive();
+        Self::spawn_with_memory_policy(id, command, args, cwd, exclusive).await
+    }
+
+    pub(crate) async fn spawn_with_memory_policy(
+        id: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<PathBuf>,
+        exclusive: bool,
+    ) -> Result<Self, String> {
+        if exclusive && id == "axel-memory-manager" {
+            return Err(
+                "independent Axel plugin is disabled by the host-selected memory backend".into(),
+            );
+        }
+        let mut inbox = Inbox::new(id.to_string());
+        inbox.exclusive_memory = exclusive;
+        let inbox = Arc::new(inbox);
         let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
         Ok(Self {
             id: id.to_string(),
@@ -1130,6 +1151,13 @@ impl ProcessExtension {
     ) -> Result<Value, (i32, String)> {
         use crate::extensions::permissions::Permission;
         use crate::memory::store::{self, MemoryQuery};
+
+        if inbox.exclusive_memory && matches!(method, "memory.append" | "memory.query") {
+            return Err((
+                -32000,
+                "legacy extension memory is disabled by the host-selected backend".into(),
+            ));
+        }
 
         match method {
             "memory.append" => {
@@ -2808,5 +2836,26 @@ mod invoke_command_dispatch_tests {
         // Done detection is independent of sink state.
         assert!(saw_done);
         assert!(!open);
+    }
+}
+
+#[cfg(test)]
+mod exclusive_memory_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exclusive_memory_rejects_legacy_rpc() {
+        let mut inbox = Inbox::new("test-ext".into());
+        inbox.exclusive_memory = true;
+        let inbox = Arc::new(inbox);
+        let err = ProcessExtension::handle_inbound_request(
+            &inbox,
+            "memory.append",
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32000);
+        assert!(err.1.contains("disabled"));
     }
 }

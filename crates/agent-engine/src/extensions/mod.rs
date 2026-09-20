@@ -33,6 +33,8 @@ pub mod notify_router;
 pub mod permissions;
 pub mod providers;
 pub mod runtime;
+#[allow(dead_code)] // merge(112): consumed by driver→actor port
+pub mod session_driver;
 pub mod settings_editor;
 pub mod tasks;
 pub mod trust;
