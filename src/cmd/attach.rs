@@ -148,6 +148,9 @@ impl Client {
             SessionEventWire::DriverArmed { plugin_id, .. } => self.out(&format!("[driver armed: {plugin_id}]\n")),
             SessionEventWire::DriverRevoked { reason, .. } => self.out(&format!("[driver revoked: {reason}]\n")),
             SessionEventWire::DriverTurnOutcome { .. } => {}
+            SessionEventWire::CostCapReached { scope, cost, cap } => self.out(&format!(
+                "[{scope} cost cap reached: ${cost:.4} ≥ ${cap:.4} — turn cancelled, driver revoked]\n"
+            )),
         }
     }
 
