@@ -2913,7 +2913,7 @@ mod rich_output_tests {
                 Arc::new(crate::tools::forum::ForumPostTool),
                 Arc::new(crate::tools::forum::ForumReadTool),
                 Arc::new(crate::tools::forum::ForumForgetTool),
-                Arc::new(crate::tools::bash::BashTool),
+                Arc::new(crate::tools::BashTool),
             ],
             &[("bash", r#"{"command":"true"}"#)],
             Arc::new(crate::extensions::hooks::HookBus::new()),
