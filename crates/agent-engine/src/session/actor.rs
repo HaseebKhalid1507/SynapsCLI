@@ -1203,15 +1203,16 @@ impl SessionActor {
                                 )
                             )
                         });
-                    // F7: emit plugin command output as SystemNotice so
-                    // `/auto start` output is visible to the user.
+                    // F7 (shady should-fix): plugin command output is visible
+                    // to the user, but BATCHED into one notice (cap 20 lines) —
+                    // a chatty `/auto start` must not flood the client with one
+                    // wire event per line.
+                    let mut lines: Vec<String> = Vec::new();
                     for event in &report.events {
                         if let crate::extensions::runtime::InvokeCommandEvent::Output(out) = event {
                             let text = match out {
-                                crate::extensions::commands::CommandOutputEvent::Text { content } => {
-                                    Some(content.clone())
-                                }
-                                crate::extensions::commands::CommandOutputEvent::System { content } => {
+                                crate::extensions::commands::CommandOutputEvent::Text { content }
+                                | crate::extensions::commands::CommandOutputEvent::System { content } => {
                                     Some(content.clone())
                                 }
                                 crate::extensions::commands::CommandOutputEvent::Error { content } => {
@@ -1220,9 +1221,18 @@ impl SessionActor {
                                 _ => None,
                             };
                             if let Some(text) = text {
-                                self.emit(SessionEventWire::SystemNotice(text));
+                                lines.push(text);
                             }
                         }
+                    }
+                    if !lines.is_empty() {
+                        const MAX_LINES: usize = 20;
+                        let truncated = lines.len() > MAX_LINES;
+                        if truncated {
+                            lines.truncate(MAX_LINES);
+                            lines.push("…output truncated".into());
+                        }
+                        self.emit(SessionEventWire::SystemNotice(lines.join("\n")));
                     }
                     if let Some(notice) = report.limit_notice() {
                         self.emit(SessionEventWire::SystemNotice(format!(
@@ -3331,7 +3341,21 @@ impl SessionTask {
                             let terminal = super::driver::capture_terminal(None, false);
                             if let Some(terminal) = terminal {
                                 if let Some(driver) = actor.driver.as_mut() {
-                                    if let Some(reason) = super::driver::observe_terminal(driver, &actor.runtime, terminal) {
+                                    let reason = super::driver::observe_terminal(driver, &actor.runtime, terminal);
+                                    // F-NEW-1 (shady): EOF is a Blocked terminal.
+                                    // Emit a DriverTurnOutcome before revoking so a
+                                    // client tracking outcomes sees the same
+                                    // outcome+revoke pair the Error path produces —
+                                    // not a turn that silently vanishes.
+                                    let sel = driver.selection.clone();
+                                    let fb = driver.grant.feedback_enabled()
+                                        .then(|| driver.completed_feedback.to_string());
+                                    actor.emit(SessionEventWire::DriverTurnOutcome {
+                                        outcome: crate::extensions::session_driver::Outcome::Blocked,
+                                        selection: sel,
+                                        feedback: fb,
+                                    });
+                                    if let Some(reason) = reason {
                                         actor.driver_revoke(&reason);
                                     }
                                 }
