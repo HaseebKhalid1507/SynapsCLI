@@ -745,10 +745,15 @@ pub async fn fetch_catalog_models(
     provider_key: &str,
 ) -> Result<Vec<CatalogModel>, String> {
     let provider = catalog_provider_for(provider_key);
-    if provider.provider_key() == "generic" {
-        return fetch_generic_catalog_provider_models(provider_key).await;
-    }
-    provider.fetch(client).await
+    let models = if provider.provider_key() == "generic" {
+        fetch_generic_catalog_provider_models(provider_key).await?
+    } else {
+        provider.fetch(client).await?
+    };
+    // Retain exact live modality evidence for request-time attachment checks,
+    // including OpenRouter and Copilot (not only the Codex reasoning picker).
+    capability_cache::replace_provider(provider_key, &models);
+    Ok(models)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -844,9 +849,9 @@ mod tests {
     // resolution; racing SYNAPS_BASE_DIR mutators made this flaky.
     #[serial_test::serial(synaps_base_dir)]
     async fn ui_catalog_fetch_github_copilot_returns_prefixed_chat_models() {
-        // When the operator has a live session, broker-proxied discovery wins.
-        // Otherwise the curated static fallback is returned. Either way runtime
-        // ids are github-copilot/<wire-id> and include fixture-established IDs.
+        // Offline test must not depend on a developer account's live picker.
+        let _base = crate::test_env::BaseDirGuard::new();
+        // Runtime ids use github-copilot/<wire-id> and fixture-established IDs.
         let models = fetch_catalog_models(&reqwest::Client::new(), "github-copilot")
             .await
             .expect("GitHub Copilot catalog");

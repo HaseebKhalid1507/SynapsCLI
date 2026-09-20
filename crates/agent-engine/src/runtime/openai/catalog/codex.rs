@@ -726,6 +726,70 @@ mod tests {
 
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
 
+    #[test]
+    fn input_modalities_use_only_exact_observed_static_and_fixture_rows() {
+        for models in [
+            codex_static_catalog_models(),
+            parse_codex_catalog_models(FIXTURE).unwrap(),
+        ] {
+            for model in models {
+                let expected = match model.id.as_str() {
+                    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+                    | "gpt-5.5" | "gpt-5.4-mini" => vec![Modality::Text, Modality::Image],
+                    // 5.4 unobserved; spark explicitly text-only.
+                    "gpt-5.4" | "gpt-5.3-codex-spark" => vec![Modality::Text],
+                    _ => panic!("unexpected selectable fixture row"),
+                };
+                assert_eq!(model.input_modalities, expected, "{}", model.id);
+                assert!(!model.input_modalities.contains(&Modality::File));
+            }
+        }
+    }
+
+    #[test]
+    fn live_input_modalities_never_backfill_static_images() {
+        for (field, expected) in [
+            ("", vec![Modality::Text]),
+            (r#", "input_modalities": null"#, vec![Modality::Text]),
+            (r#", "input_modalities": ["text"]"#, vec![Modality::Text]),
+            (r#", "input_modalities": []"#, vec![]),
+            (r#", "input_modalities": ["image"]"#, vec![Modality::Image]),
+            (
+                r#", "input_modalities": ["text", "file"]"#,
+                vec![Modality::Text, Modality::File],
+            ),
+            (
+                r#", "input_modalities": ["Image", "image/png", "future"]"#,
+                vec![
+                    Modality::Other("Image".into()),
+                    Modality::Other("image/png".into()),
+                    Modality::Other("future".into()),
+                ],
+            ),
+        ] {
+            let body = format!(r#"{{"models":[{{"slug":"gpt-6-astra"{field}}}]}}"#);
+            let models = parse_codex_catalog_models(&body).unwrap();
+            assert_eq!(models[0].input_modalities, expected);
+            assert_eq!(models[0].source, CatalogSource::Live);
+        }
+    }
+
+    #[test]
+    fn malformed_input_modalities_reject_catalog_instead_of_authorizing_static() {
+        for value in [
+            r#""image""#,
+            "true",
+            "{}",
+            "[null]",
+            "[1]",
+            r#"["text", {}]"#,
+        ] {
+            let body =
+                format!(r#"{{"models":[{{"slug":"gpt-6-astra","input_modalities":{value}}}]}}"#);
+            assert!(parse_codex_catalog_models(&body).is_err());
+        }
+    }
+
     fn ultra_test_row(
         id: &str,
         levels: &[&str],
@@ -1780,50 +1844,5 @@ mod tests {
     #[test]
     fn missing_models_key_returns_error() {
         assert!(parse_codex_catalog_models(r#"{"data":[]}"#).is_err());
-    }
-
-
-    #[test]
-    fn live_input_modalities_never_backfill_static_images() {
-        for (field, expected) in [
-            ("", vec![Modality::Text]),
-            (r#", "input_modalities": null"#, vec![Modality::Text]),
-            (r#", "input_modalities": ["text"]"#, vec![Modality::Text]),
-            (r#", "input_modalities": []"#, vec![]),
-            (r#", "input_modalities": ["image"]"#, vec![Modality::Image]),
-            (
-                r#", "input_modalities": ["text", "file"]"#,
-                vec![Modality::Text, Modality::File],
-            ),
-            (
-                r#", "input_modalities": ["Image", "image/png", "future"]"#,
-                vec![
-                    Modality::Other("Image".into()),
-                    Modality::Other("image/png".into()),
-                    Modality::Other("future".into()),
-                ],
-            ),
-        ] {
-            let body = format!(r#"{{"models":[{{"slug":"gpt-6-astra"{field}}}]}}"#);
-            let models = parse_codex_catalog_models(&body).unwrap();
-            assert_eq!(models[0].input_modalities, expected);
-            assert_eq!(models[0].source, CatalogSource::Live);
-        }
-    }
-
-    #[test]
-    fn malformed_input_modalities_reject_catalog_instead_of_authorizing_static() {
-        for value in [
-            r#""image""#,
-            "true",
-            "{}",
-            "[null]",
-            "[1]",
-            r#"["text", {}]"#,
-        ] {
-            let body =
-                format!(r#"{{"models":[{{"slug":"gpt-6-astra","input_modalities":{value}}}]}}"#);
-            assert!(parse_codex_catalog_models(&body).is_err());
-        }
     }
 }
