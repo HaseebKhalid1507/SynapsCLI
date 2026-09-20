@@ -1114,6 +1114,7 @@ async fn zero_turn_session_ends_idle_at_park_deadline_while_one_turn_parks() {
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     std::env::set_var("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
+    std::env::set_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS", "0");
     let host = host().await;
 
     // (a) zero turns → Ended(Idle), handle closes.

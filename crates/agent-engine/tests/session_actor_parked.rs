@@ -367,6 +367,7 @@ async fn unpark_missing_journal_restores_fresh_conversation() {
 async fn empty_session_never_parks_it_ends_idle() {
     let _h = Home::new();
     let _g = Grace::set("0");
+    std::env::set_var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS", "0");
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;

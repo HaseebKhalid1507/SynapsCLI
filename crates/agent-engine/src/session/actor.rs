@@ -212,6 +212,18 @@ fn parked_evict_after_from(v: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// `SYNAPS_DAEMON_IDLE_END_GRACE_SECS`: how long a ZERO-turn session with no
+/// clients lingers before it ends (F18). Default 5 s — long enough for a
+/// client that disconnected mid-reconnect, short enough that open-and-close
+/// does not pin a Runtime for a minute.
+pub fn idle_end_grace() -> std::time::Duration {
+    std::env::var("SYNAPS_DAEMON_IDLE_END_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(5))
+}
+
 /// `SYNAPS_DAEMON_PARK_GRACE_SECS`: `never` → `None` (Parked disabled);
 /// `n` → n seconds after the last detach once idle; default 60.
 pub fn park_grace() -> Option<std::time::Duration> {
@@ -838,7 +850,18 @@ impl SessionActor {
             // (which rebuilds the runtime and clears the deadline).
             return;
         }
-        if !self.can_park() && !self.can_end_idle() {
+        if self.can_end_idle() {
+            // F18: nothing to keep warm — a zero-turn session with no
+            // clients ends after a short grace, not the full park grace
+            // (which exists to keep a runtime WITH history warm for a
+            // quick reconnect).
+            if self.park_deadline.is_none() {
+                self.park_deadline =
+                    Some(tokio::time::Instant::now() + idle_end_grace());
+            }
+            return;
+        }
+        if !self.can_park() {
             self.park_deadline = None;
             return;
         }
