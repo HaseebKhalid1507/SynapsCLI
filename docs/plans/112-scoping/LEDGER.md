@@ -21,3 +21,4 @@
   - `static_table_and_wire_shape_classifier_agree_for_known_models` (anthropic.rs, confirmed at a576c597)
   - `user_binding_is_not_a_forum_even_with_user_notes_opt_in` (order-dependent flake, passes in isolation)
   - `continuous_memory_headless_lifecycle_captures_restarts_recalls_disables_and_imports` (pre-existing at 088ac939, memory_context_e2e integration test, intermittent)
+| 3-followup | synaps-engine | 2023 | 1† | 12 |
