@@ -365,6 +365,10 @@ fn handle_key(
         (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
             return process_submit(app, registry);
         }
+        // Enter with empty buffer but staged attachments → attachment-only submit.
+        (KeyCode::Enter, _) if !streaming && app.input_is_empty() && !app.pending_attachments.is_empty() => {
+            return process_submit_attachment_only(app);
+        }
         (KeyCode::Enter, _) if streaming && !app.input_is_empty() => {
             return process_streaming_submit(app);
         }
@@ -468,6 +472,15 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     } else {
         InputAction::Submit(input)
     }
+}
+
+/// User pressed Enter with empty input but staged attachments.
+fn process_submit_attachment_only(app: &mut App) -> InputAction {
+    if app.transcript.is_empty() {
+        app.logo_dismiss_t = Some(0.001);
+    }
+    app.transcript.scroll_to_bottom();
+    InputAction::Submit(String::new())
 }
 
 /// User pressed Enter with non-empty input while streaming.

@@ -218,6 +218,9 @@ pub(crate) struct App {
     /// The last Submit text until `TurnStarted`/`Refused` (§6 #9: a refused
     /// Submit gives the editor its text back).
     pub(crate) last_submitted: Option<String>,
+    /// Client-local staging buffer for multimodal attachments captured by
+    /// `/attach`. Bytes live here until Submit ships them as content blocks.
+    pub(crate) pending_attachments: agent_engine::attachments::PendingAttachments,
     /// Consecutive auto-triggered model turns since the last real user send.
     /// Incremented by the event-reactor wake path; reset on Submit / queued user message.
     /// When this reaches `auto_turn_cap` the reactor parks and shows a system message.
@@ -433,6 +436,7 @@ impl App {
             compaction_applied: None,
             resume_pending: None,
             last_submitted: None,
+            pending_attachments: Default::default(),
             consecutive_auto_turns: 0,
             model_health: std::collections::HashMap::new(),
             catalog_overrides: std::collections::BTreeMap::new(),

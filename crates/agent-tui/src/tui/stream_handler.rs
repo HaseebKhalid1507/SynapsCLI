@@ -337,6 +337,9 @@ pub(super) async fn handle_session_event_arm(
                 // streaming=true, spinner, frame) already happened in the
                 // dispatch arm; this is the tail after the stream opened.
                 app.last_submitted = None;
+                // The turn was accepted: the attachment drafts it carried are
+                // consumed now (a `Refused` would have left them for a retry).
+                app.pending_attachments.clear();
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.status_text = None;

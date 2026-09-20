@@ -1147,7 +1147,12 @@ impl SessionActor {
     }
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
-    pub(crate) async fn submit(&mut self, text: String) {
+    pub(crate) async fn submit(
+        &mut self,
+        text: String,
+        attachments: Vec<serde_json::Value>,
+        from: Option<ClientId>,
+    ) {
         // Wall 1 defense-in-depth: a latched (unverified) context head must
         // not accept new inference. The stream would refuse via
         // `durability_blocked` anyway, but that leaves the user message
@@ -1161,6 +1166,8 @@ impl SessionActor {
         }
         if self.streaming {
             // A Submit while streaming is what the TUI calls StreamingInput.
+            // Attachments during streaming are rejected by the client; if they
+            // arrive anyway, ignore them (text-only steer).
             self.steer(text);
             return;
         }
@@ -1183,9 +1190,45 @@ impl SessionActor {
         } else {
             text
         };
-        self.conv.api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": api_content}),
-        ));
+
+        if attachments.is_empty() {
+            // Text-only: existing path.
+            self.conv.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": api_content}),
+            ));
+        } else {
+            // Build multipart content: text block (if non-empty) + attachment blocks.
+            let mut blocks = Vec::with_capacity(attachments.len() + 1);
+            if !api_content.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": api_content}));
+            }
+            blocks.extend(attachments);
+            let candidate = std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": blocks}),
+            );
+            // Validate the complete history (including this message) for the
+            // session's current model before accepting.
+            let mut proposed = self.conv.api_messages.clone();
+            proposed.push(candidate.clone());
+            let model = self.runtime.model().to_string();
+            if let Err(e) = crate::runtime::attachments::validate_messages(&model, &proposed) {
+                // Typed refusal: the submitting client gets its editor text
+                // back (stream_handler restores `last_submitted` on `Refused`)
+                // and keeps its attachment drafts; mirrors see a notice.
+                match from {
+                    Some(client) => self.emit(SessionEventWire::Refused {
+                        client,
+                        command: "submit".into(),
+                        reason: format!("attachments rejected: {e}"),
+                    }),
+                    None => self.emit(SessionEventWire::SystemNotice(format!(
+                        "attachments rejected: {e}"
+                    ))),
+                }
+                return;
+            }
+            self.conv.api_messages.push(candidate);
+        }
         self.start_turn(TurnTrigger::User, None).await;
     }
 
@@ -2166,12 +2209,12 @@ impl SessionActor {
             }
         }
         match cmd {
-            SessionCommand::Submit { text, .. } => self.submit(text).await,
+            SessionCommand::Submit { text, attachments } => self.submit(text, attachments, from).await,
             SessionCommand::Steer { text } => {
                 if self.streaming {
                     self.steer(text)
                 } else {
-                    self.submit(text).await
+                    self.submit(text, vec![], from).await
                 }
             }
             SessionCommand::Cancel => self.cancel_turn().await,

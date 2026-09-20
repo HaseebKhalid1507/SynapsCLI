@@ -14,7 +14,7 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
 /// Commands that work while streaming.
-pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit"];
+pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit", "attachments", "detach"];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
@@ -776,6 +776,70 @@ pub(super) async fn handle_command(
                 app.push_msg(ChatMessage::System(rendered));
             }
         }
+        // ── attachment commands (client-local, no wire traffic) ──
+        "attach" => {
+            if arg.trim().is_empty() {
+                app.push_msg(ChatMessage::System("usage: /attach <path>".into()));
+                return CommandAction::None;
+            }
+            // Refuse while streaming or compacting.
+            if app.streaming {
+                app.push_msg(ChatMessage::System("cannot attach while streaming".into()));
+                return CommandAction::None;
+            }
+            if app.compacting {
+                app.push_msg(ChatMessage::System("cannot attach while compacting".into()));
+                return CommandAction::None;
+            }
+            let path_str = arg.trim().trim_matches(|c| c == '"' || c == '\'');
+            let path = std::path::PathBuf::from(path_str);
+            match agent_engine::attachments::load_attachment_sync(&path) {
+                Ok(loaded) => {
+                    let summaries_before = app.pending_attachments.len();
+                    match app.pending_attachments.add(loaded) {
+                        Ok(()) => {
+                            let s = &app.pending_attachments.summaries()[summaries_before..];
+                            for line in s {
+                                app.push_msg(ChatMessage::System(format!("📎 staged: {line}")));
+                            }
+                        }
+                        Err(e) => app.push_msg(ChatMessage::Error(e)),
+                    }
+                }
+                Err(e) => app.push_msg(ChatMessage::Error(format!("{path_str}: {e}"))),
+            }
+        }
+        "attachments" => {
+            let summaries = app.pending_attachments.summaries();
+            if summaries.is_empty() {
+                app.push_msg(ChatMessage::System("no pending attachments".into()));
+            } else {
+                for (i, s) in summaries.iter().enumerate() {
+                    app.push_msg(ChatMessage::System(format!("  [{i}] {s}")));
+                }
+            }
+        }
+        "detach" => {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() || trimmed == "all" || trimmed == "clear" {
+                let n = app.pending_attachments.len();
+                app.pending_attachments.clear();
+                if n > 0 {
+                    app.push_msg(ChatMessage::System(format!("detached {n} file(s)")));
+                } else {
+                    app.push_msg(ChatMessage::System("no pending attachments".into()));
+                }
+            } else if let Ok(idx) = trimmed.parse::<usize>() {
+                if idx < app.pending_attachments.len() {
+                    app.pending_attachments.remove(idx);
+                    app.push_msg(ChatMessage::System(format!("detached [{idx}]")));
+                } else {
+                    app.push_msg(ChatMessage::Error(format!("no attachment at index {idx}")));
+                }
+            } else {
+                app.push_msg(ChatMessage::System("usage: /detach [n|all]".into()));
+            }
+        }
         "quit" | "exit" => {
             return CommandAction::Quit;
         }
@@ -1305,6 +1369,43 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         "quit" | "exit" => CommandAction::Quit,
+        "attachments" => {
+            let summaries = app.pending_attachments.summaries();
+            if summaries.is_empty() {
+                app.push_msg(super::app::ChatMessage::System("no pending attachments".into()));
+            } else {
+                for (i, s) in summaries.iter().enumerate() {
+                    app.push_msg(super::app::ChatMessage::System(format!("  [{i}] {s}")));
+                }
+            }
+            CommandAction::None
+        }
+        "detach" => {
+            let arg = full_input[1..]
+                .split_once(' ')
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim();
+            let n = app.pending_attachments.len();
+            if arg.is_empty() || arg == "all" || arg == "clear" {
+                app.pending_attachments.clear();
+                if n > 0 {
+                    app.push_msg(super::app::ChatMessage::System(format!("detached {n} file(s)")));
+                } else {
+                    app.push_msg(super::app::ChatMessage::System("no pending attachments".into()));
+                }
+            } else if let Ok(idx) = arg.parse::<usize>() {
+                if idx < n {
+                    app.pending_attachments.remove(idx);
+                    app.push_msg(super::app::ChatMessage::System(format!("detached [{idx}]")));
+                } else {
+                    app.push_msg(super::app::ChatMessage::Error(format!("no attachment at index {idx}")));
+                }
+            } else {
+                app.push_msg(super::app::ChatMessage::System("usage: /detach [n|all]".into()));
+            }
+            CommandAction::None
+        }
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
     }
 }
