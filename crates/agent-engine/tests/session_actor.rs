@@ -1169,3 +1169,77 @@ async fn zero_turn_session_ends_idle_at_park_deadline_while_one_turn_parks() {
     end(&mut c).await;
     handle.closed().await;
 }
+
+/// Track F: attachments ride `Submit` as content blocks. A model that cannot
+/// take images gets a typed `Refused` addressed to the submitter (so the TUI
+/// restores the editor and keeps the drafts) and history is untouched; a
+/// model that can takes the turn with the blocks in the user message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model() {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=";
+    let image = serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}});
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    // (a) text-only model → Refused to the submitter, history unchanged.
+    let handle = host
+        .create_session(SessionConfig {
+            model_override: Some("openai-codex/gpt-5.3-codex-spark".into()),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut a, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let before = snap.conversation.api_messages.len();
+    a.send(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()] })
+        .await
+        .unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    let refused = seen
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEventWire::Refused { client, command, reason } => Some((*client, command.clone(), reason.clone())),
+            _ => None,
+        })
+        .expect("Refused event");
+    assert_eq!(refused.0, a.client_id(), "refusal is addressed to the submitter");
+    assert_eq!(refused.1, "submit");
+    assert!(refused.2.contains("attachments rejected"), "{}", refused.2);
+    assert!(
+        !seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })),
+        "no turn may start on a refused submit"
+    );
+    let (mut a2, snap2) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    assert_eq!(snap2.conversation.api_messages.len(), before, "history untouched");
+    end(&mut a2).await;
+    drop(a);
+    handle.closed().await;
+
+    // (b) image-capable model → turn starts with the block in the user message.
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    b.send(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()] })
+        .await
+        .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    let (mut c, snap3) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let user = snap3.conversation.api_messages.first().expect("user message");
+    let blocks = user["content"].as_array().expect("multipart content");
+    assert!(blocks.iter().any(|b| b["type"] == "image"), "image block on the wire: {user}");
+    assert!(blocks.iter().any(|b| b["type"] == "text" && b["text"] == "what is this"));
+    end(&mut c).await;
+    drop(b);
+    handle.closed().await;
+}

@@ -1102,7 +1102,9 @@ pub(crate) async fn handle_input_action(
                 return ControlFlow::Continue(());
             }
 
-            // Build attachment blocks (consumed on submit).
+            // Ship the attachment blocks but keep the drafts: they are
+            // consumed on `TurnStarted` (stream_handler), so a `Refused`
+            // leaves both the editor text and the attachments in place.
             let attachment_blocks = if app.pending_attachments.is_empty() {
                 Vec::new()
             } else {
@@ -1111,7 +1113,7 @@ pub(crate) async fn handle_input_action(
                 for s in &summaries {
                     app.push_msg(ChatMessage::System(format!("📎 {s}")));
                 }
-                app.pending_attachments.take_blocks()
+                app.pending_attachments.blocks()
             };
 
             let display_text = app.user_display_text_for_submission(&input);

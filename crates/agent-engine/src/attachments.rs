@@ -68,12 +68,21 @@ impl PendingAttachments {
         blocks.extend(self.items.iter().map(|a| a.block.clone()));
         Value::Array(blocks)
     }
-    /// Return the attachment content blocks for the wire (no text block).
-    /// Used by the TUI Submit path where the actor prepends the text block.
+    /// The attachment content blocks for the wire (no text block) — the
+    /// drafts are NOT consumed: they stay until the actor accepts the turn
+    /// (`TurnStarted`) so a refusal leaves them intact. See `clear()`.
+    pub fn blocks(&self) -> Vec<Value> {
+        self.items.iter().map(|a| a.block.clone()).collect()
+    }
+    /// Return the attachment content blocks and consume the drafts.
     pub fn take_blocks(&mut self) -> Vec<Value> {
-        let blocks: Vec<Value> = self.items.iter().map(|a| a.block.clone()).collect();
+        let blocks = self.blocks();
         self.items.clear();
         blocks
+    }
+    /// Drop every draft (turn accepted, or the user asked).
+    pub fn clear(&mut self) {
+        self.items.clear();
     }
 }
 

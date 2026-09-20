@@ -1147,7 +1147,12 @@ impl SessionActor {
     }
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
-    pub(crate) async fn submit(&mut self, text: String, attachments: Vec<serde_json::Value>) {
+    pub(crate) async fn submit(
+        &mut self,
+        text: String,
+        attachments: Vec<serde_json::Value>,
+        from: Option<ClientId>,
+    ) {
         // Wall 1 defense-in-depth: a latched (unverified) context head must
         // not accept new inference. The stream would refuse via
         // `durability_blocked` anyway, but that leaves the user message
@@ -1207,9 +1212,19 @@ impl SessionActor {
             proposed.push(candidate.clone());
             let model = self.runtime.model().to_string();
             if let Err(e) = crate::runtime::attachments::validate_messages(&model, &proposed) {
-                self.emit(SessionEventWire::SystemNotice(
-                    format!("attachments rejected: {e}"),
-                ));
+                // Typed refusal: the submitting client gets its editor text
+                // back (stream_handler restores `last_submitted` on `Refused`)
+                // and keeps its attachment drafts; mirrors see a notice.
+                match from {
+                    Some(client) => self.emit(SessionEventWire::Refused {
+                        client,
+                        command: "submit".into(),
+                        reason: format!("attachments rejected: {e}"),
+                    }),
+                    None => self.emit(SessionEventWire::SystemNotice(format!(
+                        "attachments rejected: {e}"
+                    ))),
+                }
                 return;
             }
             self.conv.api_messages.push(candidate);
@@ -2194,12 +2209,12 @@ impl SessionActor {
             }
         }
         match cmd {
-            SessionCommand::Submit { text, attachments } => self.submit(text, attachments).await,
+            SessionCommand::Submit { text, attachments } => self.submit(text, attachments, from).await,
             SessionCommand::Steer { text } => {
                 if self.streaming {
                     self.steer(text)
                 } else {
-                    self.submit(text, vec![]).await
+                    self.submit(text, vec![], from).await
                 }
             }
             SessionCommand::Cancel => self.cancel_turn().await,
