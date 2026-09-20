@@ -413,6 +413,7 @@ impl SessionActor {
             }
         }
         runtime.set_cwd(cfg.cwd.clone());
+        runtime.set_env(cfg.env.clone());
         // CLI `--model` overrides whatever was persisted (rpc.rs precedent).
         if let Some(ref m) = cfg.model_override {
             runtime.set_model(m.clone());
@@ -512,6 +513,7 @@ impl SessionActor {
             input_owner: None,
             awaiting_input: 0,
             journal_id: sb.session.id.clone(),
+            locked_by: None,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -873,6 +875,7 @@ impl SessionActor {
                 sb
             };
             runtime.set_cwd(cfg.cwd.clone());
+            runtime.set_env(cfg.env.clone());
             // The CURRENT model/thinking (the last published view), not
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());

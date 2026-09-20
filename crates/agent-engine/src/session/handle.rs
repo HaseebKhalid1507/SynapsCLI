@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 use super::transport::TransportError;
-use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionId, SessionLifecycle, SessionMeta};
+use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +52,9 @@ pub struct SessionHandle {
     /// Session name — `--name` at create / `/cmd saveas` later. Written by
     /// the actor so listings and `--continue <name>` see renames live.
     name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// F23: only on a lock-held placeholder — the config to retry the real
+    /// `create` with on the next attach. `None` for real actors.
+    placeholder_config: Option<Arc<SessionConfig>>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -95,6 +98,7 @@ impl SessionHandle {
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
             name: Arc::clone(&name),
+            placeholder_config: None,
         };
         (
             handle,
@@ -169,6 +173,16 @@ impl SessionHandle {
         self.events.subscribe()
     }
 
+    /// F23: the retry config carried by a lock-held placeholder.
+    pub fn placeholder_config(&self) -> Option<&SessionConfig> {
+        self.placeholder_config.as_deref()
+    }
+
+    pub(crate) fn with_placeholder_config(mut self, cfg: SessionConfig) -> Self {
+        self.placeholder_config = Some(Arc::new(cfg));
+        self
+    }
+
     pub fn meta(&self) -> &SessionMeta {
         &self.meta
     }
@@ -224,6 +238,7 @@ pub mod echo {
             input_owner: None,
             awaiting_input: 0,
             journal_id: id.0.clone(),
+            locked_by: None,
         }
     }
 
@@ -422,6 +437,136 @@ pub mod echo {
         while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
             if !echo.handle(cmd) {
                 break;
+            }
+        }
+    }
+}
+
+/// F23: a Parked placeholder for sessions whose journal lock is held by
+/// another process at reload time. Refuses Attach while held; retries
+/// on every Attach so that once the holder exits, the next attach works.
+pub mod locked_placeholder {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::session::types::*;
+    
+
+    /// Spawn a placeholder actor for session `id` whose journal is locked
+    /// by `holder_desc` (e.g. `"pid 1234 (tui)"`). The handle starts
+    /// Parked; Attach emits `AttachRefused` naming the holder. The caller
+    /// registers it in the session map under the SAME id — no alias.
+    pub fn spawn(
+        id: SessionId,
+        config: SessionConfig,
+        holder_desc: String,
+    ) -> (SessionHandle, tokio::task::JoinHandle<()>) {
+        let meta = SessionMeta {
+            id: id.clone(),
+            name: config.name.clone(),
+            model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
+            cwd: config.cwd.clone(),
+            created_at: chrono::Utc::now(),
+            continued: true,
+            continue_info: None,
+            host_pid: std::process::id(),
+            lifecycle: SessionLifecycle::Parked,
+            clients: 0,
+            input_owner: None,
+            awaiting_input: 0,
+            journal_id: id.0.clone(),
+            locked_by: Some(holder_desc.clone()),
+        };
+        let view = crate::session::view::RuntimeView {
+            model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
+            thinking_level: "off".into(),
+            reasoning_level: agent_core::reasoning::ReasoningLevel::Off,
+            is_reasoning_explicit: false,
+            thinking_budget: 0,
+            context_window: 200_000,
+            system_prompt: None,
+            compaction_model: "unknown".into(),
+            api_retries: 0,
+            subagent_timeout: 0,
+            max_tool_output: 4096,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            prompt_generation: 0,
+            hook_handler_count: 0,
+            prompt_inspection: None,
+        };
+        let (handle, ep) = SessionHandle::new(meta, view);
+        let handle = handle.with_placeholder_config(config.clone());
+        // Start as Parked.
+        ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
+        let task = tokio::spawn(run(id, ep, config, holder_desc));
+        (handle, task)
+    }
+
+    async fn run(
+        id: SessionId,
+        mut ep: SessionEndpoints,
+        _config: SessionConfig,
+        holder_desc: String,
+    ) {
+        let mut seq: u64 = 0;
+        let emit = |seq: &mut u64, events: &broadcast::Sender<Envelope>, event: SessionEventWire| {
+            let env = Envelope {
+                session_id: id.clone(),
+                seq: *seq,
+                ts: chrono::Utc::now(),
+                event,
+            };
+            *seq += 1;
+            let _ = events.send(env);
+        };
+
+        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
+            match cmd {
+                SessionCommand::Attach { .. } => {
+                    let msg = format!(
+                        "session {}: journal locked by {} \
+                         — close it or use synaps --attach from that process",
+                        id.as_str(),
+                        holder_desc
+                    );
+                    emit(&mut seq, &ep.events, SessionEventWire::AttachRefused { message: msg });
+                }
+                SessionCommand::Park => {
+                    // Already parked, no-op.
+                }
+                SessionCommand::End { reason } => {
+                    emit(&mut seq, &ep.events, SessionEventWire::Ended { reason });
+                    break;
+                }
+                SessionCommand::Detach { client } => {
+                    emit(&mut seq, &ep.events, SessionEventWire::ClientLeft { client });
+                }
+                SessionCommand::Query { id: qid, .. } => {
+                    emit(
+                        &mut seq,
+                        &ep.events,
+                        SessionEventWire::QueryResult {
+                            id: qid,
+                            value: serde_json::json!({
+                                "locked_by": holder_desc,
+                                "streaming": false,
+                                "pending_prompts": 0,
+                            }),
+                        },
+                    );
+                }
+                _ => {
+                    emit(
+                        &mut seq,
+                        &ep.events,
+                        SessionEventWire::SystemNotice(format!(
+                            "session {}: journal locked by {} — command ignored",
+                            id.as_str(),
+                            holder_desc
+                        )),
+                    );
+                }
             }
         }
     }

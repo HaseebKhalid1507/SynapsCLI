@@ -113,6 +113,7 @@ fn test_context() -> ToolContext {
             extension_leases: None,
             memory_context: None,
             cwd: None,
+            env: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,

@@ -282,6 +282,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     let mut attached_to_live = false;
     let (handle, mode) = match attach {
         Attach::Existing { session_id, mode } => match state.attach(&session_id) {
+            Some(h) if h.meta().locked_by.is_some() => (state.retry_locked_placeholder(h).await, mode),
             Some(h) => (h, mode),
             None => {
                 let _ = tx
@@ -295,6 +296,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         Attach::Create { mut config, mode } => {
             if config.cwd.is_none() {
                 config.cwd = Some(hello.cwd.clone());
+            }
+            if config.env.is_none() {
+                config.env = hello.env.clone();
             }
             if let Some(cwd) = &config.cwd {
                 if !cwd.is_absolute() || !cwd.is_dir() {

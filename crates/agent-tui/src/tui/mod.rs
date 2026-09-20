@@ -22,6 +22,7 @@ mod loop_arms;
 mod markdown;
 mod models;
 mod plugins;
+pub mod quit_guard;
 mod render;
 mod render_model;
 mod render_thread;
@@ -326,6 +327,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                             event_reader: &mut event_reader,
                             ext_mgr_shared: ext_mgr_shared.as_ref(),
                             exit_fx_sent: &mut exit_fx_sent,
+                            is_socket: matches!(mode, run_setup::TransportMode::Socket),
                         };
                         if dispatch::handle_input_action(action, state).await.is_break() {
                             break;

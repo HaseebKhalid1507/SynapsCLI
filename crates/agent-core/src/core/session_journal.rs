@@ -626,13 +626,13 @@ struct SessionSnapshotRef<'a> {
     total_output_tokens: u64,
     session_cost: f64,
     message_count: usize,
-    api_messages: &'a [SharedMessage],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    abort_context: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compacted_into: &'a Option<String>,
+    api_messages: &'a [SharedMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    abort_context: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_provenance: &'a Option<crate::prompt::PromptProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -654,10 +654,10 @@ impl<'a> SessionSnapshotRef<'a> {
             total_output_tokens: s.total_output_tokens,
             session_cost: s.session_cost,
             message_count: s.api_messages.len(),
-            api_messages: &s.api_messages,
-            abort_context: &s.abort_context,
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
+            api_messages: &s.api_messages,
+            abort_context: &s.abort_context,
             prompt_provenance: &s.prompt_provenance,
             compaction: &s.compaction,
         }

@@ -114,6 +114,7 @@ async fn reload_reconnects_digest_client_with_display_tail_only() {
         Attach::Create {
             config: SessionConfig {
                 cwd: Some(Path::new(guard.home.path()).to_path_buf()),
+                env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },

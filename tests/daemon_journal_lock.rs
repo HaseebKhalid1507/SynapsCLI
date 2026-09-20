@@ -60,6 +60,7 @@ async fn in_process_continue_of_live_daemon_session_refused() {
         Attach::Create {
             config: SessionConfig {
                 cwd: Some(cwd.clone()),
+                env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 persist: true,
                 await_extensions: true,

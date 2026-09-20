@@ -127,6 +127,11 @@ pub struct Hello {
     pub client: ClientMeta,
     pub cwd: PathBuf,
     pub client_version: String,
+    /// Client environment snapshot (secrets and `SYNAPS_CLIENT_*`/`SYNAPS_TUI_*`/
+    /// `SYNAPS_DAEMON_*`/`SYNAPS_MEM_TRACE*` stripped). `None` = in-process
+    /// (inherit process env). Legacy frames without this field decode as `None`.
+    #[serde(default)]
+    pub env: Option<super::types::SessionEnv>,
     /// Set when re-connecting after `Reloading`/EOF (C3/A4).
     #[serde(default)]
     pub reconnect_of: Option<ClientReconnect>,
@@ -152,6 +157,7 @@ impl Hello {
             },
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             client_version: binary_version(),
+            env: Some(super::types::capture_client_env()),
             reconnect_of: None,
         }
     }
@@ -1148,6 +1154,11 @@ mod tests {
         )
         .unwrap();
         assert!(h.reconnect_of.is_none());
+        // Legacy Hello without env field → None (backwards compatible).
+        assert!(h.env.is_none());
+        // Hello::new captures env.
+        let h2 = Hello::new(ClientKind::Test);
+        assert!(h2.env.is_some(), "Hello::new must capture client env");
         let b: DaemonFrame = serde_json::from_str(r#"{"type":"bye"}"#).unwrap();
         assert!(matches!(b, DaemonFrame::Bye { reason: None }));
     }

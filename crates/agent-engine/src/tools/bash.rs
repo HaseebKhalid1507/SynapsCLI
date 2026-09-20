@@ -259,6 +259,9 @@ pub(crate) async fn run_shell_command(
         if let Some(cwd) = ctx.capabilities.cwd.as_deref() {
             cmd.current_dir(cwd);
         }
+        if let Some(env) = &ctx.capabilities.env {
+            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

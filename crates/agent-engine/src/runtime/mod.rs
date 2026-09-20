@@ -446,6 +446,10 @@ pub struct Runtime {
     /// cwd — every in-process host leaves it `None`, so `ToolCapabilities.cwd`
     /// stays `None` exactly as before. The daemon sets it per session.
     cwd: Option<PathBuf>,
+    /// Per-session environment snapshot (session-identity T1). `None` =
+    /// inherit process env (in-process hosts). Daemon sessions carry the
+    /// creator client's env; tools apply `env_clear().envs()` when `Some`.
+    env: Option<crate::session::types::SessionEnv>,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -887,6 +891,7 @@ impl Runtime {
             host_tool_session: fresh_host_tool_session(),
             session_id: None,
             cwd: None,
+            env: None,
         };
         // Lease managers are installed through the same seams boot used, so
         // the per-runtime durable session-scope guards are minted exactly as
@@ -1342,6 +1347,16 @@ impl Runtime {
 
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// Per-session environment snapshot handed to tools via
+    /// `ToolCapabilities.env`. `None` = inherit process env.
+    pub fn set_env(&mut self, env: Option<crate::session::types::SessionEnv>) {
+        self.env = env;
+    }
+
+    pub fn env(&self) -> Option<&crate::session::types::SessionEnv> {
+        self.env.as_ref()
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -3236,6 +3251,7 @@ impl Runtime {
                                         extension_leases: None,
                                         memory_context: None,
                                         cwd: self.cwd.clone(),
+                                        env: self.env.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3312,6 +3328,7 @@ impl Runtime {
                         self.codex_request_role(),
                     );
                     let cfg_cwd = self.cwd.clone();
+                    let cfg_env = self.env.clone();
                     let cfg_session_id = self.session_id.clone();
 
                     for tool_use in &tool_uses {
@@ -3335,6 +3352,7 @@ impl Runtime {
                             let orchestration_inner = cfg_orchestration.clone();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
+                            let env_inner = cfg_env.clone();
                             let session_id_inner = cfg_session_id.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
@@ -3389,6 +3407,7 @@ impl Runtime {
                                                     extension_leases: None,
                                                     memory_context: None,
                                                     cwd: cwd_inner,
+                                                    env: env_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -3638,6 +3657,7 @@ impl Runtime {
             hook_bus: self.hook_bus.clone(),
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
+            env: self.env.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
@@ -3803,6 +3823,7 @@ impl Clone for Runtime {
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
+            env: self.env.clone(),
         }
     }
 }

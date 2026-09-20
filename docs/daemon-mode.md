@@ -63,6 +63,30 @@ stderr tail). Measured on bella: ready in ~75 ms.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
 
+## Detach vs abort (F27)
+
+Over a socket transport (daemon session), **Ctrl+C / `/quit` detaches the client
+but leaves the turn running** in the daemon. This is the correct default for
+"close the lid" workflows, but a footgun when the user meant to stop a
+destructive command.
+
+To avoid accidental headless turns:
+
+- **First Ctrl+C (or `/quit`) while streaming** shows a notice:
+  `turn still running in the daemon — press Esc to abort it, or Ctrl+C again
+  within 3 s to detach (session keeps running)`.
+- **Second Ctrl+C within 3 seconds** detaches as before (the turn continues in
+  the daemon).
+- **Esc while streaming** aborts the turn (sends `Cancel` to the actor) — same
+  as in-process.
+- **Ctrl+C while idle** (not streaming) detaches immediately — no double-press
+  needed.
+- **In-process** (`TransportMode::Local`, i.e. `SYNAPS_DAEMON=0` or no daemon)
+  is unchanged: quit ends the session.
+
+The line client (`synaps attach`) follows the same double-press rule. The notice
+is printed to stderr so scripts piping stdout are not affected.
+
 ## Files (under `registry_dir()`, one set per profile: `daemon-<P>.*`)
 
 | File | Mode | Purpose |
@@ -245,18 +269,59 @@ back Parked** — rehydrate creates it then sends the host-only `Park`), the non
 worker grants, **`/system`**), and the **current** model/thinking (a `/model` change mid-session
 survives; the create-time `--model` override is not re-applied). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
+A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
+NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
+in its metadata. Attach is refused with a message naming the lock holder's pid and kind (F23).
+`daemon sessions` shows it as Parked with the `locked_by` marker.
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
 owner again, second turn works; older `--exe` refused with the daemon still serving; a turn in flight is
 checkpointed and its abort context comes back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
+F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
 
 ## cwd caveats (risk §6.1)
 
 Tools, shell and the memory tool honour the session `cwd` (`Runtime.cwd`). Still process-wide in the
 daemon today: memory project scope, `host_project_root`, project-local plugin discovery, extension
 process cwd. Start the daemon in the project you care about until day 2's `memory_project_scope(cwd)`.
+
+## Session identity — environment snapshot (wave 1, T1–T3)
+
+**Principle:** a daemon session's process identity (env, cwd) comes from the
+*creating client*, not the daemon. The daemon's own env is used by exactly one
+thing: the daemon itself.
+
+### How it works
+
+1. **Client captures env at Hello.** `Hello::new()` calls `capture_client_env()`
+   which snapshots `std::env::vars()`, sorts by key, and strips:
+   - Client-only prefixes: `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*`, `SYNAPS_DAEMON_*`, `SYNAPS_MEM_TRACE*`
+   - Secrets (case-insensitive): `*_API_KEY`, `*_TOKEN`, `*_SECRET*`, `*PASSWORD*`,
+     `AWS_SECRET_*`, `*_CREDENTIALS`
+2. **Daemon copies `hello.env` → `config.env` on `Attach::Create` only.**
+   Attaching to an existing session never changes its env (creator's env is final).
+3. **`SessionConfig.env` → `Runtime.env` → `ToolCapabilities.env`** — same pipe as cwd.
+4. **Tools apply `env_clear().envs(session_env)`** when `env` is `Some`:
+   `bash.rs`, `find.rs`, `grep.rs`, `ls.rs`. No daemon env var leaks through.
+5. **In-process hosts pass `env: None`** — inherit the process env, byte-identical to before.
+
+### `SYNAPS_*` split (stub — T11 will formalize)
+
+| Category | Prefixes | Read by | In session env? |
+|---|---|---|---|
+| Client-only | `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*` | Thin TUI client | No (stripped) |
+| Daemon-only | `SYNAPS_DAEMON_*` | Daemon boot | No (stripped) |
+| Debug | `SYNAPS_MEM_TRACE*` | Profiling harness | No (stripped) |
+| Session | everything else (`SYNAPS_ANTHROPIC_BASE_URL`, etc.) | Runtime/tools | Yes |
+
+### What is NOT yet covered (wave 2+)
+
+- **Journal persistence of env minus secrets** (T5) — env does not survive daemon restart today.
+- **Extension protocol: per-call env/cwd** (T6) — sidecars still get the daemon's env.
+- **`--system` by content** (T4) — path-like args still resolved against daemon cwd.
+- **`SO_PEERCRED` uid check** (T11) — no auth boundary on the socket yet.
 
 ## What changes on the default (in-process) path — read before merging
 
