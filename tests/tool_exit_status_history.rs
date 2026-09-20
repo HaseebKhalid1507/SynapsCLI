@@ -92,9 +92,13 @@ async fn streamed_then_failed_tool_reports_exit_status_and_notice_to_model() {
         }
     }
 
-    let bodies = bodies.lock().unwrap_or_else(|p| p.into_inner());
-    assert!(bodies.len() >= 2, "expected the follow-up request, got {}", bodies.len());
-    let second: serde_json::Value = serde_json::from_slice(&bodies[1]).expect("json body");
+    // Clone out under the lock — the guard must not live across the `End` await below.
+    let second_body = {
+        let bodies = bodies.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(bodies.len() >= 2, "expected the follow-up request, got {}", bodies.len());
+        bodies[1].clone()
+    };
+    let second: serde_json::Value = serde_json::from_slice(&second_body).expect("json body");
     let tool_result = second["messages"]
         .as_array()
         .into_iter()
