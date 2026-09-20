@@ -78,3 +78,5 @@ never spawns it. Sidecar binary located via config.executable or
 | clippy | ✅ `-D warnings` clean (synaps-engine, synaps, synaps-core) |
 | two-sided | ✅ no conflict markers (pre-commit hook active) |
 | docs   | ✅ docs/tools.json regenerated (28 tools), contract.json updated (session.drive) |
+| checkpoint-B | synaps-engine | 2110 | 0 (1 order-flake: malformed_scope_fails_closed…, passes 3/3 alone) | 12 |
+| checkpoint-B | synaps-core | 732 | 0 | 8 |
