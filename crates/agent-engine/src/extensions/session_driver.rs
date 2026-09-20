@@ -994,6 +994,7 @@ mod tests {
             effort: selection().effort,
             feedback: None,
             session_id: None,
+            session_cost_so_far: None,
         }
     }
 
