@@ -1,0 +1,110 @@
+# Multiple OAuth accounts in one Synaps broker
+
+One credential broker can hold independent OAuth logins for Claude, ChatGPT/Codex, Kimi Code and Grok. Each account has a provider-scoped label. Existing unlabelled credentials remain `default`; no migration or token copying is necessary.
+
+Related: [usage snapshots](multi-account-usage.md), [quota keeper](quota-keeper.md), [goal plan](../plans/multi-account-broker-goals.md).
+
+## First login pass
+
+Run these commands **on the credential broker host**, using the newly built binary. The feature build is `target/release/synaps`; it does not replace your installed binary or restart your running broker.
+
+```bash
+SYNAPS="$PWD/target/release/synaps"  # from the repository root
+
+"$SYNAPS" login --provider openai-codex --account astra1
+"$SYNAPS" login --provider openai-codex --account astra2
+"$SYNAPS" login --provider anthropic --account claude1
+"$SYNAPS" login --provider anthropic --account claude2
+
+# Optional other subscriptions
+"$SYNAPS" login --provider kimi-code --account kimi1
+"$SYNAPS" login --provider xai-auth --account grok1
+
+"$SYNAPS" auth list
+"$SYNAPS" status --all
+"$SYNAPS" status --all --json
+```
+
+Complete each browser/device flow as the intended subscription owner. Use separate browser profiles or sign out of the previous account before the next login. Do not paste access/refresh tokens into chat. `auth login` is an alias for `login`.
+
+A named login writes directly to its named slot: it never temporarily overwrites `default`. A label is 1–32 lowercase ASCII letters/digits/`.`/`_`/`-`, beginning with a letter/digit. `default` denotes the original bare provider key; `auto` is reserved for selection, not a login label.
+
+Codex identity is checked to reject connecting one provider seat twice under different labels. Where a provider exposes no stable identity, duplicate detection is limited (reported by the login flow); keep one refresh owner per actual account. Do not copy rotating refresh tokens from another CLI or host into multiple slots. Use separate legitimate subscriptions, within provider terms and organization policy.
+
+`auth list` shows **OAuth access-token expiry**, not the quota reset. An expired but refreshable token is not an expired subscription. `status` supplies quota windows/resets; billing renewal and OAuth expiry are separate concepts. Grok's billing adapter is fixture-tested but its live schema is explicitly unverified.
+
+## Choose a seat
+
+Named logins do not silently change the default selection. Select a seat explicitly:
+
+```bash
+"$SYNAPS" auth use --provider openai-codex --account astra1
+"$SYNAPS" auth use --provider anthropic --account claude1
+
+# Optional automatic capacity-based choice
+"$SYNAPS" auth use --provider openai-codex --account auto
+"$SYNAPS" auth use --provider anthropic --account auto
+
+# Inspect exactly one seat, independently of the selection policy
+"$SYNAPS" status --provider openai-codex --account astra2
+```
+
+Selection precedence is explicit per-request account → `SYNAPS_ACCOUNT_<PROVIDER>` environment variable → `auth.account.<provider>` config → `default`. Hyphens become underscores, e.g. `SYNAPS_ACCOUNT_OPENAI_CODEX=astra2`. An unknown explicit slot or invalid selector fails closed, never falling back to another seat.
+
+`auth use` writes only the active profile's config, never moves credentials. Restart existing clients to reliably pick up a changed policy. With a policy of `auto`, use `status --all` or an explicit `--account` to inspect usage.
+
+Auto uses fresh provider evidence (a short cache, currently 60 seconds), excludes exhausted/unknown/malformed/stale readings and cooldowns, and checks model-specific limits where exposed. It does not assume every 429 is quota exhaustion. Codex permits at most one cross-account failover on a recognized quota failure **before output/tool activity**; no replay after partial work. Other providers do not gain arbitrary mid-request cross-account replay.
+
+## Keep Codex windows moving
+
+Start read-only:
+
+```bash
+"$SYNAPS" quota-keeper --once --json
+# Continuous polling, no inference:
+"$SYNAPS" quota-keeper
+```
+
+Only after checking real usage/reset behavior, opt specific seats into activation:
+
+```bash
+# Example only: choose a model confirmed to use the quota bucket you want to anchor.
+"$SYNAPS" quota-keeper \
+  --activate openai-codex@astra1 \
+  --activate openai-codex@astra2 \
+  --model gpt-6-astra
+```
+
+This consumes some quota. A cheaper model must **not** be assumed to start an Astra-specific window. The keeper requires fresh headroom and known reset evidence; an account with no known reset, or one still reported exhausted after its reset, is not activated blindly. One ambiguous attempt consumes the generation's attempt allowance. Verification requires a later provider-reported weekly reset; `now + 7 days` is never invented.
+
+First-use anchoring is documented for some reset paths, **not established as a universal rule for all natural rollovers**. Real behavior for your subscriptions is pending login/observation. The request has no project context, tools or agent loop. It has minimal reasoning/verbosity and a timeout but **no guaranteed output-token cap** on this endpoint. See the keeper runbook before enabling it.
+
+Activation is local-only, on the broker host, with a canonical private ledger beside the resolved credential file. Remote clients may poll, not activate. A disabled read-only systemd user-unit example is at `deploy/synaps-quota-keeper.service`; nothing is installed/enabled automatically.
+
+## Remote clients and storage
+
+The existing machine-authenticated broker exposes account-aware token, usage, capability and proxy operations. Upgrade the broker host as well as clients before relying on named accounts/auto. An old broker that cannot confirm the requested named slot is rejected rather than silently using its default. Machine-token holders can see account labels/minimal identity metadata; keep that token private. Use TLS or a trusted private tunnel, not public plaintext HTTP.
+
+Long-lived credentials remain in the broker host's private `auth.json`; only short-lived access tokens or sanitized usage leave the boundary. Additive keys are `openai-codex@astra1`, `anthropic@claude1`, etc. Refresh is serialized by resolved file plus slot, across processes, and persisted atomically without overwriting other slots. Identity-scoped caches cannot apply the old seat's capacity after a different account is logged into its label.
+
+Login/removal operate on **local files** even when a remote source is configured. Perform those operations on the broker host. `auth list` and status can query a remote broker; `auth use` selects policy for the invoking client.
+
+```bash
+# Deliberate local removal (does not revoke the subscription/provider account)
+"$SYNAPS" auth remove --provider openai-codex --account astra2 --yes
+# Return to the legacy slot if it exists
+"$SYNAPS" auth use --provider openai-codex --account default
+```
+
+Removing a selected slot leaves its selector failing closed until you choose another account. Keep at least one valid route before removal. Do not hand-edit or delete the keeper ledger to obtain another automatic attempt; use the explicitly documented recovery/rearm procedure.
+
+## Known operational limits
+
+- Cooldowns and short-lived capacity caches are broker-process-local, not a shared distributed database. Fleet clients should use one broker authority rather than independent credential copies.
+- A caller/process cancellation during an upstream rotating-token refresh can still require re-login if the provider rotated before persistence. This is inherited behavior, not a new guarantee of cancellation-safe refresh. Cross-process locks prevent simultaneous owners, not recovery of a lost provider response.
+- A profile inheriting the base `auth.json` may read/refresh it but cannot add/remove slots by silently creating a partial profile copy. Perform account management in the owning/base profile; do not fork refresh tokens.
+- Banked-reset count/expiry is alert-only and only as complete as provider-exposed data. The optional separate inventory fetch exists in the usage adapter; normal status/keeper polling does not force it. No redemption/purchase is performed.
+
+## Validation boundary
+
+Automated tests use synthetic credentials, fake clocks and loopback HTTP. No real login, refresh or activation is required to run them. Production logins, each provider's current usage schema, actual reset anchoring, and model/bucket correlation must be verified with the operator's accounts. The build is ready for that controlled login pass, not evidence that live activation has already succeeded.

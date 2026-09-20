@@ -112,7 +112,7 @@ Unknown label → `BrokerError::UnknownAccount { provider, label }` → HTTP 404
 
 ### Quota keeper (phase D — separate plan)
 
-The Codex weekly window anchors at the **first request after the previous window ends** (OpenAI help 20001516). A daemon on the broker host polls `/usage` per account and, when `reset_at` passes, fires one minimal `synaps -p ok` turn on that account so the next reset is exactly 7 days out. Also alerts on unused banked resets (`rate_limit_reset_credits.available_count > 0`). Out of scope here; listed so the storage/selection shapes above are known to serve it.
+First-use anchoring is documented for some Codex reset paths, but this is **not a universal documented guarantee for every natural weekly rollover** (see the safety constraints in the goal plan). The keeper polls provider-reported usage and, only after explicit per-account opt-in and fresh headroom evidence, can send one minimal, tool-free Codex request to reduce activation delay. It verifies a new window from a later provider-reported reset rather than assuming `now + 7 days`. It never runs an agent turn, purchases or redeems a reset. See [the implemented keeper runbook](../providers/quota-keeper.md) for its limits and live-validation status.
 
 ## Non-goals
 

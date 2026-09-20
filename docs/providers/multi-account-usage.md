@@ -79,6 +79,7 @@ Rules:
                      "remaining": 12.5, "total": null, "unit": "credits", "renews_at": null },
         "banked_resets": { "available_count": 2, "credits": [], "inventory_error": null },
         "identity_prefix": "acct_123",
+        "seat_fingerprint": "<SHA-256 of provider + full paired account id>",
         "notes": ["null window skipped"]     // fixed vocabulary only; never raw keys or values
       } },
     { "provider": "openai-codex", "account": "astra2", "status": "error",
@@ -127,6 +128,8 @@ Codex specifics:
   token without the claim fails with `account_id_unavailable` before any
   request. A response whose `account_id` differs from the header fails with
   `identity_mismatch` and the snapshot is discarded (pairing is never guessed).
+  A full opaque `seat_fingerprint` derived from the paired token identity lets
+  the keeper reject re-login mismatches even when short display prefixes collide.
 - `model_usage` (`{"<slug>": {"available", "available_at", "credits_would_enable"}}`)
   is parsed first as the authoritative per-model statement; model-scoped
   windows are then merged in without overwriting it (exhaustion from either

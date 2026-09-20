@@ -11,11 +11,12 @@ shell, no agent loop, no purchases, no redemption of banked resets, no login.
 
 ## Why
 
-Codex weekly windows are anchored at the first request after the previous
-window ends (OpenAI help 20001516; see `docs/plans/multi-account-broker-goals.md`).
-If a seat sits idle for two days after its reset, its next reset is two days
-later than it could have been. With several seats rotating, that idle time is
-lost quota-time. The keeper makes the delay visible and, on request, removes it.
+First-use anchoring is documented for some Codex reset paths, but it is **not
+a universal documented guarantee for every natural weekly rollover** (see
+`docs/plans/multi-account-broker-goals.md`). On accounts that require first use
+to anchor a new window, sitting idle can delay the next reset. The keeper
+makes that possible delay visible and, on explicit request and fresh capacity
+evidence, attempts to reduce it. Real behavior must be verified on your seats.
 
 The keeper never assumes a "naturally resetting" timer: a window is only
 called **active** when a *fresh* usage read shows a strictly later reset than
@@ -29,15 +30,15 @@ the generation being tracked. With no evidence the state is `unknown` or
 | Default mode | Read-only. Polls, classifies, alerts. No inference. |
 | Opt-in | Per account, per invocation: `--activate openai-codex@<label>` (or `openai-codex` for the default slot). Only Codex. Requires an explicit `--model`. |
 | Model | No default, no guessed bucket. Must be a catalog Codex id (`openai-codex/` prefix accepted). The request carries the **lowest reasoning effort the model supports**, authorized through the same execution-plan builder the runtime uses. |
-| Request | One `POST https://chatgpt.com/backend-api/codex/responses` (pinned) with the bearer vended for exactly the tracked `CredentialRef` and the `chatgpt-account-id` derived from that same token. Body mirrors the production Codex builder: `store:false`, `stream:true`, one-word instructions and input, `text.verbosity: low`, **no `tools`**. Like production it omits `max_output_tokens` (the ChatGPT backend may reject it) — so there is **no guaranteed output-token ceiling**; cost is bounded by minimal effort, a one-word prompt, low verbosity, no tools and a hard request timeout (60 s). |
+| Request | One `POST https://chatgpt.com/backend-api/codex/responses` (pinned) with the bearer vended for exactly the tracked `CredentialRef` and the `chatgpt-account-id` derived from that same token. The full token-derived seat fingerprint must match the tracked seat immediately before sending; a re-login mismatch disables activation until restart. Body mirrors the production Codex builder: `store:false`, `stream:true`, one-word instructions and input, `text.verbosity: low`, **no `tools`**. Like production it omits `max_output_tokens` (the ChatGPT backend may reject it) — so there is **no guaranteed output-token ceiling**; cost is bounded by minimal effort, a one-word prompt, low verbosity, no tools and a hard request timeout (60 s). |
 | Proven capacity gate | Activation is authorized only when the **latest** poll succeeded, is fresh (`--stale-after`), carries no overall `limit_reached`/spend-control assertion, and every window applicable to the activation model (5 h, weekly and model-scoped) shows headroom with the model not listed exhausted/unknown. A passed reset while the provider still asserts 100 % is `exhausted (reset passed)` — never due. |
 | One attempt per generation | Exactly one. The attempt is persisted (`activation_pending`) **before** the request leaves the process. Timeouts, 5xx, stream cuts, drain-cap overruns and crashes between begin and finish are *ambiguous* and consume the attempt. Only typed pre-flight failures (token vend, missing account id, request build, TCP connect) and whitelisted pre-inference 4xx (400/401/403/404/413/415/422) are refunded, with backoff and a bound of 5 per generation. 429 is never refunded. |
 | Verification | After the attempt the keeper re-reads usage. `active` requires a strictly later weekly reset. Otherwise the attempt stays pending for 10 minutes, then becomes `unverified` and is **never retried automatically**. |
 | Re-arm | `--rearm openai-codex@<label>` (with the same account in `--activate`) allows exactly one more attempt for a generation that is `unverified`. Operator action, once per invocation. |
 | Attribution | A verified new window is labelled `observed` or `keeper attempt N correlated, not proven causal`. Correlation is recorded; causation is never claimed. |
-| Locks | State-dir singleton lock plus one lock per account in the canonical keeper directory (next to the resolved `auth.json`, shared by profiles that inherit it). A second keeper on the same host for the same account is refused regardless of `--state-dir`. |
+| Locks | State-dir singleton lock plus one lock per account in the canonical keeper directory (next to the resolved `auth.json`, shared by profiles that inherit it). A second keeper on the same host for the same account is refused regardless of `--state-dir`. Strong seat identities additionally have an alias-independent seat lock; duplicate aliases are tracked once read-only and rejected for activation when selected together. |
 | Remote broker | With `auth.remote_endpoint` set the keeper is **poll-only**; `--activate` is refused because locks are host-local and two hosts could each spend an attempt. Run the activating keeper on the broker host. |
-| Ledger retention | Reconciliation never deletes an attempt ledger. An account filtered out with `--account`/`--provider` keeps its spent generation for when it returns; a re-login with a different provider seat gets a new identity key and never inherits a ticket. |
+| Ledger retention | Reconciliation never deletes an attempt ledger. An account filtered out with `--account`/`--provider` keeps its spent generation for when it returns; a re-login with a different provider seat gets a new identity key and never inherits a ticket. Changing only the label for the same strong seat preserves its attempt ledger. |
 | Secrets | State (`state.json`, 0600 in a 0700 dir, atomic writes) holds phases, generations, timestamps, HTTP status codes and error classes only. No tokens, no upstream bodies, no JWT fragments. `--show-state` is safe to paste. |
 | Banked resets | Codex `rate_limit_reset_credits` inventory is reported/alerted (count, earliest expiry, "expiring soon" within 3 days). Nothing is ever redeemed. |
 
@@ -57,6 +58,7 @@ synaps quota-keeper --once --json
 synaps quota-keeper --once --provider openai-codex --account openai-codex@astra2
 
 # Opt ONE Codex account into activation (explicit model required)
+# Confirm this model anchors the intended bucket; mini may not anchor Astra.
 synaps quota-keeper --activate openai-codex@astra2 --model gpt-5.4-mini
 
 # One extra attempt for a generation that stayed unverified (operator decision)
