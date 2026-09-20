@@ -3049,52 +3049,44 @@ mod rich_output_tests {
         assert_eq!(out[2]["content"][0]["type"], "image");
     }
 
-    /// Wire-level: history carrying N images over the cap → the request body
-    /// that hits the provider holds only the newest images under the cap.
+    /// #112 ordering: `validate_messages` (MAX_HISTORY_ENCODED_BYTES = 20 MiB)
+    /// runs BEFORE `cap_history_image_bytes` (HISTORY_IMAGE_BYTE_CAP = 20 MiB),
+    /// so a history the validator accepts is never lossily pruned — every
+    /// image the user sent reaches the provider intact. The cap is a
+    /// belt-and-braces bound only (unit-tested directly below); an over-limit
+    /// history is an error, not a silent trim
+    /// (`history_media_limit_rejects_before_lossy_pruning`).
     #[tokio::test]
-    async fn history_cap_applied_to_request_body() {
-        // 7 × 3.5 MiB = 24.5 MiB > 20 MiB → 2 oldest dropped, 5 newest kept.
+    async fn valid_history_reaches_provider_unpruned() {
+        // 5 × 3.5 MiB = 17.5 MiB < 20 MiB → valid; all 5 must be on the wire.
         let per = 3_670_016usize;
         let d = drive_with_history(
-            image_history(7, per),
+            image_history(5, per),
             vec![Arc::new(TextTool)],
             &[("toolu_z", "text_stub")],
             Arc::new(crate::extensions::hooks::HookBus::new()),
         )
         .await;
+        assert!(!d.bodies.is_empty(), "valid history must be sent");
         for body in &d.bodies {
             let msgs = body["messages"].as_array().unwrap();
             let mut kept = 0usize;
             let mut dropped = 0usize;
-            let mut bytes = 0usize;
             for m in msgs {
                 let Some(blocks) = m["content"].as_array() else { continue };
                 for b in blocks {
-                    if let Some(inner) = b["content"].as_array() {
-                        for x in inner {
-                            if is_base64_image(x) {
-                                kept += 1;
-                                bytes += base64_image_len(x);
-                            } else if x["text"] == IMAGE_DROPPED_LABEL {
-                                dropped += 1;
-                            }
+                    let Some(inner) = b["content"].as_array() else { continue };
+                    for x in inner {
+                        if x["type"] == "image" {
+                            kept += 1;
+                        } else if x["text"] == IMAGE_DROPPED_LABEL {
+                            dropped += 1;
                         }
                     }
                 }
             }
-            assert_eq!((dropped, kept), (2, 5), "{}", body["messages"].as_array().unwrap().len());
-            assert!(bytes <= HISTORY_IMAGE_BYTE_CAP, "{bytes}");
-            // Oldest two are the dropped ones.
-            let first = msgs.iter().find(|m| m["content"][0]["type"] == "tool_result").unwrap();
-            assert_eq!(first["content"][0]["content"][1]["text"], IMAGE_DROPPED_LABEL);
+            assert_eq!((dropped, kept), (0, 5), "no image may be pruned from a valid history");
         }
-        // Durable history (what gets saved) still carries every image.
-        let images_in_history = d
-            .history
-            .iter()
-            .filter(|m| m["content"][0]["content"][1]["type"] == "image")
-            .count();
-        assert_eq!(images_in_history, 7);
     }
 
     /// DARK (§7): with the default (legacy) memory backend the forum_* tools
