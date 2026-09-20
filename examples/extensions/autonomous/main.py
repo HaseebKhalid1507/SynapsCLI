@@ -127,11 +127,21 @@ def strict_json(data):
             raise Invalid("JSON integer too large")
         return int(raw)
 
+    def finite_float(raw):
+        # (E-P7, §S3) `session_cost_so_far` is a JSON number (USD). Accept
+        # bounded, finite floats; reject NaN/Infinity and overlong literals.
+        if len(raw) > 40:
+            raise Invalid("JSON float too large")
+        value = float(raw)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise Invalid("non-finite JSON number")
+        return value
+
     def no_constant(_):
         raise Invalid("non-finite JSON number")
 
     return json.loads(data, object_pairs_hook=pairs, parse_int=integer,
-                      parse_float=no_constant, parse_constant=no_constant)
+                      parse_float=finite_float, parse_constant=no_constant)
 
 
 class Preferences:
