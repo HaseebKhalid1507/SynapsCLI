@@ -65,3 +65,16 @@ never spawns it. Sidecar binary located via config.executable or
 | clippy | ✅ no NEW warnings from restored tests |
 | ported | 4 Class A tests |
 | skipped | 6 Class B, ~86 Class C (see report) |
+
+## Phase 8b — take auto-merged engine files from ref-merge
+| commit | f2240002..96c2584d (7 commits) |
+|--------|----------|
+| files  | 57 auto-merged engine/src files taken from ref-merge; 16 residual (ours-only, justified) |
+| source | 8bdabd4a |
+| check  | ✅ `cargo check --workspace --all-targets --locked` |
+| engine | ✅ 2096 pass (+64 from JR), 12 ignored, 0 fail (lib only) |
+| core   | ✅ 732 pass |
+| workspace | ✅ no new failures; known: autonomous_plugin (7, fixture), extensions_contract (1, updated), continuous_memory_adversarial (1, recall fixture) |
+| clippy | ✅ `-D warnings` clean (synaps-engine, synaps, synaps-core) |
+| two-sided | ✅ no conflict markers (pre-commit hook active) |
+| docs   | ✅ docs/tools.json regenerated (28 tools), contract.json updated (session.drive) |
