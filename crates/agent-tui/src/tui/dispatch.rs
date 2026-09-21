@@ -349,6 +349,7 @@ pub(crate) async fn handle_input_action(
                 }
                 CommandAction::ReloadPlugins => {
                     synaps_cli::skills::reload_registry(registry, config);
+                    self::sidecar::retain_enabled(app, registry);
                     app.push_msg(ChatMessage::System("plugins reloaded".to_string()));
                 }
                 CommandAction::LoadSkill { skill, arg } => {
@@ -411,15 +412,35 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::PluginCommand { command, arg } => {
-                    if matches!(
-                        command.backend,
-                        synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
-                    ) {
-                        let manager = ext_mgr_shared.read().await;
-                        commands::execute_interactive_plugin_command_events(
-                            &command, &arg, &manager, app,
-                        )
-                        .await;
+                    if let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive {
+                        plugin_extension_id,
+                    } = &command.backend
+                    {
+                        // E-P8: a slash command from a plugin holding the
+                        // `session.drive` permission is the driver front door
+                        // (e.g. `/auto start -- do X`). Route it to the actor
+                        // via `DriverStart` — the actor runs the interactive
+                        // invoke, parses the `session_driver` reply, and arms
+                        // itself. The client owns none of that lifecycle.
+                        let is_driver = {
+                            let manager = ext_mgr_shared.read().await;
+                            manager.has_session_drive(plugin_extension_id)
+                        };
+                        if is_driver {
+                            let _ = link
+                                .send(agent_engine::session::SessionCommand::DriverStart {
+                                    plugin: plugin_extension_id.clone(),
+                                    command: command.name.clone(),
+                                    arg,
+                                })
+                                .await;
+                        } else {
+                            let manager = ext_mgr_shared.read().await;
+                            commands::execute_interactive_plugin_command_events(
+                                &command, &arg, &manager, app,
+                            )
+                            .await;
+                        }
                     } else {
                         commands::execute_command_action(
                             CommandAction::PluginCommand { command, arg },
@@ -1064,162 +1085,19 @@ pub(crate) async fn handle_input_action(
                 }
 
                 CommandAction::SidecarToggle { plugin_id } => {
-                    // Phase 8 8B: target either the
-                    // claim-supplied plugin id, or fall
-                    // back to the legacy single-slot
-                    // discovery for the unclaimed case.
-                    let all = synaps_cli::sidecar::discovery::discover_all();
-                    let target = plugin_id
-                        .clone()
-                        .or_else(|| all.first().map(|s| s.plugin_name.clone()));
-                    let Some(target_pid) = target else {
-                        app.push_msg(ChatMessage::Error(
-                            "sidecar unavailable: no plugin provides a sidecar binary".to_string(),
+                    // G3b: non-blocking path via sidecar::toggle().
+                    // Under socket transport the extension manager is a
+                    // stand-in empty — toggle requires in-process hosting.
+                    if is_socket {
+                        app.push_msg(ChatMessage::System(
+                            "sidecars are managed in-process only for now — see G §Q1".into(),
                         ));
-                        return ControlFlow::Continue(());
-                    };
-
-                    if app.sidecars.contains_key(&target_pid) {
-                        // Subsequent toggle on existing sidecar — arm flag is source of truth.
-                        let label = app
-                            .sidecars
-                            .get(&target_pid)
-                            .and_then(|s| s.display_name.as_deref())
-                            .unwrap_or("sidecar")
-                            .to_string();
-                        let v = match app.sidecars.get_mut(&target_pid) {
-                            Some(v) => v,
-                            None => return ControlFlow::Continue(()),
-                        };
-                        if v.armed {
-                            v.armed = false;
-                            if let Err(err) = v.manager.release().await {
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "{label} release failed: {err}"
-                                )));
-                            }
-                            app.push_msg(ChatMessage::System(format!(
-                                "{label}: stopping — final transcript will be appended"
-                            )));
-                        } else {
-                            v.armed = true;
-                            if let Err(err) = v.manager.press().await {
-                                v.armed = false;
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "{label} press failed: {err}"
-                                )));
-                            }
-                        }
                     } else {
-                        // Spawn new sidecar instance for target_pid.
-                        let Some(discovered) =
-                            all.into_iter().find(|s| s.plugin_name == target_pid)
-                        else {
-                            app.push_msg(ChatMessage::Error(format!(
-                                "sidecar plugin '{}' not discoverable",
-                                target_pid,
-                            )));
-                            return ControlFlow::Continue(());
-                        };
-                        let (sidecar_plugin_info, sidecar_spawn_args) = {
-                            let manager = ext_mgr_shared.read().await;
-                            let info = manager.plugin_info(&target_pid).cloned();
-                            let args = match manager.sidecar_spawn_args(&target_pid).await {
-                                Ok(a) => Some(a),
-                                Err(err) => {
-                                    tracing::debug!(
-                                        plugin = %target_pid,
-                                        error = %err,
-                                        "sidecar.spawn_args RPC unavailable; using manifest defaults",
-                                    );
-                                    None
-                                }
-                            };
-                            (info, args)
-                        };
-                        match self::sidecar::SidecarUiState::spawn_for(
-                            discovered,
-                            sidecar_spawn_args,
-                            sidecar_plugin_info.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(mut state) => {
-                                let claims = registry.lifecycle_claims();
-                                let display = loop_arms::pick_display_name_for_plugin(
-                                    &state.sidecar.plugin_name,
-                                    &claims,
-                                );
-                                state.set_display_name(display);
-                                let label = state
-                                    .display_name
-                                    .clone()
-                                    .unwrap_or_else(|| "sidecar".to_string());
-                                let plugin_key = state.sidecar.plugin_name.clone();
-                                app.sidecars.insert(plugin_key.clone(), state);
-                                app.push_msg(ChatMessage::System(format!(
-                                    "{label} active — press the toggle again to stop"
-                                )));
-                                if let Some(v) = app.sidecars.get_mut(&plugin_key) {
-                                    v.armed = true;
-                                    if let Err(err) = v.manager.press().await {
-                                        v.armed = false;
-                                        v.status =
-                                            self::sidecar::SidecarUiStatus::Error(err.to_string());
-                                        app.push_msg(ChatMessage::Error(format!(
-                                            "{label} press failed: {err}"
-                                        )));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "sidecar unavailable: {err}"
-                                )));
-                            }
-                        }
+                        self::sidecar::toggle(app, plugin_id, registry, ext_mgr_shared).await;
                     }
                 }
-
                 CommandAction::SidecarStatus { plugin_id } => {
-                    // Phase 8 8B: show status for the
-                    // requested plugin, or — when None —
-                    // for the single legacy sidecar (or
-                    // the discovery hint when none have
-                    // been spawned).
-                    let line = if let Some(pid) = plugin_id.as_deref() {
-                        match app.sidecars.get(pid) {
-                                                Some(v) => v.status_line(),
-                                                None => match synaps_cli::sidecar::discovery::discover_all().into_iter().find(|s| s.plugin_name == pid) {
-                                                    Some(s) => format!(
-                                                        "sidecar: not yet started — sidecar available from plugin '{}' at {}",
-                                                        s.plugin_name, s.binary.display()
-                                                    ),
-                                                    None => format!("sidecar: no plugin '{}' provides a sidecar", pid),
-                                                },
-                                            }
-                    } else if app.sidecars.len() == 1 {
-                        // Safe: len() == 1 guarantees .next() is Some
-                        app.sidecars
-                            .values()
-                            .next()
-                            .expect("len == 1")
-                            .status_line()
-                    } else if app.sidecars.is_empty() {
-                        match synaps_cli::sidecar::discovery::discover() {
-                                                Some(s) => format!(
-                                                    "sidecar: not yet started — sidecar available from plugin '{}' at {}",
-                                                    s.plugin_name, s.binary.display()
-                                                ),
-                                                None => "sidecar: no plugin provides a sidecar binary (install a plugin that declares provides.sidecar)".to_string(),
-                                            }
-                    } else {
-                        // Multiple active — list each.
-                        let mut lines: Vec<String> =
-                            app.sidecars.values().map(|v| v.status_line()).collect();
-                        lines.sort();
-                        lines.join("\n")
-                    };
+                    let line = self::sidecar::status(app, plugin_id.as_deref(), registry);
                     app.push_msg(ChatMessage::System(line));
                 }
             }
@@ -1227,7 +1105,14 @@ pub(crate) async fn handle_input_action(
         InputAction::Submit(input) => {
             // Queue input during compaction — the actor queues it (B2) and
             // answers `Steered{delivered:false}` → "queued: …".
+            // Reject attachments during compaction; the actor would ignore them.
             if app.compacting {
+                if !app.pending_attachments.is_empty() {
+                    app.push_msg(ChatMessage::System(
+                        "cannot submit attachments while compacting — /detach or wait".into(),
+                    ));
+                    return ControlFlow::Continue(());
+                }
                 let _ = link
                     .send(agent_engine::session::SessionCommand::Submit {
                         text: input,
@@ -1236,6 +1121,21 @@ pub(crate) async fn handle_input_action(
                     .await;
                 return ControlFlow::Continue(());
             }
+
+            // Ship the attachment blocks but keep the drafts: they are
+            // consumed on `TurnStarted` (stream_handler), so a `Refused`
+            // leaves both the editor text and the attachments in place.
+            let attachment_blocks = if app.pending_attachments.is_empty() {
+                Vec::new()
+            } else {
+                // Display attachment summaries in the transcript.
+                let summaries = app.pending_attachments.summaries();
+                for s in &summaries {
+                    app.push_msg(ChatMessage::System(format!("📎 {s}")));
+                }
+                app.pending_attachments.blocks()
+            };
+
             let display_text = app.user_display_text_for_submission(&input);
             app.push_msg(ChatMessage::User(display_text));
             app.input_before_paste = None;
@@ -1250,7 +1150,7 @@ pub(crate) async fn handle_input_action(
             let _ = link
                 .send(agent_engine::session::SessionCommand::Submit {
                     text: input,
-                    attachments: Vec::new(),
+                    attachments: attachment_blocks,
                 })
                 .await;
         }
@@ -1802,6 +1702,7 @@ pub(crate) async fn handle_input_action(
                     }
                 }
             }
+            self::sidecar::retain_enabled(app, registry);
         }
         InputAction::OpenPluginsMarketplace => {
             let path = synaps_cli::skills::state::PluginsState::default_path();
@@ -1840,4 +1741,61 @@ pub(crate) async fn handle_input_action(
         }
     }
     ControlFlow::Continue(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/sidecar toggle` under Socket mode (is_socket=true) must emit
+    /// the in-process-only notice rather than attempting the spawn.
+    #[tokio::test]
+    async fn sidecar_toggle_socket_mode_emits_notice() {
+        let mut app = App::new(synaps_cli::Session::new("test", "medium", None));
+        let runtime = synaps_cli::Runtime::new().await.unwrap();
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(
+            crate::tui::testing::scripted::ScriptedTransport::new(runtime),
+        ));
+        let http = super::super::run_setup::LazyHttp::new();
+        let mut config = synaps_cli::SynapsConfig::default();
+        let registry =
+            std::sync::Arc::new(synaps_cli::skills::registry::CommandRegistry::new_with_plugins(
+                &[],
+                vec![],
+                vec![],
+            ));
+        let keybind_registry = std::sync::Arc::new(std::sync::RwLock::new(
+            synaps_cli::skills::keybinds::KeybindRegistry::new(),
+        ));
+        let system_prompt_path = std::path::PathBuf::from("/tmp/sp");
+        let render_handle = render_thread::RenderHandle::headless();
+        let mut event_reader: Option<crossterm::event::EventStream> = None;
+        let mut exit_fx_sent = false;
+
+        let state = LoopState {
+            app: &mut app,
+            link: &mut link,
+            http: &http,
+            config: &mut config,
+            registry: &registry,
+            keybind_registry: &keybind_registry,
+            system_prompt_path: &system_prompt_path,
+            render_handle: &render_handle,
+            event_reader: &mut event_reader,
+            ext_mgr_shared: None, // Socket mode
+            exit_fx_sent: &mut exit_fx_sent,
+            is_socket: true,
+        };
+
+        let action = InputAction::SlashCommand("sidecar".into(), "toggle".into());
+        handle_input_action(action, state).await;
+
+        let found = app.transcript.messages().iter().any(|m| {
+            matches!(
+                &m.msg,
+                ChatMessage::System(s) if s.contains("sidecars are managed in-process only")
+            )
+        });
+        assert!(found, "expected in-process-only notice under Socket mode");
+    }
 }

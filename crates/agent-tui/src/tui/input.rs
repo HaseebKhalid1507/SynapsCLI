@@ -348,9 +348,16 @@ fn handle_key(
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // E-P8: Ctrl-C while the driver is armed → stop automation
+            // (actor revokes on `Cancel`), not quit. Cancellation of the
+            // grant outranks the quit binding while armed.
+            if app.driver_ui.is_armed() {
+                return InputAction::Abort;
+            }
             return InputAction::Quit;
         }
-        (KeyCode::Esc, _) if streaming => {
+        // E-P8: Esc while armed (even when NOT streaming) → stop automation.
+        (KeyCode::Esc, _) if streaming || app.driver_ui.is_armed() => {
             return InputAction::Abort;
         }
         (KeyCode::Enter, KeyModifiers::SHIFT) if !streaming => {
@@ -364,6 +371,10 @@ fn handle_key(
         }
         (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
             return process_submit(app, registry);
+        }
+        // Enter with empty buffer but staged attachments → attachment-only submit.
+        (KeyCode::Enter, _) if !streaming && app.input_is_empty() && !app.pending_attachments.is_empty() => {
+            return process_submit_attachment_only(app);
         }
         (KeyCode::Enter, _) if streaming && !app.input_is_empty() => {
             return process_streaming_submit(app);
@@ -459,7 +470,7 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
-        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+        let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
         let raw_cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
         let commands = super::commands::all_commands_with_skills(registry);
@@ -468,6 +479,15 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     } else {
         InputAction::Submit(input)
     }
+}
+
+/// User pressed Enter with empty input but staged attachments.
+fn process_submit_attachment_only(app: &mut App) -> InputAction {
+    if app.transcript.is_empty() {
+        app.logo_dismiss_t = Some(0.001);
+    }
+    app.transcript.scroll_to_bottom();
+    InputAction::Submit(String::new())
 }
 
 /// User pressed Enter with non-empty input while streaming.
@@ -1212,6 +1232,39 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert!(app.input_is_empty());
         assert_eq!(app.cursor_char_pos(), 0);
+    }
+
+    /// E-P8 T2: Ctrl-C while the driver is armed → Abort (→ Cancel), NOT Quit.
+    #[test]
+    fn ctrl_c_while_driver_armed_aborts_not_quits() {
+        let mut app = make_app();
+        // Not armed → Ctrl-C quits.
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputAction::Quit
+        ));
+        app.driver_ui.armed = true;
+        // Armed → Ctrl-C stops the driver (Abort → SessionCommand::Cancel).
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputAction::Abort
+        ));
+    }
+
+    /// E-P8 T2: Esc while armed (even when NOT streaming) → Abort (→ Cancel).
+    #[test]
+    fn esc_while_driver_armed_aborts_even_when_idle() {
+        let mut app = make_app();
+        // Not armed, not streaming → Esc is a no-op.
+        assert!(matches!(
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        app.driver_ui.armed = true;
+        assert!(matches!(
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            InputAction::Abort
+        ));
     }
 
     /// Backspace / word-delete route through the editor.

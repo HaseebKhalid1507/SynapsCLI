@@ -28,7 +28,7 @@ use synaps_cli::core::config::load_config;
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 use synaps_cli::{
     core::rpc_dispatch::{
-        accumulate_usage, build_tools_list_body, build_user_content, map_stream_event, parse_frame,
+        accumulate_usage, build_tools_list_body, map_stream_event, parse_frame,
         MAX_FRAME_BYTES,
     },
     core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
@@ -571,6 +571,46 @@ async fn spawn_prompt(
 
 // ─── Per-command handlers ─────────────────────────────────────────────────────
 
+/// Validate RPC attachment paths: must be absolute, no `..` components.
+fn rpc_attachment_paths(attachments: &[RpcAttachment]) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = Vec::with_capacity(attachments.len());
+    for a in attachments {
+        let path = std::path::PathBuf::from(&a.path);
+        if !path.is_absolute() {
+            return Err(format!("attachment path must be absolute: {}", a.path));
+        }
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(format!("attachment path must not contain ..: {}", a.path));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Load RPC user content: validate paths, load files, build content blocks,
+/// validate against the session model. Returns the content Value for the
+/// user message.
+async fn load_rpc_user_content(
+    message: &str,
+    attachments: &[RpcAttachment],
+    model: &str,
+    existing_messages: &[std::sync::Arc<serde_json::Value>],
+) -> Result<(serde_json::Value, usize), String> {
+    let paths = rpc_attachment_paths(attachments)?;
+    if paths.is_empty() {
+        return Ok((serde_json::Value::String(message.to_string()), 0));
+    }
+    let content = agent_engine::attachments::build_user_content(message, &paths).await?;
+    let count = paths.len();
+    // Validate the complete history with the proposed message.
+    let candidate = std::sync::Arc::new(serde_json::json!({"role": "user", "content": content}));
+    let mut proposed = existing_messages.to_vec();
+    proposed.push(candidate);
+    agent_engine::runtime::attachments::validate_messages(model, &proposed)?;
+    // Return the content (not the full message) — caller wraps it.
+    Ok((content, count))
+}
+
 /// Handle a `Prompt` or `FollowUp` command (same engine path, no attachments on FollowUp).
 async fn handle_prompt(
     id: String,
@@ -595,8 +635,57 @@ async fn handle_prompt(
         }
     }
 
+    // Load and validate attachments (before acquiring the state lock for push).
+    let (content, attachment_count) = if attachments.is_empty() {
+        (serde_json::Value::String(message.clone()), 0)
+    } else {
+        let (model, msgs) = {
+            let st = state.lock().await;
+            (st.runtime.model().to_string(), st.api_messages.clone())
+        };
+        match load_rpc_user_content(&message, &attachments, &model, &msgs).await {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = writer_tx
+                    .send(RpcEvent::Error {
+                        id: Some(id),
+                        message: e,
+                    })
+                    .await;
+                return;
+            }
+        }
+    };
+
+    // Session-busy recheck after the async load.
+    {
+        let st = state.lock().await;
+        if st.is_busy() {
+            let _ = writer_tx
+                .send(RpcEvent::Error {
+                    id: Some(id),
+                    message: "session became busy during attachment load".to_string(),
+                })
+                .await;
+            return;
+        }
+    }
+
+    // Emit attachment disclosure before pushing.
+    if attachment_count > 0 {
+        let _ = writer_tx
+            .send(RpcEvent::Response {
+                id: id.clone(),
+                command: "attachments.disclosure".to_string(),
+                body: serde_json::json!({
+                    "count": attachment_count,
+                    "message": format!("{attachment_count} attachment(s) loaded from local filesystem"),
+                }),
+            })
+            .await;
+    }
+
     // Push user message and reset the auto-turn counter (real user input).
-    let content = build_user_content(&message, &attachments);
     {
         let mut st = state.lock().await;
         st.consecutive_auto_turns = 0;
@@ -1461,5 +1550,87 @@ mod context_head_tests {
         let state = Arc::new(state);
         handle_compact("compact-test".into(), state, writer).await;
         assert!(matches!(frames.recv().await, Some(RpcEvent::Error { .. })));
+    }
+}
+
+#[cfg(test)]
+mod rpc_attachment_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_attachment_paths_validates_absolute_and_no_parent() {
+        // Absolute path without .. → ok
+        let good = vec![RpcAttachment {
+            path: "/tmp/image.png".into(),
+            name: None,
+            mime: None,
+        }];
+        assert!(rpc_attachment_paths(&good).is_ok());
+
+        // Relative path → error
+        let relative = vec![RpcAttachment {
+            path: "relative/image.png".into(),
+            name: None,
+            mime: None,
+        }];
+        assert!(rpc_attachment_paths(&relative).is_err());
+
+        // Path with .. → error
+        let dotdot = vec![RpcAttachment {
+            path: "/tmp/../etc/passwd".into(),
+            name: None,
+            mime: None,
+        }];
+        assert!(rpc_attachment_paths(&dotdot).is_err());
+
+        // Empty → ok
+        assert!(rpc_attachment_paths(&[]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_rpc_user_content_text_only() {
+        let (content, count) =
+            load_rpc_user_content("hello", &[], "claude-sonnet-4-20250514", &[])
+                .await
+                .unwrap();
+        assert_eq!(content, "hello");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_rpc_user_content_missing_file_fails() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/nonexistent_rpc_test_file.png".into(),
+            name: None,
+            mime: None,
+        }];
+        let result =
+            load_rpc_user_content("hello", &attachments, "claude-sonnet-4-20250514", &[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_rpc_user_content_real_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "file body").unwrap();
+        let attachments = vec![RpcAttachment {
+            path: path.to_str().unwrap().into(),
+            name: None,
+            mime: None,
+        }];
+        let (content, count) = load_rpc_user_content(
+            "explain",
+            &attachments,
+            "claude-sonnet-4-20250514",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        // Content should be an array with text block + document block.
+        let arr = content.as_array().unwrap();
+        assert_eq!(arr[0]["text"], "explain");
+        assert_eq!(arr[1]["type"], "document");
     }
 }

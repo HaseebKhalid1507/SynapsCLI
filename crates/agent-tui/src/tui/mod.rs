@@ -9,6 +9,7 @@ mod clock;
 mod commands;
 mod dispatch;
 mod draw;
+mod driver_client;
 mod effort;
 mod focus;
 mod gamba;
@@ -245,29 +246,18 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
-            sidecar_event = async {
-                if app.sidecars.is_empty() {
-                    let _: () = std::future::pending().await;
-                    unreachable!()
-                } else {
-                    // Collect (plugin_id, &mut manager) and race them.
-                    let mut futures = Vec::with_capacity(app.sidecars.len());
-                    for (pid, v) in app.sidecars.iter_mut() {
-                        let pid = pid.clone();
-                        futures.push(Box::pin(async move {
-                            let ev = v.manager.next_event().await;
-                            (pid, ev)
-                        }));
-                    }
-                    let ((pid, ev), _, _) = futures::future::select_all(futures).await;
-                    (pid, ev)
-                }
-            } => {
-                let (pid, sidecar_event) = sidecar_event;
-                if let Some(event) = sidecar_event {
-                    self::sidecar::handle_event(&mut app, &pid, event);
-                    app.request_redraw();
-                }
+            sidecar_event = self::sidecar::next_event(&mut app.sidecars) => {
+                let (pid, event) = sidecar_event;
+                self::sidecar::handle_event(&mut app, &pid, event);
+                app.request_redraw();
+            }
+
+            // ── Sidecar non-blocking startup completion (G3, in-process only) ──
+            // Socket path: the TUI does not own a SidecarManager (G Q1);
+            // sidecar_starts is always empty under Socket, so this arm pends.
+            (pid, result) = self::sidecar::next_startup(&mut app.sidecar_starts) => {
+                self::sidecar::finish_startup(&mut app, &registry, pid, result);
+                app.request_redraw();
             }
 
             // ── Secret-prompt answers from the pane (PromptBridge) → Answer ──

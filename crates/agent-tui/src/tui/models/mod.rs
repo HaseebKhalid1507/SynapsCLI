@@ -1985,7 +1985,7 @@ mod tests {
                 "openai-codex/gpt-5.3-codex-spark",
             ]
         );
-        assert!(!codex_ids.iter().any(|id| *id == "openai-codex/o3"));
+        assert!(!codex_ids.contains(&"openai-codex/o3"));
 
         let anthropic = sections
             .iter()

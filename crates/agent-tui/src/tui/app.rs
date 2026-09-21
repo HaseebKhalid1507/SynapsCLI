@@ -169,6 +169,10 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// Transient status text shown in the header bar (auto-cleared when streaming starts)
     pub(crate) status_text: Option<String>,
+    /// (E-P8) Thin session-driver client state: "driver armed" mirror, set
+    /// purely from `DriverArmed`/`DriverRevoked` wire events. Gates Esc/Ctrl-C
+    /// routing and the status toast. The actor owns all driver lifecycle.
+    pub(crate) driver_ui: super::driver_client::DriverUiState,
     /// GamblersDen child process — spawned by /gamba, killed when streaming finishes
     pub(crate) gamba_child: Option<std::process::Child>,
     /// Active settings modal state (Some while /settings is open).
@@ -218,6 +222,9 @@ pub(crate) struct App {
     /// The last Submit text until `TurnStarted`/`Refused` (§6 #9: a refused
     /// Submit gives the editor its text back).
     pub(crate) last_submitted: Option<String>,
+    /// Client-local staging buffer for multimodal attachments captured by
+    /// `/attach`. Bytes live here until Submit ships them as content blocks.
+    pub(crate) pending_attachments: agent_engine::attachments::PendingAttachments,
     /// Consecutive auto-triggered model turns since the last real user send.
     /// Incremented by the event-reactor wake path; reset on Submit / queued user message.
     /// When this reaches `auto_turn_cap` the reactor parks and shows a system message.
@@ -263,6 +270,11 @@ pub(crate) struct App {
     /// Phase 8 8B: replaces the legacy single `Option<SidecarUiState>` so
     /// multiple plugin-claimed sidecars can be hosted concurrently.
     pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
+    /// Non-blocking sidecar startups in flight. Polled by `sidecar::next_startup()`
+    /// in the event loop (in-process path only; G Q1).
+    pub(crate) sidecar_starts: std::collections::HashMap<String, super::sidecar::SidecarStartup>,
+    /// True when `--no-extensions` was passed — sidecars are fully disabled.
+    pub(crate) sidecars_disabled: bool,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     /// Stored behind `Arc` so the per-frame snapshot is a refcount bump, not a deep clone.
     pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
@@ -322,6 +334,11 @@ pub(crate) struct App {
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
+
+    /// Snapshot of `(transcript.messages().len(), last_msg)` captured on
+    /// `ResponseStart`. `ResponseReset` rolls the transcript preview back
+    /// to this position — pure render state, no actor interaction.
+    pub(crate) response_preview: Option<(usize, Option<ChatMessage>)>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -404,6 +421,7 @@ impl App {
             pasted_char_count: 0,
             spinner_frame: 0,
             status_text: None,
+            driver_ui: super::driver_client::DriverUiState::default(),
             gamba_child: None,
             settings: None,
             plugins: None,
@@ -423,6 +441,7 @@ impl App {
             compaction_applied: None,
             resume_pending: None,
             last_submitted: None,
+            pending_attachments: Default::default(),
             consecutive_auto_turns: 0,
             model_health: std::collections::HashMap::new(),
             catalog_overrides: std::collections::BTreeMap::new(),
@@ -434,6 +453,8 @@ impl App {
             model_list_rx: model_list_rx_init,
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
+            sidecar_starts: std::collections::HashMap::new(),
+            sidecars_disabled: false,
             active_tasks: std::sync::Arc::new(
                 synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             ),
@@ -449,6 +470,7 @@ impl App {
             myx_last_live: None,
             theme_transition: None,
             keybinds: None,
+            response_preview: None,
             clock,
         }
     }

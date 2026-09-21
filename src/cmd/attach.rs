@@ -144,6 +144,13 @@ impl Client {
             SessionEventWire::Lifecycle(l) => self.out(&format!("[session {l:?}]\n")),
             SessionEventWire::Reloading { generation, .. } => self.out(&format!("[daemon reloading → generation {generation}]\n")),
             SessionEventWire::SubagentRows(_) | SessionEventWire::Resumed { .. } => {}
+            // E-P0: stub rendering; P9 replaces.
+            SessionEventWire::DriverArmed { plugin_id, .. } => self.out(&format!("[driver armed: {plugin_id}]\n")),
+            SessionEventWire::DriverRevoked { reason, .. } => self.out(&format!("[driver revoked: {reason}]\n")),
+            SessionEventWire::DriverTurnOutcome { .. } => {}
+            SessionEventWire::CostCapReached { scope, cost, cap } => self.out(&format!(
+                "[{scope} cost cap reached: ${cost:.4} ≥ ${cap:.4} — turn cancelled, driver revoked]\n"
+            )),
         }
     }
 
@@ -186,7 +193,20 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG] /keep-warm on|off\n"),
+            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /keep-warm on|off\n"),
+            // C1 (P9): arm a driver headlessly. Mirrors the TUI's `/auto` →
+            // `DriverStart` routing (dispatch.rs) but without an in-process
+            // ExtensionManager: the actor validates `session.drive` on
+            // `DriverStart` and refuses if the plugin lacks the permission
+            // (see `driver_start_without_permission_refused`). The client is
+            // a dumb pipe — it never owns driver lifecycle or perm checks.
+            _ if line == "/auto" || line.starts_with("/auto ") => {
+                let (plugin, command, arg) = parse_auto_command(line);
+                let _ = self
+                    .t
+                    .send(SessionCommand::DriverStart { plugin, command, arg })
+                    .await;
+            }
             "/keep-warm on" | "/keep-warm off" => {
                 let _ = self.t.send(SessionCommand::KeepWarm { on: line.ends_with("on") }).await;
             }
@@ -217,6 +237,15 @@ impl Client {
         }
         true
     }
+}
+
+/// C1 (P9): parse an `/auto [ARGS]` line into a `DriverStart` triple. The
+/// headless attach client has no in-process ExtensionManager, so it targets
+/// the `autonomous` plugin's `auto` command directly and forwards the rest
+/// verbatim as `arg`; the actor gates on `session.drive` and parses the args.
+fn parse_auto_command(line: &str) -> (String, String, String) {
+    let arg = line.strip_prefix("/auto").unwrap_or("").trim().to_string();
+    ("autonomous".to_string(), "auto".to_string(), arg)
 }
 
 fn set_echo(on: bool) {
@@ -465,6 +494,20 @@ mod tests {
         let a = Cli::parse_from(["attach", "--create", "--name", "ambient"]).args;
         assert!(a.create);
         assert_eq!(a.name.as_deref(), Some("ambient"));
+    }
+
+    #[test]
+    fn auto_line_parses_to_driver_start_triple() {
+        // C1 (P9): `/auto ARGS` → DriverStart{autonomous, auto, ARGS}.
+        let (p, c, a) = parse_auto_command("/auto start -- do the thing");
+        assert_eq!(p, "autonomous");
+        assert_eq!(c, "auto");
+        assert_eq!(a, "start -- do the thing");
+        // bare `/auto` yields an empty arg (actor supplies defaults).
+        let (_, _, a) = parse_auto_command("/auto");
+        assert_eq!(a, "");
+        let (_, _, a) = parse_auto_command("/auto   ");
+        assert_eq!(a, "");
     }
 }
 

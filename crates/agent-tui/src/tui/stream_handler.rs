@@ -188,8 +188,23 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             );
             // History repair is the actor's (mirrored by `Conversation`).
         }
-        // merge(112): handled in phase 3 (stream.rs) / phase 9 (Wall 1)
-        StreamEvent::Llm(LlmEvent::ResponseStart | LlmEvent::ResponseReset) => {}
+        // ResponseStart: snapshot the transcript position for rollback on reset.
+        StreamEvent::Llm(LlmEvent::ResponseStart) => {
+            app.drop_empty_thinking();
+            app.response_preview = Some((
+                app.transcript.messages().len(),
+                app.transcript.messages().last().map(|m| m.msg.clone()),
+            ));
+        }
+        // ResponseReset: roll the in-flight response preview back to the
+        // ResponseStart snapshot. Orphaned resets (no prior start) are
+        // silently ignored (G Q2).
+        StreamEvent::Llm(LlmEvent::ResponseReset) => {
+            if let Some((start, last)) = app.response_preview.take() {
+                app.transcript.reset_response_preview(start, last);
+                app.invalidate();
+            }
+        }
         StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
     }
 }
@@ -322,6 +337,9 @@ pub(super) async fn handle_session_event_arm(
                 // streaming=true, spinner, frame) already happened in the
                 // dispatch arm; this is the tail after the stream opened.
                 app.last_submitted = None;
+                // The turn was accepted: the attachment drafts it carried are
+                // consumed now (a `Refused` would have left them for a retry).
+                app.pending_attachments.clear();
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.status_text = None;
@@ -348,7 +366,7 @@ pub(super) async fn handle_session_event_arm(
                 app.status_text = None;
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
             }
-            TurnTrigger::EventAuto | TurnTrigger::Compaction => {
+            TurnTrigger::EventAuto | TurnTrigger::Compaction | TurnTrigger::DriverAuto => {
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.spinner_frame = 0;
@@ -564,6 +582,39 @@ pub(super) async fn handle_session_event_arm(
                 .titled("Daemon")
                 .ttl(None),
             );
+            app.request_redraw();
+        }
+        // E-P8: driver wire events → thin client render (react, never compute).
+        SessionEventWire::DriverArmed {
+            plugin_id,
+            run_id,
+            models,
+            selection,
+            deadline_ms,
+            notice,
+        } => {
+            super::driver_client::on_armed(
+                app, plugin_id, run_id, models, selection, deadline_ms, notice,
+            );
+        }
+        SessionEventWire::DriverRevoked {
+            reason,
+            undelivered_steering,
+        } => {
+            super::driver_client::on_revoked(app, reason, undelivered_steering);
+        }
+        SessionEventWire::DriverTurnOutcome {
+            outcome,
+            selection,
+            feedback,
+        } => {
+            super::driver_client::on_turn_outcome(app, outcome, selection, feedback);
+        }
+        // E-P7: spend ceiling breached — surface it loudly.
+        SessionEventWire::CostCapReached { scope, cost, cap } => {
+            app.push_msg(ChatMessage::Error(format!(
+                "{scope} cost cap reached (${cost:.4} ≥ ${cap:.4}) — turn cancelled, driver revoked"
+            )));
             app.request_redraw();
         }
     }

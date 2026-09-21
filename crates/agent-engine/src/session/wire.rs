@@ -30,9 +30,11 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 
 /// Separate from `RPC_PROTOCOL_VERSION`; bump on any non-additive change.
 /// v2 (phase 3): `Set` became a struct variant, `Bye` gained a reason.
+/// v3 (E-P0): driver events (`DriverArmed`, `DriverRevoked`,
+/// `DriverTurnOutcome`); old clients skip unknown via `#[serde(other)]`.
 /// Protocol stays exact-match; only *binary* versions compare directionally
 /// (reload, §2.8).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
 pub const PROTOCOL_MAX: u32 = PROTOCOL_VERSION;
@@ -486,6 +488,36 @@ pub enum WireSessionEvent {
     AttachRefused { message: String },
     Lifecycle { lifecycle: SessionLifecycle },
     Reloading { generation: u64, retry_after_ms: u64 },
+    /// (E-P0) Driver armed.
+    DriverArmed {
+        plugin_id: String,
+        run_id: String,
+        models: Vec<crate::extensions::session_driver::Selection>,
+        selection: crate::extensions::session_driver::Selection,
+        #[serde(default)]
+        deadline_ms: Option<u64>,
+        #[serde(default)]
+        notice: String,
+    },
+    /// (E-P0) Driver revoked.
+    DriverRevoked {
+        reason: String,
+        #[serde(default)]
+        undelivered_steering: Vec<String>,
+    },
+    /// (E-P0) Driver turn outcome.
+    DriverTurnOutcome {
+        outcome: crate::extensions::session_driver::Outcome,
+        selection: crate::extensions::session_driver::Selection,
+        #[serde(default)]
+        feedback: Option<String>,
+    },
+    /// (E-P7) Spend ceiling breached; turn cancelled and driver revoked.
+    CostCapReached {
+        scope: String,
+        cost: f64,
+        cap: f64,
+    },
     /// Forward-compat: an additive variant from a newer daemon.
     #[serde(other)]
     Unknown,
@@ -754,6 +786,18 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::AttachRefused { message } => Self::AttachRefused { message },
             S::Lifecycle(lifecycle) => Self::Lifecycle { lifecycle },
             S::Reloading { generation, retry_after_ms } => Self::Reloading { generation, retry_after_ms },
+            S::DriverArmed { plugin_id, run_id, models, selection, deadline_ms, notice } => {
+                Self::DriverArmed { plugin_id, run_id, models, selection, deadline_ms, notice }
+            }
+            S::DriverRevoked { reason, undelivered_steering } => {
+                Self::DriverRevoked { reason, undelivered_steering }
+            }
+            S::DriverTurnOutcome { outcome, selection, feedback } => {
+                Self::DriverTurnOutcome { outcome, selection, feedback }
+            }
+            S::CostCapReached { scope, cost, cap } => {
+                Self::CostCapReached { scope, cost, cap }
+            }
         }
     }
 }
@@ -807,6 +851,18 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::AttachRefused { message } => Self::AttachRefused { message },
             W::Lifecycle { lifecycle } => Self::Lifecycle(lifecycle),
             W::Reloading { generation, retry_after_ms } => Self::Reloading { generation, retry_after_ms },
+            W::DriverArmed { plugin_id, run_id, models, selection, deadline_ms, notice } => {
+                Self::DriverArmed { plugin_id, run_id, models, selection, deadline_ms, notice }
+            }
+            W::DriverRevoked { reason, undelivered_steering } => {
+                Self::DriverRevoked { reason, undelivered_steering }
+            }
+            W::DriverTurnOutcome { outcome, selection, feedback } => {
+                Self::DriverTurnOutcome { outcome, selection, feedback }
+            }
+            W::CostCapReached { scope, cost, cap } => {
+                Self::CostCapReached { scope, cost, cap }
+            }
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }
     }
@@ -945,6 +1001,7 @@ mod tests {
         v.extend([
             S::TurnStarted { turn_baseline: 4, trigger: TurnTrigger::EventAuto, user_text: None },
             S::TurnStarted { turn_baseline: 5, trigger: TurnTrigger::QueuedAuto, user_text: Some("q".into()) },
+            S::TurnStarted { turn_baseline: 6, trigger: TurnTrigger::DriverAuto, user_text: None },
             S::Conversation(conv()),
             S::Prompt(prompt()),
             S::PromptResolved { prompt_id: 3 },
@@ -1008,6 +1065,23 @@ mod tests {
             S::AttachRefused { message: "parked".into() },
             S::Lifecycle(SessionLifecycle::Parked),
             S::Reloading { generation: 2, retry_after_ms: 500 },
+            S::DriverArmed {
+                plugin_id: "autonomous".into(),
+                run_id: "run-1".into(),
+                models: vec![
+                    crate::extensions::session_driver::Selection { model: "m1".into(), effort: "high".into() },
+                    crate::extensions::session_driver::Selection { model: "m2".into(), effort: "low".into() },
+                ],
+                selection: crate::extensions::session_driver::Selection { model: "m1".into(), effort: "high".into() },
+                deadline_ms: Some(60_000),
+                notice: "armed".into(),
+            },
+            S::DriverRevoked { reason: "canceled".into(), undelivered_steering: vec!["steer1".into()] },
+            S::DriverTurnOutcome {
+                outcome: crate::extensions::session_driver::Outcome::Success,
+                selection: crate::extensions::session_driver::Selection { model: "m1".into(), effort: "high".into() },
+                feedback: Some("changed".into()),
+            },
         ]);
         v
     }
@@ -1015,8 +1089,8 @@ mod tests {
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // Every non-Stream SessionEventWire variant (31; TurnStarted twice = 32) + every StreamEvent leaf (18).
-        assert_eq!(all.len(), 32 + 18);
+        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 18 StreamEvent leaves.
+        assert_eq!(all.len(), 36 + 18);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
@@ -1089,6 +1163,59 @@ mod tests {
     }
 
     #[test]
+    fn driver_armed_round_trips_and_old_client_skips() {
+        // A v3 daemon emits DriverArmed; a v2 client decodes it as Unknown.
+        let armed = WireSessionEvent::DriverArmed {
+            plugin_id: "autonomous".into(),
+            run_id: "run-42".into(),
+            models: vec![
+                crate::extensions::session_driver::Selection { model: "m1".into(), effort: "high".into() },
+            ],
+            selection: crate::extensions::session_driver::Selection { model: "m1".into(), effort: "high".into() },
+            deadline_ms: Some(120_000),
+            notice: "armed and ready".into(),
+        };
+        let json = serde_json::to_string(&armed).unwrap();
+        // v3 client: exact round-trip.
+        let back: WireSessionEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(&back, WireSessionEvent::DriverArmed { plugin_id, .. } if plugin_id == "autonomous"));
+        // Simulated v2 client: rename tag so it hits Unknown.
+        let old_json = json.replace(r#""ev":"driver_armed""#, r#""ev":"v2_unknown_event""#);
+        let old: WireSessionEvent = serde_json::from_str(&old_json).unwrap();
+        assert!(matches!(old, WireSessionEvent::Unknown));
+    }
+
+    #[test]
+    fn driver_revoked_and_outcome_round_trip() {
+        let revoked = WireSessionEvent::DriverRevoked {
+            reason: "canceled".into(),
+            undelivered_steering: vec!["steer1".into(), "steer2".into()],
+        };
+        let json = serde_json::to_string(&revoked).unwrap();
+        let back: WireSessionEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(&back, WireSessionEvent::DriverRevoked { reason, undelivered_steering }
+            if reason == "canceled" && undelivered_steering.len() == 2));
+
+        let outcome = WireSessionEvent::DriverTurnOutcome {
+            outcome: crate::extensions::session_driver::Outcome::Success,
+            selection: crate::extensions::session_driver::Selection { model: "m".into(), effort: "high".into() },
+            feedback: Some("changed".into()),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: WireSessionEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(&back, WireSessionEvent::DriverTurnOutcome { feedback: Some(f), .. } if f == "changed"));
+    }
+
+    #[test]
+    fn driver_revoked_defaults_tolerate_missing_fields() {
+        // Old daemon or minimal frame: undelivered_steering missing → empty vec.
+        let minimal = r#"{"ev":"driver_revoked","reason":"timeout"}"#;
+        let v: WireSessionEvent = serde_json::from_str(minimal).unwrap();
+        assert!(matches!(&v, WireSessionEvent::DriverRevoked { reason, undelivered_steering }
+            if reason == "timeout" && undelivered_steering.is_empty()));
+    }
+
+    #[test]
     fn client_frames_roundtrip_and_daemon_frames_roundtrip() {
         let frames = vec![
             ClientFrame::Hello(Hello::new(ClientKind::Attach)),
@@ -1105,6 +1232,9 @@ mod tests {
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Set { id: 6, setting: SessionSetting::ReloadPrompt } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Checkpoint { reason: CheckpointReason::Reload } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::KeepWarm { on: true } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::DriverStart {
+                plugin: "autonomous".into(), command: "auto".into(), arg: "start -- do stuff".into(),
+            }},
             ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
             ClientFrame::Purge,
             ClientFrame::Bye,
@@ -1116,7 +1246,7 @@ mod tests {
         }
         let frames = vec![
             DaemonFrame::Welcome(Welcome {
-                protocol_version: 2,
+                protocol_version: PROTOCOL_VERSION,
                 daemon_version: "0.9.0".into(),
                 pid: 1,
                 profile: None,
@@ -1162,7 +1292,7 @@ mod tests {
         assert_eq!(PROTOCOL_MIN, PROTOCOL_MAX);
         let json = serde_json::to_string(&ClientFrame::Hello(h)).unwrap();
         assert!(json.starts_with(r#"{"type":"hello""#));
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
         // v1 frames (no `reconnect_of`, bare `bye`) still parse — the refusal is by version, not by shape.
         let h: Hello = serde_json::from_str(
             r#"{"protocol_version":1,"client":{"kind":"tui","terminal":null,"instance":"i"},"cwd":"/","client_version":"0"}"#,

@@ -703,6 +703,140 @@ async fn pending_prompt_survives_detach_and_replays_on_attach() {
     end(&mut b).await;
 }
 
+/// P11: a pending prompt on a NON-driver session survives the last-client
+/// detach (the reattach-to-answer contract) AND a fast re-attach cancels the
+/// abandonment deadline — the prompt is NOT auto-denied while a client is back,
+/// so the user answers it normally even past the original deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_prompt_reattach_cancels_abandon_deadline() {
+    let _h = Home::new();
+    // Tiny 1 s deadline so the test is fast; re-attach well within it.
+    std::env::set_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS", "1");
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+
+    // Detach the only client → the abandonment deadline arms (1 s).
+    a.send(SessionCommand::Detach { client: a.client_id() })
+        .await
+        .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::ClientLeft { .. })).await;
+    drop(a);
+
+    // Re-attach quickly (< 1 s): the prompt survived detach and the re-attach
+    // cancels the deadline.
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
+    assert_eq!(
+        snap.pending_prompts.len(),
+        1,
+        "prompt must survive detach on a non-driver session"
+    );
+    assert_eq!(snap.pending_prompts[0].id, pid);
+
+    // Wait PAST the original 1 s deadline while attached: the prompt must NOT be
+    // auto-denied — the deadline was cancelled by the re-attach.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(handle.is_alive(), "session stays live with the prompt pending");
+
+    // Answer succeeds → the tool sees the real value (`answered:6`), proving the
+    // prompt was never fail-closed to `None`.
+    b.send(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("s3cret".into()),
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::PromptResolved { prompt_id } if prompt_id == pid
+    )));
+    assert_eq!(tool_results(&last_conversation(&seen)), vec!["answered:6".to_string()]);
+    end(&mut b).await;
+    std::env::remove_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS");
+}
+
+/// P11: when NObody re-attaches before the abandonment deadline, the pending
+/// prompt is fail-closed (`None` / denied) so `can_park()` unblocks and the
+/// session parks normally — bounding the abandoned-prompt resource pin without
+/// punishing a transient detach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_prompt_denied_and_parks_after_abandon_deadline() {
+    let _h = Home::new();
+    // 1 s abandonment deadline, and park immediately once the turn drains.
+    std::env::set_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS", "1");
+    std::env::set_var("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host
+        .create_session(SessionConfig { persist: true, ..cfg() })
+        .await
+        .unwrap();
+
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+
+    // Detach the only client and stay gone → the deadline (1 s) expires with
+    // zero clients → the prompt is denied (`None`) → the tool returns
+    // "cancelled" → the turn drains → `can_park()` becomes true → the session
+    // parks (grace 0).
+    a.send(SessionCommand::Detach { client: a.client_id() })
+        .await
+        .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::ClientLeft { .. })).await;
+    drop(a);
+
+    // Deadline (1 s) + turn drain + park grace (0). Poll up to a few seconds.
+    let parked = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if matches!(
+                handle.lifecycle(),
+                agent_engine::session::SessionLifecycle::Parked
+            ) {
+                break true;
+            }
+            if !handle.is_alive() {
+                break false; // Ended is also acceptable (still unpinned)
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("session must unpin (park/end) after the abandonment deadline");
+    assert!(parked, "abandoned prompt did not unblock parking");
+
+    // Re-attach: the prompt is gone (denied), not stuck pending.
+    let (mut c, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    assert!(
+        snap.pending_prompts.is_empty(),
+        "abandoned prompt was not denied at the deadline: {:?}",
+        snap.pending_prompts
+    );
+    end(&mut c).await;
+    handle.closed().await;
+    std::env::remove_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS");
+    std::env::remove_var("SYNAPS_DAEMON_PARK_GRACE_SECS");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn answer_dedup_on_prompt_id() {
@@ -1167,5 +1301,90 @@ async fn zero_turn_session_ends_idle_at_park_deadline_while_one_turn_parks() {
         .unwrap();
     assert!(snap.conversation.api_messages.len() >= 2, "history survived park");
     end(&mut c).await;
+    handle.closed().await;
+}
+
+/// Track F: attachments ride `Submit` as content blocks. A model that cannot
+/// take images gets a typed `Refused` addressed to the submitter (so the TUI
+/// restores the editor and keeps the drafts) and history is untouched; a
+/// model that can takes the turn with the blocks in the user message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model() {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=";
+    let image = serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}});
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    // (a) text-only model → Refused to the submitter, history unchanged.
+    let handle = host
+        .create_session(SessionConfig {
+            model_override: Some("openai-codex/gpt-5.3-codex-spark".into()),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut a, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let before = snap.conversation.api_messages.len();
+    // Client-addressed (what the TUI does) — a host-originated `send` has
+    // no client to refuse to and gets a `SystemNotice` instead.
+    a.send_from_self(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()] })
+        .await
+        .unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    let refused = seen
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEventWire::Refused { client, command, reason } => Some((*client, command.clone(), reason.clone())),
+            _ => None,
+        })
+        .expect("Refused event");
+    assert_eq!(refused.0, a.client_id(), "refusal is addressed to the submitter");
+    assert_eq!(refused.1, "submit");
+    assert!(refused.2.contains("attachments rejected"), "{}", refused.2);
+    assert!(
+        !seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })),
+        "no turn may start on a refused submit"
+    );
+    let (mut a2, snap2) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    assert_eq!(snap2.conversation.api_messages.len(), before, "history untouched");
+    end(&mut a2).await;
+    drop(a);
+    handle.closed().await;
+
+    // (b) image-capable model → turn starts with the block in the user message.
+    // Provider-prefixed id: the validator's static modality table is keyed
+    // that way (an unprefixed `claude-sonnet-4-5` has no image evidence in a
+    // test process with an empty capability cache and is refused too).
+    let handle = host
+        .create_session(SessionConfig {
+            model_override: Some("anthropic/claude-sonnet-4-6".into()),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    b.send_from_self(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()] })
+        .await
+        .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    let (mut c, snap3) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let user = snap3.conversation.api_messages.first().expect("user message");
+    let blocks = user["content"].as_array().expect("multipart content");
+    assert!(blocks.iter().any(|b| b["type"] == "image"), "image block on the wire: {user}");
+    assert!(blocks.iter().any(|b| b["type"] == "text" && b["text"] == "what is this"));
+    end(&mut c).await;
+    drop(b);
     handle.closed().await;
 }

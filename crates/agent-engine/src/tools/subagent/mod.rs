@@ -557,3 +557,121 @@ mod codex_ultra_worker_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod forum_worker_tests {
+    use super::{apply_subagent_runtime_policy, subagent_tools};
+    use crate::tools::Tool;
+    use std::sync::Arc;
+
+    struct ExtensionProbe(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for ExtensionProbe {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "registry-only fixture"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn extension_id(&self) -> Option<&str> {
+            Some("forum-test")
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: crate::ToolContext,
+        ) -> crate::Result<String> {
+            panic!("registry construction must not execute tools")
+        }
+    }
+
+    #[test]
+    fn common_worker_policy_forks_author_without_mutating_parent() {
+        let parent = crate::Runtime::new_headless();
+        let binding = parent.memory_backend_for_test();
+        let author = binding.forum_author().clone();
+        let mut actors = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let mut worker = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&binding));
+            let inherited = worker.memory_backend_for_test();
+            assert_eq!(inherited.forum_author().group, author.group);
+            assert_eq!(
+                inherited.forum_author().parent.as_deref(),
+                Some(author.actor.as_str())
+            );
+            assert_ne!(inherited.forum_author().actor, author.actor);
+            assert!(actors.insert(inherited.forum_author().actor.clone()));
+            assert_eq!(
+                worker.clone().memory_backend_for_test().forum_author(),
+                inherited.forum_author()
+            );
+        }
+        assert_eq!(parent.memory_backend_for_test().forum_author(), &author);
+    }
+
+    // FINDING: all_launch_paths_use_common_author_registry_and_prompt_wiring
+    // Dev's oneshot/start/resume don't call super::subagent_tools() — the
+    // tool registry is set by Runtime::new() or apply_subagent_runtime_policy.
+    // The upstream source-scanning assertion is not valid on dev.
+
+    #[tokio::test]
+    async fn subagent_registry_excludes_delegation_and_search_tools() {
+        let registry = subagent_tools().await;
+        for name in [
+            "subagent",
+            "subagent_start",
+            "subagent_resume",
+            "subagent_model_authorize",
+            "subagent_models",
+            "search_tools",
+            "activate_tools",
+            "memory_context",
+        ] {
+            assert!(registry.get(name).is_none(), "must not grant {name}");
+        }
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("edit").is_some());
+    }
+
+    #[test]
+    fn fable_5_1_worker_uses_xhigh_exactly() {
+        use super::apply_anthropic_worker_reasoning;
+        use agent_core::reasoning::ReasoningLevel;
+
+        for model in [
+            "anthropic/claude-fable-5-1",
+            "anthropic/claude-fable-5",
+            "openai-codex/gpt-6-astra",
+        ] {
+            let mut runtime = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
+            runtime.set_model(model.into());
+            let before = runtime.reasoning_level();
+            apply_anthropic_worker_reasoning(&mut runtime);
+            assert_eq!(
+                runtime.reasoning_level(),
+                if model == "anthropic/claude-fable-5-1" {
+                    ReasoningLevel::XHigh
+                } else {
+                    before
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_worker_inheritance_has_no_legacy_extension_fallback() {
+        let parent = crate::Runtime::new_headless();
+        let parent_binding = parent.memory_backend_for_test();
+        let mut worker = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&parent_binding));
+        assert!(!worker.memory_backend_for_test().exclusive());
+        let mut worker_none = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None);
+        assert!(!worker_none.memory_backend_for_test().exclusive());
+    }
+}

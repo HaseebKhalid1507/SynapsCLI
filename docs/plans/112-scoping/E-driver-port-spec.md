@@ -445,6 +445,12 @@ importing it; the actor's `driver.rs` imports from the engine crate directly.
 
 Everything else: derived — see the cited sections.
 
+### §5 — DECIDED (2026-09-20, Haseeb)
+
+1. **`feedback.rs` → `crates/agent-engine/src/extensions/feedback.rs`.** Pure re-path; it imports only agent-core types. P1 does it.
+2. **`PollRequest.session_id` lands NOW.** Additive (`#[serde(default)]`, old plugins ignore it); saves a protocol bump when multi-tenancy comes. P0 adds it to the frame; the reference plugin echoes it if present.
+3. **`max_cost_usd` is HOST-IMPOSED.** The cap exists to bound a plugin nobody is watching (D-security S3) — the plugin cannot be the source of its own limit. Config: `driver.max_cost_usd` (per run, default 5.00) and `driver.daemon_max_cost_usd` (ceiling across concurrent runs, default 25.00). `Reply::Start` MAY carry an optional `max_cost_usd`; the effective cap is `min(plugin, config)` — a plugin may ask for less, never more. No `--cost` flag needed on the reference plugin. P7 implements; P0 adds the optional field to the frame.
+
 ---
 
 ## §6 — Risks + estimate

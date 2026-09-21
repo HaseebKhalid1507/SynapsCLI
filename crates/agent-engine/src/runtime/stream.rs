@@ -41,6 +41,56 @@ pub fn activation_policy(
     }
 }
 
+/// Pre-cancellation guard for provider IO. If `cancel.is_cancelled()` before
+/// the call, return `Err(Canceled)` without polling — no billed request.
+async fn await_provider_call<F>(cancel: &CancellationToken, call: F) -> Result<Value>
+where
+    F: std::future::Future<Output = Result<Value>>,
+{
+    if cancel.is_cancelled() {
+        return Err(RuntimeError::Canceled);
+    }
+    tokio::select! {
+        biased;
+        result = call => result,
+        _ = cancel.cancelled() => Err(RuntimeError::Canceled),
+    }
+}
+
+/// Cancellation wins over a ready tool, and the last precheck is inside the
+/// execution future, immediately before its first poll. Track whether it was
+/// polled: an unstarted non-idempotent tool is NOT an interrupted side effect.
+async fn await_tool_call<F: std::future::Future>(
+    cancel: &CancellationToken,
+    call: F,
+) -> (Option<F::Output>, bool) {
+    let mut started = false;
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = async {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            started = true;
+            Some(call.await)
+        } => result,
+    };
+    (result, started)
+}
+
+/// Reject unsupported/malformed media while it is still a tool result, so a
+/// text-only model can recover rather than accumulating an unsendable history.
+fn validated_tool_output(model: &str, output: crate::ToolOutput) -> (String, Option<Vec<Value>>) {
+    let (summary, blocks) = output.into_parts();
+    if let Some(ref blocks) = blocks {
+        if let Err(error) = super::attachments::validate_tool_blocks(model, blocks) {
+            return (format!("Attachment not sent: {error}"), None);
+        }
+    }
+    (summary, blocks)
+}
+
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
@@ -508,7 +558,7 @@ impl StreamMethods {
                 );
                 let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                    agent_core::TurnError::budget(dimension),
+                    budget_meter.exhaustion_error(dimension),
                 )));
                 return Ok(());
             }};
@@ -752,6 +802,13 @@ impl StreamMethods {
                 }
                 None => &messages,
             };
+
+            // Validate original media before any request-local pruning. A
+            // resumed/oversized history must fail visibly, not lose
+            // attachments first and accidentally pass the check on the reduced
+            // request. (`call_api_stream_inner` re-validates the capped copy.)
+            super::attachments::validate_messages(&model, request_messages)
+                .map_err(RuntimeError::Config)?;
 
             // History image byte cap: the per-turn byte budget resets every
             // turn but base64 images live in history forever. Bound the wire
@@ -1000,7 +1057,7 @@ impl StreamMethods {
                 request_messages
             };
 
-            let response = match ApiMethods::call_api_stream_inner(
+            let response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
                 &model,
@@ -1015,7 +1072,7 @@ impl StreamMethods {
                 refusal_retries,
                 round_options,
                 telemetry_level,
-            )
+            ))
             .await
             {
                 Ok(r) => r,
@@ -1333,14 +1390,14 @@ impl StreamMethods {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
-                                    tokio::select! {
-                                        res = tool.execute_rich(input, crate::ToolContext {
+                                    match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        }) => {
+                                        })).await {
+                                        (Some(res), _) => {
                                             let (output, rich_blocks) = match res {
-                                                Ok(o) => o.into_parts(),
+                                                Ok(o) => validated_tool_output(&model, o),
                                                 Err(e) => {
                                                     // F28: the delta lane only saw stdout/stderr;
                                                     // the exit status (and any T5 notice) lives in
@@ -1364,7 +1421,7 @@ impl StreamMethods {
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
                                             (hooked_output, rich_blocks)
                                         }
-                                        _ = cancel.cancelled() => {
+                                        (None, started) => {
                                             canceled = true;
                                             // Ledger: this call STARTED but
                                             // never recorded a result. A
@@ -1372,7 +1429,7 @@ impl StreamMethods {
                                             // interrupted side effect (unknown
                                             // commit status) and must not be
                                             // auto-rerun (Task 25, §8.3).
-                                            if crate::tools::ledger::CallLedger::interrupted_started(
+                                            if started && crate::tools::ledger::CallLedger::interrupted_started(
                                                 &tool_id,
                                                 tool.effect(),
                                             )
@@ -1588,6 +1645,7 @@ impl StreamMethods {
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
                         let prompt_inner = secret_prompt.clone();
+                        let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
                         let env_inner = env.clone();
                         let env_stripped_inner = env_stripped.clone();
@@ -1671,14 +1729,14 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    tokio::select! {
-                                        res = t.execute_rich(input, crate::ToolContext {
+                                    match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        }) => {
+                                        })).await {
+                                        (Some(res), _) => {
                                             let (output, rich_blocks, errored) = match res {
-                                                Ok(o) => { let (t, b) = o.into_parts(); (t, b, false) }
+                                                Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
                                             };
                                             let hooked_output = emit_after_tool_call(
@@ -1697,8 +1755,8 @@ impl StreamMethods {
                                             let history_handle = if errored { None } else { Some(output_handle) };
                                             (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
-                                        _ = cancel_token.cancelled() => {
-                                            (true, Some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
+                                        (None, started) => {
+                                            (true, started.then_some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }
                                     } // close else from Block check
@@ -2048,6 +2106,10 @@ fn tool_result_bytes(r: &Value) -> usize {
 mod tests {
     use super::*;
     use crate::core::config::CacheTtl;
+    use std::cell::Cell;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+    use std::time::Duration;
 
     fn user_msg(content: Value) -> SharedMessage {
         Arc::new(json!({"role": "user", "content": content}))
@@ -2055,6 +2117,139 @@ mod tests {
 
     fn assistant_msg(text: &str) -> SharedMessage {
         Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": text}]}))
+    }
+
+    // ── await_provider_call / await_tool_call cancellation tests ─────────
+
+    #[tokio::test]
+    async fn provider_pre_cancellation_never_polls_ready_future() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polls = Cell::new(0);
+        let provider = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready(Ok(json!({"content": []})))
+        });
+
+        assert!(matches!(
+            await_provider_call(&cancel, provider).await,
+            Err(RuntimeError::Canceled)
+        ));
+        assert_eq!(polls.get(), 0, "pre-cancellation must prevent dispatch");
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_preserves_cooperative_partial_cleanup() {
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let partial = json!({
+            "content": [{"type": "text", "text": "partial response"}],
+            "stop_reason": "end_turn"
+        });
+        let provider = async {
+            cancel.cancelled().await;
+            tx.send(StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 3,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }))
+            .unwrap();
+            Ok(partial.clone())
+        };
+        let mut waiting = Box::pin(await_provider_call(&cancel, provider));
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("cooperative cancellation must finish promptly")
+            .expect("provider cleanup must win over the cancellation fallback");
+        assert_eq!(result, partial);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 3,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 0,
+                ..
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "cleanup must emit usage only once");
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_bounds_and_drops_uncooperative_pending_future() {
+        struct DropFlag<'a>(&'a Cell<bool>);
+        impl Drop for DropFlag<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let dropped = Cell::new(false);
+        let polls = Cell::new(0);
+        let guard = DropFlag(&dropped);
+        let provider = async {
+            let _guard = guard;
+            poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                Poll::<Result<Value>>::Pending
+            })
+            .await
+        };
+        let mut waiting = Box::pin(await_provider_call(&cancel, provider));
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(polls.get(), 1);
+        assert!(!dropped.get());
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("a provider ignoring cancellation must not stall cleanup");
+        assert!(matches!(result, Err(RuntimeError::Canceled)));
+        assert_eq!(polls.get(), 2, "allow just one cooperative cleanup poll");
+        assert!(
+            dropped.get(),
+            "cancelled provider resources must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_pre_cancellation_never_polls_or_marks_ready_call_started() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polls = Cell::new(0);
+        let tool = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready("side effect completed")
+        });
+
+        let (result, started) = await_tool_call(&cancel, tool).await;
+        assert!(result.is_none());
+        assert!(
+            !started,
+            "an unpolled tool is not an interrupted side effect"
+        );
+        assert_eq!(
+            polls.get(),
+            0,
+            "pre-cancellation must prevent tool dispatch"
+        );
     }
 
     // ── guard framing: single source for both injection placements ────────
@@ -2505,6 +2700,8 @@ mod rich_output_tests {
         ui_results: Vec<String>,
         /// Request bodies the mock saw, in order.
         bodies: Vec<Value>,
+        /// The stream loop returned `Err` (fail-closed) instead of `Ok`.
+        rejected: bool,
     }
 
     async fn drive(
@@ -2610,7 +2807,10 @@ mod rich_output_tests {
         )
         .await
         .expect("stream loop must finish");
-        run.expect("stream loop ok");
+        // A fail-closed rejection (e.g. invalid original media) is a valid
+        // outcome: the harness records it instead of unwrapping so tests can
+        // assert on `bodies.is_empty()` / `rejected`.
+        let rejected = run.is_err();
 
         let mut history = Vec::new();
         let mut ui_results = Vec::new();
@@ -2624,11 +2824,16 @@ mod rich_output_tests {
         // Give the mock a beat to finish recording the last body.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let bodies = mock.bodies.lock().unwrap().clone();
-        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        if rejected {
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "fail-closed: no provider round");
+        } else {
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        }
         Driven {
             history,
             ui_results,
             bodies,
+            rejected,
         }
     }
 
@@ -2854,52 +3059,44 @@ mod rich_output_tests {
         assert_eq!(out[2]["content"][0]["type"], "image");
     }
 
-    /// Wire-level: history carrying N images over the cap → the request body
-    /// that hits the provider holds only the newest images under the cap.
+    /// #112 ordering: `validate_messages` (MAX_HISTORY_ENCODED_BYTES = 20 MiB)
+    /// runs BEFORE `cap_history_image_bytes` (HISTORY_IMAGE_BYTE_CAP = 20 MiB),
+    /// so a history the validator accepts is never lossily pruned — every
+    /// image the user sent reaches the provider intact. The cap is a
+    /// belt-and-braces bound only (unit-tested directly below); an over-limit
+    /// history is an error, not a silent trim
+    /// (`history_media_limit_rejects_before_lossy_pruning`).
     #[tokio::test]
-    async fn history_cap_applied_to_request_body() {
-        // 7 × 3.5 MiB = 24.5 MiB > 20 MiB → 2 oldest dropped, 5 newest kept.
+    async fn valid_history_reaches_provider_unpruned() {
+        // 5 × 3.5 MiB = 17.5 MiB < 20 MiB → valid; all 5 must be on the wire.
         let per = 3_670_016usize;
         let d = drive_with_history(
-            image_history(7, per),
+            image_history(5, per),
             vec![Arc::new(TextTool)],
             &[("toolu_z", "text_stub")],
             Arc::new(crate::extensions::hooks::HookBus::new()),
         )
         .await;
+        assert!(!d.bodies.is_empty(), "valid history must be sent");
         for body in &d.bodies {
             let msgs = body["messages"].as_array().unwrap();
             let mut kept = 0usize;
             let mut dropped = 0usize;
-            let mut bytes = 0usize;
             for m in msgs {
                 let Some(blocks) = m["content"].as_array() else { continue };
                 for b in blocks {
-                    if let Some(inner) = b["content"].as_array() {
-                        for x in inner {
-                            if is_base64_image(x) {
-                                kept += 1;
-                                bytes += base64_image_len(x);
-                            } else if x["text"] == IMAGE_DROPPED_LABEL {
-                                dropped += 1;
-                            }
+                    let Some(inner) = b["content"].as_array() else { continue };
+                    for x in inner {
+                        if x["type"] == "image" {
+                            kept += 1;
+                        } else if x["text"] == IMAGE_DROPPED_LABEL {
+                            dropped += 1;
                         }
                     }
                 }
             }
-            assert_eq!((dropped, kept), (2, 5), "{}", body["messages"].as_array().unwrap().len());
-            assert!(bytes <= HISTORY_IMAGE_BYTE_CAP, "{bytes}");
-            // Oldest two are the dropped ones.
-            let first = msgs.iter().find(|m| m["content"][0]["type"] == "tool_result").unwrap();
-            assert_eq!(first["content"][0]["content"][1]["text"], IMAGE_DROPPED_LABEL);
+            assert_eq!((dropped, kept), (0, 5), "no image may be pruned from a valid history");
         }
-        // Durable history (what gets saved) still carries every image.
-        let images_in_history = d
-            .history
-            .iter()
-            .filter(|m| m["content"][0]["content"][1]["type"] == "image")
-            .count();
-        assert_eq!(images_in_history, 7);
     }
 
     /// DARK (§7): with the default (legacy) memory backend the forum_* tools
@@ -2930,6 +3127,23 @@ mod rich_output_tests {
             !names.iter().any(|n| n.starts_with("forum_")),
             "forum tools must be hidden under the legacy backend: {names:?}"
         );
+    }
+
+    /// Invalid original histories fail closed BEFORE pruning, with zero sends.
+    #[tokio::test]
+    async fn history_media_limit_rejects_before_lossy_pruning() {
+        let history = image_history(7, 3_670_016);
+        let original = serde_json::to_string(&history).unwrap();
+        let d = drive_with_history(
+            history.clone(),
+            vec![Arc::new(TextTool)],
+            &[("toolu_z", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert!(d.rejected, "invalid original media must stop inference");
+        assert!(d.bodies.is_empty(), "oversized history must never reach the provider");
+        assert_eq!(serde_json::to_string(&history).unwrap(), original);
     }
 
     #[test]

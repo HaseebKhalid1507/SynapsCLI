@@ -1768,6 +1768,17 @@ impl Runtime {
         model: &str,
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
+        // A denied memory-backend reconfiguration poisons the runtime: the
+        // live binding no longer matches config, so no request may be sent
+        // until restart. (#112; upstream `validate_request_preflight_for`.)
+        if self
+            .memory_backend_reconfigure_denied
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RuntimeError::Config(
+                "memory backend cannot be reconfigured at runtime (including live legacy extension processes); restart required; request denied".into(),
+            ));
+        }
         let level = self.reasoning_level();
         if model.starts_with("anthropic/")
             && level == agent_core::reasoning::ReasoningLevel::UltraCode
@@ -3330,6 +3341,14 @@ impl Runtime {
         self.cache_ttl
     }
 
+    /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
+    /// that a driver-owned turn shares the session's single downgrade latch
+    /// instead of firing a redundant 1h→5m notice.
+    pub fn share_ttl_latches(&mut self, parent: &Runtime) {
+        self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
+        self.saw_1h_honored = parent.saw_1h_honored.clone();
+    }
+
     /// Change the cache TTL strategy mid-session. The next request re-marks
     /// with the new TTL; the old prefix expires naturally (single-last
     /// strategy never prunes old markers, so no invalidation logic needed).
@@ -4179,6 +4198,100 @@ impl Clone for Runtime {
             env: self.env.clone(),
             env_stripped: self.env_stripped.clone(),
             env_warned: self.env_warned.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod rich_output_validation_tests {
+    use super::*;
+
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+
+    fn rich_output(summary: &str) -> crate::ToolOutput {
+        crate::ToolOutput::Blocks {
+            summary: summary.to_string(),
+            // Deliberately omit leading text to exercise into_parts normalization.
+            blocks: vec![json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l+QAAAAASUVORK5CYII="
+                }
+            })],
+        }
+    }
+
+    #[test]
+    fn unchanged_summary_retains_rich_array_without_text_truncation() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image"));
+        assert_eq!(summary, "image");
+        let expected = blocks.clone().expect("supported image");
+        assert_eq!(expected[0], json!({"type": "text", "text": summary}));
+        assert_eq!(expected[1]["type"], "image");
+        let retained = retain_single_tool_blocks(blocks, &summary, &summary);
+        assert_eq!(
+            single_tool_result_content(&summary, retained, summary.len()),
+            Value::Array(expected)
+        );
+    }
+
+    #[test]
+    fn rewritten_or_truncated_summary_drops_rich_blocks() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image summary"));
+        assert!(blocks.is_some());
+        for hooked in [
+            "redacted".to_string(),
+            String::new(),
+            helpers::HelperMethods::truncate_tool_result(&summary, 5),
+        ] {
+            let retained = retain_single_tool_blocks(blocks.clone(), &summary, &hooked);
+            assert!(retained.is_none());
+            assert_eq!(
+                single_tool_result_content(&hooked, retained, 5),
+                Value::String(helpers::HelperMethods::truncate_tool_result(&hooked, 5))
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_malformed_media_becomes_explicit_text() {
+        let mut malformed = rich_output("private summary");
+        if let crate::ToolOutput::Blocks { blocks, .. } = &mut malformed {
+            blocks[0]["source"]["data"] = json!("private invalid payload");
+        }
+        for (model, output) in [
+            (
+                "google-gemini/unsupported-rich-test",
+                rich_output("private summary"),
+            ),
+            (MODEL, malformed),
+        ] {
+            let (summary, blocks) = validated_single_tool_output(model, output);
+            assert!(summary.starts_with("Attachment not sent: "), "{summary}");
+            assert!(!summary.contains("private"));
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 1024),
+                Value::String(summary)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_and_errors_keep_legacy_truncation() {
+        for text in ["plain output", "tool error", "Unknown tool: missing"] {
+            let (summary, blocks) = validated_single_tool_output(
+                "google-gemini/unsupported-rich-test",
+                crate::ToolOutput::Text(text.to_string()),
+            );
+            assert_eq!(summary, text);
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 5),
+                Value::String(helpers::HelperMethods::truncate_tool_result(text, 5))
+            );
         }
     }
 }
@@ -5712,6 +5825,143 @@ mod memory_context_provider_tests {
             runtime.memory_bound_providers_for_test().is_empty(),
             "no provider may be bound"
         );
+    }
+
+    // ── memory-backend configuration tests (ported from upstream) ────────
+
+    #[tokio::test]
+    async fn memory_backend_exclusive_rejects_extension_recall_capture_and_history() {
+        for selector in ["axel", "invalid-selector"] {
+            let (mut runtime, _manager) =
+                memory_runtime_with_providers(&[("memory-test", "notes")]).await;
+            let provider = runtime.resolve_memory_provider(None).unwrap();
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {selector}\n"
+            )));
+            assert!(runtime.memory_backend.exclusive());
+            assert!(matches!(
+                runtime.resolve_memory_provider(None),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.resolve_memory_provider(Some(provider.as_str())),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.memory_history_confirm(),
+                Err(
+                    super::memory_history::HistoryImportError::CaptureProviderUnavailable
+                        | super::memory_history::HistoryImportError::ConsentRequired
+                )
+            ));
+            assert_memory_off_no_lease(&runtime);
+            let mut messages = vec![Arc::new(
+                serde_json::json!({"role": "user", "content": "test"}),
+            )];
+            let original = messages.clone();
+            runtime.apply_turn_memory_recall(&mut messages).await;
+            assert_eq!(messages, original);
+            let clone = runtime.clone();
+            assert!(clone.memory_backend.exclusive());
+            assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_first_config_is_immutable_and_changes_require_restart() {
+        for (first, different) in [("legacy", "axel"), ("axel", "legacy")] {
+            let mut runtime = Runtime::new_headless();
+            let config =
+                agent_core::config::load_config_from_str(&format!("memory.backend = {first}\n"));
+            runtime.apply_config(&config);
+            let binding = runtime.memory_backend.clone();
+            runtime.apply_config(&config);
+            assert!(!runtime
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst));
+            if let (Ok(a), Ok(b)) = (binding.scope(), runtime.memory_backend.scope()) {
+                assert!(std::ptr::eq(a, b));
+            }
+            let clone = runtime.clone();
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {different}\n"
+            )));
+            assert_eq!(runtime.memory_backend.exclusive(), binding.exclusive());
+            assert_eq!(
+                runtime.memory_backend_config.as_ref(),
+                Some(&config.memory_backend)
+            );
+            for denied in [&runtime, &clone] {
+                let error = denied
+                    .validate_request_preflight()
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("restart required"), "{error}");
+                assert!(denied.resolve_memory_provider(None).is_err());
+            }
+            runtime.apply_config(&config);
+            assert!(runtime.validate_request_preflight().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_path_changes_also_require_restart() {
+        for field in ["executable", "brain"] {
+            let mut runtime = Runtime::new_headless();
+            let config = crate::config::MemoryBackendConfig::default();
+            runtime.apply_memory_backend_config(&config);
+            let mut different = config.clone();
+            let path = std::env::temp_dir().join("synaps-memory-config-test");
+            if field == "executable" {
+                different.executable = Some(path);
+            } else {
+                different.brain = Some(path);
+            }
+            runtime.apply_memory_backend_config(&different);
+            assert_eq!(runtime.memory_backend_config.as_ref(), Some(&config));
+            assert!(!runtime.memory_backend.exclusive());
+            let error = runtime
+                .validate_request_preflight()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("restart required"), "{error}");
+            assert!(runtime.resolve_memory_provider(None).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_backend_apply_config_revokes_preexisting_legacy_lease() {
+        let mut runtime = Runtime::new_headless();
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::UserIntentProof::ExplicitCommand {
+                    command_id: memory_context::mint_explicit_command_id(),
+                },
+            )
+            .unwrap();
+        let lease = runtime
+            .memory_context_lock()
+            .capture_lease_at(std::time::SystemTime::now())
+            .unwrap();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = axel\n",
+        ));
+        assert_memory_off_no_lease(&runtime);
+        assert!(runtime.extension_capture_provider(&lease).is_none());
+    }
+
+    #[test]
+    fn axel_invalid_config_cannot_grant_consent_or_fallback() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = invalid-not-axel-not-legacy\n",
+        ));
+        assert!(runtime.memory_backend.exclusive());
+        assert!(runtime.resolve_memory_provider(None).is_err());
+        assert_memory_off_no_lease(&runtime);
     }
 
     /// Task A6: enabling against a catalog that does not contain the

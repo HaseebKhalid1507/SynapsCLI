@@ -127,11 +127,21 @@ def strict_json(data):
             raise Invalid("JSON integer too large")
         return int(raw)
 
+    def finite_float(raw):
+        # (E-P7, §S3) `session_cost_so_far` is a JSON number (USD). Accept
+        # bounded, finite floats; reject NaN/Infinity and overlong literals.
+        if len(raw) > 40:
+            raise Invalid("JSON float too large")
+        value = float(raw)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise Invalid("non-finite JSON number")
+        return value
+
     def no_constant(_):
         raise Invalid("non-finite JSON number")
 
     return json.loads(data, object_pairs_hook=pairs, parse_int=integer,
-                      parse_float=no_constant, parse_constant=no_constant)
+                      parse_float=finite_float, parse_constant=no_constant)
 
 
 class Preferences:
@@ -442,8 +452,18 @@ class Driver:
                 raise Invalid("one JSON poll argument required")
             request = strict_json(text(args[0], 4096, "poll"))
             keys = {"run_id", "decision_id", "outcome", "error_kind", "model", "effort"}
-            if not isinstance(request, dict) or set(request) not in (keys, keys | {"feedback"}):
+            optional_keys = {"feedback", "session_id"}
+            # (E-P7, §S3) The host may report running spend as a JSON number.
+            # Additive and optional; validate its type separately from the
+            # string-only fields below, then set it aside.
+            cost_keys = {"session_cost_so_far"}
+            if not isinstance(request, dict) or not (keys <= set(request) <= keys | optional_keys | cost_keys):
                 raise Invalid("invalid poll fields")
+            session_cost_so_far = request.pop("session_cost_so_far", None)
+            if session_cost_so_far is not None and (
+                    isinstance(session_cost_so_far, bool)
+                    or not isinstance(session_cost_so_far, (int, float))):
+                raise Invalid("session_cost_so_far must be a number")
             if any(not isinstance(value, str) for value in request.values()):
                 raise Invalid("poll fields must be strings")
             if not ID_RE.fullmatch(request["run_id"]) or request["run_id"] != self.run.run_id:

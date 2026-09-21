@@ -164,6 +164,12 @@ pub struct SessionConfig {
     /// entry is written so `synaps send --session <name>` resolves at once.
     #[serde(default)]
     pub name: Option<String>,
+    /// (E-P7, §S3) Hard per-session spend ceiling in USD. `None` = unbounded.
+    /// Checked after every `Usage` stream event; a breach cancels the turn,
+    /// revokes any armed driver, and emits `CostCapReached`. This is the
+    /// host-owned circuit breaker for an actor-resident autonomous driver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_session_cost: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -205,6 +211,7 @@ impl Default for SessionConfig {
             await_extensions: true,
             keep_warm: false,
             name: None,
+            max_session_cost: None,
         }
     }
 }
@@ -462,8 +469,11 @@ pub enum SessionCommand {
     /// abort_context, push user msg, start turn.
     Submit {
         text: String,
+        /// Pre-built canonical user content blocks (images, documents)
+        /// produced by `PendingAttachments::build_content` on the client.
+        /// Empty ⇔ text-only (backward compatible).
         #[serde(default)]
-        attachments: Vec<agent_core::core::rpc_protocol::RpcAttachment>,
+        attachments: Vec<serde_json::Value>,
     },
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
@@ -520,6 +530,15 @@ pub enum SessionCommand {
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
+    /// (E-P0) Start or re-arm the session driver for `plugin`.
+    /// `command` is the interactive command name (e.g. "auto");
+    /// `arg` is everything after the command ("start -- do X").
+    /// No `DriverStop` — `Cancel` handles that (§2).
+    DriverStart {
+        plugin: String,
+        command: String,
+        arg: String,
+    },
 }
 
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
@@ -540,11 +559,16 @@ pub struct SessionReloadRecord {
 impl std::fmt::Debug for SessionCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Submit { attachments, .. } => f
-                .debug_struct("Submit")
-                .field("text", &format_args!("<redacted>"))
-                .field("attachments", &attachments.len())
-                .finish(),
+            Self::Submit { attachments, .. } => {
+                let kinds: Vec<&str> = attachments
+                    .iter()
+                    .filter_map(|b| b.get("type").and_then(|v| v.as_str()))
+                    .collect();
+                f.debug_struct("Submit")
+                    .field("text", &format_args!("<redacted>"))
+                    .field("attachments", &format_args!("{}:{:?}", attachments.len(), kinds))
+                    .finish()
+            }
             Self::Steer { .. } => f
                 .debug_struct("Steer")
                 .field("text", &format_args!("<redacted>"))
@@ -605,6 +629,12 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::KeepWarm { on } => f.debug_struct("KeepWarm").field("on", on).finish(),
             Self::HostEvent(ev) => f.debug_tuple("HostEvent").field(ev).finish(),
+            Self::DriverStart { plugin, command, .. } => f
+                .debug_struct("DriverStart")
+                .field("plugin", plugin)
+                .field("command", command)
+                .field("arg", &format_args!("<redacted>"))
+                .finish(),
         }
     }
 }
@@ -798,6 +828,36 @@ pub enum SessionEventWire {
     Lifecycle(SessionLifecycle),
     /// (C3) daemon is about to exec itself; clients reconnect.
     Reloading { generation: u64, retry_after_ms: u64 },
+    /// (E-P0) Driver armed on this session.
+    DriverArmed {
+        plugin_id: String,
+        run_id: String,
+        models: Vec<crate::extensions::session_driver::Selection>,
+        selection: crate::extensions::session_driver::Selection,
+        /// Remaining ms, not absolute Instant.
+        deadline_ms: Option<u64>,
+        notice: String,
+    },
+    /// (E-P0) Driver revoked.
+    DriverRevoked {
+        reason: String,
+        undelivered_steering: Vec<String>,
+    },
+    /// (E-P0) One driver turn completed.
+    DriverTurnOutcome {
+        outcome: crate::extensions::session_driver::Outcome,
+        selection: crate::extensions::session_driver::Selection,
+        feedback: Option<String>,
+    },
+    /// (E-P7, §S3) A spend ceiling was breached: the turn was cancelled and any
+    /// armed driver revoked. `scope` is "session" (config cap) or "run" (the
+    /// driver grant's per-run cap). Additive v3 driver event — old clients skip
+    /// it via `#[serde(other)]`.
+    CostCapReached {
+        scope: String,
+        cost: f64,
+        cap: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -817,6 +877,8 @@ pub enum TurnTrigger {
     EventAuto,
     PluginCommand,
     Compaction,
+    /// (E-P0) Turn initiated by the session driver.
+    DriverAuto,
 }
 
 /// Per-session, gapless `seq` assigned at the single emit site
@@ -1053,6 +1115,27 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // Submit with content blocks round-trips.
+        let blocks = vec![
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}),
+            serde_json::json!({"type":"text","text":"hello"}),
+        ];
+        let submit_with = SessionCommand::Submit {
+            text: "describe".into(),
+            attachments: blocks.clone(),
+        };
+        let json = serde_json::to_string(&submit_with).unwrap();
+        let back: SessionCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            SessionCommand::Submit { text, attachments } => {
+                assert_eq!(text, "describe");
+                assert_eq!(attachments.len(), 2);
+                assert_eq!(attachments[0]["type"], "image");
+                assert_eq!(attachments[1]["type"], "text");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -1067,6 +1150,7 @@ mod tests {
             SessionCommand::Checkpoint { reason: CheckpointReason::Reload },
             SessionCommand::KeepWarm { on: true },
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
+            SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
         ];
         for cmd in cmds {
             let json = serde_json::to_string(&cmd).unwrap();
@@ -1089,6 +1173,7 @@ mod tests {
             },
             SessionCommand::Answer { prompt_id: 1, value: Some(secret.into()) },
             SessionCommand::Resume { id: 1, query: secret.into() },
+            SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: secret.into() },
         ];
         for cmd in cmds {
             let d = format!("{cmd:?}");
@@ -1099,6 +1184,19 @@ mod tests {
         }
         let d = format!("{:?}", SessionCommand::Set { id: 4, setting: SessionSetting::ReloadPrompt });
         assert_eq!(d, "Set { id: 4, setting: ReloadPrompt }");
+
+        // Submit debug shows count+kinds, never base64.
+        let b64_secret = "aHVudGVyMi12ZXJ5LXNlY3JldA==";
+        let cmd = SessionCommand::Submit {
+            text: "x".into(),
+            attachments: vec![
+                serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":b64_secret}}),
+                serde_json::json!({"type":"document","title":"x.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBER"}}),
+            ],
+        };
+        let d = format!("{cmd:?}");
+        assert!(d.contains(r#"2:["image", "document"]"#), "{d}");
+        assert!(!d.contains(b64_secret), "base64 leaked: {d}");
     }
 
     #[test]
