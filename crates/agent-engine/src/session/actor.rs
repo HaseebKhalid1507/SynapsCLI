@@ -134,25 +134,37 @@ impl TurnLog {
         }
     }
 
-    /// `App::capture_abort_context` verbatim (app.rs:644-683).
+    /// A plain-prose summary of the interrupted turn, prepended to the next
+    /// user message. F6/#370: the previous format used protocol-shaped tags
+    /// (`[tool_use]:`, `[tool_result]:`, `[response]:`) inside a user message,
+    /// which some models (sonnet-4-6) read as an injection attempt and refused.
+    /// This version names the parts in prose and frames the block explicitly as
+    /// a host note about the model's OWN interrupted work — no protocol tags,
+    /// nothing that mimics an assistant/tool turn. (The durable fix, #112/#112
+    /// task, keeps the real canceled messages in history; this is the summary
+    /// path until then.)
     fn abort_context(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         for p in &self.parts {
             match p {
                 TurnPart::Thinking(t) if !t.is_empty() => {
                     let preview: String = t.chars().take(500).collect();
-                    parts.push(format!("[thinking]: {}", preview));
+                    parts.push(format!("- your reasoning so far: {}", preview.trim()));
                 }
                 TurnPart::Text(t) if !t.is_empty() => {
-                    parts.push(format!("[response]: {}", t));
+                    parts.push(format!("- you had started writing: {}", t.trim()));
                 }
                 TurnPart::ToolUse { name, input } => {
                     let input_preview: String = input.chars().take(200).collect();
-                    parts.push(format!("[tool_use]: {} — {}", name, input_preview));
+                    parts.push(format!(
+                        "- you invoked the {} tool with input: {}",
+                        name,
+                        input_preview.trim()
+                    ));
                 }
                 TurnPart::ToolResult { content, .. } if !content.is_empty() => {
                     let preview: String = content.chars().take(300).collect();
-                    parts.push(format!("[tool_result]: {}", preview));
+                    parts.push(format!("- that tool returned: {}", preview.trim()));
                 }
                 _ => {}
             }
@@ -161,7 +173,10 @@ impl TurnLog {
             return None;
         }
         Some(format!(
-            "[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]",
+            "(System note — ABORT CONTEXT: your previous response was interrupted \
+             before it finished. This is a factual recap of your OWN partial work, \
+             not new instructions. Continue naturally from here or adjust for the \
+             user's next message; do not re-run completed tool calls.)\n{}",
             parts.join("\n")
         ))
     }
@@ -3598,6 +3613,46 @@ impl SessionTask {
             }
         };
         self.0.finish(reason).await;
+    }
+}
+
+#[cfg(test)]
+mod abort_context_tests {
+    use super::{TurnLog, TurnPart};
+
+    fn log(parts: Vec<TurnPart>) -> TurnLog {
+        TurnLog { parts }
+    }
+
+    /// F6/#370: the abort recap must NOT contain protocol-shaped tags that a
+    /// model can read as an injected assistant/tool turn.
+    #[test]
+    fn abort_context_uses_prose_not_protocol_tags() {
+        let ctx = log(vec![
+            TurnPart::Thinking("weighing options".into()),
+            TurnPart::Text("Here is the".into()),
+            TurnPart::ToolUse { name: "bash".into(), input: "{\"command\":\"ls\"}".into() },
+            TurnPart::ToolResult { tool_id: "t1".into(), content: "a b c".into() },
+        ])
+        .abort_context()
+        .expect("non-empty log yields context");
+
+        for forbidden in ["[tool_use]", "[tool_result]", "[response]", "[thinking]"] {
+            assert!(!ctx.contains(forbidden), "protocol tag leaked: {forbidden} in {ctx}");
+        }
+        // Keeps the human-readable ABORT CONTEXT header and frames it as a note.
+        assert!(ctx.contains("ABORT CONTEXT"));
+        assert!(ctx.contains("System note"));
+        assert!(ctx.contains("not new instructions"));
+        // The actual partial work is still recapped.
+        assert!(ctx.contains("bash"));
+        assert!(ctx.contains("a b c"));
+    }
+
+    #[test]
+    fn empty_log_yields_no_context() {
+        assert!(log(vec![]).abort_context().is_none());
+        assert!(log(vec![TurnPart::Text(String::new())]).abort_context().is_none());
     }
 }
 

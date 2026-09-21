@@ -301,7 +301,7 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
         .any(|e| matches!(&e.event, SessionEventWire::Aborted { .. })));
     let conv = last_conversation(&seen);
     assert!(
-        conv.abort_context.as_deref().unwrap_or("").contains("[response]: hi"),
+        conv.abort_context.as_deref().unwrap_or("").contains("you had started writing: hi"),
         "abort context captured: {:?}",
         conv.abort_context
     );

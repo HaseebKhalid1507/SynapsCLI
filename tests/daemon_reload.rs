@@ -245,7 +245,7 @@ async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
     assert_eq!(t.session_id(), &sid);
     assert!(!snap.streaming, "the turn was checkpointed, not resumed");
     let ctx = snap.conversation.abort_context.clone().expect("abort context came back from the journal");
-    assert!(ctx.contains("[response]: partial"), "{ctx}");
+    assert!(ctx.contains("you had started writing: partial"), "{ctx}");
     assert_eq!(snap.conversation.api_messages.len(), 1, "the interrupted assistant turn is not in the history");
 
     t.detach().await;

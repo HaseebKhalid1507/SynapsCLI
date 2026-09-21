@@ -61,7 +61,7 @@ fn reference_reactor_ext_is_frozen() {
     let src = include_str!("support/reference_reactor_ext.rs");
     let hex = format!("{:x}", Sha256::digest(src.as_bytes()));
     assert_eq!(
-        hex, "0c260c753693c9cb1de0bca590d08bcd9605886c0bd89a375165b716b31618a3",
+        hex, "0dfedbd6399f26194b963a4cae83624a1fa524474762f748f8e04837700f5c34",
         "tests/support/reference_reactor_ext.rs is a frozen oracle — do not edit"
     );
 }
@@ -774,7 +774,7 @@ async fn cancel_captures_abort_context() {
     let dequeued = o.abort().await;
     assert_eq!(dequeued.as_deref(), Some("queued-then-dropped"));
     let o_ctx = o.r.abort_context.clone().expect("oracle captured context");
-    assert!(o_ctx.contains("[response]: partial"), "{o_ctx}");
+    assert!(o_ctx.contains("you had started writing: partial"), "{o_ctx}");
     o.submit("second".into()).await;
     pump_until_text(&mut o).await;
     o.abort().await;
@@ -810,7 +810,7 @@ async fn cancel_captures_abort_context() {
         serde_json::from_slice::<serde_json::Value>(&bodies[i]).unwrap()["messages"].clone()
     };
     assert_eq!(msgs(1), msgs(3), "abort-context fold differs");
-    assert!(msgs(1)[0].to_string().contains("[ABORT CONTEXT"), "{}", msgs(1)[0]);
+    assert!(msgs(1)[0].to_string().contains("ABORT CONTEXT"), "{}", msgs(1)[0]);
     assert_eq!(o.r.api_messages.len(), a.api_messages.len());
     assert_eq!(msgs_json(&o.r.api_messages), msgs_json(&a.api_messages));
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);

@@ -202,25 +202,31 @@ impl ReferenceReactorExt {
         self.r.on_queue_wake().await
     }
 
-    /// app.rs:644-683 `capture_abort_context`.
+    /// Oracle mirror of `SessionActor::TurnLog::abort_context` — MUST stay
+    /// byte-identical to the production format (F6/#370: prose, no protocol
+    /// tags, framed as a host note about the model's own interrupted work).
     fn capture_abort_context(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         for p in &self.parts {
             match p {
                 Part::Thinking(t) if !t.is_empty() => {
                     let preview: String = t.chars().take(500).collect();
-                    parts.push(format!("[thinking]: {}", preview));
+                    parts.push(format!("- your reasoning so far: {}", preview.trim()));
                 }
                 Part::Text(t) if !t.is_empty() => {
-                    parts.push(format!("[response]: {}", t));
+                    parts.push(format!("- you had started writing: {}", t.trim()));
                 }
                 Part::ToolUse { name, input } => {
                     let input_preview: String = input.chars().take(200).collect();
-                    parts.push(format!("[tool_use]: {} — {}", name, input_preview));
+                    parts.push(format!(
+                        "- you invoked the {} tool with input: {}",
+                        name,
+                        input_preview.trim()
+                    ));
                 }
                 Part::ToolResult { content, .. } if !content.is_empty() => {
                     let preview: String = content.chars().take(300).collect();
-                    parts.push(format!("[tool_result]: {}", preview));
+                    parts.push(format!("- that tool returned: {}", preview.trim()));
                 }
                 _ => {}
             }
@@ -229,7 +235,10 @@ impl ReferenceReactorExt {
             return None;
         }
         Some(format!(
-            "[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]",
+            "(System note — ABORT CONTEXT: your previous response was interrupted \
+             before it finished. This is a factual recap of your OWN partial work, \
+             not new instructions. Continue naturally from here or adjust for the \
+             user's next message; do not re-run completed tool calls.)\n{}",
             parts.join("\n")
         ))
     }
