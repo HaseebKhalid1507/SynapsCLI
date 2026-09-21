@@ -269,6 +269,7 @@ pub async fn execute_provider_tool_use(
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
         false,
+        None,
     )
     .await;
 
