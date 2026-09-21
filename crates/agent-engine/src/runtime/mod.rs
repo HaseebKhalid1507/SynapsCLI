@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+mod anthropic_quota;
 mod api;
 mod api_sync;
 pub mod attachments;
