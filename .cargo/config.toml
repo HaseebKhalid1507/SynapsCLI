@@ -1,0 +1,8 @@
+# Keep local verification bounded: higher concurrency destabilizes this PC.
+[build]
+jobs = 4
+
+[env]
+RUST_TEST_THREADS = { value = "2", force = true }
+TOKIO_WORKER_THREADS = { value = "2", force = true }
+RAYON_NUM_THREADS = { value = "4", force = true }
