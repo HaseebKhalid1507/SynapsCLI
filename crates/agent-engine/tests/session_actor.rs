@@ -703,6 +703,140 @@ async fn pending_prompt_survives_detach_and_replays_on_attach() {
     end(&mut b).await;
 }
 
+/// P11: a pending prompt on a NON-driver session survives the last-client
+/// detach (the reattach-to-answer contract) AND a fast re-attach cancels the
+/// abandonment deadline — the prompt is NOT auto-denied while a client is back,
+/// so the user answers it normally even past the original deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_prompt_reattach_cancels_abandon_deadline() {
+    let _h = Home::new();
+    // Tiny 1 s deadline so the test is fast; re-attach well within it.
+    std::env::set_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS", "1");
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+
+    // Detach the only client → the abandonment deadline arms (1 s).
+    a.send(SessionCommand::Detach { client: a.client_id() })
+        .await
+        .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::ClientLeft { .. })).await;
+    drop(a);
+
+    // Re-attach quickly (< 1 s): the prompt survived detach and the re-attach
+    // cancels the deadline.
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
+    assert_eq!(
+        snap.pending_prompts.len(),
+        1,
+        "prompt must survive detach on a non-driver session"
+    );
+    assert_eq!(snap.pending_prompts[0].id, pid);
+
+    // Wait PAST the original 1 s deadline while attached: the prompt must NOT be
+    // auto-denied — the deadline was cancelled by the re-attach.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(handle.is_alive(), "session stays live with the prompt pending");
+
+    // Answer succeeds → the tool sees the real value (`answered:6`), proving the
+    // prompt was never fail-closed to `None`.
+    b.send(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("s3cret".into()),
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::PromptResolved { prompt_id } if prompt_id == pid
+    )));
+    assert_eq!(tool_results(&last_conversation(&seen)), vec!["answered:6".to_string()]);
+    end(&mut b).await;
+    std::env::remove_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS");
+}
+
+/// P11: when NObody re-attaches before the abandonment deadline, the pending
+/// prompt is fail-closed (`None` / denied) so `can_park()` unblocks and the
+/// session parks normally — bounding the abandoned-prompt resource pin without
+/// punishing a transient detach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_prompt_denied_and_parks_after_abandon_deadline() {
+    let _h = Home::new();
+    // 1 s abandonment deadline, and park immediately once the turn drains.
+    std::env::set_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS", "1");
+    std::env::set_var("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host
+        .create_session(SessionConfig { persist: true, ..cfg() })
+        .await
+        .unwrap();
+
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+
+    // Detach the only client and stay gone → the deadline (1 s) expires with
+    // zero clients → the prompt is denied (`None`) → the tool returns
+    // "cancelled" → the turn drains → `can_park()` becomes true → the session
+    // parks (grace 0).
+    a.send(SessionCommand::Detach { client: a.client_id() })
+        .await
+        .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::ClientLeft { .. })).await;
+    drop(a);
+
+    // Deadline (1 s) + turn drain + park grace (0). Poll up to a few seconds.
+    let parked = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if matches!(
+                handle.lifecycle(),
+                agent_engine::session::SessionLifecycle::Parked
+            ) {
+                break true;
+            }
+            if !handle.is_alive() {
+                break false; // Ended is also acceptable (still unpinned)
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("session must unpin (park/end) after the abandonment deadline");
+    assert!(parked, "abandoned prompt did not unblock parking");
+
+    // Re-attach: the prompt is gone (denied), not stuck pending.
+    let (mut c, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    assert!(
+        snap.pending_prompts.is_empty(),
+        "abandoned prompt was not denied at the deadline: {:?}",
+        snap.pending_prompts
+    );
+    end(&mut c).await;
+    handle.closed().await;
+    std::env::remove_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS");
+    std::env::remove_var("SYNAPS_DAEMON_PARK_GRACE_SECS");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn answer_dedup_on_prompt_id() {

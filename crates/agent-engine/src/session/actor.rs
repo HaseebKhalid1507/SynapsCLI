@@ -248,6 +248,30 @@ pub fn park_grace() -> Option<std::time::Duration> {
 
 pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `SYNAPS_DAEMON_PROMPT_ABANDON_SECS`: how long a pending host confirmation on
+/// a NON-driver session survives after the LAST client detaches before it is
+/// fail-closed answered `None` (deny) so `can_park()` can proceed. This bounds
+/// the resource pin from an ABANDONED prompt WITHOUT punishing a transient
+/// disconnect (SSH drop, sleep, wifi): a re-attach before expiry cancels it and
+/// the user answers the prompt normally. Default 1 h — generous enough that a
+/// human coming back from lunch still answers; `never`/`0`/`off` → `None` =
+/// disabled = pure pre-#112 behaviour (a prompt survives detach forever).
+///
+/// (The driver-armed case fail-closes immediately on last detach; this deadline
+/// is only for a plain interactive session — see `detach` / `rearm_prompt_abandon`.)
+pub fn prompt_abandon_timeout() -> Option<std::time::Duration> {
+    prompt_abandon_timeout_from(std::env::var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS").ok().as_deref())
+}
+
+fn prompt_abandon_timeout_from(v: Option<&str>) -> Option<std::time::Duration> {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(3600);
+    match v.map(str::trim) {
+        Some("never" | "0" | "off") => None,
+        Some(n) => n.parse::<u64>().ok().map(std::time::Duration::from_secs).or(Some(DEFAULT)),
+        None => Some(DEFAULT),
+    }
+}
+
 /// Non-persisted runtime knobs replayed after unpark (last-wins per
 /// variant). Model/reasoning live in the journal already; `/system` is
 /// runtime-only (never journaled) so it replays too (M7).
@@ -372,6 +396,11 @@ pub struct SessionActor {
     pub(crate) keep_warm: bool,
     /// Armed on last-detach-while-idle / idle-while-detached.
     pub(crate) park_deadline: Option<tokio::time::Instant>,
+    /// (P11) Armed when the last client detaches while a pending host prompt is
+    /// held on a NON-driver session; a re-attach cancels it, expiry denies the
+    /// prompt(s) so `can_park()` can proceed. `None` = no abandoned prompt (or
+    /// the deadline is disabled by config).
+    pub(crate) prompt_abandon_deadline: Option<tokio::time::Instant>,
     // ── turn machine: the run() loop locals + App fields ──
     pub(crate) stream: Option<ActiveStream>,
     pub(crate) cancel: Option<CancellationToken>,
@@ -625,6 +654,7 @@ impl SessionActor {
             settings_replay: Vec::new(),
             keep_warm,
             park_deadline: None,
+            prompt_abandon_deadline: None,
             stream: None,
             cancel: None,
             steer_tx: None,
@@ -817,6 +847,7 @@ impl SessionActor {
             AttachState::Attached(self.attached.len())
         };
         self.rearm_park();
+        self.rearm_prompt_abandon();
     }
 
     // ── Parked (B3) ──────────────────────────────────────────────────────
@@ -1661,6 +1692,56 @@ impl SessionActor {
                 }
             }
             None => self.park_deadline = None,
+        }
+    }
+
+    /// (P11) Bound the resource pin from an ABANDONED prompt. A pending host
+    /// confirmation on a plain interactive session survives detach so the user
+    /// reattaches and answers it — but if NObody ever comes back it pins the
+    /// session forever (`can_park()` requires `pending_prompts` empty). Arm a
+    /// deadline only in that abandoned state (zero clients, prompt pending, no
+    /// driver); a re-attach clears it (prompt survives, user answers); expiry
+    /// denies the prompt(s). The driver-armed case fail-closes immediately in
+    /// `detach` and never reaches here. Idempotent: safe to call on every
+    /// attach/detach/prompt transition.
+    fn rearm_prompt_abandon(&mut self) {
+        let armed_driver = self.driver.is_some() || self.driver_pending.is_some();
+        let abandoned = self.attached.is_empty()
+            && !self.pending_prompts.is_empty()
+            && !armed_driver
+            && !self.is_parked();
+        if !abandoned {
+            // Someone is attached, the prompt was answered, or a driver took
+            // over the fail-closed path — never auto-deny while any of these.
+            self.prompt_abandon_deadline = None;
+            return;
+        }
+        if self.prompt_abandon_deadline.is_none() {
+            // `None` config ⇒ deadline stays `None` ⇒ disabled (pre-#112).
+            self.prompt_abandon_deadline =
+                prompt_abandon_timeout().map(|d| tokio::time::Instant::now() + d);
+        }
+    }
+
+    /// (P11) The prompt-abandonment deadline expired with still zero clients:
+    /// deny every pending prompt (send `None` + emit `PromptResolved`) so the
+    /// session stops zombie-blocking and `can_park()` becomes true. A re-attach
+    /// would have cleared the deadline first; re-check defensively.
+    fn on_prompt_abandon_deadline(&mut self) {
+        self.prompt_abandon_deadline = None;
+        if !self.attached.is_empty() {
+            return;
+        }
+        let had_prompts = !self.pending_prompts.is_empty();
+        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
+            let _ = tx.send(None);
+            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        }
+        if had_prompts {
+            tracing::info!(session = %self.id, "pending prompt abandoned (no clients before deadline) — denied");
+            self.publish_presence();
+            // `can_park()` may now be true — re-evaluate the park deadline.
+            self.rearm_park();
         }
     }
 
@@ -2692,6 +2773,9 @@ impl SessionActor {
         self.pending_prompts.push_back((pr.clone(), req.response_tx));
         self.publish_presence();
         self.emit(SessionEventWire::Prompt(pr));
+        // A prompt can be raised while already detached (a turn running with no
+        // client). Arm the abandonment deadline if this left us pinned.
+        self.rearm_prompt_abandon();
     }
 
     fn answer(&mut self, prompt_id: u64, value: Option<String>) {
@@ -2702,6 +2786,8 @@ impl SessionActor {
         let _ = tx.send(value);
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
+        // The last pending prompt may have just cleared — drop the deadline.
+        self.rearm_prompt_abandon();
     }
 
     // ── settings / queries / engine commands ─────────────────────────────
@@ -3020,19 +3106,24 @@ impl SessionActor {
             });
             self.publish_presence();
         }
-        // (E-P7, §S1) The last client just left. Two fail-closed gates:
+        // (E-P7 §S1 / P11) The last client just left. Fail-closed gates apply
+        // ONLY when a driver is (or was about to be) armed:
         //
-        //  1. Any pending host confirmation is answered `None` (deny). A prompt
-        //     with no client to answer it blocks the turn forever AND blocks
-        //     parking (`can_park` requires `pending_prompts` empty) — the
-        //     zombie cost stream. `tools/discovery.rs` treats `None` as
-        //     Unauthorized, so this denies rather than approves.
-        //  2. An armed driver is revoked: it must never run turns headless with
-        //     nobody watching and no way to answer a confirmation. Conservative
-        //     choice matching the "local TUI only" upstream intent — cancelling
-        //     the driver stream (via `DriverState` drop) and releasing the host
-        //     grant so the session can park normally.
-        if self.attached.is_empty() {
+        //  1. An armed driver is revoked: it must never run turns headless with
+        //     nobody watching and no way to answer a confirmation.
+        //  2. Its pending host confirmations are answered `None` (deny) — a
+        //     headless autonomous run must not sit on an unanswerable prompt.
+        //     `tools/discovery.rs` treats `None` as Unauthorized (deny).
+        //
+        // For a PLAIN interactive session (no driver), a pending prompt SURVIVES
+        // detach: the user reattaches and answers it — the daemon's core
+        // detach/reattach contract, and detach is often involuntary (SSH drop,
+        // sleep, wifi). Denying on detach would let a transient disconnect
+        // silently reject the user's action. The resource pin from an
+        // *abandoned* prompt is bounded by the pending-prompt deadline instead
+        // (see the actor select loop), not by punishing every detach.
+        if self.attached.is_empty() && (self.driver.is_some() || self.driver_pending.is_some()) {
+            self.driver_revoke("no clients attached");
             let had_prompts = !self.pending_prompts.is_empty();
             while let Some((pr, tx)) = self.pending_prompts.pop_front() {
                 let _ = tx.send(None);
@@ -3040,9 +3131,6 @@ impl SessionActor {
             }
             if had_prompts {
                 self.publish_presence();
-            }
-            if self.driver.is_some() || self.driver_pending.is_some() {
-                self.driver_revoke("no clients attached");
             }
         }
     }
@@ -3393,6 +3481,15 @@ async fn park_timer(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// (P11) Prompt-abandonment deadline: same shape as `park_timer`. `None` =
+/// disabled (no abandoned prompt, or the feature is off) → pends forever.
+async fn prompt_abandon_timer(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 200 ms cadence, gated on driver state — `None` driver+pending → pending forever.
 async fn driver_tick_timer(
     has_driver: bool,
@@ -3442,6 +3539,9 @@ impl SessionTask {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
                     }
+                }
+                _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
+                    actor.on_prompt_abandon_deadline();
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
                 _ = ext_ready(&mut actor.ext_ready) => {
@@ -3499,6 +3599,7 @@ impl SessionTask {
 #[cfg(test)]
 mod parked_evict_tests {
     use super::parked_evict_after_from;
+    use super::prompt_abandon_timeout_from;
     use std::time::Duration;
 
     #[test]
@@ -3509,5 +3610,18 @@ mod parked_evict_tests {
             assert_eq!(parked_evict_after_from(Some(never)), None, "{never:?}");
         }
         assert_eq!(parked_evict_after_from(Some("junk")), Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn prompt_abandon_defaults_to_one_hour_and_honours_never() {
+        // Default (unset) is a generous 1 h.
+        assert_eq!(prompt_abandon_timeout_from(None), Some(Duration::from_secs(3600)));
+        assert_eq!(prompt_abandon_timeout_from(Some("30")), Some(Duration::from_secs(30)));
+        // Disabled sentinels ⇒ None ⇒ pure pre-#112 (prompt survives forever).
+        for never in ["never", "0", "off"] {
+            assert_eq!(prompt_abandon_timeout_from(Some(never)), None, "{never:?}");
+        }
+        // Garbage falls back to the safe default rather than disabling the guard.
+        assert_eq!(prompt_abandon_timeout_from(Some("junk")), Some(Duration::from_secs(3600)));
     }
 }
