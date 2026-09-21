@@ -1509,9 +1509,20 @@ impl Runtime {
     }
 
     /// Conversation/session identity this runtime serves (keys hook
-    /// injection). `None` = unkeyed (workers).
+    /// injection). `None` = unkeyed (workers). Does not reset consent: linked
+    /// compaction successors remain the same conversation. Use
+    /// [`Self::begin_conversation`] for explicit new/resume boundaries.
     pub fn set_session_id(&mut self, id: Option<String>) {
         self.session_id = id;
+    }
+
+    /// Start an explicitly new or resumed conversation with fresh Confirm consent.
+    /// Replace the Arc rather than clearing its flag: old stream/worker clones
+    /// must not be able to grant consent to the next conversation. Ordinary
+    /// turns and linked compaction successors must not call this method.
+    pub fn begin_conversation(&mut self, id: Option<String>) {
+        self.session_allow_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.set_session_id(id);
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -5044,6 +5055,51 @@ mod tests {
         cloned.session_allow_all().store(true, Ordering::Relaxed);
         assert!(parent.session_allow_all().load(Ordering::Relaxed));
         assert!(!independent.session_allow_all().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn session_allow_all_conversation_boundary_isolates_old_clones() {
+        use std::sync::{atomic::Ordering, Arc};
+        let mut runtime = Runtime::new_headless();
+        let old_worker = runtime.clone();
+        old_worker.session_allow_all().store(true, Ordering::Relaxed);
+
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(runtime.session_id(), Some("next"));
+        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(
+            runtime.session_allow_all(),
+            old_worker.session_allow_all()
+        ));
+        assert!(old_worker.session_allow_all().load(Ordering::Relaxed));
+        old_worker.session_allow_all().store(false, Ordering::Relaxed);
+        old_worker.session_allow_all().store(true, Ordering::Relaxed);
+        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+
+        let new_worker = runtime.clone();
+        new_worker.session_allow_all().store(true, Ordering::Relaxed);
+        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+        // Explicit resume of even the same ID starts fresh consent.
+        runtime.begin_conversation(Some("next".into()));
+        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(
+            runtime.session_allow_all(),
+            new_worker.session_allow_all()
+        ));
+    }
+
+    #[test]
+    fn session_allow_all_identity_change_preserves_compaction_consent() {
+        use std::sync::{atomic::Ordering, Arc};
+        let mut runtime = Runtime::new_headless();
+        let worker = runtime.clone();
+        worker.session_allow_all().store(true, Ordering::Relaxed);
+        runtime.set_session_id(Some("linked-successor".into()));
+        assert!(Arc::ptr_eq(
+            runtime.session_allow_all(),
+            worker.session_allow_all()
+        ));
+        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
     }
 
     /// "Allow all (session)": the answer continues THIS call and latches the
