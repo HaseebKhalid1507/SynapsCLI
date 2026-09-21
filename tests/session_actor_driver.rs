@@ -438,9 +438,22 @@ async fn tick_revokes_on_lifecycle_death() {
 
 /// The tick should revoke when idle conflict conditions arise (e.g., compaction
 /// starts while driver is armed).
-#[tokio::test]
+///
+/// DETERMINISM: this test asserts a SPECIFIC revoke-reason class (compaction /
+/// queued-work / session-lifecycle). Without an Anthropic stub, any LLM call
+/// during the test (the driver's own scheduled turn, or the compaction
+/// summarization request) hits the real API path and EOFs → a *competing*
+/// revoke with reason "blocked or unexpected end of stream". On a fast/warm box
+/// the intended idle-conflict path wins; under CI load the EOF path wins → the
+/// assert flakes. We wire the SAME loopback stub the sibling tests use
+/// (`stub_host` + `HomeGuard` + `#[serial]`, plugin prefs proposing a real
+/// anthropic model): every request is answered cleanly, so NO call EOFs and the
+/// ONLY remaining revoke path is the compaction idle-conflict → deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn tick_revokes_on_idle_conflict() {
-    let (host, _temp) = host_with_plugin().await;
+    let guard = HomeGuard::new();
+    let (host, _temp) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
     let mut actor = session(&host).await;
     actor.arm().await;
 
