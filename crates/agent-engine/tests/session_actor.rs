@@ -836,6 +836,10 @@ async fn pending_prompt_denied_and_parks_after_abandon_deadline() {
     std::env::remove_var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS");
     std::env::remove_var("SYNAPS_DAEMON_PARK_GRACE_SECS");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn answer_dedup_on_prompt_id() {
     let _h = Home::new();
     let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
