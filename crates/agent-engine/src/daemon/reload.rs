@@ -384,8 +384,18 @@ pub async fn prepare(
         expected_clients: state.connections.load(Ordering::SeqCst),
     };
     let rs_path = reload_state_path(paths);
-    let body = serde_json::to_vec_pretty(&rs).map_err(|e| ReloadError::ExecFailed(e.to_string()))?;
-    registry::write_private_atomic(&rs_path, &body).map_err(|e| ReloadError::ExecFailed(e.to_string()))?;
+    // If either write fails we early-return WITHOUT reaching exec() (which is the
+    // only other place `reloading` is cleared), so reset the drain flag here —
+    // otherwise a failed reload-state write bricks the daemon (it refuses every
+    // new Create/Submit/Compact until restart).
+    let body = serde_json::to_vec_pretty(&rs).map_err(|e| {
+        state.reloading.store(false, Ordering::SeqCst);
+        ReloadError::ExecFailed(e.to_string())
+    })?;
+    registry::write_private_atomic(&rs_path, &body).map_err(|e| {
+        state.reloading.store(false, Ordering::SeqCst);
+        ReloadError::ExecFailed(e.to_string())
+    })?;
 
     // 4. announce — every OTHER conn selects on `reload_announce` and sends
     //    Event(Reloading) + Bye{Reloading}; give their writers ≤ 1 s.
