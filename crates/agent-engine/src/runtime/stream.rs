@@ -3092,7 +3092,7 @@ mod rich_output_tests {
             delta.send("old streamed ".into());
             delta.send("text, not the summary".into());
             if self.errored {
-                anyhow::bail!("error summary: exit status 17");
+                return Err(RuntimeError::Tool("error summary: exit status 17".into()));
             }
             Ok(self.summary.clone())
         }
@@ -3161,7 +3161,7 @@ mod rich_output_tests {
                 Some(false),
                 "summary".into(),
                 true,
-                "error summary: exit status 17",
+                "Tool execution failed: error summary: exit status 17",
             ),
         ] {
             let calls = if parallel {
