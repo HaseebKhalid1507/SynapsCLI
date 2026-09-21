@@ -301,20 +301,32 @@ impl AuthMethods {
                 )));
             }
         };
-        let binding = anthropic_binding(source, &pinned.credential);
-
         // Update shared auth state so all clones (including spawned stream
         // tasks) immediately see the fresh token. Never a refresh token.
-        {
-            let mut auth_guard = auth.write().await;
-            auth_guard.auth_token = pinned.token.token;
-            auth_guard.auth_type = "oauth".to_string();
-            auth_guard.refresh_token = None;
-            auth_guard.token_expires = Some(pinned.token.expires);
-            auth_guard.bound_credential = Some(binding);
-        }
+        Self::bind_pinned(&auth, source, pinned).await;
 
         Ok(())
+    }
+
+    /// Bind the in-memory Anthropic token to `pinned` — the seat the broker
+    /// just vended for THIS source — exactly as [`Self::refresh_with_broker`]
+    /// does after a vend. This is the ONE sanctioned mid-turn re-pin: the
+    /// request loop calls it after a gated account failover (recognized
+    /// window exhaustion under `Auto`, nothing streamed yet), so the rest of
+    /// the turn keeps the new seat through the normal `WithinTurn` fast path
+    /// and the next turn boundary re-selects as usual. Never a refresh token.
+    pub(super) async fn bind_pinned(
+        auth: &Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        pinned: PinnedToken,
+    ) {
+        let binding = anthropic_binding(source, &pinned.credential);
+        let mut auth_guard = auth.write().await;
+        auth_guard.auth_token = pinned.token.token;
+        auth_guard.auth_type = "oauth".to_string();
+        auth_guard.refresh_token = None;
+        auth_guard.token_expires = Some(pinned.token.expires);
+        auth_guard.bound_credential = Some(binding);
     }
 
     /// `Auto` vend. At a turn boundary (or with no seat pinned on this
