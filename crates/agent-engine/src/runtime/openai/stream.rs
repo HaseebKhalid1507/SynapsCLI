@@ -1477,6 +1477,12 @@ impl CodexSseDecoder {
     }
 
     fn ensure_tool(&mut self, idx: usize) -> &mut CodexToolAccumulator {
+        // `idx` is the provider-supplied `output_index`; a hostile or buggy
+        // provider sending a huge value would otherwise grow this Vec unboundedly
+        // (OOM/DoS). No legitimate response has thousands of concurrent tool
+        // calls, so clamp absurd indices to the last slot instead of allocating.
+        const MAX_TOOLS: usize = 4096;
+        let idx = idx.min(MAX_TOOLS - 1);
         while self.active_tools.len() <= idx {
             self.active_tools.push(CodexToolAccumulator::default());
         }
@@ -1928,6 +1934,24 @@ mod codex_decoder_tests {
         }
         let events = collect_events(&mut rx);
         (decoder, text_acc, events)
+    }
+
+    #[test]
+    fn hostile_output_index_does_not_grow_active_tools_unbounded() {
+        // A provider (or wire corruption) sending an absurd `output_index` must
+        // not drive an unbounded `active_tools` grow (OOM/DoS). ensure_tool clamps
+        // to MAX_TOOLS. Without the clamp this test would attempt to allocate ~1e9
+        // accumulators and hang/OOM.
+        let lines = [
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":1000000000,"delta":"x"}"#,
+            "",
+        ];
+        let (decoder, _text, _events) = drive(&lines);
+        assert!(
+            decoder.active_tools.len() <= 4096,
+            "active_tools grew to {} — output_index not bounded",
+            decoder.active_tools.len()
+        );
     }
 
     #[test]
