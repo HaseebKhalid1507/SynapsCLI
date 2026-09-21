@@ -444,6 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn await_extensions_flows_from_quick_start() {
+        // quick_start=false => caller passes await_extensions=true => the
+        // created SessionConfig blocks on extensions (historic daemon path).
+        let (a, _) = choose_attach(&opts(None, true), &[], None, true).unwrap();
+        match a {
+            Attach::Create { config, .. } => assert!(config.await_extensions),
+            other => panic!("expected Create, got {other:?}"),
+        }
+        // quick_start=true (default) => await_extensions=false => fast start.
+        let (a, _) = choose_attach(&opts(None, true), &[], None, false).unwrap();
+        match a {
+            Attach::Create { config, .. } => assert!(!config.await_extensions),
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn bare_continue_means_most_recent_not_fresh() {
         // F21: `synaps --continue` (no id) over the attach path must reach the
         // daemon as `continue_session: Some(None)` (= most recent journal),

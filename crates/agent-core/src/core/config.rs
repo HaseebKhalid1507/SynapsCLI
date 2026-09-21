@@ -1794,6 +1794,70 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn startup_and_daemon_defaults() {
+        let c = super::load_config_from_str("");
+        assert!(c.startup.quick_start, "quick_start defaults ON");
+        assert_eq!(c.startup.extensions_ready_timeout_secs, 30);
+        assert_eq!(c.daemon.idle_exit_secs, 10);
+        assert_eq!(c.daemon.prompt_abandon_secs, 3600);
+        assert_eq!(c.daemon.parked_evict_secs, 3600);
+        // No warnings for the absent keys.
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+    }
+
+    #[test]
+    fn startup_and_daemon_parse_all_keys() {
+        let c = super::load_config_from_str(concat!(
+            "startup.quick_start = off\n",
+            "startup.extensions_ready_timeout_secs = 45\n",
+            "daemon.idle_exit_secs = 20\n",
+            "daemon.prompt_abandon_secs = 0\n",
+            "daemon.parked_evict_secs = 120\n",
+        ));
+        assert!(!c.startup.quick_start);
+        assert_eq!(c.startup.extensions_ready_timeout_secs, 45);
+        assert_eq!(c.daemon.idle_exit_secs, 20);
+        assert_eq!(c.daemon.prompt_abandon_secs, 0);
+        assert_eq!(c.daemon.parked_evict_secs, 120);
+        assert!(
+            !c.warnings.iter().any(|w| w.contains("unknown")),
+            "no unknown-key warning: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    fn startup_quick_start_accepts_on() {
+        let c = super::load_config_from_str("startup.quick_start = on\n");
+        assert!(c.startup.quick_start);
+    }
+
+    #[test]
+    fn startup_and_daemon_keys_are_known() {
+        for k in [
+            "startup.quick_start",
+            "startup.extensions_ready_timeout_secs",
+            "daemon.idle_exit_secs",
+            "daemon.prompt_abandon_secs",
+            "daemon.parked_evict_secs",
+        ] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
+        }
+    }
+
+    #[test]
+    fn startup_daemon_bad_values_warn_and_keep_defaults() {
+        let c = super::load_config_from_str(concat!(
+            "startup.quick_start = maybe\n",
+            "daemon.idle_exit_secs = soon\n",
+        ));
+        assert!(c.startup.quick_start, "invalid bool keeps default");
+        assert_eq!(c.daemon.idle_exit_secs, 10, "invalid u64 keeps default");
+        assert!(c.warnings.iter().any(|w| w.contains("startup.quick_start")));
+        assert!(c.warnings.iter().any(|w| w.contains("daemon.idle_exit_secs")));
+    }
+
+    #[test]
     fn context_management_defaults_off_and_parses_all_keys() {
         use super::{ContextManagementConfig, ContextManagementMode};
         assert_eq!(
