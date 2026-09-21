@@ -25,6 +25,13 @@
 //! * **One bounded failover.** [`failover`] permits a single switch to a
 //!   different eligible seat, only on a recognized pre-output quota failure,
 //!   never after any output or tool activity and never on an ordinary 429.
+//! * **Perishable capacity first.** [`Strategy::SoonestReset`] ranks eligible
+//!   seats by tier — urgent anchored, then unanchored (first use starts the
+//!   clock), then far anchored, then no reset evidence — soonest budget reset
+//!   first, so capacity about to expire is burned before it is lost.
+//!   Stickiness keeps the currently pinned seat unless a candidate sits in a
+//!   strictly higher tier (or, within tier 1, resets strictly sooner); an
+//!   ineligible current seat is never kept and an excluded one never re-picked.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +66,19 @@ pub const WEEKLY_WINDOW_MAX_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 pub const MAX_FUTURE_OBSERVATION_SKEW_MS: u64 = 5 * 60 * 1000;
 /// Default utilization percentage at/above which a window is exhausted.
 pub const DEFAULT_EXHAUSTED_AT_PERCENT: f64 = 100.0;
+/// Default [`SelectionRequest::urgent_horizon_ms`]: an anchored budget window
+/// resetting within this horizon is "urgent" — its unused capacity is about
+/// to be lost, so it ranks first under [`Strategy::SoonestReset`].
+pub const DEFAULT_URGENT_HORIZON_MS: u64 = 24 * 60 * 60 * 1000;
+/// Tolerance for [`is_unanchored`]: a window whose reported reset is within
+/// this distance of `observed_at + duration` is sliding with the observation
+/// rather than fixed on the provider's calendar. Absorbs poll latency and
+/// clock skew between the provider and this host.
+pub const UNANCHORED_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+/// Maximum `used_percent` (inclusive) for a window to count as "≈0 % used"
+/// in [`is_unanchored`]. A window with real consumption has, by definition,
+/// already been anchored by that first use.
+pub const UNANCHORED_MAX_USED_PERCENT: f64 = 0.5;
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
 
@@ -143,7 +163,9 @@ impl WindowLimit {
             return WindowVerdict::Unknown;
         }
         let used = match self.used_percent {
-            Some(p) if !p.is_finite() || !(0.0..=100.0).contains(&p) => return WindowVerdict::Unknown,
+            Some(p) if !p.is_finite() || !(0.0..=100.0).contains(&p) => {
+                return WindowVerdict::Unknown
+            }
             other => other,
         };
         if self.limit_reached == Some(true) {
@@ -158,7 +180,9 @@ impl WindowLimit {
             Some(p) => WindowVerdict::Headroom {
                 used_percent: Some(p),
             },
-            None if self.limit_reached == Some(false) => WindowVerdict::Headroom { used_percent: None },
+            None if self.limit_reached == Some(false) => {
+                WindowVerdict::Headroom { used_percent: None }
+            }
             None => WindowVerdict::Unknown,
         }
     }
@@ -233,7 +257,7 @@ impl AccountCapacity {
     }
 }
 
-/// Ordering strategy among eligible accounts. Both are deterministic.
+/// Ordering strategy among eligible accounts. All are deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
@@ -244,6 +268,13 @@ pub enum Strategy {
     /// preference order, then storage key. Accounts whose utilization is
     /// unknown (but proven not limit-reached) sort after known ones.
     LowestUtilization,
+    /// Perishable capacity first. Eligible seats are ranked by
+    /// [`Eligible::tier`] (1 = urgent anchored, 2 = unanchored, 3 = anchored
+    /// but not urgent, 4 = no reset evidence); tiers 1 and 3 order by soonest
+    /// budget reset, tier 2 by preference then storage key, tier 4 by lowest
+    /// utilization. Remaining ties: lowest utilization → preference → storage
+    /// key. The only strategy to which [`SelectionRequest::sticky`] applies.
+    SoonestReset,
 }
 
 /// A selection request. All times are epoch milliseconds.
@@ -264,11 +295,25 @@ pub struct SelectionRequest<'a> {
     pub strategy: Strategy,
     /// Utilization percent at/above which a window counts as exhausted.
     pub exhausted_at_percent: f64,
+    /// The seat currently pinned for this provider, if any. Only consulted
+    /// when [`sticky`](Self::sticky) is set under [`Strategy::SoonestReset`];
+    /// it never bypasses eligibility or exclusion.
+    pub current: Option<&'a CredentialRef>,
+    /// An anchored budget window resetting within this many ms of `now_ms`
+    /// is urgent (tier 1). Default [`DEFAULT_URGENT_HORIZON_MS`].
+    pub urgent_horizon_ms: u64,
+    /// Keep [`current`](Self::current) when it is still eligible unless a
+    /// candidate sits in a strictly higher tier (or both are tier 1 and the
+    /// candidate resets strictly sooner). Avoids seat thrash and prompt-cache
+    /// loss. Applies to [`Strategy::SoonestReset`] only; `false` in
+    /// [`new`](Self::new) so other strategies are unaffected.
+    pub sticky: bool,
 }
 
 impl<'a> SelectionRequest<'a> {
     /// Minimal request with defaults: any model, no preference/exclusions,
-    /// lowest-utilization strategy, 100 % exhaustion threshold.
+    /// lowest-utilization strategy, 100 % exhaustion threshold, no current
+    /// seat, default urgent horizon, not sticky.
     pub fn new(provider: OAuthProviderId, now_ms: u64, max_snapshot_age_ms: u64) -> Self {
         Self {
             provider,
@@ -280,6 +325,20 @@ impl<'a> SelectionRequest<'a> {
             exclude: &[],
             strategy: Strategy::LowestUtilization,
             exhausted_at_percent: DEFAULT_EXHAUSTED_AT_PERCENT,
+            current: None,
+            urgent_horizon_ms: DEFAULT_URGENT_HORIZON_MS,
+            sticky: false,
+        }
+    }
+
+    /// Like [`new`](Self::new) but with [`Strategy::SoonestReset`], sticky
+    /// selection and the default urgent horizon. Set
+    /// [`current`](Self::current) for stickiness to have any effect.
+    pub fn soonest_reset(provider: OAuthProviderId, now_ms: u64, max_snapshot_age_ms: u64) -> Self {
+        Self {
+            strategy: Strategy::SoonestReset,
+            sticky: true,
+            ..Self::new(provider, now_ms, max_snapshot_age_ms)
         }
     }
 }
@@ -329,8 +388,13 @@ pub enum RejectReason {
     InvalidLabel {
         label: String,
     },
-    /// Eligible, but another eligible account ranked higher.
-    Outranked,
+    /// Eligible, but another eligible account ranked higher. `rank` is the
+    /// 1-based position in the final ranking (the winner is rank 1), so
+    /// callers can print the full ordered table.
+    Outranked {
+        #[serde(default)]
+        rank: u32,
+    },
 }
 
 impl std::fmt::Display for RejectReason {
@@ -355,7 +419,7 @@ impl std::fmt::Display for RejectReason {
             Self::Excluded => write!(f, "excluded"),
             Self::NotPresent => write!(f, "account not present"),
             Self::InvalidLabel { label } => write!(f, "invalid account label '{label}'"),
-            Self::Outranked => write!(f, "eligible; outranked"),
+            Self::Outranked { rank } => write!(f, "eligible; outranked (rank {rank})"),
         }
     }
 }
@@ -378,6 +442,14 @@ pub enum Selection {
         /// Maximum utilization across the applicable windows, if known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         utilization: Option<f64>,
+        /// The winner's [`Eligible::tier`] (`1..=4`; `0` only when decoded
+        /// from a record written before tiers existed). Computed under every
+        /// strategy so the pick can always be explained.
+        #[serde(default)]
+        tier: u8,
+        /// The winner's [`Eligible::budget_reset_ms`], if it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_reset_ms: Option<u64>,
         /// Candidates that lost — informational.
         rejections: Vec<Rejection>,
     },
@@ -407,12 +479,51 @@ impl Selection {
 pub struct Eligible {
     /// Max utilization over applicable windows (`None` = proven-not-limited only).
     pub utilization: Option<f64>,
+    /// Reset instant of the budget window (see [`budget_window`]), if the
+    /// provider reports one that lies in the future. A reset at or before
+    /// `now_ms` is not evidence of a new window and is reported as `None`.
+    pub budget_reset_ms: Option<u64>,
+    /// Whether the budget window's reset is a fixed instant (`Some(true)`)
+    /// or slides with the observation because the window has not been
+    /// started by a first use yet (`Some(false)`, see [`is_unanchored`]).
+    /// `None` when there is no budget reset to classify.
+    pub anchored: Option<bool>,
+    /// Priority tier under [`Strategy::SoonestReset`], computed for every
+    /// eligible seat regardless of strategy so any ranking can be explained:
+    /// 1 = anchored and resetting within the urgent horizon (capacity about
+    /// to be lost), 2 = unanchored (using it starts the clock), 3 = anchored
+    /// beyond the horizon (earliest deadline first), 4 = no reset evidence
+    /// (headroom proven, deadline unknown). Unknown anchoring with a known
+    /// reset is treated as anchored.
+    pub tier: u8,
+}
+
+/// Tier for an eligible seat; see [`Eligible::tier`].
+fn tier_for(
+    anchored: Option<bool>,
+    budget_reset_ms: Option<u64>,
+    now_ms: u64,
+    urgent_horizon_ms: u64,
+) -> u8 {
+    match (anchored, budget_reset_ms) {
+        (_, None) => 4,
+        (Some(false), Some(_)) => 2,
+        (_, Some(reset)) if reset.saturating_sub(now_ms) <= urgent_horizon_ms => 1,
+        (_, Some(_)) => 3,
+    }
 }
 
 /// Evaluate a single account against the request. Pure; ignores
 /// `explicit_account` and provider matching (the caller filters those).
-pub fn evaluate(req: &SelectionRequest<'_>, cap: &AccountCapacity) -> Result<Eligible, RejectReason> {
-    if req.exclude.iter().any(|c| c.storage_key() == cap.credential.storage_key()) {
+pub fn evaluate(
+    req: &SelectionRequest<'_>,
+    cap: &AccountCapacity,
+) -> Result<Eligible, RejectReason> {
+    if req
+        .exclude
+        .iter()
+        .any(|c| c.storage_key() == cap.credential.storage_key())
+    {
         return Err(RejectReason::Excluded);
     }
     if let Some(until) = cap.cooldown_until_ms {
@@ -480,7 +591,33 @@ pub fn evaluate(req: &SelectionRequest<'_>, cap: &AccountCapacity) -> Result<Eli
     if applicable == 0 {
         return Err(RejectReason::NoLimitEvidence);
     }
-    Ok(Eligible { utilization })
+    // Perishable-capacity evidence. Only a future reset counts: a reset at or
+    // before `now_ms` on a still-fresh reading is not evidence of a new
+    // window (the same rule `NoCapacity::earliest_reset_ms` applies).
+    let budget = budget_window(windows, req.model);
+    let budget_reset_ms = budget
+        .and_then(|w| w.resets_at_ms)
+        .filter(|t| *t > req.now_ms);
+    let anchored = match (budget, budget_reset_ms) {
+        (Some(w), Some(_)) => is_unanchored(w, observed).map(|u| !u),
+        _ => None,
+    };
+    let tier = tier_for(anchored, budget_reset_ms, req.now_ms, req.urgent_horizon_ms);
+    Ok(Eligible {
+        utilization,
+        budget_reset_ms,
+        anchored,
+        tier,
+    })
+}
+
+/// Lowest-utilization ordering: known before unknown, then ascending.
+fn utilization_cmp(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+    a.is_none().cmp(&b.is_none()).then_with(|| {
+        a.unwrap_or(0.0)
+            .partial_cmp(&b.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 fn preference_rank(req: &SelectionRequest<'_>, cred: &CredentialRef) -> usize {
@@ -548,34 +685,66 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
         let pb = preference_rank(req, &b.credential);
         match req.strategy {
             Strategy::PreferenceOrder => pa.cmp(&pb).then_with(|| ka.cmp(&kb)),
-            Strategy::LowestUtilization => {
-                let ua = ea.utilization;
-                let ub = eb.utilization;
-                ua.is_none()
-                    .cmp(&ub.is_none())
-                    .then_with(|| {
-                        ua.unwrap_or(0.0)
-                            .partial_cmp(&ub.unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| pa.cmp(&pb))
-                    .then_with(|| ka.cmp(&kb))
-            }
+            Strategy::LowestUtilization => utilization_cmp(ea.utilization, eb.utilization)
+                .then_with(|| pa.cmp(&pb))
+                .then_with(|| ka.cmp(&kb)),
+            Strategy::SoonestReset => ea
+                .tier
+                .cmp(&eb.tier)
+                .then_with(|| match ea.tier {
+                    // Soonest deadline first; both resets are `Some` here.
+                    1 | 3 => ea.budget_reset_ms.cmp(&eb.budget_reset_ms),
+                    // Unanchored seats have no deadline yet: operator order.
+                    2 => pa.cmp(&pb).then_with(|| ka.cmp(&kb)),
+                    // No reset evidence: fall back to headroom.
+                    _ => utilization_cmp(ea.utilization, eb.utilization),
+                })
+                .then_with(|| utilization_cmp(ea.utilization, eb.utilization))
+                .then_with(|| pa.cmp(&pb))
+                .then_with(|| ka.cmp(&kb)),
         }
     });
+
+    // Stickiness (SoonestReset only): keep the pinned seat unless a candidate
+    // is in a strictly higher tier, or both are urgent and the candidate's
+    // reset is strictly sooner. An ineligible/excluded current seat is not in
+    // `eligible`, so it can never be kept.
+    if req.sticky && req.strategy == Strategy::SoonestReset {
+        if let Some(current) = req.current {
+            let key = current.storage_key();
+            let at = eligible
+                .iter()
+                .position(|(c, _)| c.credential.storage_key() == key);
+            if let Some(i) = at.filter(|i| *i > 0) {
+                let best = &eligible[0].1;
+                let cur = &eligible[i].1;
+                let switch = best.tier < cur.tier
+                    || (best.tier == 1
+                        && cur.tier == 1
+                        && best.budget_reset_ms < cur.budget_reset_ms);
+                if !switch {
+                    eligible[..=i].rotate_right(1);
+                }
+            }
+        }
+    }
 
     match eligible.first() {
         Some((cap, e)) => {
             let winner = cap.credential.clone();
-            for (other, _) in eligible.iter().skip(1) {
+            for (i, (other, _)) in eligible.iter().enumerate().skip(1) {
                 rejections.push(Rejection {
                     credential: other.credential.clone(),
-                    reason: RejectReason::Outranked,
+                    reason: RejectReason::Outranked {
+                        rank: (i + 1) as u32,
+                    },
                 });
             }
             Selection::Selected {
                 credential: winner,
                 utilization: e.utilization,
+                tier: e.tier,
+                budget_reset_ms: e.budget_reset_ms,
                 rejections,
             }
         }
@@ -635,7 +804,9 @@ pub enum FailoverDecision {
         #[serde(with = "cred_serde")]
         credential: CredentialRef,
     },
-    NoFailover { reason: String },
+    NoFailover {
+        reason: String,
+    },
 }
 
 /// Decide whether the request may be retried on another seat.
@@ -681,13 +852,9 @@ pub fn failover(
 
 // ── Helpers shared with the keeper ───────────────────────────────────────────
 
-/// The account-wide weekly window of a reading, if the provider reports one.
-///
-/// Prefers account-wide (`models == None`) weekly windows; falls back to a
-/// model-scoped weekly window only when no account-wide one exists. Order is
-/// deterministic (first by scope, then by `id`).
-pub fn weekly_window(windows: &[WindowLimit]) -> Option<&WindowLimit> {
-    let mut weekly: Vec<&WindowLimit> = windows.iter().filter(|w| w.is_weekly()).collect();
+/// Weekly pick over an arbitrary set of windows: account-wide first, then `id`.
+fn pick_weekly<'w>(windows: impl Iterator<Item = &'w WindowLimit>) -> Option<&'w WindowLimit> {
+    let mut weekly: Vec<&WindowLimit> = windows.filter(|w| w.is_weekly()).collect();
     weekly.sort_by(|a, b| {
         a.models
             .is_some()
@@ -695,6 +862,71 @@ pub fn weekly_window(windows: &[WindowLimit]) -> Option<&WindowLimit> {
             .then_with(|| a.id.cmp(&b.id))
     });
     weekly.into_iter().next()
+}
+
+/// The account-wide weekly window of a reading, if the provider reports one.
+///
+/// Prefers account-wide (`models == None`) weekly windows; falls back to a
+/// model-scoped weekly window only when no account-wide one exists. Order is
+/// deterministic (first by scope, then by `id`).
+pub fn weekly_window(windows: &[WindowLimit]) -> Option<&WindowLimit> {
+    pick_weekly(windows.iter())
+}
+
+/// The *budget window* of a reading for `model`: the window whose reset
+/// decides when unused capacity is lost.
+///
+/// Among the windows that [`apply to`](WindowLimit::applies_to) `model`,
+/// prefers the weekly window with the same preference as [`weekly_window`]
+/// (account-wide before model-scoped, then `id`); otherwise the window with
+/// the longest reported `duration_ms` (ties: account-wide first, then `id`).
+/// `None` when no applicable window reports a duration — a window of unknown
+/// length cannot be a deadline.
+pub fn budget_window<'w>(
+    windows: &'w [WindowLimit],
+    model: Option<&str>,
+) -> Option<&'w WindowLimit> {
+    let applicable = || windows.iter().filter(|w| w.applies_to(model));
+    if let Some(weekly) = pick_weekly(applicable()) {
+        return Some(weekly);
+    }
+    applicable()
+        .filter(|w| w.duration_ms.is_some())
+        .min_by(|a, b| {
+            b.duration_ms
+                .cmp(&a.duration_ms)
+                .then_with(|| a.models.is_some().cmp(&b.models.is_some()))
+                .then_with(|| a.id.cmp(&b.id))
+        })
+}
+
+/// Whether `window`'s reset slides with the observation instead of being a
+/// fixed instant — the signature of a seat whose window has not been started
+/// by a first use (Codex anchors a window at first use after a reset; an
+/// idle seat therefore keeps reporting `reset ≈ observed_at + duration`).
+///
+/// * `Some(true)`: `used_percent` is reported and at most
+///   [`UNANCHORED_MAX_USED_PERCENT`], **and** both `duration_ms` and
+///   `resets_at_ms` are present, **and**
+///   `|resets_at_ms − (observed_at_ms + duration_ms)| ≤ UNANCHORED_TOLERANCE_MS`.
+/// * `Some(false)`: duration and reset are present but the window has been
+///   used, its utilization is unreported, or its reset does not track the
+///   observation (e.g. an Anthropic 7-day window at 0 % still reports the
+///   provider's fixed calendar reset).
+/// * `None`: duration or reset missing — anchoring cannot be judged.
+pub fn is_unanchored(window: &WindowLimit, observed_at_ms: u64) -> Option<bool> {
+    let (Some(duration), Some(reset)) = (window.duration_ms, window.resets_at_ms) else {
+        return None;
+    };
+    let near_zero = matches!(
+        window.used_percent,
+        Some(p) if (0.0..=UNANCHORED_MAX_USED_PERCENT).contains(&p)
+    );
+    if !near_zero {
+        return Some(false);
+    }
+    let expected = observed_at_ms.saturating_add(duration);
+    Some(expected.abs_diff(reset) <= UNANCHORED_TOLERANCE_MS)
 }
 
 #[cfg(test)]
@@ -756,7 +988,10 @@ mod tests {
         w.limit_reached = None;
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
         w.limit_reached = Some(false);
-        assert_eq!(w.verdict(100.0), WindowVerdict::Headroom { used_percent: None });
+        assert_eq!(
+            w.verdict(100.0),
+            WindowVerdict::Headroom { used_percent: None }
+        );
         w.used_percent = Some(f64::NAN);
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
         w.used_percent = Some(140.0);
@@ -773,9 +1008,12 @@ mod tests {
             exhausted_at_percent: f64::NAN,
             ..SelectionRequest::new(OAuthProviderId::OpenAiCodex, NOW, HOUR)
         };
-        assert!(select(&r, &[ok("a", vec![win("primary", 7 * DAY, 1.0, NOW + DAY)])])
-            .selected()
-            .is_none());
+        assert!(select(
+            &r,
+            &[ok("a", vec![win("primary", 7 * DAY, 1.0, NOW + DAY)])]
+        )
+        .selected()
+        .is_none());
     }
 
     #[test]
@@ -828,7 +1066,10 @@ mod tests {
             ..req()
         };
         assert_eq!(
-            select(&r, &[b.clone(), c.clone()]).selected().unwrap().storage_key(),
+            select(&r, &[b.clone(), c.clone()])
+                .selected()
+                .unwrap()
+                .storage_key(),
             "openai-codex@c"
         );
         let a = ok("a", vec![win("primary", 7 * DAY, 90.0, NOW + DAY)]);
@@ -905,7 +1146,10 @@ mod tests {
             }],
         );
         let past_exhausted = ok("p", vec![win("primary", 7 * DAY, 100.0, NOW - DAY)]);
-        let sel = select(&req(), &[exhausted, cooling, unknown_window, past_exhausted]);
+        let sel = select(
+            &req(),
+            &[exhausted, cooling, unknown_window, past_exhausted],
+        );
         let Selection::NoCapacity {
             earliest_reset_ms, ..
         } = &sel
@@ -926,7 +1170,14 @@ mod tests {
             ..win("weekly_sonnet", 7 * DAY, 100.0, NOW + DAY)
         };
         let five_h = win("five_hour", 5 * HOUR, 99.0, NOW + HOUR);
-        let acct = ok("a", vec![win("seven_day", 7 * DAY, 10.0, NOW + DAY), five_h, model_win]);
+        let acct = ok(
+            "a",
+            vec![
+                win("seven_day", 7 * DAY, 10.0, NOW + DAY),
+                five_h,
+                model_win,
+            ],
+        );
         // sonnet request hits the exhausted model window
         let r = SelectionRequest {
             model: Some("sonnet"),
@@ -943,7 +1194,9 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         // no model given: scoped windows still apply (never bypass a limit)
-        assert!(select(&req(), std::slice::from_ref(&acct)).selected().is_none());
+        assert!(select(&req(), std::slice::from_ref(&acct))
+            .selected()
+            .is_none());
         // model listed as unavailable
         let mut unavailable = acct;
         if let QuotaObservation::Ok { models, .. } = &mut unavailable.observation {
@@ -1025,7 +1278,8 @@ mod tests {
     #[test]
     fn other_providers_and_exclusions_are_ignored() {
         let mut other = ok("a", vec![win("primary", 7 * DAY, 0.0, NOW + DAY)]);
-        other.credential = CredentialRef::new(OAuthProviderId::Anthropic, Account::parse("a").unwrap());
+        other.credential =
+            CredentialRef::new(OAuthProviderId::Anthropic, Account::parse("a").unwrap());
         let b = ok("b", vec![win("primary", 7 * DAY, 0.0, NOW + DAY)]);
         let excl = vec![cred("b")];
         let r = SelectionRequest {
@@ -1126,7 +1380,10 @@ mod tests {
         );
         let known = ok("k", vec![win("primary", 7 * DAY, 95.0, NOW + DAY)]);
         assert_eq!(
-            select(&req(), &[proven.clone(), known]).selected().unwrap().storage_key(),
+            select(&req(), &[proven.clone(), known])
+                .selected()
+                .unwrap()
+                .storage_key(),
             "openai-codex@k"
         );
         assert_eq!(
@@ -1170,5 +1427,742 @@ mod tests {
         assert!(json.contains("no_capacity"));
         let back: Selection = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sel);
+    }
+
+    // ── SoonestReset ─────────────────────────────────────────────────────────
+
+    /// Request under [`Strategy::SoonestReset`] with the constructor defaults
+    /// (sticky, default horizon, no current seat).
+    fn sr_req() -> SelectionRequest<'static> {
+        SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 30 * 60 * 1000)
+    }
+
+    /// Observation instant used by [`ok`].
+    const OBSERVED: u64 = NOW - 1000;
+
+    /// Anchored weekly window: reset is a fixed instant unrelated to the
+    /// observation (Anthropic-like, or a Codex seat already in use).
+    fn anchored(used: f64, resets: u64) -> WindowLimit {
+        win("primary", 7 * DAY, used, resets)
+    }
+
+    /// Unanchored weekly window: idle Codex-like seat reporting 0 % and a
+    /// reset exactly one duration after the observation.
+    fn unanchored() -> WindowLimit {
+        win("primary", 7 * DAY, 0.0, OBSERVED + 7 * DAY)
+    }
+
+    /// Headroom proven but no reset instant reported.
+    fn no_reset(used: f64) -> WindowLimit {
+        WindowLimit {
+            resets_at_ms: None,
+            ..win("primary", 7 * DAY, used, 0)
+        }
+    }
+
+    fn label_of(sel: &Selection) -> &str {
+        sel.selected().expect("a selection").account.label_str()
+    }
+
+    fn ranks(sel: &Selection) -> Vec<(String, u32)> {
+        let (Selection::Selected { rejections, .. } | Selection::NoCapacity { rejections, .. }) =
+            sel;
+        rejections
+            .iter()
+            .filter_map(|r| match r.reason {
+                RejectReason::Outranked { rank } => {
+                    Some((r.credential.account.label_str().to_string(), rank))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn soonest_reset_beats_lower_utilization_where_lowest_utilization_does_not() {
+        // `a` is busier but its capacity expires sooner.
+        let a = ok("a", vec![anchored(60.0, NOW + 2 * DAY)]);
+        let b = ok("b", vec![anchored(10.0, NOW + 5 * DAY)]);
+        let cands = [b.clone(), a.clone()];
+        match select(&sr_req(), &cands) {
+            Selection::Selected {
+                credential,
+                tier,
+                budget_reset_ms,
+                utilization,
+                ..
+            } => {
+                assert_eq!(credential.storage_key(), "openai-codex@a");
+                assert_eq!(tier, 3);
+                assert_eq!(budget_reset_ms, Some(NOW + 2 * DAY));
+                assert_eq!(utilization, Some(60.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Same input, previous strategy: spreads load to the emptier seat.
+        assert_eq!(label_of(&select(&req(), &cands)), "b");
+        // `new` keeps its defaults byte-for-byte: not sticky, no current.
+        let r = req();
+        assert_eq!(r.strategy, Strategy::LowestUtilization);
+        assert!(!r.sticky && r.current.is_none());
+        assert_eq!(r.urgent_horizon_ms, DEFAULT_URGENT_HORIZON_MS);
+        let s = sr_req();
+        assert_eq!(s.strategy, Strategy::SoonestReset);
+        assert!(s.sticky && s.current.is_none());
+        assert_eq!(s.urgent_horizon_ms, DEFAULT_URGENT_HORIZON_MS);
+    }
+
+    #[test]
+    fn tiers_order_urgent_then_unanchored_then_far_then_no_reset() {
+        let urgent = ok("u", vec![anchored(50.0, NOW + 6 * HOUR)]);
+        let sliding = ok("s", vec![unanchored()]);
+        let far = ok("f", vec![anchored(0.0, NOW + 5 * DAY)]);
+        let none = ok("n", vec![no_reset(0.0)]);
+        let r = sr_req();
+        for (cap, tier, anch) in [
+            (&urgent, 1u8, Some(true)),
+            (&sliding, 2, Some(false)),
+            (&far, 3, Some(true)),
+            (&none, 4, None),
+        ] {
+            let e = evaluate(&r, cap).unwrap();
+            assert_eq!(e.tier, tier, "{}", cap.credential.storage_key());
+            assert_eq!(e.anchored, anch, "{}", cap.credential.storage_key());
+        }
+        // Tier is computed regardless of strategy (for `auth plan`).
+        assert_eq!(evaluate(&req(), &sliding).unwrap().tier, 2);
+        // Lower utilization/preference never beats a higher tier.
+        let cands = [none.clone(), far.clone(), sliding.clone(), urgent.clone()];
+        let sel = select(&r, &cands);
+        assert_eq!(label_of(&sel), "u");
+        assert_eq!(
+            ranks(&sel),
+            vec![
+                ("s".to_string(), 2),
+                ("f".to_string(), 3),
+                ("n".to_string(), 4)
+            ]
+        );
+        assert_eq!(
+            label_of(&select(&r, &[none.clone(), far.clone(), sliding])),
+            "s"
+        );
+        assert_eq!(label_of(&select(&r, &[none.clone(), far])), "f");
+        assert_eq!(label_of(&select(&r, &[none])), "n");
+        // Urgency is horizon-relative: with a 1 h horizon the 6 h seat is tier 3
+        // and loses to the unanchored seat.
+        let short = SelectionRequest {
+            urgent_horizon_ms: HOUR,
+            ..sr_req()
+        };
+        assert_eq!(evaluate(&short, &urgent).unwrap().tier, 3);
+        assert_eq!(
+            label_of(&select(&short, &[urgent, ok("s", vec![unanchored()])])),
+            "s"
+        );
+        // Exactly at the horizon is still urgent (inclusive).
+        let edge = ok("e", vec![anchored(0.0, NOW + DEFAULT_URGENT_HORIZON_MS)]);
+        assert_eq!(evaluate(&sr_req(), &edge).unwrap().tier, 1);
+    }
+
+    #[test]
+    fn within_tier_orders_by_reset_preference_or_utilization() {
+        // Tier 1: soonest reset wins even with higher utilization.
+        let a = ok("a", vec![anchored(90.0, NOW + 2 * HOUR)]);
+        let b = ok("b", vec![anchored(1.0, NOW + 3 * HOUR)]);
+        assert_eq!(label_of(&select(&sr_req(), &[b, a])), "a");
+        // Tier 2: preference, then storage key; utilization is irrelevant.
+        let s1 = ok("s1", vec![unanchored()]);
+        let s2 = ok("s2", vec![unanchored()]);
+        assert_eq!(
+            label_of(&select(&sr_req(), &[s2.clone(), s1.clone()])),
+            "s1"
+        );
+        let pref = vec!["s2".to_string()];
+        let r = SelectionRequest {
+            preference: &pref,
+            ..sr_req()
+        };
+        assert_eq!(label_of(&select(&r, &[s1, s2])), "s2");
+        // Tier 4: lowest utilization, unknown last.
+        let n1 = ok("n1", vec![no_reset(40.0)]);
+        let n2 = ok("n2", vec![no_reset(5.0)]);
+        let n3 = ok(
+            "n3",
+            vec![WindowLimit {
+                used_percent: None,
+                limit_reached: Some(false),
+                ..no_reset(0.0)
+            }],
+        );
+        let sel = select(&sr_req(), &[n3, n1, n2]);
+        assert_eq!(label_of(&sel), "n2");
+        assert_eq!(
+            ranks(&sel),
+            vec![("n1".to_string(), 2), ("n3".to_string(), 3)]
+        );
+        // Equal resets in tier 3: lowest utilization breaks the tie.
+        let t1 = ok("t1", vec![anchored(30.0, NOW + 3 * DAY)]);
+        let t2 = ok("t2", vec![anchored(20.0, NOW + 3 * DAY)]);
+        assert_eq!(label_of(&select(&sr_req(), &[t1, t2])), "t2");
+    }
+
+    #[test]
+    fn exhausted_soonest_seat_is_skipped_to_next_soonest() {
+        let x = ok("x", vec![anchored(100.0, NOW + HOUR)]);
+        let a = ok("a", vec![anchored(20.0, NOW + 2 * DAY)]);
+        let b = ok("b", vec![anchored(20.0, NOW + 3 * DAY)]);
+        let sel = select(&sr_req(), &[b, x.clone(), a]);
+        assert_eq!(label_of(&sel), "a");
+        let Selection::Selected { rejections, .. } = &sel else {
+            panic!("expected selection");
+        };
+        assert!(rejections
+            .iter()
+            .any(|r| r.credential.account.label_str() == "x"
+                && r.reason
+                    == RejectReason::Exhausted {
+                        window: "primary".into(),
+                        resets_at_ms: Some(NOW + HOUR),
+                    }));
+        // Everything exhausted: earliest *future* reset is reported.
+        let y = ok("y", vec![anchored(100.0, NOW + 2 * DAY)]);
+        let past = ok("p", vec![anchored(100.0, NOW - HOUR)]);
+        match select(&sr_req(), &[y, past, x]) {
+            Selection::NoCapacity {
+                earliest_reset_ms, ..
+            } => assert_eq!(earliest_reset_ms, Some(NOW + HOUR)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn five_hour_throttle_rejects_then_reenters_after_reset() {
+        let throttled = ok(
+            "t",
+            vec![
+                win("five_hour", 5 * HOUR, 100.0, NOW + HOUR),
+                win("seven_day", 7 * DAY, 30.0, NOW + 2 * DAY),
+            ],
+        );
+        let other = ok("o", vec![win("seven_day", 7 * DAY, 10.0, NOW + 4 * DAY)]);
+        let sel = select(&sr_req(), &[throttled, other.clone()]);
+        assert_eq!(label_of(&sel), "o");
+        let Selection::Selected { rejections, .. } = &sel else {
+            panic!("expected selection");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            RejectReason::Exhausted {
+                window: "five_hour".into(),
+                resets_at_ms: Some(NOW + HOUR),
+            }
+        );
+        // Clock past the 5 h reset, fresh observations: the 5 h window is
+        // empty again and the seat wins on its sooner 7 d deadline.
+        let now2 = NOW + HOUR + 1;
+        let mut throttled2 = ok(
+            "t",
+            vec![
+                win("five_hour", 5 * HOUR, 0.0, now2 + 5 * HOUR),
+                win("seven_day", 7 * DAY, 30.0, NOW + 2 * DAY),
+            ],
+        );
+        throttled2.observed_at_ms = Some(now2 - 1000);
+        let mut other2 = other;
+        other2.observed_at_ms = Some(now2 - 1000);
+        let r = SelectionRequest {
+            now_ms: now2,
+            ..sr_req()
+        };
+        match select(&r, &[other2, throttled2]) {
+            Selection::Selected {
+                credential,
+                tier,
+                budget_reset_ms,
+                ..
+            } => {
+                assert_eq!(credential.storage_key(), "openai-codex@t");
+                assert_eq!(tier, 3);
+                assert_eq!(budget_reset_ms, Some(NOW + 2 * DAY));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_unanchored_classifies_sliding_resets_only() {
+        let obs = NOW - 90_000;
+        // Codex-like idle seat: reset == observed + duration.
+        let codex_idle = win("primary", 7 * DAY, 0.0, obs + 7 * DAY);
+        assert_eq!(is_unanchored(&codex_idle, obs), Some(true));
+        // One minute of skew either way is within tolerance.
+        let skewed = win("primary", 7 * DAY, 0.0, obs + 7 * DAY + 60_000);
+        assert_eq!(is_unanchored(&skewed, obs), Some(true));
+        let skewed = win("primary", 7 * DAY, 0.0, obs + 7 * DAY - 60_000);
+        assert_eq!(is_unanchored(&skewed, obs), Some(true));
+        // Just beyond tolerance → anchored.
+        let beyond = win(
+            "primary",
+            7 * DAY,
+            0.0,
+            obs + 7 * DAY + UNANCHORED_TOLERANCE_MS + 1,
+        );
+        assert_eq!(is_unanchored(&beyond, obs), Some(false));
+        // Anthropic-like: 0 % but the calendar reset is 5 days out.
+        let anthropic = win("seven_day", 7 * DAY, 0.0, obs + 5 * DAY);
+        assert_eq!(is_unanchored(&anthropic, obs), Some(false));
+        // Real consumption means the window has already been anchored.
+        let used = win("primary", 7 * DAY, 40.0, obs + 7 * DAY);
+        assert_eq!(is_unanchored(&used, obs), Some(false));
+        // Threshold is inclusive.
+        let half = win(
+            "primary",
+            7 * DAY,
+            UNANCHORED_MAX_USED_PERCENT,
+            obs + 7 * DAY,
+        );
+        assert_eq!(is_unanchored(&half, obs), Some(true));
+        // Unreported utilization is never evidence of idleness.
+        let unreported = WindowLimit {
+            used_percent: None,
+            limit_reached: Some(false),
+            ..codex_idle.clone()
+        };
+        assert_eq!(is_unanchored(&unreported, obs), Some(false));
+        // Missing duration or reset → unknown.
+        let no_dur = WindowLimit {
+            duration_ms: None,
+            ..codex_idle.clone()
+        };
+        assert_eq!(is_unanchored(&no_dur, obs), None);
+        let no_reset = WindowLimit {
+            resets_at_ms: None,
+            ..codex_idle
+        };
+        assert_eq!(is_unanchored(&no_reset, obs), None);
+    }
+
+    #[test]
+    fn budget_window_prefers_weekly_then_longest() {
+        let five_h = win("five_hour", 5 * HOUR, 0.0, NOW + HOUR);
+        let one_h = win("one_hour", HOUR, 0.0, NOW + HOUR);
+        let thirty_d = win("thirty_day", 30 * DAY, 0.0, NOW + 20 * DAY);
+        let weekly_wide = win("weekly", 7 * DAY, 0.0, NOW + 3 * DAY);
+        let weekly_scoped = WindowLimit {
+            id: "aaa_weekly_scoped".into(),
+            models: Some(vec!["m".into()]),
+            ..weekly_wide.clone()
+        };
+        // Account-wide weekly beats model-scoped weekly beats longest other.
+        let all = [
+            thirty_d.clone(),
+            weekly_scoped.clone(),
+            five_h.clone(),
+            weekly_wide.clone(),
+        ];
+        assert_eq!(
+            budget_window(&all, Some("m")).map(|w| w.id.as_str()),
+            Some("weekly")
+        );
+        assert_eq!(
+            budget_window(&all, None).map(|w| w.id.as_str()),
+            Some("weekly")
+        );
+        let no_wide = [thirty_d.clone(), weekly_scoped.clone(), five_h.clone()];
+        assert_eq!(
+            budget_window(&no_wide, Some("m")).map(|w| w.id.as_str()),
+            Some("aaa_weekly_scoped")
+        );
+        // Scoped weekly does not apply to another model → longest applicable.
+        assert_eq!(
+            budget_window(&no_wide, Some("other")).map(|w| w.id.as_str()),
+            Some("thirty_day")
+        );
+        // No weekly at all → longest duration.
+        assert_eq!(
+            budget_window(&[five_h.clone(), one_h.clone()], None).map(|w| w.id.as_str()),
+            Some("five_hour")
+        );
+        // Equal durations: account-wide first, then id.
+        let b5 = WindowLimit {
+            id: "b5".into(),
+            ..five_h.clone()
+        };
+        let a5_scoped = WindowLimit {
+            id: "a5".into(),
+            models: Some(vec!["m".into()]),
+            ..five_h.clone()
+        };
+        assert_eq!(
+            budget_window(&[b5.clone(), a5_scoped.clone()], Some("m")).map(|w| w.id.as_str()),
+            Some("b5")
+        );
+        let a5 = WindowLimit {
+            id: "a5".into(),
+            ..five_h.clone()
+        };
+        assert_eq!(
+            budget_window(&[b5, a5], None).map(|w| w.id.as_str()),
+            Some("a5")
+        );
+        // No durations → no budget window.
+        let no_dur = WindowLimit {
+            duration_ms: None,
+            ..five_h
+        };
+        assert!(budget_window(&[no_dur.clone(), no_dur], None).is_none());
+        assert!(budget_window(&[], None).is_none());
+        // `weekly_window` is unchanged by the shared picker.
+        assert_eq!(weekly_window(&all).map(|w| w.id.as_str()), Some("weekly"));
+    }
+
+    #[test]
+    fn past_reset_with_headroom_is_not_reset_evidence() {
+        // Fresh reading, headroom, but the reported reset already passed: no
+        // deadline can be inferred → tier 4, not tier 1 with a zero horizon.
+        let stale_reset = ok("p", vec![anchored(20.0, NOW - 1)]);
+        let e = evaluate(&sr_req(), &stale_reset).unwrap();
+        assert_eq!(e.budget_reset_ms, None);
+        assert_eq!(e.anchored, None);
+        assert_eq!(e.tier, 4);
+        let far = ok("f", vec![anchored(80.0, NOW + 6 * DAY)]);
+        assert_eq!(label_of(&select(&sr_req(), &[stale_reset, far])), "f");
+    }
+
+    #[test]
+    fn sticky_keeps_current_within_tier_3() {
+        let cur = cred("cur");
+        let current = ok("cur", vec![anchored(30.0, NOW + 5 * DAY)]);
+        let sooner = ok("soon", vec![anchored(10.0, NOW + 2 * DAY)]);
+        let r = SelectionRequest {
+            current: Some(&cur),
+            ..sr_req()
+        };
+        let sel = select(&r, &[sooner.clone(), current.clone()]);
+        assert_eq!(label_of(&sel), "cur");
+        assert_eq!(ranks(&sel), vec![("soon".to_string(), 2)]);
+        // Without a current seat the sooner deadline wins.
+        assert_eq!(
+            label_of(&select(&sr_req(), &[sooner.clone(), current.clone()])),
+            "soon"
+        );
+        // sticky = false ignores `current`.
+        let r = SelectionRequest { sticky: false, ..r };
+        assert_eq!(label_of(&select(&r, &[sooner, current])), "soon");
+    }
+
+    #[test]
+    fn sticky_yields_to_strictly_higher_tier() {
+        let cur = cred("cur");
+        let current = ok("cur", vec![anchored(10.0, NOW + 5 * DAY)]);
+        let urgent = ok("urg", vec![anchored(90.0, NOW + 6 * HOUR)]);
+        let r = SelectionRequest {
+            current: Some(&cur),
+            ..sr_req()
+        };
+        assert_eq!(label_of(&select(&r, &[current.clone(), urgent])), "urg");
+        // Tier 2 also outranks a tier-3 current seat.
+        let sliding = ok("sld", vec![unanchored()]);
+        assert_eq!(label_of(&select(&r, &[current, sliding])), "sld");
+        // But a tier-2 current seat is kept over another tier-2 seat that
+        // would otherwise sort first, and over any tier-3 seat.
+        let cur_sliding = ok("cur", vec![unanchored()]);
+        let a_sliding = ok("a", vec![unanchored()]);
+        let far = ok("far", vec![anchored(0.0, NOW + 2 * DAY)]);
+        assert_eq!(label_of(&select(&r, &[a_sliding, far, cur_sliding])), "cur");
+    }
+
+    #[test]
+    fn sticky_tier1_yields_only_to_strictly_sooner_reset() {
+        let cur = cred("cur");
+        let current = ok("cur", vec![anchored(50.0, NOW + 10 * HOUR)]);
+        let r = SelectionRequest {
+            current: Some(&cur),
+            ..sr_req()
+        };
+        let sooner = ok("soon", vec![anchored(80.0, NOW + 6 * HOUR)]);
+        assert_eq!(label_of(&select(&r, &[current.clone(), sooner])), "soon");
+        // Equal reset with lower utilization would sort first, but it is not
+        // strictly sooner → current kept.
+        let equal = ok("eq", vec![anchored(1.0, NOW + 10 * HOUR)]);
+        let sel = select(&r, &[equal.clone(), current.clone()]);
+        assert_eq!(label_of(&sel), "cur");
+        assert_eq!(ranks(&sel), vec![("eq".to_string(), 2)]);
+        // Later reset in tier 1 → current kept.
+        let later = ok("late", vec![anchored(0.0, NOW + 12 * HOUR)]);
+        assert_eq!(label_of(&select(&r, &[later, current])), "cur");
+    }
+
+    #[test]
+    fn sticky_never_keeps_ineligible_current_and_only_applies_to_soonest_reset() {
+        let cur = cred("cur");
+        let other = ok("o", vec![anchored(50.0, NOW + 5 * DAY)]);
+        let r = SelectionRequest {
+            current: Some(&cur),
+            ..sr_req()
+        };
+        // Exhausted current → switch.
+        let exhausted = ok("cur", vec![anchored(100.0, NOW + DAY)]);
+        assert_eq!(label_of(&select(&r, &[exhausted, other.clone()])), "o");
+        // Cooling-down current → switch.
+        let mut cooling = ok("cur", vec![anchored(0.0, NOW + DAY)]);
+        cooling.cooldown_until_ms = Some(NOW + HOUR);
+        assert_eq!(label_of(&select(&r, &[cooling, other.clone()])), "o");
+        // Stale current → switch.
+        let mut stale = ok("cur", vec![anchored(0.0, NOW + DAY)]);
+        stale.observed_at_ms = Some(NOW - 2 * HOUR);
+        assert_eq!(label_of(&select(&r, &[stale, other.clone()])), "o");
+        // Excluded current → switch (exclusion wins over stickiness).
+        let excl = vec![cur.clone()];
+        let r_excl = SelectionRequest {
+            exclude: &excl,
+            ..r.clone()
+        };
+        let healthy = ok("cur", vec![anchored(0.0, NOW + DAY)]);
+        assert_eq!(
+            label_of(&select(&r_excl, &[healthy.clone(), other.clone()])),
+            "o"
+        );
+        // Current not among candidates at all → normal ranking, no panic.
+        assert_eq!(label_of(&select(&r, std::slice::from_ref(&other))), "o");
+        // Stickiness never applies to the other strategies, even if asked.
+        let busy_current = ok("cur", vec![anchored(90.0, NOW + 5 * DAY)]);
+        let r_lu = SelectionRequest {
+            strategy: Strategy::LowestUtilization,
+            sticky: true,
+            current: Some(&cur),
+            ..req()
+        };
+        assert_eq!(
+            label_of(&select(&r_lu, &[busy_current.clone(), other.clone()])),
+            "o"
+        );
+        let pref = vec!["o".to_string()];
+        let r_po = SelectionRequest {
+            strategy: Strategy::PreferenceOrder,
+            sticky: true,
+            current: Some(&cur),
+            preference: &pref,
+            ..req()
+        };
+        assert_eq!(label_of(&select(&r_po, &[busy_current, other])), "o");
+    }
+
+    #[test]
+    fn failover_under_soonest_reset_never_repicks_sticky_failed_seat() {
+        let cur = cred("a");
+        // `a` still claims headroom and would be kept by stickiness.
+        let a = ok("a", vec![anchored(0.0, NOW + 2 * DAY)]);
+        let b = ok("b", vec![anchored(50.0, NOW + 5 * DAY)]);
+        let r = SelectionRequest {
+            current: Some(&cur),
+            ..sr_req()
+        };
+        assert_eq!(label_of(&select(&r, &[a.clone(), b.clone()])), "a");
+        let ev = FailureEvidence {
+            kind: FailureKind::QuotaExhaustedPreOutput,
+            output_started: false,
+            tool_activity: false,
+            failovers_so_far: 0,
+        };
+        match failover(&r, &cur, &ev, &[a.clone(), b]) {
+            FailoverDecision::Failover { credential } => {
+                assert_eq!(credential.storage_key(), "openai-codex@b")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            failover(&r, &cur, &ev, &[a]),
+            FailoverDecision::NoFailover { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_account_under_soonest_reset_never_falls_back() {
+        let a = ok("a", vec![anchored(100.0, NOW + HOUR)]);
+        let b = ok("b", vec![anchored(0.0, NOW + 6 * HOUR)]);
+        let cur = cred("b");
+        // Explicit exhausted seat: fail, even though `b` is urgent and pinned.
+        let r = SelectionRequest {
+            explicit_account: Some("a"),
+            current: Some(&cur),
+            ..sr_req()
+        };
+        match select(&r, &[a.clone(), b.clone()]) {
+            Selection::NoCapacity { rejections, .. } => {
+                assert_eq!(rejections.len(), 1);
+                assert_eq!(rejections[0].credential.storage_key(), "openai-codex@a");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Explicit healthy seat: other seats are never even evaluated.
+        let r = SelectionRequest {
+            explicit_account: Some("b"),
+            ..sr_req()
+        };
+        match select(&r, &[a, b]) {
+            Selection::Selected {
+                credential,
+                rejections,
+                tier,
+                ..
+            } => {
+                assert_eq!(credential.storage_key(), "openai-codex@b");
+                assert!(rejections.is_empty());
+                assert_eq!(tier, 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// All permutations of `items` (Heap's algorithm), for order-independence checks.
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        fn go<T: Clone>(k: usize, a: &mut Vec<T>, out: &mut Vec<Vec<T>>) {
+            if k <= 1 {
+                out.push(a.clone());
+                return;
+            }
+            go(k - 1, a, out);
+            for i in 0..k - 1 {
+                if k % 2 == 0 {
+                    a.swap(i, k - 1);
+                } else {
+                    a.swap(0, k - 1);
+                }
+                go(k - 1, a, out);
+            }
+        }
+        let mut a = items.to_vec();
+        let mut out = Vec::new();
+        go(a.len(), &mut a, &mut out);
+        out
+    }
+
+    #[test]
+    fn soonest_reset_is_deterministic_under_candidate_shuffle() {
+        let cur = cred("t3b");
+        let seats = vec![
+            ok("t1", vec![anchored(70.0, NOW + 3 * HOUR)]),
+            ok("t2", vec![unanchored()]),
+            ok("t3a", vec![anchored(5.0, NOW + 2 * DAY)]),
+            ok("t3b", vec![anchored(40.0, NOW + 4 * DAY)]),
+            ok("x", vec![anchored(100.0, NOW + DAY)]),
+        ];
+        let r = SelectionRequest {
+            current: Some(&cur),
+            ..sr_req()
+        };
+        let perms = permutations(&seats);
+        assert_eq!(perms.len(), 120);
+        let baseline = select(&r, &seats);
+        assert_eq!(label_of(&baseline), "t1");
+        let normalize = |sel: &Selection| {
+            let Selection::Selected {
+                credential,
+                tier,
+                budget_reset_ms,
+                utilization,
+                rejections,
+            } = sel
+            else {
+                panic!("expected selection");
+            };
+            let mut rej: Vec<(String, RejectReason)> = rejections
+                .iter()
+                .map(|r| (r.credential.storage_key(), r.reason.clone()))
+                .collect();
+            rej.sort_by(|a, b| a.0.cmp(&b.0));
+            (
+                credential.storage_key(),
+                *tier,
+                *budget_reset_ms,
+                *utilization,
+                rej,
+            )
+        };
+        let expected = normalize(&baseline);
+        assert_eq!(
+            ranks(&baseline),
+            vec![
+                ("t2".to_string(), 2),
+                ("t3a".to_string(), 3),
+                ("t3b".to_string(), 4)
+            ]
+        );
+        for p in perms {
+            assert_eq!(normalize(&select(&r, &p)), expected);
+        }
+    }
+
+    #[test]
+    fn outranked_ranks_are_two_to_n_in_ranking_order() {
+        let seats = [
+            ok("c", vec![anchored(0.0, NOW + 4 * DAY)]),
+            ok("a", vec![anchored(0.0, NOW + 2 * DAY)]),
+            ok("d", vec![anchored(0.0, NOW + 5 * DAY)]),
+            ok("b", vec![anchored(0.0, NOW + 3 * DAY)]),
+        ];
+        let sel = select(&sr_req(), &seats);
+        assert_eq!(label_of(&sel), "a");
+        assert_eq!(
+            ranks(&sel),
+            vec![
+                ("b".to_string(), 2),
+                ("c".to_string(), 3),
+                ("d".to_string(), 4)
+            ]
+        );
+        // Ranks are produced under the existing strategies too.
+        let lu = [
+            ok("hi", vec![anchored(80.0, NOW + DAY)]),
+            ok("lo", vec![anchored(10.0, NOW + DAY)]),
+            ok("mid", vec![anchored(50.0, NOW + DAY)]),
+        ];
+        let sel = select(&req(), &lu);
+        assert_eq!(label_of(&sel), "lo");
+        assert_eq!(
+            ranks(&sel),
+            vec![("mid".to_string(), 2), ("hi".to_string(), 3)]
+        );
+        assert_eq!(
+            RejectReason::Outranked { rank: 3 }.to_string(),
+            "eligible; outranked (rank 3)"
+        );
+    }
+
+    #[test]
+    fn soonest_reset_serde_is_backward_compatible() {
+        assert_eq!(
+            serde_json::to_string(&Strategy::SoonestReset).unwrap(),
+            "\"soonest_reset\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Strategy>("\"soonest_reset\"").unwrap(),
+            Strategy::SoonestReset
+        );
+        let a = ok("a", vec![anchored(10.0, NOW + 2 * HOUR)]);
+        let b = ok("b", vec![anchored(10.0, NOW + 3 * HOUR)]);
+        let sel = select(&sr_req(), &[a, b]);
+        let json = serde_json::to_string(&sel).unwrap();
+        assert!(json.contains("\"tier\":1"));
+        assert!(json.contains("\"budget_reset_ms\""));
+        assert!(json.contains("\"rank\":2"));
+        assert_eq!(serde_json::from_str::<Selection>(&json).unwrap(), sel);
+        // Records written before tiers/ranks existed still decode.
+        let old = r#"{"outcome":"selected","credential":"openai-codex@a","utilization":10.0,"rejections":[{"credential":"openai-codex@b","reason":{"reason":"outranked"}}]}"#;
+        match serde_json::from_str::<Selection>(old).unwrap() {
+            Selection::Selected {
+                tier,
+                budget_reset_ms,
+                rejections,
+                ..
+            } => {
+                assert_eq!(tier, 0);
+                assert_eq!(budget_reset_ms, None);
+                assert_eq!(rejections[0].reason, RejectReason::Outranked { rank: 0 });
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
