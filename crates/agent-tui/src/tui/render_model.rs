@@ -156,4 +156,6 @@ pub(crate) struct SecretPromptSnap {
     pub(crate) title: String,
     pub(crate) prompt: String,
     pub(crate) masked_buffer_chars: usize,
+    /// `Confirm` only: Allow button focused (else Deny).
+    pub(crate) confirm_allow_focused: bool,
 }
