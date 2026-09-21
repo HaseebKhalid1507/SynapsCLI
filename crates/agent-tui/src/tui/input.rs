@@ -891,37 +891,48 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         .active()
         .is_some_and(|p| p.kind == PromptKind::Confirm);
     if is_confirm {
-        // Confirm dialog: a two-button lightbox, no free-text field.
+        // Confirm dialog: a button lightbox, no free-text field.
         //   y / Y                → Allow (answers "y")
+        //   a / A                → Allow all this session (answers "always";
+        //                          only when offered, else degrades to Allow)
         //   n / N / Esc          → Deny  (answers None)
         //   ← → Tab BackTab h l  → move focus between the buttons
         //   Enter                → activate the FOCUSED button; Deny is the
         //                          default focus, so a bare Enter denies.
         // Everything else — including pastes — is swallowed so nothing can
         // accidentally form an allow.
+        use synaps_cli::tools::ConfirmChoice;
         if let Event::Key(key) = event {
-            match key.code {
+            let answered = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    app.secret_prompts.confirm_allow();
-                    reconcile_secret_prompt(app);
+                    app.secret_prompts.confirm_answer(ConfirmChoice::Allow)
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    app.secret_prompts.confirm_answer(ConfirmChoice::AllowAll)
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    app.secret_prompts.cancel();
-                    reconcile_secret_prompt(app);
+                    app.secret_prompts.confirm_answer(ConfirmChoice::Deny)
                 }
-                KeyCode::Enter => {
-                    app.secret_prompts.confirm_activate_focused();
-                    reconcile_secret_prompt(app);
+                KeyCode::Enter => app.secret_prompts.confirm_activate_focused(),
+                KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                    app.secret_prompts.move_confirm_focus(true);
+                    None
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::BackTab
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => {
-                    app.secret_prompts.toggle_confirm_focus();
+                KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
+                    app.secret_prompts.move_confirm_focus(false);
+                    None
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(choice) = answered {
+                reconcile_secret_prompt(app);
+                if choice == ConfirmChoice::AllowAll {
+                    app.push_msg(ChatMessage::System(
+                        "Allow all: extension tool-call confirms are auto-approved for the rest of \
+                         this session (subagents included). Restart the session to re-arm the gate."
+                            .to_string(),
+                    ));
+                }
             }
         }
         return InputAction::None;

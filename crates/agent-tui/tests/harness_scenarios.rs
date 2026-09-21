@@ -17,6 +17,7 @@
 
 use agent_tui::tui::testing::TestHarness;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use agent_engine::tools::ConfirmChoice;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1937,6 +1938,8 @@ fn effort_enter_closes_modal_and_emits_guarded_apply_action() {
 // channel as secret prompts but are y/n questions: the FULL body (the exact
 // tool-id list) must be visible and unmasked, and only `y` may allow.
 
+const CONFIRM_TOOL_CALL_TITLE: &str = "Confirm tool call";
+
 const CONFIRM_BODY: &str = "The model requests session-scoped activation of 2 exact tool id(s):\n\
     mcp.github.create_issue\n\
     mcp.github.list_issues\n\
@@ -2005,25 +2008,44 @@ fn scenario_confirm_prompt_ignores_other_keys_and_paste() {
 #[test]
 fn scenario_confirm_prompt_renders_two_buttons_deny_focused_by_default() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let _rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+    // activate_tools gate: only Allow / Deny — the runtime accepts y/yes only.
+    let _rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
     let frame = h.snapshot();
     assert!(frame.contains("[ Allow (y) ]"), "allow button:\n{frame}");
     assert!(frame.contains("[ Deny (n) ]"), "deny button:\n{frame}");
-    assert!(frame.contains("←/→/Tab select · Enter confirm"), "footer:\n{frame}");
     assert!(
-        !h.confirm_allow_focused(),
+        !frame.contains("Allow all"),
+        "activation gate must not offer Allow all:\n{frame}"
+    );
+    assert!(frame.contains("←/→/Tab select · Enter confirm"), "footer:\n{frame}");
+    assert_eq!(
+        h.confirm_focus(),
+        ConfirmChoice::Deny,
         "Deny must be the default focus (fail-closed Enter)"
     );
 }
 
 #[test]
+fn scenario_confirm_tool_call_offers_allow_all_button() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let _rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8 — rm -rf build/");
+    let frame = h.snapshot();
+    assert!(frame.contains("[ Allow (y) ]"), "{frame}");
+    assert!(frame.contains("[ Allow all this session (a) ]"), "{frame}");
+    assert!(frame.contains("[ Deny (n) ]"), "{frame}");
+    assert!(frame.contains("y allow · a allow all · n/esc deny"), "footer:\n{frame}");
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
+}
+
+#[test]
 fn scenario_confirm_prompt_arrow_then_enter_allows() {
+    // Two-button gate: Right from Deny wraps to Allow; Left from Deny → Allow.
     for nav in [KeyCode::Right, KeyCode::Left, KeyCode::Tab, KeyCode::BackTab] {
         let mut h = TestHarness::boot_with_size(100, 30);
-        let mut rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+        let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
         h.key(nav, KeyModifiers::NONE);
         assert!(h.secret_prompt_active(), "{nav:?} only moves focus");
-        assert!(h.confirm_allow_focused());
+        assert_eq!(h.confirm_focus(), ConfirmChoice::Allow, "{nav:?}");
         h.key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(!h.secret_prompt_active(), "Enter on Allow resolves");
         assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()), "{nav:?}+Enter allows");
@@ -2031,24 +2053,71 @@ fn scenario_confirm_prompt_arrow_then_enter_allows() {
 }
 
 #[test]
+fn scenario_confirm_tool_call_focus_cycles_three_buttons() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
+    // Deny → (Right) Allow → (Right) AllowAll → (Right) Deny → (Left) AllowAll
+    h.key(KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Allow);
+    h.key(KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::AllowAll);
+    h.key(KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::AllowAll);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!h.secret_prompt_active());
+    assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("Allow all: extension tool-call confirms are auto-approved"),
+        "system line announces the latch:\n{frame}"
+    );
+}
+
+#[test]
+fn scenario_confirm_tool_call_a_key_answers_always() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
+    h.key(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert!(!h.secret_prompt_active());
+    assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
+}
+
+/// On the activation gate `a` must NOT send "always" (the runtime would
+/// treat it as a deny); it degrades to a plain single allow.
+#[test]
+fn scenario_activation_confirm_a_key_degrades_to_allow() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
+    h.key(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert!(!h.secret_prompt_active());
+    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()));
+    let frame = h.snapshot();
+    assert!(!frame.contains("Allow all:"), "no latch announcement:\n{frame}");
+}
+
+#[test]
 fn scenario_confirm_prompt_toggle_twice_then_enter_denies() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let mut rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+    let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
     h.key(KeyCode::Right, KeyModifiers::NONE);
     h.key(KeyCode::Right, KeyModifiers::NONE);
-    assert!(!h.confirm_allow_focused(), "back on Deny");
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny, "back on Deny");
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), None, "Enter on Deny denies");
 }
 
 /// A typed password (the old muscle-memory failure) must never form an allow:
 /// no button toggles on plain chars, and Enter afterwards still denies.
+/// (`a`/`h`/`l`/`y`/`n` are shortcuts, so the sample avoids them.)
 #[test]
 fn scenario_confirm_prompt_typed_password_then_enter_denies() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let mut rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
     h.type_str("s3cret-pw!");
     assert!(h.secret_prompt_active(), "plain chars never resolve a confirm");
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(!h.secret_prompt_active());
     assert_eq!(rx.try_recv().unwrap(), None, "Enter with Deny focused denies");

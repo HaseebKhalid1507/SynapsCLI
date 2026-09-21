@@ -61,7 +61,9 @@ pub use read::ReadTool;
 pub use registry::{DroppedSessionMember, SessionSchemaProjection, ToolRegistry};
 pub use respond::RespondTool;
 pub use secret_prompt::SecretPromptQueue;
-pub use secret_prompt::{PromptKind, SecretPromptHandle, SecretPromptRequest};
+pub use secret_prompt::{
+    ConfirmChoice, PromptKind, SecretPromptHandle, SecretPromptRequest, CONFIRM_ANSWER_ALLOW_ALL,
+};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{

@@ -697,7 +697,8 @@ pub(crate) fn build_render_model(
         title: p.title.clone(),
         prompt: p.prompt.clone(),
         masked_buffer_chars: p.buffer.chars().count(),
-        confirm_allow_focused: p.confirm_allow_focused,
+        confirm_focus: p.confirm_focus,
+        confirm_offers_allow_all: p.offers_allow_all(),
     });
 
     // ── 13. Runtime strings ───────────────────────────────────────────────────
@@ -1737,28 +1738,37 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
     }
     text.push(ratatui::text::Line::from(""));
     if is_confirm {
-        // Two-button lightbox. The focused button renders as a filled pill;
+        // Button lightbox. The focused button renders as a filled pill;
         // Deny is focused by default so a bare Enter stays fail-closed.
+        use synaps_cli::tools::ConfirmChoice;
         let t = THEME.load();
         let focused = Style::default()
             .fg(t.bg)
             .bg(t.warning_color)
             .add_modifier(Modifier::BOLD);
         let idle = Style::default().fg(t.help_fg);
-        let (allow_style, deny_style) = if prompt.confirm_allow_focused {
-            (focused, idle)
-        } else {
-            (idle, focused)
-        };
-        text.push(ratatui::text::Line::from(vec![
+        let style_for = |c: ConfirmChoice| if prompt.confirm_focus == c { focused } else { idle };
+        let mut row: Vec<Span<'_>> = vec![
             Span::raw("   "),
-            Span::styled("[ Allow (y) ]", allow_style),
-            Span::raw("   "),
-            Span::styled("[ Deny (n) ]", deny_style),
-        ]));
+            Span::styled("[ Allow (y) ]", style_for(ConfirmChoice::Allow)),
+        ];
+        if prompt.confirm_offers_allow_all {
+            row.push(Span::raw("   "));
+            row.push(Span::styled(
+                "[ Allow all this session (a) ]",
+                style_for(ConfirmChoice::AllowAll),
+            ));
+        }
+        row.push(Span::raw("   "));
+        row.push(Span::styled("[ Deny (n) ]", style_for(ConfirmChoice::Deny)));
+        text.push(ratatui::text::Line::from(row));
         text.push(ratatui::text::Line::from(""));
         text.push(ratatui::text::Line::from(Span::styled(
-            "y allow · n/esc deny · ←/→/Tab select · Enter confirm",
+            if prompt.confirm_offers_allow_all {
+                "y allow · a allow all · n/esc deny · ←/→/Tab select · Enter confirm"
+            } else {
+                "y allow · n/esc deny · ←/→/Tab select · Enter confirm"
+            },
             Style::default().fg(THEME.load().muted),
         )));
     } else {

@@ -150,6 +150,8 @@ pub(super) struct StreamSession {
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
+    /// Session "Allow all" latch shared with the owning [`Runtime`].
+    pub(super) session_allow_all: Arc<std::sync::atomic::AtomicBool>,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
@@ -367,6 +369,7 @@ impl StreamMethods {
             env_warned,
             secret_prompt,
             auto_approve_confirms,
+            session_allow_all,
             telemetry_level,
             orchestration,
             delegation_parent,
@@ -1380,6 +1383,7 @@ impl StreamMethods {
                                     .await,
                                     secret_prompt.as_ref(),
                                     auto_approve_confirms,
+                                    Some(&session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
@@ -1654,6 +1658,7 @@ impl StreamMethods {
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
+                        let session_allow_all_inner = session_allow_all.clone();
                         let orchestration_inner = orchestration.clone();
                         let mcp_leases_inner = mcp_lease_capability.clone();
                         let extension_leases_inner = extension_lease_capability.clone();
@@ -1699,6 +1704,7 @@ impl StreamMethods {
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
+                                        Some(&session_allow_all_inner),
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
@@ -2785,6 +2791,7 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            session_allow_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
@@ -3285,6 +3292,7 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            session_allow_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,

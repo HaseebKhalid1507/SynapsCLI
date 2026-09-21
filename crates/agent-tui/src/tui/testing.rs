@@ -481,9 +481,9 @@ impl TestHarness {
         self.activate_prompt_with_kind(synaps_cli::tools::PromptKind::Confirm, title, prompt)
     }
 
-    /// `Confirm` dialog: whether the Allow button is focused (Deny otherwise).
-    pub fn confirm_allow_focused(&self) -> bool {
-        self.app.secret_prompts.confirm_allow_focused()
+    /// `Confirm` dialog: the focused button (`Deny` when none is active).
+    pub fn confirm_focus(&self) -> synaps_cli::tools::ConfirmChoice {
+        self.app.secret_prompts.confirm_focus()
     }
 
     /// Whether a secret prompt is currently active (mirrors the SecretPrompt
