@@ -181,11 +181,16 @@ mod tests {
 
     #[test]
     fn tune_allocator_spawns_nothing_and_purge_returns() {
-        let before = memstat::self_snapshot().threads;
+        // The allocator-attributable invariant is that tuning leaves jemalloc
+        // *background threads OFF*, so no bg thread is spawned for our arenas —
+        // that is asserted directly below. We intentionally do NOT assert on a
+        // process-wide thread-count delta: `cargo test` runs tests in parallel
+        // within the binary, so unrelated tests spawn/join threads between any
+        // two `self_snapshot()` calls, which made that check flaky (it is not
+        // allocator-attributable). `purge_arenas` returning (no panic/hang) is
+        // the other half of the smoke test.
         tune_allocator();
         purge_arenas("test");
-        let after = memstat::self_snapshot().threads;
-        assert!(after <= before, "threads {before} -> {after}");
         if !allocator_tuning_disabled() {
             assert_ne!(memstat::background_threads_enabled(), Some(true));
         }
