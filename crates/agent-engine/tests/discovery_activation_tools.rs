@@ -124,6 +124,7 @@ fn ctx_with_prompt(
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
             watcher_exit_path: None,
@@ -406,6 +407,29 @@ async fn activate_tools_rejects_source_wide_unknown_and_malformed_ids() {
         .await
         .expect_err("empty batch fails typed");
     assert!(empty.to_string().contains("no tool"), "{empty}");
+}
+
+#[tokio::test]
+async fn session_allow_all_does_not_authorize_activate_tools() {
+    use agent_core::config::ActivationConfirm;
+    for mode in [ActivationConfirm::Prompt, ActivationConfirm::Deny] {
+        let registry = fixture_registry();
+        let set = shared(minimal_set(&registry));
+        let before = set_fingerprint(&set.read().unwrap());
+        let mut context = ctx(Some(capability_for_mode(&registry, &set, mode)));
+        context.capabilities.session_allow_all = Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        let error = ActivateToolsTool
+            .execute(
+                json!({"tools": ["builtin:beta_tool"], "confirmed": true}),
+                context,
+            )
+            .await
+            .expect_err("extension Confirm consent grants no activation authority");
+        assert!(error.to_string().contains("confirmation"), "{error}");
+        assert_eq!(set_fingerprint(&set.read().unwrap()), before);
+    }
 }
 
 // ── activate_tools (interactive host confirmation) ──────────────────────────

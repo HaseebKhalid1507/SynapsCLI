@@ -192,6 +192,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         before,
         None,
         false,
+        None,
     )
     .await;
     let input = match decision {
@@ -211,6 +212,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
                     watcher_exit_path: None,
@@ -384,6 +386,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
                     watcher_exit_path: None,
