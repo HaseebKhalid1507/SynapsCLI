@@ -73,6 +73,14 @@ pub const XAI_TEXT_MODELS: &[XaiModelDescriptor] = &[
         context_tokens: None,
         reasoning: true,
     },
+    // Official live model/reasoning docs, checked 2026-09-21. No inferred
+    // `-latest` alias, output limit, or vision capability for this route.
+    XaiModelDescriptor {
+        id: "grok-4.7",
+        label: "Grok 4.7",
+        context_tokens: Some(500_000),
+        reasoning: true,
+    },
 ];
 
 pub fn xai_model(id: &str) -> Option<&'static XaiModelDescriptor> {
@@ -89,7 +97,11 @@ pub fn xai_model(id: &str) -> Option<&'static XaiModelDescriptor> {
 /// xAI has not published a `grok-4.6-latest` alias (upstream 404), so only
 /// the bare id is cataloged. `grok-4.20-multi-agent-0309` supports
 /// low/medium/high/xhigh where effort controls agent count. No other exact id
-/// has documented effort support.
+/// has documented effort support in that original snapshot.
+///
+/// Added 2026-09-21: exact `grok-4.7` supports low/medium/high/xhigh,
+/// default high, no off (https://docs.x.ai/developers/model-capabilities/text/reasoning).
+/// The older models' capability contracts are unchanged by this addition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XaiReasoningCapability {
     /// Documented named-effort control (`reasoning:{effort:"..."}` on the
@@ -114,6 +126,11 @@ pub fn xai_static_capability(model_id: &str) -> Option<XaiReasoningCapability> {
     match model_id {
         "grok-4.5" | "grok-4.5-latest" | "grok-4.6" => Some(XaiReasoningCapability::Effort {
             supported: &[Low, Medium, High],
+            default_level: Some(High),
+            can_disable: false,
+        }),
+        "grok-4.7" => Some(XaiReasoningCapability::Effort {
+            supported: &[Low, Medium, High, XHigh],
             default_level: Some(High),
             can_disable: false,
         }),
@@ -174,6 +191,7 @@ mod tests {
                 "grok-4.5",
                 "grok-4.5-latest",
                 "grok-4.6",
+                "grok-4.7",
             ]
         );
     }
@@ -196,6 +214,7 @@ mod tests {
                 "grok-4.5",
                 "grok-4.5-latest",
                 "grok-4.6",
+                "grok-4.7",
             ]
         );
     }
