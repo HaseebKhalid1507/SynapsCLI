@@ -135,7 +135,7 @@ async fn run_oauth_login(
     // scan and the write then happen inside one locked read-modify-write of
     // auth.json, so a login into a named slot never touches the default slot
     // and two slots can never end up owning the same seat.
-    let creds = match auth::provider::login_unsaved(cred.provider).await {
+    let mut creds = match auth::provider::login_unsaved(cred.provider).await {
         Ok(creds) => creds,
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
@@ -143,13 +143,35 @@ async fn run_oauth_login(
             return Err(e);
         }
     };
-    let metadata = auth::AccountMetadata {
-        identity: match cred.provider {
-            auth::OAuthProviderId::OpenAiCodex => auth::extract_codex_email(&creds.access),
-            _ => None,
-        },
+    let mut metadata = auth::AccountMetadata {
+        identity: None,
         added_at: Some(synaps_cli::epoch_millis() / 1000),
     };
+    // Seat identity: Codex reads it off the JWT; Anthropic tokens are opaque,
+    // so the profile endpoint is asked once, before persistence, so the
+    // duplicate guard below has an `accountId` to compare. A lookup failure
+    // never aborts a login that already succeeded at the provider — the
+    // guard then reports `NoEvidence` and `synaps auth identify` can backfill.
+    let seat = match auth::identity_http_client() {
+        Ok(client) => auth::resolve_seat(cred.provider, &creds.access, &client, None).await,
+        Err(e) => auth::SeatResolution::Failed(e),
+    };
+    match seat {
+        auth::SeatResolution::Resolved(seat) => {
+            if creds.account_id.is_none() {
+                creds.account_id = Some(seat.account_id);
+            }
+            metadata.identity = seat.identity;
+        }
+        auth::SeatResolution::Failed(msg) => {
+            eprintln!(
+                "\n\x1b[33m⚠ could not verify {} account identity ({msg}); a duplicate of another slot cannot be detected.\x1b[0m",
+                provider.name
+            );
+            eprintln!("  Run `synaps auth identify` later to record it.");
+        }
+        auth::SeatResolution::Unsupported => {}
+    }
     let outcome = match auth::save_credential_unless_duplicate(&cred, &creds, &metadata) {
         Ok(outcome) => outcome,
         Err(e) => {

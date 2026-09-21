@@ -364,6 +364,26 @@ enum AuthAction {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Verify which provider account each stored slot holds and flag slots that
+    /// share one seat (backfills identity for logins that predate this check).
+    /// Local store only. Exits non-zero when duplicates exist.
+    Identify {
+        /// Restrict to one OAuth provider (e.g. openai-codex, claude)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restrict to one account label (or `default`)
+        #[arg(long, value_name = "LABEL|default")]
+        account: Option<String>,
+        /// Resolve and report only; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-verify slots that already carry an account id
+        #[arg(long)]
+        force: bool,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Tokio worker-thread count (§3.6 process diet). `SYNAPS_WORKER_THREADS`:
@@ -796,6 +816,21 @@ async fn async_main() -> anyhow::Result<()> {
                 account,
                 yes,
             } => cmd::auth_accounts::remove(provider, account, yes).map_err(anyhow::Error::msg)?,
+            AuthAction::Identify {
+                provider,
+                account,
+                dry_run,
+                force,
+                json,
+            } => cmd::auth_accounts::identify(cmd::auth_accounts::IdentifyOptions {
+                provider,
+                account,
+                dry_run,
+                force,
+                json,
+            })
+            .await
+            .map_err(anyhow::Error::msg)?,
         },
         Some(Command::Status {
             memory,

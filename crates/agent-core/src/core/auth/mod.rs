@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub mod account;
+pub mod anthropic_profile;
 pub mod aws_bedrock;
 pub mod azure_openai;
 pub mod broker;
@@ -23,6 +24,7 @@ mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;
 pub mod google_vertex;
+pub mod identity;
 pub mod kimi_code;
 mod openai_codex;
 mod pkce;
@@ -42,6 +44,9 @@ pub use account::{
     account_config_key, account_env_var, seat_fingerprint, Account, AccountLabel, AccountPolicy,
     AccountSelector, AccountSummary, CredentialRef, SeatIdentity, AUTO_ACCOUNT_NAME,
     DEFAULT_ACCOUNT_NAME,
+};
+pub use anthropic_profile::{
+    fetch_anthropic_profile, parse_anthropic_profile, AnthropicProfile, ANTHROPIC_PROFILE_URL,
 };
 pub use broker::{
     broker_from_source, global_broker, global_broker_install_count, preflight_cloud_capability,
@@ -63,6 +68,9 @@ pub use credential_source::{
     BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
 };
 pub use github_copilot::login as login_github_copilot;
+pub use identity::{
+    identity_http_client, resolve_seat, supports_seat_identity, ResolvedSeat, SeatResolution,
+};
 pub use kimi_code::login as login_kimi_code;
 pub use openai_codex::{
     extract_account_id as extract_codex_account_id, extract_email as extract_codex_email,
@@ -78,7 +86,8 @@ pub use storage::{
     list_accounts_detailed, list_all_accounts, load_auth, load_cloud_state, load_credential,
     load_provider_auth, load_static_key, remove_credential, save_account_metadata, save_auth,
     save_cloud_state, save_credential, save_credential_unless_duplicate, save_provider_auth,
-    save_static_key, AccountInventory, AccountMetadata, IdentityEvidence, LoginPersistOutcome,
+    save_static_key, set_slot_identity, AccountInventory, AccountMetadata, IdentityEvidence,
+    LoginPersistOutcome,
 };
 pub use token::{
     ensure_fresh_credential, ensure_fresh_provider_token, ensure_fresh_token,
