@@ -256,6 +256,93 @@ fn parse_context_management_config_key(
     Ok(())
 }
 
+/// Startup / first-turn behaviour (`startup.*` keys). Boot-time only — these
+/// take effect at the next launch, never mid-session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupConfig {
+    /// Skip blocking on extension discovery before the first turn. When true
+    /// the attach path sets `await_extensions=false` (fast cold start; a tool
+    /// from a slow extension may be unavailable on turn 1). Default: true.
+    pub quick_start: bool,
+    /// Max seconds to wait for extensions when Quick Start is off. Default: 30.
+    pub extensions_ready_timeout_secs: u64,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            quick_start: true,
+            extensions_ready_timeout_secs: 30,
+        }
+    }
+}
+
+/// Daemon lifetime knobs (`daemon.*` keys). Config-file fallbacks; the matching
+/// `SYNAPS_DAEMON_*` env vars still WIN over these when set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonConfig {
+    /// Seconds an auto-spawned daemon stays alive after the last client
+    /// disconnects. `0` = never idle-exit. Env `SYNAPS_DAEMON_IDLE_EXIT_SECS`
+    /// overrides. Default: 10.
+    pub idle_exit_secs: u64,
+    /// Seconds a pending host confirmation on a detached session survives
+    /// before it is fail-closed answered `None`. `0` = disabled (survives
+    /// forever). Env `SYNAPS_DAEMON_PROMPT_ABANDON_SECS` overrides. Default: 3600.
+    pub prompt_abandon_secs: u64,
+    /// Seconds a PARKED session row lingers before eviction. `0` = keep
+    /// forever. Env `SYNAPS_DAEMON_PARKED_EVICT_SECS` overrides. Default: 3600.
+    pub parked_evict_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_exit_secs: 10,
+            prompt_abandon_secs: 3600,
+            parked_evict_secs: 3600,
+        }
+    }
+}
+
+/// Parse `startup.*` keys. Unknown keys return an error (caller warns).
+fn parse_startup_config_key(
+    config: &mut StartupConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    match key {
+        "startup.quick_start" => {
+            config.quick_start = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
+        "startup.extensions_ready_timeout_secs" => {
+            config.extensions_ready_timeout_secs =
+                value.trim().parse().map_err(|_| "expected an unsigned second count")?;
+        }
+        _ => return Err("unknown startup key"),
+    }
+    Ok(())
+}
+
+/// Parse `daemon.*` keys. Unknown keys return an error (caller warns).
+fn parse_daemon_config_key(
+    config: &mut DaemonConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    let secs = || value.trim().parse::<u64>().map_err(|_| "expected an unsigned second count");
+    match key {
+        "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
+        "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
+        "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        _ => return Err("unknown daemon key"),
+    }
+    Ok(())
+}
+
 /// Server security configuration parsed from `server.*` keys.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
@@ -754,6 +841,10 @@ pub struct SynapsConfig {
     pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
     pub context_window: Option<u64>, // override auto-detected context window (tokens)
     pub context_management: ContextManagementConfig,
+    /// First-turn / cold-start behaviour (`startup.*`).
+    pub startup: StartupConfig,
+    /// Daemon lifetime knobs (`daemon.*`); env vars still win.
+    pub daemon: DaemonConfig,
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
@@ -834,6 +925,8 @@ impl Default for SynapsConfig {
             thinking_level: None,
             context_window: None,
             context_management: ContextManagementConfig::default(),
+            startup: StartupConfig::default(),
+            daemon: DaemonConfig::default(),
             compaction_model: None,
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
@@ -886,6 +979,11 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "context_management.rollover_tokens",
     "context_management.reserve_tokens",
     "context_management.finish_rounds",
+    "startup.quick_start",
+    "startup.extensions_ready_timeout_secs",
+    "daemon.idle_exit_secs",
+    "daemon.prompt_abandon_secs",
+    "daemon.parked_evict_secs",
     "max_tool_output",
     "bash_timeout",
     "bash_max_timeout",
@@ -1412,6 +1510,18 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     parse_turn_budget_config_key(&mut config.turn_budgets, key, val);
                 } else if key.starts_with("memory.") {
                     parse_memory_config_key(&mut config.memory, key, val);
+                } else if key.starts_with("startup.") {
+                    if let Err(reason) =
+                        parse_startup_config_key(&mut config.startup, key, val)
+                    {
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
+                } else if key.starts_with("daemon.") {
+                    if let Err(reason) =
+                        parse_daemon_config_key(&mut config.daemon, key, val)
+                    {
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
                 } else if key.starts_with("context_management.") {
                     if let Err(reason) = parse_context_management_config_key(
                         &mut config.context_management, key, val,
