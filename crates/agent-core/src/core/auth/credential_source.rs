@@ -893,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_access_token_remote_fetches_from_broker() {
         let url = spawn_broker(
-            r#"{"access_token":"sk-broker","expires":9999999999999}"#,
+            r#"{"access_token":"sk-broker","expires":9999999999999,"account":"default"}"#,
             "m",
         )
         .await;
