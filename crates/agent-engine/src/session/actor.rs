@@ -1765,6 +1765,11 @@ impl SessionActor {
         }
         if self.can_end_idle() {
             tracing::info!(session = %self.id, "idle with no history — ending instead of parking (F18)");
+            // No journal will ever exist for this id: take the lock file
+            // with us instead of leaving an orphan `.lock` (RC soak F-NEW-1).
+            if let Some(lock) = self.session_lock.take() {
+                lock.release_and_remove();
+            }
             return std::ops::ControlFlow::Break(EndReason::Idle);
         }
         if !self.can_park() {

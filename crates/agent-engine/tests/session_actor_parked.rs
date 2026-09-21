@@ -385,6 +385,9 @@ async fn empty_session_never_parks_it_ends_idle() {
         .await
         .expect("empty idle session must END at the grace deadline, not stay Live");
     assert!(agent_engine::core::session::Session::load(handle.id.as_str()).is_err());
+    // RC soak F-NEW-1: no journal → no orphan `.lock` either.
+    let lock = agent_engine::core::session_lock::sessions_dir().join(format!("{}.lock", handle.id.as_str()));
+    assert!(!lock.exists(), "orphan lock file left behind: {}", lock.display());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
