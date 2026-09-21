@@ -111,6 +111,7 @@ pub fn choose_attach(
     opts: &AttachOpts,
     sessions: &[LiveSession],
     cwd: Option<PathBuf>,
+    await_extensions: bool,
 ) -> std::result::Result<(Attach, Option<String>), String> {
     let create = |continue_session: Option<Option<String>>| Attach::Create {
         config: SessionConfig {
@@ -120,7 +121,7 @@ pub fn choose_attach(
             cwd: cwd.clone(),
             env: None,
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
-            await_extensions: true,
+            await_extensions,
             keep_warm: opts.keep_warm,
             name: opts.name.clone(),
             ..Default::default()
@@ -275,7 +276,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         })
         .collect();
     let welcome_sessions = conn.welcome.sessions.clone();
-    let (attach, notice) = choose_attach(&opts, &live, cwd).map_err(cfg_err)?;
+    // Quick Start (default on) => await_extensions=false: the daemon TUI
+    // stops blocking on extension discovery before turn 1 (fast cold start),
+    // matching the in-process TUI. Off => block like the historic daemon path.
+    let await_extensions = !synaps_cli::load_config().startup.quick_start;
+    let (attach, notice) =
+        choose_attach(&opts, &live, cwd, await_extensions).map_err(cfg_err)?;
     if let Some(n) = notice {
         // Before the TUI takes the terminal, so it survives on the scrollback.
         eprintln!("{n}");
@@ -444,14 +450,14 @@ mod tests {
         // even when --new is also set (adopt sets it).
         let mut o = opts(None, true);
         o.continue_session = Some(None);
-        let (a, _) = choose_attach(&o, &[live("abc")], None).unwrap();
+        let (a, _) = choose_attach(&o, &[live("abc")], None, true).unwrap();
         match a {
             Attach::Create { config, .. } => assert_eq!(config.continue_session, Some(None)),
             other => panic!("expected Create, got {other:?}"),
         }
         let mut o = opts(None, false);
         o.continue_session = Some(Some("xyz".into()));
-        let (a, _) = choose_attach(&o, &[], None).unwrap();
+        let (a, _) = choose_attach(&o, &[], None, true).unwrap();
         match a {
             Attach::Create { config, .. } => assert_eq!(config.continue_session, Some(Some("xyz".into()))),
             other => panic!("expected Create, got {other:?}"),
@@ -494,22 +500,22 @@ mod tests {
 
     #[test]
     fn new_creates_even_with_live_sessions() {
-        let (a, notice) = choose_attach(&opts(None, true), &[live("abc")], None).unwrap();
+        let (a, notice) = choose_attach(&opts(None, true), &[live("abc")], None, true).unwrap();
         assert!(matches!(a, Attach::Create { .. }), "{a:?}");
         assert!(notice.is_none());
-        let (a, _) = choose_attach(&opts(None, true), &[live("a"), live("b")], None).unwrap();
+        let (a, _) = choose_attach(&opts(None, true), &[live("a"), live("b")], None, true).unwrap();
         assert!(matches!(a, Attach::Create { .. }), "{a:?}");
     }
 
     #[test]
     fn new_with_explicit_id_is_rejected() {
-        let e = choose_attach(&opts(Some("abc"), true), &[live("abc")], None).unwrap_err();
+        let e = choose_attach(&opts(Some("abc"), true), &[live("abc")], None, true).unwrap_err();
         assert!(e.contains("cannot combine"), "{e}");
     }
 
     #[test]
     fn sole_live_session_is_picked_with_notice() {
-        let (a, notice) = choose_attach(&opts(None, false), &[live("abc")], None).unwrap();
+        let (a, notice) = choose_attach(&opts(None, false), &[live("abc")], None, true).unwrap();
         assert!(
             matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "abc"),
             "{a:?}"
@@ -520,9 +526,9 @@ mod tests {
 
     #[test]
     fn no_live_sessions_creates_and_many_errors_with_hint() {
-        let (a, _) = choose_attach(&opts(None, false), &[], None).unwrap();
+        let (a, _) = choose_attach(&opts(None, false), &[], None, true).unwrap();
         assert!(matches!(a, Attach::Create { .. }), "{a:?}");
-        let e = choose_attach(&opts(None, false), &[live("a"), live("b")], None).unwrap_err();
+        let e = choose_attach(&opts(None, false), &[live("a"), live("b")], None, true).unwrap_err();
         assert!(e.contains("--new") && e.contains("  a  ") && e.contains("  b  "), "{e}");
     }
 
