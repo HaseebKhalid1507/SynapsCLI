@@ -188,6 +188,79 @@ pub(crate) fn save_account_metadata_at(
     })
 }
 
+/// Record the provider seat identity on an EXISTING OAuth slot: sets
+/// `accountId` (the full provider account id) and, when given, the display
+/// `identity`. Used by the `auth identify` backfill for slots whose login
+/// predates identity acquisition (Anthropic tokens are opaque; the seat
+/// comes from the profile endpoint after the fact).
+///
+/// Touches no other field — a `refresh`/`access` rotated by another process
+/// between the caller's read and this write is never clobbered, because the
+/// write happens under the store lock and only inserts the two identity
+/// keys into the entry read under that same lock. A missing slot, a
+/// non-OAuth entry, or an empty `account_id` is an error and writes nothing.
+///
+/// Profiles: like [`remove_credential`], this refuses to act on an auth.json
+/// the active profile merely inherits.
+pub fn set_slot_identity(
+    cred: &CredentialRef,
+    account_id: &str,
+    identity: Option<&str>,
+) -> std::result::Result<(), String> {
+    let read_path = auth_file_path();
+    let write_path = crate::config::resolve_write_path("auth.json");
+    if read_path != write_path {
+        return Err(format!(
+            "{} is stored in {} which the active profile inherits; re-run without --profile \
+             (or with the profile that owns that file) to record its identity",
+            cred,
+            read_path.display()
+        ));
+    }
+    set_slot_identity_at(&write_path, cred, account_id, identity)
+}
+
+pub(crate) fn set_slot_identity_at(
+    path: &Path,
+    cred: &CredentialRef,
+    account_id: &str,
+    identity: Option<&str>,
+) -> std::result::Result<(), String> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err("account id is empty; nothing recorded".into());
+    }
+    let key = cred.storage_key();
+    if !path.exists() {
+        return Err(format!("no credential stored for {key}"));
+    }
+    let identity = identity.map(str::trim).filter(|s| !s.is_empty());
+    with_locked_root(path, false, |root| {
+        let Some(entry) = root
+            .get_mut(&key)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return Err(format!("no credential stored for {key}"));
+        };
+        if entry.get("type").and_then(|t| t.as_str()) != Some("oauth") {
+            return Err(format!(
+                "{key} is not an OAuth credential; nothing recorded"
+            ));
+        }
+        entry.insert(
+            "accountId".into(),
+            serde_json::Value::String(account_id.to_string()),
+        );
+        if let Some(identity) = identity {
+            entry.insert(
+                "identity".into(),
+                serde_json::Value::String(identity.to_string()),
+            );
+        }
+        Ok((true, ()))
+    })
+}
+
 /// Outcome of a compare-and-swap credential write (refresh rotation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CasOutcome {
@@ -1399,6 +1472,127 @@ mod tests {
         )
         .is_err());
         assert!(read_root(&path).get("anthropic@nope").is_none());
+    }
+
+    #[test]
+    fn set_slot_identity_sets_only_identity_fields_on_existing_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Hand-written entry with every field a real slot carries, plus
+        // provider metadata that must survive untouched.
+        std::fs::write(
+            &path,
+            r#"{
+              "anthropic@claude1": {"type":"oauth","refresh":"R-claude1","access":"A-claude1","expires":1234567,"label":"claude1","addedAt":99,"identity":"old@example.com","metadata":{"tenant":"t1"}},
+              "anthropic": {"type":"oauth","refresh":"R-default","access":"A-default","expires":7},
+              "groq": {"type":"api_key","key":"gsk-secret"}
+            }"#,
+        )
+        .unwrap();
+        let before = read_root(&path);
+        let cred = named(OAuthProviderId::Anthropic, "claude1");
+
+        set_slot_identity_at(
+            &path,
+            &cred,
+            "  b8a1448d-0000-4000-8000-00000000000a  ",
+            Some("  jr@example.com "),
+        )
+        .unwrap();
+        let after = read_root(&path);
+        let slot = after["anthropic@claude1"].as_object().unwrap();
+        assert_eq!(
+            slot["accountId"], "b8a1448d-0000-4000-8000-00000000000a",
+            "trimmed"
+        );
+        assert_eq!(slot["identity"], "jr@example.com", "trimmed");
+        // Every other field is byte-identical to what was stored.
+        for field in [
+            "type", "refresh", "access", "expires", "label", "addedAt", "metadata",
+        ] {
+            assert_eq!(
+                slot.get(field),
+                before["anthropic@claude1"].get(field),
+                "{field} must be untouched"
+            );
+        }
+        assert_eq!(
+            slot.len(),
+            before["anthropic@claude1"].as_object().unwrap().len() + 1,
+            "exactly one new key (accountId); identity was overwritten in place"
+        );
+        // Sibling slots and non-OAuth entries are untouched.
+        assert_eq!(after["anthropic"], before["anthropic"]);
+        assert_eq!(after["groq"], before["groq"]);
+        assert_eq!(after.len(), before.len());
+        // The listing now sees the seat.
+        let inv = list_accounts_detailed_at(&path, Some(OAuthProviderId::Anthropic)).unwrap();
+        let row = inv.accounts.iter().find(|a| a.label == "claude1").unwrap();
+        assert_eq!(row.account_id_prefix.as_deref(), Some("b8a1448d"));
+        assert_eq!(row.identity.as_deref(), Some("jr@example.com"));
+        assert!(row.seat_fingerprint.is_some());
+
+        // identity None keeps the stored identity; accountId is updated.
+        set_slot_identity_at(&path, &cred, "other-seat", None).unwrap();
+        let slot = &read_root(&path)["anthropic@claude1"];
+        assert_eq!(slot["accountId"], "other-seat");
+        assert_eq!(slot["identity"], "jr@example.com");
+        // Empty/blank identity is ignored, never written as "".
+        set_slot_identity_at(&path, &cred, "other-seat", Some("   ")).unwrap();
+        assert_eq!(
+            read_root(&path)["anthropic@claude1"]["identity"],
+            "jr@example.com"
+        );
+
+        // Backfilling the default slot makes the duplicate visible.
+        set_slot_identity_at(
+            &path,
+            &CredentialRef::default_for(OAuthProviderId::Anthropic),
+            "other-seat",
+            None,
+        )
+        .unwrap();
+        let inv = list_accounts_detailed_at(&path, Some(OAuthProviderId::Anthropic)).unwrap();
+        assert_eq!(
+            inv.duplicate_identity_keys,
+            vec!["anthropic".to_string(), "anthropic@claude1".to_string()]
+        );
+        assert_eq!(read_root(&path)["anthropic"]["refresh"], "R-default");
+    }
+
+    #[test]
+    fn set_slot_identity_fails_closed_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let cred = named(OAuthProviderId::Anthropic, "claude1");
+        // Missing store: error, and no file/lock/dir side effects.
+        assert!(set_slot_identity_at(&path, &cred, "seat", None).is_err());
+        assert!(!path.exists());
+        assert!(!path.with_extension("json.lock").exists());
+
+        std::fs::write(
+            &path,
+            r#"{"anthropic":{"type":"oauth","refresh":"R","access":"A","expires":1},"groq":{"type":"api_key","key":"k"}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        // Missing slot.
+        assert!(set_slot_identity_at(&path, &cred, "seat", Some("x@example.com")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(
+            read_root(&path).get("anthropic@claude1").is_none(),
+            "no phantom slot"
+        );
+        // Empty / blank account id.
+        let default = CredentialRef::default_for(OAuthProviderId::Anthropic);
+        assert!(set_slot_identity_at(&path, &default, "", None).is_err());
+        assert!(set_slot_identity_at(&path, &default, "   ", Some("x@example.com")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(read_root(&path)["anthropic"].get("accountId").is_none());
+        // Corrupt store: refused, never reset.
+        std::fs::write(&path, "{{not json").unwrap();
+        assert!(set_slot_identity_at(&path, &default, "seat", None).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{{not json");
     }
 
     #[test]

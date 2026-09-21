@@ -1537,6 +1537,10 @@ mod tests {
                                     | "label"
                                     | "identity"
                                     | "account_id_prefix"
+                                    // Opaque SHA-256 over the provider account id
+                                    // (never token material); lets a client pin
+                                    // spending to exactly one listed seat.
+                                    | "seat_fingerprint"
                                     | "expires"
                                     | "added_at"
                                     | "selected"

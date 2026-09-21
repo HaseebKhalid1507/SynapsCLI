@@ -29,9 +29,33 @@ Complete each browser/device flow as the intended subscription owner. Use separa
 
 A named login writes directly to its named slot: it never temporarily overwrites `default`. A label is 1–32 lowercase ASCII letters/digits/`.`/`_`/`-`, beginning with a letter/digit. `default` denotes the original bare provider key; `auto` is reserved for selection, not a login label.
 
-Codex identity is checked to reject connecting one provider seat twice under different labels. Where a provider exposes no stable identity, duplicate detection is limited (reported by the login flow); keep one refresh owner per actual account. Do not copy rotating refresh tokens from another CLI or host into multiple slots. Use separate legitimate subscriptions, within provider terms and organization policy.
+Codex and Claude identity is checked to reject connecting one provider seat twice under different labels (see [Duplicate-seat detection](#duplicate-seat-detection)). Where a provider exposes no stable identity, duplicate detection is limited (reported by the login flow); keep one refresh owner per actual account. Do not copy rotating refresh tokens from another CLI or host into multiple slots. Use separate legitimate subscriptions, within provider terms and organization policy.
 
 `auth list` shows **OAuth access-token expiry**, not the quota reset. An expired but refreshable token is not an expired subscription. `status` supplies quota windows/resets; billing renewal and OAuth expiry are separate concepts. Grok's billing adapter is fixture-tested but its live schema is explicitly unverified.
+
+## Duplicate-seat detection
+
+Two slots that hold the same provider account would spend one quota twice and rotate one refresh token from two owners, so the broker keys every slot on the provider's own account id (stored as `accountId`, shown as an 8-character `ID` prefix by `auth list`).
+
+| Provider | Identity source | When |
+|---|---|---|
+| ChatGPT/Codex | `chatgpt_account_id` claim in the access-token JWT (no network) | at login and on every refresh |
+| Claude (Anthropic) | `account.uuid` from `GET /api/oauth/profile` (read-only, bearer + `anthropic-beta`) — the quota-bearing entity; `organization.uuid` is informational | at login (one request) and via `auth identify` |
+| Kimi Code, Grok, Copilot, Gemini | none exposed | duplicates cannot be detected; keep one refresh owner per real account |
+
+- **Login-time guard.** `synaps login` resolves the identity *before* writing, then scans sibling slots of the same provider inside the same locked write. A seat already connected under another label is refused (`Not stored: this … seat is already connected as account '<label>'`). If the Anthropic profile lookup fails (network, 5xx), the login still succeeds and warns that a duplicate cannot be detected — nothing is ever guessed.
+- **Backfill for pre-existing slots.** Logins made before this check (or whose lookup failed) carry no `accountId`; `auth list` prints `note: N slot(s) have unverified identity`. Run, on the broker host:
+
+  ```bash
+  "$SYNAPS" auth identify --dry-run          # resolve + report, write nothing
+  "$SYNAPS" auth identify                    # record accountId/identity on each slot
+  "$SYNAPS" auth identify --provider anthropic --account claude1 --force   # re-verify one slot
+  "$SYNAPS" auth identify --json             # rows + duplicate groups for scripts
+  ```
+
+  `identify` mints a fresh access token through the normal single-flight refresh path, asks the provider once per slot, and records only `accountId`/`identity` (never touching token fields). Slots that already carry an id are reported as `already` unless `--force`. It exits non-zero iff duplicates remain, printing `⚠ DUPLICATE SEAT: anthropic, anthropic@claude1 share one anthropic account (…)` with the exact `auth remove` command to run. It refuses to run against a remote credential source (the refresh token lives on the broker host only).
+- **Listing.** `auth list` marks every member of a duplicate group with `DUPLICATE-SEAT` and repeats the flagged keys in a `WARNING:` line (`duplicate_identity_keys` in `--json`).
+- **Keeper.** With activation opted in, the quota keeper dedupes aliases by seat fingerprint and fails closed on a slot whose seat is ambiguous or duplicated; it never activates one seat twice through two labels.
 
 ## Choose a seat
 
