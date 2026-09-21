@@ -117,6 +117,11 @@ pub const DEFAULT_MARGIN_MS: u64 = 5 * 60 * 1000;
 
 // ── In-memory token cache ────────────────────────────────────────────────────
 
+type LocalBrokerMap = std::collections::BTreeMap<
+    (std::path::PathBuf, std::path::PathBuf),
+    Arc<super::broker::LocalBroker>,
+>;
+
 /// Thread-safe cache of broker access tokens. Cloneable handle over shared
 /// state. Holds ONLY short-lived access tokens, never a refresh token, never
 /// persisted to disk.
@@ -129,6 +134,9 @@ pub const DEFAULT_MARGIN_MS: u64 = 5 * 60 * 1000;
 #[derive(Clone, Default)]
 pub struct TokenCache {
     inner: Arc<RwLock<HashMap<String, BrokerToken>>>,
+    /// Local runtime authority retained across adapter construction. Clones
+    /// share cooldown/current-seat state; profiles have separate entries.
+    pub(crate) local_brokers: Arc<std::sync::Mutex<LocalBrokerMap>>,
 }
 
 /// Opaque, log-safe identity of a remote credential source.

@@ -208,6 +208,9 @@ enum Command {
         /// With --memory: walk this pid's tree instead of the live sessions.
         #[arg(long, requires = "memory")]
         pid: Option<u32>,
+        /// Show full usage windows, model availability, credits and diagnostics.
+        #[arg(long, conflicts_with_all = ["memory", "json"])]
+        verbose: bool,
         /// Usage for one OAuth provider (e.g. openai-codex, claude, kimi-code, xai-auth).
         #[arg(long, conflicts_with = "memory")]
         provider: Option<String>,
@@ -340,6 +343,16 @@ enum AuthAction {
         #[arg(long)]
         provider: Option<String>,
         /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview automatic subscription ranking without making an inference request
+    Plan {
+        #[arg(long)]
+        provider: Option<String>,
+        /// Filter capacity by the model you intend to use
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -806,6 +819,13 @@ async fn async_main() -> anyhow::Result<()> {
                     .await
                     .map_err(anyhow::Error::msg)?
             }
+            AuthAction::Plan {
+                provider,
+                model,
+                json,
+            } => cmd::auth_accounts::plan(provider, model, json)
+                .await
+                .map_err(anyhow::Error::msg)?,
             AuthAction::Use { provider, account } => {
                 cmd::auth_accounts::use_account(provider, account)
                     .await
@@ -836,6 +856,7 @@ async fn async_main() -> anyhow::Result<()> {
             memory,
             json,
             pid,
+            verbose,
             provider,
             account,
             all,
@@ -849,6 +870,7 @@ async fn async_main() -> anyhow::Result<()> {
                     account,
                     all,
                     json,
+                    verbose,
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;

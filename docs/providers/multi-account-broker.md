@@ -31,6 +31,20 @@ A named login writes directly to its named slot: it never temporarily overwrites
 
 Codex and Claude identity is checked to reject connecting one provider seat twice under different labels (see [Duplicate-seat detection](#duplicate-seat-detection)). Where a provider exposes no stable identity, duplicate detection is limited (reported by the login flow); keep one refresh owner per actual account. Do not copy rotating refresh tokens from another CLI or host into multiple slots. Use separate legitimate subscriptions, within provider terms and organization policy.
 
+`status` uses a compact provider-grouped layout: each account shows its stored
+email (or `unknown`), plan when available, and one line per main quota window
+with percentage **used** and reset countdown. Unknown usage is never shown as
+zero. Account errors and limit/spend-control warnings remain visible. Quiet
+auxiliary counters and parser diagnostics are available with `status --all
+--verbose`; `--json` retains the full report and includes optional per-account
+`identity` metadata. Selection is unchanged: use `--all` for all accounts.
+
+If an older login has no stored email, run `synaps auth identify --force` on the
+credential host to backfill provider identity, then rerun status. Not all
+providers expose an email; these remain `unknown`. Status only reads broker
+metadata and usage; it does not perform a login or expose tokens. Emails are
+personal data—redact them before sharing status output.
+
 `auth list` shows **OAuth access-token expiry**, not the quota reset. An expired but refreshable token is not an expired subscription. `status` supplies quota windows/resets; billing renewal and OAuth expiry are separate concepts. Grok's billing adapter is fixture-tested but its live schema is explicitly unverified.
 
 ## Duplicate-seat detection
@@ -77,7 +91,45 @@ Selection precedence is explicit per-request account → `SYNAPS_ACCOUNT_<PROVID
 
 `auth use` writes only the active profile's config, never moves credentials. Restart existing clients to reliably pick up a changed policy. With a policy of `auto`, use `status --all` or an explicit `--account` to inspect usage.
 
-Auto uses fresh provider evidence (a short cache, currently 60 seconds), excludes exhausted/unknown/malformed/stale readings and cooldowns, and checks model-specific limits where exposed. It does not assume every 429 is quota exhaustion. Codex permits at most one cross-account failover on a recognized quota failure **before output/tool activity**; no replay after partial work. Other providers do not gain arbitrary mid-request cross-account replay.
+Auto uses fresh provider evidence (a short cache, currently 60 seconds), excludes exhausted/unknown/malformed/stale readings and cooldowns, and checks model-specific limits. For a requested Codex model, a generic quota window does **not** prove model entitlement: absent availability evidence is rejected (including free seats with no Astra entitlement). Claude's paid `extra_usage` counter is not included subscription capacity and does not block a healthy subscription when disabled/null.
+
+The default strategy is **soonest reset**, with these priority tiers:
+
+| Tier | Eligible subscriptions | Order |
+|---|---|---|
+| 1 | Fixed reset within 24 hours | Earliest reset first |
+| 2 | Likely unanchored/idle window | Stable account order |
+| 3 | Fixed reset farther away | Earliest reset first |
+| 4 | Headroom known, reset unknown | Lowest utilization |
+
+Tier 2 is a **heuristic**, not verification: usage ≤0.5% and reset within five minutes of `observation + window duration`. A freshly started window can look similar. It gives real work a chance to start an idle clock; it does not prove every natural Codex rollover needs activation. The chooser sends no activation probes.
+
+Selection is sticky by default: keep a healthy seat within the same tier to reduce churn, unless another seat reaches a higher-priority tier (or has an earlier urgent deadline). Hitting any applicable window limit, including Claude's five-hour limit, disqualifies it. Cooldowns follow the provider seat, not its alias; duplicate aliases cannot bypass them. A new login into a label does not inherit the previous seat's cooldown.
+
+```ini
+# Defaults; apply only to providers selected as auto:
+auth.auto.strategy = soonest_reset
+auth.auto.urgent_horizon_hours = 24
+auth.auto.sticky = true
+# Optional per-provider override:
+# auth.auto.strategy.openai-codex = lowest_utilization
+```
+
+Strategies: `soonest_reset`, `lowest_utilization`, `preference_order`. Horizon accepts 1–168 hours. Invalid values produce a config warning and use that key's documented default. Explicit account selection still takes precedence and never silently falls back.
+
+Preview before selecting auto:
+
+```bash
+"$SYNAPS" auth plan --provider anthropic --model claude-fable-5-1
+"$SYNAPS" auth plan --provider openai-codex --model gpt-6-astra
+"$SYNAPS" auth plan --json
+```
+
+The preview shows rank, tier, reset, utilization, and rejection reason, and prints `would select: <provider>@<account>`. A `*` reset is likely unanchored. It calls the same ranking code as the broker, but a **new CLI process has no running session's stickiness/cooldown history**. It does not change selection, spend inference, or activate quotas; expired OAuth tokens may refresh normally. Without `--model`, it reports generic capacity, not a guarantee a seat can serve your chosen model. For remote credentials, run this command on the broker host.
+
+It does not assume every 429 is quota exhaustion. Codex and Anthropic permit **at most one immediate account switch per request**, under Auto only, on recognized pre-output window exhaustion. No cross-account replay after partial streamed output/tool activity; generic throttles retain ordinary bounded backoff. Claude recognizes rejected unified/per-window rate-limit status headers, or a typed rate-limit error with a long reset hint; the live exhaustion header schema remains to be verified with an actual limited request. A recognized limit is reported to the broker even when replay is prohibited, so the next turn can choose another seat. If the next seat also fails or none is eligible, the request stops rather than touring accounts indefinitely.
+
+A switch appears as `⚠ <account> exhausted until <time> — switching to <next>`. Local runtime broker adapters share cooldown and sticky state through the runtime's token-cache handle; rebuilding an adapter no longer forgets a limit. Restarting the runtime clears that in-memory state; fresh usage still gates capacity. No cross-provider model substitution or purchase of extra credits is performed.
 
 ## Keep Codex windows moving
 
@@ -124,7 +176,7 @@ Removing a selected slot leaves its selector failing closed until you choose ano
 
 ## Known operational limits
 
-- Cooldowns and short-lived capacity caches are broker-process-local, not a shared distributed database. Fleet clients should use one broker authority rather than independent credential copies.
+- Cooldowns and short-lived capacity caches are broker-instance/runtime-local, not a shared distributed database. Fleet clients should use one broker authority rather than independent credential copies.
 - A caller/process cancellation during an upstream rotating-token refresh can still require re-login if the provider rotated before persistence. This is inherited behavior, not a new guarantee of cancellation-safe refresh. Cross-process locks prevent simultaneous owners, not recovery of a lost provider response.
 - A profile inheriting the base `auth.json` may read/refresh it but cannot add/remove slots by silently creating a partial profile copy. Perform account management in the owning/base profile; do not fork refresh tokens.
 - Banked-reset count/expiry is alert-only and only as complete as provider-exposed data. The optional separate inventory fetch exists in the usage adapter; normal status/keeper polling does not force it. No redemption/purchase is performed.

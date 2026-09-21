@@ -594,3 +594,233 @@ async fn auto_selection_discards_replaced_seats_and_removed_slots() {
         ));
     }
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn chooser_ranks_deadlines_keeps_sticky_seat_and_preview_is_non_spending() {
+    use agent_core::auth::{quota_policy::Strategy, AutoSelectionPolicy};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let home = install_store();
+    let before = std::fs::read(home.path().join("auth.json")).unwrap();
+    let a_reset_hours = Arc::new(AtomicU64::new(60));
+    let reset = a_reset_hours.clone();
+    let app = Router::new().route("/usage", get(move |headers: HeaderMap| {
+        let reset = reset.clone();
+        async move {
+            let a = headers.get("authorization").unwrap().to_str().unwrap().ends_with("anthropic-a-access");
+            let hours = if a { reset.load(Ordering::SeqCst) } else { 48 };
+            let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis((agent_core::epoch_millis() + hours * 3_600_000) as i64).unwrap().to_rfc3339();
+            Json(json!({"seven_day": {"utilization": if a { 5.0 } else { 70.0 }, "resets_at": time}, "extra_usage": {"utilization": null, "is_enabled": false}}))
+        }
+    }));
+    let upstream = spawn(app).await;
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_account_policy(
+            AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto),
+        )
+        .with_usage_endpoint_override(format!("{upstream}/usage"))
+        .with_max_snapshot_age(std::time::Duration::from_secs(1));
+    let plan = broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
+    assert!(plan.current.is_none());
+    assert_eq!(plan.rows[0].credential.account.label_str(), "b");
+    assert_eq!(plan.rows[0].rank, Some(1));
+    assert_eq!(plan.rows[1].rank, Some(2));
+    assert!(
+        broker
+            .plan(OAuthProviderId::Anthropic, None)
+            .await
+            .unwrap()
+            .current
+            .is_none(),
+        "preview must not pin a winner"
+    );
+    let first = broker
+        .access_token_pinned(OAuthProviderId::Anthropic)
+        .await
+        .unwrap();
+    assert_eq!(first.credential.account.label_str(), "b");
+    a_reset_hours.store(36, Ordering::SeqCst); // A is sooner now, same tier.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        broker
+            .access_token_pinned(OAuthProviderId::Anthropic)
+            .await
+            .unwrap()
+            .credential,
+        first.credential
+    );
+    a_reset_hours.store(12, Ordering::SeqCst); // Urgent A preempts healthy B.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        broker
+            .access_token_pinned(OAuthProviderId::Anthropic)
+            .await
+            .unwrap()
+            .credential
+            .account
+            .label_str(),
+        "a"
+    );
+    broker
+        .report_cooldown(
+            &named(OAuthProviderId::Anthropic, "a"),
+            None,
+            "synthetic_limit",
+        )
+        .await
+        .unwrap();
+    let cooldown = broker
+        .accounts(OAuthProviderId::Anthropic)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.label == "a")
+        .unwrap()
+        .cooldown_until;
+    let plan = broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
+    assert_eq!(plan.rows[0].credential.account.label_str(), "b");
+    assert_eq!(
+        plan.current.unwrap().account.label_str(),
+        "a",
+        "preview did not repin away from cooling seat"
+    );
+    assert_eq!(
+        broker
+            .accounts(OAuthProviderId::Anthropic)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.label == "a")
+            .unwrap()
+            .cooldown_until,
+        cooldown
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("auth.json")).unwrap(),
+        before,
+        "valid-token preview and vend do not rewrite credentials"
+    );
+    a_reset_hours.store(60, Ordering::SeqCst);
+    let other = LocalBroker::new(reqwest::Client::new())
+        .with_auto_policy(AutoSelectionPolicy {
+            strategy: Strategy::LowestUtilization,
+            ..Default::default()
+        })
+        .with_usage_endpoint_override(format!("{upstream}/usage"));
+    assert_eq!(
+        other
+            .plan(OAuthProviderId::Anthropic, None)
+            .await
+            .unwrap()
+            .rows[0]
+            .credential
+            .account
+            .label_str(),
+        "a"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn runtime_broker_cache_retains_limits_but_separates_profiles_and_principals() {
+    use agent_core::auth::{broker_from_source, CredentialSource};
+    let _home = install_store();
+    let cache = TokenCache::new();
+    let a = broker_from_source(&CredentialSource::Local, &cache, reqwest::Client::new());
+    let b = broker_from_source(
+        &CredentialSource::Local,
+        &cache.clone(),
+        reqwest::Client::new(),
+    );
+    assert!(Arc::ptr_eq(&a, &b));
+    a.report_cooldown(&named(OAuthProviderId::Anthropic, "a"), None, "limit")
+        .await
+        .unwrap();
+    assert!(b
+        .accounts(OAuthProviderId::Anthropic)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.label == "a")
+        .unwrap()
+        .cooldown_until
+        .is_some());
+    let _other_home = install_store();
+    let c = broker_from_source(&CredentialSource::Local, &cache, reqwest::Client::new());
+    assert!(!Arc::ptr_eq(&b, &c));
+    assert!(c
+        .accounts(OAuthProviderId::Anthropic)
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.cooldown_until.is_none()));
+    let remote = broker_from_source(
+        &CredentialSource::Remote {
+            endpoint: "http://127.0.0.1:1".into(),
+            machine_token: "synthetic".into(),
+        },
+        &cache,
+        reqwest::Client::new(),
+    );
+    assert!(!Arc::ptr_eq(&c, &remote));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn alias_cannot_bypass_cooldown_and_relogin_does_not_inherit_it() {
+    let home = install_store();
+    let path = home.path().join("auth.json");
+    let mut root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    root["anthropic@a"]["accountId"] = json!("one-seat");
+    root["anthropic@b"]["accountId"] = json!("one-seat");
+    std::fs::write(&path, root.to_string()).unwrap();
+    let broker = LocalBroker::new(reqwest::Client::new());
+    broker
+        .report_cooldown(&named(OAuthProviderId::Anthropic, "a"), None, "limit")
+        .await
+        .unwrap();
+    assert!(broker
+        .accounts(OAuthProviderId::Anthropic)
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.cooldown_until.is_some()));
+    root["anthropic@b"]["accountId"] = json!("new-seat");
+    std::fs::write(&path, root.to_string()).unwrap();
+    assert!(broker
+        .accounts(OAuthProviderId::Anthropic)
+        .await
+        .unwrap()
+        .iter()
+        .find(|r| r.label == "b")
+        .unwrap()
+        .cooldown_until
+        .is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn generic_codex_headroom_does_not_authorize_a_model_not_reported_available() {
+    let _home = install_store();
+    let app = Router::new().route("/usage", get(|| async {
+        Json(json!({"plan_type":"free", "rate_limit":{"limit_reached":false,"primary_window":{"used_percent":0,"limit_window_seconds":2592000,"reset_after_seconds":2592000}}}))
+    }));
+    let upstream = spawn(app).await;
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_usage_endpoint_override(format!("{upstream}/usage"));
+    assert!(broker
+        .plan(OAuthProviderId::OpenAiCodex, Some("gpt-6-astra"))
+        .await
+        .unwrap()
+        .selection
+        .selected()
+        .is_none());
+    assert!(broker
+        .plan(OAuthProviderId::OpenAiCodex, None)
+        .await
+        .unwrap()
+        .selection
+        .selected()
+        .is_some());
+}

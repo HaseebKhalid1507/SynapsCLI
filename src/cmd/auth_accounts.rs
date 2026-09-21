@@ -804,3 +804,164 @@ mod tests {
         assert_eq!(r.detail.as_deref(), Some("dry-run: not written"));
     }
 }
+
+/// Inspect the local broker's exact auto policy. No inference, activation,
+/// selection changes or purchased credits. Expired OAuth tokens may rotate.
+pub async fn plan(
+    provider: Option<String>,
+    model: Option<String>,
+    json: bool,
+) -> Result<(), String> {
+    let cfg = config::load_config();
+    if cfg.auth.credential_source().is_remote() {
+        return Err(
+            "auth plan runs on the broker host; run it on the machine storing auth.json".into(),
+        );
+    }
+    let providers = match provider.as_deref() {
+        Some(p) => vec![parse_provider(p)?],
+        None => auth::list_all_accounts()?
+            .iter()
+            .filter_map(|r| r.provider.parse().ok())
+            .collect::<std::collections::BTreeSet<OAuthProviderId>>()
+            .into_iter()
+            .collect(),
+    };
+    let broker = auth::LocalBroker::new(auth::identity_http_client()?);
+    let mut plans = Vec::new();
+    for provider in providers {
+        plans.push(
+            broker
+                .plan(provider, model.as_deref())
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"schema_version": 1, "plans": plans}))
+                .map_err(|e| e.to_string())?
+        );
+    } else {
+        for plan in &plans {
+            println!("{}", render_plan(plan));
+        }
+        println!("tiers: 1 urgent (within horizon) · 2 likely unanchored* · 3 anchored · 4 unknown reset");
+        println!("* A near-zero full-duration reset is a heuristic, not proof of an idle clock. No inference was sent.");
+        println!("Preview has no session history; a running broker may retain a healthy sticky seat. Use --model to check model-specific limits.");
+    }
+    Ok(())
+}
+
+fn render_plan(plan: &auth::SelectionPlan) -> String {
+    use std::fmt::Write;
+    use synaps_cli::auth::quota_policy::Selection;
+    let mut out = format!(
+        "{} — {:?}, horizon {}h, sticky={}, current: {}\n",
+        plan.provider,
+        plan.strategy,
+        plan.urgent_horizon_ms / 3_600_000,
+        plan.sticky,
+        plan.current
+            .as_ref()
+            .map(|c| c.account.label_str())
+            .unwrap_or("none")
+    );
+    writeln!(
+        out,
+        "{:<5} {:<14} {:<5} {:<12} {:<7} VERDICT",
+        "RANK", "ACCOUNT", "TIER", "RESETS-IN", "USED"
+    )
+    .unwrap();
+    for row in &plan.rows {
+        let reset = row
+            .budget_reset_ms
+            .map(|t| {
+                let mins = t.saturating_sub(plan.now_ms) / 60_000;
+                format!(
+                    "{}d {:02}h{:02}m{}",
+                    mins / 1440,
+                    mins / 60 % 24,
+                    mins % 60,
+                    if row.anchored == Some(false) { "*" } else { "" }
+                )
+            })
+            .unwrap_or_else(|| "unknown".into());
+        writeln!(
+            out,
+            "{:<5} {:<14} {:<5} {:<12} {:<7} {}",
+            row.rank
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.credential.account.label_str(),
+            row.tier
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".into()),
+            reset,
+            row.utilization
+                .map(|u| format!("{u:.0}%"))
+                .unwrap_or_else(|| "?".into()),
+            row.verdict
+        )
+        .unwrap();
+    }
+    match &plan.selection {
+        Selection::Selected {
+            credential, tier, ..
+        } => writeln!(out, "would select: {credential} (tier {tier})").unwrap(),
+        Selection::NoCapacity {
+            earliest_reset_ms, ..
+        } => writeln!(
+            out,
+            "no proven capacity; earliest exhausted-window reset: {}",
+            earliest_reset_ms
+                .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t as i64))
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "unknown".into())
+        )
+        .unwrap(),
+    }
+    out
+}
+
+#[cfg(test)]
+mod chooser_tests {
+    use super::*;
+    use auth::quota_policy::{AccountCapacity, QuotaObservation, SelectionRequest, WindowLimit};
+    #[test]
+    fn plan_render_is_the_same_ranked_decision_as_the_broker_and_has_no_tokens() {
+        let provider = OAuthProviderId::Anthropic;
+        let now = 1_800_000_000_000;
+        let caps: Vec<_> = [("tomorrow", 75., 12), ("later", 5., 72)]
+            .into_iter()
+            .map(|(label, used, hours)| AccountCapacity {
+                credential: CredentialRef::new(provider, Account::named(label).unwrap()),
+                observed_at_ms: Some(now),
+                cooldown_until_ms: None,
+                observation: QuotaObservation::Ok {
+                    windows: vec![WindowLimit {
+                        id: "seven_day".into(),
+                        duration_ms: Some(7 * 86_400_000),
+                        used_percent: Some(used),
+                        limit_reached: None,
+                        resets_at_ms: Some(now + hours * 3_600_000),
+                        models: None,
+                    }],
+                    models: None,
+                },
+            })
+            .collect();
+        let plan = auth::SelectionPlan::from_candidates(
+            &SelectionRequest::soonest_reset(provider, now, 60_000),
+            &caps,
+        );
+        let text = render_plan(&plan);
+        assert!(text.contains("would select: anthropic@tomorrow (tier 1)"));
+        assert!(text.contains("eligible; outranked (rank 2)"));
+        let serialized = serde_json::to_string(&plan).unwrap();
+        for secret_key in ["access_token", "refresh_token", "Bearer"] {
+            assert!(!serialized.contains(secret_key));
+        }
+    }
+}
