@@ -84,12 +84,17 @@ rerun locally for your own.
 | **synaps** (core, no extensions) | **~38.8 MB** | **~68.5 MB** | **~3.3 MB** |
 | jcode (memory off) | 62.7 MB | 136.2 MB | ~8.2 MB |
 | synaps (with 3 extensions) | ~111 MB | ~141.7 MB | ~3.4 MB |
+| antigravity | 134.5 MB | 357.5 MB | ~24.8 MB |
 | pi | 119.6 MB | 717.8 MB | ~66.5 MB |
+| claude code | 204.8 MB | 1131.2 MB | ~103 MB |
+| opencode | 393.9 MB | 1144.0 MB | ~83 MB |
 | codex | 137.0 MB | 1213.1 MB | ~119.6 MB |
 
-At 10 concurrent sessions on the reference machine, Synaps core used **~50% less
-RAM than jcode**, ~10× less than pi, and ~18× less than codex. The daemon is why:
-sessions share one runtime, so the marginal cost of a session is a thin client.
+At 10 concurrent sessions on the reference machine, Synaps core used **~2× less
+RAM than the next-lightest harness** and 10–18× less than the heaviest. The
+daemon is why: sessions share one runtime, so the marginal cost of a session is
+a thin client. Not shown (not installed on the reference machine): `cursor-agent`,
+GitHub Copilot CLI.
 
 ## Caveats (read these)
 
