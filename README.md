@@ -134,7 +134,10 @@ sessions, so the marginal cost of a session is a thin client.
 |--------------------|----------:|------------:|------------------:|
 | **synaps** (core)  | **~39 MB** | **~69 MB**  | **~3.3 MB** |
 | jcode (memory off) | 63 MB      | 136 MB      | ~8.2 MB |
+| antigravity        | 135 MB     | 358 MB      | ~25 MB |
 | pi                 | 120 MB     | 718 MB      | ~66 MB |
+| claude code        | 205 MB     | 1131 MB     | ~103 MB |
+| opencode           | 394 MB     | 1144 MB     | ~83 MB |
 | codex              | 137 MB     | 1213 MB     | ~120 MB |
 
 Warm start (attach to the running daemon) is ~10 ms to first frame; cold start

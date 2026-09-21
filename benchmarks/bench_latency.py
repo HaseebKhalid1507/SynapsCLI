@@ -85,6 +85,10 @@ def build_specs(args: argparse.Namespace) -> dict[str, ToolSpec]:
         "codex": ToolSpec("codex", ["codex"]),
         "opencode": ToolSpec("opencode", ["opencode"]),
         "pi": ToolSpec("pi", ["pi"]),
+        "antigravity": ToolSpec("antigravity", ["antigravity"],
+                                {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"}),
+        "claude_code": ToolSpec("claude_code", ["claude"]),
+        "cursor": ToolSpec("cursor", ["cursor-agent"]),
     }
 
 
