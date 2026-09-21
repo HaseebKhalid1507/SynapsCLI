@@ -411,6 +411,8 @@ pub struct AuthConfig {
     /// validation (and fail-closed handling of bad labels) happens in
     /// [`AccountPolicy::from_config_map`](crate::core::auth::AccountPolicy::from_config_map).
     pub accounts: BTreeMap<String, String>,
+    /// Raw automatic chooser settings, relative to auth.auto.
+    pub auto: BTreeMap<String, String>,
 }
 
 impl AuthConfig {
@@ -1246,6 +1248,9 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
                         .insert(provider.to_string(), v.to_string());
                 }
             }
+            if let Some(key) = key.strip_prefix("auth.auto.") {
+                auth_config.auto.insert(key.to_string(), v.to_string());
+            }
             // Other unknown auth.* keys preserved (not rejected)
         }
     }
@@ -1532,6 +1537,11 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
+                    if let Some(key) = key.strip_prefix("auth.auto.") {
+                        let (_, warnings) = crate::auth::AutoSelectionPolicy::from_config_map(
+                            &BTreeMap::from([(key.to_string(), val.trim().to_string())]));
+                        config.warnings.extend(warnings);
+                    }
                     if let Some(provider) = key.strip_prefix("auth.account.") {
                         let mut one = BTreeMap::new();
                         one.insert(provider.trim().to_string(), val.trim().to_string());
@@ -3304,6 +3314,7 @@ api_retries = 5
             remote_endpoint: Some("https://b".into()),
             machine_token: Some("m".into()),
             accounts: BTreeMap::new(),
+            auto: BTreeMap::new(),
         };
         assert_eq!(
             auth.credential_source(),
@@ -3377,6 +3388,7 @@ api_retries = 5
             remote_endpoint: Some("https://config-host".into()),
             machine_token: Some("config-tok".into()),
             accounts: BTreeMap::new(),
+            auto: BTreeMap::new(),
         };
         std::env::set_var("SYNAPS_AUTH_ENDPOINT", "https://env-host");
         std::env::set_var("SYNAPS_MACHINE_TOKEN", "env-tok");

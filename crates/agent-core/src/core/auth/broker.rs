@@ -1617,6 +1617,16 @@ pub struct LocalBroker {
     /// Injected account policy. `None` → resolved from env + config on every
     /// selection (no global mutation, picks up `synaps auth use` changes).
     account_policy: Option<AccountPolicy>,
+    auto_policy: Option<super::AutoSelectionPolicy>,
+    auto_policy_cache: std::sync::Mutex<
+        Option<(
+            std::path::PathBuf,
+            Option<std::time::SystemTime>,
+            super::AutoSelectionPolicy,
+        )>,
+    >,
+    /// Successful vends only, scoped by model and immutable seat identity.
+    current_accounts: SharedMap<(CredentialRef, SeatIdentity)>,
     /// In-memory cooldowns for automatic selection, keyed by storage key.
     cooldowns: Arc<std::sync::Mutex<BTreeMap<String, Cooldown>>>,
     /// Test seam: overrides the usage endpoint for typed usage snapshots.
@@ -1671,6 +1681,9 @@ impl LocalBroker {
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
             account_policy: None,
+            auto_policy: None,
+            auto_policy_cache: std::sync::Mutex::new(None),
+            current_accounts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             usage_endpoint_override: None,
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
@@ -1689,6 +1702,45 @@ impl LocalBroker {
     pub fn with_account_policy(mut self, policy: AccountPolicy) -> Self {
         self.account_policy = Some(policy);
         self
+    }
+
+    /// Pin the automatic ranking policy (tests/embedding).
+    pub fn with_auto_policy(mut self, policy: super::AutoSelectionPolicy) -> Self {
+        self.auto_policy = Some(policy);
+        self
+    }
+
+    fn auto_policy(&self) -> super::AutoSelectionPolicy {
+        if let Some(policy) = &self.auto_policy {
+            return policy.clone();
+        }
+        let path = crate::config::resolve_read_path("config");
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut cache = self
+            .auto_policy_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_path, cached_time, policy)) = cache.as_ref() {
+            if cached_path == &path && *cached_time == mtime {
+                return policy.clone();
+            }
+        }
+        let (policy, warnings) =
+            super::AutoSelectionPolicy::from_config_map(&crate::config::load_config().auth.auto);
+        for warning in warnings {
+            tracing::warn!(%warning, "automatic account policy");
+        }
+        *cache = Some((path, mtime, policy.clone()));
+        policy
+    }
+
+    fn current_key(provider: OAuthProviderId, model: Option<&str>) -> String {
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            provider,
+            model.unwrap_or("")
+        )
     }
 
     /// Test seam: point the pinned ChatGPT backend host at a loopback fake.
@@ -1750,17 +1802,31 @@ impl LocalBroker {
         config_policy.with_env_overlay()
     }
 
-    /// Active cooldown for a storage key (expired entries are dropped).
+    /// Limits follow the immutable seat, not an alias that can be re-used.
+    fn cooldown_key(&self, cred: &CredentialRef) -> String {
+        let seat = self
+            .stored_seat(cred)
+            .ok()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| cred.storage_key());
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            cred.provider,
+            seat
+        )
+    }
+
+    /// Reading an expired cooldown is non-mutating (preview shares this path).
     fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
-        let mut map = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
-        match map.get(storage_key) {
-            Some(c) if c.until_ms > now_ms => Some(c.until_ms),
-            Some(_) => {
-                map.remove(storage_key);
-                None
-            }
-            None => None,
-        }
+        let cred = CredentialRef::parse_storage_key(storage_key)?;
+        let key = self.cooldown_key(&cred);
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|c| c.until_ms > now_ms)
+            .map(|c| c.until_ms)
     }
 
     /// Verify an explicitly addressed slot exists. Named slots that are
@@ -1828,6 +1894,13 @@ impl LocalBroker {
             let (credential, seat) = self.select_auto(provider, model).await?;
             match ensure_fresh_credential_for_seat(&self.http, &credential, &seat).await {
                 Ok(creds) => {
+                    self.current_accounts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            Self::current_key(provider, model),
+                            (credential.clone(), seat),
+                        );
                     return Ok(PinnedToken {
                         credential,
                         token: AccessToken {
@@ -1996,75 +2069,130 @@ impl LocalBroker {
         }
     }
 
-    /// Automatic selection: fresh, read-only usage for every stored account
-    /// of `provider`, fed to the pure capacity policy. Fails closed — no
-    /// account is advertised without proven capacity for `model`. Returns
-    /// the seat the winning reading was taken from so the vend can be pinned
-    /// to it.
-    async fn select_auto(
+    /// Preview the exact ranking without vending inference credentials or
+    /// changing stickiness/cooldowns. Usage reads may refresh expired OAuth
+    /// tokens through the ordinary rotation-safe credential path.
+    pub async fn plan(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
-    ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
-        use super::quota_policy::{select, Selection, SelectionRequest, Strategy};
+    ) -> Result<super::SelectionPlan, BrokerError> {
+        self.selection_plan(provider, model)
+            .await
+            .map(|(plan, _)| plan)
+    }
+
+    async fn selection_plan(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<(super::SelectionPlan, BTreeMap<String, SeatIdentity>), BrokerError> {
+        use super::quota_policy::SelectionRequest;
         let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
-        if summaries.is_empty() {
-            return Err(BrokerError::NoAccountAvailable {
-                provider: provider.as_str().to_string(),
-                reason: "no stored accounts".into(),
-            });
-        }
         let mut candidates = Vec::with_capacity(summaries.len());
-        let mut seats: BTreeMap<String, SeatIdentity> = BTreeMap::new();
+        let mut seats = BTreeMap::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut exclude = Vec::new();
         for summary in &summaries {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
-            let (capacity, seat) = self.capacity_for(&cred).await;
+            let (mut capacity, seat) = self.capacity_for(&cred).await;
+            // A generic Codex window (including a free 30-day plan) does
+            // not prove entitlement to Astra or any other requested model.
+            if provider == OAuthProviderId::OpenAiCodex {
+                if let (Some(model), super::quota_policy::QuotaObservation::Ok { models, .. }) =
+                    (model, &mut capacity.observation)
+                {
+                    let availability = models.get_or_insert_with(Vec::new);
+                    if !availability
+                        .iter()
+                        .any(|m| super::quota_policy::model_matches(&m.model, model))
+                    {
+                        availability.push(super::quota_policy::ModelAvailability {
+                            model: model.to_string(),
+                            state: super::quota_policy::ModelState::Unknown,
+                        });
+                    }
+                }
+            }
             if let Some(seat) = seat {
+                if !seen.insert(seat.as_str().to_string()) {
+                    exclude.push(cred.clone());
+                }
                 seats.insert(cred.storage_key(), seat);
             }
             candidates.push(capacity);
         }
-        // Evaluation clock is taken AFTER the (sequential) fetches so the
-        // freshest observation is never judged "in the future".
         let now_ms = crate::epoch_millis();
         for capacity in &mut candidates {
             capacity.cooldown_until_ms =
                 self.cooldown_until(&capacity.credential.storage_key(), now_ms);
         }
-        let preference: Vec<String> = summaries.iter().map(|s| s.label.clone()).collect();
+        let previous = self
+            .current_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::current_key(provider, model))
+            .cloned();
+        let current = previous
+            .filter(|(cred, seat)| seats.get(&cred.storage_key()) == Some(seat))
+            .map(|(cred, _)| cred);
+        let policy = self.auto_policy();
+        let preference: Vec<_> = summaries.iter().map(|s| s.label.clone()).collect();
         let request = SelectionRequest {
             model,
             preference: &preference,
-            strategy: Strategy::LowestUtilization,
+            exclude: &exclude,
+            strategy: policy.strategy_for(provider),
+            current: current.as_ref(),
+            urgent_horizon_ms: policy.urgent_horizon_ms,
+            sticky: policy.sticky,
             ..SelectionRequest::new(provider, now_ms, self.max_snapshot_age.as_millis() as u64)
         };
-        match select(&request, &candidates) {
-            Selection::Selected { credential, .. } => {
-                // The policy only selects proven capacity, and proven
-                // capacity always came with its seat.
+        Ok((
+            super::SelectionPlan::from_candidates(&request, &candidates),
+            seats,
+        ))
+    }
+
+    async fn select_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
+        use super::quota_policy::Selection;
+        let (plan, mut seats) = self.selection_plan(provider, model).await?;
+        match plan.selection {
+            Selection::Selected {
+                credential,
+                tier,
+                budget_reset_ms,
+                utilization,
+                ..
+            } => {
                 let seat = seats.remove(&credential.storage_key()).ok_or_else(|| {
                     BrokerError::NoAccountAvailable {
-                        provider: provider.as_str().to_string(),
+                        provider: provider.to_string(),
                         reason: "selected account has no paired seat identity".into(),
                     }
                 })?;
+                tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
                 Ok((credential, seat))
             }
             Selection::NoCapacity {
                 rejections,
                 earliest_reset_ms,
             } => {
-                let detail: Vec<String> = rejections
+                let detail: Vec<_> = rejections
                     .iter()
-                    .map(|r| format!("{}: {:?}", r.credential.account, r.reason))
+                    .map(|r| format!("{}: {}", r.credential.account, r.reason))
                     .collect();
                 let reset = earliest_reset_ms
                     .map(|t| format!("; earliest reset at {t}"))
                     .unwrap_or_default();
                 Err(BrokerError::NoAccountAvailable {
-                    provider: provider.as_str().to_string(),
+                    provider: provider.to_string(),
                     reason: format!("{}{reset}", detail.join(", ")),
                 })
             }
@@ -2705,7 +2833,7 @@ impl CredentialBroker for LocalBroker {
             .min(max_until);
         let reason = crate::truncate_str(reason, 64).to_string();
         tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
-        let key = cred.storage_key();
+        let key = self.cooldown_key(cred);
         self.cooldowns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3388,7 +3516,23 @@ pub fn broker_from_source(
     http: reqwest::Client,
 ) -> Arc<dyn CredentialBroker> {
     match source {
-        super::CredentialSource::Local => Arc::new(LocalBroker::new(http)),
+        super::CredentialSource::Local => {
+            // Runtime refresh and failover build adapters repeatedly. Keep
+            // their local authority on the runtime-owned TokenCache, not a
+            // global broker (which may belong to another remote principal).
+            let key = (
+                storage::auth_file_path(),
+                crate::config::resolve_read_path("config"),
+            );
+            let mut brokers = cache
+                .local_brokers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            brokers
+                .entry(key)
+                .or_insert_with(|| Arc::new(LocalBroker::new(http)))
+                .clone()
+        }
         super::CredentialSource::Remote {
             endpoint,
             machine_token,

@@ -1,6 +1,15 @@
 # Auto chooser: soonest-reset-first with automatic hop
 
-Status: plan (2026-09-21). Branch `feat/multi-account-broker`.
+Status: implemented; targeted integration validation passed (2026-09-21). Branch `feat/multi-account-broker`.
+
+## Implementation notes / corrections to the original proposal
+
+- G1 is committed at `05f3d60f`. G3's classifier/router and loop tests landed with the concurrent `08060e1d` commit; G2 finishes the shared broker lifecycle, config and preview.
+- Sliding-reset inference is only a heuristic; a single near-zero/full-duration observation cannot verify first-use anchoring. No activation work is included here.
+- `auth plan` on a new CLI process has no session's in-memory sticky/cooldown history; remote users run it on the broker host. Usage reads may rotate expired tokens, but never make inference requests or change the account selector.
+- Shared local authority is scoped to the runtime's `TokenCache` handle plus auth/config paths, not a process-global broker that might represent a different remote principal. Cooldowns are seat-scoped to prevent aliases bypassing them.
+- Disabled/null Claude `extra_usage` is feature-scoped, not an inference limit. Codex selection for a requested model rejects seats without provider-reported model availability.
+- Operator resource limit: Cargo jobs=4, test threads=2 (runtime tracing tests serial), Tokio workers=2; no concurrent verification commands or Fable workers.
 
 ## Problem
 
@@ -179,3 +188,15 @@ when W1 reports its public API. G4 is foreground work after W2/W3 land.
 Each worker: `cargo fmt` on touched files only (tree is not fmt-clean),
 `cargo build`, crate tests, `cargo clippy -p <crate> --all-targets -- -D warnings`.
 No commits by workers; the foreground reviews and commits per goal.
+
+## Verification evidence (foreground, bounded workers)
+
+- `cargo test -j 4 -p synaps-core -- --test-threads=2`: full core suite passed (883 tests at this run; later config-loader regression added).
+- `cargo test -j 4 -p synaps-core --test broker_accounts -- --test-threads=2`: synthetic loopback tests cover earlier deadline vs lower utilization, stickiness across successful vends, urgent preemption, exhausted/cooling rejection, non-spending preview, alias cooldowns, relogin isolation, retained local adapters and profile/principal separation. Requested Codex model must be reported available.
+- `cargo test -j 4 --bin synaps -- --test-threads=2`: 105 passed including rank/preview rendering.
+- `cargo test -j 4 -p synaps-engine --lib runtime:: -- --test-threads=1`: 1117 passed, 3 ignored. At two test threads the tracing schema-capture test failed once (missing capture), then passed alone and in the serial suite. Serial suite includes Anthropic pre-output hop, no post-output replay, explicit-seat refusal, bounded one-hop budget and generic-429 backoff tests.
+- `cargo clippy -j 4 -p synaps-core -p synaps --all-targets -- -D warnings`: passed.
+- Full `cargo test -j 2 --workspace -- --test-threads=1` attempted, but stopped at `tests/attach_no_daemon.rs:64`: a subprocess expected a daemon-disabled notice but got terminal setup failure (`No such device or address`). Full workspace is **not** claimed green.
+- Live `auth plan --provider anthropic --model claude-fable-5-1`: claude4 tier 1, then default/claude5/claude3/claude2. Live `--provider openai-codex --model gpt-6-astra`: default then codex4 then codex3; codex3 now reports a fixed reset (tier 3, different from the original plan's idle observation). Free codex2/7 were excluded for unknown Astra availability, codex5/6 for exhaustion. No inference/activation was sent.
+
+Remaining operational validation: observe a real provider-declared exhaustion and its hop; do not deliberately spend an account just to test this. Keeper sliding-reset correction and Kimi/Grok schema work remain separate tasks. Builds use at most 4 Cargo jobs (release uses 2), Rust tests at most 2 threads, never concurrently launched by this session.

@@ -1333,9 +1333,23 @@ impl ApiMethods {
 
                             clock.mark_headers();
                             let trace_rid = provider_request_id_from_headers(resp.headers());
-                            let error_text = await_or_cancel(cancel, resp.text())
-                                .await?
-                                .unwrap_or_default();
+                            // Error bodies may echo prompts or be unbounded.
+                            // Retain only the quota probe cap, even before
+                            // classification/humanization; never buffer the
+                            // full upstream response just to take a prefix.
+                            let error_text = await_or_cancel(cancel, async {
+                                let mut stream = resp.bytes_stream();
+                                let mut bytes = Vec::new();
+                                while let Some(Ok(chunk)) = stream.next().await {
+                                    let remaining = QUOTA_PROBE_BODY_CAP - bytes.len();
+                                    bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                                    if bytes.len() == QUOTA_PROBE_BODY_CAP {
+                                        break;
+                                    }
+                                }
+                                String::from_utf8_lossy(&bytes).into_owned()
+                            })
+                            .await?;
 
                             // Decide whether we've exhausted retries for this error class.
                             let retry_exhausted = if is_429 {

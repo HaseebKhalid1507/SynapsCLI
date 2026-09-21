@@ -45,6 +45,8 @@ pub struct StatusOptions {
     /// Every stored account of every usage-capable provider (or of `provider`).
     pub all: bool,
     pub json: bool,
+    /// Full windows, model availability, credits and adapter diagnostics.
+    pub verbose: bool,
 }
 
 // ── Backend seam ─────────────────────────────────────────────────────────────
@@ -57,6 +59,10 @@ trait UsageBackend: Send + Sync {
     fn source_label(&self) -> &str;
     /// Labels of the stored accounts for `provider` (non-secret listing).
     async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, String>;
+    /// Optional display metadata; unavailable metadata must not hide usage.
+    async fn identities(&self, _provider: OAuthProviderId) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// The account the active policy selects when none is given explicitly.
     fn resolve_default(&self, provider: OAuthProviderId) -> Result<Account, String>;
     /// Typed read-only usage for exactly this credential.
@@ -72,7 +78,11 @@ impl BrokerBackend {
     fn from_config() -> Self {
         let config = synaps_cli::config::load_config();
         let source = config.auth.credential_source();
-        let label = if source.is_remote() { "remote" } else { "local" };
+        let label = if source.is_remote() {
+            "remote"
+        } else {
+            "local"
+        };
         let cache = synaps_cli::auth::TokenCache::new();
         let http = reqwest::Client::new();
         let broker = synaps_cli::auth::broker_from_source(&source, &cache, http);
@@ -119,13 +129,25 @@ impl UsageBackend for BrokerBackend {
             .map_err(|e| e.to_string())
     }
 
+    async fn identities(&self, provider: OAuthProviderId) -> Vec<(String, String)> {
+        self.broker
+            .accounts(provider)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.identity.map(|identity| (row.label, identity)))
+            .collect()
+    }
+
     fn resolve_default(&self, provider: OAuthProviderId) -> Result<Account, String> {
         match self.broker.account_selector(provider) {
             AccountSelector::Account(account) => Ok(account),
             AccountSelector::Auto => Err(format!(
                 "{provider} is set to automatic account selection; pass --account <label> or --all"
             )),
-            other => Err(format!("invalid account selector for {provider}: {other:?}")),
+            other => Err(format!(
+                "invalid account selector for {provider}: {other:?}"
+            )),
         }
     }
 
@@ -245,7 +267,9 @@ async fn select_targets(
         Some(label) => Account::parse(label).map_err(|e| format!("invalid --account: {e}"))?,
         None => backend.resolve_default(provider)?,
     };
-    selection.targets.push(CredentialRef::new(provider, account));
+    selection
+        .targets
+        .push(CredentialRef::new(provider, account));
     Ok(selection)
 }
 
@@ -257,19 +281,30 @@ async fn build_report(backend: &dyn UsageBackend, selection: Selection) -> Usage
         report.accounts.push(AccountUsageEntry {
             provider: failure.provider.as_str().to_string(),
             account: "*".into(),
+            identity: None,
             outcome: AccountUsageOutcome::Error {
                 error: UsageErrorSummary::other("account_listing", failure.message),
             },
         });
     }
+    let mut identities = std::collections::BTreeMap::new();
     for cred in selection.targets {
         let outcome = match backend.fetch(&cred).await {
             Ok(snapshot) => AccountUsageOutcome::ok(snapshot),
             Err(error) => AccountUsageOutcome::Error { error },
         };
+        if let std::collections::btree_map::Entry::Vacant(entry) = identities.entry(cred.provider) {
+            entry.insert(backend.identities(cred.provider).await);
+        }
+        let identity = identities[&cred.provider]
+            .iter()
+            .find(|(label, _)| label == cred.account.label_str())
+            .map(|(_, identity)| identity.trim().to_string())
+            .filter(|identity| !identity.is_empty());
         report.accounts.push(AccountUsageEntry {
             provider: cred.provider.as_str().to_string(),
             account: cred.account.label_str().to_string(),
+            identity,
             outcome,
         });
     }
@@ -303,7 +338,9 @@ fn bar(percent: Option<f64>) -> String {
     const WIDTH: usize = 30;
     match percent {
         Some(p) => {
-            let filled = ((p / 100.0) * WIDTH as f64).round().clamp(0.0, WIDTH as f64) as usize;
+            let filled = ((p / 100.0) * WIDTH as f64)
+                .round()
+                .clamp(0.0, WIDTH as f64) as usize;
             format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
         }
         None => "?".repeat(WIDTH),
@@ -416,7 +453,7 @@ fn render_snapshot(out: &mut String, s: &UsageSnapshot, now_ms: u64) {
     }
 }
 
-fn render_text(report: &UsageReport, now_ms: u64) -> String {
+fn render_verbose(report: &UsageReport, now_ms: u64) -> String {
     let mut out = String::new();
     out.push_str(&format!("\n  ⚡ Account Usage ({})\n\n", report.source));
     if report.accounts.is_empty() {
@@ -426,6 +463,10 @@ fn render_text(report: &UsageReport, now_ms: u64) -> String {
     }
     for entry in &report.accounts {
         out.push_str(&format!("  {} / {}\n", entry.provider, entry.account));
+        out.push_str(&format!(
+            "    email: {}\n",
+            inline_text(entry.identity.as_deref().unwrap_or("unknown"))
+        ));
         match &entry.outcome {
             AccountUsageOutcome::Ok { snapshot } => render_snapshot(&mut out, snapshot, now_ms),
             AccountUsageOutcome::Error { error } => {
@@ -433,7 +474,10 @@ fn render_text(report: &UsageReport, now_ms: u64) -> String {
                     .http_status
                     .map(|s| format!(" [HTTP {s}]"))
                     .unwrap_or_default();
-                out.push_str(&format!("    ✗ {}{status}: {}\n", error.kind, error.message));
+                out.push_str(&format!(
+                    "    ✗ {}{status}: {}\n",
+                    error.kind, error.message
+                ));
                 if error.kind == "unauthorized" || error.kind == "credential" {
                     out.push_str(&format!(
                         "      run `synaps login --provider {} --account {}` to re-authenticate\n",
@@ -444,6 +488,154 @@ fn render_text(report: &UsageReport, now_ms: u64) -> String {
         }
         out.push('\n');
     }
+    out
+}
+
+// Remove terminal controls from provider-supplied display metadata.
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
+}
+
+fn inline_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn compact_window(w: &UsageWindow, now_ms: u64) -> String {
+    let used = w
+        .used_percent
+        .valid()
+        .map(|p| format!("{p:.0}% used"))
+        .unwrap_or_else(|| "usage unknown".into());
+    let reset = w
+        .reset_at
+        .map(|at| relative_time(now_ms, at))
+        .unwrap_or_else(|| "reset unknown".into());
+    let label = if w.label == "unknown" {
+        &w.id
+    } else {
+        &w.label
+    };
+    let scope = match &w.scope {
+        WindowScope::Model { model } => format!(" · {model}"),
+        WindowScope::Feature { feature } => format!(" · {feature}"),
+        WindowScope::Account => String::new(),
+    };
+    let flag = if w.is_exhausted() {
+        " · EXHAUSTED"
+    } else {
+        ""
+    };
+    format!("{label}{scope}: {used} · {reset}{flag}")
+}
+
+/// Compact stacked rows remain readable in narrow terminals, without dropping
+/// unknown/exhausted primary windows or hiding per-account failures.
+fn render_text(report: &UsageReport, now_ms: u64) -> String {
+    if report.accounts.is_empty() {
+        return render_verbose(report, now_ms);
+    }
+    let mut out = format!(
+        "\n  Account Usage · {} · {} accounts · {} errors\n",
+        report.source,
+        report.accounts.len(),
+        report.error_count()
+    );
+    let mut groups = std::collections::BTreeMap::<&str, Vec<&AccountUsageEntry>>::new();
+    for entry in &report.accounts {
+        groups.entry(&entry.provider).or_default().push(entry);
+    }
+    let mut missing_identity = false;
+    for (provider, entries) in groups {
+        out.push_str(&format!("\n  {}\n", inline_text(provider)));
+        for entry in entries {
+            let identity = entry.identity.as_deref().unwrap_or("unknown");
+            missing_identity |= entry.identity.is_none() && entry.account != "*";
+            let plan = match &entry.outcome {
+                AccountUsageOutcome::Ok { snapshot } => snapshot.plan.as_deref().unwrap_or(""),
+                _ => "",
+            };
+            let plan = if plan.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", inline_text(plan))
+            };
+            out.push_str(&format!(
+                "    {} · email: {}{plan}\n",
+                inline_text(&entry.account),
+                inline_text(identity)
+            ));
+            match &entry.outcome {
+                AccountUsageOutcome::Error { error } => {
+                    out.push_str(&format!(
+                        "      ! {}: {}\n",
+                        inline_text(&error.kind),
+                        inline_text(&error.message)
+                    ));
+                    if error.kind == "unauthorized" || error.kind == "credential" {
+                        out.push_str(&format!(
+                            "      Re-login: synaps login --provider {} --account {}\n",
+                            inline_text(provider),
+                            inline_text(&entry.account)
+                        ));
+                    }
+                }
+                AccountUsageOutcome::Ok { snapshot: s } => {
+                    if s.limit_reached == Some(true) {
+                        out.push_str("      ! Account limit reached\n");
+                    }
+                    if s.spend_control_reached == Some(true) {
+                        out.push_str("      ! Spend control reached\n");
+                    }
+                    let mut shown = 0;
+                    for w in &s.windows {
+                        // Quiet auxiliary counters move to --verbose, not the
+                        // main inference windows (even when unknown or at 0%).
+                        let auxiliary = matches!(w.scope, WindowScope::Feature { .. })
+                            || (w.duration_secs.is_none() && w.reset_at.is_none());
+                        if auxiliary && !w.is_exhausted() {
+                            continue;
+                        }
+                        out.push_str(&format!(
+                            "      {}\n",
+                            inline_text(&compact_window(w, now_ms))
+                        ));
+                        shown += 1;
+                    }
+                    if shown == 0 {
+                        out.push_str("      Usage/reset unknown; see --verbose\n");
+                    }
+                    for model in &s.model_availability {
+                        if model.availability != Availability::Available {
+                            let state = if model.availability == Availability::Exhausted {
+                                "unavailable"
+                            } else {
+                                "availability unknown"
+                            };
+                            out.push_str(&format!(
+                                "      ! {}: {state}\n",
+                                inline_text(&model.model)
+                            ));
+                        }
+                    }
+                    if s.notes.iter().any(|n| n.contains("unverified")) {
+                        out.push_str(
+                            "      ! Provider schema unverified; treat usage as provisional\n",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if missing_identity {
+        out.push_str(
+            "\n  Email unknown? Run `synaps auth identify --force` on the credential host.\n",
+        );
+    }
+    out.push_str(
+        "\n  Percentages are used capacity. --verbose: full details · --json: structured output\n",
+    );
     out
 }
 
@@ -458,7 +650,13 @@ async fn run_with_backend(
     if opts.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", render_text(&report, synaps_cli::epoch_millis()));
+        let now = synaps_cli::epoch_millis();
+        let text = if opts.verbose {
+            render_verbose(&report, now)
+        } else {
+            render_text(&report, now)
+        };
+        print!("{}", safe_text(&text));
     }
     if !report.accounts.is_empty() && report.ok_count() == 0 {
         return Err(format!(
@@ -491,6 +689,7 @@ mod usage_tests {
         accounts: BTreeMap<OAuthProviderId, Result<Vec<String>, String>>,
         defaults: BTreeMap<OAuthProviderId, Result<Account, String>>,
         results: BTreeMap<String, Result<UsageSnapshot, UsageErrorSummary>>,
+        identities: BTreeMap<OAuthProviderId, Vec<(String, String)>>,
     }
 
     impl FakeBackend {
@@ -499,6 +698,7 @@ mod usage_tests {
                 accounts: BTreeMap::new(),
                 defaults: BTreeMap::new(),
                 results: BTreeMap::new(),
+                identities: BTreeMap::new(),
             }
         }
         fn with_accounts(mut self, p: OAuthProviderId, labels: &[&str]) -> Self {
@@ -534,6 +734,9 @@ mod usage_tests {
                 .get(&provider)
                 .cloned()
                 .unwrap_or_else(|| Ok(Vec::new()))
+        }
+        async fn identities(&self, provider: OAuthProviderId) -> Vec<(String, String)> {
+            self.identities.get(&provider).cloned().unwrap_or_default()
         }
         fn resolve_default(&self, provider: OAuthProviderId) -> Result<Account, String> {
             self.defaults
@@ -587,6 +790,7 @@ mod usage_tests {
             account: account.map(str::to_string),
             all,
             json,
+            verbose: false,
         }
     }
 
@@ -594,13 +798,31 @@ mod usage_tests {
 
     #[test]
     fn provider_aliases_and_rejections() {
-        assert_eq!(parse_status_provider("claude").unwrap(), OAuthProviderId::Anthropic);
-        assert_eq!(parse_status_provider("Anthropic").unwrap(), OAuthProviderId::Anthropic);
-        assert_eq!(parse_status_provider("codex").unwrap(), OAuthProviderId::OpenAiCodex);
-        assert_eq!(parse_status_provider("openai-codex").unwrap(), OAuthProviderId::OpenAiCodex);
-        assert_eq!(parse_status_provider("kimi-code").unwrap(), OAuthProviderId::KimiCode);
+        assert_eq!(
+            parse_status_provider("claude").unwrap(),
+            OAuthProviderId::Anthropic
+        );
+        assert_eq!(
+            parse_status_provider("Anthropic").unwrap(),
+            OAuthProviderId::Anthropic
+        );
+        assert_eq!(
+            parse_status_provider("codex").unwrap(),
+            OAuthProviderId::OpenAiCodex
+        );
+        assert_eq!(
+            parse_status_provider("openai-codex").unwrap(),
+            OAuthProviderId::OpenAiCodex
+        );
+        assert_eq!(
+            parse_status_provider("kimi-code").unwrap(),
+            OAuthProviderId::KimiCode
+        );
         assert_eq!(parse_status_provider("grok").unwrap(), OAuthProviderId::Xai);
-        assert_eq!(parse_status_provider("xai-auth").unwrap(), OAuthProviderId::Xai);
+        assert_eq!(
+            parse_status_provider("xai-auth").unwrap(),
+            OAuthProviderId::Xai
+        );
         // Static-key collisions stay rejected like `synaps login`.
         assert!(parse_status_provider("kimi").is_err());
         assert!(parse_status_provider("nonsense").is_err());
@@ -617,7 +839,9 @@ mod usage_tests {
             OAuthProviderId::Anthropic,
             Ok(Account::parse("work").unwrap()),
         );
-        let sel = select_targets(&backend, &StatusOptions::default()).await.unwrap();
+        let sel = select_targets(&backend, &StatusOptions::default())
+            .await
+            .unwrap();
         assert_eq!(sel.targets.len(), 1);
         assert_eq!(sel.targets[0].provider, OAuthProviderId::Anthropic);
         assert_eq!(sel.targets[0].account.label_str(), "work");
@@ -631,13 +855,19 @@ mod usage_tests {
             .await
             .unwrap();
         assert_eq!(sel.targets[0].storage_key(), "openai-codex@astra2");
-        let sel = select_targets(&backend, &opts(Some("codex"), Some("default"), false, false))
-            .await
-            .unwrap();
+        let sel = select_targets(
+            &backend,
+            &opts(Some("codex"), Some("default"), false, false),
+        )
+        .await
+        .unwrap();
         assert_eq!(sel.targets[0].storage_key(), "openai-codex");
-        let err = select_targets(&backend, &opts(Some("codex"), Some("Bad Label!"), false, false))
-            .await
-            .unwrap_err();
+        let err = select_targets(
+            &backend,
+            &opts(Some("codex"), Some("Bad Label!"), false, false),
+        )
+        .await
+        .unwrap_err();
         assert!(err.starts_with("invalid --account"), "{err}");
         let err = select_targets(&backend, &opts(None, Some("astra2"), false, false))
             .await
@@ -665,19 +895,30 @@ mod usage_tests {
     async fn all_enumerates_every_provider_and_isolates_listing_failures() {
         let backend = FakeBackend::new()
             .with_accounts(OAuthProviderId::Anthropic, &["default", "work"])
-            .with_accounts(OAuthProviderId::OpenAiCodex, &["default", "astra2", "BAD LABEL"])
+            .with_accounts(
+                OAuthProviderId::OpenAiCodex,
+                &["default", "astra2", "BAD LABEL"],
+            )
             .with_listing_error(OAuthProviderId::KimiCode, "auth.json unreadable");
-        let sel = select_targets(&backend, &opts(None, None, true, false)).await.unwrap();
+        let sel = select_targets(&backend, &opts(None, None, true, false))
+            .await
+            .unwrap();
         let keys: Vec<String> = sel.targets.iter().map(|c| c.storage_key()).collect();
         assert_eq!(
             keys,
-            vec!["anthropic", "anthropic@work", "openai-codex", "openai-codex@astra2"]
+            vec![
+                "anthropic",
+                "anthropic@work",
+                "openai-codex",
+                "openai-codex@astra2"
+            ]
         );
         assert_eq!(sel.listing_failures.len(), 2);
         assert!(sel
             .listing_failures
             .iter()
-            .any(|f| f.provider == OAuthProviderId::OpenAiCodex && f.message.contains("label rejected")));
+            .any(|f| f.provider == OAuthProviderId::OpenAiCodex
+                && f.message.contains("label rejected")));
         assert!(sel
             .listing_failures
             .iter()
@@ -687,7 +928,10 @@ mod usage_tests {
             .await
             .unwrap();
         assert_eq!(sel.targets.len(), 2);
-        assert!(sel.targets.iter().all(|c| c.provider == OAuthProviderId::Anthropic));
+        assert!(sel
+            .targets
+            .iter()
+            .all(|c| c.provider == OAuthProviderId::Anthropic));
         assert!(sel.listing_failures.is_empty());
     }
 
@@ -709,7 +953,9 @@ mod usage_tests {
                     http_status: Some(401),
                 }),
             );
-        let sel = select_targets(&backend, &opts(None, None, true, true)).await.unwrap();
+        let sel = select_targets(&backend, &opts(None, None, true, true))
+            .await
+            .unwrap();
         let report = build_report(&backend, sel).await;
         assert_eq!(report.source, "local");
         assert_eq!(report.accounts.len(), 4);
@@ -726,21 +972,33 @@ mod usage_tests {
         assert_eq!(rows[0]["error"]["kind"], "account_listing");
         assert_eq!(rows[1]["provider"], "anthropic");
         assert_eq!(rows[1]["status"], "ok");
-        assert_eq!(rows[1]["snapshot"]["windows"][0]["used_percent"]["state"], "valid");
-        assert_eq!(rows[2]["snapshot"]["model_availability"][0]["model"], "gpt-6-astra");
-        assert_eq!(rows[2]["snapshot"]["model_availability"][0]["availability"], "exhausted");
+        assert_eq!(
+            rows[1]["snapshot"]["windows"][0]["used_percent"]["state"],
+            "valid"
+        );
+        assert_eq!(
+            rows[2]["snapshot"]["model_availability"][0]["model"],
+            "gpt-6-astra"
+        );
+        assert_eq!(
+            rows[2]["snapshot"]["model_availability"][0]["availability"],
+            "exhausted"
+        );
         assert_eq!(rows[3]["account"], "astra2");
         assert_eq!(rows[3]["error"]["http_status"], 401);
         // Round-trips through the shared schema.
         let back: UsageReport = serde_json::from_value(v).unwrap();
         assert_eq!(back, report);
 
-        let text = render_text(&report, T0);
+        let text = render_verbose(&report, T0);
         assert!(text.contains("⚡ Account Usage (local)"));
         assert!(text.contains("anthropic / default"));
         assert!(text.contains("five_hour (5h)"));
         assert!(text.contains("12%") || text.contains("13%"));
-        assert!(text.contains("unknown (null)"), "unknown percent is labelled, not zeroed");
+        assert!(
+            text.contains("unknown (null)"),
+            "unknown percent is labelled, not zeroed"
+        );
         assert!(text.contains("reset unknown"));
         assert!(text.contains("EXHAUSTED"));
         assert!(text.contains("model gpt-6-astra: unavailable until 2026-01-05 09:00 UTC (purchased credits would enable; not automatic)"));
@@ -760,7 +1018,10 @@ mod usage_tests {
             .with_accounts(OAuthProviderId::Anthropic, &["default"])
             .with_result(
                 "anthropic",
-                Err(UsageErrorSummary::other("transport", "usage transport error: connect")),
+                Err(UsageErrorSummary::other(
+                    "transport",
+                    "usage transport error: connect",
+                )),
             );
         let err = run_with_backend(&backend, &opts(None, None, true, true))
             .await
@@ -772,7 +1033,10 @@ mod usage_tests {
             .with_result("anthropic", Ok(anthropic_snapshot("default")))
             .with_result(
                 "anthropic@work",
-                Err(UsageErrorSummary::other("transport", "usage transport error: connect")),
+                Err(UsageErrorSummary::other(
+                    "transport",
+                    "usage transport error: connect",
+                )),
             );
         run_with_backend(&backend, &opts(None, None, true, true))
             .await
@@ -782,7 +1046,13 @@ mod usage_tests {
         run_with_backend(&empty, &opts(None, None, true, false))
             .await
             .expect("no connected accounts is not an error");
-        let report = build_report(&empty, select_targets(&empty, &opts(None, None, true, false)).await.unwrap()).await;
+        let report = build_report(
+            &empty,
+            select_targets(&empty, &opts(None, None, true, false))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(render_text(&report, T0).contains("No connected accounts"));
 
         // Explicit missing account: error row, no fallback to default.
@@ -797,6 +1067,99 @@ mod usage_tests {
             AccountUsageOutcome::Error { error } => assert_eq!(error.kind, "unknown_account"),
             other => panic!("expected error row, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn identities_are_scoped_to_provider_and_slot_even_on_usage_failure() {
+        let mut backend = FakeBackend::new()
+            .with_accounts(OAuthProviderId::Anthropic, &["default", "work"])
+            .with_accounts(OAuthProviderId::OpenAiCodex, &["default"])
+            .with_result("anthropic", Ok(anthropic_snapshot("default")))
+            .with_result("openai-codex", Ok(codex_snapshot("default")));
+        backend.identities.insert(
+            OAuthProviderId::Anthropic,
+            vec![
+                ("default".into(), "personal@example.com".into()),
+                ("work".into(), "work@example.com".into()),
+            ],
+        );
+        let sel = select_targets(&backend, &opts(None, None, true, false))
+            .await
+            .unwrap();
+        let report = build_report(&backend, sel).await;
+        assert_eq!(
+            report.accounts[0].identity.as_deref(),
+            Some("personal@example.com")
+        );
+        assert_eq!(
+            report.accounts[1].identity.as_deref(),
+            Some("work@example.com")
+        );
+        assert!(matches!(
+            report.accounts[1].outcome,
+            AccountUsageOutcome::Error { .. }
+        ));
+        assert_eq!(report.accounts[2].identity, None);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["accounts"][1]["identity"], "work@example.com");
+        assert!(json["accounts"][2].get("identity").is_none());
+        let text = render_text(&report, T0);
+        assert!(text.contains("work · email: work@example.com"));
+        assert!(text.contains("default · email: unknown · pro"));
+        assert!(text.contains("unknown_account"));
+        assert!(text.contains("auth identify --force"));
+    }
+
+    #[test]
+    fn compact_view_preserves_limits_unknowns_and_scoped_exhaustion() {
+        let snapshot = parse_anthropic_usage(
+            r#"{
+            "five_hour": {"utilization": 0, "resets_at": null},
+            "seven_day": {"utilization": null, "resets_at": null},
+            "seven_day_sonnet": {"utilization": 100, "resets_at": "2025-09-24T00:00:00Z"},
+            "extra_usage": {"utilization": 0, "is_enabled": false}
+        }"#,
+            "work",
+            T0,
+        )
+        .unwrap();
+        let mut report = UsageReport::new("remote", T0);
+        report.accounts.push(AccountUsageEntry {
+            provider: "anthropic".into(),
+            account: "work".into(),
+            identity: Some("person@example.com".into()),
+            outcome: AccountUsageOutcome::ok(snapshot),
+        });
+        let text = render_text(&report, T0);
+        assert!(text.contains("remote · 1 accounts · 0 errors"));
+        assert!(text.contains("5h: 0% used · reset unknown"));
+        assert!(text.contains("7d: usage unknown · reset unknown"));
+        assert!(text.contains("sonnet: 100% used"));
+        assert!(text.contains("EXHAUSTED"));
+        assert!(!text.contains("extra_usage"));
+        assert!(!text.contains("note:"));
+        assert!(!text.contains("auth identify"));
+        assert!(render_verbose(&report, T0).contains("extra_usage"));
+        if let AccountUsageOutcome::Ok { snapshot } = &mut report.accounts[0].outcome {
+            snapshot.spend_control_reached = Some(true);
+            snapshot.limit_reached = Some(true);
+            snapshot
+                .notes
+                .push("grok billing schema unverified against a live account".into());
+        }
+        let text = render_text(&report, T0);
+        assert!(text.contains("Spend control reached"));
+        assert!(text.contains("Account limit reached"));
+        assert!(text.contains("Provider schema unverified"));
+    }
+
+    #[test]
+    fn metadata_cannot_inject_terminal_controls_or_rows() {
+        assert_eq!(
+            inline_text("a\nb\r\t\x1b[2J@example.com"),
+            "ab[2J@example.com"
+        );
+        assert_eq!(safe_text("a\nb\x1b[2J"), "a\nb[2J");
     }
 
     #[test]

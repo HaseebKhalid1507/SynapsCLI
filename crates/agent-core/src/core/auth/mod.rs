@@ -33,6 +33,8 @@ pub mod providers;
 pub mod quota_keeper;
 pub mod quota_policy;
 pub mod static_providers;
+pub mod auto_selection;
+pub use auto_selection::{AutoSelectionPolicy, PlanRow, SelectionPlan};
 mod storage;
 mod token;
 pub mod usage;

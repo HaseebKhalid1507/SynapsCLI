@@ -658,6 +658,9 @@ impl UsageErrorSummary {
 pub struct AccountUsageEntry {
     pub provider: String,
     pub account: String,
+    /// Display-only identity from broker metadata (usually an email); never a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     #[serde(flatten)]
     pub outcome: AccountUsageOutcome,
 }
@@ -816,6 +819,11 @@ fn anthropic_duration_hint(key: &str) -> Option<u64> {
 
 /// The Anthropic scope for a window key: `seven_day_sonnet` → Model, `…_oauth_apps` → Feature.
 fn anthropic_scope(key: &str) -> WindowScope {
+    if key == "extra_usage" {
+        return WindowScope::Feature {
+            feature: "extra_usage".into(),
+        };
+    }
     let mut parts = key.splitn(3, '_');
     let (_count, _unit, rest) = (parts.next(), parts.next(), parts.next());
     match rest {
@@ -2253,17 +2261,29 @@ mod tests {
     }
 
     #[test]
+    fn usage_entry_accepts_older_reports_without_identity() {
+        let entry: AccountUsageEntry = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic", "account": "default", "status": "error",
+            "error": {"kind": "credential", "message": "unavailable", "http_status": null}
+        })).unwrap();
+        assert_eq!(entry.identity, None);
+        assert!(serde_json::to_value(entry).unwrap().get("identity").is_none());
+    }
+
+    #[test]
     fn report_round_trip_with_partial_errors() {
         let snap = parse_anthropic_usage(ANTHROPIC_FIXTURE, "default", T0).unwrap();
         let mut report = UsageReport::new("local", T0);
         report.accounts.push(AccountUsageEntry {
             provider: "anthropic".into(),
             account: "default".into(),
+            identity: None,
             outcome: AccountUsageOutcome::ok(snap),
         });
         report.accounts.push(AccountUsageEntry {
             provider: "openai-codex".into(),
             account: "astra2".into(),
+            identity: None,
             outcome: AccountUsageOutcome::error(&UsageError::Unauthorized { status: 401 }),
         });
         assert_eq!(report.ok_count(), 1);
