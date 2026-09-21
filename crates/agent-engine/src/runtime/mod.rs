@@ -209,6 +209,29 @@ pub async fn emit_after_tool_call(
     max_tool_output: usize,
     session_id: Option<&str>,
 ) -> String {
+    emit_after_tool_call_outcome(
+        hook_bus, tool_name, runtime_tool_name, input, output, max_tool_output, session_id,
+    )
+    .await
+    .output
+}
+
+/// Distinguish an authoritative hook replacement from ordinary budget truncation.
+/// Byte equality with the summary cannot establish whether the delta lane is stale.
+pub(super) struct AfterToolCallOutcome {
+    pub output: String,
+    pub replaced: bool,
+}
+
+pub(super) async fn emit_after_tool_call_outcome(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+    max_tool_output: usize,
+    session_id: Option<&str>,
+) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
@@ -218,8 +241,10 @@ pub async fn emit_after_tool_call(
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
+    let mut replaced = false;
     let post_hook = match hook_bus.emit(&event).await {
         HookResult::Replace { mut output } => {
+            replaced = true;
             if output.len() > MAX_REPLACE_OUTPUT {
                 tracing::warn!(
                     tool = %tool_name,
@@ -249,7 +274,10 @@ pub async fn emit_after_tool_call(
     // Compress-then-truncate: apply the context-budget cap AFTER the hook.
     // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
     // no-extension path is behavior-identical to the legacy ordering.
-    crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output)
+    AfterToolCallOutcome {
+        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output),
+        replaced,
+    }
 }
 
 /// A reasoning-level substitution performed during a model change because the

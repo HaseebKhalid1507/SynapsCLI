@@ -2,7 +2,7 @@ use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use super::{
-    emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision,
+    emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
     BeforeToolCallDecision,
 };
 use crate::extensions::hooks::events::HookEvent;
@@ -1410,7 +1410,7 @@ impl StreamMethods {
                                                     (e.to_string(), None)
                                                 }
                                             };
-                                            let hooked_output = emit_after_tool_call(
+                                            let outcome = emit_after_tool_call_outcome(
                                                 &hook_bus,
                                                 &tool_name,
                                                 Some(&runtime_name),
@@ -1422,8 +1422,11 @@ impl StreamMethods {
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
                                             // the image would desync text and image.
-                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
-                                            (hooked_output, rich_blocks)
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
+                                            if outcome.replaced {
+                                                production_output = None;
+                                            }
+                                            (outcome.output, rich_blocks)
                                         }
                                         (None, started) => {
                                             canceled = true;
@@ -1745,7 +1748,7 @@ impl StreamMethods {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
                                             };
-                                            let hooked_output = emit_after_tool_call(
+                                            let outcome = emit_after_tool_call_outcome(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
@@ -1755,11 +1758,12 @@ impl StreamMethods {
                                                 session_id_inner.as_deref(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
-                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
                                             // F28: an errored tool's summary carries the exit
-                                            // status; drop the delta-lane handle so it can't win.
-                                            let history_handle = if errored { None } else { Some(output_handle) };
-                                            (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
+                                            // status; a real Replace is authoritative even when equal
+                                            // to the summary. Neither may lose to the delta lane.
+                                            let history_handle = if errored || outcome.replaced { None } else { Some(output_handle) };
+                                            (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
                                             (true, started.then_some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
@@ -1994,8 +1998,9 @@ fn drop_rich_if_rewritten(
     rich_blocks: Option<Vec<Value>>,
     hooked_output: &str,
     output: &str,
+    replaced: bool,
 ) -> Option<Vec<Value>> {
-    if hooked_output == output {
+    if !replaced && hooked_output == output {
         return rich_blocks;
     }
     if rich_blocks.is_some() {
@@ -2620,6 +2625,199 @@ mod rich_output_tests {
             }
         }
         async fn shutdown(&self) {}
+    }
+
+    struct StreamingTextTool {
+        summary: String,
+        errored: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StreamingTextTool {
+        fn name(&self) -> &str {
+            "streaming_stub"
+        }
+        fn description(&self) -> &str {
+            "streams text and returns a separate summary"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            let delta = ctx.channels.tx_delta.as_ref().expect("streaming lane");
+            delta.send("old streamed ".into());
+            delta.send("text, not the summary".into());
+            if self.errored {
+                anyhow::bail!("error summary: exit status 17");
+            }
+            Ok(self.summary.clone())
+        }
+    }
+
+    struct ContinueHook;
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for ContinueHook {
+        fn id(&self) -> &str {
+            "continue-hook"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn output_hook_bus(replace: Option<bool>) -> Arc<crate::extensions::hooks::HookBus> {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        if let Some(replace) = replace {
+            let mut perms = PermissionSet::new();
+            perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+            perms.grant(crate::extensions::permissions::Permission::ToolsTransformOutput);
+            let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> = if replace {
+                Arc::new(ReplaceHook)
+            } else {
+                Arc::new(ContinueHook)
+            };
+            bus.subscribe(HookKind::AfterToolCall, handler, None, None, perms)
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    async fn streaming_history_cases(parallel: bool) {
+        // Equal replacement/summary bytes must STILL discard the distinct delta lane.
+        // Long Continue/no-hook summaries must NOT be mistaken for replacements.
+        for (hook, summary, errored, expected) in [
+            (Some(true), "summary".into(), false, "REPLACED BY HOOK"),
+            (
+                Some(true),
+                "REPLACED BY HOOK".into(),
+                false,
+                "REPLACED BY HOOK",
+            ),
+            (
+                Some(false),
+                "summary".into(),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                Some(false),
+                "s".repeat(40_000),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                None,
+                "s".repeat(40_000),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                Some(false),
+                "summary".into(),
+                true,
+                "error summary: exit status 17",
+            ),
+        ] {
+            let calls = if parallel {
+                vec![("toolu_a", "streaming_stub"), ("toolu_b", "streaming_stub")]
+            } else {
+                vec![("toolu_a", "streaming_stub")]
+            };
+            let d = drive(
+                vec![Arc::new(StreamingTextTool { summary, errored })],
+                &calls,
+                output_hook_bus(hook).await,
+            )
+            .await;
+            let wire = tool_result_message(&d.bodies[1]);
+            let history = d
+                .history
+                .iter()
+                .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+                .expect("durable tool results");
+            for message in [wire, history.as_ref()] {
+                let results = message["content"].as_array().unwrap();
+                assert_eq!(results.len(), calls.len());
+                for result in results {
+                    assert_eq!(
+                        result["content"], expected,
+                        "parallel={parallel}, hook={hook:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_streaming_history_respects_hook_outcome() {
+        streaming_history_cases(false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_streaming_history_respects_hook_outcome() {
+        streaming_history_cases(true).await;
+    }
+
+    // Provider-free checks of the internal outcome and compatibility wrapper.
+    #[tokio::test]
+    async fn after_tool_outcome_distinguishes_replace_from_truncation() {
+        for hook in [None, Some(false), Some(true)] {
+            let bus = output_hook_bus(hook).await;
+            for summary in ["REPLACED BY HOOK".to_string(), "é".repeat(100)] {
+                let outcome = emit_after_tool_call_outcome(
+                    &bus,
+                    "stub",
+                    None,
+                    json!({}),
+                    summary.clone(),
+                    10,
+                    None,
+                )
+                .await;
+                assert_eq!(outcome.replaced, hook == Some(true));
+                let source = if outcome.replaced {
+                    "REPLACED BY HOOK"
+                } else {
+                    &summary
+                };
+                assert_eq!(
+                    outcome.output,
+                    HelperMethods::truncate_tool_result(source, 10)
+                );
+                assert_eq!(
+                    outcome.output,
+                    crate::runtime::emit_after_tool_call(
+                        &bus,
+                        "stub",
+                        None,
+                        json!({}),
+                        summary,
+                        10,
+                        None,
+                    )
+                    .await
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rich_blocks_drop_for_replacement_even_when_summary_is_equal() {
+        let blocks = Some(vec![json!({"type":"text","text":"summary"})]);
+        assert!(drop_rich_if_rewritten(blocks.clone(), "summary", "summary", true).is_none());
+        assert!(drop_rich_if_rewritten(blocks.clone(), "short", "long summary", false).is_none());
+        assert_eq!(
+            drop_rich_if_rewritten(blocks.clone(), "summary", "summary", false),
+            blocks
+        );
     }
 
     fn sse_tool_use_round(tool_uses: &[(&str, &str)]) -> String {
