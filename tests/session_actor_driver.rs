@@ -1225,48 +1225,77 @@ async fn s1_rearm_after_zero_client_revoke() {
     a2.end().await;
 }
 
-/// S1: a pending host confirmation is fail-closed answered `None` (deny) when
-/// the LAST client detaches, so the session does not zombie-block on a prompt
-/// with nobody to answer it. Verified via the re-attach snapshot showing the
-/// prompt was drained.
+/// S1 (P11): the pending-prompt fail-closed is now DRIVER-specific. A plain
+/// interactive session KEEPS its prompt across detach (the reattach-to-answer
+/// contract, see `session_actor.rs::pending_prompt_survives_detach_and_replays_on_attach`);
+/// only a session with a driver armed at last-detach drains it. This test
+/// genuinely ARMS a driver, lets the driver's turn raise a host prompt
+/// (`prompt_fixture` blocks the turn on the `SecretPromptHandle`), then detaches
+/// the last client and asserts BOTH gates fired:
+///   (a) the pending prompt was drained (fail-closed `None`), and
+///   (b) the driver was revoked ("no clients attached") — proven by the
+///       single-tenancy grant being released so a fresh session can re-arm.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn s1_pending_prompt_fail_closed_on_last_detach() {
     let guard = HomeGuard::new();
-    // Turn calls prompt_fixture → raises a prompt; a follow-up SSE would end
-    // the turn once the (auto-denied) prompt resolves.
+    // The driver's turn calls prompt_fixture → raises a host prompt (blocking the
+    // turn on the SecretPromptHandle); the follow-up SSE ends the turn once the
+    // (fail-closed) prompt resolves. `stub_host` loads the autonomous plugin with
+    // a prefs.json proposing anthropic/claude-fable-5-1, so the driver turn hits
+    // the loopback Anthropic stub (fictional favorites would EOF → Blocked).
     let bodies: &'static [&'static str] =
-        Box::leak(Box::new([sse_prompt_fixture("toolu_p7pf"), ANTHROPIC_SSE]));
+        Box::leak(Box::new([sse_prompt_fixture("toolu_p11pf"), ANTHROPIC_SSE]));
     let (host, _temp) = stub_host(&guard, Script::SeqSse(bodies), "").await;
     host.parts().tools.write().await.register(Arc::new(PromptFixtureTool));
 
-    let mut a = session_cfg(
-        &host,
-        SessionConfig {
-            model_override: Some("anthropic/claude-fable-5-1".into()),
-            persist: false,
-            ..SessionConfig::default()
-        },
-    )
-    .await;
+    // Arm a driver on session A (holds the host single-tenancy grant). The driver
+    // turn runs under the plugin's proposed model → hits the stub → prompt_fixture.
+    let mut a = session(&host).await;
+    a.arm().await;
 
-    // Normal (foreground) turn that raises a prompt.
-    a.send(SessionCommand::Submit { text: "go".into(), attachments: vec![] })
-        .await;
+    // The driver's turn raises the host prompt and blocks on it.
     a.until(|e| matches!(e, SessionEventWire::Prompt(_))).await;
 
-    // Detach the only client → S1 fail-closed drains the prompt (None).
+    // Detach A's ONLY client. A driver IS armed → B's S1 gate fires: the driver
+    // is revoked AND its pending host confirmation is drained (`None`).
     a.send(SessionCommand::Detach { client: ClientId(1) }).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Re-attach: the prompt must be gone (drained), not stuck pending.
+    // (b) revoked: the single-tenancy grant was released — a fresh session can
+    // now arm. Poll because the revoke/grant-release races the detach handling.
+    let mut b = session(&host).await;
+    let mut armed = false;
+    for _ in 0..40 {
+        b.driver_start().await;
+        let ev = b
+            .until(|e| {
+                matches!(
+                    e,
+                    SessionEventWire::SystemNotice(_) | SessionEventWire::DriverArmed { .. }
+                )
+            })
+            .await;
+        if matches!(ev, SessionEventWire::DriverArmed { .. }) {
+            armed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        armed,
+        "driver grant was not released after last-client detach (S1 revoke)"
+    );
+    b.end().await;
+
+    // (a) drained: re-attach to A — the prompt is gone, not stuck pending.
     let (t2, snap) =
         LocalTransport::attach(a.handle.clone(), ClientMeta::new(ClientKind::Test))
             .await
             .unwrap();
     assert!(
         snap.pending_prompts.is_empty(),
-        "pending prompt was not fail-closed on last detach (S1): {:?}",
+        "driver-armed pending prompt was not fail-closed on last detach (S1): {:?}",
         snap.pending_prompts
     );
     t2.send(SessionCommand::End {
