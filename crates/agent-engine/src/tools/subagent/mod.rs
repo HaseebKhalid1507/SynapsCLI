@@ -691,7 +691,7 @@ mod forum_worker_tests {
         let mut actors = std::collections::HashSet::new();
         for _ in 0..3 {
             let mut worker = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&binding));
+            apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&binding), None);
             let inherited = worker.memory_backend_for_test();
             assert_eq!(inherited.forum_author().group, author.group);
             assert_eq!(
@@ -743,7 +743,7 @@ mod forum_worker_tests {
             "openai-codex/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
             runtime.set_model(model.into());
             let before = runtime.reasoning_level();
             apply_anthropic_worker_reasoning(&mut runtime);
@@ -763,10 +763,10 @@ mod forum_worker_tests {
         let parent = crate::Runtime::new_headless();
         let parent_binding = parent.memory_backend_for_test();
         let mut worker = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&parent_binding));
+        apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&parent_binding), None);
         assert!(!worker.memory_backend_for_test().exclusive());
         let mut worker_none = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None);
+        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None);
         assert!(!worker_none.memory_backend_for_test().exclusive());
     }
 }
