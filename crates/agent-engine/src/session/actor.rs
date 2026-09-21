@@ -2977,19 +2977,24 @@ impl SessionActor {
             });
             self.publish_presence();
         }
-        // (E-P7, §S1) The last client just left. Two fail-closed gates:
+        // (E-P7 §S1 / P11) The last client just left. Fail-closed gates apply
+        // ONLY when a driver is (or was about to be) armed:
         //
-        //  1. Any pending host confirmation is answered `None` (deny). A prompt
-        //     with no client to answer it blocks the turn forever AND blocks
-        //     parking (`can_park` requires `pending_prompts` empty) — the
-        //     zombie cost stream. `tools/discovery.rs` treats `None` as
-        //     Unauthorized, so this denies rather than approves.
-        //  2. An armed driver is revoked: it must never run turns headless with
-        //     nobody watching and no way to answer a confirmation. Conservative
-        //     choice matching the "local TUI only" upstream intent — cancelling
-        //     the driver stream (via `DriverState` drop) and releasing the host
-        //     grant so the session can park normally.
-        if self.attached.is_empty() {
+        //  1. An armed driver is revoked: it must never run turns headless with
+        //     nobody watching and no way to answer a confirmation.
+        //  2. Its pending host confirmations are answered `None` (deny) — a
+        //     headless autonomous run must not sit on an unanswerable prompt.
+        //     `tools/discovery.rs` treats `None` as Unauthorized (deny).
+        //
+        // For a PLAIN interactive session (no driver), a pending prompt SURVIVES
+        // detach: the user reattaches and answers it — the daemon's core
+        // detach/reattach contract, and detach is often involuntary (SSH drop,
+        // sleep, wifi). Denying on detach would let a transient disconnect
+        // silently reject the user's action. The resource pin from an
+        // *abandoned* prompt is bounded by the pending-prompt deadline instead
+        // (see the actor select loop), not by punishing every detach.
+        if self.attached.is_empty() && (self.driver.is_some() || self.driver_pending.is_some()) {
+            self.driver_revoke("no clients attached");
             let had_prompts = !self.pending_prompts.is_empty();
             while let Some((pr, tx)) = self.pending_prompts.pop_front() {
                 let _ = tx.send(None);
@@ -2997,9 +3002,6 @@ impl SessionActor {
             }
             if had_prompts {
                 self.publish_presence();
-            }
-            if self.driver.is_some() || self.driver_pending.is_some() {
-                self.driver_revoke("no clients attached");
             }
         }
     }
