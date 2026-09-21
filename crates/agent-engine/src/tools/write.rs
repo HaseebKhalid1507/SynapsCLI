@@ -85,7 +85,7 @@ impl Tool for WriteTool {
             .map(|m| m.permissions())
             .ok();
 
-        let tmp_path = path.with_extension("agent-tmp");
+        let tmp_path = super::util::unique_tmp_path(&path);
         tokio::fs::write(&tmp_path, content)
             .await
             .map_err(|e| RuntimeError::Tool(format!("Failed to write file: {}", e)))?;
