@@ -210,7 +210,13 @@ pub async fn emit_after_tool_call(
     session_id: Option<&str>,
 ) -> String {
     emit_after_tool_call_outcome(
-        hook_bus, tool_name, runtime_tool_name, input, output, max_tool_output, session_id,
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        output,
+        max_tool_output,
+        session_id,
     )
     .await
     .output
@@ -275,7 +281,10 @@ pub(super) async fn emit_after_tool_call_outcome(
     // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
     // no-extension path is behavior-identical to the legacy ordering.
     AfterToolCallOutcome {
-        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output),
+        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(
+            &post_hook,
+            max_tool_output,
+        ),
         replaced,
     }
 }
