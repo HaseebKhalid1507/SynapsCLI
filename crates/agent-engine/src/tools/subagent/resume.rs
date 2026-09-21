@@ -142,6 +142,7 @@ impl Tool for SubagentResumeTool {
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
+        let session_allow_all = ctx.capabilities.session_allow_all.clone();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -242,7 +243,7 @@ impl Tool for SubagentResumeTool {
                     // turn budget. Subagents are short-lived one-shots — paying the 1h
                     // write premium (~2× input price) on them is unrecoverable waste
                     // (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
+                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref(), session_allow_all.as_ref());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model_a.clone());
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());

@@ -499,8 +499,8 @@ pub struct Runtime {
     delegation_parent: Option<String>,
     /// Session-scoped "Allow all" latch for extension `Confirm` gates
     /// (`before_tool_call`). Set when the user picks "Allow all (session)"
-    /// in the Confirm dialog; shared by worker clones so subagents in the
-    /// same session inherit it. Never persisted.
+    /// in the Confirm dialog; shared by clones and delegated workers in the
+    /// same session. Never persisted.
     session_allow_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
@@ -3612,6 +3612,7 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        session_allow_all: Some(self.session_allow_all.clone()),
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
@@ -3656,7 +3657,7 @@ impl Runtime {
                                     .await,
                                     None,
                                     false,
-                                    None,
+                                    Some(&self.session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
@@ -3734,6 +3735,7 @@ impl Runtime {
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
+                            let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
                             let memory_context_inner = self.memory_tool_capability();
@@ -3763,7 +3765,7 @@ impl Runtime {
                                                 .await,
                                                 None,
                                                 false,
-                                                None,
+                                                Some(&session_allow_all_inner),
                                             )
                                             .await;
                                         if let crate::runtime::BeforeToolCallDecision::Block {
@@ -3784,6 +3786,7 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    session_allow_all: Some(session_allow_all_inner.clone()),
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
                                                     watcher_exit_path: exit_path,
@@ -3912,6 +3915,16 @@ impl Runtime {
     /// once the user picked "Allow all (session)" in a Confirm dialog.
     pub fn session_allow_all(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
         &self.session_allow_all
+    }
+
+    /// Bind a worker to the calling session, not the process-wide host.
+    pub(crate) fn inherit_session_allow_all(
+        &mut self,
+        parent: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        if let Some(parent) = parent {
+            self.session_allow_all = parent.clone();
+        }
     }
 
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
@@ -5012,6 +5025,25 @@ mod tests {
             crate::extensions::hooks::events::HookResult::Block { reason }
                 if reason.contains("confirmation denied")
         ));
+    }
+
+    #[test]
+    fn session_allow_all_clones_share_but_independent_runtimes_do_not() {
+        use std::sync::{atomic::Ordering, Arc};
+        let parent = Runtime::new_headless();
+        let cloned = parent.clone();
+        let independent = Runtime::new_headless();
+        assert!(Arc::ptr_eq(
+            parent.session_allow_all(),
+            cloned.session_allow_all()
+        ));
+        assert!(!Arc::ptr_eq(
+            parent.session_allow_all(),
+            independent.session_allow_all()
+        ));
+        cloned.session_allow_all().store(true, Ordering::Relaxed);
+        assert!(parent.session_allow_all().load(Ordering::Relaxed));
+        assert!(!independent.session_allow_all().load(Ordering::Relaxed));
     }
 
     /// "Allow all (session)": the answer continues THIS call and latches the
