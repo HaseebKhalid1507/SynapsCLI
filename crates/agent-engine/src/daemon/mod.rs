@@ -679,14 +679,22 @@ pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
 /// extension boot. Ten seconds covers "oops, wrong window"; `0`/`never` →
 /// never exit on idle.
 pub fn autospawn_idle_exit() -> Option<Duration> {
-    autospawn_idle_exit_from(std::env::var("SYNAPS_DAEMON_IDLE_EXIT_SECS").ok().as_deref())
+    // Precedence: env > config (`daemon.idle_exit_secs`) > built-in default.
+    let cfg_secs = crate::config::load_config().daemon.idle_exit_secs;
+    autospawn_idle_exit_from(
+        std::env::var("SYNAPS_DAEMON_IDLE_EXIT_SECS").ok().as_deref(),
+        cfg_secs,
+    )
 }
 
-fn autospawn_idle_exit_from(v: Option<&str>) -> Option<Duration> {
+fn autospawn_idle_exit_from(v: Option<&str>, cfg_secs: u64) -> Option<Duration> {
+    // `0` (env or config) disables idle-exit; otherwise config is the default
+    // when the env var is absent or unparseable.
+    let from_cfg = || (cfg_secs != 0).then(|| Duration::from_secs(cfg_secs));
     match v.map(str::trim) {
         Some("0" | "never" | "off") => None,
-        Some(n) => n.parse::<u64>().ok().map(Duration::from_secs).or(Some(AUTOSPAWN_IDLE_EXIT)),
-        None => Some(AUTOSPAWN_IDLE_EXIT),
+        Some(n) => n.parse::<u64>().ok().map(Duration::from_secs).or_else(from_cfg),
+        None => from_cfg(),
     }
 }
 
@@ -758,15 +766,23 @@ mod flag_tests {
 
     #[test]
     fn autospawn_idle_exit_defaults_to_10s_and_honours_never() {
-        assert_eq!(autospawn_idle_exit_from(None), Some(AUTOSPAWN_IDLE_EXIT));
+        // cfg_secs = 10 mirrors the DaemonConfig default.
+        let d = AUTOSPAWN_IDLE_EXIT.as_secs();
+        assert_eq!(autospawn_idle_exit_from(None, d), Some(AUTOSPAWN_IDLE_EXIT));
         assert_eq!(AUTOSPAWN_IDLE_EXIT, Duration::from_secs(10));
-        assert_eq!(autospawn_idle_exit_from(Some("15")), Some(Duration::from_secs(15)));
-        assert_eq!(autospawn_idle_exit_from(Some(" 300 ")), Some(Duration::from_secs(300)));
+        assert_eq!(autospawn_idle_exit_from(Some("15"), d), Some(Duration::from_secs(15)));
+        assert_eq!(autospawn_idle_exit_from(Some(" 300 "), d), Some(Duration::from_secs(300)));
         for never in ["0", "never", "off"] {
-            assert_eq!(autospawn_idle_exit_from(Some(never)), None, "{never:?}");
+            assert_eq!(autospawn_idle_exit_from(Some(never), d), None, "{never:?}");
         }
-        // garbage → the default, never "no exit"
-        assert_eq!(autospawn_idle_exit_from(Some("soon")), Some(AUTOSPAWN_IDLE_EXIT));
+        // garbage env → the config default, never "no exit"
+        assert_eq!(autospawn_idle_exit_from(Some("soon"), d), Some(AUTOSPAWN_IDLE_EXIT));
+        // env absent → config value is the default (env > config > builtin).
+        assert_eq!(autospawn_idle_exit_from(None, 42), Some(Duration::from_secs(42)));
+        // config 0 disables idle-exit when env is absent.
+        assert_eq!(autospawn_idle_exit_from(None, 0), None);
+        // env still wins over config.
+        assert_eq!(autospawn_idle_exit_from(Some("5"), 42), Some(Duration::from_secs(5)));
     }
 
     #[test]

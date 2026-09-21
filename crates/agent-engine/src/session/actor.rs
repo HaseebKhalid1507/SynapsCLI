@@ -222,15 +222,24 @@ impl<T> std::ops::DerefMut for Live<T> {
 /// row only exists so `--attach <id>` / the adopt banner can find it quickly.
 /// Default 1 h; `never` → keep forever.
 pub fn parked_evict_after() -> Option<std::time::Duration> {
-    parked_evict_after_from(std::env::var("SYNAPS_DAEMON_PARKED_EVICT_SECS").ok().as_deref())
+    // Precedence: env > config (`daemon.parked_evict_secs`) > builtin default.
+    let cfg_secs = crate::config::load_config().daemon.parked_evict_secs;
+    parked_evict_after_from(
+        std::env::var("SYNAPS_DAEMON_PARKED_EVICT_SECS").ok().as_deref(),
+        cfg_secs,
+    )
 }
 
-fn parked_evict_after_from(v: Option<&str>) -> Option<std::time::Duration> {
-    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(3600);
+fn parked_evict_after_from(v: Option<&str>, cfg_secs: u64) -> Option<std::time::Duration> {
+    let from_cfg = || (cfg_secs != 0).then(|| std::time::Duration::from_secs(cfg_secs));
     match v.map(str::trim) {
         Some("never" | "0" | "off") => None,
-        Some(n) => n.parse::<u64>().ok().map(std::time::Duration::from_secs).or(Some(DEFAULT)),
-        None => Some(DEFAULT),
+        Some(n) => n
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+            .or_else(from_cfg),
+        None => from_cfg(),
     }
 }
 
@@ -275,15 +284,24 @@ pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_se
 /// (The driver-armed case fail-closes immediately on last detach; this deadline
 /// is only for a plain interactive session — see `detach` / `rearm_prompt_abandon`.)
 pub fn prompt_abandon_timeout() -> Option<std::time::Duration> {
-    prompt_abandon_timeout_from(std::env::var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS").ok().as_deref())
+    // Precedence: env > config (`daemon.prompt_abandon_secs`) > builtin default.
+    let cfg_secs = crate::config::load_config().daemon.prompt_abandon_secs;
+    prompt_abandon_timeout_from(
+        std::env::var("SYNAPS_DAEMON_PROMPT_ABANDON_SECS").ok().as_deref(),
+        cfg_secs,
+    )
 }
 
-fn prompt_abandon_timeout_from(v: Option<&str>) -> Option<std::time::Duration> {
-    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(3600);
+fn prompt_abandon_timeout_from(v: Option<&str>, cfg_secs: u64) -> Option<std::time::Duration> {
+    let from_cfg = || (cfg_secs != 0).then(|| std::time::Duration::from_secs(cfg_secs));
     match v.map(str::trim) {
         Some("never" | "0" | "off") => None,
-        Some(n) => n.parse::<u64>().ok().map(std::time::Duration::from_secs).or(Some(DEFAULT)),
-        None => Some(DEFAULT),
+        Some(n) => n
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+            .or_else(from_cfg),
+        None => from_cfg(),
     }
 }
 
@@ -546,14 +564,24 @@ impl SessionActor {
         // process-level discovery is known-finished. Never re-runs discovery.
         // `await_extensions=false` (TUI): a spawned waiter fires the
         // `ext_ready` arm instead, so boot never blocks on discovery.
+        // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
+        // the wait on extension discovery; the const remains the fallback.
+        let ext_ready_timeout = {
+            let secs = config.startup.extensions_ready_timeout_secs;
+            if secs == 0 {
+                budgets::EXTENSIONS_READY_TIMEOUT
+            } else {
+                std::time::Duration::from_secs(secs)
+            }
+        };
         let mut ext_ready = None;
         if cfg.await_extensions {
-            if tokio::time::timeout(budgets::EXTENSIONS_READY_TIMEOUT, host.extensions_ready())
+            if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())
                 .await
                 .is_err()
             {
                 tracing::warn!(
-                    budget_secs = budgets::EXTENSIONS_READY_TIMEOUT_SECS,
+                    budget_secs = ext_ready_timeout.as_secs(),
                     "extensions_ready timed out — on_session_start may miss late extensions"
                 );
             }
@@ -563,11 +591,8 @@ impl SessionActor {
             let (tx, rx) = oneshot::channel();
             let waiter_host = Arc::clone(host);
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    budgets::EXTENSIONS_READY_TIMEOUT,
-                    waiter_host.extensions_ready(),
-                )
-                .await;
+                let _ = tokio::time::timeout(ext_ready_timeout, waiter_host.extensions_ready())
+                    .await;
                 let _ = tx.send(());
             });
             ext_ready = Some(rx);
@@ -3664,24 +3689,35 @@ mod parked_evict_tests {
 
     #[test]
     fn parked_evict_defaults_to_one_hour_and_honours_never() {
-        assert_eq!(parked_evict_after_from(None), Some(Duration::from_secs(3600)));
-        assert_eq!(parked_evict_after_from(Some("120")), Some(Duration::from_secs(120)));
+        // cfg_secs = 3600 mirrors the DaemonConfig default.
+        let d = 3600u64;
+        assert_eq!(parked_evict_after_from(None, d), Some(Duration::from_secs(3600)));
+        assert_eq!(parked_evict_after_from(Some("120"), d), Some(Duration::from_secs(120)));
         for never in ["never", "0", "off"] {
-            assert_eq!(parked_evict_after_from(Some(never)), None, "{never:?}");
+            assert_eq!(parked_evict_after_from(Some(never), d), None, "{never:?}");
         }
-        assert_eq!(parked_evict_after_from(Some("junk")), Some(Duration::from_secs(3600)));
+        assert_eq!(parked_evict_after_from(Some("junk"), d), Some(Duration::from_secs(3600)));
+        // env absent → config wins; config 0 disables; env still beats config.
+        assert_eq!(parked_evict_after_from(None, 42), Some(Duration::from_secs(42)));
+        assert_eq!(parked_evict_after_from(None, 0), None);
+        assert_eq!(parked_evict_after_from(Some("7"), 42), Some(Duration::from_secs(7)));
     }
 
     #[test]
     fn prompt_abandon_defaults_to_one_hour_and_honours_never() {
-        // Default (unset) is a generous 1 h.
-        assert_eq!(prompt_abandon_timeout_from(None), Some(Duration::from_secs(3600)));
-        assert_eq!(prompt_abandon_timeout_from(Some("30")), Some(Duration::from_secs(30)));
+        // cfg_secs = 3600 mirrors the DaemonConfig default.
+        let d = 3600u64;
+        assert_eq!(prompt_abandon_timeout_from(None, d), Some(Duration::from_secs(3600)));
+        assert_eq!(prompt_abandon_timeout_from(Some("30"), d), Some(Duration::from_secs(30)));
         // Disabled sentinels ⇒ None ⇒ pure pre-#112 (prompt survives forever).
         for never in ["never", "0", "off"] {
-            assert_eq!(prompt_abandon_timeout_from(Some(never)), None, "{never:?}");
+            assert_eq!(prompt_abandon_timeout_from(Some(never), d), None, "{never:?}");
         }
         // Garbage falls back to the safe default rather than disabling the guard.
-        assert_eq!(prompt_abandon_timeout_from(Some("junk")), Some(Duration::from_secs(3600)));
+        assert_eq!(prompt_abandon_timeout_from(Some("junk"), d), Some(Duration::from_secs(3600)));
+        // env absent → config wins; config 0 disables; env still beats config.
+        assert_eq!(prompt_abandon_timeout_from(None, 42), Some(Duration::from_secs(42)));
+        assert_eq!(prompt_abandon_timeout_from(None, 0), None);
+        assert_eq!(prompt_abandon_timeout_from(Some("7"), 42), Some(Duration::from_secs(7)));
     }
 }

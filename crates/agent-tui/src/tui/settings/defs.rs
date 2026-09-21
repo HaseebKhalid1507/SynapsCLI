@@ -22,13 +22,13 @@ pub(crate) enum SettingApply {
 
 macro_rules! define_settings {
     ($(
-        $key:ident, $label:expr, $category:ident, $editor:expr, $help:expr,
+        $key:literal, $label:expr, $category:ident, $editor:expr, $help:expr,
             $apply:expr;
     )*) => {
         pub(crate) const ALL_SETTINGS: &[SettingDef] = &[
             $(
                 SettingDef {
-                    key: stringify!($key),
+                    key: $key,
                     label: $label,
                     category: Category::$category,
                     editor: $editor,
@@ -48,7 +48,7 @@ macro_rules! define_settings {
         ) -> SettingApply {
             match key {
                 $(
-                    stringify!($key) => {
+                    $key => {
                         let handler: fn(&mut crate::tui::app::App, &str) -> SettingApply = $apply;
                         handler(app, value)
                     }
@@ -60,11 +60,11 @@ macro_rules! define_settings {
 }
 
 define_settings! {
-    model, "Model", Model, EditorKind::ModelPicker,
+    "model", "Model", Model, EditorKind::ModelPicker,
         "Which Claude model to use.",
         |_app, value| SettingApply::Session(SessionSetting::Model { model: value.to_string() });
 
-    thinking, "Thinking", Model,
+    "thinking", "Thinking", Model,
         EditorKind::DynamicCycler,
         "Thinking depth — controls effort on adaptive models, budget on legacy.",
         |app, value| {
@@ -85,12 +85,12 @@ define_settings! {
             }
         };
 
-    reasoning_type, "Reasoning", Model,
+    "reasoning_type", "Reasoning", Model,
         EditorKind::Display,
         "How the active model expresses reasoning depth (derived from exact model capabilities; read-only).",
         |_app, _value| { /* display-only: no editor emits Apply for this key */ SettingApply::Local(Ok(())) };
 
-    context_window, "Context window", Model,
+    "context_window", "Context window", Model,
         EditorKind::Cycler(&["200k", "1m", "auto"]),
         "Override context window limit (auto = model default).",
         |_app, value| {
@@ -105,7 +105,7 @@ define_settings! {
             SettingApply::Session(SessionSetting::ContextWindow { tokens: window })
         };
 
-    compaction_model, "Compaction model", Model,
+    "compaction_model", "Compaction model", Model,
         EditorKind::ModelPicker,
         "Model used for /compact (default: claude-sonnet-4-6).",
         |_app, value| {
@@ -117,46 +117,46 @@ define_settings! {
             SettingApply::Session(SessionSetting::CompactionModel { model })
         };
 
-    api_retries, "API retries", Agent, EditorKind::Text { numeric: true },
+    "api_retries", "API retries", Agent, EditorKind::Text { numeric: true },
         "Retries on transient API errors.",
         |_app, value| match value.parse::<u32>() {
             Ok(n) => SettingApply::Session(SessionSetting::ApiRetries { n }),
             Err(_) => SettingApply::Local(Ok(())),
         };
 
-    subagent_timeout, "Subagent timeout", Agent, EditorKind::Text { numeric: true },
+    "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |_app, value| match value.parse::<u64>() {
             Ok(secs) => SettingApply::Session(SessionSetting::SubagentTimeout { secs }),
             Err(_) => SettingApply::Local(Ok(())),
         };
 
-    max_tool_output, "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
+    "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |_app, value| match value.parse::<usize>() {
             Ok(bytes) => SettingApply::Session(SessionSetting::MaxToolOutput { bytes }),
             Err(_) => SettingApply::Local(Ok(())),
         };
 
-    bash_timeout, "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
+    "bash_timeout", "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
         |_app, value| match value.parse::<u64>() {
             Ok(secs) => SettingApply::Session(SessionSetting::BashTimeout { secs }),
             Err(_) => SettingApply::Local(Ok(())),
         };
 
-    bash_max_timeout, "Bash max timeout", ToolLimits, EditorKind::Text { numeric: true },
+    "bash_max_timeout", "Bash max timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Legacy setting retained for config compatibility; requested bash timeouts are no longer clamped.",
         |_app, value| match value.parse::<u64>() {
             Ok(secs) => SettingApply::Session(SessionSetting::BashMaxTimeout { secs }),
             Err(_) => SettingApply::Local(Ok(())),
         };
 
-    theme, "Theme", Appearance, EditorKind::ThemePicker,
+    "theme", "Theme", Appearance, EditorKind::ThemePicker,
         "Color theme (restart required).",
         |_app, _value| { /* handled after write_config_value in apply_setting() */ SettingApply::Local(Ok(())) };
 
-    tui_background_opaque, "Background", Appearance, EditorKind::Cycler(&["opaque", "invisible"]),
+    "tui_background_opaque", "Background", Appearance, EditorKind::Cycler(&["opaque", "invisible"]),
         "Opaque paints Synaps' theme background; invisible uses your terminal background.",
         |_app, value| {
             match value {
@@ -167,7 +167,7 @@ define_settings! {
             SettingApply::Local(Ok(()))
         };
 
-    theme_transition, "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
+    "theme_transition", "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
         "Animated cross-fade on theme changes (on = 350ms). Off = instant snap. Integer ms (0-2000) accepted in the config file.",
         |_app, value| {
             match synaps_cli::config::ThemeTransitionMode::parse(value) {
@@ -179,7 +179,7 @@ define_settings! {
             }
         };
 
-    sidecar_toggle_key, "Sidecar toggle key", Sidecar,
+    "sidecar_toggle_key", "Sidecar toggle key", Sidecar,
         EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
         "Keybind that toggles the active sidecar plugin. Takes effect immediately.",
         |app, value| {
@@ -194,6 +194,45 @@ define_settings! {
                 }
             }
             SettingApply::Local(Ok(()))
+        };
+
+    "startup.quick_start", "Quick start", Startup, EditorKind::Cycler(&["on", "off"]),
+        "Skip waiting for extensions to finish loading before the first turn (faster startup; a tool from a slow extension may be unavailable on turn 1). Takes effect next launch.",
+        |_app, value| match value {
+            "on" | "off" => SettingApply::Local(Ok(())),
+            _ => SettingApply::Local(Err("expected on or off".to_string())),
+        };
+
+    "startup.extensions_ready_timeout_secs", "Extensions-ready wait", Startup,
+        EditorKind::Text { numeric: true },
+        "Max seconds to wait for extensions when Quick Start is off. Takes effect next launch.",
+        |_app, value| match value.parse::<u64>() {
+            Ok(_) => SettingApply::Local(Ok(())),
+            Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
+        };
+
+    "daemon.idle_exit_secs", "Daemon idle timeout", Daemon,
+        EditorKind::Text { numeric: true },
+        "Seconds the daemon stays alive after the last client disconnects (higher = stays warm, fewer cold starts). 0 = never idle-exit. Env SYNAPS_DAEMON_IDLE_EXIT_SECS overrides.",
+        |_app, value| match value.parse::<u64>() {
+            Ok(_) => SettingApply::Local(Ok(())),
+            Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
+        };
+
+    "daemon.prompt_abandon_secs", "Prompt-abandon timeout", Daemon,
+        EditorKind::Text { numeric: true },
+        "Seconds a pending confirmation on a detached session survives before it is auto-denied. 0 = disabled (survives forever). Env SYNAPS_DAEMON_PROMPT_ABANDON_SECS overrides.",
+        |_app, value| match value.parse::<u64>() {
+            Ok(_) => SettingApply::Local(Ok(())),
+            Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
+        };
+
+    "daemon.parked_evict_secs", "Parked eviction", Daemon,
+        EditorKind::Text { numeric: true },
+        "Seconds a parked session row lingers in the daemon before eviction (its state stays on disk; --continue rebuilds it). 0 = keep forever. Env SYNAPS_DAEMON_PARKED_EVICT_SECS overrides.",
+        |_app, value| match value.parse::<u64>() {
+            Ok(_) => SettingApply::Local(Ok(())),
+            Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
         };
 }
 
@@ -221,6 +260,48 @@ mod tests {
             .find(|d| d.key == "sidecar_toggle_key")
             .expect("sidecar_toggle_key setting should be defined");
         assert_eq!(def.category, Category::Sidecar);
+    }
+
+    #[test]
+    fn quick_start_setting_is_in_startup_category() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "startup.quick_start")
+            .expect("startup.quick_start setting should be defined");
+        assert_eq!(def.category, Category::Startup);
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
+            _ => panic!("startup.quick_start editor should be a Cycler"),
+        }
+    }
+
+    #[test]
+    fn daemon_settings_are_in_daemon_category() {
+        for key in [
+            "daemon.idle_exit_secs",
+            "daemon.prompt_abandon_secs",
+            "daemon.parked_evict_secs",
+        ] {
+            let def = ALL_SETTINGS
+                .iter()
+                .find(|d| d.key == key)
+                .unwrap_or_else(|| panic!("{key} setting should be defined"));
+            assert_eq!(def.category, Category::Daemon, "{key} should be in Daemon");
+            assert!(
+                matches!(def.editor, EditorKind::Text { numeric: true }),
+                "{key} should be a numeric Text editor"
+            );
+        }
+    }
+
+    #[test]
+    fn extensions_ready_timeout_is_in_startup_category() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "startup.extensions_ready_timeout_secs")
+            .expect("startup.extensions_ready_timeout_secs should be defined");
+        assert_eq!(def.category, Category::Startup);
+        assert!(matches!(def.editor, EditorKind::Text { numeric: true }));
     }
 
     #[test]
