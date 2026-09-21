@@ -891,20 +891,35 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         .active()
         .is_some_and(|p| p.kind == PromptKind::Confirm);
     if is_confirm {
-        // Confirm dialog: no free-text field. `y` answers "y" (allow);
-        // `n`, Esc and Enter (empty field) answer None (deny, fail-closed).
+        // Confirm dialog: a two-button lightbox, no free-text field.
+        //   y / Y                → Allow (answers "y")
+        //   n / N / Esc          → Deny  (answers None)
+        //   ← → Tab BackTab h l  → move focus between the buttons
+        //   Enter                → activate the FOCUSED button; Deny is the
+        //                          default focus, so a bare Enter denies.
         // Everything else — including pastes — is swallowed so nothing can
         // accidentally form an allow.
         if let Event::Key(key) = event {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    app.secret_prompts.push_char('y');
-                    app.secret_prompts.submit();
+                    app.secret_prompts.confirm_allow();
                     reconcile_secret_prompt(app);
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.secret_prompts.cancel();
                     reconcile_secret_prompt(app);
+                }
+                KeyCode::Enter => {
+                    app.secret_prompts.confirm_activate_focused();
+                    reconcile_secret_prompt(app);
+                }
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Char('h')
+                | KeyCode::Char('l') => {
+                    app.secret_prompts.toggle_confirm_focus();
                 }
                 _ => {}
             }

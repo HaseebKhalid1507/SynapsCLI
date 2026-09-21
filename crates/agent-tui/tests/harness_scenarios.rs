@@ -2002,6 +2002,58 @@ fn scenario_confirm_prompt_ignores_other_keys_and_paste() {
     assert!(!frame.contains('\u{2022}'), "nothing is echoed or masked:\n{frame}");
 }
 
+#[test]
+fn scenario_confirm_prompt_renders_two_buttons_deny_focused_by_default() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let _rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+    let frame = h.snapshot();
+    assert!(frame.contains("[ Allow (y) ]"), "allow button:\n{frame}");
+    assert!(frame.contains("[ Deny (n) ]"), "deny button:\n{frame}");
+    assert!(frame.contains("←/→/Tab select · Enter confirm"), "footer:\n{frame}");
+    assert!(
+        !h.confirm_allow_focused(),
+        "Deny must be the default focus (fail-closed Enter)"
+    );
+}
+
+#[test]
+fn scenario_confirm_prompt_arrow_then_enter_allows() {
+    for nav in [KeyCode::Right, KeyCode::Left, KeyCode::Tab, KeyCode::BackTab] {
+        let mut h = TestHarness::boot_with_size(100, 30);
+        let mut rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+        h.key(nav, KeyModifiers::NONE);
+        assert!(h.secret_prompt_active(), "{nav:?} only moves focus");
+        assert!(h.confirm_allow_focused());
+        h.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!h.secret_prompt_active(), "Enter on Allow resolves");
+        assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()), "{nav:?}+Enter allows");
+    }
+}
+
+#[test]
+fn scenario_confirm_prompt_toggle_twice_then_enter_denies() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+    h.key(KeyCode::Right, KeyModifiers::NONE);
+    h.key(KeyCode::Right, KeyModifiers::NONE);
+    assert!(!h.confirm_allow_focused(), "back on Deny");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), None, "Enter on Deny denies");
+}
+
+/// A typed password (the old muscle-memory failure) must never form an allow:
+/// no button toggles on plain chars, and Enter afterwards still denies.
+#[test]
+fn scenario_confirm_prompt_typed_password_then_enter_denies() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt("Confirm tool call", CONFIRM_BODY);
+    h.type_str("s3cret-pw!");
+    assert!(h.secret_prompt_active(), "plain chars never resolve a confirm");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!h.secret_prompt_active());
+    assert_eq!(rx.try_recv().unwrap(), None, "Enter with Deny focused denies");
+}
+
 /// The same defect hit long Secret prompts (a sudo reason): the body is
 /// word-wrapped instead of truncated to the first line.
 #[test]

@@ -101,7 +101,7 @@ pub async fn resolve_before_tool_call_result(
             let response = prompt
                 .prompt(
                     "Confirm tool call".to_string(),
-                    format!("{}\n\nType 'yes' or 'y' to allow.", message),
+                    format!("{}\n\nAllow this tool call?", message),
                 )
                 .await;
 

@@ -45,6 +45,9 @@ pub struct PendingSecretPrompt {
     pub title: String,
     pub prompt: String,
     pub buffer: String,
+    /// `Confirm` only: which of the two buttons is focused. `false` = Deny
+    /// (the default, so a bare Enter stays fail-closed), `true` = Allow.
+    pub confirm_allow_focused: bool,
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
@@ -89,6 +92,7 @@ impl SecretPromptQueue {
                 title: req.title,
                 prompt: req.prompt,
                 buffer: String::new(),
+                confirm_allow_focused: false,
                 response_tx: req.response_tx,
             });
         }
@@ -111,6 +115,46 @@ impl SecretPromptQueue {
     pub fn backspace(&mut self) {
         if let Some(active) = self.active.as_mut() {
             active.buffer.pop();
+        }
+    }
+
+    /// `Confirm` dialog: move focus between the two buttons (Allow ⇄ Deny).
+    /// No-op for `Secret` prompts.
+    pub fn toggle_confirm_focus(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            if active.kind == PromptKind::Confirm {
+                active.confirm_allow_focused = !active.confirm_allow_focused;
+            }
+        }
+    }
+
+    /// `Confirm` dialog: whether the Allow button is focused (Deny otherwise).
+    pub fn confirm_allow_focused(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|a| a.kind == PromptKind::Confirm && a.confirm_allow_focused)
+    }
+
+    /// `Confirm` dialog: answer "y" (allow) — the only string the runtime's
+    /// `resolve_before_tool_call_result` / `activate_tools` gates accept.
+    pub fn confirm_allow(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            if active.kind != PromptKind::Confirm {
+                return;
+            }
+            active.buffer.clear();
+            active.buffer.push('y');
+        }
+        self.submit();
+    }
+
+    /// `Confirm` dialog: activate the focused button (Enter). Deny is the
+    /// default focus, so an un-navigated Enter denies (fail-closed).
+    pub fn confirm_activate_focused(&mut self) {
+        if self.confirm_allow_focused() {
+            self.confirm_allow();
+        } else {
+            self.cancel();
         }
     }
 
