@@ -89,7 +89,7 @@ impl Tool for WatcherExitTool {
             }
 
             // Atomic write for handoff
-            let tmp_path = super::util::unique_tmp_path(&path);
+            let tmp_path = super::util::unique_tmp_path(path);
             tokio::fs::write(&tmp_path, &json_content)
                 .await
                 .map_err(|e| {
