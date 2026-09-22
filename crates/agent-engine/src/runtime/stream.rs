@@ -5,7 +5,7 @@ use super::{
     emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
     BeforeToolCallDecision,
 };
-use crate::extensions::hooks::events::HookEvent;
+use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -1123,6 +1123,8 @@ impl StreamMethods {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let d = assess_context(&s.config, &s.policy, budget);
                     s.policy = d.next_state;
+                    // Informational only: surfaced to on_message_complete hooks.
+                    s.last_band = Some(d.band);
                     d
                 };
                 let current_advisory;
@@ -1400,15 +1402,30 @@ impl StreamMethods {
                 }
 
                 let assistant_text = assistant_text_from_content(content);
+                let context_management = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .hook_context_management();
                 let hook_event = HookEvent::on_message_complete(
                     &assistant_text,
                     json!({
                         "content_block_count": content.len(),
                         "has_tool_use": !tool_uses.is_empty(),
+                        "context_management": context_management,
                     }),
                 )
                 .with_session(session_id.as_deref());
-                let _ = hook_bus.emit(&hook_event).await;
+                // An extension may report an advisory work phase; it is
+                // applied exactly like the model's own `context_checkpoint`
+                // (no note) and is never capacity or permission authority.
+                if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
+                    if context_enabled {
+                        continuation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .report_hook_phase(&phase);
+                    }
+                }
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
@@ -3456,6 +3473,25 @@ mod rich_output_tests {
         .await
     }
 
+    async fn drive_with_continuation(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        continuation: crate::runtime::continuation::SharedContinuation,
+    ) -> Driven {
+        drive_with_model_and_options(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            std::time::Duration::from_secs(20),
+            Some(continuation),
+        )
+        .await
+    }
+
     async fn drive_with_model(
         model: &str,
         messages: Vec<SharedMessage>,
@@ -3463,13 +3499,14 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
-        drive_with_model_and_deadline(
+        drive_with_model_and_options(
             model,
             messages,
             tools_to_register,
             tool_uses,
             hook_bus,
             std::time::Duration::from_secs(20),
+            None,
         )
         .await
     }
@@ -3487,13 +3524,14 @@ mod rich_output_tests {
     ) -> Driven {
         let deadline = std::time::Duration::from_secs(120);
         let started = std::time::Instant::now();
-        let driven = drive_with_model_and_deadline(
+        let driven = drive_with_model_and_options(
             "claude-sonnet-4-6",
             messages,
             tools_to_register,
             tool_uses,
             hook_bus,
             deadline,
+            None,
         )
         .await;
         eprintln!(
@@ -3503,13 +3541,14 @@ mod rich_output_tests {
         driven
     }
 
-    async fn drive_with_model_and_deadline(
+    async fn drive_with_model_and_options(
         model: &str,
         messages: Vec<SharedMessage>,
         tools_to_register: Vec<Arc<dyn Tool>>,
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
         deadline: std::time::Duration,
+        continuation: Option<crate::runtime::continuation::SharedContinuation>,
     ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
@@ -3528,7 +3567,7 @@ mod rich_output_tests {
         ))
         .unwrap();
 
-        let session = harness_session(
+        let mut session = harness_session(
             base_url,
             tools,
             tx,
@@ -3539,6 +3578,9 @@ mod rich_output_tests {
             false,
             model,
         );
+        if let Some(continuation) = continuation {
+            session.continuation = continuation;
+        }
 
         let started = std::time::Instant::now();
         let run = tokio::time::timeout(
@@ -3813,6 +3855,138 @@ mod rich_output_tests {
         )
         .await;
         assert!(retained.lock().unwrap().is_none());
+    }
+
+    /// on_message_complete hook that records every event's `data` and reports
+    /// an advisory `new_task` phase.
+    struct PhaseHook {
+        seen: Mutex<Vec<Value>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for PhaseHook {
+        fn id(&self) -> &str {
+            "phase-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.seen.lock().unwrap().push(event.data.clone());
+            HookResult::ContextPhase {
+                phase: "new_task".into(),
+            }
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn phase_hook_bus(
+        with_lifecycle: bool,
+    ) -> (Arc<crate::extensions::hooks::HookBus>, Arc<PhaseHook>) {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let hook = Arc::new(PhaseHook {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::LlmContent);
+        if with_lifecycle {
+            perms.grant(crate::extensions::permissions::Permission::SessionLifecycle);
+        }
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> = hook.clone();
+        bus.subscribe(HookKind::OnMessageComplete, handler, None, None, perms)
+            .await
+            .unwrap();
+        (bus, hook)
+    }
+
+    fn auto_continuation() -> crate::runtime::continuation::SharedContinuation {
+        let mut state = crate::runtime::continuation::ContinuationState::default();
+        state.config.mode = agent_core::config::ContextManagementMode::Auto;
+        std::sync::Arc::new(std::sync::Mutex::new(state))
+    }
+
+    /// End-to-end through the stream loop: the hook sees the additive
+    /// `context_management` payload and its `context_phase` report lands in
+    /// the continuation policy exactly like a `context_checkpoint` call.
+    #[tokio::test]
+    async fn on_message_complete_context_phase_reaches_continuation() {
+        use agent_core::core::context_policy::WorkPhase;
+        let (bus, hook) = phase_hook_bus(true).await;
+        let continuation = auto_continuation();
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let _ = drive_with_continuation(
+            initial,
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one hook per assistant message: {seen:?}");
+        assert_eq!(seen[0]["content_block_count"], 1);
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(
+            seen[0]["context_management"],
+            json!({"enabled": true, "band": "normal", "phase": "unknown"})
+        );
+        // The second event reflects the phase applied after the first report.
+        assert_eq!(seen[1]["context_management"]["phase"], "new_task");
+
+        let state = continuation.lock().unwrap();
+        assert_eq!(state.policy.phase(), WorkPhase::NewTask);
+        assert!(state.note.is_empty(), "hook path never records a note");
+        assert_eq!(
+            state.last_band,
+            Some(agent_core::core::context_policy::ContextBand::Normal)
+        );
+    }
+
+    /// Without `session.lifecycle` the report is ignored by the bus; with
+    /// context management disabled the payload says so and nothing is applied.
+    #[tokio::test]
+    async fn on_message_complete_context_phase_is_ignored_without_key_or_when_disabled() {
+        use agent_core::core::context_policy::WorkPhase;
+        // Observe key only, management enabled.
+        let (bus, hook) = phase_hook_bus(false).await;
+        let continuation = auto_continuation();
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let _ = drive_with_continuation(
+            initial.clone(),
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        assert_eq!(
+            continuation.lock().unwrap().policy.phase(),
+            WorkPhase::Unknown,
+            "report without session.lifecycle must not be applied"
+        );
+
+        // Both keys, management disabled.
+        let (bus, hook) = phase_hook_bus(true).await;
+        let continuation = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::runtime::continuation::ContinuationState::default(),
+        ));
+        let _ = drive_with_continuation(
+            initial,
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for data in &seen {
+            assert_eq!(
+                data["context_management"],
+                json!({"enabled": false, "band": Value::Null, "phase": "unknown"})
+            );
+        }
+        let state = continuation.lock().unwrap();
+        assert_eq!(state.policy.phase(), WorkPhase::Unknown);
+        assert_eq!(state.last_band, None);
     }
 
     /// The user message carrying tool results, from the round-2 request body.
