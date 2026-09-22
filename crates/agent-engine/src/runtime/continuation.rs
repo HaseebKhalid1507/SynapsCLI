@@ -79,6 +79,11 @@ pub struct ContinuationState {
     last_advisory: Option<ContextAdvisory>,
     pub initialized: bool,
     pub latest_archive: Option<String>,
+    /// Band of the latest admission assessment (`assess_context`) for this
+    /// window. Informational only (surfaced to `on_message_complete`
+    /// extension hooks); it is never an input to admission and is cleared
+    /// on reset and after a committed rollover.
+    pub last_band: Option<ContextBand>,
     /// A head save was requested but not durably acknowledged. Only an explicit
     /// session reload/reset resolves that uncertainty; mode toggles do not.
     pub durability_blocked: bool,
@@ -98,6 +103,7 @@ impl Default for ContinuationState {
             last_advisory: None,
             initialized: false,
             latest_archive: None,
+            last_band: None,
             durability_blocked: false,
             restore_pending: false,
         }
@@ -133,6 +139,52 @@ impl ContinuationState {
         }
         self.policy.report_phase(phase);
         Ok(())
+    }
+
+    /// Advisory `context_management` snapshot for the `on_message_complete`
+    /// extension hook payload. Disabled => `enabled:false`, `band:null`,
+    /// phase `"unknown"`. Never exposes the note.
+    pub fn hook_context_management(&self) -> Value {
+        if !self.enabled() {
+            return json!({"enabled": false, "band": Value::Null, "phase": WorkPhase::Unknown.as_str()});
+        }
+        json!({
+            "enabled": true,
+            "band": self.last_band.map(context_band_str),
+            "phase": self.policy.phase().as_str(),
+        })
+    }
+
+    /// Apply an advisory phase report from an extension hook. Identical to the
+    /// model's own `context_checkpoint` with no note; unknown strings warn and
+    /// are ignored, as is the disabled error. Never records a note.
+    pub fn report_hook_phase(&mut self, extension_phase: &str) {
+        match WorkPhase::parse(extension_phase) {
+            Some(phase) => match self.checkpoint(phase, None) {
+                Ok(()) => tracing::info!(
+                    phase = phase.as_str(),
+                    "context phase reported by extension hook"
+                ),
+                Err(error) => tracing::debug!(
+                    %error,
+                    "extension hook context phase ignored (context management off)"
+                ),
+            },
+            None => tracing::warn!(
+                phase = %extension_phase,
+                "extension hook reported an unknown context phase — ignoring"
+            ),
+        }
+    }
+}
+
+/// Wire string for a context band in hook payloads.
+pub(crate) fn context_band_str(band: ContextBand) -> &'static str {
+    match band {
+        ContextBand::Normal => "normal",
+        ContextBand::Pressure => "pressure",
+        ContextBand::Rollover => "rollover",
+        ContextBand::HardLimit => "hard_limit",
     }
 }
 
@@ -263,6 +315,7 @@ impl PreparedRollover {
         s.policy.reset();
         s.note.clear();
         s.last_advisory = None;
+        s.last_band = None;
         s.durability_blocked = false;
         Ok(self.messages)
     }
@@ -674,6 +727,15 @@ mod tests {
             window: 2,
             archive_id: "a".repeat(32),
         }
+    }
+
+    #[test]
+    fn rollover_commit_clears_last_band() {
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        state.lock().unwrap().last_band = Some(ContextBand::Rollover);
+        let head = prepared(&state);
+        head.commit(&state).unwrap();
+        assert_eq!(state.lock().unwrap().last_band, None);
     }
 
     #[tokio::test]
@@ -1282,6 +1344,90 @@ mod command_tests {
             "Context pressure: ~350000 tokens."
         );
     }
+    /// A `new_task` report arriving from the extension hook path must leave
+    /// the policy state exactly as the model's `context_checkpoint` tool
+    /// would (boundary pending => rollover at pressure, not before), and
+    /// must never touch the note.
+    #[test]
+    fn hook_phase_report_matches_tool_checkpoint_exactly() {
+        use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget};
+        let config = ContextManagementConfig {
+            mode: ContextManagementMode::Auto,
+            pressure_tokens: Some(250_000),
+            rollover_tokens: Some(500_000),
+            ..Default::default()
+        };
+        let mut via_tool = ContinuationState {
+            config,
+            note: "keep".into(),
+            ..Default::default()
+        };
+        let mut via_hook = ContinuationState {
+            config,
+            note: "keep".into(),
+            ..Default::default()
+        };
+        via_tool.checkpoint(WorkPhase::NewTask, None).unwrap();
+        via_hook.report_hook_phase("new_task");
+        assert_eq!(via_hook.policy, via_tool.policy);
+        assert_eq!(via_hook.note, "keep", "hook path never records a note");
+        assert_eq!(via_hook.policy.phase(), WorkPhase::NewTask);
+        let budget = |used_tokens| ContextBudget {
+            context_window_tokens: 1_000_000,
+            used_tokens,
+            hard_remaining_tokens: 1_000_000 - used_tokens,
+            required_next_round_tokens: 16_000,
+        };
+        assert_eq!(
+            assess_context(&config, &via_hook.policy, budget(249_999)).action,
+            ContextAction::Continue
+        );
+        assert_eq!(
+            assess_context(&config, &via_hook.policy, budget(250_000)).action,
+            ContextAction::Rollover,
+            "boundary_pending set by the hook path triggers rollover at pressure"
+        );
+
+        // Unknown strings and the disabled mode are ignored without panicking
+        // or mutating the policy.
+        let before = via_hook.policy;
+        via_hook.report_hook_phase("deploy_to_prod");
+        assert_eq!(via_hook.policy, before);
+        let mut off = ContinuationState::default();
+        off.report_hook_phase("new_task");
+        assert_eq!(off.policy, ContextState::default());
+    }
+
+    #[test]
+    fn hook_context_management_payload_reflects_mode_band_and_phase() {
+        let mut state = ContinuationState::default();
+        assert_eq!(
+            state.hook_context_management(),
+            json!({"enabled": false, "band": Value::Null, "phase": "unknown"})
+        );
+        state.config.mode = ContextManagementMode::Auto;
+        assert_eq!(
+            state.hook_context_management(),
+            json!({"enabled": true, "band": Value::Null, "phase": "unknown"})
+        );
+        state.last_band = Some(ContextBand::Pressure);
+        state.note = "secret unfinished state".into();
+        state.checkpoint(WorkPhase::Execute, None).unwrap();
+        let payload = state.hook_context_management();
+        assert_eq!(
+            payload,
+            json!({"enabled": true, "band": "pressure", "phase": "execute"})
+        );
+        assert!(!payload.to_string().contains("secret"));
+        for (band, wire) in [
+            (ContextBand::Normal, "normal"),
+            (ContextBand::Rollover, "rollover"),
+            (ContextBand::HardLimit, "hard_limit"),
+        ] {
+            assert_eq!(context_band_str(band), wire);
+        }
+    }
+
     #[test]
     fn user_status_does_not_expose_internal_task_phase() {
         let rt = crate::Runtime::new_headless();

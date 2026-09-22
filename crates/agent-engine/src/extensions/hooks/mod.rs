@@ -38,7 +38,35 @@ fn hook_result_action(result: &HookResult) -> &'static str {
         HookResult::Confirm { .. } => "confirm",
         HookResult::Modify { .. } => "modify",
         HookResult::Replace { .. } => "replace",
+        HookResult::ContextPhase { .. } => "context_phase",
     }
+}
+
+/// Two-key gate for an advisory `context_phase` report: subscribing to
+/// `on_message_complete` needs `privacy.llm_content`; reporting a phase to
+/// the host's context management additionally needs `session.lifecycle`.
+/// Returns `Some(phase)` when the report is accepted, `None` (after a
+/// warning) when it must be ignored and treated as `continue`.
+fn accept_context_phase(
+    reg: &HandlerRegistration,
+    kind: HookKind,
+    phase: String,
+) -> Option<String> {
+    if !reg.permissions.has(Permission::SessionLifecycle) {
+        tracing::warn!(
+            hook = %kind.as_str(),
+            extension = %reg.handler.id(),
+            "Extension returned context_phase without session.lifecycle permission — ignoring report"
+        );
+        return None;
+    }
+    tracing::info!(
+        hook = %kind.as_str(),
+        extension = %reg.handler.id(),
+        phase = %phase,
+        "Extension reported advisory context phase"
+    );
+    Some(phase)
 }
 
 /// A registered hook handler with its metadata.
@@ -175,6 +203,9 @@ impl HookBus {
 
         // Collect injections from all handlers rather than returning on first
         let mut injections: Vec<String> = Vec::new();
+        // First valid advisory context-phase report wins; the chain continues
+        // so later observers still see the event.
+        let mut context_phase: Option<String> = None;
 
         for reg in &registrations {
             // Tool-specific filter: skip handlers that don't match.
@@ -323,6 +354,21 @@ impl HookBus {
                     );
                     return HookResult::Confirm { message };
                 }
+                Ok(HookResult::ContextPhase { phase }) => {
+                    // Advisory only — never stops the chain. Two-key gated;
+                    // an ignored report is a plain continue.
+                    if let Some(phase) = accept_context_phase(reg, event.kind, phase) {
+                        if context_phase.is_none() {
+                            context_phase = Some(phase);
+                        } else {
+                            tracing::debug!(
+                                hook = %event.kind.as_str(),
+                                extension = %reg.handler.id(),
+                                "Extension context_phase superseded by an earlier report — ignoring"
+                            );
+                        }
+                    }
+                }
                 Err(_timeout) => {
                     tracing::warn!(
                         hook = %event.kind.as_str(),
@@ -335,11 +381,15 @@ impl HookBus {
             }
         }
 
-        // Merge accumulated injections from all handlers
+        // Merge accumulated injections from all handlers. An advisory phase
+        // report is returned only when nothing else would be (Block/Inject
+        // take precedence; on_message_complete permits neither).
         if !injections.is_empty() {
             HookResult::Inject {
                 content: injections.join("\n\n"),
             }
+        } else if let Some(phase) = context_phase {
+            HookResult::ContextPhase { phase }
         } else {
             HookResult::Continue
         }
@@ -412,7 +462,11 @@ impl HookBus {
                     let handler = reg.handler.clone();
                     let event_clone = event.clone();
                     async move {
-                        tokio::time::timeout(HANDLER_TIMEOUT, handler.handle(&event_clone)).await
+                        (
+                            reg,
+                            tokio::time::timeout(HANDLER_TIMEOUT, handler.handle(&event_clone))
+                                .await,
+                        )
                     }
                 })
                 .collect();
@@ -420,7 +474,10 @@ impl HookBus {
         let results = join_all(futures).await;
 
         let mut injections: Vec<String> = Vec::new();
-        for result in results {
+        // First accepted report in completion order (registration order for
+        // the collected results); advisory only, never stops the chain.
+        let mut context_phase: Option<String> = None;
+        for (reg, result) in results {
             match result {
                 Ok(HookResult::Continue) => {}
                 Ok(HookResult::Block { reason }) => {
@@ -438,9 +495,26 @@ impl HookBus {
                 Ok(HookResult::Confirm { message }) => {
                     return HookResult::Confirm { message };
                 }
+                Ok(result @ HookResult::ContextPhase { .. }) => {
+                    if !event.kind.allows_result(&result) {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = hook_result_action(&result),
+                            "Extension returned action not allowed for hook — ignoring"
+                        );
+                        continue;
+                    }
+                    if let HookResult::ContextPhase { phase } = result {
+                        if let Some(phase) = accept_context_phase(reg, event.kind, phase) {
+                            context_phase.get_or_insert(phase);
+                        }
+                    }
+                }
                 Err(_timeout) => {
                     tracing::warn!(
                         hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
                         timeout_secs = HANDLER_TIMEOUT.as_secs(),
                         "Hook handler timed out in concurrent emit — skipping"
                     );
@@ -452,6 +526,8 @@ impl HookBus {
             HookResult::Inject {
                 content: injections.join("\n\n"),
             }
+        } else if let Some(phase) = context_phase {
+            HookResult::ContextPhase { phase }
         } else {
             HookResult::Continue
         }
@@ -690,6 +766,231 @@ mod tests {
             recorded, "ORIGINAL",
             "Replace without tools.transform_output must be ignored — original preserved"
         );
+    }
+
+    // ── context_phase (advisory work-phase report) ───────────────────────────
+
+    fn phase(p: &str) -> HookResult {
+        HookResult::ContextPhase { phase: p.into() }
+    }
+
+    fn message_complete_event() -> HookEvent {
+        HookEvent::on_message_complete(
+            "done",
+            serde_json::json!({"content_block_count": 1, "has_tool_use": false}),
+        )
+    }
+
+    /// Two-key gate, positive side: `privacy.llm_content` (subscribe) plus
+    /// `session.lifecycle` (report) => the advisory report is returned.
+    #[tokio::test]
+    async fn context_phase_accepted_with_session_lifecycle() {
+        let bus = HookBus::new();
+        let reporter = TestHandler::new("reporter", phase("new_task"));
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            reporter.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent, Permission::SessionLifecycle]),
+        )
+        .await
+        .unwrap();
+
+        let result = bus.emit(&message_complete_event()).await;
+        assert_eq!(result, phase("new_task"));
+        assert_eq!(reporter.calls(), 1);
+    }
+
+    /// Two-key gate, negative side: the observe key alone lets the handler
+    /// run, but its report is ignored (treated as continue).
+    #[tokio::test]
+    async fn context_phase_ignored_without_session_lifecycle() {
+        let bus = HookBus::new();
+        let reporter = TestHandler::new("observer-only", phase("new_task"));
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            reporter.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent]),
+        )
+        .await
+        .unwrap();
+
+        let result = bus.emit(&message_complete_event()).await;
+        assert_eq!(result, HookResult::Continue);
+        assert_eq!(reporter.calls(), 1, "handler still runs (it's subscribed)");
+    }
+
+    /// A report does not stop the chain: later observers still run, and the
+    /// first VALID report wins over later ones (an unprivileged earlier
+    /// report does not claim the slot).
+    #[tokio::test]
+    async fn context_phase_does_not_stop_chain_and_first_valid_wins() {
+        let bus = HookBus::new();
+        let unprivileged = TestHandler::new("unprivileged", phase("plan"));
+        let first = TestHandler::new("first", phase("new_task"));
+        let second = TestHandler::new("second", phase("wrap_up"));
+        let observer = TestHandler::new("observer", HookResult::Continue);
+        let both = || perms_with(&[Permission::LlmContent, Permission::SessionLifecycle]);
+
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            unprivileged.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent]),
+        )
+        .await
+        .unwrap();
+        for handler in [first.clone(), second.clone()] {
+            bus.subscribe(HookKind::OnMessageComplete, handler, None, None, both())
+                .await
+                .unwrap();
+        }
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            observer.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent]),
+        )
+        .await
+        .unwrap();
+
+        let result = bus.emit(&message_complete_event()).await;
+        assert_eq!(result, phase("new_task"), "first valid report wins");
+        assert_eq!(unprivileged.calls(), 1);
+        assert_eq!(first.calls(), 1);
+        assert_eq!(second.calls(), 1, "later reporter still runs");
+        assert_eq!(observer.calls(), 1, "later observer still runs");
+    }
+
+    /// A Block from an on_message_complete handler is still ignored, and a
+    /// valid phase report from another handler is still returned.
+    #[tokio::test]
+    async fn context_phase_survives_ignored_block_on_message_complete() {
+        let bus = HookBus::new();
+        let blocker = TestHandler::new(
+            "blocker",
+            HookResult::Block {
+                reason: "nope".into(),
+            },
+        );
+        let reporter = TestHandler::new("reporter", phase("execute"));
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            blocker.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent, Permission::SessionLifecycle]),
+        )
+        .await
+        .unwrap();
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            reporter.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent, Permission::SessionLifecycle]),
+        )
+        .await
+        .unwrap();
+
+        let result = bus.emit(&message_complete_event()).await;
+        assert_eq!(result, phase("execute"));
+        assert_eq!(blocker.calls(), 1);
+        assert_eq!(reporter.calls(), 1);
+    }
+
+    /// context_phase is not allowed on any other hook kind, even with both
+    /// permissions — sequential and concurrent paths alike.
+    #[tokio::test]
+    async fn context_phase_not_allowed_on_other_hooks() {
+        let bus = HookBus::new();
+        let all_perms = perms_with(&[
+            Permission::ToolsIntercept,
+            Permission::LlmContent,
+            Permission::SessionLifecycle,
+        ]);
+        let handlers: Vec<(HookKind, HookEvent, Arc<TestHandler>)> = vec![
+            (
+                HookKind::BeforeToolCall,
+                HookEvent::before_tool_call("bash", serde_json::json!({})),
+                TestHandler::new("btc", phase("new_task")),
+            ),
+            (
+                HookKind::AfterToolCall,
+                HookEvent::after_tool_call("bash", serde_json::json!({}), "o".into()),
+                TestHandler::new("atc", phase("new_task")),
+            ),
+            (
+                HookKind::BeforeMessage,
+                HookEvent::before_message("hi"),
+                TestHandler::new("bm", phase("new_task")),
+            ),
+            (
+                HookKind::OnCompaction,
+                HookEvent::on_compaction("a", "b", "s", 1, serde_json::json!({})),
+                TestHandler::new("oc", phase("new_task")),
+            ),
+            (
+                HookKind::OnSessionStart,
+                HookEvent::on_session_start("s"),
+                TestHandler::new("oss", phase("new_task")),
+            ),
+            (
+                HookKind::OnSessionEnd,
+                HookEvent::on_session_end("s", None),
+                TestHandler::new("ose", phase("new_task")),
+            ),
+        ];
+        for (kind, _, handler) in &handlers {
+            bus.subscribe(*kind, handler.clone(), None, None, all_perms.clone())
+                .await
+                .unwrap();
+        }
+        for (kind, event, handler) in &handlers {
+            let result = bus.emit(event).await;
+            assert_eq!(result, HookResult::Continue, "{}", kind.as_str());
+            assert_eq!(handler.calls(), 1, "{}", kind.as_str());
+        }
+        // Concurrent path (only legal for non-transform hooks).
+        let end = HookEvent::on_session_end("s", None);
+        assert_eq!(bus.emit_concurrent(&end).await, HookResult::Continue);
+    }
+
+    /// The concurrent emit path applies the same two-key gate and first-wins
+    /// aggregation for on_message_complete.
+    #[tokio::test]
+    async fn context_phase_concurrent_emit_two_key_gate() {
+        let bus = HookBus::new();
+        let unprivileged = TestHandler::new("unprivileged", phase("plan"));
+        let reporter = TestHandler::new("reporter", phase("wrap_up"));
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            unprivileged.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent]),
+        )
+        .await
+        .unwrap();
+        bus.subscribe(
+            HookKind::OnMessageComplete,
+            reporter.clone(),
+            None,
+            None,
+            perms_with(&[Permission::LlmContent, Permission::SessionLifecycle]),
+        )
+        .await
+        .unwrap();
+
+        let result = bus.emit_concurrent(&message_complete_event()).await;
+        assert_eq!(result, phase("wrap_up"));
+        assert_eq!(unprivileged.calls(), 1);
+        assert_eq!(reporter.calls(), 1);
     }
 
     #[test]

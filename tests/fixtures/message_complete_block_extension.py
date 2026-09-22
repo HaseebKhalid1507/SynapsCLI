@@ -43,6 +43,12 @@ def main():
             params = message.get("params", {})
             if params.get("kind") == "on_message_complete" and params.get("message") == "Block me":
                 write_message({"jsonrpc": "2.0", "id": message["id"], "result": {"action": "block", "reason": "ignored"}})
+            elif params.get("kind") == "on_message_complete" and params.get("message") == "Report phase":
+                # Advisory context-phase report; echoes the host-supplied
+                # context_management data back so the test can check it arrived.
+                cm = params.get("data", {}).get("context_management")
+                phase = "new_task" if isinstance(cm, dict) and "enabled" in cm else "missing_context_management"
+                write_message({"jsonrpc": "2.0", "id": message["id"], "result": {"action": "context_phase", "phase": phase}})
             else:
                 write_message({"jsonrpc": "2.0", "id": message["id"], "result": {"action": "continue"}})
         elif method == "shutdown":

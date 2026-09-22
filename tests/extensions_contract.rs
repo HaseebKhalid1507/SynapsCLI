@@ -166,6 +166,37 @@ fn after_tool_call_truncates_utf8_safely() {
     );
 }
 
+/// `context_phase` is an additive optional result within protocol version 1:
+/// it is advertised only on `on_message_complete`, documented in the
+/// contract, and the protocol version is not bumped for it.
+#[test]
+fn context_phase_is_additive_optional_on_message_complete_only() {
+    let contract = extension_contract();
+    assert_eq!(
+        contract["extension_protocol_version"],
+        serde_json::json!(synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION),
+        "context_phase is additive-optional and must NOT bump the protocol version"
+    );
+    let note = &contract["hooks"]["on_message_complete"]["context_phase"];
+    assert_eq!(note["status"], "optional");
+    assert!(note["compatibility"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no version bump"));
+    assert!(note["permission"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("session.lifecycle"));
+    for &hook in ALL_HOOK_KINDS {
+        assert_eq!(
+            hook.allowed_action_names().contains(&"context_phase"),
+            hook == HookKind::OnMessageComplete,
+            "{} must advertise context_phase iff it is on_message_complete",
+            hook.as_str()
+        );
+    }
+}
+
 #[test]
 fn on_message_complete_event_carries_assistant_content_as_message() {
     let event = HookEvent::on_message_complete(
