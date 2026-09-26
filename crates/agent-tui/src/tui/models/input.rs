@@ -337,6 +337,14 @@ mod tests {
     /// test above; this one pins the routing.
     #[test]
     fn e_opens_expanded_provider_browser() {
+        // Host state is read TWICE (the expectation below, then again inside
+        // handle_event). Config-env tests swap SYNAPS_BASE_DIR to an empty
+        // tempdir under CONFIG_ENV_TEST_LOCK; without the lock one of those
+        // can land between the reads, and a logged-in provider (anthropic)
+        // vanishes from the second read only.
+        let _guard = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
         let sections = crate::tui::models::build_sections("claude-opus-4-7", &state);
