@@ -177,7 +177,7 @@ async fn owner_detach_passes_to_oldest_non_observer() {
     let host = host().await;
     let handle = host.create_session(cfg()).await.unwrap();
 
-    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
     let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
     let (mut c, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;

@@ -26,6 +26,14 @@ struct CodexTokenResponse {
 }
 
 pub async fn login() -> std::result::Result<OAuthCredentials, String> {
+    login_into(Some(PROVIDER)).await
+}
+
+/// Login; `Some(key)` persists ONLY into that slot (`openai-codex` or
+/// `openai-codex@<label>`), `None` returns the credential unsaved.
+pub async fn login_into(
+    persist_key: Option<&str>,
+) -> std::result::Result<OAuthCredentials, String> {
     let verifier = generate_code_verifier();
     let challenge = generate_code_challenge(&verifier);
     let state = generate_state();
@@ -87,7 +95,9 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 
     eprintln!("\n\x1b[1mExchanging code for tokens...\x1b[0m");
     let creds = exchange_code_for_tokens(&result.code, &verifier).await?;
-    save_provider_auth(PROVIDER, &creds)?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)?;
+    }
     Ok(creds)
 }
 
@@ -225,6 +235,20 @@ fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
         code,
         state: state?,
     })
+}
+
+/// Display-only identity (email claim) carried by a Codex access token, if
+/// present. Never a secret; used to label accounts in listings.
+pub fn extract_email(access_token: &str) -> Option<String> {
+    let payload = access_token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let json: Value = serde_json::from_slice(&decoded).ok()?;
+    json.get("https://api.openai.com/profile")?
+        .get("email")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 254)
+        .map(ToString::to_string)
 }
 
 pub fn extract_account_id(access_token: &str) -> Option<String> {

@@ -15,6 +15,12 @@ Each crate has `extern crate self as synaps_cli;` and re-exports its dependencie
 
 ## Build & Test
 
+**Local resource limit:** never run builds/tests with more than 8 workers; this PC
+crashes under high concurrency. `.cargo/config.toml` defaults to 4 Cargo jobs,
+2 Rust test threads, 2 Tokio workers, and 4 Rayon threads. Run verification commands
+sequentially, not concurrently across agents. Do not override these upward; PTY
+tests still use one test thread. For nextest, explicitly use `--test-threads 2`.
+
 ```bash
 cargo build --release                    # full release build (lto, single codegen unit, strip)
 cargo build                              # dev build — faster compile, slower runtime

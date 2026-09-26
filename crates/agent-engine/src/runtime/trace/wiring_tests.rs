@@ -126,6 +126,7 @@ fn auth() -> Arc<RwLock<AuthState>> {
         auth_type: "api_key".into(),
         refresh_token: None,
         token_expires: Some(9_999_999_999_999),
+        bound_credential: None,
     }))
 }
 
