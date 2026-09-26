@@ -54,20 +54,20 @@ pub const RPC_PROTOCOL_VERSION: u32 = 1;
 /// A file attachment included with a [`RpcCommand::Prompt`] message.
 ///
 /// The rpc child reads the file at `path` from the local filesystem.
-/// `name` and `mime` are optional hints; if absent the child falls back to
-/// the basename of `path` and MIME auto-detection respectively.
+/// `name` and `mime` are compatibility hints, not authority: the child uses
+/// the basename and content-based MIME detection. Bytes are embedded in the
+/// selected provider request and private session history after validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcAttachment {
     /// Local filesystem path the rpc child can read.
     ///
-    /// Convention (enforced when Task 10 adds binary attachment support):
-    /// MUST be an absolute path; MUST NOT contain `..` segments. Path-traversal
-    /// validation will reject relative or `..`-bearing paths at that point.
+    /// MUST be an absolute path; MUST NOT contain `..` segments. The local
+    /// RPC handler validates this before bounded regular-file ingestion.
     pub path: String,
     /// Optional human-meaningful filename (defaults to basename of `path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Optional MIME hint; rpc child re-detects if absent.
+    /// Optional MIME hint; the RPC child always re-detects actual content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
 }
@@ -371,6 +371,10 @@ pub enum RpcEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AssistantEvent {
+    #[serde(rename = "response_start")]
+    ResponseStart,
+    #[serde(rename = "response_reset")]
+    ResponseReset,
     /// An incremental text chunk from the assistant's response.
     #[serde(rename = "text_delta")]
     TextDelta {

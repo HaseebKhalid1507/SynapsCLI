@@ -1,0 +1,27 @@
+# Title
+
+Some *emphasis* and **strong** and `inline code` and a [link](https://example.com "t").
+
+## List
+
+- item one
+- item two
+  1. nested
+  2. ordered
+
+> quote with **bold**
+
+```rust
+fn main() { println!("hi"); }
+```
+
+```python
+def f(x): return x * 2
+```
+
+| a | b |
+|---|---|
+| 1 | 2 |
+
+![img](x.png)  <b>html</b>
+***

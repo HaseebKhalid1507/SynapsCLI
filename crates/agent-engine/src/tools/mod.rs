@@ -10,17 +10,21 @@ use std::sync::{Arc, Mutex};
 // ── Module declarations ──────────────────────────────────────────────────────────
 
 mod bash;
+pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
 mod find;
+pub mod forum;
 mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
 mod powershell;
-mod read;
+pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
+#[doc(hidden)]
+pub use subagent::{legacy_fresh_runtime, spawn_runtime};
 mod write;
 
 pub mod activation;
@@ -34,6 +38,7 @@ pub mod respond;
 pub mod send_channel;
 pub mod shell;
 pub(crate) mod util;
+pub(crate) use util::expand_path;
 pub mod watcher_exit;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
@@ -56,7 +61,7 @@ pub use read::ReadTool;
 pub use registry::{DroppedSessionMember, SessionSchemaProjection, ToolRegistry};
 pub use respond::RespondTool;
 pub use secret_prompt::SecretPromptQueue;
-pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
+pub use secret_prompt::{PromptKind, SecretPromptHandle, SecretPromptRequest};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
@@ -67,7 +72,7 @@ pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
-pub(crate) use util::{expand_path, strip_ansi, NEXT_SUBAGENT_ID};
+pub(crate) use util::{resolve_path_in, strip_ansi, NEXT_SUBAGENT_ID};
 
 // Facade: expose finalize internals for integration tests without making the
 // subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.
@@ -89,14 +94,24 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
+    /// Host-owned note storage binding. Runtime contexts always provide the
+    /// same binding; `None` is reserved for manually constructed contexts.
+    /// A present binding is exclusive: errors never permit legacy fallback.
+    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
+    /// Originating turn cancellation, pinned before tool dispatch. A late
+    /// registration cannot inherit a later user's renewed launch authority.
+    pub launch_cancel: Option<crate::CancellationToken>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
     /// Current worker handle when this context belongs to a delegated
     /// runtime. `None` denotes the foreground root.
     pub delegation_parent: Option<String>,
+    /// Host-built foreground Codex plan for exact-model Ultra inheritance.
+    /// Not a model-supplied tool parameter or an authorization grant.
+    pub codex_parent_plan: Option<crate::runtime::openai::catalog::CodexExecutionPlan>,
     pub secret_prompt: Option<SecretPromptHandle>,
     /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
     /// path must authorize before creating channels, threads, or provider runtimes.
@@ -123,6 +138,22 @@ pub struct ToolCapabilities {
     /// while `status`/`disable` still answer deterministically `Off`
     /// (memory off requires no infrastructure).
     pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
+    /// Per-session working directory (Phase 2 daemons serve sessions from N
+    /// directories in one process). `None` = inherit the process cwd — the
+    /// only value Phase 1 ever sets, so behaviour is byte-identical.
+    pub cwd: Option<PathBuf>,
+    /// Per-session environment snapshot (session-identity T1). `None` =
+    /// inherit process env. When `Some`, tools call `env_clear().envs()`
+    /// so no daemon env leaks into session subprocesses.
+    pub env: Option<crate::session::types::SessionEnv>,
+    /// Names of env vars stripped as secrets (T5). Tools use this for
+    /// loud notices when a command fails referencing a stripped var.
+    pub env_stripped: Vec<String>,
+    /// Per-name "already warned" guard (T5): prevents duplicate notices
+    /// within a single session. Shared via `Arc<Mutex<…>>` so the same
+    /// set survives across tool calls (caps are rebuilt per call in
+    /// stream.rs). Poisoned-mutex recovery via `into_inner`.
+    pub env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Configuration limits and timeouts.
@@ -295,7 +326,7 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 #[cfg(test)]
 mod tool_output_tests {

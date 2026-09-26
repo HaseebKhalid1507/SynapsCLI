@@ -12,12 +12,15 @@ pub(crate) fn create_tool_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            launch_cancel: None,
+            memory_backend: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
             delegation_parent: None,
+            codex_parent_plan: None,
             secret_prompt: None,
             orchestration: Some(std::sync::Arc::new(
                 crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
@@ -27,6 +30,10 @@ pub(crate) fn create_tool_context() -> ToolContext {
             mcp_leases: None,
             extension_leases: None,
             memory_context: None,
+            cwd: None,
+            env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
         },
         limits: ToolLimits {
             max_tool_output: 30000,

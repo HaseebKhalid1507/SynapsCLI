@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-BASELINE=1  # T241 slice 0: mem_transcript synthetic benchmark is #[ignore]d (slow, loads syntect)
+BASELINE=2  # mem_transcript + highlight_mem synthetic benchmarks are #[ignore]d (slow: syntect / process-global counters)
 TARGET_DIR="crates/agent-tui/tests"
 
 # Resolve relative to repo root regardless of CWD.

@@ -13,6 +13,8 @@ pub(crate) enum Category {
     Appearance,
     Plugins,
     Sidecar,
+    Startup,
+    Daemon,
 }
 
 impl Category {
@@ -25,11 +27,13 @@ impl Category {
             Category::Appearance => "Appearance",
             Category::Plugins => "Plugins",
             Category::Sidecar => "Sidecar",
+            Category::Startup => "Startup",
+            Category::Daemon => "Daemon",
         }
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 7] = [
+pub(crate) const CATEGORIES: [Category; 9] = [
     Category::Model,
     Category::Providers,
     Category::Agent,
@@ -37,6 +41,8 @@ pub(crate) const CATEGORIES: [Category; 7] = [
     Category::Appearance,
     Category::Plugins,
     Category::Sidecar,
+    Category::Startup,
+    Category::Daemon,
 ];
 
 /// Phase 8 slice 8A.4: hide the legacy global `Sidecar` page when at
@@ -152,9 +158,9 @@ mod tests {
     }
 
     #[test]
-    fn visible_categories_returns_all_seven_when_no_claims() {
+    fn visible_categories_returns_all_when_no_claims() {
         let v = visible_categories(&[]);
-        assert_eq!(v.len(), 7);
+        assert_eq!(v.len(), 9);
         assert!(v.contains(&Category::Sidecar));
     }
 
@@ -162,17 +168,17 @@ mod tests {
     fn visible_categories_hides_sidecar_when_claim_has_settings_category() {
         let claim = mk_claim("sample-sidecar", "capture", Some("capture"));
         let v = visible_categories(&[claim]);
-        assert_eq!(v.len(), 6);
+        assert_eq!(v.len(), 8);
         assert!(!v.contains(&Category::Sidecar));
         assert_eq!(v[0], Category::Model);
-        assert_eq!(*v.last().unwrap(), Category::Plugins);
+        assert_eq!(*v.last().unwrap(), Category::Daemon);
     }
 
     #[test]
     fn visible_categories_keeps_sidecar_when_claim_has_no_settings_category() {
         let claim = mk_claim("p", "ocr", None);
         let v = visible_categories(&[claim]);
-        assert_eq!(v.len(), 7);
+        assert_eq!(v.len(), 9);
         assert!(v.contains(&Category::Sidecar));
     }
 }

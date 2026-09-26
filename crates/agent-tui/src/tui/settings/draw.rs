@@ -686,6 +686,28 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &Ru
     );
 }
 
+/// Read a bool config key as "on"/"off" for settings display, defaulting when
+/// unset. Accepts the same truthy/falsey spellings the parser does.
+fn bool_config_display(key: &str, default: bool) -> String {
+    let val = synaps_cli::config::read_config_value(key)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let on = match val.as_deref() {
+        Some("true" | "1" | "on" | "yes") => true,
+        Some("false" | "0" | "off" | "no") => false,
+        _ => default,
+    };
+    if on { "on".into() } else { "off".into() }
+}
+
+/// Read a u64 config key for settings display, defaulting when unset/invalid.
+fn u64_config_display(key: &str, default: u64) -> String {
+    synaps_cli::config::read_config_value(key)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .to_string()
+}
+
 pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> String {
     match def.key {
         "model" => snap.model.clone(),
@@ -714,6 +736,13 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "on".to_string()),
+        "startup.quick_start" => bool_config_display("startup.quick_start", true),
+        "startup.extensions_ready_timeout_secs" => {
+            u64_config_display("startup.extensions_ready_timeout_secs", 30)
+        }
+        "daemon.idle_exit_secs" => u64_config_display("daemon.idle_exit_secs", 10),
+        "daemon.prompt_abandon_secs" => u64_config_display("daemon.prompt_abandon_secs", 3600),
+        "daemon.parked_evict_secs" => u64_config_display("daemon.parked_evict_secs", 3600),
         _ => "?".into(),
     }
 }

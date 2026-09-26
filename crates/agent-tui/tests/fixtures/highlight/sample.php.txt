@@ -1,0 +1,21 @@
+<?php
+declare(strict_types=1);
+namespace App;
+
+use App\Models\User;
+
+/** docblock */
+final class Foo extends Bar implements Baz {
+    private const MAX = 10;
+    public function __construct(private readonly string $name = 'x') {}
+    public function run(array $items, ?int $n = null): string {
+        // comment
+        $s = "hello {$this->name} $n";
+        foreach ($items as $k => $v) { if ($v === null || $k > self::MAX) continue; }
+        return sprintf('%s %d', $s, count($items)) . PHP_EOL;
+    }
+}
+$f = fn($x) => $x * 2.5;
+echo (new Foo())->run([1, 2, 3]), $f(0x1f);
+?>
+<p><?= htmlspecialchars($s) ?></p>

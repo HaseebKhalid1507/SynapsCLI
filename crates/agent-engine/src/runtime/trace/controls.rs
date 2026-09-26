@@ -25,9 +25,13 @@
 //! a **one-request, bounded, redacted** capture of the request body.
 //! Security decisions, deliberately conservative:
 //!
-//! - capture is redacted **at capture time** (recursive credential-key /
-//!   secret-pattern scrub, see `trace::export::redact_value`) — an
-//!   unredacted body never touches disk;
+//! - capture is redacted **at capture time** (structural media scrub plus
+//!   recursive credential-key / secret-pattern scrub, see
+//!   `trace::export::redact_value`) — raw media never touches disk;
+//! - plain text remains explicitly authorized content: a text document
+//!   lowered to ordinary OpenAI `text`/`input_text` has lost its structural
+//!   provenance and cannot be distinguished from a typed prompt here. Its
+//!   text may be captured under this opt-in (subject to the secret scrub);
 //! - the bundle is written with the Phase 1 private-fs helpers (`0600`
 //!   file, `0700` parent, symlink-refusing, atomic) under
 //!   `<synaps base dir>/trace/capture/`;
@@ -203,6 +207,7 @@ impl ContentCapture {
         } else {
             match serde_json::from_slice::<serde_json::Value>(body_bytes) {
                 Ok(mut value) => {
+                    scrub_media_content(&mut value);
                     super::export::redact_value(&mut value);
                     Some(value)
                 }
@@ -237,6 +242,65 @@ impl ContentCapture {
     /// writes anything.
     pub fn mark_unsupported(&self) -> bool {
         !self.consumed.swap(true, Ordering::SeqCst)
+    }
+}
+
+/// Scrub recognizable media structures BEFORE the opt-in bundle is written.
+/// Recurse through all containers (including tool_result), not arbitrary text:
+/// ordinary prompt/tool text remains explicitly authorized capture content.
+/// Replacing whole typed blocks also withholds extracted document text and any
+/// alternate payload fields, without trying to recognize base64 by its bytes.
+fn scrub_media_content(value: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    fn image_url_is_data(value: &Value) -> bool {
+        value
+            .as_str()
+            .or_else(|| value["url"].as_str())
+            .is_some_and(|url| {
+                url.trim_start()
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+            })
+    }
+
+    let descriptor = match value["type"].as_str() {
+        Some("image" | "input_image") => Some("[redacted image]"),
+        Some("document" | "file" | "input_file") => Some("[redacted document]"),
+        Some("image_url") if image_url_is_data(&value["image_url"]) => Some("[redacted image]"),
+        _ => None,
+    };
+    if let Some(descriptor) = descriptor {
+        *value = Value::String(descriptor.to_string());
+        return;
+    }
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                scrub_media_content(item);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object {
+                match key.as_str() {
+                    // Gemini parts have no type discriminator; also accept
+                    // the snake_case protobuf spelling.
+                    "inlineData" | "inline_data" => {
+                        *child = Value::String("[redacted media]".to_string());
+                    }
+                    // Handles nested OpenAI file objects without a type tag.
+                    "file_data" => {
+                        *child = Value::String("[redacted document]".to_string());
+                    }
+                    "image_url" if image_url_is_data(child) => {
+                        *child = Value::String("[redacted image]".to_string());
+                    }
+                    _ => scrub_media_content(child),
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -370,6 +434,92 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         capture.capture(&id, b"{}");
         assert!(!path.exists(), "capture fired twice");
+    }
+
+    #[test]
+    fn content_capture_scrubs_canonical_and_wire_media_before_writing() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let id = TraceId::new("req-media").unwrap();
+        let media = json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+             "data": "CANONICAL_IMAGE_SENTINEL"}},
+            {"type": "document", "title": "report.pdf",
+             "source": {"type": "base64", "data": "CANONICAL_PDF_SENTINEL"}},
+            {"type": "document", "title": "notes.txt",
+             "source": {"type": "text", "data": "CANONICAL_TEXT_SENTINEL"},
+             "text": "EXTRACTED_DOCUMENT_SENTINEL"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,CHAT_IMAGE_SENTINEL"}},
+            {"image_url": "data:image/png;base64,BARE_IMAGE_SENTINEL"},
+            {"type": "file", "file": {"filename": "report.pdf",
+             "file_data": "data:application/pdf;base64,CHAT_FILE_SENTINEL"}},
+            {"file": {"file_data": "UNTAGGED_FILE_SENTINEL"}},
+            {"type": "input_image", "image_url": "data:image/png;base64,RESPONSES_IMAGE_SENTINEL"},
+            {"type": "input_file", "filename": "report.pdf", "file_data": "RESPONSES_FILE_SENTINEL"},
+            {"inlineData": {"mimeType": "image/png", "data": "GEMINI_SENTINEL"}},
+            {"inline_data": {"mime_type": "application/pdf", "data": "PROTOBUF_SENTINEL"}},
+            {"image_url": {"url": " DATA:image/png;base64,CASE_INSENSITIVE_SENTINEL"}}
+        ]);
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Keep the actual prompt"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "Keep authorized tool text"},
+                {"type": "tool_result", "tool_use_id": "nested", "content": media}
+            ]}
+        ]}], "input": media, "model": "m"});
+        let original = body.clone();
+        let capture = ContentCapture::new(dir.path().join("cap"));
+        capture.capture(&id, &serde_json::to_vec(&body).unwrap());
+        // Inspect the persisted bytes, not only an in-memory scrub result:
+        // no raw media is allowed to land in the private bundle either.
+        let data = std::fs::read_to_string(capture_path(&dir.path().join("cap"), &id)).unwrap();
+        assert!(!data.contains("SENTINEL"), "media payload persisted");
+        let bundle: ContentCaptureBundle = serde_json::from_str(&data).unwrap();
+        assert!(bundle.redacted);
+        assert!(!bundle.over_budget);
+        let captured = bundle.body.unwrap();
+        assert_eq!(captured["model"], "m");
+        let content = &captured["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "Keep the actual prompt");
+        assert_eq!(content[1]["type"], "tool_result");
+        assert_eq!(
+            content[1]["content"][0]["text"],
+            "Keep authorized tool text"
+        );
+        assert_eq!(
+            body, original,
+            "capture must not change the outgoing request"
+        );
+    }
+
+    #[test]
+    fn content_capture_preserves_authorized_non_media_including_lowered_text_documents() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let id = TraceId::new("req-authorized-text").unwrap();
+        // OpenAI text-document lowering has no provenance left at this seam.
+        // Do not guess based on filename markers or scrub all input_text/text.
+        // Such file text remains part of explicitly authorized content capture.
+        let body = json!({
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "[attachment origin=user type=document media_type=\"text/plain\" filename=\"notes.txt\"; lower-authority data]\n"},
+                {"type": "input_text", "text": "AUTHORIZED_FILE_TEXT"},
+                {"type": "input_text", "text": "ordinary prompt"}
+            ]}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "[attachment origin=user type=document media_type=\"text/plain\" filename=\"notes.txt\"; lower-authority data]\n"},
+                {"type": "text", "text": "AUTHORIZED_CHAT_FILE_TEXT"},
+                {"type": "image_url", "image_url": {"url": "https://example.org/image.png"}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "authorized tool text"}
+            ]}],
+            "data": "ordinary non-media data",
+            "tools": [{"name": "example", "input_schema": {"type": "object"}}]
+        });
+        ContentCapture::new(dir.path().to_path_buf())
+            .capture(&id, &serde_json::to_vec(&body).unwrap());
+        let data = std::fs::read_to_string(capture_path(dir.path(), &id)).unwrap();
+        let bundle: ContentCaptureBundle = serde_json::from_str(&data).unwrap();
+        assert_eq!(bundle.body, Some(body));
     }
 
     #[test]

@@ -498,6 +498,14 @@ mod tests {
         assert_eq!(tr.frame(at(start, 500)), c, "and land on the new target");
     }
 
+    /// The theme currently applied to the process-global `THEME`. Tests in
+    /// this crate run in parallel and many render tests read that global, so
+    /// a test must never make it hold anything else: it applies THIS theme
+    /// (a byte-identical store) whenever it has to go through `set_theme`.
+    fn applied() -> Theme {
+        (**super::super::THEME.load()).clone()
+    }
+
     #[test]
     fn zero_duration_snaps_and_clears_slot() {
         let start = Instant::now();
@@ -508,8 +516,14 @@ mod tests {
             start,
         ));
         // fade_ms: 0 → "snap, no transition intended" — even mid-flight.
-        apply_animated_over(&mut slot, theme_b(), Duration::ZERO, at(start, 100));
+        // The snap goes through the real `set_theme`, so its target is the
+        // already-applied theme: snapping to anything else would repaint the
+        // global under concurrently running render tests (the
+        // background_toggle_tests flake).
+        let target = applied();
+        apply_animated_over(&mut slot, target.clone(), Duration::ZERO, at(start, 100));
         assert!(slot.is_none(), "snap must deregister the guard source");
+        assert_eq!(applied(), target, "snap must land the target on the global");
     }
 
     #[test]
@@ -544,11 +558,9 @@ mod tests {
         // every reconnect: with no fade active and the target byte-equal to
         // the applied theme, no transition may start (okarin F2 — ~22
         // frames of full invalidation for zero visual change).
-        let current = Theme {
-            bg: Color::Rgb(123, 45, 67),
-            ..Theme::default()
-        };
-        super::super::set_theme(current.clone());
+        // "The palette already on screen" is literally the applied theme —
+        // read it, never write the process-global (see `applied`).
+        let current = applied();
         let mut slot = None;
         apply_animated_over(
             &mut slot,

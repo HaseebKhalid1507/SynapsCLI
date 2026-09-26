@@ -524,6 +524,10 @@ pub(crate) fn set_background_opaque(opaque: bool) {
 pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =
     LazyLock::new(|| ArcSwap::from_pointee(load_theme_from_config()));
 
+/// Replace the process-global theme. Tests: every test in this crate shares
+/// this global and runs in parallel with render tests that read it, so a test
+/// may only store the theme that is already applied (see
+/// `theme::transition::tests::applied`) — never a different one.
 pub(crate) fn set_theme(theme: Theme) {
     THEME.store(Arc::new(theme));
 }

@@ -23,11 +23,325 @@ use synaps_cli::sidecar::spawn::SidecarSpawnArgs;
 
 use super::app::{App, ChatMessage};
 
+type ExtensionManager =
+    std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>;
+type CommandRegistry = synaps_cli::skills::registry::CommandRegistry;
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+// ── Non-blocking sidecar startup (G3) ────────────────────────────────────
+
+/// Own the task rather than detaching it: shutdown, cancellation and a dropped
+/// completion all drop the manager, which kills the child and aborts readers.
+pub(crate) struct SidecarStartup {
+    pub task: tokio::task::JoinHandle<Result<SidecarUiState, String>>,
+    pub sidecar: DiscoveredSidecar,
+    pub label: String,
+}
+
+impl Drop for SidecarStartup {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SidecarStartup {
+    pub fn start(
+        sidecar: DiscoveredSidecar,
+        has_extension: bool,
+        label: String,
+        manager: ExtensionManager,
+    ) -> Self {
+        let discovered = sidecar.clone();
+        let display_name = label.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(STARTUP_TIMEOUT, async move {
+                let (info, handler) = if has_extension {
+                    let manager = manager.read().await;
+                    (
+                        manager.plugin_info(&discovered.plugin_name).cloned(),
+                        Some(manager.user_action_handler(&discovered.plugin_name)?),
+                    )
+                } else {
+                    (None, None)
+                };
+                let args = if let Some(handler) = handler {
+                    match handler.sidecar_spawn_args().await {
+                        Ok(args) => Some(args),
+                        Err(error) if spawn_args_unsupported(&error) => None,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                let mut state = SidecarUiState::spawn_for(discovered, args, info.as_ref()).await?;
+                state.set_display_name(Some(display_name));
+                Ok(state)
+            })
+            .await
+            .map_err(|_| "sidecar startup timed out after 30s; toggle to retry".to_string())?
+        });
+        Self {
+            task,
+            sidecar,
+            label,
+        }
+    }
+}
+
+fn spawn_args_unsupported(error: &str) -> bool {
+    matches!(
+        error,
+        "extension runtime does not support sidecar.spawn_args"
+            | "Extension error: method not found"
+            | "Extension error: unknown method"
+            | "Extension error: unknown method: sidecar.spawn_args"
+    )
+}
+
+fn loading_message(label: &str) -> String {
+    format!("{label}: still loading — try the toggle again when ready")
+}
+
+/// Non-blocking half of the toggle path. All filesystem discovery came from
+/// the filtered boot registry; lock waits, RPC and process startup run off-loop.
+pub(crate) async fn toggle(
+    app: &mut App,
+    plugin_id: Option<String>,
+    registry: &CommandRegistry,
+    manager: &ExtensionManager,
+) {
+    if app.sidecars_disabled {
+        app.push_msg(ChatMessage::System(
+            "Sidecars are disabled (--no-extensions).".into(),
+        ));
+        return;
+    }
+    let all = registry.sidecars();
+    let target = plugin_id.or_else(|| all.first().map(|s| s.plugin_name.clone()));
+    let Some(pid) = target else {
+        app.push_msg(ChatMessage::Error(
+            "sidecar unavailable: no enabled plugin provides a sidecar binary".into(),
+        ));
+        return;
+    };
+    if let Some(pending) = app.sidecar_starts.get(&pid) {
+        app.push_msg(ChatMessage::System(loading_message(&pending.label)));
+        return;
+    }
+    let Some(discovered) = all.into_iter().find(|s| s.plugin_name == pid) else {
+        app.sidecars.remove(&pid);
+        app.push_msg(ChatMessage::Error(format!(
+            "sidecar plugin '{pid}' is not enabled or discoverable"
+        )));
+        return;
+    };
+    drain_events(app, &pid);
+    if app.sidecars.get(&pid).is_some_and(|state| {
+        state.sidecar != discovered || matches!(state.status, SidecarUiStatus::Error(_))
+    }) {
+        app.sidecars.remove(&pid);
+    }
+    if let Some(state) = app.sidecars.get_mut(&pid) {
+        let label = state.display_name.clone().unwrap_or_else(|| pid.clone());
+        if matches!(state.status, SidecarUiStatus::Loading) {
+            app.push_msg(ChatMessage::System(loading_message(&label)));
+            return;
+        }
+        if state.armed {
+            state.armed = false;
+            match state.manager.release().await {
+                Ok(()) => app.push_msg(ChatMessage::System(format!(
+                    "{label}: stopping — final transcript will be appended"
+                ))),
+                Err(error) => {
+                    state.status = SidecarUiStatus::Error(error.to_string());
+                    app.push_msg(ChatMessage::Error(format!(
+                        "{label} release failed: {error}"
+                    )));
+                }
+            }
+        } else {
+            match state.manager.press().await {
+                Ok(()) => {
+                    state.armed = true;
+                    app.push_msg(ChatMessage::System(format!(
+                        "{label} active — toggle again to stop"
+                    )));
+                }
+                Err(error) => {
+                    state.status = SidecarUiStatus::Error(error.to_string());
+                    app.push_msg(ChatMessage::Error(format!("{label} press failed: {error}")));
+                }
+            }
+        }
+        return;
+    }
+    let label = super::loop_arms::pick_display_name_for_plugin(&pid, &registry.lifecycle_claims())
+        .unwrap_or_else(|| pid.clone());
+    if registry.sidecar_has_extension(&pid) && app.extension_loader_running {
+        app.push_msg(ChatMessage::System(loading_message(&label)));
+        return;
+    }
+    let startup = SidecarStartup::start(
+        discovered,
+        registry.sidecar_has_extension(&pid),
+        label.clone(),
+        manager.clone(),
+    );
+    app.sidecar_starts.insert(pid, startup);
+    app.push_msg(ChatMessage::System(loading_message(&label)));
+}
+
+/// JoinHandle polling is cancellation-safe across tokio::select iterations.
+pub(crate) async fn next_startup(
+    starts: &mut std::collections::HashMap<String, SidecarStartup>,
+) -> (String, Result<SidecarUiState, String>) {
+    if starts.is_empty() {
+        return std::future::pending().await;
+    }
+    let futures: Vec<_> = starts
+        .iter_mut()
+        .map(|(pid, start)| {
+            let pid = pid.clone();
+            Box::pin(async move {
+                let result = (&mut start.task)
+                    .await
+                    .unwrap_or_else(|_| Err("sidecar startup task failed; toggle to retry".into()));
+                (pid, result)
+            })
+        })
+        .collect();
+    futures::future::select_all(futures).await.0
+}
+
+pub(crate) fn finish_startup(
+    app: &mut App,
+    registry: &CommandRegistry,
+    pid: String,
+    result: Result<SidecarUiState, String>,
+) {
+    let Some(pending) = app.sidecar_starts.remove(&pid) else {
+        return;
+    };
+    if app.sidecars_disabled || !registry.sidecars().contains(&pending.sidecar) {
+        app.push_msg(ChatMessage::System(format!(
+            "{} startup cancelled: plugin changed or disabled",
+            pending.label
+        )));
+        return;
+    }
+    match result {
+        Ok(state) => {
+            debug_assert!(!state.armed);
+            app.sidecars.insert(pid.clone(), state);
+            drain_events(app, &pid);
+            if app
+                .sidecars
+                .get(&pid)
+                .is_some_and(|state| matches!(state.status, SidecarUiStatus::Idle))
+            {
+                app.push_msg(ChatMessage::System(format!(
+                    "{} ready — toggle to activate",
+                    pending.label
+                )));
+            }
+        }
+        Err(error) => app.push_msg(ChatMessage::Error(format!(
+            "{} unavailable: {error}",
+            pending.label
+        ))),
+    }
+}
+
+fn drain_events(app: &mut App, pid: &str) {
+    for _ in 0..64 {
+        let Some(event) = app
+            .sidecars
+            .get_mut(pid)
+            .and_then(|s| s.manager.try_next_event())
+        else {
+            return;
+        };
+        let failed = matches!(
+            event,
+            SidecarLifecycleEvent::Error(_) | SidecarLifecycleEvent::Exited
+        );
+        handle_event(app, pid, event);
+        if failed || !app.sidecars.contains_key(pid) {
+            return;
+        }
+    }
+    if let Some(state) = app.sidecars.get_mut(pid) {
+        state.status = SidecarUiStatus::Loading;
+    }
+}
+
+pub(crate) fn retain_enabled(app: &mut App, registry: &CommandRegistry) {
+    let enabled = registry.sidecars();
+    app.sidecar_starts
+        .retain(|_, pending| enabled.contains(&pending.sidecar));
+    app.sidecars
+        .retain(|_, state| enabled.contains(&state.sidecar));
+}
+
+pub(crate) fn status(app: &App, plugin_id: Option<&str>, registry: &CommandRegistry) -> String {
+    if app.sidecars_disabled {
+        return "Sidecars are disabled (--no-extensions).".into();
+    }
+    let mut lines = Vec::new();
+    for sidecar in registry
+        .sidecars()
+        .into_iter()
+        .filter(|s| plugin_id.map_or(true, |p| p == s.plugin_name))
+    {
+        let pid = &sidecar.plugin_name;
+        lines.push(if let Some(pending) = app.sidecar_starts.get(pid) {
+            loading_message(&pending.label)
+        } else if let Some(state) = app.sidecars.get(pid) {
+            state.status_line()
+        } else {
+            format!("{pid}: not yet started — toggle to load in the background")
+        });
+    }
+    lines.sort();
+    if lines.is_empty() {
+        "sidecar: no enabled plugin provides the requested sidecar".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Poll every live sidecar without holding a borrow across UI dispatch.
+pub(crate) async fn next_event(
+    sidecars: &mut std::collections::HashMap<String, SidecarUiState>,
+) -> (String, SidecarLifecycleEvent) {
+    if sidecars.is_empty() {
+        return std::future::pending().await;
+    }
+    let futures: Vec<_> = sidecars
+        .iter_mut()
+        .map(|(pid, state)| {
+            let pid = pid.clone();
+            Box::pin(async move {
+                let event = state
+                    .manager
+                    .next_event()
+                    .await
+                    .unwrap_or(SidecarLifecycleEvent::Exited);
+                (pid, event)
+            })
+        })
+        .collect();
+    futures::future::select_all(futures).await.0
+}
+
 /// What the chatui currently shows for the sidecar indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidecarUiStatus {
     /// Sidecar is not currently doing plugin-defined work.
     Idle,
+    /// Sidecar process is spawning / waiting for `ready_after_init`.
+    Loading,
     /// Sidecar is doing plugin-defined work and supplied a display label.
     Active { label: String },
     /// Sidecar reported an error; user should `/sidecar toggle` to retry.
@@ -63,7 +377,7 @@ impl SidecarUiState {
     ///
     /// Returns `Err` with a user-facing message if no plugin provides
     /// a sidecar binary or the spawn itself fails.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // legacy convenience — toggle() uses SidecarStartup::start() instead
     pub async fn spawn_default() -> Result<Self, String> {
         Self::spawn_with(None, None).await
     }
@@ -71,7 +385,7 @@ impl SidecarUiState {
     /// Same as [`Self::spawn_default`], but lets callers pass cached extension
     /// `info.get` metadata so build-info probing avoids the legacy sidecar shim
     /// when possible.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // legacy convenience — toggle() uses SidecarStartup::start() instead
     pub async fn spawn_default_with_plugin_info(
         plugin_info: Option<&synaps_cli::extensions::info::PluginInfo>,
     ) -> Result<Self, String> {
@@ -116,9 +430,33 @@ impl SidecarUiState {
             "protocol_version": SIDECAR_PROTOCOL_VERSION,
         });
 
-        let manager = SidecarManager::spawn(&sidecar.binary, &args, config)
+        let mut manager = SidecarManager::spawn(&sidecar.binary, &args, config)
             .await
             .map_err(|err: SidecarError| format!("failed to start sidecar: {}", err))?;
+
+        // Strong post-Init readiness is opt-in; legacy Hello-only sidecars
+        // remain compatible. "ready_after_init" promises exactly a ready status
+        // only AFTER Init has been processed and triggers can be accepted.
+        if manager.ready_after_init() {
+            tokio::time::timeout(STARTUP_TIMEOUT, async {
+                loop {
+                    match manager.next_event().await {
+                        Some(SidecarLifecycleEvent::StateChanged { state, .. })
+                            if state == "ready" =>
+                        {
+                            return Ok(())
+                        }
+                        Some(SidecarLifecycleEvent::Error(error)) => return Err(error),
+                        Some(SidecarLifecycleEvent::Exited) | None => {
+                            return Err("sidecar exited while loading".to_string())
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "sidecar did not report ready after Init within 30s".to_string())??;
+        }
 
         // Read the sidecar's compiled backend straight from the cached
         // `info.get` response (Phase 5). Falls back to None when the plugin
@@ -141,7 +479,6 @@ impl SidecarUiState {
     /// Set the human-readable display name (from the plugin's
     /// `provides.sidecar.lifecycle.display_name`). Called by the
     /// chatui dispatcher after spawn when a lifecycle claim is known.
-    #[allow(dead_code)]
     pub fn set_display_name(&mut self, name: Option<String>) {
         self.display_name = name;
     }
@@ -170,6 +507,7 @@ fn format_status_line(
     let label = display_name.unwrap_or("sidecar");
     let state = match status {
         SidecarUiStatus::Idle => "idle".to_string(),
+        SidecarUiStatus::Loading => "loading".to_string(),
         SidecarUiStatus::Active { label } => label.clone(),
         SidecarUiStatus::Error(msg) => return format!("{label}: error — {msg}"),
     };
@@ -198,7 +536,9 @@ pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecyc
         }
         SidecarLifecycleEvent::StateChanged { state, label } => {
             let is_inactive = matches!(state.as_str(), "idle" | "ready" | "stopped");
-            if is_inactive {
+            if matches!(state.as_str(), "loading" | "initializing") && !v.armed {
+                v.status = SidecarUiStatus::Loading;
+            } else if is_inactive {
                 if !v.armed {
                     v.status = SidecarUiStatus::Idle;
                 }
@@ -453,6 +793,166 @@ mod tests {
             None,
         );
         assert_eq!(line, "Sensor: error — oops");
+    }
+
+    #[test]
+    fn status_line_shows_loading() {
+        let line = format_status_line(
+            Some("Voice"),
+            &SidecarUiStatus::Loading,
+            "voice-plugin",
+            "/opt/voice/bin/sidecar",
+            None,
+        );
+        assert!(line.contains("loading"), "got: {line}");
+        assert!(line.starts_with("Voice:"), "got: {line}");
+    }
+
+    #[test]
+    fn only_unsupported_spawn_args_can_use_defaults() {
+        assert!(spawn_args_unsupported("Extension error: method not found"));
+        assert!(spawn_args_unsupported(
+            "extension runtime does not support sidecar.spawn_args"
+        ));
+        for error in [
+            "activation denied",
+            "sidecar.spawn_args timed out",
+            "invalid response",
+            "denied -32601",
+        ] {
+            assert!(!spawn_args_unsupported(error));
+        }
+    }
+
+    #[cfg(unix)]
+    mod async_startup {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::{path::Path, sync::Arc, time::Duration};
+
+        fn fixture() -> (tempfile::TempDir, synaps_cli::skills::Plugin) {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("sidecar.py");
+            std::fs::write(
+                &bin,
+                r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+root = pathlib.Path(__file__).parent
+(root / 'pid').write_text(str(os.getpid()))
+with (root / 'spawns').open('a') as f: f.write('spawn\n')
+while not (root / 'hello').exists(): time.sleep(.01)
+print(json.dumps({'type':'hello','protocol_version':2,'extension':'test-sidecar','capabilities':['ready_after_init']}), flush=True)
+for line in sys.stdin:
+    msg = json.loads(line)
+    with (root / 'commands').open('a') as f: f.write(line)
+    if msg['type'] == 'init':
+        while not (root / 'ready').exists(): time.sleep(.01)
+        print(json.dumps({'type':'status','state':'ready'}), flush=True)
+    elif msg['type'] == 'shutdown': break
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let manifest = serde_json::from_value(serde_json::json!({
+                "name": "test-sidecar",
+                "provides": {"sidecar": {"command": "sidecar.py", "protocol_version": 2}}
+            }))
+            .unwrap();
+            let plugin = synaps_cli::skills::Plugin {
+                name: "test-sidecar".into(),
+                root: dir.path().to_path_buf(),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(manifest),
+            };
+            (dir, plugin)
+        }
+
+        fn registry(plugin: synaps_cli::skills::Plugin) -> CommandRegistry {
+            CommandRegistry::new_with_plugins(&[], vec![], vec![plugin])
+        }
+
+        fn manager() -> ExtensionManager {
+            let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(Arc::new(
+                synaps_cli::extensions::hooks::HookBus::new(),
+            ));
+            manager.bind_memory_backend(false);
+            Arc::new(tokio::sync::RwLock::new(manager))
+        }
+
+        #[allow(dead_code)] // used by extended tests (slow_hello, etc.)
+        async fn wait_for(mut condition: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !condition() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture condition timed out");
+        }
+        #[allow(dead_code)] // used by extended tests (slow_hello, panic_clears, etc.)
+        fn text(path: &Path) -> String {
+            std::fs::read_to_string(path).unwrap_or_default()
+        }
+
+        async fn complete(app: &mut App, registry: &CommandRegistry) {
+            let (pid, result) = tokio::time::timeout(
+                Duration::from_secs(5),
+                next_startup(&mut app.sidecar_starts),
+            )
+            .await
+            .expect("startup should finish");
+            finish_startup(app, registry, pid, result);
+        }
+
+        #[tokio::test]
+        async fn delayed_completion_drains_loading_before_allowing_a_trigger() {
+            let (dir, plugin) = fixture();
+            std::fs::write(dir.path().join("hello"), "go").unwrap();
+            std::fs::write(dir.path().join("ready"), "go").unwrap();
+            let registry = registry(plugin);
+            let mut app = fresh_app();
+            toggle(&mut app, None, &registry, &manager()).await;
+            complete(&mut app, &registry).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(!app.sidecars["test-sidecar"].armed);
+        }
+
+        #[tokio::test]
+        async fn disable_cancels_both_loading_and_live_sidecars() {
+            let (dir, plugin) = fixture();
+            std::fs::write(dir.path().join("hello"), "go").unwrap();
+            std::fs::write(dir.path().join("ready"), "go").unwrap();
+            let registry = registry(plugin);
+            let manager = manager();
+            let mut app = fresh_app();
+            toggle(&mut app, None, &registry, &manager).await;
+            complete(&mut app, &registry).await;
+            assert!(app.sidecars.contains_key("test-sidecar"));
+            app.sidecars_disabled = true;
+            // Start a new toggle — should refuse
+            toggle(&mut app, None, &registry, &manager).await;
+            assert!(app.sidecar_starts.is_empty());
+        }
+
+        #[tokio::test]
+        async fn disabled_sidecars_and_registry_removal_never_start() {
+            let (dir, plugin) = fixture();
+            let registry = registry(plugin);
+            let manager = manager();
+            let mut app = fresh_app();
+            app.sidecars_disabled = true;
+            toggle(&mut app, None, &registry, &manager).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(status(&app, None, &registry).contains("disabled"));
+            app.sidecars_disabled = false;
+            registry.rebuild_with_plugins(vec![], vec![]);
+            toggle(&mut app, Some("test-sidecar".into()), &registry, &manager).await;
+            assert!(app.sidecar_starts.is_empty());
+            assert!(!dir.path().join("pid").exists());
+        }
     }
 }
 

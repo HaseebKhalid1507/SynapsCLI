@@ -113,6 +113,13 @@ pub enum TapeStep {
     /// Checkpoint: materialize a frame here (a no-op for state, but records
     /// author intent and forces line-cache maintenance mid-tape).
     Snapshot,
+    /// PLAN-phase3 §5.1 layer 2: one session envelope (the serde mirror of
+    /// `SessionEventWire`) through the production presentation arm
+    /// (`stream_handler::handle_session_event_arm`) — the same code path
+    /// under `LocalTransport` and `SocketTransport`. `Conversation` carries
+    /// its digest only (no messages), as on the wire. Stored as the wire
+    /// JSON (`WireSessionEvent` has no `PartialEq`).
+    SessionEvent(serde_json::Value),
 }
 
 /// Which modal an [`TapeStep::OpenModal`] opens.
@@ -474,6 +481,14 @@ impl<'h> TapeRecorder<'h> {
         self
     }
 
+    /// Record + feed one session envelope (layer-2 differential tapes).
+    pub fn session_event(&mut self, ev: agent_engine::session::wire::WireSessionEvent) -> &mut Self {
+        let json = serde_json::to_value(&ev).expect("WireSessionEvent serialises");
+        self.harness.feed_event(ev.into());
+        self.steps.push(TapeStep::SessionEvent(json));
+        self
+    }
+
     /// Record a snapshot checkpoint and return the rendered frame.
     pub fn snapshot(&mut self) -> String {
         self.steps.push(TapeStep::Snapshot);
@@ -556,6 +571,11 @@ impl TestHarness {
                 }
                 TapeStep::Snapshot => {
                     let _ = self.snapshot();
+                }
+                TapeStep::SessionEvent(json) => {
+                    let ev: agent_engine::session::wire::WireSessionEvent =
+                        serde_json::from_value(json.clone()).expect("tape SessionEvent parses");
+                    self.feed_event(ev.into());
                 }
             }
         }

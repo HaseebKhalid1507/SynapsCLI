@@ -29,6 +29,7 @@ pub use core::reasoning;
 pub use core::retention;
 pub use core::session;
 pub use core::session_journal;
+pub use core::session_lock;
 pub use core::watcher_types;
 
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
@@ -62,3 +63,6 @@ pub mod prompt;
 pub mod text;
 
 pub use text::BoundedText;
+
+#[path = "core/context_archive.rs"]
+pub mod context_archive;

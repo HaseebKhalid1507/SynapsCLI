@@ -107,6 +107,242 @@ pub fn get_active_config_dir() -> PathBuf {
     base
 }
 
+/// Automatic context management is opt-in; independent of compaction disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextManagementMode {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl ContextManagementMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Task-aware soft context bands, parsed from `context_management.*` keys.
+///
+/// Missing thresholds use window-aware defaults (200k: 140k/180k;
+/// 1m: 250k/400k). A single override adjusts the other default as necessary
+/// to keep pressure below rollover. These settings never override the host's
+/// hard capacity or authorize tools, disclosure, or a session transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextManagementConfig {
+    pub mode: ContextManagementMode,
+    /// Optional absolute token threshold; `auto` in config clears the override.
+    pub pressure_tokens: Option<u64>,
+    /// Optional absolute token threshold; `auto` in config clears the override.
+    pub rollover_tokens: Option<u64>,
+    /// Minimum remaining headroom before any model round. Default: 16,000.
+    pub reserve_tokens: u64,
+    /// Maximum extra Plan/WrapUp rounds after rollover becomes due. Default: 2.
+    /// Zero disables extensions; phase reports cannot renew this allowance.
+    pub finish_rounds: u32,
+}
+
+impl Default for ContextManagementConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextManagementMode::Off,
+            pressure_tokens: None,
+            rollover_tokens: None,
+            reserve_tokens: 16_000,
+            finish_rounds: 2,
+        }
+    }
+}
+
+impl ContextManagementConfig {
+    pub const MAX_FINISH_ROUNDS: u32 = 8;
+    pub const MAX_RESERVE_TOKENS: u64 = 1_000_000;
+
+    /// Validate independently of a model selection. Also call
+    /// `validate_for_window` when the effective context window is known.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.pressure_tokens == Some(0) {
+            return Err("pressure_tokens must be positive");
+        }
+        if self.rollover_tokens.is_some_and(|v| v < 2) {
+            return Err("rollover_tokens must be at least 2");
+        }
+        if let (Some(pressure), Some(rollover)) = (self.pressure_tokens, self.rollover_tokens) {
+            if pressure >= rollover {
+                return Err("pressure_tokens must be below rollover_tokens");
+            }
+        }
+        if !(1..=Self::MAX_RESERVE_TOKENS).contains(&self.reserve_tokens) {
+            return Err("reserve_tokens must be between 1 and 1000000");
+        }
+        if self.finish_rounds > Self::MAX_FINISH_ROUNDS {
+            return Err("finish_rounds must be between 0 and 8");
+        }
+        Ok(())
+    }
+
+    /// Threshold overrides must fit the effective window. The hard budget
+    /// remains authoritative even when an override fits this validation.
+    pub fn validate_for_window(&self, context_window_tokens: u64) -> Result<(), &'static str> {
+        self.validate()?;
+        if context_window_tokens < 2 {
+            return Err("context window must contain at least two tokens");
+        }
+        if self
+            .pressure_tokens
+            .is_some_and(|v| v >= context_window_tokens)
+        {
+            return Err("pressure_tokens must be below the context window");
+        }
+        if self
+            .rollover_tokens
+            .is_some_and(|v| v > context_window_tokens)
+        {
+            return Err("rollover_tokens must not exceed the context window");
+        }
+        Ok(())
+    }
+}
+
+/// Parse fields first; validate the complete policy after all lines so threshold
+/// ordering and an explicit context window do not depend on config key order.
+fn parse_context_management_config_key(
+    config: &mut ContextManagementConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    match key {
+        "context_management.mode" => {
+            config.mode = ContextManagementMode::parse(value).ok_or("expected off or auto")?;
+        }
+        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+            let tokens = if value.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "expected auto or an unsigned token count")?,
+                )
+            };
+            if key == "context_management.pressure_tokens" {
+                config.pressure_tokens = tokens;
+            } else {
+                config.rollover_tokens = tokens;
+            }
+        }
+        "context_management.reserve_tokens" => {
+            config.reserve_tokens = value
+                .parse()
+                .map_err(|_| "expected an unsigned token count")?;
+        }
+        "context_management.finish_rounds" => {
+            config.finish_rounds = value
+                .parse()
+                .map_err(|_| "expected an unsigned round count")?;
+        }
+        _ => return Err("unknown context management key"),
+    }
+    Ok(())
+}
+
+/// Startup / first-turn behaviour (`startup.*` keys). Boot-time only — these
+/// take effect at the next launch, never mid-session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupConfig {
+    /// Skip blocking on extension discovery before the first turn. When true
+    /// the attach path sets `await_extensions=false` (fast cold start; a tool
+    /// from a slow extension may be unavailable on turn 1). Default: true.
+    pub quick_start: bool,
+    /// Max seconds to wait for extensions when Quick Start is off. Default: 30.
+    pub extensions_ready_timeout_secs: u64,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            quick_start: true,
+            extensions_ready_timeout_secs: 30,
+        }
+    }
+}
+
+/// Daemon lifetime knobs (`daemon.*` keys). Config-file fallbacks; the matching
+/// `SYNAPS_DAEMON_*` env vars still WIN over these when set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonConfig {
+    /// Seconds an auto-spawned daemon stays alive after the last client
+    /// disconnects. `0` = never idle-exit. Env `SYNAPS_DAEMON_IDLE_EXIT_SECS`
+    /// overrides. Default: 10.
+    pub idle_exit_secs: u64,
+    /// Seconds a pending host confirmation on a detached session survives
+    /// before it is fail-closed answered `None`. `0` = disabled (survives
+    /// forever). Env `SYNAPS_DAEMON_PROMPT_ABANDON_SECS` overrides. Default: 3600.
+    pub prompt_abandon_secs: u64,
+    /// Seconds a PARKED session row lingers before eviction. `0` = keep
+    /// forever. Env `SYNAPS_DAEMON_PARKED_EVICT_SECS` overrides. Default: 3600.
+    pub parked_evict_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_exit_secs: 10,
+            prompt_abandon_secs: 3600,
+            parked_evict_secs: 3600,
+        }
+    }
+}
+
+/// Parse `startup.*` keys. Unknown keys return an error (caller warns).
+fn parse_startup_config_key(
+    config: &mut StartupConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    match key {
+        "startup.quick_start" => {
+            config.quick_start = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
+        "startup.extensions_ready_timeout_secs" => {
+            config.extensions_ready_timeout_secs =
+                value.trim().parse().map_err(|_| "expected an unsigned second count")?;
+        }
+        _ => return Err("unknown startup key"),
+    }
+    Ok(())
+}
+
+/// Parse `daemon.*` keys. Unknown keys return an error (caller warns).
+fn parse_daemon_config_key(
+    config: &mut DaemonConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    let secs = || value.trim().parse::<u64>().map_err(|_| "expected an unsigned second count");
+    match key {
+        "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
+        "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
+        "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        _ => return Err("unknown daemon key"),
+    }
+    Ok(())
+}
+
 /// Server security configuration parsed from `server.*` keys.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
@@ -219,6 +455,39 @@ impl CacheTtl {
     }
 }
 
+/// `tools.activation_confirm` — host policy for model-initiated
+/// `activate_tools` (progressive tool disclosure).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivationConfirm {
+    /// Authorize model-initiated activation without prompting (default).
+    #[default]
+    Auto,
+    /// Ask the host: the y/n "Confirm tool activation" dialog; only an
+    /// explicit y/yes authorizes (fail-closed).
+    Prompt,
+    /// Never authorize model-initiated activation; no prompt is raised.
+    Deny,
+}
+
+impl ActivationConfirm {
+    pub fn parse(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "prompt" => Some(Self::Prompt),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Prompt => "prompt",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Animated theme-transition mode, parsed from `theme_transition`:
 /// - `"on"` (default): cross-fade theme changes over the default 350 ms.
 /// - `"off"`: instant snap — accessibility, and mercy on tmux-over-ssh.
@@ -271,17 +540,42 @@ impl ThemeTransitionMode {
 /// server and RPC modes.
 #[derive(Debug, Clone)]
 pub struct EventsConfig {
-    /// When `true` (default), the server/RPC session automatically triggers a
-    /// model turn when runtime events arrive while idle.  Set
+    /// When `true` (default), the server/RPC/daemon session automatically
+    /// triggers a model turn when runtime events arrive while idle.  Set
     /// `events.auto_turn = false` (or `0` / `no` / `off`) to opt out.
     /// Unrecognised values fail safe to `false` with a warning.
-    /// The built-in cap (`AUTO_TURN_CAP = 5`) still applies regardless.
+    /// The consecutive-turn cap (`auto_turn_cap`) still applies regardless.
     pub auto_turn: bool,
+    /// Maximum number of consecutive auto-triggered model turns before the
+    /// engine parks and waits for real user input.  Set via
+    /// `events.auto_turn_cap = N`.  Default **5**.
+    ///
+    /// `0` (or `unlimited` / `inf` / `infinite`) disables the cap entirely —
+    /// "to infinity and beyond".  Unparseable values warn and keep the default.
+    pub auto_turn_cap: u32,
 }
+
+/// Default for `events.auto_turn_cap` — mirrors `engine::reactor::AUTO_TURN_CAP`.
+pub const DEFAULT_AUTO_TURN_CAP: u32 = 5;
 
 impl Default for EventsConfig {
     fn default() -> Self {
-        Self { auto_turn: true }
+        Self {
+            auto_turn: true,
+            auto_turn_cap: DEFAULT_AUTO_TURN_CAP,
+        }
+    }
+}
+
+/// Parse a `events.auto_turn_cap` value.  Returns `None` on garbage.
+///
+/// Accepts a non-negative integer (`0` = unlimited) or one of the aliases
+/// `unlimited` / `inf` / `infinite` / `infinity` / `none` (all → `0`).
+pub fn parse_auto_turn_cap(val: &str) -> Option<u32> {
+    let normalised = val.trim().to_lowercase();
+    match normalised.as_str() {
+        "unlimited" | "inf" | "infinite" | "infinity" | "none" => Some(0),
+        n => n.parse::<u32>().ok(),
     }
 }
 
@@ -304,6 +598,19 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
                 false
             }
         };
+    } else if key == "events.auto_turn_cap" {
+        match parse_auto_turn_cap(val) {
+            Some(cap) => cfg.auto_turn_cap = cap,
+            None => {
+                eprintln!(
+                    "warning: config: unrecognised value for events.auto_turn_cap = {:?}; \
+                     expected a non-negative integer or unlimited/inf/infinite (0 = unlimited) \
+                     — keeping default {}",
+                    val.trim(),
+                    DEFAULT_AUTO_TURN_CAP
+                );
+            }
+        }
     } // unknown events.* keys ignored
 }
 
@@ -320,7 +627,7 @@ pub struct TurnBudgetOverrides {
     pub max_cost_usd: Option<f64>,
     /// Bounded auto-renewals of the provider-round allowance after it is
     /// exhausted mid-turn (spec §8.1). Each renewal resets the round counter;
-    /// wall-clock is never renewed, so total turn time stays bounded. `0`
+    /// round renewals never reset wall-clock (durable context successors do). `0`
     /// disables graceful continuation (hard stop at the first exhaustion).
     pub max_round_renewals: Option<u32>,
 }
@@ -377,7 +684,8 @@ fn parse_turn_budget_config_key(budgets: &mut TurnBudgetsConfig, key: &str, val:
 /// Continuous-memory settings surface (Task A2, spec §12). Every field is
 /// fail-closed: unknown or invalid values warn and keep the compiled default.
 ///
-/// By construction this struct is the complete `memory.*` config surface.
+/// This struct contains continuous-memory policy; backend selection lives in
+/// the separate `MemoryBackendConfig`.
 /// Secret handling, retention, and project-scope rules are deliberately NOT
 /// fields here — they are not configurable at all (spec §12: "Secret,
 /// retention, and project rules are not configurable to fail open").
@@ -501,6 +809,27 @@ fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) {
     }
 }
 
+/// Host-owned note storage selection, independent of continuous-memory consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryBackendKind {
+    #[default]
+    Legacy,
+    Axel,
+    /// Invalid configuration must never select legacy storage implicitly.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryBackendConfig {
+    pub kind: MemoryBackendKind,
+    /// Explicit absolute executable path; never resolved through PATH.
+    pub executable: Option<PathBuf>,
+    /// Optional absolute shared Axel brain path; absent uses the private user default.
+    pub brain: Option<PathBuf>,
+    /// Explicit host opt-in to user-wide notes. Never grants capture/history consent.
+    pub user_scope: bool,
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -511,6 +840,11 @@ pub struct SynapsConfig {
     /// to `thinking_budget` for legacy numeric-only values.
     pub thinking_level: Option<crate::core::reasoning::ReasoningLevel>,
     pub context_window: Option<u64>, // override auto-detected context window (tokens)
+    pub context_management: ContextManagementConfig,
+    /// First-turn / cold-start behaviour (`startup.*`).
+    pub startup: StartupConfig,
+    /// Daemon lifetime knobs (`daemon.*`); env vars still win.
+    pub daemon: DaemonConfig,
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
@@ -551,6 +885,12 @@ pub struct SynapsConfig {
     /// stream starts with the small essential local core plus discovery and
     /// authorization gateways; exact activations are added per session.
     pub progressive_tool_disclosure: bool,
+    /// Host confirmation policy for MODEL-INITIATED `activate_tools`
+    /// (`tools.activation_confirm`). `Auto` (default) authorizes without
+    /// prompting; `Prompt` asks the host (y/n confirm dialog); `Deny` never
+    /// authorizes (locked-down hosts). `server.auto_approve_confirms = true`
+    /// still authorizes regardless of this key.
+    pub tools_activation_confirm: ActivationConfirm,
     /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
     /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
     /// an append-only delta journal with periodic atomic snapshots. See
@@ -570,6 +910,8 @@ pub struct SynapsConfig {
     pub turn_budgets: TurnBudgetsConfig,
     /// Continuous-memory settings surface (Task A2, spec §12).
     pub memory: MemoryConfig,
+    /// Host-owned backend; selecting it does not enable recall or capture.
+    pub memory_backend: MemoryBackendConfig,
     /// Non-fatal problems found while parsing the config file (unknown keys,
     /// unparseable values). Surfaced once at startup — never block boot.
     pub warnings: Vec<String>,
@@ -582,6 +924,9 @@ impl Default for SynapsConfig {
             thinking_budget: None,
             thinking_level: None,
             context_window: None,
+            context_management: ContextManagementConfig::default(),
+            startup: StartupConfig::default(),
+            daemon: DaemonConfig::default(),
             compaction_model: None,
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
@@ -605,6 +950,7 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
+            tools_activation_confirm: ActivationConfirm::default(),
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
@@ -616,6 +962,7 @@ impl Default for SynapsConfig {
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
             memory: MemoryConfig::default(),
+            memory_backend: MemoryBackendConfig::default(),
             warnings: Vec::new(),
         }
     }
@@ -627,6 +974,16 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "thinking",
     "compaction_model",
     "context_window",
+    "context_management.mode",
+    "context_management.pressure_tokens",
+    "context_management.rollover_tokens",
+    "context_management.reserve_tokens",
+    "context_management.finish_rounds",
+    "startup.quick_start",
+    "startup.extensions_ready_timeout_secs",
+    "daemon.idle_exit_secs",
+    "daemon.prompt_abandon_secs",
+    "daemon.parked_evict_secs",
     "max_tool_output",
     "bash_timeout",
     "bash_max_timeout",
@@ -648,6 +1005,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "disabled_skills",
     "disabled_tools",
     "progressive_tool_disclosure",
+    "tools.activation_confirm",
     "session_persistence",
 ];
 
@@ -687,8 +1045,8 @@ fn parse_comma_list(val: &str) -> Vec<String> {
         .collect()
 }
 
-fn write_comma_list(key: &str, values: &[String]) -> std::io::Result<()> {
-    write_config_value(key, &values.join(", "))
+fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> {
+    write_config_value_locked(key, &values.join(", "))
 }
 
 /// Parse shell.* configuration keys and update the ShellConfig.
@@ -902,6 +1260,8 @@ pub fn load_config() -> SynapsConfig {
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
+    let mut invalid_context_management = false;
+    let mut invalid_memory_backend = false;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1078,6 +1438,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
+            "tools.activation_confirm" => match ActivationConfirm::parse(val) {
+                Some(mode) => config.tools_activation_confirm = mode,
+                None => config.warnings.push(format!(
+                    "tools.activation_confirm = {val} — expected auto, prompt or deny; \
+                     keeping the default (auto)"
+                )),
+            },
             "session_persistence" => {
                 match crate::core::session_journal::SessionPersistence::parse(val) {
                     Some(mode) => config.session_persistence = mode,
@@ -1089,6 +1456,43 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             }
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);
+            }
+            "memory.backend" => {
+                config.memory_backend.kind = match val {
+                    "legacy" => MemoryBackendKind::Legacy,
+                    "axel" => MemoryBackendKind::Axel,
+                    _ => {
+                        invalid_memory_backend = true;
+                        config.warnings.push(format!(
+                            "memory.backend = {val} — expected legacy or axel; memory backend unavailable"
+                        ));
+                        MemoryBackendKind::Unavailable
+                    }
+                };
+            }
+            "memory.user_scope" => match val {
+                "true" => config.memory_backend.user_scope = true,
+                "false" => config.memory_backend.user_scope = false,
+                _ => {
+                    invalid_memory_backend = true;
+                    config.warnings.push("memory.user_scope — expected true or false; memory backend unavailable".into());
+                }
+            },
+            "memory.axel.executable" | "memory.axel.brain" => {
+                let path = PathBuf::from(val);
+                if !path.is_absolute() {
+                    invalid_memory_backend = true;
+                    config.warnings.push(format!(
+                        "{key} — expected an absolute path; memory backend unavailable"
+                    ));
+                }
+                // Retain invalid paths too: direct config consumers must not
+                // mistake an invalid explicit path for an absent default.
+                if key == "memory.axel.executable" {
+                    config.memory_backend.executable = Some(path);
+                } else {
+                    config.memory_backend.brain = Some(path);
+                }
             }
             _ => {
                 // Handle namespaced keys
@@ -1106,6 +1510,25 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     parse_turn_budget_config_key(&mut config.turn_budgets, key, val);
                 } else if key.starts_with("memory.") {
                     parse_memory_config_key(&mut config.memory, key, val);
+                } else if key.starts_with("startup.") {
+                    if let Err(reason) =
+                        parse_startup_config_key(&mut config.startup, key, val)
+                    {
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
+                } else if key.starts_with("daemon.") {
+                    if let Err(reason) =
+                        parse_daemon_config_key(&mut config.daemon, key, val)
+                    {
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
+                } else if key.starts_with("context_management.") {
+                    if let Err(reason) = parse_context_management_config_key(
+                        &mut config.context_management, key, val,
+                    ) {
+                        invalid_context_management = true;
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config
                         .provider_keys
@@ -1131,6 +1554,31 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 }
             }
         }
+    }
+
+    // Never leave a partially parsed automatic policy enabled. Syntax errors
+    // invalidate this whole parse pass, even if a later duplicate is valid.
+    let context_validation = match config.context_window {
+        Some(window) => config.context_management.validate_for_window(window),
+        None => config.context_management.validate(),
+    };
+    if let Err(reason) = context_validation {
+        invalid_context_management = true;
+        config
+            .warnings
+            .push(format!("context_management — {reason}"));
+    }
+    if invalid_context_management {
+        config.context_management = ContextManagementConfig::default();
+        config.warnings.push(
+            "invalid context_management configuration — using defaults (mode off)".to_string(),
+        );
+    }
+
+    // Any invalid backend setting poisons this parse pass, regardless of key
+    // order or later duplicate selectors. Never silently route to legacy.
+    if invalid_memory_backend {
+        config.memory_backend.kind = MemoryBackendKind::Unavailable;
     }
 
     // Fail-closed operator-consent rule (Task A2, spec §12): a non-"off"
@@ -1174,10 +1622,54 @@ pub fn read_config_value(key: &str) -> Option<String> {
     None
 }
 
+/// Exclusive advisory lock on `<config>.lock`, held around every
+/// read-modify-write of the config file (same pattern as `auth.json`).
+/// Two writers (`/settings` in two processes, a `/model` favorite toggle
+/// racing a settings edit) no longer lose each other's updates.
+///
+/// Held for the RMW only (< 1 ms); readers (`load_config`) never take it —
+/// they already tolerate the atomic rename. `SYNAPS_CONFIG_LOCK=0` bypasses.
+///
+/// NOT reentrant: flock on a fresh fd of the same file from the same process
+/// conflicts on Linux. Callers that already hold the guard must use the
+/// `_locked` inner fns.
+struct ConfigLock {
+    _file: Option<std::fs::File>,
+}
+
+impl ConfigLock {
+    fn acquire() -> std::io::Result<Self> {
+        if std::env::var("SYNAPS_CONFIG_LOCK").as_deref() == Ok("0") {
+            return Ok(Self { _file: None });
+        }
+        use fs4::fs_std::FileExt;
+        let lock_path = resolve_write_path("config").with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        let file = open.open(&lock_path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { _file: Some(file) })
+    }
+}
+
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
 /// Replaces the first existing line that matches the key, or appends if absent.
 /// Preserves comments and unknown keys. Writes atomically via temp file + rename.
 pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
+    write_config_value_locked(key, value)
+}
+
+/// The RMW body; caller holds [`ConfigLock`].
+fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
@@ -1232,24 +1724,40 @@ pub fn add_favorite_model(id: &str) -> std::io::Result<()> {
     if trimmed.is_empty() {
         return Ok(());
     }
+    let _guard = ConfigLock::acquire()?;
     let mut values = load_config().favorite_models;
     if !values.iter().any(|v| v == trimmed) {
         values.push(trimmed.to_string());
         values.sort();
     }
-    write_comma_list("favorite_models", &values)
+    write_comma_list_locked("favorite_models", &values)
 }
 
 /// Remove a favorite model id (`provider/model`) from config.
 pub fn remove_favorite_model(id: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
     let mut values = load_config().favorite_models;
     values.retain(|v| v != id.trim());
-    write_comma_list("favorite_models", &values)
+    write_comma_list_locked("favorite_models", &values)
 }
 
 /// Return whether a model id is marked as favorite.
 pub fn is_favorite_model(id: &str) -> bool {
     load_config().favorite_models.iter().any(|v| v == id.trim())
+}
+
+/// Whether a key matches the secret denylist (case-insensitive).
+/// Used by the journal save path to ensure secret values never reach disk,
+/// and by the client env capture to strip secrets before `Hello`.
+pub fn is_secret_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.ends_with("_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_CREDENTIALS")
+        || upper.ends_with("_API_KEY")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
 }
 
 /// Resolve the system prompt from CLI flag, config file, or default.
@@ -1285,6 +1793,269 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_and_daemon_defaults() {
+        let c = super::load_config_from_str("");
+        assert!(c.startup.quick_start, "quick_start defaults ON");
+        assert_eq!(c.startup.extensions_ready_timeout_secs, 30);
+        assert_eq!(c.daemon.idle_exit_secs, 10);
+        assert_eq!(c.daemon.prompt_abandon_secs, 3600);
+        assert_eq!(c.daemon.parked_evict_secs, 3600);
+        // No warnings for the absent keys.
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+    }
+
+    #[test]
+    fn startup_and_daemon_parse_all_keys() {
+        let c = super::load_config_from_str(concat!(
+            "startup.quick_start = off\n",
+            "startup.extensions_ready_timeout_secs = 45\n",
+            "daemon.idle_exit_secs = 20\n",
+            "daemon.prompt_abandon_secs = 0\n",
+            "daemon.parked_evict_secs = 120\n",
+        ));
+        assert!(!c.startup.quick_start);
+        assert_eq!(c.startup.extensions_ready_timeout_secs, 45);
+        assert_eq!(c.daemon.idle_exit_secs, 20);
+        assert_eq!(c.daemon.prompt_abandon_secs, 0);
+        assert_eq!(c.daemon.parked_evict_secs, 120);
+        assert!(
+            !c.warnings.iter().any(|w| w.contains("unknown")),
+            "no unknown-key warning: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    fn startup_quick_start_accepts_on() {
+        let c = super::load_config_from_str("startup.quick_start = on\n");
+        assert!(c.startup.quick_start);
+    }
+
+    #[test]
+    fn startup_and_daemon_keys_are_known() {
+        for k in [
+            "startup.quick_start",
+            "startup.extensions_ready_timeout_secs",
+            "daemon.idle_exit_secs",
+            "daemon.prompt_abandon_secs",
+            "daemon.parked_evict_secs",
+        ] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
+        }
+    }
+
+    #[test]
+    fn startup_daemon_bad_values_warn_and_keep_defaults() {
+        let c = super::load_config_from_str(concat!(
+            "startup.quick_start = maybe\n",
+            "daemon.idle_exit_secs = soon\n",
+        ));
+        assert!(c.startup.quick_start, "invalid bool keeps default");
+        assert_eq!(c.daemon.idle_exit_secs, 10, "invalid u64 keeps default");
+        assert!(c.warnings.iter().any(|w| w.contains("startup.quick_start")));
+        assert!(c.warnings.iter().any(|w| w.contains("daemon.idle_exit_secs")));
+    }
+
+    #[test]
+    fn context_management_defaults_off_and_parses_all_keys() {
+        use super::{ContextManagementConfig, ContextManagementMode};
+        assert_eq!(
+            super::load_config_from_str("").context_management,
+            ContextManagementConfig::default()
+        );
+        let parsed = super::load_config_from_str(
+            "context_management.mode = AUTO\n\
+             context_management.pressure_tokens = 250000\n\
+             context_management.rollover_tokens = 400000\n\
+             context_management.reserve_tokens = 24000\n\
+             context_management.finish_rounds = 3\n\
+             context_window = 1m\n",
+        );
+        assert_eq!(
+            parsed.context_management,
+            ContextManagementConfig {
+                mode: ContextManagementMode::Auto,
+                pressure_tokens: Some(250_000),
+                rollover_tokens: Some(400_000),
+                reserve_tokens: 24_000,
+                finish_rounds: 3,
+            }
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert!(parsed.provider_keys.is_empty());
+        assert!(super::load_config_from_str("context_management.mode = off")
+            .warnings
+            .is_empty());
+    }
+
+    #[test]
+    fn context_management_auto_clears_overrides_and_allows_bounded_extremes() {
+        for rounds in [0, super::ContextManagementConfig::MAX_FINISH_ROUNDS] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\n\
+                 context_management.pressure_tokens = 300000\n\
+                 context_management.rollover_tokens = 450000\n\
+                 context_management.pressure_tokens = auto\n\
+                 context_management.rollover_tokens = AUTO\n\
+                 context_management.finish_rounds = {rounds}\n"
+            ));
+            assert_eq!(parsed.context_management.pressure_tokens, None);
+            assert_eq!(parsed.context_management.rollover_tokens, None);
+            assert_eq!(parsed.context_management.finish_rounds, rounds);
+            assert!(parsed.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn context_management_invalid_values_reset_entire_policy() {
+        for (key, value) in [
+            ("mode", "on"),
+            ("pressure_tokens", "0"),
+            ("pressure_tokens", "-1"),
+            ("pressure_tokens", "250k"),
+            ("pressure_tokens", "18446744073709551616"),
+            ("rollover_tokens", "1"),
+            ("rollover_tokens", "nope"),
+            ("reserve_tokens", "0"),
+            ("reserve_tokens", "1000001"),
+            ("reserve_tokens", "auto"),
+            ("finish_rounds", "9"),
+            ("finish_rounds", "-1"),
+            ("finish_rounds", "4294967296"),
+            ("finish_rounds", ""),
+            ("mod", "auto"),
+        ] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\ncontext_management.{key} = {value}\n"
+            ));
+            assert_eq!(
+                parsed.context_management,
+                super::ContextManagementConfig::default(),
+                "{key}={value}"
+            );
+            assert!(!parsed.warnings.is_empty(), "{key}={value}");
+            assert!(parsed.provider_keys.is_empty());
+        }
+        let duplicate = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.finish_rounds = bad\ncontext_management.finish_rounds = 2"
+        );
+        assert_eq!(
+            duplicate.context_management,
+            super::ContextManagementConfig::default()
+        );
+    }
+
+    #[test]
+    fn context_management_validates_final_threshold_order_and_window() {
+        for fields in [
+            "pressure_tokens = 400000\ncontext_management.rollover_tokens = 400000",
+            "pressure_tokens = 500000\ncontext_management.rollover_tokens = 400000",
+            "pressure_tokens = 1000000",
+            "rollover_tokens = 1000001",
+        ] {
+            for window_first in [false, true] {
+                let policy =
+                    format!("context_management.mode = auto\ncontext_management.{fields}\n");
+                let content = if window_first {
+                    format!("context_window = 1m\n{policy}")
+                } else {
+                    format!("{policy}context_window = 1m\n")
+                };
+                let parsed = super::load_config_from_str(&content);
+                assert_eq!(
+                    parsed.context_management,
+                    super::ContextManagementConfig::default()
+                );
+                assert!(!parsed.warnings.is_empty());
+            }
+        }
+        // Temporarily reversed overrides are valid once the whole file is parsed.
+        let parsed = super::load_config_from_str(
+            "context_management.mode = auto\n\
+             context_management.rollover_tokens = 100000\n\
+             context_management.pressure_tokens = 300000\n\
+             context_management.rollover_tokens = 450000\ncontext_window = 1m",
+        );
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.context_management.rollover_tokens, Some(450_000));
+    }
+
+    #[test]
+    fn context_management_parsed_finish_override_bounds_rollover_extension() {
+        use crate::core::context_policy::{
+            assess_context, ContextAction, ContextBudget, ContextState, WorkPhase,
+        };
+        let config = super::load_config_from_str(
+            "context_management.mode = auto\n\
+             context_management.finish_rounds = 1\ncontext_window = 1m",
+        );
+        let budget = ContextBudget {
+            context_window_tokens: 1_000_000,
+            used_tokens: 400_000,
+            hard_remaining_tokens: 600_000,
+            required_next_round_tokens: 8_000,
+        };
+        let mut state = ContextState::default();
+        state.report_phase(WorkPhase::Plan);
+        let first = assess_context(&config.context_management, &state, budget);
+        assert_eq!(
+            first.action,
+            ContextAction::FinishBounded {
+                rounds_remaining: 0
+            }
+        );
+        state = first.next_state;
+        state.report_phase(WorkPhase::WrapUp);
+        assert_eq!(
+            assess_context(&config.context_management, &state, budget).action,
+            ContextAction::Rollover
+        );
+    }
+
+    #[test]
+    fn context_management_keys_are_known_for_suggestions() {
+        for key in [
+            "mode",
+            "pressure_tokens",
+            "rollover_tokens",
+            "reserve_tokens",
+            "finish_rounds",
+        ] {
+            let full = format!("context_management.{key}");
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&full.as_str()));
+            assert_eq!(
+                super::did_you_mean(&format!("{full}x")),
+                Some(full.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn context_management_parsed_policy_rolls_over_before_executing_350k_plan() {
+        use crate::core::context_policy::{
+            assess_context, ContextAction, ContextBudget, ContextState, WorkPhase,
+        };
+        let config =
+            super::load_config_from_str("context_management.mode = auto\ncontext_window = 1m");
+        let budget = ContextBudget {
+            context_window_tokens: config.context_window.unwrap(),
+            used_tokens: 350_000,
+            hard_remaining_tokens: 650_000,
+            required_next_round_tokens: 8_000,
+        };
+        let mut state = ContextState::default();
+        state.report_phase(WorkPhase::Plan);
+        let plan = assess_context(&config.context_management, &state, budget);
+        assert_eq!(plan.action, ContextAction::Advisory);
+        state = plan.next_state;
+        state.report_phase(WorkPhase::Execute);
+        assert_eq!(
+            assess_context(&config.context_management, &state, budget).action,
+            ContextAction::Rollover
+        );
+    }
+
     #[test]
     fn tui_background_opaque_defaults_and_parses_supported_values() {
         assert!(super::load_config_from_str("").tui_background_opaque);
@@ -1442,6 +2213,92 @@ mod tests {
              memory.default_mode_confirmed = true\n",
         );
         assert_eq!(after.memory.default_mode, "recall_once");
+    }
+
+    #[test]
+    fn memory_backend_defaults_are_independent_of_consent() {
+        let config = super::load_config_from_str("");
+        assert_eq!(config.memory_backend, super::MemoryBackendConfig::default());
+        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
+        let axel = super::load_config_from_str("memory.backend = axel\n");
+        assert_eq!(axel.memory_backend.kind, super::MemoryBackendKind::Axel);
+        assert_eq!(axel.memory, config.memory);
+        assert!(axel.warnings.is_empty());
+    }
+
+    #[test]
+    fn user_wide_notes_require_explicit_valid_opt_in() {
+        let default = super::load_config_from_str("memory.backend = axel\n");
+        assert!(!default.memory_backend.user_scope);
+        let enabled =
+            super::load_config_from_str("memory.backend = axel\nmemory.user_scope = true\n");
+        assert!(enabled.memory_backend.user_scope);
+        assert_eq!(enabled.memory, default.memory);
+        for bad in ["yes", "", "1", "TRUE"] {
+            let config = super::load_config_from_str(&format!(
+                "memory.user_scope = {bad}\nmemory.backend = axel\n"
+            ));
+            assert_eq!(
+                config.memory_backend.kind,
+                super::MemoryBackendKind::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn memory_backend_invalid_selector_fails_closed() {
+        for content in [
+            "memory.backend = typo\n",
+            "memory.backend = \n",
+            "memory.backend = unavailable\n",
+            "memory.backend = axel\nmemory.backend = typo\n",
+            "memory.backend = typo\nmemory.backend = legacy\n",
+        ] {
+            let config = super::load_config_from_str(content);
+            assert_eq!(
+                config.memory_backend.kind,
+                super::MemoryBackendKind::Unavailable
+            );
+            assert!(config
+                .warnings
+                .iter()
+                .any(|w| w.contains("memory backend unavailable")));
+        }
+    }
+
+    #[test]
+    fn memory_backend_absolute_paths_are_preserved() {
+        let root = std::env::current_dir().unwrap();
+        let executable = root.join("fixture bin/axel");
+        let brain = root.join("fixture brain");
+        let config = super::load_config_from_str(&format!(
+            "memory.axel.brain = {}\nmemory.backend = axel\nmemory.axel.executable = {}\n",
+            brain.display(),
+            executable.display()
+        ));
+        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Axel);
+        assert_eq!(config.memory_backend.executable, Some(executable));
+        assert_eq!(config.memory_backend.brain, Some(brain));
+        assert!(config.warnings.is_empty());
+    }
+
+    #[test]
+    fn memory_backend_relative_or_empty_paths_fail_closed_in_any_order() {
+        for key in ["memory.axel.executable", "memory.axel.brain"] {
+            for path in ["relative/path", "~/brain", ""] {
+                for content in [
+                    format!("memory.backend = axel\n{key} = {path}\n"),
+                    format!("{key} = {path}\nmemory.backend = legacy\n"),
+                ] {
+                    let config = super::load_config_from_str(&content);
+                    assert_eq!(
+                        config.memory_backend.kind,
+                        super::MemoryBackendKind::Unavailable
+                    );
+                    assert!(config.warnings.iter().any(|w| w.contains("absolute path")));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1758,6 +2615,7 @@ mod tests {
         assert!(config.favorite_models.is_empty());
         assert!(config.disabled_skills.is_empty());
         assert!(!config.progressive_tool_disclosure);
+        assert_eq!(config.tools_activation_confirm, ActivationConfirm::Auto);
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
@@ -1769,6 +2627,32 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_tools_activation_confirm_modes() {
+        for (raw, expected, warns) in [
+            ("prompt", ActivationConfirm::Prompt, false),
+            ("deny", ActivationConfirm::Deny, false),
+            ("AUTO", ActivationConfirm::Auto, false),
+            ("garbage", ActivationConfirm::Auto, true),
+        ] {
+            let home = make_test_home(&format!("activation-confirm-{raw}"));
+            let cfg = home.join(".synaps-cli/config");
+            std::fs::write(&cfg, format!("tools.activation_confirm = {raw}\n")).unwrap();
+            with_home(&home, || {
+                let config = load_config();
+                assert_eq!(config.tools_activation_confirm, expected, "{raw}");
+                assert_eq!(
+                    config.warnings.iter().any(|w| w.contains("tools.activation_confirm")),
+                    warns,
+                    "{raw}: {:?}",
+                    config.warnings
+                );
+            });
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]
@@ -1987,6 +2871,77 @@ context_window = 200k\n\
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("model = claude-opus-4-6"));
         assert!(contents.contains("theme = dracula"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_concurrent_writers_lose_nothing() {
+        let home = make_test_home("concurrent");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "# keep\n").unwrap();
+
+        // HOME is process-global; set it for the whole test, not per thread.
+        with_home(&home, || {
+            let a = std::thread::spawn(|| {
+                for i in 0..200 {
+                    write_config_value("a_key", &i.to_string()).unwrap();
+                }
+            });
+            let b = std::thread::spawn(|| {
+                for i in 0..200 {
+                    write_config_value("b_key", &i.to_string()).unwrap();
+                }
+            });
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("# keep"), "{contents}");
+        assert!(contents.contains("a_key = 199"), "{contents}");
+        assert!(contents.contains("b_key = 199"), "{contents}");
+        assert_eq!(contents.matches("a_key").count(), 1);
+        assert_eq!(contents.matches("b_key").count(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = home.join(".synaps-cli/config.lock");
+            let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_lock_kill_switch_still_writes() {
+        let home = make_test_home("lock-off");
+        let cfg = home.join(".synaps-cli/config");
+        std::env::set_var("SYNAPS_CONFIG_LOCK", "0");
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+        std::env::remove_var("SYNAPS_CONFIG_LOCK");
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        assert!(!home.join(".synaps-cli/config.lock").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn add_favorite_model_end_to_end_does_not_deadlock() {
+        let home = make_test_home("favorite-lock");
+        let cfg = home.join(".synaps-cli/config");
+        with_home(&home, || {
+            add_favorite_model("anthropic/claude-sonnet-4-6").unwrap();
+            add_favorite_model("openai/gpt-5").unwrap();
+            remove_favorite_model("anthropic/claude-sonnet-4-6").unwrap();
+        });
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("favorite_models = openai/gpt-5"), "{contents}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2211,6 +3166,56 @@ api_retries = 5
             !cfg.events.auto_turn,
             "typo 'fales' must fail safe to false"
         );
+    }
+
+    // ── events.auto_turn_cap parser ──────────────────────────────────────────
+
+    #[test]
+    fn events_auto_turn_cap_default_is_five() {
+        let cfg = load_config_from_str("");
+        assert_eq!(cfg.events.auto_turn_cap, 5);
+        assert_eq!(DEFAULT_AUTO_TURN_CAP, 5);
+    }
+
+    #[test]
+    fn events_auto_turn_cap_zero_is_unlimited() {
+        let cfg = load_config_from_str("events.auto_turn_cap = 0");
+        assert_eq!(cfg.events.auto_turn_cap, 0);
+    }
+
+    #[test]
+    fn events_auto_turn_cap_unlimited_aliases() {
+        for val in ["unlimited", "inf", "infinite", "Infinity", "UNLIMITED", " inf "] {
+            let cfg = load_config_from_str(&format!("events.auto_turn_cap = {val}"));
+            assert_eq!(
+                cfg.events.auto_turn_cap, 0,
+                "expected 0 for events.auto_turn_cap = {val:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn events_auto_turn_cap_explicit_number() {
+        let cfg = load_config_from_str("events.auto_turn_cap = 12");
+        assert_eq!(cfg.events.auto_turn_cap, 12);
+    }
+
+    #[test]
+    fn events_auto_turn_cap_garbage_keeps_default() {
+        for val in ["banana", "-3", "5.5", "", "true"] {
+            let cfg = load_config_from_str(&format!("events.auto_turn_cap = {val}"));
+            assert_eq!(
+                cfg.events.auto_turn_cap, 5,
+                "garbage {val:?} must keep default 5"
+            );
+        }
+    }
+
+    #[test]
+    fn events_auto_turn_cap_independent_of_auto_turn() {
+        let cfg = load_config_from_str("events.auto_turn = false\nevents.auto_turn_cap = 0");
+        assert!(!cfg.events.auto_turn);
+        assert_eq!(cfg.events.auto_turn_cap, 0);
     }
 
     #[test]
