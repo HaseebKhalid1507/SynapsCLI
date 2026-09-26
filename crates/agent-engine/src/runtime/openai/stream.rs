@@ -3064,6 +3064,36 @@ mod xai_tests {
     }
 
     #[test]
+    fn grok47_responses_wire_uses_exact_efforts_and_preserves_tool_shape() {
+        for (level, effort) in [
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+            (ReasoningLevel::XHigh, "xhigh"),
+        ] {
+            let input = json!([{"role": "user", "content": "hello"}]);
+            let tool = json!({"type": "function", "name": "inspect", "parameters": {"type": "object"}});
+            let body = build_xai_body("grok-4.7", level, input.clone(), vec![tool.clone()], Some(1024)).unwrap();
+            assert_eq!(body["model"], "grok-4.7");
+            assert_eq!(body["reasoning"], json!({"effort": effort}));
+            assert_eq!(body["input"], input);
+            assert_eq!(body["tools"], json!([tool]));
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["max_output_tokens"], 1024);
+            assert!(body.get("messages").is_none());
+            assert!(body.get("reasoning_effort").is_none());
+            // Default ciphertext does not require opting into include or
+            // changing storage policy (official docs say ignoring it works).
+            assert!(body.get("include").is_none());
+            assert!(body.get("store").is_none());
+        }
+        assert!(body_for("grok-4.7", ReasoningLevel::Adaptive).unwrap().get("reasoning").is_none());
+        for level in [ReasoningLevel::Off, ReasoningLevel::Max, ReasoningLevel::Ultra, ReasoningLevel::UltraCode] {
+            assert!(body_for("grok-4.7", level).is_err(), "{level}");
+        }
+    }
+
+    #[test]
     fn grok46_emits_exact_documented_efforts() {
         for (level, effort) in [
             (ReasoningLevel::Low, "low"),
