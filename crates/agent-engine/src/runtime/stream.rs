@@ -2,10 +2,10 @@ use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use super::{
-    emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision,
+    emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
     BeforeToolCallDecision,
 };
-use crate::extensions::hooks::events::HookEvent;
+use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -150,6 +150,8 @@ pub(super) struct StreamSession {
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
+    /// Session "Allow all" latch shared with the owning [`Runtime`].
+    pub(super) session_allow_all: Arc<std::sync::atomic::AtomicBool>,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
@@ -367,6 +369,7 @@ impl StreamMethods {
             env_warned,
             secret_prompt,
             auto_approve_confirms,
+            session_allow_all,
             telemetry_level,
             orchestration,
             delegation_parent,
@@ -909,6 +912,8 @@ impl StreamMethods {
                         },
                     );
                     s.policy = d.next_state;
+                    // Informational only: surfaced to on_message_complete hooks.
+                    s.last_band = Some(d.band);
                     d
                 };
                 let current_advisory;
@@ -1163,15 +1168,30 @@ impl StreamMethods {
                 }
 
                 let assistant_text = assistant_text_from_content(content);
+                let context_management = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .hook_context_management();
                 let hook_event = HookEvent::on_message_complete(
                     &assistant_text,
                     json!({
                         "content_block_count": content.len(),
                         "has_tool_use": !tool_uses.is_empty(),
+                        "context_management": context_management,
                     }),
                 )
                 .with_session(session_id.as_deref());
-                let _ = hook_bus.emit(&hook_event).await;
+                // An extension may report an advisory work phase; it is
+                // applied exactly like the model's own `context_checkpoint`
+                // (no note) and is never capacity or permission authority.
+                if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
+                    if context_enabled {
+                        continuation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .report_hook_phase(&phase);
+                    }
+                }
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
@@ -1380,6 +1400,7 @@ impl StreamMethods {
                                     .await,
                                     secret_prompt.as_ref(),
                                     auto_approve_confirms,
+                                    Some(&session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
@@ -1392,7 +1413,7 @@ impl StreamMethods {
                                     let input_for_hook = input.clone();
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -1406,7 +1427,7 @@ impl StreamMethods {
                                                     (e.to_string(), None)
                                                 }
                                             };
-                                            let hooked_output = emit_after_tool_call(
+                                            let outcome = emit_after_tool_call_outcome(
                                                 &hook_bus,
                                                 &tool_name,
                                                 Some(&runtime_name),
@@ -1418,8 +1439,11 @@ impl StreamMethods {
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
                                             // the image would desync text and image.
-                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
-                                            (hooked_output, rich_blocks)
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
+                                            if outcome.replaced {
+                                                production_output = None;
+                                            }
+                                            (outcome.output, rich_blocks)
                                         }
                                         (None, started) => {
                                             canceled = true;
@@ -1654,6 +1678,7 @@ impl StreamMethods {
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
+                        let session_allow_all_inner = session_allow_all.clone();
                         let orchestration_inner = orchestration.clone();
                         let mcp_leases_inner = mcp_lease_capability.clone();
                         let extension_leases_inner = extension_lease_capability.clone();
@@ -1699,6 +1724,7 @@ impl StreamMethods {
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
+                                        Some(&session_allow_all_inner),
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
@@ -1731,7 +1757,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -1739,7 +1765,7 @@ impl StreamMethods {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
                                             };
-                                            let hooked_output = emit_after_tool_call(
+                                            let outcome = emit_after_tool_call_outcome(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
@@ -1749,11 +1775,12 @@ impl StreamMethods {
                                                 session_id_inner.as_deref(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
-                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
                                             // F28: an errored tool's summary carries the exit
-                                            // status; drop the delta-lane handle so it can't win.
-                                            let history_handle = if errored { None } else { Some(output_handle) };
-                                            (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
+                                            // status; a real Replace is authoritative even when equal
+                                            // to the summary. Neither may lose to the delta lane.
+                                            let history_handle = if errored || outcome.replaced { None } else { Some(output_handle) };
+                                            (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
                                             (true, started.then_some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
@@ -1988,8 +2015,9 @@ fn drop_rich_if_rewritten(
     rich_blocks: Option<Vec<Value>>,
     hooked_output: &str,
     output: &str,
+    replaced: bool,
 ) -> Option<Vec<Value>> {
-    if hooked_output == output {
+    if !replaced && hooked_output == output {
         return rich_blocks;
     }
     if rich_blocks.is_some() {
@@ -2616,6 +2644,199 @@ mod rich_output_tests {
         async fn shutdown(&self) {}
     }
 
+    struct StreamingTextTool {
+        summary: String,
+        errored: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StreamingTextTool {
+        fn name(&self) -> &str {
+            "streaming_stub"
+        }
+        fn description(&self) -> &str {
+            "streams text and returns a separate summary"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            let delta = ctx.channels.tx_delta.as_ref().expect("streaming lane");
+            delta.send("old streamed ".into());
+            delta.send("text, not the summary".into());
+            if self.errored {
+                return Err(RuntimeError::Tool("error summary: exit status 17".into()));
+            }
+            Ok(self.summary.clone())
+        }
+    }
+
+    struct ContinueHook;
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for ContinueHook {
+        fn id(&self) -> &str {
+            "continue-hook"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn output_hook_bus(replace: Option<bool>) -> Arc<crate::extensions::hooks::HookBus> {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        if let Some(replace) = replace {
+            let mut perms = PermissionSet::new();
+            perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+            perms.grant(crate::extensions::permissions::Permission::ToolsTransformOutput);
+            let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> = if replace {
+                Arc::new(ReplaceHook)
+            } else {
+                Arc::new(ContinueHook)
+            };
+            bus.subscribe(HookKind::AfterToolCall, handler, None, None, perms)
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    async fn streaming_history_cases(parallel: bool) {
+        // Equal replacement/summary bytes must STILL discard the distinct delta lane.
+        // Long Continue/no-hook summaries must NOT be mistaken for replacements.
+        for (hook, summary, errored, expected) in [
+            (Some(true), "summary".into(), false, "REPLACED BY HOOK"),
+            (
+                Some(true),
+                "REPLACED BY HOOK".into(),
+                false,
+                "REPLACED BY HOOK",
+            ),
+            (
+                Some(false),
+                "summary".into(),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                Some(false),
+                "s".repeat(40_000),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                None,
+                "s".repeat(40_000),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                Some(false),
+                "summary".into(),
+                true,
+                "Tool execution failed: error summary: exit status 17",
+            ),
+        ] {
+            let calls = if parallel {
+                vec![("toolu_a", "streaming_stub"), ("toolu_b", "streaming_stub")]
+            } else {
+                vec![("toolu_a", "streaming_stub")]
+            };
+            let d = drive(
+                vec![Arc::new(StreamingTextTool { summary, errored })],
+                &calls,
+                output_hook_bus(hook).await,
+            )
+            .await;
+            let wire = tool_result_message(&d.bodies[1]);
+            let history = d
+                .history
+                .iter()
+                .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+                .expect("durable tool results");
+            for message in [wire, history.as_ref()] {
+                let results = message["content"].as_array().unwrap();
+                assert_eq!(results.len(), calls.len());
+                for result in results {
+                    assert_eq!(
+                        result["content"], expected,
+                        "parallel={parallel}, hook={hook:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_streaming_history_respects_hook_outcome() {
+        streaming_history_cases(false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_streaming_history_respects_hook_outcome() {
+        streaming_history_cases(true).await;
+    }
+
+    // Provider-free checks of the internal outcome and compatibility wrapper.
+    #[tokio::test]
+    async fn after_tool_outcome_distinguishes_replace_from_truncation() {
+        for hook in [None, Some(false), Some(true)] {
+            let bus = output_hook_bus(hook).await;
+            for summary in ["REPLACED BY HOOK".to_string(), "é".repeat(100)] {
+                let outcome = emit_after_tool_call_outcome(
+                    &bus,
+                    "stub",
+                    None,
+                    json!({}),
+                    summary.clone(),
+                    10,
+                    None,
+                )
+                .await;
+                assert_eq!(outcome.replaced, hook == Some(true));
+                let source = if outcome.replaced {
+                    "REPLACED BY HOOK"
+                } else {
+                    &summary
+                };
+                assert_eq!(
+                    outcome.output,
+                    HelperMethods::truncate_tool_result(source, 10)
+                );
+                assert_eq!(
+                    outcome.output,
+                    crate::runtime::emit_after_tool_call(
+                        &bus,
+                        "stub",
+                        None,
+                        json!({}),
+                        summary,
+                        10,
+                        None,
+                    )
+                    .await
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rich_blocks_drop_for_replacement_even_when_summary_is_equal() {
+        let blocks = Some(vec![json!({"type":"text","text":"summary"})]);
+        assert!(drop_rich_if_rewritten(blocks.clone(), "summary", "summary", true).is_none());
+        assert!(drop_rich_if_rewritten(blocks.clone(), "short", "long summary", false).is_none());
+        assert_eq!(
+            drop_rich_if_rewritten(blocks.clone(), "summary", "summary", false),
+            blocks
+        );
+    }
+
     fn sse_tool_use_round(tool_uses: &[(&str, &str)]) -> String {
         let mut s = String::new();
         s.push_str(r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#);
@@ -2719,6 +2940,20 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
+        let continuation = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::runtime::continuation::ContinuationState::default(),
+        ));
+        drive_with_continuation(messages, tools_to_register, tool_uses, hook_bus, continuation)
+            .await
+    }
+
+    async fn drive_with_continuation(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        continuation: crate::runtime::continuation::SharedContinuation,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
         let mut registry = ToolRegistry::new();
@@ -2741,9 +2976,7 @@ mod rich_output_tests {
             memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
             context_window: 200_000,
-            continuation: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::runtime::continuation::ContinuationState::default(),
-            )),
+            continuation,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token: "test-token".into(),
                 auth_type: "api_key".into(),
@@ -2785,6 +3018,7 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            session_allow_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
@@ -2835,6 +3069,138 @@ mod rich_output_tests {
             bodies,
             rejected,
         }
+    }
+
+    /// on_message_complete hook that records every event's `data` and reports
+    /// an advisory `new_task` phase.
+    struct PhaseHook {
+        seen: Mutex<Vec<Value>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for PhaseHook {
+        fn id(&self) -> &str {
+            "phase-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.seen.lock().unwrap().push(event.data.clone());
+            HookResult::ContextPhase {
+                phase: "new_task".into(),
+            }
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn phase_hook_bus(
+        with_lifecycle: bool,
+    ) -> (Arc<crate::extensions::hooks::HookBus>, Arc<PhaseHook>) {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let hook = Arc::new(PhaseHook {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::LlmContent);
+        if with_lifecycle {
+            perms.grant(crate::extensions::permissions::Permission::SessionLifecycle);
+        }
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> = hook.clone();
+        bus.subscribe(HookKind::OnMessageComplete, handler, None, None, perms)
+            .await
+            .unwrap();
+        (bus, hook)
+    }
+
+    fn auto_continuation() -> crate::runtime::continuation::SharedContinuation {
+        let mut state = crate::runtime::continuation::ContinuationState::default();
+        state.config.mode = agent_core::config::ContextManagementMode::Auto;
+        std::sync::Arc::new(std::sync::Mutex::new(state))
+    }
+
+    /// End-to-end through the stream loop: the hook sees the additive
+    /// `context_management` payload and its `context_phase` report lands in
+    /// the continuation policy exactly like a `context_checkpoint` call.
+    #[tokio::test]
+    async fn on_message_complete_context_phase_reaches_continuation() {
+        use agent_core::core::context_policy::WorkPhase;
+        let (bus, hook) = phase_hook_bus(true).await;
+        let continuation = auto_continuation();
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let _ = drive_with_continuation(
+            initial,
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one hook per assistant message: {seen:?}");
+        assert_eq!(seen[0]["content_block_count"], 1);
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(
+            seen[0]["context_management"],
+            json!({"enabled": true, "band": "normal", "phase": "unknown"})
+        );
+        // The second event reflects the phase applied after the first report.
+        assert_eq!(seen[1]["context_management"]["phase"], "new_task");
+
+        let state = continuation.lock().unwrap();
+        assert_eq!(state.policy.phase(), WorkPhase::NewTask);
+        assert!(state.note.is_empty(), "hook path never records a note");
+        assert_eq!(
+            state.last_band,
+            Some(agent_core::core::context_policy::ContextBand::Normal)
+        );
+    }
+
+    /// Without `session.lifecycle` the report is ignored by the bus; with
+    /// context management disabled the payload says so and nothing is applied.
+    #[tokio::test]
+    async fn on_message_complete_context_phase_is_ignored_without_key_or_when_disabled() {
+        use agent_core::core::context_policy::WorkPhase;
+        // Observe key only, management enabled.
+        let (bus, hook) = phase_hook_bus(false).await;
+        let continuation = auto_continuation();
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let _ = drive_with_continuation(
+            initial.clone(),
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        assert_eq!(
+            continuation.lock().unwrap().policy.phase(),
+            WorkPhase::Unknown,
+            "report without session.lifecycle must not be applied"
+        );
+
+        // Both keys, management disabled.
+        let (bus, hook) = phase_hook_bus(true).await;
+        let continuation = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::runtime::continuation::ContinuationState::default(),
+        ));
+        let _ = drive_with_continuation(
+            initial,
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for data in &seen {
+            assert_eq!(
+                data["context_management"],
+                json!({"enabled": false, "band": Value::Null, "phase": "unknown"})
+            );
+        }
+        let state = continuation.lock().unwrap();
+        assert_eq!(state.policy.phase(), WorkPhase::Unknown);
+        assert_eq!(state.last_band, None);
     }
 
     /// The user message carrying tool results, from the round-2 request body.
@@ -3285,6 +3651,7 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            session_allow_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,

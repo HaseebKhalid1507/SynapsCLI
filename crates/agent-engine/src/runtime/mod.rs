@@ -73,19 +73,33 @@ pub async fn emit_before_tool_call(
     hook_bus.emit(&event).await
 }
 
+/// Answer the Confirm dialog sends for its "Allow all (session)" button.
+/// `resolve_before_tool_call_result` treats it as an allow AND latches the
+/// session's [`Runtime::session_allow_all`] flag so later Confirm results
+/// are auto-approved without a prompt (until the session ends).
+pub use crate::tools::CONFIRM_ANSWER_ALLOW_ALL;
+
 /// Resolve a before_tool_call result that may request user confirmation.
 ///
-/// When `auto_approve_confirms` is true, `Confirm` is short-circuited to `Continue`.
-/// Headless/non-interactive callers with `auto_approve_confirms = false` fail closed.
+/// When `auto_approve_confirms` is true, or `session_allow_all` has been
+/// latched by an earlier "Allow all (session)" answer, `Confirm` is
+/// short-circuited to `Continue`. Headless/non-interactive callers with
+/// neither fail closed.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
+    session_allow_all: Option<&std::sync::atomic::AtomicBool>,
 ) -> crate::extensions::hooks::events::HookResult {
+    use std::sync::atomic::Ordering;
     match hook_result {
         crate::extensions::hooks::events::HookResult::Confirm { message } => {
             if auto_approve_confirms {
                 tracing::info!(message = %message, "confirm auto-approved (auto_approve_confirms=true)");
+                return crate::extensions::hooks::events::HookResult::Continue;
+            }
+            if session_allow_all.is_some_and(|f| f.load(Ordering::Relaxed)) {
+                tracing::info!(message = %message, "confirm auto-approved (session allow-all latched)");
                 return crate::extensions::hooks::events::HookResult::Continue;
             }
 
@@ -101,7 +115,7 @@ pub async fn resolve_before_tool_call_result(
             let response = prompt
                 .prompt(
                     "Confirm tool call".to_string(),
-                    format!("{}\n\nType 'yes' or 'y' to allow.", message),
+                    format!("{}\n\nAllow this tool call?", message),
                 )
                 .await;
 
@@ -109,6 +123,20 @@ pub async fn resolve_before_tool_call_result(
                 Some(answer)
                     if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
                 {
+                    crate::extensions::hooks::events::HookResult::Continue
+                }
+                Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
+                    match session_allow_all {
+                        Some(flag) => {
+                            flag.store(true, Ordering::Relaxed);
+                            tracing::warn!(
+                                "user chose Allow all: tool-call confirms auto-approved for the rest of this session"
+                            );
+                        }
+                        None => tracing::warn!(
+                            "user chose Allow all but this path has no session latch; approving this call only"
+                        ),
+                    }
                     crate::extensions::hooks::events::HookResult::Continue
                 }
                 _ => crate::extensions::hooks::events::HookResult::Block {
@@ -126,8 +154,16 @@ pub async fn resolve_before_tool_call_decision(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
+    session_allow_all: Option<&std::sync::atomic::AtomicBool>,
 ) -> BeforeToolCallDecision {
-    match resolve_before_tool_call_result(hook_result, secret_prompt, auto_approve_confirms).await {
+    match resolve_before_tool_call_result(
+        hook_result,
+        secret_prompt,
+        auto_approve_confirms,
+        session_allow_all,
+    )
+    .await
+    {
         crate::extensions::hooks::events::HookResult::Block { reason } => {
             BeforeToolCallDecision::Block { reason }
         }
@@ -173,6 +209,35 @@ pub async fn emit_after_tool_call(
     max_tool_output: usize,
     session_id: Option<&str>,
 ) -> String {
+    emit_after_tool_call_outcome(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        output,
+        max_tool_output,
+        session_id,
+    )
+    .await
+    .output
+}
+
+/// Distinguish an authoritative hook replacement from ordinary budget truncation.
+/// Byte equality with the summary cannot establish whether the delta lane is stale.
+pub(super) struct AfterToolCallOutcome {
+    pub output: String,
+    pub replaced: bool,
+}
+
+pub(super) async fn emit_after_tool_call_outcome(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+    max_tool_output: usize,
+    session_id: Option<&str>,
+) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
@@ -182,8 +247,10 @@ pub async fn emit_after_tool_call(
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
+    let mut replaced = false;
     let post_hook = match hook_bus.emit(&event).await {
         HookResult::Replace { mut output } => {
+            replaced = true;
             if output.len() > MAX_REPLACE_OUTPUT {
                 tracing::warn!(
                     tool = %tool_name,
@@ -213,7 +280,13 @@ pub async fn emit_after_tool_call(
     // Compress-then-truncate: apply the context-budget cap AFTER the hook.
     // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
     // no-extension path is behavior-identical to the legacy ordering.
-    crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output)
+    AfterToolCallOutcome {
+        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(
+            &post_hook,
+            max_tool_output,
+        ),
+        replaced,
+    }
 }
 
 /// A reasoning-level substitution performed during a model change because the
@@ -461,6 +534,11 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
+    /// Session-scoped "Allow all" latch for extension `Confirm` gates
+    /// (`before_tool_call`). Set when the user picks "Allow all (session)"
+    /// in the Confirm dialog; shared by clones and delegated workers in the
+    /// same session. Never persisted.
+    session_allow_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -1016,6 +1094,7 @@ impl Runtime {
             progressive_tool_disclosure: host.progressive_tool_disclosure,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
+            session_allow_all: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -1467,9 +1546,20 @@ impl Runtime {
     }
 
     /// Conversation/session identity this runtime serves (keys hook
-    /// injection). `None` = unkeyed (workers).
+    /// injection). `None` = unkeyed (workers). Does not reset consent: linked
+    /// compaction successors remain the same conversation. Use
+    /// [`Self::begin_conversation`] for explicit new/resume boundaries.
     pub fn set_session_id(&mut self, id: Option<String>) {
         self.session_id = id;
+    }
+
+    /// Start an explicitly new or resumed conversation with fresh Confirm consent.
+    /// Replace the Arc rather than clearing its flag: old stream/worker clones
+    /// must not be able to grant consent to the next conversation. Ordinary
+    /// turns and linked compaction successors must not call this method.
+    pub fn begin_conversation(&mut self, id: Option<String>) {
+        self.session_allow_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.set_session_id(id);
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -3570,6 +3660,7 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        session_allow_all: Some(self.session_allow_all.clone()),
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
@@ -3614,6 +3705,7 @@ impl Runtime {
                                     .await,
                                     None,
                                     false,
+                                    Some(&self.session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
@@ -3691,6 +3783,7 @@ impl Runtime {
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
+                            let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
                             let memory_context_inner = self.memory_tool_capability();
@@ -3720,6 +3813,7 @@ impl Runtime {
                                                 .await,
                                                 None,
                                                 false,
+                                                Some(&session_allow_all_inner),
                                             )
                                             .await;
                                         if let crate::runtime::BeforeToolCallDecision::Block {
@@ -3740,6 +3834,7 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    session_allow_all: Some(session_allow_all_inner.clone()),
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
                                                     watcher_exit_path: exit_path,
@@ -3862,6 +3957,22 @@ impl Runtime {
             false,
         )
         .await
+    }
+
+    /// Session-scoped "Allow all" latch for extension Confirm gates. `true`
+    /// once the user picked "Allow all (session)" in a Confirm dialog.
+    pub fn session_allow_all(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+        &self.session_allow_all
+    }
+
+    /// Bind a worker to the calling session, not the process-wide host.
+    pub(crate) fn inherit_session_allow_all(
+        &mut self,
+        parent: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        if let Some(parent) = parent {
+            self.session_allow_all = parent.clone();
+        }
     }
 
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
@@ -4049,6 +4160,7 @@ impl Runtime {
             env_stripped: self.env_stripped.clone(),
             env_warned: self.env_warned.clone(),
             auto_approve_confirms,
+            session_allow_all: self.session_allow_all.clone(),
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
@@ -4179,6 +4291,7 @@ impl Clone for Runtime {
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
+            session_allow_all: self.session_allow_all.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
             // one stream can never kill a sibling's leases.
@@ -4873,6 +4986,7 @@ mod tests {
             },
             None,
             false,
+            None,
         )
         .await;
 
@@ -4892,6 +5006,7 @@ mod tests {
             },
             None,
             false,
+            None,
         )
         .await;
 
@@ -4921,6 +5036,7 @@ mod tests {
             },
             Some(&handle),
             false,
+            None,
         )
         .await;
 
@@ -4947,6 +5063,7 @@ mod tests {
             },
             Some(&handle),
             false,
+            None,
         )
         .await;
 
@@ -4955,6 +5072,155 @@ mod tests {
             result,
             crate::extensions::hooks::events::HookResult::Block { reason }
                 if reason.contains("confirmation denied")
+        ));
+    }
+
+    #[test]
+    fn session_allow_all_clones_share_but_independent_runtimes_do_not() {
+        use std::sync::{atomic::Ordering, Arc};
+        let parent = Runtime::new_headless();
+        let cloned = parent.clone();
+        let independent = Runtime::new_headless();
+        assert!(Arc::ptr_eq(
+            parent.session_allow_all(),
+            cloned.session_allow_all()
+        ));
+        assert!(!Arc::ptr_eq(
+            parent.session_allow_all(),
+            independent.session_allow_all()
+        ));
+        cloned.session_allow_all().store(true, Ordering::Relaxed);
+        assert!(parent.session_allow_all().load(Ordering::Relaxed));
+        assert!(!independent.session_allow_all().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn session_allow_all_conversation_boundary_isolates_old_clones() {
+        use std::sync::{atomic::Ordering, Arc};
+        let mut runtime = Runtime::new_headless();
+        let old_worker = runtime.clone();
+        old_worker.session_allow_all().store(true, Ordering::Relaxed);
+
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(runtime.session_id(), Some("next"));
+        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(
+            runtime.session_allow_all(),
+            old_worker.session_allow_all()
+        ));
+        assert!(old_worker.session_allow_all().load(Ordering::Relaxed));
+        old_worker.session_allow_all().store(false, Ordering::Relaxed);
+        old_worker.session_allow_all().store(true, Ordering::Relaxed);
+        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+
+        let new_worker = runtime.clone();
+        new_worker.session_allow_all().store(true, Ordering::Relaxed);
+        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+        // Explicit resume of even the same ID starts fresh consent.
+        runtime.begin_conversation(Some("next".into()));
+        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(
+            runtime.session_allow_all(),
+            new_worker.session_allow_all()
+        ));
+    }
+
+    #[test]
+    fn session_allow_all_identity_change_preserves_compaction_consent() {
+        use std::sync::{atomic::Ordering, Arc};
+        let mut runtime = Runtime::new_headless();
+        let worker = runtime.clone();
+        worker.session_allow_all().store(true, Ordering::Relaxed);
+        runtime.set_session_id(Some("linked-successor".into()));
+        assert!(Arc::ptr_eq(
+            runtime.session_allow_all(),
+            worker.session_allow_all()
+        ));
+        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+    }
+
+    /// "Allow all (session)": the answer continues THIS call and latches the
+    /// session flag, after which a Confirm resolves without any prompt.
+    #[tokio::test]
+    async fn confirm_prompt_always_latches_session_allow_all() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let latch = AtomicBool::new(false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            let _ = request
+                .response_tx
+                .send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+            // A second prompt must NEVER arrive: the latch short-circuits it.
+            assert!(rx.recv().await.is_none(), "second confirm must not prompt");
+        });
+
+        let first = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            first,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        assert!(latch.load(Ordering::Relaxed), "latch set by 'always'");
+
+        let second = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy again?".into(),
+            },
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            second,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        drop(handle);
+        task.await.unwrap();
+    }
+
+    /// The latch only short-circuits Confirm; Block from an extension is
+    /// still a Block, and a headless path with the latch set continues
+    /// instead of failing closed.
+    #[tokio::test]
+    async fn session_allow_all_does_not_override_block() {
+        use std::sync::atomic::AtomicBool;
+        let latch = AtomicBool::new(true);
+        let blocked = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Block {
+                reason: "nope".into(),
+            },
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            blocked,
+            crate::extensions::hooks::events::HookResult::Block { reason } if reason == "nope"
+        ));
+        let headless = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            headless,
+            crate::extensions::hooks::events::HookResult::Continue
         ));
     }
 

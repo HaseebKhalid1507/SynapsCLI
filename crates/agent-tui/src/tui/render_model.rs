@@ -148,4 +148,8 @@ pub(crate) struct SecretPromptSnap {
     pub(crate) title: String,
     pub(crate) prompt: String,
     pub(crate) masked_buffer_chars: usize,
+    /// `Confirm` only: the focused button.
+    pub(crate) confirm_focus: synaps_cli::tools::ConfirmChoice,
+    /// `Confirm` only: whether the "Allow all (session)" button is offered.
+    pub(crate) confirm_offers_allow_all: bool,
 }

@@ -145,6 +145,7 @@ fn empty_tool_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
             watcher_exit_path: None,
