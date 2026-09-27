@@ -30,8 +30,8 @@ context-continuation work (#112) ships alongside it, **off by default**.
   environment variables before connecting, and they are never written to
   the session files: secret-looking names (`*_KEY`, `*_TOKEN`, `*SECRET*`,
   `*PASSWORD*`, `*_CREDENTIALS`, `*_PAT`, `*_DSN`) and any value that
-  carries credentials in a URL (`DATABASE_URL=postgres://user:pass@…`, an
-  authenticated proxy, a Sentry DSN). The agent's tools run with the
+  carries credentials in a URL (a `DATABASE_URL` holding a username and
+  password, an authenticated proxy, a Sentry DSN). The agent's tools run with the
   stripped environment, and a command that fails while referencing a
   stripped variable gets a notice. An authenticated `HTTPS_PROXY` is used
   implicitly by curl and git, so it fails without one. (#119, #152)
