@@ -8,7 +8,7 @@
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
   <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust">
   <a href="https://ratatui.rs/"><img src="https://ratatui.rs/built-with-ratatui/badge.svg" alt="Built With Ratatui" height="20"></a>
-  <img src="https://img.shields.io/badge/binary-20MB-success.svg" alt="20MB binary">
+  <img src="https://img.shields.io/badge/binary-25MB-success.svg" alt="25MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
   <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
@@ -17,7 +17,7 @@
 
 <p align="center">
   Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
-  Any model, 20MB, 20ms cold start.
+  Any model, 25MB, ~10ms to first frame.
 </p>
 
 ---
@@ -26,7 +26,7 @@
   <img src="https://github.com/user-attachments/assets/c8a444e6-6975-474a-bc87-f02e744975ed" alt="SynapsCLI — a crew of agents running in parallel" width="100%" />
 </p>
 
-Synaps is an agent runtime written in Rust. It runs agents with built-in tools, subagents, and extensions against any model, from Claude and ChatGPT to a local Ollama. The terminal UI is one client of the engine: `synaps rpc` speaks JSON-RPC over stdio, so other programs can drive it. Extend it with plugins in any language and MCP servers.
+Synaps is an agent runtime written in Rust. It runs agents with built-in tools, subagents, and extensions against any model, from Claude and ChatGPT to a local Ollama. A background daemon owns the engine and every session, and the terminal UI is a thin client of it: several terminals can share one live session, and a session outlives the window that started it. `synaps rpc` speaks JSON-RPC over stdio, so other programs can drive the engine too. Extend it with plugins in any language and MCP servers.
 
 ---
 
@@ -114,15 +114,17 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 ## What's in the box
 
+- **One daemon, many clients.** Plain `synaps` attaches to a shared background daemon: extensions boot once, sessions are journaled and resumable, and a second terminal can mirror, observe, or take over the same live session. `synaps daemon reload` swaps in a new binary without dropping a session.
 - **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Steer one mid-flight without killing it.
-- **Runs without you.** `synaps watcher` supervises fleets: heartbeats, crash recovery, cost limits. Half the sessions on my machine have no human in them.
-- **Credentials stay in the broker.** Agents get short-lived, scoped tokens. A compromised agent can't leak what it never held.
+- **Runs without you.** `/auto` hands a session to an autonomous driver (Esc takes it back). `synaps watcher` supervises fleets: heartbeats, crash recovery, cost limits. Half the sessions on my machine have no human in them.
+- **Credentials stay in the broker.** Agents get short-lived, scoped tokens. A compromised agent can't leak what it never held. Secrets in your shell never reach the daemon either: a thin client strips them by name, and any value carrying credentials in a URL, before it connects.
 - **Bounded turns.** Caps on tool calls, wall clock, tokens, bytes, and cost. An agent can't spend what you didn't give it.
 - **Memory that survives.** Project-scoped memory, `/compact` checkpoints, sessions that chain across days.
+- **Sees what you see.** The model reads images directly, and `/attach` stages images, PDFs, and text into a turn.
 - **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
 - **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **Lean is fast.** One 20MB binary, 20ms cold start. No framework tax, no interpreter warming up.
-- **19 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
+- **Lean is fast.** One 25MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
+- **20 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
 ## Benchmarks
 
@@ -149,7 +151,9 @@ Warm start (attach to the running daemon) is ~10 ms to first frame; cold start
 
 | Command | What it does |
 |---------|-------------|
-| `synaps` | The TUI. Streaming, markdown, a live subagent panel |
+| `synaps` | The TUI, a thin client on the shared daemon (spawned on first launch). Streaming, markdown, a live subagent panel |
+| `synaps attach` | A thin line client attached to a daemon session |
+| `synaps daemon` | The session daemon: `status`, `sessions`, `stop`, and `reload` (re-exec in place, sessions intact) |
 | `synaps chat` | Same engine, stdin/stdout. Pipes, scripts, CI |
 | `synaps rpc` | JSON-RPC over stdio. Embed the engine in other software |
 | `synaps server` | WebSocket API: token auth, origin validation, streaming |
@@ -195,7 +199,7 @@ Protocol spec: [docs/extensions/](docs/extensions/).
 
 ## Contributing
 
-Synaps is young (started April 2026) and moving fast: 1,995 commits and ~190K lines of Rust in its first four months, shipped to crates.io, Homebrew, and the AUR, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
+Synaps is young (started April 2026) and moving fast: 2,500+ commits, ~275K lines of Rust, and 32 releases in its first six months, shipped to crates.io, Homebrew, the AUR, and `.deb`, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
@@ -213,12 +217,12 @@ Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) - quest
 ```
 crates/
 ├── agent-core/      # provider identity, auth broker, models, prompts, orchestration policy
-├── agent-engine/    # provider transports, runtime, worker lifecycle, tools, extensions
+├── agent-engine/    # provider transports, runtime, session daemon, worker lifecycle, tools, extensions
 │                   # MCP, events, skills, sidecar, cloud and OpenAI-compatible routing
 ├── agent-tui/       # ratatui UI, model/effort settings, themes, plugin modals
 └── (root)           # the `synaps` binary crate: CLI dispatch, login, watcher, broker
 ```
-Native Anthropic, OpenAI Responses/chat, Gemini Code Assist, and cloud-provider transports all emit the same `StreamEvent`, so the TUI and tool loop stay provider-blind. Provider-qualified identities and pre-authorized execution plans remain typed through routing.
+The session daemon hosts one `EngineHost` (extensions, MCP, and providers shared across sessions) and a `SessionActor` per session; the TUI, `synaps attach`, and headless clients connect to it over a Unix socket. Native Anthropic, OpenAI Responses/chat, Gemini Code Assist, and cloud-provider transports all emit the same `StreamEvent`, so the TUI and tool loop stay provider-blind. Provider-qualified identities and pre-authorized execution plans remain typed through routing.
 
 ---
 
