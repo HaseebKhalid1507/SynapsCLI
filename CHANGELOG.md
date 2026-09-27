@@ -2,9 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.10.0] — It's Daemon Time — 2026-09-27
+## [0.10.0] — 2026-09-27
 
-**It's daemon time.** Plain `synaps` is now a thin client over a shared
+**It's Daemon Time.**
+
+Plain `synaps` is now a thin client over a shared
 background daemon: extensions boot once, sessions are journaled and
 resumable, and more than one client can sit on the same session. The
 context-continuation work (#112) ships alongside it, **off by default**.
