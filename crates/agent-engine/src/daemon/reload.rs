@@ -638,6 +638,16 @@ mod tests {
         assert!(version_gate(&cur, &pv("0.8.9", 2)).is_err(), "older refused");
         assert!(version_gate(&cur, &pv("0.9.0", 1)).is_err(), "older protocol refused");
         assert!(version_gate(&cur, &pv("garbage", 2)).is_err());
+        // Two-digit minor (daemon dev builds report 0.9.1 → 0.10.0): compared
+        // numerically, not as strings — "10" < "9" lexically would refuse it.
+        assert!(
+            version_gate(&pv("0.9.1", 3), &pv("0.10.0", 3)).is_ok(),
+            "0.10.0 is newer than 0.9.1"
+        );
+        assert!(
+            version_gate(&pv("0.10.0", 3), &pv("0.9.1", 3)).is_err(),
+            "0.9.1 is older than 0.10.0"
+        );
     }
 
     #[cfg(unix)]
