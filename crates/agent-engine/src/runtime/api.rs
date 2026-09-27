@@ -1492,13 +1492,16 @@ impl ApiMethods {
                                 break;
                             }
 
-                            // C1: a 401 with a Remote source means the broker token
-                            // was rejected (revoked, or rotated at the broker before
-                            // our cache thought it expired). Invalidate, refetch from
-                            // the broker, and retry ONCE with the fresh token.
+                            // C1: a 401 means the token we sent was rejected —
+                            // revoked, or rotated elsewhere (broker, another
+                            // `synaps login`, refresh cron, synced auth.json)
+                            // before our in-memory expiry said so. Status-level,
+                            // so nothing has streamed yet. Invalidate, re-vend,
+                            // and retry ONCE. Local API-key mode is excluded:
+                            // there is no managed credential to reload.
                             if status.as_u16() == 401
-                                && options.credential_source.is_remote()
                                 && !auth_retried
+                                && (options.credential_source.is_remote() || auth_type == "oauth")
                             {
                                 auth_retried = true;
                                 clock.mark_headers();
@@ -1514,19 +1517,24 @@ impl ApiMethods {
                                     );
                                 }
                                 let _ = await_or_cancel(cancel, resp.text()).await?; // drain body
-                                options.token_cache.invalidate("anthropic");
-                                {
-                                    let mut g = await_or_cancel(cancel, auth.write()).await?;
-                                    g.auth_token.clear();
-                                    g.token_expires = None;
-                                }
+                                tracing::warn!(
+                                    "Anthropic rejected the access token (401); reloading credentials and retrying once"
+                                );
+                                // The token THIS request carried — not whatever
+                                // shared state holds now (a concurrent stream may
+                                // already have reloaded; see reload_after_rejection).
+                                let sent = auth_header_value
+                                    .strip_prefix("Bearer ")
+                                    .unwrap_or(&auth_header_value)
+                                    .to_string();
                                 await_or_cancel(
                                     cancel,
-                                    super::auth::AuthMethods::refresh_if_needed(
+                                    super::auth::AuthMethods::reload_after_rejection(
                                         std::sync::Arc::clone(auth),
                                         client,
                                         &options.credential_source,
                                         &options.token_cache,
+                                        Some(&sent),
                                     ),
                                 )
                                 .await??;
@@ -3945,6 +3953,7 @@ mod on401_tests {
             auth_type: "api_key".to_string(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
         }))
     }
 
@@ -4088,6 +4097,132 @@ mod on401_tests {
             "Local source must never retry on 401, got {} calls",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    // ─── Local OAuth source: 401 → reload auth.json → retry once ──────────
+    //
+    // Models the reported bug: auth.json was rotated externally (another
+    // `synaps login`, refresh-auth cron, lab-laptop sync) while this session
+    // still holds the old, unexpired token in memory.
+
+    /// Mock Anthropic that 401s any request whose bearer is not `good_bearer`,
+    /// recording every Authorization header it sees.
+    async fn spawn_mock_anthropic_accepting(
+        good_bearer: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_clone = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen_clone);
+                async move {
+                    let got = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let ok = got == format!("Bearer {good_bearer}");
+                    seen.lock().unwrap().push(got);
+                    if ok {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            SSE_SUCCESS.to_string(),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json")],
+                            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}"
+                                .to_string(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn write_local_anthropic_creds(base: &std::path::Path, access: &str) {
+        let body = json!({
+            "anthropic": {
+                "type": "oauth",
+                "refresh": "rt-test",
+                "access": access,
+                "expires": 9_999_999_999_999u64,
+            }
+        });
+        std::fs::write(base.join("auth.json"), body.to_string()).unwrap();
+    }
+
+    fn local_oauth_auth(token: &str) -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: token.to_string(),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
+        }))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_local_oauth_reloads_rotated_auth_json_and_retries_once() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_local_anthropic_creds(base.path(), "sk-rotated-on-disk");
+        let (url, seen) = spawn_mock_anthropic_accepting("sk-rotated-on-disk").await;
+
+        let auth = local_oauth_auth("sk-stale-in-memory");
+        let options = make_options(url, CredentialSource::Local, TokenCache::new());
+        let result = drive_call(Arc::clone(&auth), options).await;
+
+        assert!(
+            result.is_ok(),
+            "expected success after reload: {:?}",
+            result.err()
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                "Bearer sk-stale-in-memory".to_string(),
+                "Bearer sk-rotated-on-disk".to_string()
+            ],
+            "exactly one retry, and it must carry the reloaded token"
+        );
+        assert_eq!(auth.read().await.auth_token, "sk-rotated-on-disk");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_local_oauth_persistent_401_is_terminal_not_loop() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_local_anthropic_creds(base.path(), "sk-also-rejected");
+        let (url, seen) = spawn_mock_anthropic_accepting("sk-never-valid").await;
+
+        let auth = local_oauth_auth("sk-stale-in-memory");
+        let options = make_options(url, CredentialSource::Local, TokenCache::new());
+        let result = drive_call(auth, options).await;
+
+        let err = result.expect_err("second 401 must be terminal");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "persistent 401 must cause exactly 2 upstream calls"
+        );
+        let msg = err.to_string();
+        for secret in ["sk-stale-in-memory", "sk-also-rejected", "rt-test"] {
+            assert!(
+                !msg.contains(secret),
+                "error must not surface token values: {msg}"
+            );
+        }
     }
 
     // ─── Request-lifecycle T1: outgoing-request trace is metadata-only ──────
@@ -4338,6 +4473,7 @@ mod cloud_capability_tests {
             auth_type: "api_key".into(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
         }));
         let client = Client::new();
         let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
@@ -4395,6 +4531,7 @@ mod cancellation_tests {
             auth_type: "api_key".into(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
         }))
     }
 
