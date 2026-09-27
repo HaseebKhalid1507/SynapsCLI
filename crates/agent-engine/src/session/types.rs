@@ -61,12 +61,24 @@ const ENV_STRIP_PREFIXES: &[&str] = &[
 /// The stripped names are ONLY the secrets (not `SYNAPS_*` prefixes, those are noise).
 /// Used by thin clients before `Hello`.
 pub fn capture_client_env() -> (SessionEnv, Vec<String>) {
+    strip_client_env(std::env::vars())
+}
+
+/// The pure part of [`capture_client_env`]: filter `vars` (unit-testable
+/// without touching the process environment).
+pub fn strip_client_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> (SessionEnv, Vec<String>) {
     let mut env: SessionEnv = Vec::new();
     let mut stripped: Vec<String> = Vec::new();
-    for (k, v) in std::env::vars() {
-        if should_strip_env(&k) {
+    for (k, v) in vars {
+        // A credential VALUE is stripped whatever its key is called
+        // (`DATABASE_URL=postgres://u:p@h`): the name denylist alone let it
+        // through to the daemon and the session files.
+        let secret_value = agent_core::core::config::is_secret_env_value(&v);
+        if should_strip_env(&k) || secret_value {
             // Only record secret names, not SYNAPS_* prefix noise.
-            if is_secret_key(&k) {
+            if is_secret_key(&k) || secret_value {
                 stripped.push(k);
             }
         } else {
@@ -1063,6 +1075,45 @@ mod tests {
     }
 
     #[test]
+    fn strip_client_env_drops_credential_values_whatever_the_key() {
+        let vars = vec![
+            ("HOME".to_string(), "/home/u".to_string()),
+            (
+                "DATABASE_URL".to_string(),
+                "postgres://app:hunter2@db/prod".to_string(),
+            ),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://user:pass@proxy:3128".to_string(),
+            ),
+            (
+                "SENTRY_DSN".to_string(),
+                "https://abc123@o1.ingest.sentry.io/42".to_string(),
+            ),
+            ("GITHUB_PAT".to_string(), "ghp_x".to_string()),
+            (
+                "API_BASE_URL".to_string(),
+                "https://api.example.com/v1".to_string(),
+            ),
+        ];
+        let (env, stripped) = strip_client_env(vars);
+        let kept: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["API_BASE_URL", "HOME"],
+            "only non-secrets survive"
+        );
+        assert!(env.iter().all(|(_, v)| !v.contains("hunter2")
+            && !v.contains("user:pass")
+            && !v.contains("abc123")));
+        assert_eq!(
+            stripped,
+            vec!["DATABASE_URL", "GITHUB_PAT", "HTTPS_PROXY", "SENTRY_DSN"],
+            "stripped names are recorded"
+        );
+    }
+
+    #[test]
     fn capture_client_env_is_sorted_and_stripped() {
         // We can't fully control the process env in a unit test, but we can
         // verify the output is sorted and that known strip-list vars are absent.
@@ -1070,16 +1121,29 @@ mod tests {
         // Every stripped name is a secret by our own rule, and none of them
         // survived into the kept env.
         for name in &stripped {
-            assert!(is_secret_key(name), "stripped non-secret: {name}");
-            assert!(env.iter().all(|(k, _)| k != name), "stripped name leaked: {name}");
+            let by_value = std::env::var(name)
+                .map(|v| agent_core::core::config::is_secret_env_value(&v))
+                .unwrap_or(false);
+            assert!(
+                is_secret_key(name) || by_value,
+                "stripped non-secret: {name}"
+            );
+            assert!(
+                env.iter().all(|(k, _)| k != name),
+                "stripped name leaked: {name}"
+            );
         }
         // Sorted
         for w in env.windows(2) {
             assert!(w[0].0 <= w[1].0, "not sorted: {:?} > {:?}", w[0].0, w[1].0);
         }
         // No secrets or client-only vars
-        for (k, _) in &env {
+        for (k, v) in &env {
             assert!(!should_strip_env(k), "should have been stripped: {k}");
+            assert!(
+                !agent_core::core::config::is_secret_env_value(v),
+                "credential value kept: {k}"
+            );
         }
     }
 
