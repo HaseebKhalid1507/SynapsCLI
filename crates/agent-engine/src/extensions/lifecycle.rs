@@ -624,6 +624,14 @@ impl Tool for DeferredExtensionTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
+        let binding = ctx
+            .capabilities
+            .memory_backend
+            .clone()
+            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
+        if binding.exclusive() && crate::memory_backend::competing_note_tool(&self.tool_name) {
+            return Err(crate::RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
+        }
         // Without the typed session lease capability, a deferred extension
         // tool NEVER starts a process.
         let Some(leases) = ctx.capabilities.extension_leases.clone() else {

@@ -1,4 +1,26 @@
 //! `synaps send` — deliver an event via Unix socket, falling back to inbox file-drop.
+//!
+//! ## Driver-aware remote steering (P9, C2)
+//! `send` is a dumb pipe: it delivers an [`Event`] to the target session's
+//! per-session event socket, which lands in the runtime `event_queue`. It does
+//! NOT speak `SessionCommand` (no `Submit`/`Steer`), and it never inspects
+//! driver state. ALL Submit-vs-Steer routing — including remote steering of a
+//! *driver-armed* session — is owned by the actor's event-queue wake path
+//! (`session/actor.rs::on_queue_wake` → `engine/reactor.rs::drain_event_queue`
+//! + `wake_action`):
+//!
+//! * session **busy** (a driver-owned turn is streaming): the event is
+//!   **Steered** into the live stream via the steer channel — this is exactly
+//!   the "route to Steer while driver-armed" behavior, achieved server-side.
+//! * session **idle + driver armed**: the event is injected as context but the
+//!   actor **inhibits the competing turn** (`on_queue_wake`: "RunTurn inhibited
+//!   — driver armed") so the driver's own tick owns scheduling — no rogue
+//!   Submit-turn races the driver.
+//! * session **idle + unarmed**: injected + a normal auto-turn (the historical
+//!   `Submit` behavior).
+//!
+//! Because armed-state routing is the actor's job, `send` needs no armed-state
+//! discovery and stays transport-simple. See `tests/send_remote_steering.rs`.
 
 use chrono::Utc;
 use synaps_cli::events::registry::{

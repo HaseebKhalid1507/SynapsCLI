@@ -467,6 +467,7 @@ pub struct SessionMemoryState {
     session_id: SessionId,
     durable: DurableSlot,
     one_shot: OneShotSlot,
+    recall_epoch: u64,
 }
 
 impl SessionMemoryState {
@@ -478,6 +479,7 @@ impl SessionMemoryState {
             session_id,
             durable: DurableSlot::Empty,
             one_shot: OneShotSlot::Empty,
+            recall_epoch: 0,
         }
     }
 
@@ -628,6 +630,7 @@ impl SessionMemoryState {
         if *session != self.session_id {
             return;
         }
+        self.recall_epoch = self.recall_epoch.wrapping_add(1);
         self.durable = DurableSlot::Empty;
         self.one_shot = match std::mem::replace(&mut self.one_shot, OneShotSlot::Empty) {
             OneShotSlot::Empty | OneShotSlot::Pending(_) => OneShotSlot::Empty,
@@ -1066,7 +1069,8 @@ pub struct MemoryContextCapability {
     /// Supplied by host wiring at construction — never by model JSON. Task
     /// A5 replaces this with per-request `ExplicitCommand` /
     /// `ExactCurrentRequest` proof plumbing.
-    one_shot_proof: UserIntentProof,
+    one_shot_proof: Option<UserIntentProof>,
+    disable_host: Option<Arc<dyn Fn() -> MemoryContextStatus + Send + Sync>>,
 }
 
 impl MemoryContextCapability {
@@ -1084,7 +1088,24 @@ impl MemoryContextCapability {
             state,
             project_id,
             provider_id,
-            one_shot_proof,
+            one_shot_proof: Some(one_shot_proof),
+            disable_host: None,
+        }
+    }
+
+    /// Shared status/revocation only; this handle conveys no grant authority.
+    pub(crate) fn control_only(
+        state: Arc<Mutex<SessionMemoryState>>,
+        project_id: ProjectId,
+        provider_id: ContextProviderId,
+        disable_host: Arc<dyn Fn() -> MemoryContextStatus + Send + Sync>,
+    ) -> Self {
+        Self {
+            state,
+            project_id,
+            provider_id,
+            one_shot_proof: None,
+            disable_host: Some(disable_host),
         }
     }
 
@@ -1108,6 +1129,9 @@ impl MemoryContextCapability {
     /// locally allowed"). Idempotent: revoking an already-off session is a
     /// no-op that reports `Off`.
     pub fn disable(&self) -> MemoryContextStatus {
+        if let Some(disable) = &self.disable_host {
+            return disable();
+        }
         let mut state = self.lock();
         let session = state.session_id.clone();
         // Infallible by construction: the session identity is read from the
@@ -1127,6 +1151,10 @@ impl MemoryContextCapability {
         &self,
         expires_minutes: Option<u32>,
     ) -> Result<MemoryContextStatus, MemoryContextError> {
+        let proof = self
+            .one_shot_proof
+            .clone()
+            .ok_or(MemoryContextError::RequiresHostConfirmation)?;
         let granted_at = SystemTime::now();
         let expires_at =
             expires_minutes.map(|m| granted_at + Duration::from_secs(u64::from(m) * 60));
@@ -1139,7 +1167,7 @@ impl MemoryContextCapability {
             MemoryContextMode::RecallOnce,
             CapturePolicy::default(),
             RecallPolicy::default(),
-            self.one_shot_proof.clone(),
+            proof,
             granted_at,
             expires_at,
         )?;
@@ -1349,6 +1377,8 @@ pub enum MemorySource {
     ChatHistory,
     /// Explicitly stated by the user.
     UserStated,
+    /// Explicit stored note; producer provenance is not necessarily a user.
+    StoredNote,
 }
 
 /// Why the provider ranked a record into the contribution (spec §6.5, §10.4
@@ -1369,6 +1399,7 @@ impl MemorySource {
         match self {
             MemorySource::ChatHistory => "chat history",
             MemorySource::UserStated => "user stated",
+            MemorySource::StoredNote => "stored note",
         }
     }
 }
@@ -2315,6 +2346,8 @@ pub(crate) fn emit_memory_observability_event(event: &MemoryObservabilityEvent) 
 pub(crate) struct RetainedRecallTurn {
     /// Digest of the logical request this retention belongs to.
     pub(crate) request_digest: [u8; 32],
+    lease: MemoryContextLease,
+    recall_epoch: u64,
     /// The accepted, validated contribution.
     pub(crate) contribution: MemoryContextContribution,
     /// Spec §10.4 explainability metadata (`/memory why` is task B5).
@@ -2451,6 +2484,7 @@ pub(crate) fn parse_contribution_wire(
         let source = match field_str(raw, "source")? {
             "chat_history" => MemorySource::ChatHistory,
             "user_stated" => MemorySource::UserStated,
+            "stored_note" => MemorySource::StoredNote,
             _ => return Err(MemoryContextError::ContributionMalformed { field: "source" }),
         };
         let sensitivity = DisclosureClass::parse(field_str(raw, "sensitivity")?).ok_or(
@@ -2539,6 +2573,13 @@ pub(crate) fn parse_contribution_wire(
 }
 
 impl SessionMemoryState {
+    fn recall_authorized(&self, lease: &MemoryContextLease, epoch: u64) -> bool {
+        epoch == self.recall_epoch
+            && !lease.is_expired_at(SystemTime::now())
+            && (matches!(&self.durable, DurableSlot::Active(active) if active == lease)
+                || matches!(&self.one_shot, OneShotSlot::Consumed(id) if id == &lease.lease_id))
+    }
+
     /// Task B4: take the recall authority for a genuinely NEW eligible
     /// user-prompt turn. A pending one-shot wins and is CONSUMED exactly
     /// here (`Pending → Consumed`, spec §7.4.11); otherwise a live durable
@@ -2629,22 +2670,25 @@ where
     // 2. Retry-exact reuse of the retained accepted contribution.
     let request_digest = logical_request_digest(messages);
     {
+        let consent = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut slot = retained
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match slot.as_ref() {
-            Some(retained_turn) if retained_turn.request_digest == request_digest => {
+            Some(retained_turn)
+                if retained_turn.request_digest == request_digest
+                    && consent
+                        .recall_authorized(&retained_turn.lease, retained_turn.recall_epoch) =>
+            {
                 let contribution = retained_turn.contribution.clone();
                 let why = retained_turn.why.clone();
                 drop(slot);
                 insert_memory_message(messages, &contribution);
                 // §15: the retry-exact reuse is an accepted contribution for
                 // this request — observable as completed (reused), no call.
-                let session_id = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .session_id()
-                    .clone();
+                let session_id = consent.session_id().clone();
                 emit_memory_observability_event(&MemoryObservabilityEvent::recall_reused(
                     &session_id,
                     &contribution,
@@ -2659,12 +2703,16 @@ where
         }
     }
     // 3. Eligibility — the disabled path makes ZERO provider calls.
-    let (lease, session_id) = {
+    let (lease, session_id, recall_epoch) = {
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session_id = state.session_id().clone();
-        (state.take_turn_recall_lease(), session_id)
+        (
+            state.take_turn_recall_lease(),
+            session_id,
+            state.recall_epoch,
+        )
     };
     let Some(lease) = lease else {
         // §15: recall was considered on an eligible prompt while memory is
@@ -2717,7 +2765,22 @@ where
     // §15: started is emitted BEFORE the extension call dispatches.
     emit_memory_observability_event(&MemoryObservabilityEvent::recall_started(&correlation));
     let started = std::time::Instant::now();
-    let response = match tokio::time::timeout(hard_timeout, call(lease, request)).await {
+    let consent_live = || {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recall_authorized(&lease, recall_epoch)
+    };
+    let response = match tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if !consent_live() { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => return TurnRecallOutcome::NotEligible,
+        response = tokio::time::timeout(hard_timeout.min(RECALL_HARD_TIMEOUT), call(lease.clone(), request)) => response,
+    } {
         Err(_elapsed) => return skipped(RecallSkip::Timeout, hard_timeout),
         Ok(Err(RecallCallError::ProviderUnavailable)) => {
             return skipped(RecallSkip::ProviderUnavailable, started.elapsed())
@@ -2735,6 +2798,16 @@ where
     {
         return skipped(RecallSkip::RejectedByValidator, recall_latency);
     }
+    // Hold consent through acceptance so disable cannot race a late response.
+    let consent = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !consent.recall_authorized(&lease, recall_epoch) {
+        return TurnRecallOutcome::NotEligible;
+    }
+    if contribution.provider_id != lease.provider_id {
+        return skipped(RecallSkip::RejectedByValidator, recall_latency);
+    }
     // 6. Accept: inject + retain for retry reuse and §10.4 explainability.
     let why = recall_turn_metadata(&contribution, recall_latency);
     emit_memory_observability_event(&MemoryObservabilityEvent::recall_completed(
@@ -2746,6 +2819,8 @@ where
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RetainedRecallTurn {
         request_digest,
+        lease,
+        recall_epoch,
         contribution,
         why,
     });
@@ -4649,5 +4724,69 @@ mod tests {
                 "{millis}ms"
             );
         }
+    }
+    #[tokio::test]
+    async fn axel_disable_cancels_pending_recall_and_invalidates_retry() {
+        let state = Mutex::new(state_in(MemoryContextMode::RecallEachPrompt));
+        let retained = Mutex::new(None);
+        let project = ProjectId::parse("proj-1").unwrap();
+        let original = vec![Arc::new(
+            serde_json::json!({"role":"user","content":"synthetic recall"}),
+        )];
+        let mut messages = original.clone();
+        let (outcome, ()) = tokio::join!(
+            resolve_turn_recall(
+                &state,
+                &retained,
+                &project,
+                100_000,
+                &mut messages,
+                RECALL_HARD_TIMEOUT,
+                |_, _| async { std::future::pending::<Result<Value, RecallCallError>>().await }
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                state.lock().unwrap().revoke(&sid("sess-1"));
+            }
+        );
+        assert_eq!(outcome, TurnRecallOutcome::NotEligible);
+        assert_eq!(messages, original);
+        assert!(retained.lock().unwrap().is_none());
+
+        state
+            .lock()
+            .unwrap()
+            .install(mint("sess-1", MemoryContextMode::RecallEachPrompt, "fresh"))
+            .unwrap();
+        assert_eq!(
+            resolve_turn_recall(
+                &state,
+                &retained,
+                &project,
+                100_000,
+                &mut messages,
+                RECALL_HARD_TIMEOUT,
+                |_, _| async { Ok(wire_contribution("proj-1", "accepted")) }
+            )
+            .await,
+            TurnRecallOutcome::Injected
+        );
+        state.lock().unwrap().revoke(&sid("sess-1"));
+        let mut retry = original.clone();
+        assert_eq!(
+            resolve_turn_recall(
+                &state,
+                &retained,
+                &project,
+                100_000,
+                &mut retry,
+                RECALL_HARD_TIMEOUT,
+                |_, _| async { panic!("off must never dispatch") }
+            )
+            .await,
+            TurnRecallOutcome::NotEligible
+        );
+        assert_eq!(retry, original);
+        assert!(retained.lock().unwrap().is_none());
     }
 }

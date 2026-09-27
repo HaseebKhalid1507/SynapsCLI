@@ -147,19 +147,31 @@ impl HookKind {
 
 // ── HookEvent ─────────────────────────────────────────────────────────────────
 
+/// `SYNAPS_HOOK_SESSION_ID=0` disables the `session_id` field on tool/message
+/// hook events (they emit `null`, as before daemon-mode phase 2).
+pub fn hook_session_id_enabled() -> bool {
+    !matches!(
+        std::env::var("SYNAPS_HOOK_SESSION_ID").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
 /// A hook event payload dispatched to extension handlers.
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
 ///
 /// | Kind                  | tool_name | tool_input | tool_output | message | session_id |
 /// |-----------------------|-----------|------------|-------------|---------|------------|
-/// | `before_tool_call`    | ✓         | ✓          |             |         |            |
-/// | `after_tool_call`     | ✓         | ✓          | ✓           |         |            |
-/// | `before_message`      |           |            |             | ✓       |            |
-/// | `on_message_complete` |           |            |             | ✓       |            |
+/// | `before_tool_call`    | ✓         | ✓          |             |         | ✓*         |
+/// | `after_tool_call`     | ✓         | ✓          | ✓           |         | ✓*         |
+/// | `before_message`      |           |            |             | ✓       | ✓*         |
+/// | `on_message_complete` |           |            |             | ✓       | ✓*         |
 /// | `on_compaction`       |           |            |             | ✓       | ✓          |
 /// | `on_session_start`    |           |            |             |         | ✓          |
 /// | `on_session_end`      |           |            |             |         | ✓          |
+///
+/// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
+/// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
 ///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
@@ -192,6 +204,21 @@ pub struct HookEvent {
 }
 
 impl HookEvent {
+    /// Attach the owning conversation id to a tool/message event (builder).
+    ///
+    /// Additive: the JSON field already exists (`session_id`), so extensions
+    /// that ignore it are unaffected. Workers pass `None` and keep emitting
+    /// `null`. Kill-switch `SYNAPS_HOOK_SESSION_ID=0` forces `null` for a
+    /// misbehaving plugin.
+    pub fn with_session(mut self, id: Option<&str>) -> Self {
+        self.session_id = if hook_session_id_enabled() {
+            id.map(str::to_string)
+        } else {
+            None
+        };
+        self
+    }
+
     /// Construct a `before_tool_call` event.
     pub fn before_tool_call(tool_name: &str, input: Value) -> Self {
         Self {

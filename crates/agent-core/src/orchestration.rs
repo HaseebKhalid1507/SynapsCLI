@@ -157,6 +157,8 @@ pub struct DelegationPolicy {
     effective_choices: Vec<QualifiedModelId>,
     pub max_concurrent_workers: usize,
     pub max_total_workers: usize,
+    /// Manifestless interactive policies count outstanding work, not session age.
+    pub recycle_reconciled_workers: bool,
 }
 impl DelegationPolicy {
     /// Compatibility constructor. Its explicit models form the trusted pinned catalog.
@@ -287,6 +289,7 @@ impl DelegationPolicy {
             effective_choices: choices.into_iter().collect(),
             max_concurrent_workers: concurrent,
             max_total_workers: total,
+            recycle_reconciled_workers: false,
         })
     }
     pub fn authorize(&self, model: &QualifiedModelId) -> Result<Option<&str>, DispatchDenied> {
@@ -483,6 +486,7 @@ pub struct WorkerRegistry {
     policy: DelegationPolicy,
     workers: BTreeMap<WorkerHandle, Worker>,
     total: usize,
+    next_worker_id: u64,
     events: VecDeque<OrchestrationEvent>,
     dropped_events: u64,
 }
@@ -492,6 +496,7 @@ impl WorkerRegistry {
             policy,
             workers: BTreeMap::new(),
             total: 0,
+            next_worker_id: 0,
             events: VecDeque::new(),
             dropped_events: 0,
         }
@@ -563,7 +568,15 @@ impl WorkerRegistry {
         now_unix: u64,
     ) -> Result<(), DispatchDenied> {
         self.policy.authorize_at(model, now_unix)?;
-        if self.total >= self.policy.max_total_workers {
+        let budget_used = if self.policy.recycle_reconciled_workers {
+            self.workers
+                .values()
+                .filter(|w| w.state != State::Reconciled)
+                .count()
+        } else {
+            self.total
+        };
+        if budget_used >= self.policy.max_total_workers {
             return Err(DispatchDenied::new(DispatchFailureCode::TotalWorkerLimit));
         }
         if self
@@ -623,7 +636,8 @@ impl WorkerRegistry {
             return Err(error);
         }
         self.total += 1;
-        let h = WorkerHandle(format!("worker-{}", self.total));
+        self.next_worker_id += 1;
+        let h = WorkerHandle(format!("worker-{}", self.next_worker_id));
         self.workers.insert(
             h.clone(),
             Worker {
@@ -747,6 +761,20 @@ impl WorkerRegistry {
             State::Reconciled,
             "worker.reconciled",
         )
+    }
+    /// Drop metadata only after result reconciliation AND runtime-handle retirement.
+    /// Lifetime dispatch count and monotonic identity sequence are never refunded.
+    pub fn retire_reconciled(&mut self, h: &WorkerHandle) -> bool {
+        if self
+            .workers
+            .get(h)
+            .is_some_and(|w| w.state == State::Reconciled)
+        {
+            self.workers.remove(h);
+            true
+        } else {
+            false
+        }
     }
     pub fn completion_gate(&self) -> CompletionGate {
         // Only block on FINISHED-but-unreconciled workers. Running/Starting/

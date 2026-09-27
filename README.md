@@ -124,6 +124,27 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **Lean is fast.** One 20MB binary, 20ms cold start. No framework tax, no interpreter warming up.
 - **19 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
+## Benchmarks
+
+Measured on one 24-core Linux box, same machine, same harness for every tool.
+Memory is total PSS across the whole process tree; the daemon is shared across
+sessions, so the marginal cost of a session is a thin client.
+
+| Memory (total PSS) | 1 session | 10 sessions | per added session |
+|--------------------|----------:|------------:|------------------:|
+| **synaps** (core)  | **~39 MB** | **~69 MB**  | **~3.3 MB** |
+| jcode (memory off) | 63 MB      | 136 MB      | ~8.2 MB |
+| antigravity        | 135 MB     | 358 MB      | ~25 MB |
+| pi                 | 120 MB     | 718 MB      | ~66 MB |
+| claude code        | 205 MB     | 1131 MB     | ~103 MB |
+| opencode           | 394 MB     | 1144 MB     | ~83 MB |
+| codex              | 137 MB     | 1213 MB     | ~120 MB |
+
+Warm start (attach to the running daemon) is ~10 ms to first frame; cold start
+(spawn the daemon) is ~90–160 ms. Reproduce with the scripts in
+[`benchmarks/`](benchmarks/) — full methodology, caveats, and how-to in
+[BENCHMARKS.md](BENCHMARKS.md).
+
 ## Modes
 
 | Command | What it does |

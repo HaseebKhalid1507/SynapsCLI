@@ -28,7 +28,12 @@
 //!   scan cap; session end is the drop of the LAST owner of the shared
 //!   durable [`McpSessionEndGuard`] scope (runtime clones + in-flight
 //!   streams hold it; no per-turn guard exists). No PID signalling, no
-//!   long-lived task, no unbounded channel.
+//!   long-lived task, no unbounded channel;
+//! - a server configured `shared: true` (daemon mode, opt-in) is keyed
+//!   under [`SHARED_SESSION_KEY`] instead of the session: one child serves
+//!   every session, `terminate_session` spares it, `reap_idle` and
+//!   `terminate_all` still reap it. Every call still validates exact
+//!   name + digest; sharing widens the CHILD, never the grant.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +43,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::connection::McpConnection;
-use super::descriptors::server_config_fingerprint;
+use super::descriptors::{self, server_config_fingerprint};
 use super::McpServerConfig;
 use crate::tools::activation::SessionId;
 use crate::tools::catalog::SchemaDigest;
@@ -52,6 +57,20 @@ pub fn config_source_from_disk() -> ConfigSource {
     Arc::new(|server: &str| {
         super::load_mcp_config().and_then(|c| c.mcp_servers.get(server).cloned())
     })
+}
+
+/// Lease-map session key for `shared: true` servers (one child per
+/// process, not per session). Never a real session's key: `terminate_session`
+/// skips it explicitly.
+pub const SHARED_SESSION_KEY: &str = "*";
+
+/// Session component of the lease key for `server` under `config`.
+pub fn lease_session_key(config: &McpServerConfig, session: &SessionId) -> String {
+    if config.shared {
+        SHARED_SESSION_KEY.to_string()
+    } else {
+        session.as_str().to_string()
+    }
 }
 
 /// Default idle bound for opportunistic reaping.
@@ -139,6 +158,9 @@ pub struct McpRuntimeManager {
     config_source: ConfigSource,
     idle_max: Duration,
     next_token: std::sync::atomic::AtomicU64,
+    /// Descriptor-cache path for write-back after `tools/list`
+    /// (production: profile-resolved default; tests inject a temp path).
+    cache_path: Arc<dyn Fn() -> std::path::PathBuf + Send + Sync>,
 }
 
 impl McpRuntimeManager {
@@ -148,7 +170,26 @@ impl McpRuntimeManager {
             config_source,
             idle_max,
             next_token: std::sync::atomic::AtomicU64::new(1),
+            cache_path: Arc::new(descriptors::default_cache_path),
         }
+    }
+
+    /// Override the descriptor-cache write-back location (tests, or a
+    /// host that keeps its cache elsewhere).
+    pub fn with_cache_path(mut self, path: std::path::PathBuf) -> Self {
+        self.cache_path = Arc::new(move || path.clone());
+        self
+    }
+
+    /// Lease-map key for (session, server), honouring `shared: true`.
+    /// Reads the config source (bounded local read); an unconfigured
+    /// server keys per session (it has no lease to find anyway).
+    fn lease_key(&self, session: &SessionId, server: &str) -> (String, String) {
+        let session_key = match (self.config_source)(server) {
+            Some(config) => lease_session_key(&config, session),
+            None => session.as_str().to_string(),
+        };
+        (session_key, server.to_string())
     }
 
     /// Sync RAII-safe termination: mark cancelled, then — when the
@@ -220,12 +261,13 @@ impl McpRuntimeManager {
     /// one child process shared by that session's exact tools of that
     /// server).
     pub fn revoke_server_lease(&self, session: &SessionId, server: &str) {
+        let key = self.lease_key(session, server);
         let removed = {
             let mut map = self
                 .leases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.remove(&(session.as_str().to_string(), server.to_string()))
+            map.remove(&key)
         };
         if let Some(state) = removed {
             Self::cancel_state(state);
@@ -243,6 +285,7 @@ impl McpRuntimeManager {
     }
 
     /// Terminate every lease held by one session. Returns how many.
+    /// Shared (`"*"`) leases are never a session's to terminate.
     pub fn terminate_session(&self, session: &SessionId) -> usize {
         let removed: Vec<LeaseState> = {
             let mut map = self
@@ -251,7 +294,7 @@ impl McpRuntimeManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let keys: Vec<(String, String)> = map
                 .keys()
-                .filter(|(s, _)| s == session.as_str())
+                .filter(|(s, _)| s != SHARED_SESSION_KEY && s == session.as_str())
                 .cloned()
                 .collect();
             keys.into_iter().filter_map(|k| map.remove(&k)).collect()
@@ -330,7 +373,7 @@ impl McpRuntimeManager {
         }
         self.reap_idle();
 
-        let key = (session.as_str().to_string(), server.to_string());
+        let key = (lease_session_key(&config, session), server.to_string());
         let inner: Arc<LeaseInner> = loop {
             // 2. Single-flight acquisition. The guard-scoped decision below
             // returns an owned action, so the map lock is NEVER held across
@@ -413,7 +456,7 @@ impl McpRuntimeManager {
                 }
                 Acquire::Start { token, done_tx } => {
                     let started = self
-                        .start_lease(expected_fingerprint, &config)
+                        .start_lease(server, expected_fingerprint, &config)
                         .await
                         .map_err(|e| McpLeaseError::Transport(server.to_string(), e));
                     let ours = {
@@ -504,8 +547,12 @@ impl McpRuntimeManager {
 
     /// Spawn + initialize + single bounded tools/list for one server. No
     /// manager lock is held. Any failure kills the child before returning.
+    /// On success the listing is written back to the descriptor cache
+    /// (`SYNAPS_MCP_CACHE_WRITEBACK=0` disables) so the next boot advertises
+    /// the same dormant tools without spawning.
     async fn start_lease(
         &self,
+        server: &str,
         fingerprint: &str,
         config: &McpServerConfig,
     ) -> Result<Arc<LeaseInner>, String> {
@@ -518,8 +565,37 @@ impl McpRuntimeManager {
             }
         };
         let mut listing = HashMap::new();
-        for def in defs {
+        for def in &defs {
             listing.insert(def.name.clone(), SchemaDigest::of_schema(&def.input_schema));
+        }
+        if descriptors::cache_writeback_enabled() {
+            let descriptors: Vec<descriptors::CachedToolDescriptor> = defs
+                .into_iter()
+                .map(|def| descriptors::CachedToolDescriptor {
+                    name: def.name,
+                    description: def.description,
+                    input_schema: def.input_schema,
+                })
+                .collect();
+            let path = (self.cache_path)();
+            let server_owned = server.to_string();
+            let fingerprint_owned = fingerprint.to_string();
+            // Blocking file I/O (flock + atomic rename) off the reactor;
+            // failure is logged, never surfaced — the lease is already good.
+            let _ = tokio::task::spawn_blocking(move || {
+                match descriptors::record_server_listing(
+                    &path,
+                    &server_owned,
+                    &fingerprint_owned,
+                    &descriptors,
+                ) {
+                    Ok(count) => tracing::debug!(server = %server_owned, tools = count,
+                        "MCP descriptor cache written back after tools/list"),
+                    Err(err) => tracing::warn!(server = %server_owned, error = %err,
+                        "MCP descriptor cache write-back failed"),
+                }
+            })
+            .await;
         }
         Ok(Arc::new(LeaseInner {
             fingerprint: fingerprint.to_string(),
@@ -531,6 +607,19 @@ impl McpRuntimeManager {
         }))
     }
 
+    /// Test seam: the live lease keys `(session_key, server)`; shared
+    /// servers show [`SHARED_SESSION_KEY`].
+    #[doc(hidden)]
+    pub fn lease_keys_for_tests(&self) -> Vec<(String, String)> {
+        let map = self
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut keys: Vec<_> = map.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// Test seam: `Weak` ownership token of one lease. `upgrade() == None`
     /// proves the manager (and any bounded shutdown task) released it.
     #[doc(hidden)]
@@ -539,11 +628,12 @@ impl McpRuntimeManager {
         session: &SessionId,
         server: &str,
     ) -> Option<std::sync::Weak<()>> {
+        let key = self.lease_key(session, server);
         let map = self
             .leases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match map.get(&(session.as_str().to_string(), server.to_string())) {
+        match map.get(&key) {
             Some(LeaseState::Ready(inner)) => Some(Arc::downgrade(&inner.liveness)),
             _ => None,
         }

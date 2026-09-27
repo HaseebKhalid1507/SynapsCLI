@@ -105,6 +105,80 @@ pub fn renamed_tool_losses(name_map: &ToolNameMap) -> Vec<TranslationLoss> {
         .collect()
 }
 
+/// Text documents lose structural provenance on the OpenAI wire. Never let
+/// that lowering bypass attachment privacy: consume the optional content arm
+/// visibly without a bundle (metadata tracing still proceeds normally).
+pub fn capture_request_content(
+    trace: &TraceContext,
+    request_id: &TraceId,
+    body: &[u8],
+    messages: &[crate::SharedMessage],
+) {
+    fn text_document(block: &Value) -> bool {
+        (block["type"] == "document" && block["source"]["type"] == "text")
+            || (block["type"] == "tool_result"
+                && block["content"]
+                    .as_array()
+                    .is_some_and(|inner| inner.iter().any(text_document)))
+    }
+    if messages.iter().any(|message| {
+        message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(text_document))
+    }) {
+        trace.capture_unsupported("text_document_attachment_content_withheld");
+    } else {
+        trace.capture_request_content(request_id, body);
+    }
+}
+
+/// Metadata-only attachment rewrites. Native image/file bytes survive, but
+/// origin labels and tool-result lifts synthesize user blocks; text documents
+/// are lowered from documents to ordinary input text. Never record filenames,
+/// tool outputs, URLs, or source payloads in this report.
+pub fn attachment_translation_losses(messages: &[crate::SharedMessage]) -> Vec<TranslationLoss> {
+    fn inspect(block: &Value, id: String, nested: bool, out: &mut Vec<TranslationLoss>) {
+        if matches!(block["type"].as_str(), Some("image" | "document")) {
+            out.push(TranslationLoss {
+                action: if block["source"]["type"] == "text" {
+                    TranslationAction::Downgraded
+                } else {
+                    TranslationAction::Synthesized
+                },
+                element: TranslationElement::MessageBlock,
+                element_id: TraceId::new(&id).ok(),
+            });
+            if nested && block["source"]["type"] == "text" {
+                out.push(TranslationLoss {
+                    action: TranslationAction::Synthesized,
+                    element: TranslationElement::MessageBlock,
+                    element_id: TraceId::new(&id).ok(),
+                });
+            }
+        } else if block["type"] == "tool_result" {
+            if let Some(inner) = block["content"].as_array() {
+                for (i, b) in inner.iter().enumerate() {
+                    inspect(b, format!("{id}.content[{i}]"), true, out);
+                }
+            }
+        }
+    }
+    let mut losses = Vec::new();
+    for (m, message) in messages.iter().enumerate() {
+        if let Some(blocks) = message["content"].as_array() {
+            for (b, block) in blocks.iter().enumerate() {
+                inspect(
+                    block,
+                    format!("messages[{m}].blocks[{b}]"),
+                    false,
+                    &mut losses,
+                );
+            }
+        }
+    }
+    losses
+}
+
 /// Begin tracing one OpenAI-compatible request. Returns `None` when tracing
 /// is disabled or any structural identity is unrepresentable — tracing can
 /// never fail the request.
@@ -140,6 +214,8 @@ pub async fn begin_openai_tracer(
     // Lazy, spawn_blocking-backed key load; `None` degrades the record to
     // digest-free sections and is counted, never surfaced as an error.
     let key = trace.digest_key().await;
+    let mut translation = translation;
+    translation.extend(attachment_translation_losses(messages));
     let structure = openai_request_structure(
         key.as_deref(),
         exact_sent_bytes,
@@ -306,5 +382,30 @@ impl StreamAttempt {
                 terminal,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attachment_capture_tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn lowered_document_capture_is_visibly_withheld_using_canonical_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = Arc::new(super::super::controls::ContentCapture::new(
+            temp.path().to_path_buf(),
+        ));
+        let trace = TraceContext::disabled().with_content_capture(capture);
+        let messages = vec![Arc::new(serde_json::json!({"role":"user","content":[
+            {"type":"document","title":"private.txt","source":{"type":"text","media_type":"text/plain","data":"FILE_SENTINEL"}}
+        ]}))];
+        capture_request_content(
+            &trace,
+            &TraceId::new("capture-test").unwrap(),
+            br#"{"input":"FILE_SENTINEL"}"#,
+            &messages,
+        );
+        assert_eq!(trace.degraded_records(), 1);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

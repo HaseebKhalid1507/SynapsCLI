@@ -82,6 +82,10 @@ pub enum ServerMessage {
     /// Additive variant — old clients ignore unknown message types.
     #[serde(rename = "notice")]
     Notice { text: String },
+    #[serde(rename = "response_start")]
+    ResponseStart,
+    #[serde(rename = "response_reset")]
+    ResponseReset,
 
     /// Error occurred
     #[serde(rename = "error")]

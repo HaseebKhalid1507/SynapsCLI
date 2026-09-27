@@ -84,7 +84,7 @@ The current `src/skills.rs` is replaced by this module tree.
   "name": "pi-skills",
   "version": "1.0.0",
   "description": "...",
-  "owner": { "name": "JR Morton", "url": "..." },
+  "owner": { "name": "upstream", "url": "..." },
   "plugins": [
     {
       "name": "web-tools",

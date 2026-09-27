@@ -66,7 +66,15 @@ impl Tool for ShellStartTool {
             .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
 
         let command = params["command"].as_str().map(|s| s.to_string());
-        let working_directory = params["working_directory"].as_str().map(|s| s.to_string());
+        let working_directory = params["working_directory"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| {
+                ctx.capabilities
+                    .cwd
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
         let rows = params["rows"].as_u64().map(|r| r as u16);
         let cols = params["cols"].as_u64().map(|c| c as u16);
         let readiness_timeout_ms = params["readiness_timeout_ms"].as_u64();

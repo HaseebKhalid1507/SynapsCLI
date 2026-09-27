@@ -1,0 +1,23 @@
+# comment
+name: synaps
+version: 1.2
+enabled: true
+nothing: ~
+list:
+  - one
+  - "two"
+  - 'three'
+  - 4
+nested:
+  key: &anchor value
+  ref: *anchor
+  multi: |
+    line one
+    line two
+  folded: >-
+    folded
+    text
+? complex
+: key
+---
+doc: 2

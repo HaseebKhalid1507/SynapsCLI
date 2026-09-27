@@ -8,14 +8,22 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 /// What happened during a stream event — renderer decides how to display.
 #[derive(Debug)]
 pub enum EngineStreamEvent {
+    ResponseStart,
+    ResponseReset,
     /// Thinking text arrived.
     Thinking(String),
     /// Response text arrived.
     Text(String),
     /// Tool use started.
-    ToolStart { tool_id: String, tool_name: String },
+    ToolStart {
+        tool_id: String,
+        tool_name: String,
+    },
     /// Tool use input delta.
-    ToolDelta { tool_id: String, delta: String },
+    ToolDelta {
+        tool_id: String,
+        delta: String,
+    },
     /// Tool use finalized.
     ///
     /// `input` is the parsed JSON value, not a stringified version. Renderers
@@ -28,13 +36,26 @@ pub enum EngineStreamEvent {
         input: serde_json::Value,
     },
     /// Tool result delta.
-    ToolResultDelta { tool_id: String, delta: String },
+    ToolResultDelta {
+        tool_id: String,
+        delta: String,
+    },
     /// Tool result complete.
-    ToolResult { tool_id: String, result: String },
+    ToolResult {
+        tool_id: String,
+        result: String,
+    },
     /// Subagent dispatched.
-    SubagentStart { id: u64, name: String, task: String },
+    SubagentStart {
+        id: u64,
+        name: String,
+        task: String,
+    },
     /// Subagent status update.
-    SubagentUpdate { id: u64, status: String },
+    SubagentUpdate {
+        id: u64,
+        status: String,
+    },
     /// Subagent finished.
     SubagentDone {
         id: u64,
@@ -42,7 +63,9 @@ pub enum EngineStreamEvent {
         duration_secs: f64,
     },
     /// Steering message was delivered.
-    SteeringDelivered { message: String },
+    SteeringDelivered {
+        message: String,
+    },
     /// Usage stats for this turn.
     Usage {
         input_tokens: u64,
@@ -172,6 +195,12 @@ pub fn process_stream_event_with_terminal_capture(
     terminal_capture: impl FnOnce(),
 ) -> (EngineStreamEvent, StreamCompletion) {
     match event {
+        StreamEvent::Llm(LlmEvent::ResponseStart) => {
+            (EngineStreamEvent::ResponseStart, StreamCompletion::Continue)
+        }
+        StreamEvent::Llm(LlmEvent::ResponseReset) => {
+            (EngineStreamEvent::ResponseReset, StreamCompletion::Continue)
+        }
         StreamEvent::Llm(LlmEvent::Thinking(text)) => (
             EngineStreamEvent::Thinking(text),
             StreamCompletion::Continue,
@@ -207,6 +236,12 @@ pub fn process_stream_event_with_terminal_capture(
             EngineStreamEvent::ToolResult { tool_id, result },
             StreamCompletion::Continue,
         ),
+        StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { receipt, .. }) => {
+            receipt.complete(Err(std::io::Error::other(
+                "this stream consumer has no durable context-head handler",
+            )));
+            (EngineStreamEvent::Noop, StreamCompletion::Continue)
+        }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             *messages = history;
             (EngineStreamEvent::Noop, StreamCompletion::Continue)

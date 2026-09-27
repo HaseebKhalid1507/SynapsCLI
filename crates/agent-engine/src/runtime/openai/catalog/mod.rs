@@ -53,7 +53,7 @@ pub use codex::{
     codex_models_path, codex_models_url, codex_static_capability, codex_static_catalog_models,
     parse_codex_catalog_models, plan_codex_execution, validate_codex_level, CodexCapabilitySource,
     CodexExecutionMode, CodexExecutionPlan, CodexMultiAgentMode, CodexPlanError,
-    CodexPlanErrorCode, CodexRequestRole, CodexWireEffort, ExecutionRole,
+    CodexPlanErrorCode, CodexRequestRole, CodexWireEffort, ExecutionRole, CODEX_CLIENT_VERSION,
     PROVIDER_KEY as CODEX_PROVIDER_KEY, PROVIDER_NAME as CODEX_PROVIDER_NAME,
 };
 pub use generic::parse_generic_catalog_models;
@@ -184,6 +184,8 @@ pub enum ReasoningSupport {
         supported: Vec<agent_core::reasoning::ReasoningLevel>,
         /// Default level from catalog's `default_reasoning_level`, if present.
         default_level: Option<agent_core::reasoning::ReasoningLevel>,
+        /// Wire effort for Ultra from the exact model catalog. Not a worker-only hint.
+        multi_agent_reasoning_effort: Option<agent_core::reasoning::ReasoningLevel>,
         /// Exact model's collaboration protocol. Ultra requires V2.
         multi_agent_version: Option<CodexMultiAgentVersion>,
     },
@@ -537,7 +539,10 @@ impl ModelCatalogProvider for CodexCatalogProvider {
         // models endpoint. Static seeds are offline / not-configured fallback
         // only — never the normal successful result when auth is available.
         Box::pin(async move {
-            let path = codex_models_path(env!("CARGO_PKG_VERSION"));
+            // Advertise the pinned Codex protocol version, not SynapsCLI's
+            // crate version: the backend filters the catalog by
+            // `minimal_client_version` and returns nothing for unknown values.
+            let path = codex_models_path(codex::CODEX_CLIENT_VERSION);
             match broker_proxy_catalog_body("openai-codex", &path).await {
                 Ok(body) => {
                     let models = parse_codex_catalog_models(&body)
@@ -740,10 +745,15 @@ pub async fn fetch_catalog_models(
     provider_key: &str,
 ) -> Result<Vec<CatalogModel>, String> {
     let provider = catalog_provider_for(provider_key);
-    if provider.provider_key() == "generic" {
-        return fetch_generic_catalog_provider_models(provider_key).await;
-    }
-    provider.fetch(client).await
+    let models = if provider.provider_key() == "generic" {
+        fetch_generic_catalog_provider_models(provider_key).await?
+    } else {
+        provider.fetch(client).await?
+    };
+    // Retain exact live modality evidence for request-time attachment checks,
+    // including OpenRouter and Copilot (not only the Codex reasoning picker).
+    capability_cache::replace_provider(provider_key, &models);
+    Ok(models)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -839,9 +849,9 @@ mod tests {
     // resolution; racing SYNAPS_BASE_DIR mutators made this flaky.
     #[serial_test::serial(synaps_base_dir)]
     async fn ui_catalog_fetch_github_copilot_returns_prefixed_chat_models() {
-        // When the operator has a live session, broker-proxied discovery wins.
-        // Otherwise the curated static fallback is returned. Either way runtime
-        // ids are github-copilot/<wire-id> and include fixture-established IDs.
+        // Offline test must not depend on a developer account's live picker.
+        let _base = crate::test_env::BaseDirGuard::new();
+        // Runtime ids use github-copilot/<wire-id> and fixture-established IDs.
         let models = fetch_catalog_models(&reqwest::Client::new(), "github-copilot")
             .await
             .expect("GitHub Copilot catalog");
@@ -1298,10 +1308,27 @@ mod tests {
         }
 
         #[test]
-        fn models_path_carries_package_client_version() {
-            let path = codex_models_path(env!("CARGO_PKG_VERSION"));
-            assert!(path.starts_with("/models?client_version="));
-            assert!(path.contains(env!("CARGO_PKG_VERSION")));
+        fn models_path_carries_pinned_codex_protocol_version() {
+            let path = codex_models_path(codex::CODEX_CLIENT_VERSION);
+            assert!(path.starts_with("/codex/models?client_version="));
+            assert!(path.ends_with(codex::CODEX_CLIENT_VERSION));
+            // The crate version must never leak onto the wire: the backend
+            // treats it as an unknown client and returns an empty catalog.
+            assert!(!path.contains(env!("CARGO_PKG_VERSION")));
+        }
+
+        #[test]
+        fn pinned_codex_protocol_version_meets_astra_floor() {
+            // gpt-6-astra publishes minimal_client_version 0.153.0.
+            let parse = |v: &str| -> (u64, u64, u64) {
+                let mut it = v.split('.').map(|p| p.parse::<u64>().expect("numeric"));
+                (
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                    it.next().unwrap_or(0),
+                )
+            };
+            assert!(parse(codex::CODEX_CLIENT_VERSION) >= parse("0.153.0"));
         }
 
         #[test]

@@ -25,7 +25,9 @@ impl Tool for SubagentStatusTool {
          (running/completed/cancelled/timed_out/failed), the last 500 characters of output \
          produced so far, elapsed time in seconds, and the number of tool calls \
          made. If the status is 'failed', an 'error' field contains the failure reason. \
-         Non-blocking — returns immediately."
+         Non-blocking — returns immediately. Use for an occasional progress peek only: \
+         subagents are reactive and push a completion event that wakes you when they \
+         finish, so never call this in a sleep/poll loop."
     }
 
     fn parameters(&self) -> Value {

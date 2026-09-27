@@ -24,6 +24,9 @@ pub(super) enum InputAction {
     SettingsApply(&'static str, String),
     /// Models modal requested switching to a runtime model id.
     ModelsApply(String),
+    /// Models modal "trust" action → `Set{GrantWorkerModel}` (result ignored,
+    /// as the direct `grant_worker_model` call was).
+    GrantWorkerModel(String),
     /// Effort lightbox requested applying a reasoning level (string form).
     /// The dispatch arm re-checks streaming + exact-model validity
     /// (`effort::apply_guard`) before any mutation/persist.
@@ -65,7 +68,7 @@ pub(super) enum InputAction {
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
-    runtime: &synaps_cli::Runtime,
+    runtime: &impl agent_engine::session::RuntimeRead,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
@@ -345,9 +348,16 @@ fn handle_key(
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // E-P8: Ctrl-C while the driver is armed → stop automation
+            // (actor revokes on `Cancel`), not quit. Cancellation of the
+            // grant outranks the quit binding while armed.
+            if app.driver_ui.is_armed() {
+                return InputAction::Abort;
+            }
             return InputAction::Quit;
         }
-        (KeyCode::Esc, _) if streaming => {
+        // E-P8: Esc while armed (even when NOT streaming) → stop automation.
+        (KeyCode::Esc, _) if streaming || app.driver_ui.is_armed() => {
             return InputAction::Abort;
         }
         (KeyCode::Enter, KeyModifiers::SHIFT) if !streaming => {
@@ -361,6 +371,10 @@ fn handle_key(
         }
         (KeyCode::Enter, _) if !streaming && !app.input_is_empty() => {
             return process_submit(app, registry);
+        }
+        // Enter with empty buffer but staged attachments → attachment-only submit.
+        (KeyCode::Enter, _) if !streaming && app.input_is_empty() && !app.pending_attachments.is_empty() => {
+            return process_submit_attachment_only(app);
         }
         (KeyCode::Enter, _) if streaming && !app.input_is_empty() => {
             return process_streaming_submit(app);
@@ -456,7 +470,7 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
-        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+        let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
         let raw_cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
         let commands = super::commands::all_commands_with_skills(registry);
@@ -465,6 +479,15 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     } else {
         InputAction::Submit(input)
     }
+}
+
+/// User pressed Enter with empty input but staged attachments.
+fn process_submit_attachment_only(app: &mut App) -> InputAction {
+    if app.transcript.is_empty() {
+        app.logo_dismiss_t = Some(0.001);
+    }
+    app.transcript.scroll_to_bottom();
+    InputAction::Submit(String::new())
 }
 
 /// User pressed Enter with non-empty input while streaming.
@@ -552,7 +575,11 @@ fn route_effort(event: Event, app: &mut App) -> InputAction {
 /// another modal (§6), so the `InputAction` is returned directly — the
 /// `PaneOutcome` mapping above is realized inline, matching the P7.4
 /// `route_help_find` shape.
-fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> InputAction {
+fn route_models(
+    event: Event,
+    app: &mut App,
+    runtime: &impl agent_engine::session::RuntimeRead,
+) -> InputAction {
     // Invariant (checked by the tripwire): top() == Models ⇒ models is Some.
     let Some(state) = &mut app.models else {
         return InputAction::None;
@@ -575,8 +602,7 @@ fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> I
                 // so subagent dispatch honors the grant this session. The
                 // config favorite is already persisted; a policy refusal (e.g.
                 // malformed ID) must not break the picker interaction.
-                let _ = runtime.grant_worker_model(&model);
-                InputAction::None
+                InputAction::GrantWorkerModel(model)
             }
             super::models::InputOutcome::ExpandProvider(provider) => {
                 InputAction::ModelsExpandProvider(provider)
@@ -646,7 +672,7 @@ fn route_plugins(event: Event, app: &mut App) -> InputAction {
 fn route_settings(
     event: Event,
     app: &mut App,
-    runtime: &synaps_cli::Runtime,
+    runtime: &impl agent_engine::session::RuntimeRead,
     registry: &Arc<CommandRegistry>,
 ) -> InputAction {
     // Invariant (checked by the tripwire): top() == Settings | PluginEditor ⇒
@@ -848,9 +874,10 @@ pub(super) fn reconcile_secret_prompt(app: &mut App) {
     }
 }
 
-/// P7.8 stack-routed pane handler for the async secret / masked-input prompt.
+/// P7.8 stack-routed pane handler for the async secret / masked-input prompt
+/// and (by `PromptKind`) the y/n confirm dialog.
 ///
-/// Reproduces the former inline `mod.rs` interception VERBATIM: Enter submits,
+/// Secret reproduces the former inline `mod.rs` interception VERBATIM: Enter submits,
 /// Esc cancels, Backspace deletes, Char / per-char Paste append, everything
 /// else is swallowed (`PaneOutcome::Consumed`). After `submit()` / `cancel()`
 /// (which may auto-activate the next queued prompt) it reconciles the stack so
@@ -858,6 +885,32 @@ pub(super) fn reconcile_secret_prompt(app: &mut App) {
 /// drains. Returns `InputAction::None`; the former inline `app.request_redraw()`
 /// is preserved by `request_immediate_redraw` on the input path (`mod.rs`).
 fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
+    use synaps_cli::tools::PromptKind;
+    let is_confirm = app
+        .secret_prompts
+        .active()
+        .is_some_and(|p| p.kind == PromptKind::Confirm);
+    if is_confirm {
+        // Confirm dialog: no free-text field. `y` answers "y" (allow);
+        // `n`, Esc and Enter (empty field) answer None (deny, fail-closed).
+        // Everything else — including pastes — is swallowed so nothing can
+        // accidentally form an allow.
+        if let Event::Key(key) = event {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.secret_prompts.push_char('y');
+                    app.secret_prompts.submit();
+                    reconcile_secret_prompt(app);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    app.secret_prompts.cancel();
+                    reconcile_secret_prompt(app);
+                }
+                _ => {}
+            }
+        }
+        return InputAction::None;
+    }
     match event {
         Event::Key(key) => match key.code {
             KeyCode::Enter => {
@@ -1179,6 +1232,39 @@ mod tests {
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert!(app.input_is_empty());
         assert_eq!(app.cursor_char_pos(), 0);
+    }
+
+    /// E-P8 T2: Ctrl-C while the driver is armed → Abort (→ Cancel), NOT Quit.
+    #[test]
+    fn ctrl_c_while_driver_armed_aborts_not_quits() {
+        let mut app = make_app();
+        // Not armed → Ctrl-C quits.
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputAction::Quit
+        ));
+        app.driver_ui.armed = true;
+        // Armed → Ctrl-C stops the driver (Abort → SessionCommand::Cancel).
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InputAction::Abort
+        ));
+    }
+
+    /// E-P8 T2: Esc while armed (even when NOT streaming) → Abort (→ Cancel).
+    #[test]
+    fn esc_while_driver_armed_aborts_even_when_idle() {
+        let mut app = make_app();
+        // Not armed, not streaming → Esc is a no-op.
+        assert!(matches!(
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        app.driver_ui.armed = true;
+        assert!(matches!(
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            InputAction::Abort
+        ));
     }
 
     /// Backspace / word-delete route through the editor.

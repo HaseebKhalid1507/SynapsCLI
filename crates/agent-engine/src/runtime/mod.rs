@@ -2,7 +2,7 @@ use crate::{Result, RuntimeError, ToolRegistry};
 use futures::stream::Stream;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 mod api;
 mod api_sync;
+pub mod attachments;
 mod auth;
+mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
@@ -21,6 +23,7 @@ pub mod chat_capture;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod context;
+pub mod continuation;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
@@ -44,6 +47,7 @@ use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
 pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.
 pub enum BeforeToolCallDecision {
@@ -52,14 +56,17 @@ pub enum BeforeToolCallDecision {
 }
 
 /// Emit a `before_tool_call` event and include the runtime tool name when it
-/// differs from the API-safe name.
+/// differs from the API-safe name. `session_id` is the owning conversation
+/// (`None` for workers → JSON `null`, unchanged).
 pub async fn emit_before_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
     runtime_tool_name: Option<&str>,
     input: Value,
+    session_id: Option<&str>,
 ) -> crate::extensions::hooks::events::HookResult {
-    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input);
+    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
+        .with_session(session_id);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -164,12 +171,14 @@ pub async fn emit_after_tool_call(
     input: Value,
     output: String,
     max_tool_output: usize,
+    session_id: Option<&str>,
 ) -> String {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
     let mut event =
-        crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output);
+        crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output)
+            .with_session(session_id);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -215,6 +224,44 @@ pub struct ReasoningClamp {
     pub to: agent_core::reasoning::ReasoningLevel,
 }
 
+fn validated_single_tool_output(
+    model: &str,
+    output: crate::ToolOutput,
+) -> (String, Option<Vec<Value>>) {
+    let (summary, blocks) = output.into_parts();
+    if let Some(ref blocks) = blocks {
+        if let Err(error) = attachments::validate_tool_blocks(model, blocks) {
+            return (format!("Attachment not sent: {error}"), None);
+        }
+    }
+    (summary, blocks)
+}
+
+/// A summary rewrite (including the post-hook truncation) invalidates rich
+/// blocks: retaining them would bypass the hook's replacement/redaction.
+fn retain_single_tool_blocks(
+    blocks: Option<Vec<Value>>,
+    original: &str,
+    hooked: &str,
+) -> Option<Vec<Value>> {
+    if original == hooked {
+        blocks
+    } else {
+        None
+    }
+}
+
+fn single_tool_result_content(
+    result: &str,
+    blocks: Option<Vec<Value>>,
+    max_tool_output: usize,
+) -> Value {
+    match blocks {
+        Some(blocks) => Value::Array(blocks),
+        None => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
+    }
+}
+
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
 #[derive(Clone)]
@@ -254,6 +301,9 @@ pub struct Runtime {
     /// `models::context_window_for_model`. Lets users cap context at e.g.
     /// 200k even on models that natively support 1M.
     context_window_override: Option<u64>,
+    /// Opt-in context windows within a stable logical session (#112).
+    /// DARK by default: `ContextManagementMode::Off`.
+    pub(crate) continuation: continuation::SharedContinuation,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
@@ -309,6 +359,13 @@ pub struct Runtime {
     /// memory-context state from a parent runtime into a freshly
     /// constructed one.
     memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
+    /// Immutable host-owned note backend and captured project scope (#112).
+    /// DARK by default: `MemoryBinding::legacy_current()`.
+    memory_backend: crate::memory_backend::MemoryBinding,
+    /// First explicit host selection; never replace the captured binding.
+    memory_backend_config: Option<crate::config::MemoryBackendConfig>,
+    /// Sticky across same-session clones: live extension policy needs restart.
+    memory_backend_reconfigure_denied: Arc<std::sync::atomic::AtomicBool>,
     /// Production resolves the exact leased extension provider at dispatch.
     /// Tests may install this in-process provider to observe the same worker
     /// boundary without spawning an extension process.
@@ -398,6 +455,9 @@ pub struct Runtime {
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// `tools.activation_confirm` host policy for model-initiated
+    /// `activate_tools` (auto | prompt | deny). Default `auto`.
+    activation_confirm: agent_core::config::ActivationConfirm,
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
@@ -429,6 +489,24 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// Conversation/session identity this runtime serves. Keys the
+    /// `on_session_start` hook injection (Phase 2 keys everything).
+    /// `None` = unkeyed (workers, tests) — reads no injection.
+    session_id: Option<String>,
+    /// Per-session working directory (Phase 2 daemon mode). `None` = process
+    /// cwd — every in-process host leaves it `None`, so `ToolCapabilities.cwd`
+    /// stays `None` exactly as before. The daemon sets it per session.
+    cwd: Option<PathBuf>,
+    /// Per-session environment snapshot (session-identity T1). `None` =
+    /// inherit process env (in-process hosts). Daemon sessions carry the
+    /// creator client's env; tools apply `env_clear().envs()` when `Some`.
+    env: Option<crate::session::types::SessionEnv>,
+    /// Names of env vars stripped as secrets (T5).
+    env_stripped: Vec<String>,
+    /// Shared per-session "already warned" set for env-stripped notices (T5).
+    /// Cloned into every `ToolCapabilities` so the dedup survives across
+    /// tool calls within the same session.
+    env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -642,6 +720,79 @@ fn memory_provider_id() -> memory_context::ContextProviderId {
         .expect("static provider id is always valid")
 }
 
+fn terminal_capture_start(messages: &[crate::SharedMessage]) -> Option<crate::SharedMessage> {
+    messages
+        .iter()
+        .rfind(|message| {
+            message["role"] == "user"
+                && (message["content"].is_string()
+                    || message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| block["type"] != "tool_result")
+                    }))
+        })
+        .cloned()
+}
+
+fn terminal_capture_messages<'a>(
+    messages: &'a [crate::SharedMessage],
+    start: &crate::SharedMessage,
+) -> Option<&'a [crate::SharedMessage]> {
+    // Identity, not an index (recall may prepend) or text equality (old turns
+    // can have identical prompts). If rollover removed the source, fail closed
+    // rather than recapturing its summary or unrelated earlier history.
+    let index = messages
+        .iter()
+        .position(|message| Arc::ptr_eq(message, start))?;
+    Some(&messages[index..])
+}
+
+/// The stream publishes history only after a valid terminal completion. Consume
+/// it once, never capture the pre-inference prompt or reselect a changed lease.
+fn dispatch_completed_terminal_capture(
+    completed: bool,
+    final_history: &std::sync::Mutex<Option<Vec<crate::SharedMessage>>>,
+    state: &std::sync::Mutex<memory_context::SessionMemoryState>,
+    selected: Option<(
+        memory_context::MemoryContextLease,
+        Arc<dyn capture_worker::CaptureProvider>,
+    )>,
+    started_at: std::time::SystemTime,
+    turn_start: Option<&crate::SharedMessage>,
+) -> bool {
+    let history = final_history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let (Some(messages), Some((lease, provider))) = (history, selected) else {
+        return false;
+    };
+    if !completed {
+        return false;
+    }
+    let Some(messages) = turn_start.and_then(|start| terminal_capture_messages(&messages, start))
+    else {
+        return false;
+    };
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state
+        .capture_lease_at(std::time::SystemTime::now())
+        .as_ref()
+        != Some(&lease)
+    {
+        return false;
+    }
+    memory_capture_worker()
+        .submit_terminal(
+            &lease,
+            terminal_capture_history(&lease, messages, started_at),
+            memory_context::RetentionClass::Standard,
+            provider,
+        )
+        .unwrap_or(false)
+}
+
 /// Idle timeout for the runtime HTTP client: how long a request may go
 /// without receiving *any* bytes (headers or body chunks) before it is
 /// killed. Resets on every received chunk, so healthy long-running streams
@@ -669,6 +820,77 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
         .build()
 }
 
+/// The process-global HTTP client for `EngineHost` (same builder as
+/// `Runtime::new`).
+/// The host's HTTP client builder (also used by the attach-TUI client, A4).
+pub fn build_host_http_client() -> Result<Client> {
+    build_http_client(HTTP_READ_TIMEOUT)
+        .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))
+}
+
+/// Internal: every field of `Runtime` in one place so `new()`,
+/// `new_headless()`, `foreground_runtime()` and `worker_runtime()` cannot
+/// drift. `Runtime::new()` is: build fresh parts → `from_parts`.
+pub(crate) struct RuntimeParts {
+    pub host: crate::host::HostParts,
+    pub session_manager: Arc<crate::tools::shell::SessionManager>,
+    pub reaper: Option<(tokio::task::JoinHandle<()>, CancellationToken)>,
+}
+
+impl RuntimeParts {
+    /// Fresh shell session manager + idle reaper (needs a tokio runtime).
+    pub(crate) fn with_reaper(host: crate::host::HostParts) -> Self {
+        let session_manager = fresh_session_manager();
+        let cancel = CancellationToken::new();
+        let handle =
+            crate::tools::shell::session::start_reaper(session_manager.clone(), cancel.clone());
+        Self {
+            host,
+            session_manager,
+            reaper: Some((handle, cancel)),
+        }
+    }
+
+    /// Fresh shell session manager, no reaper (offline / headless).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn without_reaper(host: crate::host::HostParts) -> Self {
+        Self {
+            host,
+            session_manager: fresh_session_manager(),
+            reaper: None,
+        }
+    }
+}
+
+fn fresh_session_manager() -> Arc<crate::tools::shell::SessionManager> {
+    let config = crate::tools::shell::ShellConfig::default();
+    crate::tools::shell::SessionManager::new(config)
+}
+
+/// Fresh, process-local host parts — exactly what `Runtime::new()` used to
+/// construct inline: new client, new registry, new hook bus, Local creds,
+/// new token cache, no lease managers.
+fn fresh_host_parts() -> Result<crate::host::HostParts> {
+    let client = build_host_http_client()?;
+    // Operational retention (Task 12): physically remove expired
+    // content-capture bundles at session startup — bounded, fail-soft,
+    // confined to the private capture dir. The root resolved here is
+    // the SAME value bound into `capture_dir` (fix1 I2b).
+    let capture_dir = trace::default_capture_dir();
+    let _ = trace::sweep_expired_captures(&capture_dir);
+    Ok(crate::host::HostParts {
+        client,
+        tools: Arc::new(RwLock::new(ToolRegistry::new())),
+        hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
+        credential_source: crate::auth::CredentialSource::Local,
+        token_cache: crate::auth::TokenCache::new(),
+        mcp_runtime: None,
+        extension_runtime: None,
+        capture_dir,
+        progressive_tool_disclosure: false,
+    })
+}
+
 /// Preserve compatibility with favorite IDs written before Anthropic used its
 /// runtime-qualified provider name. Authorization always stores the canonical
 /// exact identity; unrelated bare values remain invalid and are ignored.
@@ -683,36 +905,47 @@ fn canonical_trusted_worker_model(model: &str) -> String {
     }
 }
 
+/// The owning runtime stops its shell-session reaper when it goes away
+/// (clones carry `None`). Without this every dropped `Runtime` — a parked
+/// session, a finished worker — left a 30 s ticker holding the manager.
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(c) = &self.reaper_cancel {
+            c.cancel();
+        }
+    }
+}
+
 impl Runtime {
     pub async fn new() -> Result<Self> {
+        // UNCHANGED semantics: fresh everything (tests, `synaps agent`).
+        Ok(Self::from_parts(RuntimeParts::with_reaper(
+            fresh_host_parts()?,
+        )))
+    }
+
+    /// The single struct-literal site for `Runtime`. Host-owned parts come
+    /// from `parts.host`; everything else is fresh.
+    pub(crate) fn from_parts(parts: RuntimeParts) -> Self {
         // Runtime construction is credential-blind. Credentials are acquired
         // lazily through the broker abstraction after configuration is applied;
         // this layer never opens auth.json or consults a secret environment var.
         let (auth_token, auth_type, refresh_token, token_expires) =
             (String::new(), "oauth".to_string(), None, Some(0));
-
-        let client = build_http_client(HTTP_READ_TIMEOUT)
-            .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
-
-        // Operational retention (Task 12): physically remove expired
-        // content-capture bundles at session startup — bounded, fail-soft,
-        // confined to the private capture dir. The root resolved here is
-        // the SAME value bound into `capture_dir` below (fix1 I2b).
-        let capture_dir = trace::default_capture_dir();
-        let _ = trace::sweep_expired_captures(&capture_dir);
-
-        let session_manager = {
-            let config = crate::tools::shell::ShellConfig::default();
-            crate::tools::shell::SessionManager::new(config)
+        let RuntimeParts {
+            host,
+            session_manager,
+            reaper,
+        } = parts;
+        let (reaper_handle, reaper_cancel) = match reaper {
+            Some((h, c)) => (Some(h), Some(c)),
+            None => (None, None),
         };
+        let mcp_runtime = host.mcp_runtime;
+        let extension_runtime = host.extension_runtime;
 
-        // Start the idle session reaper
-        let mgr = session_manager.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let reaper_handle = crate::tools::shell::session::start_reaper(mgr, cancel.clone());
-
-        Ok(Runtime {
-            client,
+        let mut runtime = Runtime {
+            client: host.client,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
                 auth_type,
@@ -720,7 +953,7 @@ impl Runtime {
                 token_expires,
             })),
             model: crate::models::default_model().to_string(),
-            tools: Arc::new(RwLock::new(ToolRegistry::new())),
+            tools: host.tools,
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
@@ -753,6 +986,11 @@ impl Runtime {
             // Off/no-lease default — subagents get a FRESH construction of
             // this state (task A5 invariant), never a copy of the parent's.
             memory_context_state: fresh_memory_context_state(),
+            // DARK defaults: legacy memory backend, continuation off (#112).
+            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_backend_config: None,
+            memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
             pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
@@ -762,20 +1000,21 @@ impl Runtime {
             pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
             retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            capture_dir,
+            capture_dir: host.capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
-            hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
-            reaper_handle: Some(reaper_handle),
-            reaper_cancel: Some(cancel),
-            credential_source: crate::auth::CredentialSource::Local,
-            token_cache: crate::auth::TokenCache::new(),
+            hook_bus: host.hook_bus,
+            reaper_handle,
+            reaper_cancel,
+            credential_source: host.credential_source,
+            token_cache: host.token_cache,
             trusted_worker_models: Vec::new(),
-            progressive_tool_disclosure: false,
+            progressive_tool_disclosure: host.progressive_tool_disclosure,
+            activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
             mcp_runtime: None,
             mcp_session_scope: None,
@@ -785,8 +1024,24 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
-        })
+            session_id: None,
+            cwd: None,
+            env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
+        };
+        // Lease managers are installed through the same seams boot used, so
+        // the per-runtime durable session-scope guards are minted exactly as
+        // before (keyed by this runtime's fresh host tool session).
+        if let Some(m) = mcp_runtime {
+            runtime.install_mcp_runtime(m);
+        }
+        if let Some(m) = extension_runtime {
+            runtime.install_extension_runtime(m);
+        }
+        runtime
     }
+
 
     /// Offline construction seam for headless test harnesses (P4).
     ///
@@ -802,87 +1057,25 @@ impl Runtime {
     pub fn new_headless() -> Self {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
-
-        let session_manager = {
-            let config = crate::tools::shell::ShellConfig::default();
-            crate::tools::shell::SessionManager::new(config)
-        };
-
-        Runtime {
+        let host = crate::host::HostParts {
             client,
-            auth: Arc::new(RwLock::new(AuthState {
-                auth_token: "test-token".to_string(),
-                auth_type: "api_key".to_string(),
-                refresh_token: None,
-                token_expires: None,
-            })),
-            model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
-            system_prompt: None,
-            effective_prompt: None,
-            prompt_generation: 0,
-            prompt_reload_source: None,
-            thinking_budget: 4096,
-            named_level: None,
-            explicit_reasoning: false,
-            codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
-            context_window_override: None,
-            compaction_model: None,
-            compaction_mode: agent_core::compaction::CompactionMode::default(),
-            compaction_exclusions: Vec::new(),
-            remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            subagent_registry: Arc::new(Mutex::new(
-                crate::runtime::subagent::SubagentRegistry::new(),
-            )),
-            orchestration: None,
-            event_queue: Arc::new(crate::events::EventQueue::new(1000)),
-            watcher_exit_path: None,
-            max_tool_output: 30000,
-            bash_timeout: 30,
-            bash_max_timeout: 300,
-            subagent_timeout: 300,
-            api_retries: 3,
-            refusal_retries: 2,
-            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
-            telemetry_writer: None,
-            trace_ctx: trace::TraceContext::disabled(),
-            trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
-            // Off/no-lease default — subagents get a FRESH construction of
-            // this state (task A5 invariant), never a copy of the parent's.
-            memory_context_state: fresh_memory_context_state(),
-            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(any(test, feature = "testing"))]
-            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            // Empty per construction — a held recall segment is turn-scoped
-            // session state and is never copied into a fresh runtime.
-            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            capture_dir: trace::default_capture_dir(),
-            cache_diagnostics: false,
-            cache_ttl: crate::core::config::CacheTtl::default(),
-            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_msg_id: Arc::new(Mutex::new(None)),
-            session_manager,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
-            reaper_handle: None,
-            reaper_cancel: None,
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
-            trusted_worker_models: Vec::new(),
-            progressive_tool_disclosure: false,
-            delegation_parent: None,
             mcp_runtime: None,
-            mcp_session_scope: None,
             extension_runtime: None,
-            extension_session_scope: None,
-            turn_budget: crate::runtime::budget::TurnBudget::for_role(
-                crate::runtime::budget::TurnRole::Foreground,
-            ),
-            host_tool_session: fresh_host_tool_session(),
-        }
+            capture_dir: trace::default_capture_dir(),
+            progressive_tool_disclosure: false,
+        };
+        let mut runtime = Self::from_parts(RuntimeParts::without_reaper(host));
+        runtime.auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "test-token".to_string(),
+            auth_type: "api_key".to_string(),
+            refresh_token: None,
+            token_expires: None,
+        }));
+        runtime
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -1248,9 +1441,22 @@ impl Runtime {
         &self.event_queue
     }
 
+    /// Install a session-lifetime queue (B3 unpark: the queue outlives the
+    /// `Runtime` so `synaps send` keeps resolving while parked). Must be
+    /// called before the first turn — in-flight streams hold a clone.
+    pub fn set_event_queue(&mut self, queue: Arc<crate::events::EventQueue>) {
+        self.event_queue = queue;
+    }
+
     /// Get a shared reference to the extension hook bus.
     pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
         &self.hook_bus
+    }
+
+    /// Background shell/PTY sessions owned by this runtime (`Checkpoint`
+    /// and `Parked` close them via `shutdown_all`).
+    pub fn session_manager(&self) -> &Arc<crate::tools::shell::SessionManager> {
+        &self.session_manager
     }
 
     /// Runtime-scoped tool-session identity used by the stream execution
@@ -1258,6 +1464,44 @@ impl Runtime {
     /// fresh per independently constructed `Runtime`.
     pub fn host_tool_session_id(&self) -> &crate::tools::activation::SessionId {
         &self.host_tool_session
+    }
+
+    /// Conversation/session identity this runtime serves (keys hook
+    /// injection). `None` = unkeyed (workers).
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id;
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Per-session working directory handed to tools via
+    /// `ToolCapabilities.cwd`. `None` = process cwd.
+    pub fn set_cwd(&mut self, cwd: Option<PathBuf>) {
+        self.cwd = cwd;
+    }
+
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    /// Per-session environment snapshot handed to tools via
+    /// `ToolCapabilities.env`. `None` = inherit process env.
+    pub fn set_env(&mut self, env: Option<crate::session::types::SessionEnv>) {
+        self.env = env;
+    }
+
+    pub fn set_env_stripped(&mut self, stripped: Vec<String>) {
+        self.env_stripped = stripped;
+    }
+
+    pub fn env(&self) -> Option<&crate::session::types::SessionEnv> {
+        self.env.as_ref()
+    }
+
+    pub fn env_stripped(&self) -> &[String] {
+        &self.env_stripped
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -1271,6 +1515,33 @@ impl Runtime {
 
     pub fn http_client(&self) -> &Client {
         &self.client
+    }
+
+    /// Whether this runtime projects a progressive (core-only) tool schema.
+    pub fn progressive_tool_disclosure(&self) -> bool {
+        self.progressive_tool_disclosure
+    }
+
+    /// `tools.activation_confirm` policy in force for this runtime.
+    pub fn activation_confirm(&self) -> agent_core::config::ActivationConfirm {
+        self.activation_confirm
+    }
+
+    /// Override the `tools.activation_confirm` policy (hosts/tests that do
+    /// not go through `apply_config`).
+    pub fn set_activation_confirm(&mut self, mode: agent_core::config::ActivationConfirm) {
+        self.activation_confirm = mode;
+    }
+
+    /// Identity of the underlying connection pool: two `Client` handles that
+    /// clone the same `Arc` share one pool. `reqwest::Client` is a single
+    /// `Arc<ClientRef>`, so its bytes ARE the pool pointer.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn http_client_pool_id(&self) -> usize {
+        const _: () = assert!(std::mem::size_of::<Client>() == std::mem::size_of::<usize>());
+        // SAFETY: size asserted above; only the bit pattern is read, no
+        // ownership is taken (transmute_copy does not move out of `self`).
+        unsafe { std::mem::transmute_copy::<Client, usize>(&self.client) }
     }
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
@@ -1418,6 +1689,21 @@ impl Runtime {
         self.codex_request_role
     }
 
+    pub(crate) fn codex_delegation_plan(
+        model: &str,
+        level: agent_core::reasoning::ReasoningLevel,
+        role: crate::runtime::openai::catalog::CodexRequestRole,
+    ) -> Option<crate::runtime::openai::catalog::CodexExecutionPlan> {
+        use crate::runtime::openai::catalog::{plan_codex_execution, CodexRequestRole};
+        if role != CodexRequestRole::Foreground
+            || level != agent_core::reasoning::ReasoningLevel::Ultra
+            || !model.starts_with("openai-codex/")
+        {
+            return None;
+        }
+        plan_codex_execution(model, level, role, None).ok()
+    }
+
     async fn authorized_anthropic_plan(
         &self,
     ) -> Result<Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>> {
@@ -1471,11 +1757,28 @@ impl Runtime {
             .await
     }
 
+    /// Session-driver preflight: same validation as request preflight.
+    /// merge(112): added for session_driver.rs; thin delegation.
+    pub(crate) async fn validate_session_driver_preflight(&self) -> Result<()> {
+        self.validate_request_preflight().await
+    }
+
     async fn validate_request_preflight_for(
         &self,
         model: &str,
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
+        // A denied memory-backend reconfiguration poisons the runtime: the
+        // live binding no longer matches config, so no request may be sent
+        // until restart. (#112; upstream `validate_request_preflight_for`.)
+        if self
+            .memory_backend_reconfigure_denied
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RuntimeError::Config(
+                "memory backend cannot be reconfigured at runtime (including live legacy extension processes); restart required; request denied".into(),
+            ));
+        }
         let level = self.reasoning_level();
         if model.starts_with("anthropic/")
             && level == agent_core::reasoning::ReasoningLevel::UltraCode
@@ -1741,7 +2044,7 @@ impl Runtime {
         // only baseline model-visible records are accepted back.
         memory_context::validate_contribution(
             &contribution,
-            &memory_project_id(),
+            &self.memory_context_project_id(),
             budget,
             &memory_context::DisclosureGrantSet::model_visible_only(),
         )?;
@@ -1794,22 +2097,35 @@ impl Runtime {
     /// address plus the plugin's declared recall tool digest — an unroutable
     /// provider fails open as `provider_unavailable` without ever spawning.
     async fn apply_turn_memory_recall(&self, messages: &mut Vec<crate::SharedMessage>) {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.clear_memory_contribution();
+            tracing::debug!("memory recall unavailable for the selected host backend");
+            return;
+        }
         let extension_runtime = self.extension_runtime.clone();
+        let binding = self.memory_backend.clone();
         let session = self.host_tool_session.clone();
         let outcome = memory_context::resolve_turn_recall(
             &self.memory_context_state,
             &self.retained_recall_turn,
-            &memory_project_id(),
+            &self.memory_context_project_id(),
             self.context_window(),
             messages,
             memory_context::RECALL_HARD_TIMEOUT,
             move |lease: memory_context::MemoryContextLease,
                   request: memory_context::RecallRequest| async move {
+                if binding.is_axel() {
+                    return axel_context::recall(binding, lease, request).await;
+                }
                 let Some(manager) = extension_runtime else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
                 let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                let (Some("extension"), Some(plugin), Some(_local)) =
+                let (Some("extension"), Some(plugin), Some(local)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
@@ -1819,15 +2135,25 @@ impl Runtime {
                 else {
                     return Err(memory_context::RecallCallError::ProviderUnavailable);
                 };
-                crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
-                    .call_exact(
-                        plugin,
-                        memory_context::MEMORY_RECALL_TOOL_NAME,
-                        &digest,
-                        memory_context::recall_request_wire(&request),
-                    )
-                    .await
-                    .map_err(|_| memory_context::RecallCallError::CallFailed)
+                let mut response =
+                    crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
+                        .call_exact(
+                            plugin,
+                            memory_context::MEMORY_RECALL_TOOL_NAME,
+                            &digest,
+                            memory_context::recall_request_wire(&request),
+                        )
+                        .await
+                        .map_err(|_| memory_context::RecallCallError::CallFailed)?;
+                // Legacy extension wire names the local declared provider;
+                // bind it to the exact host-qualified lease after validation.
+                if response["provider_id"] != local
+                    && response["provider_id"] != lease.provider_id.as_str()
+                {
+                    return Err(memory_context::RecallCallError::CallFailed);
+                }
+                response["provider_id"] = json!(lease.provider_id.as_str());
+                Ok(response)
             },
         )
         .await;
@@ -1974,8 +2300,116 @@ impl Runtime {
             .map_or(0, |manager| manager.lease_count())
     }
 
+    /// Inherit storage authority only, with a fresh worker execution author.
+    /// Oneshot, start, and resume share this path; even resume must not reuse
+    /// a prior actor. Off/no-lease context state and tool grants stay untouched.
+    pub(crate) fn inherit_memory_backend(&mut self, binding: crate::memory_backend::MemoryBinding) {
+        self.memory_backend = binding.fork_for_worker();
+    }
+
+    /// Bind standalone host entry points without applying unrelated settings.
+    pub fn apply_memory_backend_config(&mut self, config: &crate::config::MemoryBackendConfig) {
+        if let Some(selected) = &self.memory_backend_config {
+            if selected != config {
+                self.memory_backend_reconfigure_denied
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!("memory backend change denied: live extension processes cannot be reconfigured at runtime; original binding retained; restart required");
+                self.memory_context_disable();
+                self.clear_memory_contribution();
+            }
+            return;
+        }
+        if config.kind != crate::config::MemoryBackendKind::Legacy {
+            self.memory_context_disable();
+        }
+        // merge(112) §4: under the daemon the session cwd differs from
+        // process cwd; use it when available so project-scope resolution
+        // lands in the right repo.
+        self.memory_backend = crate::memory_backend::MemoryBinding::from_config_with_cwd(
+            config,
+            self.cwd.clone().or_else(|| std::env::current_dir().ok()),
+        );
+        self.memory_backend_config = Some(config.clone());
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // merge(112): consumed in phase 5
+    pub(crate) fn memory_backend_for_test(&self) -> crate::memory_backend::MemoryBinding {
+        self.memory_backend.clone()
+    }
+
+    /// True when legacy note/history/provider access is forbidden by the host
+    /// selection, including invalid or unavailable backend configuration.
+    /// Whether the project forum is live for this runtime (Axel backend).
+    /// Workers use it to decide whether forum guidance belongs in the prompt.
+    pub fn memory_backend_is_axel(&self) -> bool {
+        self.memory_backend.is_axel()
+    }
+
+    pub fn memory_backend_exclusive(&self) -> bool {
+        self.memory_backend.exclusive()
+    }
+
+    fn memory_context_project_id(&self) -> memory_context::ProjectId {
+        if self.memory_backend.exclusive() {
+            self.memory_backend
+                .scope()
+                .ok()
+                .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
+                .unwrap_or_else(|| {
+                    memory_context::ProjectId::parse("project-unresolved").expect("static id")
+                })
+        } else {
+            memory_project_id()
+        }
+    }
+
+    pub fn memory_tool_capability(&self) -> Option<memory_context::MemoryContextCapability> {
+        if !self.memory_backend.exclusive() {
+            return None;
+        }
+        let runtime = self.clone();
+        Some(memory_context::MemoryContextCapability::control_only(
+            self.memory_context_state.clone(),
+            self.memory_context_project_id(),
+            memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID).expect("static id"),
+            Arc::new(move || runtime.memory_context_disable()),
+        ))
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
+    /// Includes the `disabled_tools` pass on this runtime's registry — the
+    /// fresh-`Runtime::new()` path, where the registry holds builtins only.
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
+        self.apply_config_inner(config, true);
+    }
+
+    /// `apply_config` WITHOUT the `disabled_tools` pass. Used by
+    /// `EngineHost::foreground_runtime`: the host already disabled builtins
+    /// on the fresh registry before skills/MCP registered (the old boot
+    /// point), and a second pass here would also strip `load_skill`,
+    /// `search_skills`, `connect_mcp_server` and dormant MCP tools — which
+    /// the old boot never did.
+    pub(crate) fn apply_config_keep_tools(&mut self, config: &crate::config::SynapsConfig) {
+        self.apply_config_inner(config, false);
+    }
+
+    fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
+        // #112: apply memory backend config early (binding is immutable once set).
+        self.apply_memory_backend_config(&config.memory_backend);
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Unavailable selections revoke grants; never retain an extension escape hatch.
+            self.memory_context_disable();
+            self.clear_memory_contribution();
+            *self
+                .retained_recall_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
@@ -1997,6 +2431,10 @@ impl Runtime {
             );
         }
         self.context_window_override = config.context_window;
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config = config.context_management;
         self.compaction_model = config.compaction_model.clone();
         self.compaction_mode = config.compaction_mode;
         self.compaction_exclusions = config.compaction_exclude.clone();
@@ -2012,6 +2450,12 @@ impl Runtime {
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
+        self.activation_confirm = config.tools_activation_confirm;
+        tracing::info!(
+            mode = config.tools_activation_confirm.as_str(),
+            auto_approve_confirms = config.server.auto_approve_confirms,
+            "tools.activation_confirm: model-initiated activate_tools policy"
+        );
         self.trusted_worker_models = config
             .favorite_models
             .iter()
@@ -2045,9 +2489,9 @@ impl Runtime {
         self.apply_auth_config(config);
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
-        // try_write is safe here: apply_config runs at boot before the registry
-        // is shared with other tasks.
-        if !config.disabled_tools.is_empty() {
+        // try_write is safe here: this runs on a fresh runtime's private
+        // registry before it is shared with other tasks.
+        if disable_tools && !config.disabled_tools.is_empty() {
             if let Ok(mut reg) = self.tools.try_write() {
                 reg.disable(&config.disabled_tools);
             }
@@ -2298,7 +2742,7 @@ impl Runtime {
         memory_context::emit_memory_observability_event(
             &memory_context::MemoryObservabilityEvent::context_disabled(
                 &session,
-                &memory_project_id(),
+                &self.memory_context_project_id(),
             ),
         );
         // State mutex released before touching the lease manager: the
@@ -2356,6 +2800,23 @@ impl Runtime {
     ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
     {
         use crate::extensions::context_provider as ext_cp;
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Invalid exclusive configurations never fall back to extensions.
+            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+        }
+        if self.memory_backend.is_axel() {
+            self.memory_backend
+                .validate_axel_config()
+                .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?;
+            if requested.is_some_and(|id| id != axel_context::PROVIDER_ID) {
+                return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+            }
+            return memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID);
+        }
         let Some(extension_runtime) = &self.extension_runtime else {
             return Ok(memory_provider_id());
         };
@@ -2471,7 +2932,7 @@ impl Runtime {
         memory_context::MemoryContextLease::grant(
             memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
             state.session_id().clone(),
-            memory_project_id(),
+            self.memory_context_project_id(),
             provider_id,
             mode,
             memory_context::CapturePolicy::default(),
@@ -2589,6 +3050,25 @@ impl Runtime {
         &self,
         lease: &memory_context::MemoryContextLease,
     ) -> Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> {
+        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
+            || self
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        if self.memory_backend.is_axel() {
+            if lease.provider_id.as_str() != axel_context::PROVIDER_ID
+                || lease.project_id != self.memory_context_project_id()
+            {
+                return None;
+            }
+            return Some(Arc::new(axel_context::AxelCaptureProvider {
+                binding: self.memory_backend.clone(),
+                state: self.memory_context_state.clone(),
+                lease: lease.clone(),
+            }));
+        }
         let manager = self.extension_runtime.clone()?;
         let mut parts = lease.provider_id.as_str().splitn(3, ':');
         let (Some("extension"), Some(plugin), Some(_)) = (parts.next(), parts.next(), parts.next())
@@ -2861,6 +3341,14 @@ impl Runtime {
         self.cache_ttl
     }
 
+    /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
+    /// that a driver-owned turn shares the session's single downgrade latch
+    /// instead of firing a redundant 1h→5m notice.
+    pub fn share_ttl_latches(&mut self, parent: &Runtime) {
+        self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
+        self.saw_1h_honored = parent.saw_1h_honored.clone();
+    }
+
     /// Change the cache TTL strategy mid-session. The next request re-marks
     /// with the new TTL; the old prefix expires naturally (single-last
     /// strategy never prunes old markers, so no invalidation logic needed).
@@ -2943,6 +3431,17 @@ impl Runtime {
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
+        if self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+        {
+            return Err(RuntimeError::Session(
+                "context head save is unresolved; reload the session before further inference"
+                    .into(),
+            ));
+        }
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         // Refresh OAuth token if expired only after capability preflight.
@@ -2965,6 +3464,7 @@ impl Runtime {
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
+                    memory_backend: None,
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -3051,7 +3551,7 @@ impl Runtime {
                         (tool_use["name"].as_str(), tool_use["id"].as_str())
                     {
                         let input = &tool_use["input"];
-                        let result = match self.tools.read().await.get(tool_name).cloned() {
+                        let (result, rich_blocks) = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
                                 let input = self
                                     .tools
@@ -3070,18 +3570,29 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        launch_cancel: None,
+                                        memory_backend: Some(self.memory_backend.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         delegation_parent: None,
+                                        codex_parent_plan: Self::codex_delegation_plan(
+                                            &self.model,
+                                            self.reasoning_level(),
+                                            self.codex_request_role(),
+                                        ),
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
                                         tool_activation: None,
                                         mcp_leases: None,
                                         extension_leases: None,
-                                        memory_context: None,
+                                        memory_context: self.memory_tool_capability(),
+                                        cwd: self.cwd.clone(),
+                                        env: self.env.clone(),
+                                        env_stripped: self.env_stripped.clone(),
+                                        env_warned: self.env_warned.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3098,6 +3609,7 @@ impl Runtime {
                                         tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
+                                        self.session_id.as_deref(),
                                     )
                                     .await,
                                     None,
@@ -3105,35 +3617,37 @@ impl Runtime {
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
-                                    format!("Tool call blocked by extension: {}", reason)
+                                    (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
                                     else {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
-                                    let output = match tool.execute(input, ctx).await {
-                                        Ok(output) => output,
-                                        Err(e) => e.to_string(),
+                                    let (output, rich_blocks) = match tool.execute_rich(input, ctx).await {
+                                        Ok(output) => validated_single_tool_output(&self.model, output),
+                                        Err(e) => (e.to_string(), None),
                                     };
-                                    let output = emit_after_tool_call(
+                                    let hooked_output = emit_after_tool_call(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
-                                        output,
+                                        output.clone(),
                                         self.max_tool_output,
+                                        self.session_id.as_deref(),
                                     )
                                     .await;
-                                    output
+                                    let rich_blocks = retain_single_tool_blocks(rich_blocks, &output, &hooked_output);
+                                    (hooked_output, rich_blocks)
                                 }
                             }
-                            None => format!("Unknown tool: {}", tool_name),
+                            None => (format!("Unknown tool: {}", tool_name), None),
                         };
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
+                            "content": single_tool_result_content(&result, rich_blocks, self.max_tool_output)
                         }));
                     }
                 } else {
@@ -3150,6 +3664,14 @@ impl Runtime {
                     let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
                     let cfg_orchestration = self.orchestration.clone();
+                    let codex_parent_plan = Self::codex_delegation_plan(
+                        &self.model,
+                        self.reasoning_level(),
+                        self.codex_request_role(),
+                    );
+                    let cfg_cwd = self.cwd.clone();
+                    let cfg_env = self.env.clone();
+                    let cfg_session_id = self.session_id.clone();
 
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -3170,6 +3692,15 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let orchestration_inner = cfg_orchestration.clone();
+                            let memory_backend_inner = self.memory_backend.clone();
+                            let memory_context_inner = self.memory_tool_capability();
+                            let codex_parent_plan_inner = codex_parent_plan.clone();
+                            let cwd_inner = cfg_cwd.clone();
+                            let env_inner = cfg_env.clone();
+                            let env_stripped_inner = self.env_stripped.clone();
+                            let env_warned_inner = self.env_warned.clone();
+                            let session_id_inner = cfg_session_id.clone();
+                            let attachment_model = self.model.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
 
@@ -3184,6 +3715,7 @@ impl Runtime {
                                                     &tool_name_for_hook,
                                                     Some(&runtime_name_for_hook),
                                                     input.clone(),
+                                                    session_id_inner.as_deref(),
                                                 )
                                                 .await,
                                                 None,
@@ -3194,7 +3726,7 @@ impl Runtime {
                                             reason,
                                         } = decision
                                         {
-                                            format!("Tool call blocked by extension: {}", reason)
+                                            (format!("Tool call blocked by extension: {}", reason), None)
                                         } else {
                                             let crate::runtime::BeforeToolCallDecision::Continue {
                                                 input,
@@ -3208,18 +3740,25 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    launch_cancel: None,
+                                                    memory_backend: Some(memory_backend_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
                                                     subagent_registry: Some(registry_inner),
                                                     delegation_parent: None,
+                                                    codex_parent_plan: codex_parent_plan_inner,
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,
                                                     tool_activation: None,
                                                     mcp_leases: None,
                                                     extension_leases: None,
-                                                    memory_context: None,
+                                                    memory_context: memory_context_inner,
+                                                    cwd: cwd_inner,
+                                                    env: env_inner,
+                                                    env_stripped: env_stripped_inner,
+                                                    env_warned: env_warned_inner,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -3230,23 +3769,34 @@ impl Runtime {
                                                 },
                                             };
                                             let input_for_hook = input.clone();
-                                            let output = match t.execute(input, ctx).await {
-                                                Ok(output) => output,
-                                                Err(e) => e.to_string(),
-                                            };
-                                            let output = crate::runtime::emit_after_tool_call(
-                                                &hook_bus_inner,
-                                                &tool_name_for_hook,
-                                                Some(&runtime_name_for_hook),
-                                                input_for_hook,
-                                                output,
-                                                cfg_max_tool_output,
-                                            )
-                                            .await;
-                                            output
+                                            let (output, rich_blocks) =
+                                                match t.execute_rich(input, ctx).await {
+                                                    Ok(output) => validated_single_tool_output(
+                                                        &attachment_model,
+                                                        output,
+                                                    ),
+                                                    Err(e) => (e.to_string(), None),
+                                                };
+                                            let hooked_output =
+                                                crate::runtime::emit_after_tool_call(
+                                                    &hook_bus_inner,
+                                                    &tool_name_for_hook,
+                                                    Some(&runtime_name_for_hook),
+                                                    input_for_hook,
+                                                    output.clone(),
+                                                    cfg_max_tool_output,
+                                                    session_id_inner.as_deref(),
+                                                )
+                                                .await;
+                                            let rich_blocks = retain_single_tool_blocks(
+                                                rich_blocks,
+                                                &output,
+                                                &hooked_output,
+                                            );
+                                            (hooked_output, rich_blocks)
                                         }
                                     }
-                                    None => format!("Unknown tool: {}", tool_name),
+                                    None => (format!("Unknown tool: {}", tool_name), None),
                                 };
                                 (tool_id, result)
                             });
@@ -3270,13 +3820,13 @@ impl Runtime {
                     // Build tool_results in original order — every tool_use MUST have a result
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            let result = results_map.remove(tool_id).unwrap_or_else(|| {
-                                "Tool execution failed: task panicked".to_string()
+                            let (result, rich_blocks) = results_map.remove(tool_id).unwrap_or_else(|| {
+                                ("Tool execution failed: task panicked".to_string(), None)
                             });
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
+                                "content": single_tool_result_content(&result, rich_blocks, self.max_tool_output)
                             }));
                         }
                     }
@@ -3338,6 +3888,23 @@ impl Runtime {
         // (spec §5.2) so every frontend can tie the failure to trace lines.
         let turn_correlation_id = agent_core::next_turn_correlation_id();
 
+        if self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+        {
+            let error = RuntimeError::Session(
+                "context head save is unresolved; reload the session before further inference"
+                    .into(),
+            );
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                helpers::turn_error_for(&error, &turn_correlation_id),
+            )));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
+        }
+
         if let Err(error) = self.validate_request_preflight().await {
             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                 helpers::turn_error_for(&error, &turn_correlation_id),
@@ -3376,6 +3943,7 @@ impl Runtime {
         // extension calls. Every recall failure fails OPEN: the turn itself
         // is never blocked or failed by memory.
         let capture_started_at = std::time::SystemTime::now();
+        let capture_turn_start = terminal_capture_start(&messages);
         // Snapshot the full prompt-time lease: terminal dispatch must never
         // reselect a provider after the user changes memory state.
         let capture_lease = self
@@ -3412,10 +3980,13 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
-        let capture_runtime = self.extension_runtime.clone();
-        let capture_session = self.host_tool_session.clone();
+        let capture_provider = capture_lease
+            .as_ref()
+            .and_then(|lease| self.extension_capture_provider(lease));
+        let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
+            memory_backend: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -3440,7 +4011,13 @@ impl Runtime {
             usage_counters: None,
         };
 
+        let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
         let session = crate::runtime::stream::StreamSession {
+            memory_backend: self.memory_backend.clone(),
+            memory_context: self.memory_tool_capability(),
+            final_capture_history: final_capture_history.clone(),
+            context_window: self.context_window(),
+            continuation: self.continuation.clone(),
             auth,
             client,
             credential_source,
@@ -3466,12 +4043,18 @@ impl Runtime {
             event_queue,
             secret_prompt,
             hook_bus: self.hook_bus.clone(),
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            env_stripped: self.env_stripped.clone(),
+            env_warned: self.env_warned.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
@@ -3481,7 +4064,6 @@ impl Runtime {
         };
 
         tokio::spawn(async move {
-            let capture_messages = messages.clone();
             let completed = match StreamMethods::run_stream_internal(session, messages).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -3491,37 +4073,16 @@ impl Runtime {
                     false
                 }
             };
-            if completed {
-                if let (Some(lease), Some(manager)) = (capture_lease, capture_runtime) {
-                    let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                    if let (Some("extension"), Some(plugin), Some(_)) =
-                        (parts.next(), parts.next(), parts.next())
-                    {
-                        if let Some(digest) = manager
-                            .declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)
-                        {
-                            let provider = std::sync::Arc::new(ExtensionCaptureProvider {
-                                manager,
-                                session: capture_session,
-                                plugin: plugin.to_owned(),
-                                digest,
-                                handle: tokio::runtime::Handle::current(),
-                            });
-                            let history = terminal_capture_history(
-                                &lease,
-                                &capture_messages,
-                                capture_started_at,
-                            );
-                            let _ = memory_capture_worker().submit_terminal(
-                                &lease,
-                                history,
-                                memory_context::RetentionClass::Standard,
-                                provider,
-                            );
-                        }
-                    }
-                }
-            }
+            // The stream publishes its FINAL history only on a valid terminal
+            // completion; capture that, never the pre-inference prompt.
+            dispatch_completed_terminal_capture(
+                completed,
+                &final_capture_history,
+                &capture_state,
+                capture_lease.zip(capture_provider),
+                capture_started_at,
+                capture_turn_start.as_ref(),
+            );
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
             // caller becomes async.  Poison-safe via reap_finished internals.
@@ -3529,6 +4090,7 @@ impl Runtime {
                 &reaper_registry,
                 reaper_orchestration.as_deref(),
             );
+            agent_core::core::memstat::log_turn_memory();
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 
@@ -3552,6 +4114,7 @@ impl Clone for Runtime {
             explicit_reasoning: self.explicit_reasoning,
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
+            continuation: Arc::clone(&self.continuation),
             compaction_model: self.compaction_model.clone(),
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),
@@ -3579,6 +4142,9 @@ impl Clone for Runtime {
             // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
             // they always start Off/no-lease (task A5 invariant).
             memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
+            memory_backend: self.memory_backend.clone(),
+            memory_backend_config: self.memory_backend_config.clone(),
+            memory_backend_reconfigure_denied: Arc::clone(&self.memory_backend_reconfigure_denied),
             pending_history_import_preview: std::sync::Arc::clone(
                 &self.pending_history_import_preview,
             ),
@@ -3611,6 +4177,7 @@ impl Clone for Runtime {
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
@@ -3625,6 +4192,106 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            // Clones serve the same conversation (see memory_context_state).
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            env_stripped: self.env_stripped.clone(),
+            env_warned: self.env_warned.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod rich_output_validation_tests {
+    use super::*;
+
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+
+    fn rich_output(summary: &str) -> crate::ToolOutput {
+        crate::ToolOutput::Blocks {
+            summary: summary.to_string(),
+            // Deliberately omit leading text to exercise into_parts normalization.
+            blocks: vec![json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l+QAAAAASUVORK5CYII="
+                }
+            })],
+        }
+    }
+
+    #[test]
+    fn unchanged_summary_retains_rich_array_without_text_truncation() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image"));
+        assert_eq!(summary, "image");
+        let expected = blocks.clone().expect("supported image");
+        assert_eq!(expected[0], json!({"type": "text", "text": summary}));
+        assert_eq!(expected[1]["type"], "image");
+        let retained = retain_single_tool_blocks(blocks, &summary, &summary);
+        assert_eq!(
+            single_tool_result_content(&summary, retained, summary.len()),
+            Value::Array(expected)
+        );
+    }
+
+    #[test]
+    fn rewritten_or_truncated_summary_drops_rich_blocks() {
+        let (summary, blocks) = validated_single_tool_output(MODEL, rich_output("image summary"));
+        assert!(blocks.is_some());
+        for hooked in [
+            "redacted".to_string(),
+            String::new(),
+            helpers::HelperMethods::truncate_tool_result(&summary, 5),
+        ] {
+            let retained = retain_single_tool_blocks(blocks.clone(), &summary, &hooked);
+            assert!(retained.is_none());
+            assert_eq!(
+                single_tool_result_content(&hooked, retained, 5),
+                Value::String(helpers::HelperMethods::truncate_tool_result(&hooked, 5))
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_malformed_media_becomes_explicit_text() {
+        let mut malformed = rich_output("private summary");
+        if let crate::ToolOutput::Blocks { blocks, .. } = &mut malformed {
+            blocks[0]["source"]["data"] = json!("private invalid payload");
+        }
+        for (model, output) in [
+            (
+                "google-gemini/unsupported-rich-test",
+                rich_output("private summary"),
+            ),
+            (MODEL, malformed),
+        ] {
+            let (summary, blocks) = validated_single_tool_output(model, output);
+            assert!(summary.starts_with("Attachment not sent: "), "{summary}");
+            assert!(!summary.contains("private"));
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 1024),
+                Value::String(summary)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_and_errors_keep_legacy_truncation() {
+        for text in ["plain output", "tool error", "Unknown tool: missing"] {
+            let (summary, blocks) = validated_single_tool_output(
+                "google-gemini/unsupported-rich-test",
+                crate::ToolOutput::Text(text.to_string()),
+            );
+            assert_eq!(summary, text);
+            assert!(blocks.is_none());
+            assert_eq!(
+                single_tool_result_content(&summary, blocks, 5),
+                Value::String(helpers::HelperMethods::truncate_tool_result(text, 5))
+            );
         }
     }
 }
@@ -5158,6 +5825,143 @@ mod memory_context_provider_tests {
             runtime.memory_bound_providers_for_test().is_empty(),
             "no provider may be bound"
         );
+    }
+
+    // ── memory-backend configuration tests (ported from upstream) ────────
+
+    #[tokio::test]
+    async fn memory_backend_exclusive_rejects_extension_recall_capture_and_history() {
+        for selector in ["axel", "invalid-selector"] {
+            let (mut runtime, _manager) =
+                memory_runtime_with_providers(&[("memory-test", "notes")]).await;
+            let provider = runtime.resolve_memory_provider(None).unwrap();
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {selector}\n"
+            )));
+            assert!(runtime.memory_backend.exclusive());
+            assert!(matches!(
+                runtime.resolve_memory_provider(None),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.resolve_memory_provider(Some(provider.as_str())),
+                Err(memory_context::MemoryContextError::ProviderNotRegistered)
+            ));
+            assert!(matches!(
+                runtime.memory_history_confirm(),
+                Err(
+                    super::memory_history::HistoryImportError::CaptureProviderUnavailable
+                        | super::memory_history::HistoryImportError::ConsentRequired
+                )
+            ));
+            assert_memory_off_no_lease(&runtime);
+            let mut messages = vec![Arc::new(
+                serde_json::json!({"role": "user", "content": "test"}),
+            )];
+            let original = messages.clone();
+            runtime.apply_turn_memory_recall(&mut messages).await;
+            assert_eq!(messages, original);
+            let clone = runtime.clone();
+            assert!(clone.memory_backend.exclusive());
+            assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_first_config_is_immutable_and_changes_require_restart() {
+        for (first, different) in [("legacy", "axel"), ("axel", "legacy")] {
+            let mut runtime = Runtime::new_headless();
+            let config =
+                agent_core::config::load_config_from_str(&format!("memory.backend = {first}\n"));
+            runtime.apply_config(&config);
+            let binding = runtime.memory_backend.clone();
+            runtime.apply_config(&config);
+            assert!(!runtime
+                .memory_backend_reconfigure_denied
+                .load(std::sync::atomic::Ordering::SeqCst));
+            if let (Ok(a), Ok(b)) = (binding.scope(), runtime.memory_backend.scope()) {
+                assert!(std::ptr::eq(a, b));
+            }
+            let clone = runtime.clone();
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {different}\n"
+            )));
+            assert_eq!(runtime.memory_backend.exclusive(), binding.exclusive());
+            assert_eq!(
+                runtime.memory_backend_config.as_ref(),
+                Some(&config.memory_backend)
+            );
+            for denied in [&runtime, &clone] {
+                let error = denied
+                    .validate_request_preflight()
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("restart required"), "{error}");
+                assert!(denied.resolve_memory_provider(None).is_err());
+            }
+            runtime.apply_config(&config);
+            assert!(runtime.validate_request_preflight().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_backend_path_changes_also_require_restart() {
+        for field in ["executable", "brain"] {
+            let mut runtime = Runtime::new_headless();
+            let config = crate::config::MemoryBackendConfig::default();
+            runtime.apply_memory_backend_config(&config);
+            let mut different = config.clone();
+            let path = std::env::temp_dir().join("synaps-memory-config-test");
+            if field == "executable" {
+                different.executable = Some(path);
+            } else {
+                different.brain = Some(path);
+            }
+            runtime.apply_memory_backend_config(&different);
+            assert_eq!(runtime.memory_backend_config.as_ref(), Some(&config));
+            assert!(!runtime.memory_backend.exclusive());
+            let error = runtime
+                .validate_request_preflight()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("restart required"), "{error}");
+            assert!(runtime.resolve_memory_provider(None).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_backend_apply_config_revokes_preexisting_legacy_lease() {
+        let mut runtime = Runtime::new_headless();
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::CaptureAndRecall,
+                memory_context::UserIntentProof::ExplicitCommand {
+                    command_id: memory_context::mint_explicit_command_id(),
+                },
+            )
+            .unwrap();
+        let lease = runtime
+            .memory_context_lock()
+            .capture_lease_at(std::time::SystemTime::now())
+            .unwrap();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = axel\n",
+        ));
+        assert_memory_off_no_lease(&runtime);
+        assert!(runtime.extension_capture_provider(&lease).is_none());
+    }
+
+    #[test]
+    fn axel_invalid_config_cannot_grant_consent_or_fallback() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = invalid-not-axel-not-legacy\n",
+        ));
+        assert!(runtime.memory_backend.exclusive());
+        assert!(runtime.resolve_memory_provider(None).is_err());
+        assert_memory_off_no_lease(&runtime);
     }
 
     /// Task A6: enabling against a catalog that does not contain the

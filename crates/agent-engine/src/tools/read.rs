@@ -1,4 +1,4 @@
-use super::{expand_path, Tool, ToolContext, ToolOutput};
+use super::{resolve_path_in, Tool, ToolContext, ToolOutput};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 
@@ -60,11 +60,11 @@ impl Tool for ReadTool {
             .map(ToolOutput::into_summary)
     }
 
-    async fn execute_rich(&self, params: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+    async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let raw_path = params["path"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
-        let path = expand_path(raw_path);
+        let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
         // Size guard BEFORE reading: one stat, no bytes loaded.
         let meta = tokio::fs::metadata(&path).await.map_err(|e| {
@@ -252,7 +252,11 @@ pub(crate) fn image_integrity_error(mime: &str, b: &[u8]) -> Option<&'static str
     None
 }
 
-fn image_output(path: &std::path::Path, mime: &'static str, bytes: &[u8]) -> Result<ToolOutput> {
+pub(crate) fn image_output(
+    path: &std::path::Path,
+    mime: &'static str,
+    bytes: &[u8],
+) -> Result<ToolOutput> {
     use base64::Engine as _;
     let kb = bytes.len().div_ceil(1024);
     if bytes.len() > MAX_IMAGE_BYTES {

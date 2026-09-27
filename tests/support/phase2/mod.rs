@@ -91,6 +91,15 @@ pub const ANTHROPIC_SSE_TOOL_USE: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
 );
 
+/// Minimal non-streaming Anthropic Messages response (what
+/// `call_api_simple` — the compaction summary path — parses).
+pub const ANTHROPIC_MESSAGES_JSON: &str = concat!(
+    "{\"id\":\"msg_05\",\"type\":\"message\",\"role\":\"assistant\",",
+    "\"model\":\"claude-sonnet-4-5\",\"content\":[{\"type\":\"text\",\"text\":\"summary\"}],",
+    "\"stop_reason\":\"end_turn\",\"stop_sequence\":null,",
+    "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}"
+);
+
 /// Minimal OpenAI Chat Completions SSE success body.
 pub const OAI_CHAT_SSE: &str = concat!(
     "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
@@ -171,6 +180,22 @@ pub enum Script {
     /// SSE bodies answered per arrival order; the last body repeats for any
     /// further hits (tool-loop fixtures: tool-use turn, then continuation).
     SeqSse(&'static [&'static str]),
+    /// `body` split on the SSE frame boundary (`\n\n`), each frame preceded
+    /// by `frame_delay` — a deterministic mid-stream window for steer /
+    /// event-injection differential scenarios.
+    Paced {
+        body: &'static str,
+        frame_delay: Duration,
+    },
+    /// Streaming requests (`"stream":true` in the body) get `sse`;
+    /// non-streaming ones (the compaction summary via `call_api_simple`)
+    /// get `json` — a Messages response body — after `json_delay`. Lets a
+    /// `/compact` scenario run end-to-end against the same stub.
+    SseOrJson {
+        sse: &'static str,
+        json: &'static str,
+        json_delay: Duration,
+    },
     /// Delay headers, then a comment first byte, then the model events, with
     /// each SSE frame fragmented into small chunks.
     Timed {
@@ -181,8 +206,29 @@ pub enum Script {
     },
 }
 
+fn is_streaming_request(req_body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(req_body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false)
+}
+
 fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
     match script {
+        Script::SseOrJson {
+            sse: sse_body, json, ..
+        } => {
+            if is_streaming_request(req_body) {
+                sse((*sse_body).to_string())
+            } else {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    (*json).to_string(),
+                )
+                    .into_response()
+            }
+        }
         Script::Sse(body) => sse((*body).to_string()),
         Script::SeqSse(bodies) => {
             let body = bodies
@@ -264,6 +310,23 @@ fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
                 .body(Body::from_stream(stream))
                 .unwrap()
         }
+        Script::Paced { body, frame_delay } => {
+            let frames: Vec<Bytes> = body
+                .split_inclusive("\n\n")
+                .map(|f| Bytes::copy_from_slice(f.as_bytes()))
+                .collect();
+            let delay = *frame_delay;
+            let stream = futures::stream::unfold((0usize, frames), move |(i, frames)| async move {
+                let frame = frames.get(i).cloned()?;
+                tokio::time::sleep(delay).await;
+                Some((Ok::<_, std::convert::Infallible>(frame), (i + 1, frames)))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
         Script::Timed {
             header_delay,
             first_byte_delay,
@@ -329,8 +392,12 @@ pub async fn spawn_stub(script: Script) -> (String, Arc<AtomicUsize>, Bodies) {
         async move {
             let hit = hits.fetch_add(1, Ordering::SeqCst);
             bodies.lock().unwrap().push(body.to_vec());
-            if let Script::Timed { header_delay, .. } = &script {
-                tokio::time::sleep(*header_delay).await;
+            match &script {
+                Script::Timed { header_delay, .. } => tokio::time::sleep(*header_delay).await,
+                Script::SseOrJson { json_delay, .. } if !is_streaming_request(&body) => {
+                    tokio::time::sleep(*json_delay).await
+                }
+                _ => {}
             }
             scripted_response(&script, hit, &body)
         }

@@ -1,9 +1,35 @@
 //! Shared utilities for tool implementations — path expansion, ANSI stripping, IDs.
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global counter for unique subagent IDs across all dispatches
 pub(crate) static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Monotonic counter to disambiguate concurrent temp files within one process.
+static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Build a unique sibling temp path for atomic write-then-rename.
+///
+/// Preserves the original file name (including extension) and appends a unique
+/// suffix, so two files that share a stem but differ by extension (e.g. `x.md`
+/// and `x.exe`) never collide on the same temp path. The suffix also carries a
+/// pid + monotonic sequence so concurrent edits of the *same* file are safe too.
+/// The temp path is a sibling of the target (same directory) so the subsequent
+/// `rename` stays on one filesystem and remains atomic.
+pub(crate) fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{}.{}.agent-tmp", std::process::id(), nanos, seq));
+    path.with_file_name(name)
+}
+
 
 /// Strip ANSI escape sequences from a string.
 /// Handles CSI sequences (\x1b[...X), OSC sequences (\x1b]...\x07), and simple \x1b(X) escapes.
@@ -64,10 +90,41 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Expand `raw` (tilde-aware) and, when `cwd` is `Some`, anchor a relative
+/// path to it. `None` returns the expanded path untouched — still relative,
+/// resolved by the OS against the process cwd exactly as before (§3.4).
+pub(crate) fn resolve_path_in(raw: &str, cwd: Option<&std::path::Path>) -> PathBuf {
+    let expanded = expand_path(raw);
+    match cwd {
+        Some(base) if expanded.is_relative() => base.join(expanded),
+        _ => expanded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn resolve_path_in_anchors_relative_to_cwd() {
+        let base = std::path::Path::new("/tmp/synaps-cwd-test");
+        assert_eq!(
+            resolve_path_in("rel/file.txt", Some(base)),
+            base.join("rel/file.txt")
+        );
+        assert_eq!(
+            resolve_path_in("/abs/file.txt", Some(base)),
+            PathBuf::from("/abs/file.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_path_in_none_is_byte_identical_to_expand_path() {
+        for raw in ["rel/file.txt", "./x", "/abs", "~/foo", "~"] {
+            assert_eq!(resolve_path_in(raw, None), expand_path(raw), "{raw}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

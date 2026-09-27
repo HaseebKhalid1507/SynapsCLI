@@ -49,6 +49,10 @@ pub struct ActivationCapability {
     catalog: ToolCatalog,
     session_set: SharedSessionToolSet,
     authority: ActivationAuthority,
+    /// Whether `activate_tools` may ask the host (the y/n confirm dialog)
+    /// when `authority` is `Unauthorized`. `false` = `tools.activation_confirm
+    /// = deny`: fail closed without ever raising a prompt.
+    host_prompt_allowed: bool,
 }
 
 impl ActivationCapability {
@@ -61,7 +65,20 @@ impl ActivationCapability {
             catalog,
             session_set,
             authority,
+            host_prompt_allowed: true,
         }
+    }
+
+    /// Set whether the host confirm prompt may be raised for an
+    /// `Unauthorized` authority (`tools.activation_confirm`: `prompt` →
+    /// true, `deny` → false). Default true.
+    pub fn with_host_prompt(mut self, allowed: bool) -> Self {
+        self.host_prompt_allowed = allowed;
+        self
+    }
+
+    pub fn host_prompt_allowed(&self) -> bool {
+        self.host_prompt_allowed
     }
 
     pub fn catalog(&self) -> &ToolCatalog {
@@ -160,7 +177,10 @@ async fn confirm_activation_with_host(
         ids.join("\n")
     );
     match prompt
-        .prompt("Confirm tool activation".to_string(), question)
+        .prompt(
+            crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE.to_string(),
+            question,
+        )
         .await
     {
         Some(answer) => {
@@ -259,8 +279,10 @@ impl Tool for ActivateToolsTool {
 
     fn description(&self) -> &str {
         "Request session-scoped activation of exact tool ids returned by \
-         search_tools. Activation is subject to host confirmation policy; \
-         only the exact requested tools are activated for this session."
+         search_tools. Activation is subject to the host's \
+         tools.activation_confirm policy (auto: granted; prompt: the user is \
+         asked y/n; deny: always refused); only the exact requested tools are \
+         activated for this session."
     }
 
     fn origin(&self) -> ToolOrigin {
@@ -315,15 +337,20 @@ impl Tool for ActivateToolsTool {
             tool_ids.push(id);
         }
         // Host confirmation policy (M1): authority is host-only and exact.
-        // Explicit host auto-approve authorizes directly; otherwise, when an
+        // `tools.activation_confirm = auto` (default) or explicit server
+        // auto-approve authorizes directly; `prompt`: when an
         // interactive host prompt exists, the HOST is asked to approve this
         // bounded exact id list and only an explicit y/yes authorizes.
         // Absent prompt, denial, or cancellation stays fail-closed. The
         // model-authored JSON arguments are never consulted for authority.
         // The prompt await happens strictly BEFORE the session-set lock is
         // taken; no lock is held across an await.
+        // `tools.activation_confirm = deny` never raises the prompt.
         let authority = match capability.authority() {
             ActivationAuthority::ModelConfirmed => ActivationAuthority::ModelConfirmed,
+            ActivationAuthority::Unauthorized if !capability.host_prompt_allowed() => {
+                ActivationAuthority::Unauthorized
+            }
             ActivationAuthority::Unauthorized => {
                 confirm_activation_with_host(ctx.capabilities.secret_prompt.as_ref(), &tool_ids)
                     .await

@@ -22,6 +22,14 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Daemon-mode opt-in: ONE child serves every session in the process
+    /// (lease key `"*"`) instead of one child per session. The server then
+    /// sees every session's calls and holds cross-session state
+    /// (roots/cwd) — never the default. Excluded from the config
+    /// fingerprint (launch identity only); flipping it starts a fresh
+    /// lease key. See `docs/mcp.md`.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// MCP config file format: { "mcpServers": { "name": { command, args, env } } }
@@ -364,6 +372,7 @@ mod tests {
             command: "/bin/true".to_string(),
             args: vec!["--flag".to_string()],
             env: HashMap::from([("KEY".to_string(), "value".to_string())]),
+            shared: false,
         }
     }
 

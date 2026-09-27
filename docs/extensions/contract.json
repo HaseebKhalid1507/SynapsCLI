@@ -63,19 +63,20 @@
     }
   },
   "permissions": [
-    "tools.intercept",
-    "tools.transform_output",
-    "privacy.llm_content",
-    "session.lifecycle",
-    "tools.register",
-    "providers.register",
+    "audio.input",
+    "audio.output",
+    "config.subscribe",
+    "config.write",
     "context_providers.register",
     "memory.read",
     "memory.write",
-    "config.write",
-    "config.subscribe",
-    "audio.input",
-    "audio.output"
+    "privacy.llm_content",
+    "providers.register",
+    "session.drive",
+    "session.lifecycle",
+    "tools.intercept",
+    "tools.register",
+    "tools.transform_output"
   ],
   "reserved_permissions": [
     "tools.override"

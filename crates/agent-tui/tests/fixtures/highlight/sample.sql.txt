@@ -1,0 +1,13 @@
+-- comment
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO users (name) VALUES ('alice'), ("bob");
+SELECT u.id, COUNT(*) AS n, MAX(o.total) * 1.5
+  FROM users u LEFT JOIN orders o ON o.user_id = u.id
+ WHERE u.name LIKE 'a%' AND o.total > 10.0 OR u.id IN (1, 2, 3)
+ GROUP BY u.id HAVING n >= 2 ORDER BY n DESC LIMIT 10;
+/* block */
+UPDATE users SET name = NULL WHERE id = 1; DROP TABLE IF EXISTS tmp;

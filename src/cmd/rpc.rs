@@ -28,13 +28,14 @@ use synaps_cli::core::config::load_config;
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 use synaps_cli::{
     core::rpc_dispatch::{
-        accumulate_usage, build_tools_list_body, build_user_content, map_stream_event, parse_frame,
+        accumulate_usage, build_tools_list_body, map_stream_event, parse_frame,
         MAX_FRAME_BYTES,
     },
     core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
     engine::reactor::{
-        claim_auto_turn, drain_event_queue, event_payload_from_drained,
-        spawn_prompt_registration_check, wake_action, WakeAction, AUTO_TURN_CAP,
+        auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue,
+        event_payload_from_drained, spawn_prompt_registration_check, wake_action_with_cap,
+        WakeAction,
     },
     engine::setup::{self, EngineOpts},
     Runtime, Session, SessionEvent, StreamEvent,
@@ -61,6 +62,11 @@ struct InFlight {
 struct RpcState {
     runtime: Runtime,
     session: Session,
+    /// Wall 1 for the headless bridge: rpc drives `Runtime` directly (no
+    /// `SessionActor`), so IT must answer `ContextHeadCheckpoint` and honour
+    /// the durability latch — otherwise a rollover latches `durability_blocked`
+    /// with nobody to complete the receipt.
+    context_head: synaps_cli::engine::session::ContextHeadPersistence,
     api_messages: Vec<synaps_cli::SharedMessage>,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -70,7 +76,7 @@ struct RpcState {
     /// when the turn completes (Done path), then injected for the next turn.
     pending_events: Vec<String>,
     /// Number of consecutive auto-triggered turns since the last real user message.
-    /// Reset to 0 on every real Prompt / FollowUp. Capped at AUTO_TURN_CAP.
+    /// Reset to 0 on every real Prompt / FollowUp. Capped at `auto_turn_cap`.
     consecutive_auto_turns: u32,
     /// `true` while an auto-turn has been reserved but its `spawn_prompt` call
     /// has not yet registered `in_flight`.  Counts as busy so concurrent Prompt
@@ -79,13 +85,15 @@ struct RpcState {
     auto_turn_pending: bool,
     /// Mirror of `config.events.auto_turn` — loaded once at boot.
     events_auto_turn: bool,
+    /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
+    auto_turn_cap: u32,
 }
 
 impl RpcState {
     /// Persist the current conversation to the session file. No-op if the
     /// message list is empty.
     async fn save_session(&mut self) {
-        if self.api_messages.is_empty() {
+        if self.context_head.is_blocked(&self.session) || self.api_messages.is_empty() {
             return;
         }
         self.session.api_messages = self.api_messages.clone();
@@ -100,6 +108,31 @@ impl RpcState {
         if let Err(e) = self.session.save().await {
             tracing::error!(error = %e, "failed to save session");
         }
+    }
+
+    async fn persist_context_head(
+        &mut self,
+        session_id: &str,
+        messages: Vec<synaps_cli::SharedMessage>,
+    ) -> std::io::Result<()> {
+        let mut candidate = self.session.clone();
+        candidate.api_messages = messages;
+        candidate.total_input_tokens = self.total_input_tokens;
+        candidate.total_output_tokens = self.total_output_tokens;
+        candidate.session_cost = self.session_cost;
+        candidate.model = self.runtime.model().to_string();
+        candidate.system_prompt = self.runtime.system_prompt().map(str::to_string);
+        candidate.thinking_level = self.runtime.thinking_level().to_string();
+        candidate.updated_at = chrono::Utc::now();
+        candidate.auto_title();
+        self.context_head
+            .persist(
+                &mut self.session,
+                &mut self.api_messages,
+                session_id,
+                candidate,
+            )
+            .await
     }
 
     /// Returns `true` if the session is busy — either a streaming task is
@@ -156,7 +189,7 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 /// Controls whether a post-flush auto-turn may be reserved:
 ///
 /// * **`true`** (Done path): if all conditions are met (`events_auto_turn` enabled,
-///   buffered events present, `consecutive_auto_turns < AUTO_TURN_CAP`, last
+///   buffered events present, `consecutive_auto_turns` under `auto_turn_cap` (0 = unlimited), last
 ///   message is `role=user`), atomically claim the cap slot, set
 ///   `auto_turn_pending = true`, and return `Some(auto_id)`.  The caller
 ///   **must** forward the id to the scheduler without holding the lock.
@@ -187,7 +220,8 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
     if allow_chain
         && had_buffered
         && st.events_auto_turn
-        && st.consecutive_auto_turns < AUTO_TURN_CAP
+        && !st.context_head.is_blocked(&st.session)
+        && !auto_turn_cap_reached(st.consecutive_auto_turns, st.auto_turn_cap)
         && st
             .api_messages
             .last()
@@ -195,7 +229,8 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
             .unwrap_or(false)
     {
         // Atomically claim the turn and reserve pending flag.
-        if claim_auto_turn(&mut st.consecutive_auto_turns) {
+        let cap = st.auto_turn_cap;
+        if claim_auto_turn_with_cap(&mut st.consecutive_auto_turns, cap) {
             st.auto_turn_pending = true;
             let auto_id = format!("auto:post-flush-{}", chrono::Utc::now().timestamp_millis());
             return Some(auto_id);
@@ -277,6 +312,17 @@ async fn spawn_prompt(
             st.auto_turn_pending = false;
             return;
         }
+        if st.context_head.is_blocked(&st.session) {
+            st.auto_turn_pending = false;
+            let _ = wtx
+                .send(RpcEvent::Error {
+                    id: Some(prompt_id.clone()),
+                    message: "context head is unverified — start a new session or restart/resume"
+                        .into(),
+                })
+                .await;
+            return;
+        }
         st.api_messages.clone()
     };
 
@@ -312,6 +358,16 @@ async fn spawn_prompt(
         };
 
         while let Some(ev) = stream.next().await {
+            if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                session_id,
+                messages,
+                receipt,
+            }) = ev
+            {
+                let mut st = state.lock().await;
+                receipt.complete(st.persist_context_head(&session_id, messages).await);
+                continue;
+            }
             // Peel off MessageHistory first so we can MOVE the payload into
             // state instead of cloning it (the vec can be several MB).
             if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
@@ -515,6 +571,46 @@ async fn spawn_prompt(
 
 // ─── Per-command handlers ─────────────────────────────────────────────────────
 
+/// Validate RPC attachment paths: must be absolute, no `..` components.
+fn rpc_attachment_paths(attachments: &[RpcAttachment]) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = Vec::with_capacity(attachments.len());
+    for a in attachments {
+        let path = std::path::PathBuf::from(&a.path);
+        if !path.is_absolute() {
+            return Err(format!("attachment path must be absolute: {}", a.path));
+        }
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(format!("attachment path must not contain ..: {}", a.path));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Load RPC user content: validate paths, load files, build content blocks,
+/// validate against the session model. Returns the content Value for the
+/// user message.
+async fn load_rpc_user_content(
+    message: &str,
+    attachments: &[RpcAttachment],
+    model: &str,
+    existing_messages: &[std::sync::Arc<serde_json::Value>],
+) -> Result<(serde_json::Value, usize), String> {
+    let paths = rpc_attachment_paths(attachments)?;
+    if paths.is_empty() {
+        return Ok((serde_json::Value::String(message.to_string()), 0));
+    }
+    let content = agent_engine::attachments::build_user_content(message, &paths).await?;
+    let count = paths.len();
+    // Validate the complete history with the proposed message.
+    let candidate = std::sync::Arc::new(serde_json::json!({"role": "user", "content": content}));
+    let mut proposed = existing_messages.to_vec();
+    proposed.push(candidate);
+    agent_engine::runtime::attachments::validate_messages(model, &proposed)?;
+    // Return the content (not the full message) — caller wraps it.
+    Ok((content, count))
+}
+
 /// Handle a `Prompt` or `FollowUp` command (same engine path, no attachments on FollowUp).
 async fn handle_prompt(
     id: String,
@@ -539,8 +635,57 @@ async fn handle_prompt(
         }
     }
 
+    // Load and validate attachments (before acquiring the state lock for push).
+    let (content, attachment_count) = if attachments.is_empty() {
+        (serde_json::Value::String(message.clone()), 0)
+    } else {
+        let (model, msgs) = {
+            let st = state.lock().await;
+            (st.runtime.model().to_string(), st.api_messages.clone())
+        };
+        match load_rpc_user_content(&message, &attachments, &model, &msgs).await {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = writer_tx
+                    .send(RpcEvent::Error {
+                        id: Some(id),
+                        message: e,
+                    })
+                    .await;
+                return;
+            }
+        }
+    };
+
+    // Session-busy recheck after the async load.
+    {
+        let st = state.lock().await;
+        if st.is_busy() {
+            let _ = writer_tx
+                .send(RpcEvent::Error {
+                    id: Some(id),
+                    message: "session became busy during attachment load".to_string(),
+                })
+                .await;
+            return;
+        }
+    }
+
+    // Emit attachment disclosure before pushing.
+    if attachment_count > 0 {
+        let _ = writer_tx
+            .send(RpcEvent::Response {
+                id: id.clone(),
+                command: "attachments.disclosure".to_string(),
+                body: serde_json::json!({
+                    "count": attachment_count,
+                    "message": format!("{attachment_count} attachment(s) loaded from local filesystem"),
+                }),
+            })
+            .await;
+    }
+
     // Push user message and reset the auto-turn counter (real user input).
-    let content = build_user_content(&message, &attachments);
     {
         let mut st = state.lock().await;
         st.consecutive_auto_turns = 0;
@@ -573,6 +718,15 @@ async fn handle_compact(
     // 1. Brief lock: snapshot what the transition needs, then drop guard.
     let (msgs, runtime, session) = {
         let st = state.lock().await;
+        if st.context_head.is_blocked(&st.session) {
+            let _ = writer_tx
+                .send(RpcEvent::Error {
+                    id: Some(id),
+                    message: "cannot compact while the context head is unverified".into(),
+                })
+                .await;
+            return;
+        }
         (
             st.api_messages.clone(),
             st.runtime.clone(),
@@ -674,7 +828,9 @@ async fn handle_new_session(
         );
         let sid = new_sess.id.clone();
         st.session = new_sess;
+        st.context_head = Default::default();
         st.api_messages.clear();
+        st.runtime.reset_context_continuation(&sid, &[]);
         st.total_input_tokens = 0;
         st.total_output_tokens = 0;
         st.session_cost = 0.0;
@@ -940,13 +1096,17 @@ pub async fn run(
     let ready_session_id = session.id.clone();
     let ready_model = runtime.model().to_string();
 
-    // Load config for events_auto_turn (default: true per SynapsConfig defaults).
-    let events_auto_turn = load_config().events.auto_turn;
+    // Load config for events_auto_turn (default: true per SynapsConfig defaults)
+    // and the consecutive auto-turn cap (default 5; 0 = unlimited).
+    let boot_config = load_config();
+    let events_auto_turn = boot_config.events.auto_turn;
+    let auto_turn_cap = boot_config.events.auto_turn_cap;
 
     // 4. Build shared state.
     let state = Arc::new(Mutex::new(RpcState {
         runtime,
         session,
+        context_head: Default::default(),
         api_messages: initial_messages,
         total_input_tokens: initial_in,
         total_output_tokens: initial_out,
@@ -956,6 +1116,7 @@ pub async fn run(
         consecutive_auto_turns: 0,
         auto_turn_pending: false,
         events_auto_turn,
+        auto_turn_cap,
     }));
 
     // 5. Spawn the writer task that owns stdout.
@@ -1003,6 +1164,7 @@ pub async fn run(
                     let mut st = state_d.lock().await;
                     let busy = st.is_busy();
                     let events_auto_turn = st.events_auto_turn;
+                    let auto_turn_cap = st.auto_turn_cap;
                     let consecutive = st.consecutive_auto_turns;
                     // Drain: split borrows explicitly to satisfy the borrow checker
                     // for the drain call, then drop the split borrow before
@@ -1031,11 +1193,20 @@ pub async fn run(
 
                     // Decide auto-turn: only when idle + enabled + wake says RunTurn.
                     let auto_id = if !busy && events_auto_turn {
-                        let action =
-                            wake_action(&drained, &st.api_messages, false, true, consecutive);
+                        let action = wake_action_with_cap(
+                            &drained,
+                            &st.api_messages,
+                            false,
+                            true,
+                            consecutive,
+                            auto_turn_cap,
+                        );
                         if action == WakeAction::RunTurn {
                             // Atomically claim and reserve — one turn per batch.
-                            if claim_auto_turn(&mut st.consecutive_auto_turns) {
+                            if claim_auto_turn_with_cap(
+                                &mut st.consecutive_auto_turns,
+                                auto_turn_cap,
+                            ) {
                                 st.auto_turn_pending = true;
                                 let first_id = drained
                                     .first()
@@ -1333,4 +1504,133 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod context_head_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn context_head_rejection_blocks_shutdown_save_and_auto_chain() {
+        let mut session = Session::new("synthetic", "medium", Some("host authority"));
+        session.id = "synthetic-rpc-context-head".into();
+        session.api_messages = vec![Arc::new(serde_json::json!({
+            "role":"user", "content":"original synthetic head"
+        }))];
+        let old_messages = session.api_messages.clone();
+        let mut st = RpcState {
+            runtime: Runtime::new_headless(),
+            session,
+            context_head: Default::default(),
+            api_messages: old_messages.clone(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            session_cost: 0.0,
+            in_flight: None,
+            pending_events: vec!["synthetic pending event".into()],
+            consecutive_auto_turns: 0,
+            auto_turn_pending: false,
+            events_auto_turn: true,
+            auto_turn_cap: 5,
+        };
+        let (receipt, acknowledged) = synaps_cli::core::context_head::ContextHeadReceipt::channel();
+        receipt.complete(st.persist_context_head("wrong-session", Vec::new()).await);
+        assert!(acknowledged.await.unwrap().is_err());
+        assert_eq!(st.api_messages, old_messages);
+        let state = Mutex::new(st);
+        assert!(terminal_flush(&state, true).await.is_none());
+        let mut st = state.lock().await;
+        assert!(!st.auto_turn_pending);
+        assert_eq!(st.consecutive_auto_turns, 0);
+        assert_eq!(st.api_messages.len(), 2); // buffered event retained, not inferred
+        st.save_session().await; // blocked, no real filesystem access
+        assert_eq!(st.session.api_messages, old_messages);
+        let (writer, mut frames) = mpsc::channel(8);
+        drop(st);
+        let state = Arc::new(state);
+        handle_compact("compact-test".into(), state, writer).await;
+        assert!(matches!(frames.recv().await, Some(RpcEvent::Error { .. })));
+    }
+}
+
+#[cfg(test)]
+mod rpc_attachment_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_attachment_paths_validates_absolute_and_no_parent() {
+        // Absolute path without .. → ok
+        let good = vec![RpcAttachment {
+            path: "/tmp/image.png".into(),
+            name: None,
+            mime: None,
+        }];
+        assert!(rpc_attachment_paths(&good).is_ok());
+
+        // Relative path → error
+        let relative = vec![RpcAttachment {
+            path: "relative/image.png".into(),
+            name: None,
+            mime: None,
+        }];
+        assert!(rpc_attachment_paths(&relative).is_err());
+
+        // Path with .. → error
+        let dotdot = vec![RpcAttachment {
+            path: "/tmp/../etc/passwd".into(),
+            name: None,
+            mime: None,
+        }];
+        assert!(rpc_attachment_paths(&dotdot).is_err());
+
+        // Empty → ok
+        assert!(rpc_attachment_paths(&[]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_rpc_user_content_text_only() {
+        let (content, count) =
+            load_rpc_user_content("hello", &[], "claude-sonnet-4-20250514", &[])
+                .await
+                .unwrap();
+        assert_eq!(content, "hello");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_rpc_user_content_missing_file_fails() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/nonexistent_rpc_test_file.png".into(),
+            name: None,
+            mime: None,
+        }];
+        let result =
+            load_rpc_user_content("hello", &attachments, "claude-sonnet-4-20250514", &[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_rpc_user_content_real_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "file body").unwrap();
+        let attachments = vec![RpcAttachment {
+            path: path.to_str().unwrap().into(),
+            name: None,
+            mime: None,
+        }];
+        let (content, count) = load_rpc_user_content(
+            "explain",
+            &attachments,
+            "claude-sonnet-4-20250514",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        // Content should be an array with text block + document block.
+        let arr = content.as_array().unwrap();
+        assert_eq!(arr[0]["text"], "explain");
+        assert_eq!(arr[1]["type"], "document");
+    }
 }

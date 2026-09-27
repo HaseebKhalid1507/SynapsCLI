@@ -243,6 +243,8 @@ pub async fn run(config_path: String, trigger_context: String) {
         );
         std::process::exit(1);
     });
+    // Bind notes independently of worker settings and memory-context consent.
+    runtime.apply_memory_backend_config(&synaps_cli::config::load_config().memory_backend);
     // Task 23: headless autonomous workers run under the AUTONOMOUS turn
     // budget (typed config overrides applied) — the tightest role.
     runtime.set_turn_budget(synaps_cli::runtime::budget::TurnBudget::from_config(
@@ -321,6 +323,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         })
     };
     let agent_registration = synaps_cli::events::registry::SessionRegistration {
+        kind: synaps_cli::events::registry::REGISTRATION_KIND.to_string(),
         session_id: agent_session_id.clone(),
         name: Some(agent_name.clone()),
         socket_path: agent_socket_path.clone(),

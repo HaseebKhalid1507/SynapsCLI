@@ -216,13 +216,7 @@ impl Tool for BashTool {
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
         let script = bash_script_with_secure_sudo(command);
-        run_shell_command(
-            &script,
-            ShellSpec::Bash,
-            params["timeout"].as_u64(),
-            ctx,
-        )
-        .await
+        run_shell_command(&script, ShellSpec::Bash, params["timeout"].as_u64(), ctx).await
     }
 }
 
@@ -256,11 +250,18 @@ pub(crate) async fn run_shell_command(
 
         let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = match spec {
             ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
-            ShellSpec::PowerShell => {
-                (powershell_program(), vec!["-NoProfile".into(), "-Command".into(), script.into()])
-            }
+            ShellSpec::PowerShell => (
+                powershell_program(),
+                vec!["-NoProfile".into(), "-Command".into(), script.into()],
+            ),
         };
         let mut cmd = tokio::process::Command::new(program);
+        if let Some(cwd) = ctx.capabilities.cwd.as_deref() {
+            cmd.current_dir(cwd);
+        }
+        if let Some(env) = &ctx.capabilities.env {
+            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -486,8 +487,30 @@ pub(crate) async fn run_shell_command(
                 if status.success() || was_truncated {
                     Ok(output)
                 } else {
+                    let mut notice = String::new();
+                    // T5: when a command fails and references a stripped secret,
+                    // append a notice (once per name per session).
+                    if !ctx.capabilities.env_stripped.is_empty() {
+                        let mut warned = ctx.capabilities.env_warned.lock().unwrap_or_else(|p| p.into_inner());
+                        for name in &ctx.capabilities.env_stripped {
+                            if warned.contains(name) {
+                                continue;
+                            }
+                            // Word-boundary match: covers $NAME, ${NAME},
+                            // ${NAME:?}, ${NAME:-x}, $env:NAME and NAME=…
+                            if references_env_name(script, name) {
+                                notice.push_str(&format!(
+                                    "\nnote: ${name} was stripped from the session env as a secret; \
+                                     reattach from a shell that has it \
+                                     (synaps --system … from that shell) \
+                                     — the daemon never receives credentials."
+                                ));
+                                warned.insert(name.clone());
+                            }
+                        }
+                    }
                     Err(RuntimeError::Tool(format!(
-                        "Command failed (exit {}):\n{}",
+                        "Command failed (exit {}):\n{}{notice}",
                         status.code().unwrap_or(-1),
                         output
                     )))
@@ -503,6 +526,26 @@ pub(crate) async fn run_shell_command(
             ))),
         }
     }
+}
+
+/// Does `script` mention `name` as a whole identifier (not as a substring of
+/// a longer one)? Used by the T5 stripped-secret notice; a false positive
+/// costs one advisory line on an already-failing command, a false negative
+/// hides the reason the command failed — so err towards matching.
+fn references_env_name(script: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = script[from..].find(name) {
+        let start = from + pos;
+        let end = start + name.len();
+        let before_ok = !script[..start].chars().next_back().is_some_and(is_ident);
+        let after_ok = !script[end..].chars().next().is_some_and(is_ident);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -962,5 +1005,92 @@ exit 1
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
         assert!(error.contains("failed") || error.contains("exit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_honours_capability_cwd_when_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expected = tmp.path().canonicalize().unwrap();
+        let mut ctx = create_tool_context();
+        ctx.capabilities.cwd = Some(tmp.path().to_path_buf());
+        let out = BashTool
+            .execute(json!({"command": "pwd -P"}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), expected.to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_inherits_process_cwd_when_capability_cwd_is_none() {
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let ctx = create_tool_context();
+        assert!(ctx.capabilities.cwd.is_none());
+        let out = BashTool
+            .execute(json!({"command": "pwd -P"}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), expected.to_string_lossy());
+    }
+
+    #[test]
+    fn references_env_name_is_word_bounded() {
+        assert!(references_env_name("echo ${GH_TOKEN:?}", "GH_TOKEN"));
+        assert!(references_env_name("echo $GH_TOKEN", "GH_TOKEN"));
+        assert!(references_env_name("GH_TOKEN=x gh auth", "GH_TOKEN"));
+        assert!(references_env_name("$env:GH_TOKEN", "GH_TOKEN"));
+        assert!(!references_env_name("echo $GH_TOKEN_FILE", "GH_TOKEN"));
+        assert!(!references_env_name("echo $MY_GH_TOKEN", "GH_TOKEN"));
+        assert!(!references_env_name("gh auth status", "GH_TOKEN"));
+    }
+
+    /// T5 notice: non-zero exit + script references stripped var → notice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_notice_on_stripped_secret_reference() {
+        let warned = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        // --- case 1: non-zero exit + reference → notice
+        let mut ctx = create_tool_context();
+        ctx.capabilities.env_stripped = vec!["GH_TOKEN".into()];
+        ctx.capabilities.env_warned = warned.clone();
+        let err = BashTool
+            .execute(json!({"command": "echo ${GH_TOKEN:?} 2>&1; exit 1"}), ctx)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("note: $GH_TOKEN was stripped"),
+            "notice must name the var: {msg}"
+        );
+
+        // --- case 2: zero exit → no notice
+        let mut ctx2 = create_tool_context();
+        ctx2.capabilities.env_stripped = vec!["GH_TOKEN".into()];
+        ctx2.capabilities.env_warned = warned.clone();
+        let out = BashTool
+            .execute(json!({"command": "echo $GH_TOKEN; exit 0"}), ctx2)
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("note:"),
+            "zero exit must not produce a notice: {out}"
+        );
+
+        // --- case 3: second failure → no duplicate (same Arc)
+        let mut ctx3 = create_tool_context();
+        ctx3.capabilities.env_stripped = vec!["GH_TOKEN".into()];
+        ctx3.capabilities.env_warned = warned.clone();
+        let err2 = BashTool
+            .execute(json!({"command": "echo ${GH_TOKEN}; exit 1"}), ctx3)
+            .await
+            .unwrap_err();
+        let msg2 = format!("{err2}");
+        assert!(
+            !msg2.contains("note: $GH_TOKEN was stripped"),
+            "dedup must suppress the second notice: {msg2}"
+        );
     }
 }

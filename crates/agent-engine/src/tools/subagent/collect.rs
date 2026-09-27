@@ -25,10 +25,10 @@ impl Tool for SubagentCollectTool {
 
     fn description(&self) -> &str {
         "Retrieve a reactive subagent's result. Non-blocking — returns immediately \
-         (status + partial output if still running). Standard flow: poll with \
-         subagent_status while the subagent runs; when subagent_status reports a \
-         terminal status (completed/failed/timed_out/cancelled), call this ONCE with \
-         reconciled=true — that single call both collects the result and attests \
+         (status + partial output if still running). Standard flow: dispatch with \
+         subagent_start, carry on (or end your turn) — the subagent's completion event \
+         wakes you with a terminal status (completed/failed/timed_out/cancelled); then \
+         call this ONCE with reconciled=true — that single call both collects the result and attests \
          reconciliation, clearing the completion gate. Calling without reconciled=true \
          is an inspection-only read: it leaves the completion gate blocked and forces \
          a second call. reconciled=true is idempotent and safe on repeats."

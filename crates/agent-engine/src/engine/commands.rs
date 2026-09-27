@@ -188,8 +188,15 @@ pub fn handle_engine_command(
     // owns it) — the TUI intercepts `/context` earlier and passes its own
     // history through `context_command`.
     match cmd {
+        "context" if !arg.is_empty() => {
+            return Some(match runtime.context_management_command(arg) {
+                Ok(s) => CommandResult::Output(s),
+                Err(e) => CommandResult::Error(e),
+            })
+        }
         "context" => return Some(context_command(runtime, None)),
         "trace" => return Some(trace_command(arg, runtime)),
+        "budget" => return Some(budget_command(arg, runtime)),
         "memory" => return Some(memory_command(arg, runtime)),
         _ => {}
     }
@@ -282,7 +289,66 @@ pub fn context_command(
     runtime: &crate::Runtime,
     history: Option<&[crate::SharedMessage]>,
 ) -> CommandResult {
-    CommandResult::Output(runtime.context_report(history).render())
+    CommandResult::Output(format!(
+        "{}\n{}",
+        runtime.context_report(history).render(),
+        runtime.context_management_status()
+    ))
+}
+
+/// Explicit operator control of future turns. No config writes, inference,
+/// history mutation, or changes to an already-running stream's budget snapshot.
+/// This is a frontend slash command, never a model-callable budget renewal.
+pub fn budget_command(arg: &str, runtime: &mut crate::Runtime) -> CommandResult {
+    const USAGE: &str = "usage: /budget [status] | /budget time <duration> (positive whole seconds/minutes/hours, e.g. 30m or 4h; maximum 24h)";
+    let words: Vec<_> = arg.split_whitespace().collect();
+    match words.as_slice() {
+        [] | ["status"] => {
+            let budget = runtime.turn_budget();
+            CommandResult::Output(format!(
+                "Turn budget (configured for future turns, not live usage):\n\
+                 wall-clock: {}s; provider rounds: {} (+{} bounded renewals); tool calls: {}; tool-result bytes: {}\n\
+                 context tokens: {}; cost USD: {}\n\
+                 Committed context rollovers reset only elapsed time; other limits remain cumulative. /budget time 4h changes only the next-turn time allowance in this runtime; it is not saved to config or session storage.",
+                budget.max_elapsed.as_secs(),
+                budget.max_provider_rounds,
+                budget.max_round_renewals,
+                budget.max_tool_calls,
+                budget.max_accumulated_tool_result_bytes,
+                budget.max_context_tokens.map_or_else(|| "unset".into(), |v| v.to_string()),
+                budget.max_cost_usd.map_or_else(|| "unset".into(), |v| v.to_string()),
+            ))
+        }
+        ["time", duration] => {
+            let Some(seconds) = parse_turn_duration(duration) else {
+                return CommandResult::Error(USAGE.into());
+            };
+            let mut budget = runtime.turn_budget().clone();
+            budget.max_elapsed = std::time::Duration::from_secs(seconds);
+            runtime.set_turn_budget(budget);
+            CommandResult::Output(format!(
+                "Turn wall-clock limit set to {seconds}s for future turns in this runtime only (not saved). Running turns, worker budgets and all other limits are unchanged. Send a prompt to continue retained history; this command does not start a turn."
+            ))
+        }
+        _ => CommandResult::Error(USAGE.into()),
+    }
+}
+
+fn parse_turn_duration(value: &str) -> Option<u64> {
+    let (digits, multiplier) = if let Some(digits) = value.strip_suffix('s') {
+        (digits, 1)
+    } else if let Some(digits) = value.strip_suffix('m') {
+        (digits, 60)
+    } else if let Some(digits) = value.strip_suffix('h') {
+        (digits, 3600)
+    } else {
+        return None;
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = digits.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    (1..=86_400).contains(&seconds).then_some(seconds)
 }
 
 /// `/trace next|next content|status` (Task 12): explicit trace controls.
@@ -900,6 +966,134 @@ mod tests {
             }
             other => panic!("expected Output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn budget_duration_parser_is_strict_and_bounded() {
+        for (input, seconds) in [
+            ("1s", 1),
+            ("30m", 1800),
+            ("4h", 14400),
+            ("24h", 86400),
+            ("1440m", 86400),
+            ("86400s", 86400),
+        ] {
+            assert_eq!(parse_turn_duration(input), Some(seconds), "{input}");
+        }
+        for input in [
+            "",
+            "s",
+            "0s",
+            "0h",
+            "25h",
+            "86401s",
+            "1441m",
+            "4",
+            "4H",
+            "-1h",
+            "+1h",
+            "1.5h",
+            "1h30m",
+            " 4h",
+            "4 h",
+            "4h ",
+            "1e3s",
+            "∞h",
+            "１２h",
+            "18446744073709551615h",
+            "18446744073709551616s",
+            "off",
+            "unlimited",
+        ] {
+            assert_eq!(parse_turn_duration(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn budget_command_status_and_invalid_arguments_do_not_mutate() {
+        let mut runtime = crate::Runtime::new_headless();
+        let original = runtime.turn_budget().clone();
+        for arg in ["", "status", "  status  "] {
+            let Some(CommandResult::Output(text)) =
+                handle_engine_command("budget", arg, &mut runtime)
+            else {
+                panic!("{arg}");
+            };
+            assert!(text.contains("wall-clock: 7200s"));
+            assert!(text.contains("not live usage"));
+            assert!(text.contains("tool calls: 512"));
+            assert_eq!(runtime.turn_budget(), &original);
+        }
+        for arg in [
+            "time",
+            "time 0s",
+            "time 25h",
+            "time 1h trailing",
+            "status 4h",
+            "off",
+            "reset",
+        ] {
+            assert!(
+                matches!(
+                    handle_engine_command("budget", arg, &mut runtime),
+                    Some(CommandResult::Error(_))
+                ),
+                "{arg}"
+            );
+            assert_eq!(runtime.turn_budget(), &original);
+        }
+    }
+
+    #[test]
+    fn budget_command_changes_only_future_runtime_time_limit() {
+        use crate::runtime::budget::{TurnBudget, TurnBudgetMeter, TurnRole};
+        let mut runtime = crate::Runtime::new_headless();
+        let original = TurnBudget {
+            max_elapsed: std::time::Duration::ZERO,
+            max_tool_calls: 11,
+            max_context_tokens: Some(456),
+            max_cost_usd: Some(0.75),
+            ..TurnBudget::for_role(TurnRole::Foreground)
+        };
+        runtime.set_turn_budget(original.clone());
+        let mut in_flight = TurnBudgetMeter::new(runtime.turn_budget().clone());
+        let other_runtime = runtime.clone();
+        let Some(CommandResult::Output(text)) =
+            handle_engine_command("budget", "time 4h", &mut runtime)
+        else {
+            panic!("expected output");
+        };
+        assert!(text.contains("14400s"));
+        assert!(text.contains("not saved"));
+        let mut expected = original.clone();
+        expected.max_elapsed = std::time::Duration::from_secs(14400);
+        assert_eq!(runtime.turn_budget(), &expected);
+        assert_eq!(other_runtime.turn_budget(), &original);
+        assert_eq!(
+            in_flight.begin_round(),
+            Err(agent_core::BudgetDimension::WallClock)
+        );
+        assert!(TurnBudgetMeter::new(runtime.turn_budget().clone())
+            .begin_round()
+            .is_ok());
+        assert_eq!(
+            crate::Runtime::new_headless()
+                .turn_budget()
+                .max_elapsed
+                .as_secs(),
+            7200
+        );
+        assert_eq!(
+            TurnBudget::for_role(TurnRole::Worker).max_elapsed.as_secs(),
+            3600
+        );
+        assert_eq!(
+            TurnBudget::for_role(TurnRole::Autonomous)
+                .max_elapsed
+                .as_secs(),
+            900
+        );
+        assert!(crate::skills::BUILTIN_COMMANDS.contains(&"budget"));
     }
 
     // ── /memory (task A5, spec §7.3) ────────────────────────────────────────

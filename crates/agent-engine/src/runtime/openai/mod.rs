@@ -209,6 +209,59 @@ pub async fn try_route(
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
+    try_route_with_memory_backend(
+        model,
+        client,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        temperature,
+        max_tokens,
+        thinking_budget,
+        reasoning_level,
+        cancel,
+        source,
+        cache,
+        max_retries,
+        codex_request_role,
+        tool_session_id,
+        session_tool_set,
+        None,
+        trace,
+        suppress_stream_deltas,
+    )
+    .await
+}
+
+/// Runtime route retaining the host's immutable memory binding. The public
+/// compatibility facade above has no runtime capability and cannot mint one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_route_with_memory_backend(
+    model: &str,
+    client: &reqwest::Client,
+    tools_schema: &std::sync::Arc<Vec<serde_json::Value>>,
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::runtime::types::StreamEvent>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    thinking_budget: u32,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    cancel: &tokio_util::sync::CancellationToken,
+    source: &crate::auth::CredentialSource,
+    cache: &crate::auth::TokenCache,
+    max_retries: u32,
+    codex_request_role: catalog::CodexRequestRole,
+    tool_session_id: Option<&crate::tools::activation::SessionId>,
+    session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
+    memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    trace: &crate::runtime::trace::TraceContext,
+    suppress_stream_deltas: bool,
+) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
+    if let Err(error) = super::attachments::validate_messages(model, messages) {
+        return Some(Err(error.into()));
+    }
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
             // Extension-hosted provider: routing gates, audits, and the
@@ -230,6 +283,7 @@ pub async fn try_route(
                     cancel,
                     tool_session_id,
                     session_tool_set,
+                    memory_backend,
                     trace,
                 )
                 .await,
@@ -270,6 +324,7 @@ pub async fn try_route(
                 trace,
                 exact_wire_bytes,
                 suppress_stream_deltas,
+                max_retries,
             )
             .await,
         ),

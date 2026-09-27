@@ -81,16 +81,20 @@ pub(crate) fn is_allowed_google_gemini_path(path: &str) -> bool {
 pub const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
 /// Allow only the official Codex model-catalog path:
-/// `GET /models?client_version=<non-empty>`.
+/// `GET /codex/models?client_version=<non-empty>`.
 ///
 /// Query is constrained to a single non-empty `client_version` key — no extra
-/// params, no empty version, no bare `/models`. Same-host inference paths
-/// (`/codex/responses`, …) stay out of this catalog-only allowlist.
+/// params, no empty version, no bare `/codex/models`. Same-host inference
+/// paths (`/codex/responses`, …) stay out of this catalog-only allowlist, as
+/// does the ChatGPT web picker at `/models` (different schema, not a Codex
+/// catalog).
+pub(crate) const OPENAI_CODEX_MODELS_PATH: &str = "/codex/models";
+
 pub(crate) fn is_allowed_openai_codex_path(path: &str) -> bool {
     let Some((base, query)) = path.split_once('?') else {
         return false;
     };
-    if base != "/models" {
+    if base != OPENAI_CODEX_MODELS_PATH {
         return false;
     }
     let mut client_version: Option<&str> = None;
@@ -2357,9 +2361,23 @@ pub fn broker_from_source(
 static GLOBAL_BROKER: std::sync::RwLock<Option<Arc<dyn CredentialBroker>>> =
     std::sync::RwLock::new(None);
 
+static GLOBAL_BROKER_INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Install the process-wide broker (called once from runtime configuration).
+/// Every call is counted ([`global_broker_install_count`]) and, when
+/// `SYNAPS_MEM_TRACE=1`, logged — the daemon-mode S7 gate asserts the count
+/// stays at 1 across subagent spawns.
 pub fn set_global_broker(broker: Arc<dyn CredentialBroker>) {
     *GLOBAL_BROKER.write().expect("broker registry poisoned") = Some(broker);
+    let n = GLOBAL_BROKER_INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if crate::core::memstat::mem_trace_enabled() {
+        tracing::info!(target: "agent_core::memstat", installs = n, "global broker installed");
+    }
+}
+
+/// How many times [`set_global_broker`] has run in this process.
+pub fn global_broker_install_count() -> u64 {
+    GLOBAL_BROKER_INSTALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The process-wide broker. Defaults to the in-process [`LocalBroker`] so
@@ -2775,14 +2793,15 @@ mod tests {
         );
     }
 
-    /// Codex catalog proxy is pinned to GET /models?client_version=… only.
-    /// Arbitrary same-host paths and query shapes are denied.
+    /// Codex catalog proxy is pinned to GET /codex/models?client_version=…
+    /// only. Arbitrary same-host paths and query shapes are denied — including
+    /// the ChatGPT web picker at `/models`, which is not a Codex catalog.
     #[test]
     fn proxy_allows_only_pinned_openai_codex_models_path() {
         let allowed = ProxyRequest {
             provider: "openai-codex".into(),
             method: ProxyMethod::Get,
-            path: "/models?client_version=0.6.0".into(),
+            path: "/codex/models?client_version=0.153.3".into(),
             body: None,
             stream: false,
             body_bytes: None,
@@ -2793,13 +2812,15 @@ mod tests {
         );
 
         for path in [
-            "/models",
-            "/models?client_version=",
-            "/models?foo=1",
-            "/models?client_version=0.6.0&extra=1",
+            "/codex/models",
+            "/codex/models?client_version=",
+            "/codex/models?foo=1",
+            "/codex/models?client_version=0.153.3&extra=1",
             "/codex/responses",
-            "/backend-api/models?client_version=0.6.0",
-            "/v1/models?client_version=0.6.0",
+            "/models",
+            "/models?client_version=0.153.3",
+            "/backend-api/codex/models?client_version=0.153.3",
+            "/v1/models?client_version=0.153.3",
             "/chat/completions",
         ] {
             let req = ProxyRequest {
@@ -2820,7 +2841,7 @@ mod tests {
         let post = ProxyRequest {
             provider: "openai-codex".into(),
             method: ProxyMethod::Post,
-            path: "/models?client_version=0.6.0".into(),
+            path: "/codex/models?client_version=0.153.3".into(),
             body: None,
             stream: false,
             body_bytes: None,

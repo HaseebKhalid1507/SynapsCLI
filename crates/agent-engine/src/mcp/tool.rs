@@ -39,7 +39,15 @@ impl Tool for McpTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let binding = ctx
+            .capabilities
+            .memory_backend
+            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
+        if binding.exclusive() && crate::memory_backend::competing_note_tool(&self.server_tool_name)
+        {
+            return Err(RuntimeError::Tool("independent MCP memory is disabled by the host-selected backend; use short memory tools".into()));
+        }
         let mut conn = self.connection.lock().await;
         conn.call_tool(&self.server_tool_name, params)
             .await

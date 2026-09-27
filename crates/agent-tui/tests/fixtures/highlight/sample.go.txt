@@ -1,0 +1,27 @@
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+// Foo is a type.
+type Foo struct {
+	Name string `json:"name"`
+	n    int
+}
+
+func (f *Foo) String() string { return fmt.Sprintf("%s:%d", f.Name, f.n) }
+
+func main() {
+	ch := make(chan int, 10)
+	go func() { ch <- 1 }()
+	select {
+	case v := <-ch:
+		fmt.Println(v, 0x1f, 1e9, 'c', `raw`)
+	default:
+		os.Exit(1)
+	}
+	var m map[string][]interface{} = nil
+	_ = m
+}

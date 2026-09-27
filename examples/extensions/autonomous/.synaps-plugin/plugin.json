@@ -1,0 +1,22 @@
+{
+  "name": "autonomous",
+  "version": "0.1.5",
+  "description": "Explicit local TUI autonomous session driver; loop, limits and favorite failover policy stay in this plugin.",
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "auto",
+      "description": "Explicitly start/stop an autonomous run, inspect status, or configure favorites.",
+      "interactive": true,
+      "subcommands": ["start", "stop", "status", "favorites"]
+    }
+  ],
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["main.py"],
+    "permissions": ["session.drive"],
+    "hooks": []
+  }
+}

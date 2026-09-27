@@ -1,4 +1,4 @@
-use super::{expand_path, Tool, ToolContext};
+use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 
@@ -76,7 +76,7 @@ impl Tool for EditTool {
             }
         }
 
-        let path = expand_path(raw_path);
+        let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
         let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
             RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
@@ -106,7 +106,7 @@ impl Tool for EditTool {
             .map(|m| m.permissions())
             .ok();
 
-        let tmp_path = path.with_extension("agent-tmp");
+        let tmp_path = super::util::unique_tmp_path(&path);
         tokio::fs::write(&tmp_path, &new_content)
             .await
             .map_err(|e| RuntimeError::Tool(format!("Failed to write file: {}", e)))?;
@@ -241,5 +241,51 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&test_file);
+    }
+
+    // Regression: two files sharing a stem but differing by extension must not
+    // collide on the same temp path. `Path::with_extension("agent-tmp")` mapped
+    // both `x.md` and `x.exe` to `x.agent-tmp`; concurrent edits corrupted each
+    // other and left an orphan temp file.
+    #[tokio::test]
+    async fn test_edit_same_stem_different_ext_no_collision() {
+        let dir = std::env::temp_dir().join(format!("edit_collision_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("x.md");
+        let exe = dir.join("x.exe");
+        std::fs::write(&md, "hello from MD\ncommon").unwrap();
+        std::fs::write(&exe, "hello from EXE\ncommon").unwrap();
+
+        let tool = EditTool;
+        let edit_md = tool.execute(
+            json!({"path": md.to_string_lossy(), "old_string": "hello from MD", "new_string": "MD EDITED"}),
+            create_tool_context(),
+        );
+        let edit_exe = tool.execute(
+            json!({"path": exe.to_string_lossy(), "old_string": "hello from EXE", "new_string": "EXE EDITED"}),
+            create_tool_context(),
+        );
+        // Drive both concurrently to exercise the temp-path race.
+        let (r_md, r_exe) = tokio::join!(edit_md, edit_exe);
+        r_md.unwrap();
+        r_exe.unwrap();
+
+        // Each file keeps its own edited content — no cross-contamination.
+        let md_content = std::fs::read_to_string(&md).unwrap();
+        let exe_content = std::fs::read_to_string(&exe).unwrap();
+        assert!(md_content.contains("MD EDITED"), "md content: {md_content:?}");
+        assert!(!md_content.contains("EXE"), "md leaked exe content: {md_content:?}");
+        assert!(exe_content.contains("EXE EDITED"), "exe content: {exe_content:?}");
+        assert!(!exe_content.contains("from MD"), "exe leaked md content: {exe_content:?}");
+
+        // No orphan temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("agent-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "orphan temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
