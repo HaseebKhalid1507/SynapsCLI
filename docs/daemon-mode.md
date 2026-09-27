@@ -337,8 +337,18 @@ thing: the daemon itself.
 1. **Client captures env at Hello.** `Hello::new()` calls `capture_client_env()`
    which snapshots `std::env::vars()`, sorts by key, and strips:
    - Client-only prefixes: `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*`, `SYNAPS_DAEMON_*`, `SYNAPS_MEM_TRACE*`
-   - Secrets (case-insensitive): `*_API_KEY`, `*_TOKEN`, `*_SECRET*`, `*PASSWORD*`,
-     `AWS_SECRET_*`, `*_CREDENTIALS`
+   - Secret **names** (case-insensitive, `config::is_secret_key`): `*_KEY` (so `*_API_KEY`),
+     `*_TOKEN`, `*_CREDENTIALS`, `*_PAT`, `*_DSN`, `*SECRET*`, `*PASSWORD*`, `*PASSWD*`.
+     Suffix-anchored where it says so: `SSH_KEY_PATH` and `API_TOKEN_TTL_SECS` are kept.
+   - Secret **values**, whatever the key is called (`config::is_secret_env_value`): any URL
+     with userinfo, anywhere in the value — `scheme://user:pass@host` or `scheme://key@host`
+     (`DATABASE_URL=postgres://u:p@h`, an authenticated `HTTPS_PROXY`, a Sentry DSN, a JDBC
+     option string, a list of URLs). A username-only URL (`ssh://git@host`) counts too.
+   - Stripped secrets are recorded **by name** in `env_stripped`; their values go nowhere.
+     Consequence: the session's tools do not see them. A command that fails while
+     referencing one gets the notice below; an authenticated `HTTPS_PROXY` is used
+     implicitly by curl/git, so it fails without one. For a workflow that needs a secret
+     in the agent's shell, run in-process (`SYNAPS_DAEMON=0`).
 2. **Daemon copies `hello.env` → `config.env` on `Attach::Create` only.**
    Attaching to an existing session never changes its env (creator's env is final).
 3. **`SessionConfig.env` → `Runtime.env` → `ToolCapabilities.env`** — same pipe as cwd.
@@ -407,8 +417,9 @@ env on `--continue` is written back so the next restart sees the latest.
 3. The daemon's own process env is **never** used for a daemon-hosted session.
 
 **Belt-and-braces:** the journal-side write runs every env pair through
-`is_secret_key` — a value for a denylisted key is dropped even if a future
-client forgets to strip.  The `env_stripped` list records **names only**.
+`is_secret_env` — the name denylist **or** a credential-carrying value — so a
+secret is dropped even if a future client forgets to strip. The `env_stripped`
+list records **names only**.
 
 **Loud notices:** when a bash command exits non-zero AND the script text
 references a name from `env_stripped` as a whole identifier (`$NAME`,
