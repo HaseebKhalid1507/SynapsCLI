@@ -6,7 +6,6 @@
 //! other platforms so callers never need their own `cfg`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
 /// What a process in a session tree is, classified from its cmdline.
@@ -526,6 +525,7 @@ fn plugin_name_from_path(arg: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::collections::HashMap;
 
     #[derive(Default)]
     pub(super) struct Status {
