@@ -549,7 +549,9 @@ mod private {
                     self.0.as_raw_fd(),
                     name.as_ptr(),
                     flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                    0o600 as libc::mode_t,
+                    // Variadic mode: C promotes it to unsigned int, and Rust
+                    // refuses a u16 (`mode_t` on macOS) in a variadic call.
+                    0o600 as libc::c_uint,
                 )
             })?;
             file_ok(&file.metadata()?)?;
