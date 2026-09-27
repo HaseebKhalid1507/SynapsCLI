@@ -2,6 +2,90 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] — 2026-09-27
+
+**It's Daemon Time.**
+
+Plain `synaps` is now a thin client over a shared
+background daemon: extensions boot once, sessions are journaled and
+resumable, and more than one client can sit on the same session. The
+context-continuation work (#112) ships alongside it, **off by default**.
+
+### Added
+
+- **Daemon mode, on by default.** Plain `synaps` adopts the running daemon
+  for its profile, or spawns one, and attaches as a thin client. An
+  auto-spawned daemon exits 10 s after its last client leaves; a lost daemon
+  connection exits with code 4. Extensions load once and are shared across
+  sessions and subagents. Measured on real sessions: 74–78% less memory for
+  5–10 sessions, about 2 MB per extra session. (#105, #111, #115, #116, #122)
+- **Several clients on one session:** attach from another terminal (mirror,
+  observe or take over), replay of a parked session on attach, and a bare
+  `--continue`. `synaps daemon reload` swaps in a new binary without ending
+  sessions. (#111, #116)
+- **Session identity:** a session's environment and working directory come
+  from the client that created it, not from the daemon; `--system ./file`
+  is read on the client, by content. (#117, #119)
+- **Secrets never reach the daemon.** A thin client strips secret
+  environment variables before connecting, and they are never written to
+  the session files: secret-looking names (`*_KEY`, `*_TOKEN`, `*SECRET*`,
+  `*PASSWORD*`, `*_CREDENTIALS`, `*_PAT`, `*_DSN`) and any value that
+  carries credentials in a URL (`DATABASE_URL=postgres://user:pass@…`, an
+  authenticated proxy, a Sentry DSN). The agent's tools run with the
+  stripped environment, and a command that fails while referencing a
+  stripped variable gets a notice. An authenticated `HTTPS_PROXY` is used
+  implicitly by curl and git, so it fails without one. (#119, #152)
+- **Daemon and startup settings** in the config file and on the Settings
+  page: `startup.quick_start` (on), `daemon.idle_exit_secs` (10; 0 = never),
+  `daemon.prompt_abandon_secs` (3600), `daemon.parked_evict_secs`,
+  `startup.extensions_ready_timeout_secs`. Environment variables still take
+  precedence. (#138)
+- **Local multimodal attachments:** `/attach`, `/attachments` and `/detach`
+  in the TUI and headless chat, for images, PDFs and UTF-8 text, translated
+  per provider capability. Nothing changes until you attach. (#112, #137)
+- **`/auto` autonomous driver:** explicitly started, one per session, Esc or
+  Ctrl-C cancels. (#128, #137)
+- **Opt-in context continuation, Axel memory backend and project forum**,
+  all off by default (`context_management.mode = off`,
+  `memory.backend = legacy`). The Axel backend needs its separately built
+  sidecar and Linux. (#112, #120, #121, #137)
+- `events.auto_turn_cap` (0 = unlimited). (#106)
+- **Models:** GPT-6 Astra and the Ultra `xhigh` effort for Codex (#110);
+  Grok 4.7 through xAI OAuth Responses (#146).
+- TUI: response start/reset rendering, non-blocking sidecar startup and a
+  `/sidecar` command. (#126)
+
+### Changed
+
+- Subagent tool descriptions: completion is reactive; never sleep or poll.
+  (#118)
+
+### Fixed
+
+- **A bash command that printed output and then failed reached the model
+  as a success** (F28): the output won over the exit status. Affected every
+  build since streaming landed. (#119)
+- A turn where the model spoke before a tool call and then had nothing to
+  add was treated as an error and dropped (F19). (#120)
+- A hostile provider `output_index` could grow memory without bound. (#145)
+- `edit`/`write` atomic writes could collide on the temporary path. (#141)
+- Session saves failed under traverse-only (0711) parent directories. (#150)
+
+### Upgrade notes
+
+- `SYNAPS_DAEMON=0` turns every daemon feature off and runs in-process, as
+  in 0.9. `SYNAPS_DAEMON_ADOPT=0` keeps plain `synaps` in-process while
+  leaving `synaps daemon` and `--attach` available. If the daemon cannot
+  start, plain `synaps` falls back to in-process with a notice.
+- In daemon mode the agent's tools no longer see secret environment
+  variables (see "Secrets never reach the daemon" above). Use
+  `SYNAPS_DAEMON=0` for a workflow that needs one in the agent's shell.
+
+### Internal
+
+- Benchmark suite: `BENCHMARKS.md` and `benchmarks/`. (#139, #140)
+- CI flake fixes and the engine test port. (#125, #142, #143, #151)
+
 ## [0.9.1] — 2026-09-07
 
 ### Added
