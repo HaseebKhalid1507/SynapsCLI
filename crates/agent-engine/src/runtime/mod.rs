@@ -489,6 +489,10 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// The `SessionToolSet` retained for `host_tool_session` across stream
+    /// turns (exact activations are session-scoped). Minted empty with the
+    /// runtime and shared by `Clone`, exactly like `host_tool_session`.
+    retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
     /// Conversation/session identity this runtime serves. Keys the
     /// `on_session_start` hook injection (Phase 2 keys everything).
     /// `None` = unkeyed (workers, tests) — reads no injection.
@@ -1024,6 +1028,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
+            retained_tool_set: Default::default(),
             session_id: None,
             cwd: None,
             env: None,
@@ -4056,6 +4061,7 @@ impl Runtime {
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
+            retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
             extension_runtime: self.extension_runtime.clone(),
@@ -4192,6 +4198,7 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
