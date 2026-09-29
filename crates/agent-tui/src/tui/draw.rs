@@ -643,7 +643,7 @@ pub(crate) fn build_render_model(
             } else if prefix_matches.len() > 1 {
                 Some(GhostHint {
                     ghost_text: String::new(),
-                    match_badge: Some(format!("  {} matches · Tab search", prefix_matches.len())),
+                    match_badge: Some(format!("{} matches", prefix_matches.len())),
                 })
             } else {
                 None
@@ -1445,25 +1445,43 @@ pub(crate) fn render_frame_into(
                 let ghost_style = Style::default()
                     .fg(slab.ghost_fg())
                     .add_modifier(Modifier::ITALIC);
-                if let Some(ref badge) = hint.match_badge {
-                    last_row.push(Span::styled(badge.clone(), ghost_style));
-                } else if !hint.ghost_text.is_empty() {
+                // Several matches: the count and "tab search" hang in the
+                // status tab instead (see below).
+                if hint.match_badge.is_none() && !hint.ghost_text.is_empty() {
                     last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
                 }
             } else if model.input.is_empty() {
-                let placeholder = if model.streaming {
+                // Placeholder: the prompt in dim italic, then hints that
+                // fit whole (Noodle: key bright, word dim), dropped from the
+                // right when narrow.
+                let room = w.saturating_sub(INPUT_PREFIX_WIDTH + 1);
+                let lead = if model.streaming {
                     "agent is working \u{2014} type to steer or queue a follow-up"
                 } else {
-                    "Ask anything  \u{b7}  / for commands  \u{b7}  alt+enter for a new line"
+                    "Ask anything"
                 };
-                let room = w.saturating_sub(INPUT_PREFIX_WIDTH + 1);
-                let text: String = placeholder.chars().take(room).collect();
+                let lead: String = lead.chars().take(room).collect();
+                let mut used = display_width(&lead);
                 last_row.push(Span::styled(
-                    text,
+                    lead,
                     Style::default()
                         .fg(slab.dim_fg())
                         .add_modifier(Modifier::ITALIC),
                 ));
+                if !model.streaming {
+                    let key = Style::default().fg(slab.tone_fg(neon::Tone::Key));
+                    let word = Style::default().fg(slab.dim_fg());
+                    for (k, wd) in [("/", " commands"), ("alt+enter", " newline")] {
+                        let seg = 3 + display_width(k) + display_width(wd);
+                        if used + seg > room {
+                            break;
+                        }
+                        last_row.push(Span::raw("   "));
+                        last_row.push(Span::styled(k, key));
+                        last_row.push(Span::styled(wd, word));
+                        used += seg;
+                    }
+                }
             }
         }
         let lines: Vec<ratatui::text::Line> =
@@ -1492,25 +1510,45 @@ pub(crate) fn render_frame_into(
             neon::paint_cursor(frame.buffer_mut(), input_area, &slab, at);
         }
 
-        // Status tab hanging off the bottom edge.
-        let tab = if model.streaming {
-            Some(format!(
-                " {} working {:.1}s \u{b7} esc abort ",
-                SPINNER_FRAMES[spinner_idx], model.prompt_fx.stream_secs
-            ))
+        // Status tab hanging off the bottom edge (key bright, word dim).
+        use neon::Tone::{Key, Live, Word};
+        let tab: Option<Vec<(String, neon::Tone)>> = if model.streaming {
+            Some(vec![
+                (format!("{} working ", SPINNER_FRAMES[spinner_idx]), Live),
+                (format!("{:.1}s", model.prompt_fx.stream_secs), Word),
+                ("   ".into(), Word),
+                ("esc".into(), Key),
+                (" abort".into(), Word),
+            ])
         } else if model
             .ghost_hint
             .as_ref()
             .is_some_and(|h| !h.ghost_text.is_empty())
         {
-            Some(" tab complete ".to_string())
+            Some(vec![("tab".into(), Key), (" complete".into(), Word)])
+        } else if let Some(count) = model
+            .ghost_hint
+            .as_ref()
+            .and_then(|h| h.match_badge.clone())
+        {
+            Some(vec![
+                (count, Word),
+                ("   ".into(), Word),
+                ("tab".into(), Key),
+                (" search".into(), Word),
+            ])
         } else if input_lines > 1 {
-            Some(format!(" {input_lines} lines \u{b7} alt+enter newline "))
+            Some(vec![
+                (format!("{input_lines} lines"), Word),
+                ("   ".into(), Word),
+                ("alt+enter".into(), Key),
+                (" newline".into(), Word),
+            ])
         } else {
             None
         };
         if let Some(tab) = tab {
-            neon::paint_tab(frame.buffer_mut(), input_area, &slab, &tab, model.streaming);
+            neon::paint_tab(frame.buffer_mut(), input_area, &slab, &tab);
         }
     }
 
@@ -1521,9 +1559,10 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Footer ────────────────────────────────────────────────────────────
-    // Keys bright, words at a legible dim (Noodle's contrast, not the old
-    // muted-on-dimmer pair). The info block takes only its real width, and
-    // hints that don't fit are dropped whole instead of clipped mid-word.
+    // Noodle's status bar: keys bright, words at a legible dim, segments set
+    // apart by space instead of dots or pipes. The info block takes only its
+    // real width, and hints that don't fit are dropped whole instead of
+    // clipped mid-word.
     let theme = THEME.load();
     let dim = theme.chrome_dim();
     let cost_str = if model.session_cost > 0.0 {
@@ -1583,9 +1622,12 @@ pub(crate) fn render_frame_into(
                 Span::raw("")
             }
         },
-        Span::styled("\u{03b8}:", Style::default().fg(dim)),
-        Span::styled(model.runtime_thinking.clone(), Style::default().fg(dim)),
-        Span::styled(" \u{2502} ", Style::default().fg(theme.border)),
+        Span::styled("\u{03b8} ", Style::default().fg(dim)),
+        Span::styled(
+            model.runtime_thinking.clone(),
+            Style::default().fg(theme.claude_text),
+        ),
+        Span::raw("   "),
         Span::styled(
             model.runtime_model.clone(),
             Style::default().fg(theme.header_fg),
@@ -1598,7 +1640,6 @@ pub(crate) fn render_frame_into(
 
     let key_style = Style::default().fg(theme.claude_text);
     let label_style = Style::default().fg(dim);
-    let dot_style = Style::default().fg(theme.border);
     let hints: [(&str, &str); 5] = [
         ("ctrl+c", "quit"),
         ("esc", "abort"),
@@ -1624,7 +1665,7 @@ pub(crate) fn render_frame_into(
             break;
         }
         if i > 0 {
-            spans.push(Span::styled(" \u{00b7} ", dot_style));
+            spans.push(Span::raw("   "));
         }
         spans.push(Span::styled(format!("{key} "), key_style));
         spans.push(Span::styled(*label, label_style));
@@ -2082,6 +2123,23 @@ mod neon_prompt_tests {
     }
 
     #[test]
+    fn several_matches_hang_a_search_tab() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("/s"); // several commands start with s
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        let rim = row(&buf, bottom);
+        assert!(
+            rim.contains(" matches") && rim.contains("tab search"),
+            "{rim:?}"
+        );
+        assert!(
+            !row(&buf, top + 1).contains("matches"),
+            "not inline any more"
+        );
+    }
+
+    #[test]
     fn cursor_is_a_lit_block_after_the_text() {
         let mut h = TestHarness::boot_with_size(W, H);
         h.type_str("hi");
@@ -2180,13 +2238,16 @@ mod footer_tests {
             let mut h = TestHarness::boot_with_size(w, 24);
             let row = footer(&mut h, w);
             let shown = HINTS.iter().filter(|hint| row.contains(*hint)).count();
-            let left = row.split("  ").next().unwrap_or("").trim();
-            for part in left.split(" \u{00b7} ").filter(|p| !p.is_empty()) {
-                assert!(
-                    HINTS.contains(&part),
-                    "w={w}: clipped hint {part:?} in {row:?}"
-                );
+            for hint in HINTS {
+                let key = hint.split(' ').next().unwrap();
+                if row.contains(&format!("{key} ")) {
+                    assert!(row.contains(hint), "w={w}: clipped {hint:?} in {row:?}");
+                }
             }
+            assert!(
+                !row.contains('\u{00b7}') && !row.contains('\u{2502}'),
+                "no dots or pipes: {row:?}"
+            );
             if w >= 80 {
                 assert!(shown >= 2, "w={w}: hints visible at common widths: {row:?}");
             }

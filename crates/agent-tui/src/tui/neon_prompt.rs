@@ -519,28 +519,53 @@ pub(crate) fn paint_cursor(buf: &mut Buffer, area: Rect, slab: &Slab, at: Cursor
     }
 }
 
+/// The role of a piece of hint text — Noodle's contrast rule: the thing you
+/// press is bright, the word that explains it is dim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Tone {
+    /// A key or command to type (`input_fg`).
+    Key,
+    /// The explaining word, a count, a time (the legible dim).
+    Word,
+    /// Live activity (`status_streaming`).
+    Live,
+}
+
+impl Slab {
+    /// Foreground for a hint [`Tone`] on the body.
+    pub(crate) fn tone_fg(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Key => color(self.legible(self.text, self.brightest(), 4.5)),
+            Tone::Word => self.dim_fg(),
+            Tone::Live => self.spinner_fg(),
+        }
+    }
+}
+
 /// A status tab hanging off the bottom rim, right-aligned inside the slab:
-/// the body colour extends down under the text. Streaming text is the
-/// theme's streaming colour, hints the legible dim. Skipped when it doesn't
-/// fit.
-pub(crate) fn paint_tab(buf: &mut Buffer, area: Rect, slab: &Slab, text: &str, streaming: bool) {
-    let len = super::text_metrics::width(text) as u16;
+/// the body colour extends down under the text, padded one cell each side
+/// (a Noodle badge). Skipped when it doesn't fit.
+pub(crate) fn paint_tab(buf: &mut Buffer, area: Rect, slab: &Slab, parts: &[(String, Tone)]) {
+    let len: u16 = parts
+        .iter()
+        .map(|(t, _)| super::text_metrics::width(t) as u16)
+        .sum::<u16>()
+        + 2;
     if area.height < 3 || area.width < len + 8 {
         return;
     }
     let y = area.bottom() - 1;
     let r = area.width - 2;
     let mut rx = r - 2 - len;
-    let fg = if streaming {
-        slab.spinner_fg()
-    } else {
-        slab.dim_fg()
-    };
-    for ch in text.chars() {
-        let bg = color(slab.fill_at(rx));
-        let mut tmp = [0u8; 4];
-        put(buf, area.x + rx, y, ch.encode_utf8(&mut tmp), fg, bg);
-        rx += super::text_metrics::char_width(ch) as u16;
+    let pad = [(" ".to_string(), Tone::Word)];
+    for (text, tone) in pad.iter().chain(parts).chain(pad.iter()) {
+        let fg = slab.tone_fg(*tone);
+        for ch in text.chars() {
+            let bg = color(slab.fill_at(rx));
+            let mut tmp = [0u8; 4];
+            put(buf, area.x + rx, y, ch.encode_utf8(&mut tmp), fg, bg);
+            rx += super::text_metrics::char_width(ch) as u16;
+        }
     }
 }
 
