@@ -525,6 +525,10 @@ pub(crate) fn paint_cursor(buf: &mut Buffer, area: Rect, slab: &Slab, at: Cursor
 pub(crate) enum Tone {
     /// A key or command to type (`input_fg`).
     Key,
+    /// A key in a passive hint (placeholder, line count): halfway between
+    /// [`Tone::Key`] and [`Tone::Word`], so it reads as a key without
+    /// shouting.
+    SoftKey,
     /// The explaining word, a count, a time (the legible dim).
     Word,
     /// Live activity (`status_streaming`).
@@ -536,6 +540,11 @@ impl Slab {
     pub(crate) fn tone_fg(&self, tone: Tone) -> Color {
         match tone {
             Tone::Key => color(self.legible(self.text, self.brightest(), 4.5)),
+            Tone::SoftKey => {
+                let word = self.legible(self.muted, self.brightest(), 4.5);
+                let key = self.legible(self.text, self.brightest(), 4.5);
+                color(mix(key, word, 0.5))
+            }
             Tone::Word => self.dim_fg(),
             Tone::Live => self.spinner_fg(),
         }
@@ -890,5 +899,35 @@ mod streaming_dim_tests {
         let back = done + Duration::from_secs_f32(DIM_FADE + 0.01);
         assert_eq!(clock.frame(back, false).dim, 0.0);
         assert!(!clock.animating(back, false), "still again afterwards");
+    }
+}
+
+#[cfg(test)]
+mod tone_tests {
+    use super::*;
+
+    fn rgb_of(c: Color) -> Rgb {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("expected rgb, got {other:?}"),
+        }
+    }
+
+    /// A soft key sits between a key and a word: dimmer than a key, still
+    /// brighter than the word beside it, and AA.
+    #[test]
+    fn soft_key_is_between_key_and_word() {
+        for name in ["default", "myx", "night-city", "gruvbox", "nord", "forest"] {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let slab = Slab::new(&theme, PromptFx::default(), 80, None);
+            let bg = slab.brightest();
+            let c = |t| contrast(rgb_of(slab.tone_fg(t)), bg);
+            let (key, soft, word) = (c(Tone::Key), c(Tone::SoftKey), c(Tone::Word));
+            assert!(
+                soft < key && soft > word,
+                "{name}: {key:.2} > {soft:.2} > {word:.2}"
+            );
+            assert!(soft >= 4.5, "{name}: soft key {soft:.2}");
+        }
     }
 }

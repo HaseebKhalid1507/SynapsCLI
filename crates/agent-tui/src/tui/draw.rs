@@ -1469,7 +1469,7 @@ pub(crate) fn render_frame_into(
                         .add_modifier(Modifier::ITALIC),
                 ));
                 if !model.streaming {
-                    let key = Style::default().fg(slab.tone_fg(neon::Tone::Key));
+                    let key = Style::default().fg(slab.tone_fg(neon::Tone::SoftKey));
                     let word = Style::default().fg(slab.dim_fg());
                     for (k, wd) in [("/", " commands"), ("alt+enter", " newline")] {
                         let seg = 3 + display_width(k) + display_width(wd);
@@ -1511,7 +1511,7 @@ pub(crate) fn render_frame_into(
         }
 
         // Status tab hanging off the bottom edge (key bright, word dim).
-        use neon::Tone::{Key, Live, Word};
+        use neon::Tone::{Key, Live, SoftKey, Word};
         let tab: Option<Vec<(String, neon::Tone)>> = if model.streaming {
             Some(vec![
                 (format!("{} working ", SPINNER_FRAMES[spinner_idx]), Live),
@@ -1541,7 +1541,7 @@ pub(crate) fn render_frame_into(
             Some(vec![
                 (format!("{input_lines} lines"), Word),
                 ("   ".into(), Word),
-                ("alt+enter".into(), Key),
+                ("alt+enter".into(), SoftKey),
                 (" newline".into(), Word),
             ])
         } else {
