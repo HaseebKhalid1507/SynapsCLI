@@ -128,7 +128,7 @@ fn handle_event_inner(
 ) -> InputAction {
     if matches!(event, Event::Key(_) | Event::Paste(_)) {
         let now = app.clock.now();
-        app.prompt_clock.touch(now, true);
+        app.prompt_clock.touch(now);
     }
     match event {
         Event::Key(key) => handle_key(key, app, streaming, registry, keybinds),

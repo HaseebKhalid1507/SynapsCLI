@@ -2077,25 +2077,20 @@ mod neon_prompt_tests {
         assert_ne!(cursor.style().bg, body.style().bg, "cursor cell is lit");
     }
 
-    /// Idle costs nothing: the prompt stops asking for frames once it
-    /// settles, and a keystroke or a stream wakes it.
+    /// No motion while idle: the prompt asks for frames only while a
+    /// keystroke's trail fades, or while a turn streams.
     #[test]
-    fn prompt_animation_settles_and_wakes() {
+    fn prompt_is_still_when_idle() {
         let mut h = TestHarness::boot_with_size(W, H);
-        assert!(h.prompt_animating(), "breathes after boot");
-        h.advance_clock_ms(8_000);
-        assert!(!h.prompt_animating(), "settled after idling");
+        assert!(!h.prompt_animating(), "still at boot");
         h.type_str("x");
-        assert!(h.prompt_animating(), "a keystroke wakes it");
-        h.advance_clock_ms(8_000);
-        assert!(!h.prompt_animating());
+        assert!(h.prompt_animating(), "a keystroke lights the trail");
+        h.advance_clock_ms(1_000);
+        assert!(!h.prompt_animating(), "still again once it fades");
         h.set_streaming(true);
-        assert!(h.prompt_animating(), "always animates while streaming");
+        assert!(h.prompt_animating(), "animates while streaming");
     }
 
-    /// What's behind the slab is the chrome, full width and continuous with
-    /// the footer row, in both background modes (the toggle owns only the
-    /// conversation canvas).
     #[test]
     #[serial]
     fn backdrop_is_full_width_chrome_like_the_footer() {

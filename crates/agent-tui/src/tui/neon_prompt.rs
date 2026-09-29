@@ -3,11 +3,13 @@
 //!
 //! The shape is made only of half-cell blocks (`▗▄▖ ▐ ▌ ▝▀▘`), so there is no
 //! line art. Its fill is a faint horizontal gradient through the theme's
-//! prompt colour → secondary accent → assistant label, mixed into the canvas,
-//! with a half-cell halo around the edge. While ready it slowly breathes and
-//! drifts; after a few idle seconds it eases to rest and stops asking for
-//! frames. While a turn streams the colour calms and a shimmer sweeps across.
-//! The cursor is a lit block with a soft glow that trails behind typing.
+//! prompt colour → secondary accent → assistant label, floating on the chrome
+//! band it shares with the footer.
+//!
+//! At rest it is completely still (no frames at all). Motion only answers
+//! something happening: the cursor is a lit block whose glow trails behind
+//! typing, sending flashes the slab, and while a turn streams the colour calms
+//! and a shimmer sweeps across with a glow under it.
 //!
 //! Split in two:
 //! - [`PromptClock`] lives on `App` (main task) and turns input/stream events
@@ -36,13 +38,7 @@ const WHITE: Rgb = (255, 255, 255);
 /// canvas margin, half-block side, padding.
 pub(crate) const INSET_X: u16 = 3;
 
-const BREATH_PERIOD: f32 = 3.6;
-const DRIFT_PERIOD: f32 = 24.0;
 const SHIMMER_PERIOD: f32 = 1.9;
-/// Seconds without input before the ready animation starts to settle.
-const IDLE_AFTER: f32 = 6.0;
-/// Seconds the settle takes; after `IDLE_AFTER + SETTLE` no frames are needed.
-const SETTLE: f32 = 1.5;
 const TRAIL_DECAY: f32 = 0.7;
 const PULSE_DECAY: f32 = 0.45;
 /// Redraw cadence the prompt asks for while it animates on its own.
@@ -90,14 +86,10 @@ fn rgb(c: Color, fallback: Color) -> Rgb {
 // ───────────────────────────── timing (main task) ──────────────────────────
 
 /// Everything time-dependent the renderer needs for one frame. `Default` is
-/// the resting look (no breath, no trail, no pulse) — what tests and
+/// the resting look (no trail, no pulse) — what idle, tests and
 /// `SYNAPS_NO_BOOT_FX=1` get.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PromptFx {
-    /// 0..1 slow glow pulse while ready (0 at rest).
-    pub(crate) breath: f32,
-    /// Gradient drift offset (cycles).
-    pub(crate) phase: f32,
     /// 0..1 position of the streaming sweep.
     pub(crate) shimmer: f32,
     /// 0..1 cursor glow energy after a keystroke.
@@ -112,15 +104,11 @@ pub(crate) struct PromptFx {
 #[derive(Debug)]
 pub(crate) struct PromptClock {
     enabled: bool,
-    last_input: Instant,
     last_key: Instant,
     last_send: Instant,
-    wake: Instant,
-    last_tick: Instant,
     last_frame: Instant,
     stream_since: Instant,
     was_streaming: bool,
-    phase: f32,
 }
 
 impl PromptClock {
@@ -133,28 +121,16 @@ impl PromptClock {
         let long_ago = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
         Self {
             enabled,
-            last_input: now,
             last_key: long_ago,
             last_send: long_ago,
-            wake: now,
-            last_tick: now,
             last_frame: long_ago,
             stream_since: now,
             was_streaming: false,
-            phase: 0.0,
         }
     }
 
     fn secs(later: Instant, earlier: Instant) -> f32 {
         later.saturating_duration_since(earlier).as_secs_f32()
-    }
-
-    fn energy(&self, now: Instant, streaming: bool) -> f32 {
-        if streaming {
-            return 1.0;
-        }
-        let idle = Self::secs(now, self.last_input);
-        1.0 - ((idle - IDLE_AFTER) / SETTLE).clamp(0.0, 1.0)
     }
 
     fn trail(&self, now: Instant) -> f32 {
@@ -169,31 +145,22 @@ impl PromptClock {
             .powi(2)
     }
 
-    /// Any input (key, paste). `key` also lights the cursor trail.
-    pub(crate) fn touch(&mut self, now: Instant, key: bool) {
-        if self.energy(now, false) < 1.0 {
-            self.wake = now; // restart the breath from 0 so waking never jumps
-        }
-        self.last_input = now;
-        if key {
-            self.last_key = now;
-        }
+    /// A key or paste went into the input: lights the cursor trail.
+    pub(crate) fn touch(&mut self, now: Instant) {
+        self.last_key = now;
     }
 
     /// A message was sent: brief brightening of the slab.
     pub(crate) fn sent(&mut self, now: Instant) {
         self.last_send = now;
-        self.touch(now, false);
     }
 
-    /// True while the prompt animates on its own (streaming, or ready and
-    /// not yet settled). Feeds the tick guard, so idle costs nothing.
+    /// True while something is moving: a turn is streaming, or a keystroke's
+    /// trail / a send's flash is still fading (under a second). At rest it is
+    /// false, so the prompt never costs a frame while idle. Feeds the tick
+    /// guard.
     pub(crate) fn animating(&self, now: Instant, streaming: bool) -> bool {
-        self.enabled
-            && (streaming
-                || self.energy(now, streaming) > 0.0
-                || self.trail(now) > 0.0
-                || self.pulse(now) > 0.0)
+        self.enabled && (streaming || self.trail(now) > 0.0 || self.pulse(now) > 0.0)
     }
 
     /// Whether the tick arm should request a redraw for the prompt now.
@@ -208,34 +175,28 @@ impl PromptClock {
         true
     }
 
-    /// Advance the drift and produce this frame's snapshot. Called once per
-    /// built `RenderModel`.
+    /// This frame's snapshot. Called once per built `RenderModel`.
     pub(crate) fn frame(&mut self, now: Instant, streaming: bool) -> PromptFx {
         if streaming != self.was_streaming {
             self.was_streaming = streaming;
             if streaming {
                 self.stream_since = now;
             }
-            self.touch(now, false);
         }
         let streamed = Self::secs(now, self.stream_since);
         let stream_secs = if streaming { streamed } else { 0.0 };
         if !self.enabled {
-            self.last_tick = now;
             return PromptFx {
                 stream_secs,
                 ..PromptFx::default()
             };
         }
-        let e = self.energy(now, streaming);
-        let dt = Self::secs(now, self.last_tick).min(0.2);
-        self.last_tick = now;
-        self.phase = (self.phase + dt / DRIFT_PERIOD * e).fract();
-        let woke = Self::secs(now, self.wake);
         PromptFx {
-            breath: e * (0.5 - 0.5 * (std::f32::consts::TAU * woke / BREATH_PERIOD).cos()),
-            phase: self.phase,
-            shimmer: (streamed / SHIMMER_PERIOD).fract(),
+            shimmer: if streaming {
+                (streamed / SHIMMER_PERIOD).fract()
+            } else {
+                0.0
+            },
             trail: self.trail(now),
             pulse: self.pulse(now),
             stream_secs,
@@ -295,14 +256,17 @@ impl Slab {
             Vec::with_capacity(w),
         );
         for x in 0..w {
-            let mut t = grad(x as f32 / wf * 0.85 + fx.phase);
+            let mut t = grad(x as f32 / wf * 0.85);
+            // `glow` is light spilling onto the band around the slab: only
+            // under the moving sweep or a send flash. At rest it is 0, so the
+            // band is exactly the footer's colour.
             let (amount, glow) = if streaming {
                 let dist = (x as f32 - sweep) / 9.0;
                 let s = (-dist * dist).exp();
                 t = mix(mix(t, muted, 0.45), stream, s * 0.8);
-                (0.075 + 0.085 * s, 0.03 + 0.12 * s)
+                (0.075 + 0.085 * s, 0.12 * s)
             } else {
-                (0.13 + 0.05 * fx.breath, 0.05 + 0.07 * fx.breath)
+                (0.13, 0.0)
             };
             tint.push(t);
             fill.push(mix(base, t, amount + 0.14 * fx.pulse));
@@ -381,8 +345,7 @@ impl Slab {
 
     /// Prompt glyph colour (ready).
     pub(crate) fn prompt_fg(&self) -> Color {
-        let c = mix(self.prompt, WHITE, 0.1 * self.fx.breath);
-        color(self.legible(c, self.brightest(), 4.5))
+        color(self.legible(self.prompt, self.brightest(), 4.5))
     }
 
     /// Spinner colour while streaming.
@@ -584,14 +547,13 @@ mod tests {
         }
     }
 
-    /// Worst-case frames: rest, full breath + pulse, and a shimmer sweeping
+    /// Worst-case frames: rest, full pulse + trail, and a shimmer sweeping
     /// every position while streaming.
     fn frames() -> Vec<(PromptFx, bool)> {
         let mut out = vec![
             (PromptFx::default(), false),
             (
                 PromptFx {
-                    breath: 1.0,
                     pulse: 1.0,
                     trail: 1.0,
                     ..PromptFx::default()
@@ -603,7 +565,6 @@ mod tests {
             out.push((
                 PromptFx {
                     shimmer: i as f32 / 10.0,
-                    phase: i as f32 / 10.0,
                     ..PromptFx::default()
                 },
                 true,
@@ -654,21 +615,23 @@ mod tests {
     }
 
     #[test]
-    fn clock_settles_and_stops_asking_for_frames() {
+    fn still_at_rest_moving_only_on_events() {
         let t0 = Instant::now();
         let mut clock = PromptClock::with_enabled(t0, true);
-        assert!(clock.animating(t0, false), "breathes after boot");
-        let settled = t0 + Duration::from_secs_f32(IDLE_AFTER + SETTLE + 0.1);
-        assert!(!clock.animating(settled, false), "at rest after idling");
-        assert!(!clock.wants_frame(settled, false));
-        assert_eq!(clock.frame(settled, false).breath, 0.0);
+        assert!(!clock.animating(t0, false), "no motion at boot/idle");
+        assert!(!clock.wants_frame(t0, false));
+        assert_eq!(clock.frame(t0, false), PromptFx::default(), "resting look");
 
-        clock.touch(settled, true);
-        assert!(clock.animating(settled, false), "a key wakes it");
-        assert!(
-            clock.frame(settled, false).trail > 0.9,
-            "and lights the trail"
-        );
+        clock.touch(t0);
+        assert!(clock.animating(t0, false), "a key lights the trail");
+        assert!(clock.frame(t0, false).trail > 0.9);
+        let faded = t0 + Duration::from_secs_f32(TRAIL_DECAY + 0.01);
+        assert!(!clock.animating(faded, false), "and it fades back to rest");
+
+        clock.sent(faded);
+        assert!(clock.animating(faded, false), "a send flashes");
+        let settled = faded + Duration::from_secs_f32(PULSE_DECAY + 0.01);
+        assert!(!clock.animating(settled, false));
 
         assert!(
             clock.animating(settled + Duration::from_secs(600), true),
@@ -676,20 +639,33 @@ mod tests {
         );
     }
 
+    /// At rest the band behind the slab (halo) is exactly the chrome, so the
+    /// input rows and the footer are one colour.
+    #[test]
+    fn resting_halo_is_exactly_the_chrome() {
+        for name in BUILTINS {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 80);
+            for x in [1u16, 20, 78] {
+                assert_eq!(Slab::at(&slab.halo, x), rgb_of(theme.bg), "{name} x={x}");
+            }
+        }
+    }
+
     #[test]
     fn frames_are_throttled() {
         let t0 = Instant::now();
         let mut clock = PromptClock::with_enabled(t0, true);
-        assert!(clock.wants_frame(t0, false));
-        assert!(!clock.wants_frame(t0 + Duration::from_millis(10), false));
-        assert!(clock.wants_frame(t0 + FRAME, false));
+        assert!(clock.wants_frame(t0, true));
+        assert!(!clock.wants_frame(t0 + Duration::from_millis(10), true));
+        assert!(clock.wants_frame(t0 + FRAME, true));
     }
 
     #[test]
     fn disabled_clock_is_static() {
         let t0 = Instant::now();
         let mut clock = PromptClock::with_enabled(t0, false);
-        clock.touch(t0, true);
+        clock.touch(t0);
         assert!(!clock.animating(t0, true));
         let fx = clock.frame(t0 + Duration::from_secs(2), true);
         assert_eq!(
