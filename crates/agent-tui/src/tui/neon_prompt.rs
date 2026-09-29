@@ -2,9 +2,8 @@
 //! bordered box.
 //!
 //! The shape is made only of half-cell blocks (`▗▄▖ ▐ ▌ ▝▀▘`), so there is no
-//! line art. Its fill is a faint horizontal gradient through the theme's
-//! prompt colour → secondary accent → assistant label, floating on the chrome
-//! band it shares with the footer.
+//! line art. Its fill is one flat, faint tint of the theme's prompt colour,
+//! floating on the chrome band it shares with the footer.
 //!
 //! At rest it is completely still (no frames at all). Motion only answers
 //! something happening: the cursor is a lit block whose glow trails behind
@@ -222,7 +221,8 @@ pub(crate) struct Slab {
     fill: Vec<Rgb>,
     /// Halo under the half-cell edges, per column.
     halo: Vec<Rgb>,
-    /// The gradient colour itself, per column (cursor + glow source).
+    /// The colour the fill is tinted toward, per column: the prompt colour,
+    /// or the shimmer while streaming (cursor + glow source).
     tint: Vec<Rgb>,
 }
 
@@ -233,18 +233,8 @@ impl Slab {
         let canvas = rgb(theme.message_background(), d.message_bg);
         let text = rgb(theme.input_fg, d.input_fg);
         let prompt = rgb(theme.prompt_fg, d.prompt_fg);
-        let accent2 = rgb(theme.subagent_name, d.subagent_name);
-        let label = rgb(theme.claude_label, d.claude_label);
         let muted = rgb(theme.muted, d.muted);
         let stream = rgb(theme.status_streaming, d.status_streaming);
-
-        // Cyclic gradient: prompt → accent2 → label → prompt.
-        let stops = [prompt, accent2, label, prompt];
-        let grad = |t: f32| {
-            let t = t.rem_euclid(1.0) * (stops.len() - 1) as f32;
-            let i = (t.floor() as usize).min(stops.len() - 2);
-            mix(stops[i], stops[i + 1], t - i as f32)
-        };
 
         let base = mix(backdrop, text, 0.025);
         let w = usize::from(width.max(1));
@@ -256,7 +246,7 @@ impl Slab {
             Vec::with_capacity(w),
         );
         for x in 0..w {
-            let mut t = grad(x as f32 / wf * 0.85);
+            let mut t = prompt;
             // `glow` is light spilling onto the band around the slab: only
             // under the moving sweep or a send flash. At rest it is 0, so the
             // band is exactly the footer's colour.
@@ -334,7 +324,7 @@ impl Slab {
 
     /// The body colour text is hardest to read on: the brightest column of
     /// the fill. Foreground colours are made legible against it, so they
-    /// hold everywhere along the gradient and under the shimmer.
+    /// hold everywhere, including under the shimmer.
     fn brightest(&self) -> Rgb {
         self.fill
             .iter()
@@ -371,8 +361,8 @@ impl Slab {
         color(self.legible(self.muted, self.brightest(), 4.5))
     }
 
-    /// Typed input: the theme's input colour, lifted only if a bright
-    /// gradient would otherwise wash it out.
+    /// Typed input: the theme's input colour, lifted only if a bright tint
+    /// would otherwise wash it out.
     pub(crate) fn text_fg(&self) -> Color {
         color(self.legible(self.text, self.brightest(), 4.5))
     }
@@ -690,5 +680,24 @@ mod tests {
             clock.frame(t1 + Duration::from_secs(5), false).stream_secs,
             0.0
         );
+    }
+}
+
+#[cfg(test)]
+mod flat_fill_tests {
+    use super::*;
+
+    /// No gradient: at rest every column of the body is the same colour.
+    #[test]
+    fn resting_fill_is_flat() {
+        for name in ["default", "myx", "night-city", "gruvbox"] {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 100);
+            let first = slab.fill_at(0);
+            assert!(
+                (0..100).all(|x| slab.fill_at(x) == first),
+                "{name}: fill varies across the slab"
+            );
+        }
     }
 }
