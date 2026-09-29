@@ -1507,41 +1507,11 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Footer ────────────────────────────────────────────────────────────
-    let [keybinds_area, info_area] = Layout::horizontal([
-        Constraint::Min(1),
-        Constraint::Length(model.runtime_model.len() as u16 + 75),
-    ])
-    .areas(footer_area);
-
-    let key_style = Style::default().fg(THEME.load().muted);
-    let label_style = Style::default().fg(THEME.load().help_fg);
-    let dot_style = Style::default().fg(THEME.load().help_fg);
-    let keybinds = Paragraph::new(ratatui::text::Line::from(vec![
-        Span::styled(" ctrl+c ", key_style),
-        Span::styled("quit", label_style),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("esc ", key_style),
-        Span::styled("abort", label_style),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("shift+\u{2191}\u{2193} ", key_style),
-        Span::styled("scroll", label_style),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("ctrl+o ", key_style),
-        Span::styled(
-            if model.show_full_output {
-                "full"
-            } else {
-                "compact"
-            },
-            label_style,
-        ),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("enter ", key_style),
-        Span::styled("send", label_style),
-    ]))
-    .style(Style::default().bg(THEME.load().bg));
-    frame.render_widget(keybinds, keybinds_area);
-
+    // Keys bright, words at a legible dim (Noodle's contrast, not the old
+    // muted-on-dimmer pair). The info block takes only its real width, and
+    // hints that don't fit are dropped whole instead of clipped mid-word.
+    let theme = THEME.load();
+    let dim = theme.chrome_dim();
     let cost_str = if model.session_cost > 0.0 {
         format!("${:.4} ", model.session_cost)
     } else {
@@ -1573,9 +1543,9 @@ pub(crate) fn render_frame_into(
     } else {
         String::new()
     };
-    let info = Paragraph::new(ratatui::text::Line::from(vec![
-        Span::styled(&cost_str, Style::default().fg(THEME.load().cost_color)),
-        Span::styled(&token_str, Style::default().fg(THEME.load().muted)),
+    let info_line = ratatui::text::Line::from(vec![
+        Span::styled(&cost_str, Style::default().fg(theme.cost_color)),
+        Span::styled(&token_str, Style::default().fg(dim)),
         {
             let turn_context = model.last_turn_context;
             let context_window = model.last_turn_context_window.max(1);
@@ -1605,21 +1575,63 @@ pub(crate) fn render_frame_into(
                 Span::raw("")
             }
         },
-        Span::styled("\u{03b8}:", Style::default().fg(THEME.load().muted)),
-        Span::styled(
-            model.runtime_thinking.clone(),
-            Style::default().fg(THEME.load().help_fg),
-        ),
-        Span::styled(" \u{2502} ", Style::default().fg(THEME.load().border)),
+        Span::styled("\u{03b8}:", Style::default().fg(dim)),
+        Span::styled(model.runtime_thinking.clone(), Style::default().fg(dim)),
+        Span::styled(" \u{2502} ", Style::default().fg(theme.border)),
         Span::styled(
             model.runtime_model.clone(),
-            Style::default().fg(THEME.load().header_fg),
+            Style::default().fg(theme.header_fg),
         ),
         Span::styled(" ", Style::default()),
-    ]))
-    .alignment(Alignment::Right)
-    .style(Style::default().bg(THEME.load().bg));
-    frame.render_widget(info, info_area);
+    ]);
+    let info_width = (info_line.width() as u16).min(footer_area.width);
+    let [keybinds_area, info_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(info_width)]).areas(footer_area);
+
+    let key_style = Style::default().fg(theme.claude_text);
+    let label_style = Style::default().fg(dim);
+    let dot_style = Style::default().fg(theme.border);
+    let hints: [(&str, &str); 5] = [
+        ("ctrl+c", "quit"),
+        ("esc", "abort"),
+        ("shift+\u{2191}\u{2193}", "scroll"),
+        (
+            "ctrl+o",
+            if model.show_full_output {
+                "full"
+            } else {
+                "compact"
+            },
+        ),
+        ("enter", "send"),
+    ];
+    // One cell of air before the info block.
+    let room = usize::from(keybinds_area.width).saturating_sub(1);
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1;
+    for (i, (key, label)) in hints.iter().enumerate() {
+        let sep = if i > 0 { 3 } else { 0 };
+        let seg = sep + display_width(key) + 1 + display_width(label);
+        if used + seg > room {
+            break;
+        }
+        if i > 0 {
+            spans.push(Span::styled(" \u{00b7} ", dot_style));
+        }
+        spans.push(Span::styled(format!("{key} "), key_style));
+        spans.push(Span::styled(*label, label_style));
+        used += seg;
+    }
+    frame.render_widget(
+        Paragraph::new(ratatui::text::Line::from(spans)).style(Style::default().bg(theme.bg)),
+        keybinds_area,
+    );
+    frame.render_widget(
+        Paragraph::new(info_line)
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(theme.bg)),
+        info_area,
+    );
 
     // ── Effects ───────────────────────────────────────────────────────────
     if let Some(ref mut fx) = boot_fx {
@@ -2112,5 +2124,62 @@ mod neon_prompt_tests {
             "the slab body itself stays painted"
         );
         set_background_opaque(prior);
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::super::testing::TestHarness;
+    use super::super::theme::THEME;
+
+    const HINTS: &[&str] = &[
+        "ctrl+c quit",
+        "esc abort",
+        "shift+\u{2191}\u{2193} scroll",
+        "ctrl+o compact",
+        "enter send",
+    ];
+
+    fn footer(h: &mut TestHarness, w: u16) -> String {
+        let buf = h.render();
+        (0..w).map(|x| buf[(x, 23)].symbol()).collect()
+    }
+
+    /// Hints are dropped whole when narrow — never clipped mid-word (the
+    /// old footer showed "ctrl+c qui" in the README GIF and nothing at all at
+    /// 80 columns).
+    #[test]
+    fn hints_fit_whole_or_not_at_all() {
+        for w in [40u16, 60, 80, 100, 120, 200] {
+            let mut h = TestHarness::boot_with_size(w, 24);
+            let row = footer(&mut h, w);
+            let shown = HINTS.iter().filter(|hint| row.contains(*hint)).count();
+            let left = row.split("  ").next().unwrap_or("").trim();
+            for part in left.split(" \u{00b7} ").filter(|p| !p.is_empty()) {
+                assert!(
+                    HINTS.contains(&part),
+                    "w={w}: clipped hint {part:?} in {row:?}"
+                );
+            }
+            if w >= 80 {
+                assert!(shown >= 2, "w={w}: hints visible at common widths: {row:?}");
+            }
+            if w >= 120 {
+                assert_eq!(shown, HINTS.len(), "w={w}: all hints fit: {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keys_are_bright_and_words_legible() {
+        let mut h = TestHarness::boot_with_size(120, 24);
+        let theme = THEME.load();
+        let buf = h.render();
+        let row: String = (0..120).map(|x| buf[(x, 23)].symbol()).collect();
+        let key_x = row.find("ctrl+c").expect("hint shown") as u16;
+        let word_x = row.find("quit").expect("hint shown") as u16;
+        assert_eq!(buf[(key_x, 23)].style().fg, Some(theme.claude_text));
+        assert_eq!(buf[(word_x, 23)].style().fg, Some(theme.chrome_dim()));
     }
 }

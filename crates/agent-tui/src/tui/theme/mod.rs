@@ -345,6 +345,49 @@ impl Theme {
     }
 }
 
+/// WCAG 2 contrast ratio between two colours; non-RGB colours count as black.
+fn wcag_contrast(a: Color, b: Color) -> f64 {
+    fn lum(c: Color) -> f64 {
+        let Color::Rgb(r, g, b) = c else {
+            return 0.0;
+        };
+        let lin = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    }
+    let (la, lb) = (lum(a), lum(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+impl Theme {
+    /// Secondary text on the chrome (`bg`): `muted` lifted toward `input_fg`
+    /// just until it reads at 4.5:1 (WCAG AA). Several palettes' `muted` and
+    /// `help_fg` sit near 2:1 on chrome, which is the "dimmed text is low
+    /// contrast" note from the Ratatui showcase review.
+    pub(crate) fn chrome_dim(&self) -> Color {
+        let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (self.muted, self.input_fg) else {
+            return self.muted;
+        };
+        for step in 0..=20u8 {
+            let t = f64::from(step) / 20.0;
+            let mix =
+                |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+            let c = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+            if wcag_contrast(c, self.bg) >= 4.5 {
+                return c;
+            }
+        }
+        self.input_fg
+    }
+}
+
 /// Per-part style resolvers (P19.1).
 ///
 /// Resolution rule: **part override if present, else the base token**. The
@@ -975,6 +1018,46 @@ mod message_canvas_tests {
             assert!(
                 luminance(rgb(t.message_background())) < luminance(rgb(t.code_bg)),
                 "{name}: canvas must sit below code_bg in elevation"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod chrome_dim_tests {
+    use super::*;
+
+    #[test]
+    fn chrome_dim_reads_at_aa_on_every_builtin_and_stays_below_text() {
+        for name in [
+            "default",
+            "night-city",
+            "neon-rain",
+            "amber",
+            "phosphor",
+            "solarized-dark",
+            "blood",
+            "ocean",
+            "rose-pine",
+            "nord",
+            "dracula",
+            "monokai",
+            "myx",
+            "gruvbox",
+            "catppuccin",
+            "tokyo-night",
+            "sunset",
+            "ice",
+            "forest",
+            "lavender",
+        ] {
+            let t = Theme::builtin_for_test(name);
+            let dim = t.chrome_dim();
+            let c = wcag_contrast(dim, t.bg);
+            assert!(c >= 4.5, "{name}: chrome_dim {c:.2}");
+            assert!(
+                c <= wcag_contrast(t.input_fg, t.bg) + 1e-9,
+                "{name}: dim text must not outshine the input text"
             );
         }
     }
