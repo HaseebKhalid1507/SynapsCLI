@@ -46,8 +46,11 @@ const PULSE_DECAY: f32 = 0.45;
 const DIM_FADE: f32 = 0.25;
 /// How far the dim goes: the body gives back this share of its lift off the
 /// chrome, and typed text moves this far toward the body (never below AA).
-const DIM_BODY: f32 = 0.5;
+const DIM_BODY: f32 = 0.6;
 const DIM_TEXT: f32 = 0.3;
+/// Seconds of the "your turn" cue when a turn ends: a wash of the theme's
+/// prompt colour over the slab (and a little around it) that fades out.
+const ARRIVE_DECAY: f32 = 0.9;
 /// Redraw cadence the prompt asks for while it animates on its own.
 const FRAME: Duration = Duration::from_millis(40);
 
@@ -123,6 +126,9 @@ pub(crate) struct PromptFx {
     /// 0..1 how dimmed the prompt is: 1 while a turn streams (the agent has
     /// the floor), 0 when idle, eased between over [`DIM_FADE`].
     pub(crate) dim: f32,
+    /// 0..1 the "your turn" cue right after a turn ends, fading out over
+    /// [`ARRIVE_DECAY`].
+    pub(crate) arrive: f32,
 }
 
 /// Input/stream event times → per-frame [`PromptFx`]. Lives on `App`.
@@ -135,6 +141,8 @@ pub(crate) struct PromptClock {
     stream_since: Instant,
     /// When streaming last started or stopped (drives the dim fade).
     stream_changed: Instant,
+    /// When the last turn ended (drives the "your turn" cue).
+    ready_at: Instant,
     was_streaming: bool,
 }
 
@@ -153,6 +161,7 @@ impl PromptClock {
             last_frame: long_ago,
             stream_since: now,
             stream_changed: long_ago,
+            ready_at: long_ago,
             was_streaming: false,
         }
     }
@@ -169,6 +178,15 @@ impl PromptClock {
 
     fn pulse(&self, now: Instant) -> f32 {
         (1.0 - Self::secs(now, self.last_send) / PULSE_DECAY)
+            .max(0.0)
+            .powi(2)
+    }
+
+    fn arrive(&self, now: Instant, streaming: bool) -> f32 {
+        if streaming {
+            return 0.0;
+        }
+        (1.0 - Self::secs(now, self.ready_at) / ARRIVE_DECAY)
             .max(0.0)
             .powi(2)
     }
@@ -203,7 +221,11 @@ impl PromptClock {
     /// guard.
     pub(crate) fn animating(&self, now: Instant, streaming: bool) -> bool {
         self.enabled
-            && (streaming || self.fading(now) || self.trail(now) > 0.0 || self.pulse(now) > 0.0)
+            && (streaming
+                || self.fading(now)
+                || self.arrive(now, streaming) > 0.0
+                || self.trail(now) > 0.0
+                || self.pulse(now) > 0.0)
     }
 
     /// Whether the tick arm should request a redraw for the prompt now.
@@ -225,6 +247,8 @@ impl PromptClock {
             self.stream_changed = now;
             if streaming {
                 self.stream_since = now;
+            } else {
+                self.ready_at = now;
             }
         }
         let streamed = Self::secs(now, self.stream_since);
@@ -246,6 +270,7 @@ impl PromptClock {
             pulse: self.pulse(now),
             stream_secs,
             dim: self.dim(now, streaming),
+            arrive: self.arrive(now, streaming),
         }
     }
 }
@@ -280,11 +305,12 @@ pub(crate) struct Slab {
     halo: Vec<Rgb>,
 }
 
-/// How far the body stands off the chrome (WCAG contrast): enough to read as
-/// a surface, as quiet as the transcript canvas's own step.
-const BODY_CONTRAST: f32 = 1.12;
+/// How far the body stands off the chrome when the prompt is ready (WCAG
+/// contrast): clearly the brightest surface in the bottom band, the "ready for
+/// you" state. Streaming gives back [`DIM_BODY`] of it.
+const BODY_CONTRAST: f32 = 1.22;
 /// Cap on the lift toward the text colour.
-const BODY_MAX_LIFT: f32 = 0.15;
+const BODY_MAX_LIFT: f32 = 0.25;
 
 impl Slab {
     /// `glow`: the colour of the sweep across the slab while a turn streams
@@ -310,7 +336,10 @@ impl Slab {
         // little — the body gives back part of its lift.
         body = mix(backdrop, text, lift * (1.0 - DIM_BODY * fx.dim));
         // Send flash: the body brightens toward the text colour for a moment.
-        let rest = mix(body, text, 0.08 * fx.pulse);
+        // "Your turn": when a turn ends the prompt colour washes over the
+        // slab and fades, so the hand-back is felt, not just read.
+        let rest = mix(mix(body, text, 0.08 * fx.pulse), prompt, 0.14 * fx.arrive);
+        let arrive_halo = mix(backdrop, prompt, 0.06 * fx.arrive);
 
         let w = usize::from(width.max(1));
         let wf = w as f32;
@@ -326,7 +355,7 @@ impl Slab {
                 halo.push(mix(backdrop, glow, 0.07 * s));
             } else {
                 fill.push(rest);
-                halo.push(backdrop);
+                halo.push(arrive_halo);
             }
         }
         let typed = mix(text, body, DIM_TEXT * fx.dim);
@@ -625,6 +654,13 @@ mod tests {
                 },
                 false,
             ),
+            (
+                PromptFx {
+                    arrive: 1.0,
+                    ..PromptFx::default()
+                },
+                false,
+            ),
         ];
         for i in 0..10 {
             out.push((
@@ -684,7 +720,7 @@ mod tests {
             assert_eq!(slab.cursor(), rgb_of(theme.input_fg), "{name}: cursor");
             let c = contrast(slab.body, rgb_of(theme.bg));
             assert!(
-                (1.05..=1.25).contains(&c),
+                (1.05..=1.30).contains(&c),
                 "{name}: body/chrome step {c:.3} (body {:?})",
                 slab.body
             );
@@ -898,7 +934,9 @@ mod streaming_dim_tests {
         assert!(clock.animating(done, false), "frames for the fade back");
         let back = done + Duration::from_secs_f32(DIM_FADE + 0.01);
         assert_eq!(clock.frame(back, false).dim, 0.0);
-        assert!(!clock.animating(back, false), "still again afterwards");
+        // (The "your turn" cue outlasts the fade; still once both are done.)
+        let settled = done + Duration::from_secs_f32(DIM_FADE.max(ARRIVE_DECAY) + 0.01);
+        assert!(!clock.animating(settled, false), "still again afterwards");
     }
 }
 
@@ -929,5 +967,81 @@ mod tone_tests {
             );
             assert!(soft >= 4.5, "{name}: soft key {soft:.2}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::*;
+
+    const PALETTES: &[&str] = &[
+        "default",
+        "myx",
+        "night-city",
+        "gruvbox",
+        "nord",
+        "catppuccin",
+        "blood",
+        "forest",
+    ];
+
+    /// Ready is clearly the more prominent state: the slab stands well off
+    /// the chrome when idle and steps back while a turn streams.
+    #[test]
+    fn ready_slab_stands_out_and_streaming_steps_back() {
+        for name in PALETTES {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let chrome = match theme.bg {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => unreachable!(),
+            };
+            let ready = Slab::new(&theme, PromptFx::default(), 80, None);
+            let busy = Slab::new(
+                &theme,
+                PromptFx {
+                    dim: 1.0,
+                    ..PromptFx::default()
+                },
+                80,
+                None,
+            );
+            let (r, b) = (contrast(ready.body, chrome), contrast(busy.body, chrome));
+            assert!(r >= 1.15, "{name}: ready step {r:.3}");
+            assert!(r - b >= 0.08, "{name}: ready {r:.3} vs streaming {b:.3}");
+        }
+    }
+
+    /// When a turn ends the prompt colour washes over the slab, then fades;
+    /// the clock asks for frames only while it does.
+    #[test]
+    fn turn_end_cues_your_turn_then_rests() {
+        let t0 = Instant::now();
+        let mut clock = PromptClock::with_enabled(t0, true);
+        assert_eq!(clock.frame(t0, false).arrive, 0.0, "no cue at launch");
+        clock.frame(t0, true);
+        let end = t0 + Duration::from_secs(5);
+        assert_eq!(clock.frame(end, false).arrive, 1.0, "cue at turn end");
+        assert!(clock.animating(end + Duration::from_millis(500), false));
+        let later = end + Duration::from_secs_f32(ARRIVE_DECAY + 0.01);
+        assert_eq!(clock.frame(later, false).arrive, 0.0);
+        assert!(!clock.animating(later, false), "still afterwards");
+
+        let theme = Theme::default();
+        let cue = Slab::new(
+            &theme,
+            PromptFx {
+                arrive: 1.0,
+                ..PromptFx::default()
+            },
+            80,
+            None,
+        );
+        let calm = Slab::new(&theme, PromptFx::default(), 80, None);
+        assert_ne!(cue.fill_at(10), calm.fill_at(10), "the cue tints the slab");
+        assert_ne!(
+            Slab::at(&cue.halo, 10),
+            calm.backdrop,
+            "and glows around it"
+        );
     }
 }
