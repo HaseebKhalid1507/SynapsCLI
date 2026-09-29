@@ -41,6 +41,13 @@ pub(crate) const INSET_X: u16 = 3;
 const SHIMMER_PERIOD: f32 = 1.9;
 const TRAIL_DECAY: f32 = 0.7;
 const PULSE_DECAY: f32 = 0.45;
+/// Seconds the prompt takes to dim when a turn starts streaming (and to come
+/// back when it ends).
+const DIM_FADE: f32 = 0.25;
+/// How far the dim goes: the body gives back this share of its lift off the
+/// chrome, and typed text moves this far toward the body (never below AA).
+const DIM_BODY: f32 = 0.5;
+const DIM_TEXT: f32 = 0.3;
 /// Redraw cadence the prompt asks for while it animates on its own.
 const FRAME: Duration = Duration::from_millis(40);
 
@@ -113,6 +120,9 @@ pub(crate) struct PromptFx {
     pub(crate) pulse: f32,
     /// Seconds the current turn has been streaming.
     pub(crate) stream_secs: f32,
+    /// 0..1 how dimmed the prompt is: 1 while a turn streams (the agent has
+    /// the floor), 0 when idle, eased between over [`DIM_FADE`].
+    pub(crate) dim: f32,
 }
 
 /// Input/stream event times → per-frame [`PromptFx`]. Lives on `App`.
@@ -123,6 +133,8 @@ pub(crate) struct PromptClock {
     last_send: Instant,
     last_frame: Instant,
     stream_since: Instant,
+    /// When streaming last started or stopped (drives the dim fade).
+    stream_changed: Instant,
     was_streaming: bool,
 }
 
@@ -140,6 +152,7 @@ impl PromptClock {
             last_send: long_ago,
             last_frame: long_ago,
             stream_since: now,
+            stream_changed: long_ago,
             was_streaming: false,
         }
     }
@@ -160,6 +173,20 @@ impl PromptClock {
             .powi(2)
     }
 
+    fn fading(&self, now: Instant) -> bool {
+        Self::secs(now, self.stream_changed) < DIM_FADE
+    }
+
+    fn dim(&self, now: Instant, streaming: bool) -> f32 {
+        let p = (Self::secs(now, self.stream_changed) / DIM_FADE).clamp(0.0, 1.0);
+        let eased = p * p * (3.0 - 2.0 * p);
+        if streaming {
+            eased
+        } else {
+            1.0 - eased
+        }
+    }
+
     /// A key or paste went into the input: lights the cursor trail.
     pub(crate) fn touch(&mut self, now: Instant) {
         self.last_key = now;
@@ -175,7 +202,8 @@ impl PromptClock {
     /// false, so the prompt never costs a frame while idle. Feeds the tick
     /// guard.
     pub(crate) fn animating(&self, now: Instant, streaming: bool) -> bool {
-        self.enabled && (streaming || self.trail(now) > 0.0 || self.pulse(now) > 0.0)
+        self.enabled
+            && (streaming || self.fading(now) || self.trail(now) > 0.0 || self.pulse(now) > 0.0)
     }
 
     /// Whether the tick arm should request a redraw for the prompt now.
@@ -194,6 +222,7 @@ impl PromptClock {
     pub(crate) fn frame(&mut self, now: Instant, streaming: bool) -> PromptFx {
         if streaming != self.was_streaming {
             self.was_streaming = streaming;
+            self.stream_changed = now;
             if streaming {
                 self.stream_since = now;
             }
@@ -203,6 +232,7 @@ impl PromptClock {
         if !self.enabled {
             return PromptFx {
                 stream_secs,
+                dim: if streaming { 1.0 } else { 0.0 },
                 ..PromptFx::default()
             };
         }
@@ -215,6 +245,7 @@ impl PromptClock {
             trail: self.trail(now),
             pulse: self.pulse(now),
             stream_secs,
+            dim: self.dim(now, streaming),
         }
     }
 }
@@ -231,9 +262,13 @@ pub(crate) struct Slab {
     /// What the slab floats on: the chrome (`bg`), full width, continuous
     /// with the footer row below.
     backdrop: Rgb,
-    /// The resting body colour.
+    /// The body colour this frame (dimmed while streaming, before flash or
+    /// sweep).
     body: Rgb,
+    /// The theme's `input_fg`, full strength (the legibility anchor).
     text: Rgb,
+    /// Typed-text colour this frame: `text`, dimmed while streaming.
+    typed: Rgb,
     prompt: Rgb,
     muted: Rgb,
     stream: Rgb,
@@ -271,6 +306,9 @@ impl Slab {
             lift += 0.01;
             body = mix(backdrop, text, lift);
         }
+        // Streaming: the agent has the floor, so the prompt steps back a
+        // little — the body gives back part of its lift.
+        body = mix(backdrop, text, lift * (1.0 - DIM_BODY * fx.dim));
         // Send flash: the body brightens toward the text colour for a moment.
         let rest = mix(body, text, 0.08 * fx.pulse);
 
@@ -291,10 +329,12 @@ impl Slab {
                 halo.push(backdrop);
             }
         }
+        let typed = mix(text, body, DIM_TEXT * fx.dim);
         Self {
             backdrop,
             body,
             text,
+            typed,
             prompt,
             muted,
             stream,
@@ -326,9 +366,9 @@ impl Slab {
         }
     }
 
-    /// Cursor block: the theme's text colour (the classic inverse cursor).
+    /// Cursor block: the typed-text colour (the classic inverse cursor).
     fn cursor(&self) -> Rgb {
-        self.text
+        self.legible(self.typed, self.brightest(), 4.5)
     }
 
     /// How much of the cursor colour bleeds into the cell `dx` columns away:
@@ -376,9 +416,10 @@ impl Slab {
         color(self.legible(self.muted, self.brightest(), 3.6))
     }
 
-    /// Typed input: the theme's `input_fg`.
+    /// Typed input: the theme's `input_fg`, dimmed a little while a turn
+    /// streams (never below 4.5:1).
     pub(crate) fn text_fg(&self) -> Color {
-        color(self.text)
+        color(self.legible(self.typed, self.brightest(), 4.5))
     }
 }
 
@@ -555,6 +596,7 @@ mod tests {
             out.push((
                 PromptFx {
                     shimmer: i as f32 / 10.0,
+                    dim: 1.0,
                     ..PromptFx::default()
                 },
                 true,
@@ -686,9 +728,10 @@ mod tests {
             fx,
             PromptFx {
                 stream_secs: fx.stream_secs,
+                dim: 1.0,
                 ..PromptFx::default()
             },
-            "no motion when disabled; only the elapsed clock"
+            "no motion when disabled: the elapsed clock, and the dim snaps"
         );
     }
 
@@ -750,5 +793,77 @@ mod glow_tests {
             slab.body,
             "outside the sweep the body is untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_dim_tests {
+    use super::*;
+
+    const PALETTES: &[&str] = &["default", "myx", "night-city", "gruvbox", "forest", "blood"];
+
+    /// Idle and streaming look different: while streaming the body sits
+    /// closer to the chrome and typed text is softer — still AA.
+    #[test]
+    fn streaming_dims_body_and_text() {
+        for name in PALETTES {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let idle = Slab::new(&theme, PromptFx::default(), 80, None);
+            let busy = Slab::new(
+                &theme,
+                PromptFx {
+                    dim: 1.0,
+                    ..PromptFx::default()
+                },
+                80,
+                None,
+            );
+            let chrome = rgb_of(theme.bg);
+            assert!(
+                contrast(busy.body, chrome) < contrast(idle.body, chrome),
+                "{name}: body steps back toward the chrome"
+            );
+            assert!(
+                contrast(busy.body, chrome) > 1.02,
+                "{name}: but the slab is still there"
+            );
+            let (ti, tb) = (rgb_of(idle.text_fg()), rgb_of(busy.text_fg()));
+            assert_ne!(ti, tb, "{name}: typed text dims");
+            assert!(
+                contrast(tb, busy.brightest()) >= 4.49,
+                "{name}: dimmed text stays AA"
+            );
+        }
+    }
+
+    fn rgb_of(c: Color) -> Rgb {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("expected rgb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dim_fades_in_and_out_with_the_stream() {
+        let t0 = Instant::now();
+        let mut clock = PromptClock::with_enabled(t0, true);
+        assert_eq!(clock.frame(t0, false).dim, 0.0, "idle: not dimmed");
+        assert_eq!(
+            clock.frame(t0, true).dim,
+            0.0,
+            "stream starts: fade begins at 0"
+        );
+        let mid = t0 + Duration::from_secs_f32(DIM_FADE / 2.0);
+        let d = clock.frame(mid, true).dim;
+        assert!(d > 0.2 && d < 0.8, "halfway through the fade: {d}");
+        let done = t0 + Duration::from_secs_f32(DIM_FADE + 0.01);
+        assert_eq!(clock.frame(done, true).dim, 1.0);
+
+        // Stream ends: fades back, and keeps asking for frames until it has.
+        assert_eq!(clock.frame(done, false).dim, 1.0);
+        assert!(clock.animating(done, false), "frames for the fade back");
+        let back = done + Duration::from_secs_f32(DIM_FADE + 0.01);
+        assert_eq!(clock.frame(back, false).dim, 0.0);
+        assert!(!clock.animating(back, false), "still again afterwards");
     }
 }
