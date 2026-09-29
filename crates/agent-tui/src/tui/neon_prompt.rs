@@ -2,13 +2,14 @@
 //! bordered box.
 //!
 //! The shape is made only of half-cell blocks (`▗▄▖ ▐ ▌ ▝▀▘`), so there is no
-//! line art. Its fill is one flat, faint tint of the theme's prompt colour,
-//! floating on the chrome band it shares with the footer.
+//! line art. Its body is the theme's chrome lifted toward the theme's own
+//! text colour, floating on the chrome band it shares with the footer. Every
+//! colour is a theme token or a mix of two.
 //!
 //! At rest it is completely still (no frames at all). Motion only answers
-//! something happening: the cursor is a lit block whose glow trails behind
-//! typing, sending flashes the slab, and while a turn streams the colour calms
-//! and a shimmer sweeps across with a glow under it.
+//! something happening: a faint glow trails behind the cursor while typing,
+//! sending brightens the body for a moment, and while a turn streams a soft
+//! band of the theme's streaming colour sweeps across.
 //!
 //! Split in two:
 //! - [`PromptClock`] lives on `App` (main task) and turns input/stream events
@@ -30,8 +31,6 @@ use ratatui::{
 use super::theme::Theme;
 
 type Rgb = (u8, u8, u8);
-
-const WHITE: Rgb = (255, 255, 255);
 
 /// Columns between the input area's edge and the text column's prompt glyph:
 /// canvas margin, half-block side, padding.
@@ -206,74 +205,81 @@ impl PromptClock {
 // ───────────────────────────── colours (render side) ───────────────────────
 
 /// One frame's colours for an input area of a given width.
+///
+/// Every colour is a theme token or a mix of two theme tokens — nothing
+/// invented (no white, no foreign accent). The body is the chrome lifted
+/// toward the theme's own text colour, so it keeps the chrome's hue on every
+/// palette; the prompt glyph, text and spinner use their tokens unchanged.
 pub(crate) struct Slab {
     /// What the slab floats on: the chrome (`bg`), full width, continuous
     /// with the footer row below.
     backdrop: Rgb,
-    canvas: Rgb,
+    /// The resting body colour.
+    body: Rgb,
     text: Rgb,
     prompt: Rgb,
     muted: Rgb,
     stream: Rgb,
-    streaming: bool,
     fx: PromptFx,
-    /// Fill of the slab body, per column.
+    /// Fill of the slab body, per column (varies only under the shimmer).
     fill: Vec<Rgb>,
-    /// Halo under the half-cell edges, per column.
+    /// Band colour under the half-cell edges, per column: the chrome, lit
+    /// only under the shimmer.
     halo: Vec<Rgb>,
-    /// The colour the fill is tinted toward, per column: the prompt colour,
-    /// or the shimmer while streaming (cursor + glow source).
-    tint: Vec<Rgb>,
 }
+
+/// How far the body stands off the chrome (WCAG contrast): enough to read as
+/// a surface, as quiet as the transcript canvas's own step.
+const BODY_CONTRAST: f32 = 1.12;
+/// Cap on the lift toward the text colour.
+const BODY_MAX_LIFT: f32 = 0.15;
 
 impl Slab {
     pub(crate) fn new(theme: &Theme, fx: PromptFx, streaming: bool, width: u16) -> Self {
         let d = Theme::default();
         let backdrop = rgb(theme.bg, d.bg);
-        let canvas = rgb(theme.message_background(), d.message_bg);
         let text = rgb(theme.input_fg, d.input_fg);
         let prompt = rgb(theme.prompt_fg, d.prompt_fg);
         let muted = rgb(theme.muted, d.muted);
         let stream = rgb(theme.status_streaming, d.status_streaming);
 
-        let base = mix(backdrop, text, 0.025);
+        // Chrome lifted toward the theme's text just far enough to read.
+        let mut body = backdrop;
+        let mut lift = 0.0;
+        while lift < BODY_MAX_LIFT && contrast(body, backdrop) < BODY_CONTRAST {
+            lift += 0.01;
+            body = mix(backdrop, text, lift);
+        }
+        // Send flash: the body brightens toward the text colour for a moment.
+        let rest = mix(body, text, 0.08 * fx.pulse);
+
         let w = usize::from(width.max(1));
         let wf = w as f32;
         let sweep = fx.shimmer * (wf + 40.0) - 20.0;
-        let (mut fill, mut halo, mut tint) = (
-            Vec::with_capacity(w),
-            Vec::with_capacity(w),
-            Vec::with_capacity(w),
-        );
+        let (mut fill, mut halo) = (Vec::with_capacity(w), Vec::with_capacity(w));
         for x in 0..w {
-            let mut t = prompt;
-            // `glow` is light spilling onto the band around the slab: only
-            // under the moving sweep or a send flash. At rest it is 0, so the
-            // band is exactly the footer's colour.
-            let (amount, glow) = if streaming {
+            if streaming {
+                // A soft band of the theme's streaming colour sweeps across,
+                // spilling a little onto the chrome around the slab.
                 let dist = (x as f32 - sweep) / 9.0;
                 let s = (-dist * dist).exp();
-                t = mix(mix(t, muted, 0.45), stream, s * 0.8);
-                (0.075 + 0.085 * s, 0.12 * s)
+                fill.push(mix(rest, stream, 0.10 * s));
+                halo.push(mix(backdrop, stream, 0.07 * s));
             } else {
-                (0.13, 0.0)
-            };
-            tint.push(t);
-            fill.push(mix(base, t, amount + 0.14 * fx.pulse));
-            halo.push(mix(backdrop, t, glow + 0.10 * fx.pulse));
+                fill.push(rest);
+                halo.push(backdrop);
+            }
         }
         Self {
             backdrop,
-            canvas,
+            body,
             text,
             prompt,
             muted,
             stream,
-            streaming,
             fx,
             fill,
             halo,
-            tint,
         }
     }
 
@@ -286,12 +292,12 @@ impl Slab {
         Self::at(&self.fill, x)
     }
 
-    /// Nudge `c` toward the text colour until it reads at `target` on `bg`.
+    /// `c` mixed toward the theme's text colour just until it reads at
+    /// `target` on `bg` (unchanged if it already does).
     fn legible(&self, c: Rgb, bg: Rgb, target: f32) -> Rgb {
-        let toward = mix(self.text, WHITE, 0.3);
         let mut t = 0.0;
         loop {
-            let out = mix(c, toward, t);
+            let out = mix(c, self.text, t);
             if contrast(out, bg) >= target || t >= 1.0 {
                 return out;
             }
@@ -299,72 +305,59 @@ impl Slab {
         }
     }
 
-    /// Cursor block colour at column `x`.
-    fn cursor(&self, x: u16) -> Rgb {
-        if self.streaming {
-            mix(self.prompt, self.text, 0.35)
-        } else {
-            mix(Self::at(&self.tint, x), WHITE, 0.25)
-        }
+    /// Cursor block: the theme's text colour (the classic inverse cursor).
+    fn cursor(&self) -> Rgb {
+        self.text
     }
 
-    /// How much of the cursor colour bleeds into the cell `dx` columns away.
+    /// How much of the cursor colour bleeds into the cell `dx` columns away:
+    /// a faint glow that trails behind typing and fades.
     fn glow(&self, dx: i32) -> f32 {
         let trail = self.fx.trail;
-        let k = 0.35 + 0.65 * trail;
         match dx {
-            -1 => 0.26 * k,
-            -2 => 0.14 * k,
-            -3 => 0.07 * k * trail.max(0.3),
-            -4 => 0.035 * trail,
-            1 => 0.09 * k,
+            -1 => 0.12 * trail,
+            -2 => 0.06 * trail,
+            -3 => 0.03 * trail,
             _ => 0.0,
         }
     }
 
     /// The body colour text is hardest to read on: the brightest column of
-    /// the fill. Foreground colours are made legible against it, so they
-    /// hold everywhere, including under the shimmer.
+    /// the fill. Foreground colours are checked against it, so they hold
+    /// everywhere, including under the shimmer.
     fn brightest(&self) -> Rgb {
         self.fill
             .iter()
             .copied()
             .max_by(|a, b| luminance(*a).total_cmp(&luminance(*b)))
-            .unwrap_or(self.canvas)
+            .unwrap_or(self.body)
     }
 
-    /// Prompt glyph colour (ready).
+    /// Prompt glyph: the theme's `prompt_fg`.
     pub(crate) fn prompt_fg(&self) -> Color {
-        color(self.legible(self.prompt, self.brightest(), 4.5))
+        color(self.legible(self.prompt, self.brightest(), 3.0))
     }
 
-    /// Spinner colour while streaming.
+    /// Spinner while streaming: the theme's `status_streaming`.
     pub(crate) fn spinner_fg(&self) -> Color {
-        color(self.legible(self.stream, self.brightest(), 4.5))
+        color(self.legible(self.stream, self.brightest(), 3.0))
     }
 
-    /// Placeholder text colour (italic).
-    pub(crate) fn placeholder_fg(&self) -> Color {
-        let bg = self.brightest();
-        color(self.legible(mix(bg, self.text, 0.55), bg, 4.5))
-    }
-
-    /// Ghost-completion colour: deliberately dimmer than typed text, never
-    /// below 3.6:1.
-    pub(crate) fn ghost_fg(&self) -> Color {
-        let bg = self.brightest();
-        color(self.legible(mix(bg, self.text, 0.45), bg, 3.6))
-    }
-
-    /// Scroll-arrow colour in the prompt column.
-    pub(crate) fn arrow_fg(&self) -> Color {
+    /// Secondary text on the body (placeholder, scroll arrows, hint tabs):
+    /// `muted` lifted toward the text colour until it reads at 4.5:1.
+    pub(crate) fn dim_fg(&self) -> Color {
         color(self.legible(self.muted, self.brightest(), 4.5))
     }
 
-    /// Typed input: the theme's input colour, lifted only if a bright tint
-    /// would otherwise wash it out.
+    /// Ghost completion: `muted` at 3.6:1, deliberately dimmer than typed
+    /// text and than the placeholder.
+    pub(crate) fn ghost_fg(&self) -> Color {
+        color(self.legible(self.muted, self.brightest(), 3.6))
+    }
+
+    /// Typed input: the theme's `input_fg`.
     pub(crate) fn text_fg(&self) -> Color {
-        color(self.legible(self.text, self.brightest(), 4.5))
+        color(self.text)
     }
 }
 
@@ -433,9 +426,7 @@ pub(crate) fn paint_slab(buf: &mut Buffer, area: Rect, slab: &Slab, cursor: Opti
             color(slab.fill_at(r)),
             halo_r,
         ); // ▌
-        let lit = cursor
-            .filter(|c| c.y == y)
-            .map(|c| (c.x, slab.cursor(c.x - area.x)));
+        let lit = cursor.filter(|c| c.y == y).map(|c| (c.x, slab.cursor()));
         for rx in l + 1..r {
             let mut bg = slab.fill_at(rx);
             if let Some((cx, cur)) = lit {
@@ -453,52 +444,40 @@ pub(crate) fn paint_cursor(buf: &mut Buffer, area: Rect, slab: &Slab, at: Cursor
     {
         return;
     }
-    let rel = at.x - area.x;
-    let (fill, cur) = (slab.fill_at(rel), slab.cursor(rel));
+    let fill = slab.fill_at(at.x - area.x);
     if let Some(cell) = buf.cell_mut((at.x, at.y)) {
         let sym = if cell.symbol().trim().is_empty() {
             " ".to_string()
         } else {
             cell.symbol().to_string()
         };
-        cell.set_symbol(&sym).set_fg(color(fill)).set_bg(color(cur));
+        cell.set_symbol(&sym)
+            .set_fg(color(fill))
+            .set_bg(color(slab.cursor()));
     }
 }
 
-/// A status tab hanging off the bottom rim, right-aligned inside the slab.
-/// `accent_streaming` picks the stream colour, otherwise the prompt colour.
-/// Skipped when it doesn't fit.
-pub(crate) fn paint_tab(
-    buf: &mut Buffer,
-    area: Rect,
-    slab: &Slab,
-    text: &str,
-    accent_streaming: bool,
-) {
+/// A status tab hanging off the bottom rim, right-aligned inside the slab:
+/// the body colour extends down under the text. Streaming text is the
+/// theme's streaming colour, hints the legible dim. Skipped when it doesn't
+/// fit.
+pub(crate) fn paint_tab(buf: &mut Buffer, area: Rect, slab: &Slab, text: &str, streaming: bool) {
     let len = super::text_metrics::width(text) as u16;
     if area.height < 3 || area.width < len + 8 {
         return;
     }
-    let accent = if accent_streaming {
-        slab.stream
-    } else {
-        slab.prompt
-    };
     let y = area.bottom() - 1;
     let r = area.width - 2;
     let mut rx = r - 2 - len;
+    let fg = if streaming {
+        slab.spinner_fg()
+    } else {
+        slab.dim_fg()
+    };
     for ch in text.chars() {
-        let bg = mix(slab.fill_at(rx), accent, 0.16);
-        let fg = slab.legible(mix(accent, WHITE, 0.1), bg, 4.5);
+        let bg = color(slab.fill_at(rx));
         let mut tmp = [0u8; 4];
-        put(
-            buf,
-            area.x + rx,
-            y,
-            ch.encode_utf8(&mut tmp),
-            color(fg),
-            color(bg),
-        );
+        put(buf, area.x + rx, y, ch.encode_utf8(&mut tmp), fg, bg);
         rx += super::text_metrics::char_width(ch) as u16;
     }
 }
@@ -564,30 +543,45 @@ mod tests {
     }
 
     #[test]
-    fn typed_text_placeholder_and_prompt_stay_legible_on_every_palette() {
+    fn text_and_hints_stay_legible_on_every_palette() {
         for name in BUILTINS {
             let theme = super::super::theme::Theme::builtin_for_test(name);
             for (fx, streaming) in frames() {
                 let slab = Slab::new(&theme, fx, streaming, 100);
-                for x in [3u16, 5, 30, 60, 94] {
-                    let bg = slab.fill_at(x);
-                    let text = contrast(rgb_of(slab.text_fg()), bg);
+                let bg = slab.brightest();
+                for (what, fg, min) in [
+                    ("text", slab.text_fg(), 4.5),
+                    ("dim", slab.dim_fg(), 4.5),
+                    ("ghost", slab.ghost_fg(), 3.6),
+                    ("prompt", slab.prompt_fg(), 3.0),
+                    ("spinner", slab.spinner_fg(), 3.0),
+                ] {
+                    let c = contrast(rgb_of(fg), bg);
                     assert!(
-                        text >= 4.5,
-                        "{name}: text {text:.2} at x={x} streaming={streaming}"
+                        c >= min - 0.01,
+                        "{name}: {what} {c:.2} streaming={streaming}"
                     );
-                    for (what, fg, min) in [
-                        ("placeholder", slab.placeholder_fg(), 4.5),
-                        ("prompt", slab.prompt_fg(), 4.5),
-                        ("spinner", slab.spinner_fg(), 4.5),
-                        ("ghost", slab.ghost_fg(), 3.6),
-                        ("arrow", slab.arrow_fg(), 4.5),
-                    ] {
-                        let c = contrast(rgb_of(fg), bg);
-                        assert!(c >= min - 0.01, "{name}: {what} {c:.2} at x={x}");
-                    }
                 }
             }
+        }
+    }
+
+    /// Matches the theme: at rest the prompt glyph, text and cursor are the
+    /// theme's own tokens, and the body stays in the chrome's family — a
+    /// quiet step off the chrome, not a new colour.
+    #[test]
+    fn resting_colours_are_the_themes_own() {
+        for name in BUILTINS {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 80);
+            assert_eq!(slab.text_fg(), theme.input_fg, "{name}: text");
+            assert_eq!(slab.cursor(), rgb_of(theme.input_fg), "{name}: cursor");
+            let c = contrast(slab.body, rgb_of(theme.bg));
+            assert!(
+                (1.05..=1.25).contains(&c),
+                "{name}: body/chrome step {c:.3} (body {:?})",
+                slab.body
+            );
         }
     }
 

@@ -1441,7 +1441,7 @@ pub(crate) fn render_frame_into(
                 last_row.push(Span::styled(
                     text,
                     Style::default()
-                        .fg(slab.placeholder_fg())
+                        .fg(slab.dim_fg())
                         .add_modifier(Modifier::ITALIC),
                 ));
             }
@@ -1457,13 +1457,13 @@ pub(crate) fn render_frame_into(
             let buf = frame.buffer_mut();
             if input_scroll > 0 {
                 if let Some(cell) = buf.cell_mut((text_area.x, text_area.y)) {
-                    cell.set_symbol("\u{2191}").set_fg(slab.arrow_fg());
+                    cell.set_symbol("\u{2191}").set_fg(slab.dim_fg());
                 }
             }
             let below = input_lines > input_scroll + text_area.height;
             if below && (text_area.height > 1 || input_scroll > 0) {
                 if let Some(cell) = buf.cell_mut((text_area.x, text_area.bottom() - 1)) {
-                    cell.set_symbol("\u{2193}").set_fg(slab.arrow_fg());
+                    cell.set_symbol("\u{2193}").set_fg(slab.dim_fg());
                 }
             }
         }
