@@ -603,6 +603,13 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
+        "tui_streaming_glow" => {
+            if super::super::neon_prompt::streaming_glow_enabled() {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
         "startup.quick_start" => {
             let on = match synaps_cli::config::read_config_value("startup.quick_start")
                 .map(|v| v.trim().to_string())

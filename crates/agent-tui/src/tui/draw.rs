@@ -1375,20 +1375,16 @@ pub(crate) fn render_frame_into(
 
         let inset = neon::INSET_X;
         let theme = THEME.load();
-        // The streaming glow wears the context bar's colour, so it shifts
-        // with it as the context window fills.
-        let glow = context_bar_color(
-            &theme,
-            model.last_turn_context,
-            model.last_turn_context_window,
-        );
-        let slab = neon::Slab::new(
-            &theme,
-            model.prompt_fx,
-            model.streaming,
-            input_area.width,
-            glow,
-        );
+        // Optional streaming glow (Settings → Streaming glow): it wears the
+        // context bar's colour, so it shifts with the bar as the window fills.
+        let glow = (model.streaming && neon::streaming_glow_enabled()).then(|| {
+            context_bar_color(
+                &theme,
+                model.last_turn_context,
+                model.last_turn_context_window,
+            )
+        });
+        let slab = neon::Slab::new(&theme, model.prompt_fx, input_area.width, glow);
         let text_area = ratatui::layout::Rect {
             x: input_area.x.saturating_add(inset),
             y: input_area.y.saturating_add(1),
@@ -2107,6 +2103,33 @@ mod neon_prompt_tests {
         assert!(!h.prompt_animating(), "still again once it fades");
         h.set_streaming(true);
         assert!(h.prompt_animating(), "animates while streaming");
+    }
+
+    /// The streaming glow is off unless the setting turns it on.
+    #[test]
+    #[serial]
+    fn streaming_glow_follows_the_setting() {
+        use super::super::neon_prompt::{set_streaming_glow, streaming_glow_enabled};
+        let prior = streaming_glow_enabled();
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.set_streaming(true);
+        h.render(); // the stream clock starts on the first streaming frame
+        h.advance_clock_ms(950); // half a sweep: its centre is mid-slab
+        let body_varies = |h: &mut TestHarness| {
+            let buf = h.render().clone();
+            let (top, _) = rims(&buf);
+            // The top rim's body half, across the slab (no cursor there).
+            let fills: Vec<_> = (3..W - 3).map(|x| buf[(x, top)].style().fg).collect();
+            fills.iter().any(|f| *f != fills[0])
+        };
+        set_streaming_glow(false);
+        assert!(!body_varies(&mut h), "no sweep with the glow off");
+        set_streaming_glow(true);
+        assert!(
+            body_varies(&mut h),
+            "a sweep across the slab with the glow on"
+        );
+        set_streaming_glow(prior);
     }
 
     #[test]
