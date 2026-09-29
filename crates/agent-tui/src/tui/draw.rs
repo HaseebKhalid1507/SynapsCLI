@@ -1382,13 +1382,7 @@ pub(crate) fn render_frame_into(
             x: text_area.x + cursor_col,
             y: text_area.y + cursor_row - input_scroll,
         });
-        neon::paint_slab(
-            frame.buffer_mut(),
-            input_area,
-            &slab,
-            cursor_at,
-            background_is_opaque(),
-        );
+        neon::paint_slab(frame.buffer_mut(), input_area, &slab, cursor_at);
 
         let prompt_span = if model.streaming {
             Span::styled(
@@ -1932,9 +1926,8 @@ mod neon_prompt_tests {
     //! box-drawing border, text in a fixed column with a hanging indent.
     use super::super::app::SPINNER_FRAMES;
     use super::super::testing::TestHarness;
-    use super::super::theme::{background_is_opaque, set_background_opaque};
+    use super::super::theme::{background_is_opaque, set_background_opaque, THEME};
     use ratatui::buffer::Buffer;
-    use ratatui::style::Color;
     use serial_test::serial;
 
     const W: u16 = 80;
@@ -2100,29 +2093,26 @@ mod neon_prompt_tests {
         assert!(h.prompt_animating(), "always animates while streaming");
     }
 
+    /// What's behind the slab is the chrome, full width and continuous with
+    /// the footer row, in both background modes (the toggle owns only the
+    /// conversation canvas).
     #[test]
     #[serial]
-    fn transparent_canvas_leaves_the_margins_and_halo_unpainted() {
+    fn backdrop_is_full_width_chrome_like_the_footer() {
         let prior = background_is_opaque();
         let mut h = TestHarness::boot_with_size(W, H);
-
-        set_background_opaque(true);
-        let buf = h.render().clone();
-        let (top, _) = rims(&buf);
-        assert!(matches!(buf[(0, top + 1)].style().bg, Some(Color::Rgb(..))));
-
-        set_background_opaque(false);
-        let buf = h.render().clone();
-        assert_eq!(buf[(0, top + 1)].style().bg, Some(Color::Reset), "margin");
-        assert_eq!(
-            buf[(10, top)].style().bg,
-            Some(Color::Reset),
-            "halo under the rim"
-        );
-        assert!(
-            matches!(buf[(10, top + 1)].style().bg, Some(Color::Rgb(..))),
-            "the slab body itself stays painted"
-        );
+        for opaque in [true, false] {
+            set_background_opaque(opaque);
+            let chrome = Some(THEME.load().bg);
+            let buf = h.render().clone();
+            let (top, bottom) = rims(&buf);
+            assert_eq!(buf[(0, H - 1)].style().bg, chrome, "footer row is chrome");
+            for y in top..=bottom {
+                for x in [0, W - 1] {
+                    assert_eq!(buf[(x, y)].style().bg, chrome, "({x},{y}) opaque={opaque}");
+                }
+            }
+        }
         set_background_opaque(prior);
     }
 }

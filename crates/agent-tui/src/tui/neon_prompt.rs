@@ -247,6 +247,9 @@ impl PromptClock {
 
 /// One frame's colours for an input area of a given width.
 pub(crate) struct Slab {
+    /// What the slab floats on: the chrome (`bg`), full width, continuous
+    /// with the footer row below.
+    backdrop: Rgb,
     canvas: Rgb,
     text: Rgb,
     prompt: Rgb,
@@ -265,6 +268,7 @@ pub(crate) struct Slab {
 impl Slab {
     pub(crate) fn new(theme: &Theme, fx: PromptFx, streaming: bool, width: u16) -> Self {
         let d = Theme::default();
+        let backdrop = rgb(theme.bg, d.bg);
         let canvas = rgb(theme.message_background(), d.message_bg);
         let text = rgb(theme.input_fg, d.input_fg);
         let prompt = rgb(theme.prompt_fg, d.prompt_fg);
@@ -281,7 +285,7 @@ impl Slab {
             mix(stops[i], stops[i + 1], t - i as f32)
         };
 
-        let base = mix(canvas, text, 0.025);
+        let base = mix(backdrop, text, 0.025);
         let w = usize::from(width.max(1));
         let wf = w as f32;
         let sweep = fx.shimmer * (wf + 40.0) - 20.0;
@@ -302,9 +306,10 @@ impl Slab {
             };
             tint.push(t);
             fill.push(mix(base, t, amount + 0.14 * fx.pulse));
-            halo.push(mix(canvas, t, glow + 0.10 * fx.pulse));
+            halo.push(mix(backdrop, t, glow + 0.10 * fx.pulse));
         }
         Self {
+            backdrop,
             canvas,
             text,
             prompt,
@@ -425,36 +430,23 @@ pub(crate) struct CursorAt {
     pub(crate) y: u16,
 }
 
-/// Paint the slab (margins, half-cell rims, sides, body) over `area`.
-/// `opaque_canvas` = the background toggle: when the canvas is transparent the
-/// margins and halo stay transparent too, and only the shape is drawn.
-pub(crate) fn paint_slab(
-    buf: &mut Buffer,
-    area: Rect,
-    slab: &Slab,
-    cursor: Option<CursorAt>,
-    opaque_canvas: bool,
-) {
+/// Paint the slab (backdrop, half-cell rims, sides, body) over `area`.
+///
+/// The backdrop is the chrome colour across the full width, so the input rows
+/// and the footer read as one band with the slab floating on it. Like the
+/// header and footer, it is painted whatever the background toggle says —
+/// the toggle owns only the conversation canvas.
+pub(crate) fn paint_slab(buf: &mut Buffer, area: Rect, slab: &Slab, cursor: Option<CursorAt>) {
     if area.width < 4 || area.height < 3 {
         return;
     }
-    let outside = |x: u16, v: &[Rgb]| {
-        if opaque_canvas {
-            color(Slab::at(v, x))
-        } else {
-            Color::Reset
-        }
-    };
-    let canvas = if opaque_canvas {
-        color(slab.canvas)
-    } else {
-        Color::Reset
-    };
+    let outside = |x: u16, v: &[Rgb]| color(Slab::at(v, x));
+    let backdrop = color(slab.backdrop);
     let (top, bottom) = (area.y, area.bottom() - 1);
     let (l, r) = (1u16, area.width - 2); // relative columns of the rounded sides
     for y in area.top()..area.bottom() {
-        put(buf, area.x, y, " ", canvas, canvas);
-        put(buf, area.right() - 1, y, " ", canvas, canvas);
+        put(buf, area.x, y, " ", backdrop, backdrop);
+        put(buf, area.right() - 1, y, " ", backdrop, backdrop);
     }
     for rx in l..=r {
         let (top_sym, bottom_sym) = if rx == l {
