@@ -749,6 +749,21 @@ pub(crate) fn build_render_model(
     Some((model, patch))
 }
 
+/// The footer context bar's colour for this much of the window used:
+/// `border_active` under 50%, `status_streaming` under 75%, `error_color`
+/// above. With no turn yet (the bar is hidden) it is the under-50% colour.
+/// Shared with the prompt's streaming glow.
+fn context_bar_color(theme: &super::theme::Theme, context: u64, window: u64) -> Color {
+    let ratio = (context as f64 / window.max(1) as f64).min(1.0);
+    if ratio < 0.5 {
+        theme.border_active
+    } else if ratio < 0.75 {
+        theme.status_streaming
+    } else {
+        theme.error_color
+    }
+}
+
 /// Render one frame from a [`RenderModel`] snapshot.
 ///
 /// Runs on the dedicated render `std::thread`, which maintains its own
@@ -1359,11 +1374,20 @@ pub(crate) fn render_frame_into(
         use super::view_model::INPUT_PREFIX_WIDTH;
 
         let inset = neon::INSET_X;
+        let theme = THEME.load();
+        // The streaming glow wears the context bar's colour, so it shifts
+        // with it as the context window fills.
+        let glow = context_bar_color(
+            &theme,
+            model.last_turn_context,
+            model.last_turn_context_window,
+        );
         let slab = neon::Slab::new(
-            &THEME.load(),
+            &theme,
             model.prompt_fx,
             model.streaming,
             input_area.width,
+            glow,
         );
         let text_area = ratatui::layout::Rect {
             x: input_area.x.saturating_add(inset),
@@ -1548,13 +1572,7 @@ pub(crate) fn render_frame_into(
                 let bar_width: usize = 14;
                 let filled = (usage_ratio * bar_width as f64).round() as usize;
                 let empty = bar_width.saturating_sub(filled);
-                let bar_color = if usage_ratio < 0.5 {
-                    THEME.load().border_active
-                } else if usage_ratio < 0.75 {
-                    THEME.load().status_streaming
-                } else {
-                    THEME.load().error_color
-                };
+                let bar_color = context_bar_color(&theme, turn_context, context_window);
                 let pct = (usage_ratio * 100.0) as u32;
                 Span::styled(
                     format!(
@@ -2166,5 +2184,22 @@ mod footer_tests {
         let word_x = row.find("quit").expect("hint shown") as u16;
         assert_eq!(buf[(key_x, 23)].style().fg, Some(theme.claude_text));
         assert_eq!(buf[(word_x, 23)].style().fg, Some(theme.chrome_dim()));
+    }
+}
+
+#[cfg(test)]
+mod context_bar_color_tests {
+    use super::super::theme::Theme;
+    use super::context_bar_color;
+
+    #[test]
+    fn follows_the_usage_thresholds() {
+        let t = Theme::default();
+        assert_eq!(context_bar_color(&t, 0, 0), t.border_active, "no turn yet");
+        assert_eq!(context_bar_color(&t, 49, 100), t.border_active);
+        assert_eq!(context_bar_color(&t, 50, 100), t.status_streaming);
+        assert_eq!(context_bar_color(&t, 74, 100), t.status_streaming);
+        assert_eq!(context_bar_color(&t, 75, 100), t.error_color);
+        assert_eq!(context_bar_color(&t, 500, 100), t.error_color, "clamped");
     }
 }

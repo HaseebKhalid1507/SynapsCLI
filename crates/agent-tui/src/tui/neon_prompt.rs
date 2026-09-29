@@ -235,8 +235,17 @@ const BODY_CONTRAST: f32 = 1.12;
 const BODY_MAX_LIFT: f32 = 0.15;
 
 impl Slab {
-    pub(crate) fn new(theme: &Theme, fx: PromptFx, streaming: bool, width: u16) -> Self {
+    /// `glow` is the colour of the streaming sweep (the context bar's
+    /// colour, chosen by the caller).
+    pub(crate) fn new(
+        theme: &Theme,
+        fx: PromptFx,
+        streaming: bool,
+        width: u16,
+        glow: Color,
+    ) -> Self {
         let d = Theme::default();
+        let glow = rgb(glow, d.border_active);
         let backdrop = rgb(theme.bg, d.bg);
         let text = rgb(theme.input_fg, d.input_fg);
         let prompt = rgb(theme.prompt_fg, d.prompt_fg);
@@ -259,12 +268,12 @@ impl Slab {
         let (mut fill, mut halo) = (Vec::with_capacity(w), Vec::with_capacity(w));
         for x in 0..w {
             if streaming {
-                // A soft band of the theme's streaming colour sweeps across,
-                // spilling a little onto the chrome around the slab.
+                // A soft band of the glow colour sweeps across, spilling a
+                // little onto the chrome around the slab.
                 let dist = (x as f32 - sweep) / 9.0;
                 let s = (-dist * dist).exp();
-                fill.push(mix(rest, stream, 0.10 * s));
-                halo.push(mix(backdrop, stream, 0.07 * s));
+                fill.push(mix(rest, glow, 0.10 * s));
+                halo.push(mix(backdrop, glow, 0.07 * s));
             } else {
                 fill.push(rest);
                 halo.push(backdrop);
@@ -546,8 +555,17 @@ mod tests {
     fn text_and_hints_stay_legible_on_every_palette() {
         for name in BUILTINS {
             let theme = super::super::theme::Theme::builtin_for_test(name);
-            for (fx, streaming) in frames() {
-                let slab = Slab::new(&theme, fx, streaming, 100);
+            // The sweep can wear any of the context bar's three colours.
+            let glows = [
+                theme.border_active,
+                theme.status_streaming,
+                theme.error_color,
+            ];
+            for ((fx, streaming), glow) in frames()
+                .into_iter()
+                .flat_map(|f| glows.map(move |g| (f, g)))
+            {
+                let slab = Slab::new(&theme, fx, streaming, 100, glow);
                 let bg = slab.brightest();
                 for (what, fg, min) in [
                     ("text", slab.text_fg(), 4.5),
@@ -573,7 +591,7 @@ mod tests {
     fn resting_colours_are_the_themes_own() {
         for name in BUILTINS {
             let theme = super::super::theme::Theme::builtin_for_test(name);
-            let slab = Slab::new(&theme, PromptFx::default(), false, 80);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 80, theme.border_active);
             assert_eq!(slab.text_fg(), theme.input_fg, "{name}: text");
             assert_eq!(slab.cursor(), rgb_of(theme.input_fg), "{name}: cursor");
             let c = contrast(slab.body, rgb_of(theme.bg));
@@ -589,7 +607,7 @@ mod tests {
     fn ghost_reads_dimmer_than_typed_text() {
         for name in BUILTINS {
             let theme = super::super::theme::Theme::builtin_for_test(name);
-            let slab = Slab::new(&theme, PromptFx::default(), false, 80);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 80, theme.border_active);
             let bg = slab.fill_at(10);
             assert!(
                 contrast(rgb_of(slab.ghost_fg()), bg) < contrast(rgb_of(slab.text_fg()), bg),
@@ -629,7 +647,7 @@ mod tests {
     fn resting_halo_is_exactly_the_chrome() {
         for name in BUILTINS {
             let theme = super::super::theme::Theme::builtin_for_test(name);
-            let slab = Slab::new(&theme, PromptFx::default(), false, 80);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 80, theme.border_active);
             for x in [1u16, 20, 78] {
                 assert_eq!(Slab::at(&slab.halo, x), rgb_of(theme.bg), "{name} x={x}");
             }
@@ -686,12 +704,39 @@ mod flat_fill_tests {
     fn resting_fill_is_flat() {
         for name in ["default", "myx", "night-city", "gruvbox"] {
             let theme = super::super::theme::Theme::builtin_for_test(name);
-            let slab = Slab::new(&theme, PromptFx::default(), false, 100);
+            let slab = Slab::new(&theme, PromptFx::default(), false, 100, theme.border_active);
             let first = slab.fill_at(0);
             assert!(
                 (0..100).all(|x| slab.fill_at(x) == first),
                 "{name}: fill varies across the slab"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod glow_tests {
+    use super::*;
+
+    /// The streaming sweep takes the caller's glow colour (the context bar's).
+    #[test]
+    fn streaming_sweep_wears_the_glow_colour() {
+        let theme = Theme::default();
+        let glow = Color::Rgb(250, 10, 10);
+        let fx = PromptFx {
+            shimmer: 0.5, // sweep centre at column 50 of 100
+            ..PromptFx::default()
+        };
+        let slab = Slab::new(&theme, fx, true, 100, glow);
+        assert_eq!(slab.fill_at(50), mix(slab.body, (250, 10, 10), 0.10));
+        assert_eq!(
+            Slab::at(&slab.halo, 50),
+            mix(slab.backdrop, (250, 10, 10), 0.07)
+        );
+        assert_eq!(
+            slab.fill_at(0),
+            slab.body,
+            "outside the sweep the body is untouched"
+        );
     }
 }
