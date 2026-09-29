@@ -531,7 +531,9 @@ pub(crate) fn build_render_model(
     } else {
         0
     };
-    let input_inner_width = term_size.width.saturating_sub(2);
+    let input_inner_width = term_size
+        .width
+        .saturating_sub(2 * super::neon_prompt::INSET_X);
     let (input_lines, _, _) =
         super::view_model::input_wrap_info(&inputs.input, inputs.cursor_pos, input_inner_width);
     let max_input_lines: u16 = 10;
@@ -723,6 +725,7 @@ pub(crate) fn build_render_model(
         input: inputs.input.clone(),
         cursor_pos: inputs.cursor_pos,
         ghost_hint,
+        prompt_fx: inputs.prompt_fx,
         show_full_output: inputs.transcript.show_full_output(),
         session_cost: inputs.session_cost,
         total_input_tokens: inputs.total_input_tokens,
@@ -855,31 +858,13 @@ pub(crate) fn render_frame_into(
     } else {
         0
     };
-    let input_inner_width = frame.area().width.saturating_sub(2);
+    let input_inner_width = frame
+        .area()
+        .width
+        .saturating_sub(2 * super::neon_prompt::INSET_X);
     let max_input_lines: u16 = 10;
-
-    // Recompute input_lines for layout using the snapshot input + cursor_pos.
-    let (input_lines, _, _) = {
-        let w = input_inner_width.max(1) as usize;
-        let prefix_width: usize = 2;
-        let mut total_lines: u16 = 1;
-        let mut col: usize = prefix_width;
-        for ch in model.input.chars() {
-            if ch == '\n' {
-                total_lines += 1;
-                col = prefix_width;
-                continue;
-            }
-            let cw = char_width(ch);
-            if col + cw > w {
-                total_lines += 1;
-                col = 0;
-            }
-            col += cw;
-        }
-        // cursor_row / cursor_col not needed for layout — use dummy values.
-        (total_lines, 0u16, 0u16)
-    };
+    let (input_lines, cursor_row, cursor_col) =
+        super::view_model::input_wrap_info(&model.input, model.cursor_pos, input_inner_width);
     let input_height = input_lines.min(max_input_lines) + 2;
     let download_height: u16 = if !model.active_tasks.is_empty() { 1 } else { 0 };
 
@@ -1365,118 +1350,153 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Input ─────────────────────────────────────────────────────────────
-    let input_border_color = if model.streaming {
-        THEME.load().border
-    } else {
-        THEME.load().border_active
-    };
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(input_border_color))
-        .style(Style::default().bg(THEME.load().bg));
-    let w = input_inner_width.max(1) as usize;
-    let prefix_width: usize = 2;
-    let prompt_style = Style::default().fg(THEME.load().prompt_fg);
-    let input_style = Style::default().fg(THEME.load().input_fg);
-    let input_lines_vec: Vec<ratatui::text::Line> = {
+    // Neon prompt (neon_prompt.rs): a soft-edged slab of light with no drawn
+    // border. The text sits in a fixed column `INSET_X` in from the edge, with
+    // a hanging indent on every row after the first, so wrapped and
+    // multi-line input stays aligned. Wrap math: view_model::input_wrap_info.
+    {
+        use super::neon_prompt::{self as neon, CursorAt};
+        use super::view_model::INPUT_PREFIX_WIDTH;
+
+        let inset = neon::INSET_X;
+        let slab = neon::Slab::new(
+            &THEME.load(),
+            model.prompt_fx,
+            model.streaming,
+            input_area.width,
+        );
+        let text_area = ratatui::layout::Rect {
+            x: input_area.x.saturating_add(inset),
+            y: input_area.y.saturating_add(1),
+            width: input_area.width.saturating_sub(2 * inset),
+            height: input_area.height.saturating_sub(2),
+        };
+        let w = (input_inner_width as usize).max(INPUT_PREFIX_WIDTH + 1);
+        let visible_lines = text_area.height.max(1);
+        let input_scroll: u16 = if cursor_row >= visible_lines {
+            cursor_row - visible_lines + 1
+        } else {
+            0
+        };
+        let cursor_at = (text_area.height > 0).then(|| CursorAt {
+            x: text_area.x + cursor_col,
+            y: text_area.y + cursor_row - input_scroll,
+        });
+        neon::paint_slab(
+            frame.buffer_mut(),
+            input_area,
+            &slab,
+            cursor_at,
+            background_is_opaque(),
+        );
+
+        let prompt_span = if model.streaming {
+            Span::styled(
+                format!("{} ", SPINNER_FRAMES[spinner_idx]),
+                Style::default()
+                    .fg(slab.spinner_fg())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "\u{276f} ",
+                Style::default()
+                    .fg(slab.prompt_fg())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let text_style = Style::default().fg(slab.text_fg());
+        let indent = || Span::raw(" ".repeat(INPUT_PREFIX_WIDTH));
         let mut rows: Vec<Vec<Span>> = Vec::new();
-        let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
-        let mut col: usize = prefix_width;
+        let mut current_row: Vec<Span> = vec![prompt_span];
+        let mut col: usize = INPUT_PREFIX_WIDTH;
         for ch in model.input.chars() {
             if ch == '\n' {
-                rows.push(std::mem::take(&mut current_row));
-                current_row = vec![Span::styled("  ", prompt_style)];
-                col = prefix_width;
+                rows.push(std::mem::replace(&mut current_row, vec![indent()]));
+                col = INPUT_PREFIX_WIDTH;
                 continue;
             }
             let cw = char_width(ch);
-            if col + cw > w {
-                rows.push(std::mem::take(&mut current_row));
-                current_row = Vec::new();
-                col = 0;
+            if col + cw > w && col > INPUT_PREFIX_WIDTH {
+                rows.push(std::mem::replace(&mut current_row, vec![indent()]));
+                col = INPUT_PREFIX_WIDTH;
             }
-            let mut s = String::new();
-            s.push(ch);
-            current_row.push(Span::styled(s, input_style));
+            current_row.push(Span::styled(ch.to_string(), text_style));
             col += cw;
         }
         rows.push(current_row);
 
-        // Apply ghost hint from model
-        if let Some(ref hint) = model.ghost_hint {
-            let ghost_style = Style::default()
-                .fg(THEME.load().border)
-                .add_modifier(Modifier::DIM);
-            if let Some(last_row) = rows.last_mut() {
+        if let Some(last_row) = rows.last_mut() {
+            if let Some(ref hint) = model.ghost_hint {
+                let ghost_style = Style::default()
+                    .fg(slab.ghost_fg())
+                    .add_modifier(Modifier::ITALIC);
                 if let Some(ref badge) = hint.match_badge {
                     last_row.push(Span::styled(badge.clone(), ghost_style));
                 } else if !hint.ghost_text.is_empty() {
                     last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
                 }
+            } else if model.input.is_empty() {
+                let placeholder = if model.streaming {
+                    "agent is working \u{2014} type to steer or queue a follow-up"
+                } else {
+                    "Ask anything  \u{b7}  / for commands  \u{b7}  alt+enter for a new line"
+                };
+                let room = w.saturating_sub(INPUT_PREFIX_WIDTH + 1);
+                let text: String = placeholder.chars().take(room).collect();
+                last_row.push(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(slab.placeholder_fg())
+                        .add_modifier(Modifier::ITALIC),
+                ));
             }
         }
-        rows.into_iter().map(ratatui::text::Line::from).collect()
-    };
+        let lines: Vec<ratatui::text::Line> =
+            rows.into_iter().map(ratatui::text::Line::from).collect();
+        // No block and no base style: the text patches only its foreground, so
+        // the slab painted underneath shows through.
+        frame.render_widget(Paragraph::new(lines).scroll((input_scroll, 0)), text_area);
 
-    // Cursor position for scroll offset
-    let (_, cursor_row, cursor_col) = {
-        let w2 = input_inner_width.max(1) as usize;
-        let mut total_rows: u16 = 1;
-        let mut cur_row: u16 = 0;
-        let mut cur_col: u16 = 0;
-        let mut col: usize = prefix_width;
-        for (i, ch) in model.input.chars().enumerate() {
-            if i == model.cursor_pos {
-                cur_row = total_rows - 1;
-                cur_col = col as u16;
+        // Scroll arrows in the prompt column (hanging-indent rows only).
+        if text_area.height > 0 {
+            let buf = frame.buffer_mut();
+            if input_scroll > 0 {
+                if let Some(cell) = buf.cell_mut((text_area.x, text_area.y)) {
+                    cell.set_symbol("\u{2191}").set_fg(slab.arrow_fg());
+                }
             }
-            if ch == '\n' {
-                total_rows += 1;
-                col = prefix_width;
-                continue;
+            let below = input_lines > input_scroll + text_area.height;
+            if below && (text_area.height > 1 || input_scroll > 0) {
+                if let Some(cell) = buf.cell_mut((text_area.x, text_area.bottom() - 1)) {
+                    cell.set_symbol("\u{2193}").set_fg(slab.arrow_fg());
+                }
             }
-            let cw = char_width(ch);
-            if col + cw > w2 {
-                total_rows += 1;
-                col = 0;
-            }
-            col += cw;
         }
-        if model.cursor_pos >= model.input.chars().count() {
-            cur_row = total_rows - 1;
-            cur_col = col as u16;
+
+        if let Some(at) = cursor_at {
+            neon::paint_cursor(frame.buffer_mut(), input_area, &slab, at);
         }
-        (total_rows, cur_row, cur_col)
-    };
 
-    let visible_lines = max_input_lines;
-    let input_scroll: u16 = if cursor_row >= visible_lines {
-        cursor_row - visible_lines + 1
-    } else {
-        0
-    };
-    let input_widget = Paragraph::new(input_lines_vec)
-        .scroll((input_scroll, 0))
-        .block(input_block);
-    frame.render_widget(input_widget, input_area);
-
-    // Software cursor
-    let cursor_x = input_area.x + 1 + cursor_col;
-    let cursor_y = input_area.y + 1 + cursor_row - input_scroll;
-    if cursor_x < input_area.x.saturating_add(input_area.width)
-        && cursor_y < input_area.y.saturating_add(input_area.height)
-    {
-        if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
-            let symbol = cell.symbol().to_string();
-            let cursor_symbol = if symbol.trim().is_empty() {
-                " "
-            } else {
-                symbol.as_str()
-            };
-            cell.set_symbol(cursor_symbol)
-                .set_fg(THEME.load().bg)
-                .set_bg(THEME.load().input_fg);
+        // Status tab hanging off the bottom edge.
+        let tab = if model.streaming {
+            Some(format!(
+                " {} working {:.1}s \u{b7} esc abort ",
+                SPINNER_FRAMES[spinner_idx], model.prompt_fx.stream_secs
+            ))
+        } else if model
+            .ghost_hint
+            .as_ref()
+            .is_some_and(|h| !h.ghost_text.is_empty())
+        {
+            Some(" tab complete ".to_string())
+        } else if input_lines > 1 {
+            Some(format!(" {input_lines} lines \u{b7} alt+enter newline "))
+        } else {
+            None
+        };
+        if let Some(tab) = tab {
+            neon::paint_tab(frame.buffer_mut(), input_area, &slab, &tab, model.streaming);
         }
     }
 
@@ -1890,6 +1910,207 @@ mod background_toggle_tests {
             "row 0 (header) must not change between modes, but did"
         );
 
+        set_background_opaque(prior);
+    }
+}
+
+#[cfg(test)]
+mod neon_prompt_tests {
+    //! The input is the neon slab (neon_prompt.rs): half-block shape, no
+    //! box-drawing border, text in a fixed column with a hanging indent.
+    use super::super::app::SPINNER_FRAMES;
+    use super::super::testing::TestHarness;
+    use super::super::theme::{background_is_opaque, set_background_opaque};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use serial_test::serial;
+
+    const W: u16 = 80;
+    const H: u16 = 16;
+
+    fn sym(buf: &Buffer, x: u16, y: u16) -> &str {
+        buf[(x, y)].symbol()
+    }
+
+    fn row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area().width).map(|x| sym(buf, x, y)).collect()
+    }
+
+    /// (top rim, bottom rim) rows of the slab: the rows whose column 1 holds
+    /// the top-left / bottom-left quadrant.
+    fn rims(buf: &Buffer) -> (u16, u16) {
+        let h = buf.area().height;
+        let bottom = (0..h)
+            .rev()
+            .find(|&y| sym(buf, 1, y) == "\u{259D}")
+            .expect("bottom rim ▝");
+        let top = (0..bottom)
+            .rev()
+            .find(|&y| sym(buf, 1, y) == "\u{2597}")
+            .expect("top rim ▗");
+        (top, bottom)
+    }
+
+    #[test]
+    fn prompt_is_a_half_block_slab_without_box_drawing() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("hello");
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert_eq!(bottom, top + 2, "one text row between the rims");
+        let text = top + 1;
+        for (x, y, want) in [
+            (1, top, "\u{2597}"),
+            (W - 2, top, "\u{2596}"),
+            (1, text, "\u{2590}"),
+            (W - 2, text, "\u{258C}"),
+            (1, bottom, "\u{259D}"),
+            (W - 2, bottom, "\u{2598}"),
+            (3, text, "\u{276f}"),
+            (5, text, "h"),
+        ] {
+            assert_eq!(sym(&buf, x, y), want, "({x},{y})");
+        }
+        for y in top..=bottom {
+            for x in 0..W {
+                let c = sym(&buf, x, y).chars().next().unwrap_or(' ');
+                assert!(
+                    !('\u{2500}'..='\u{257F}').contains(&c),
+                    "box-drawing {c:?} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_input_keeps_a_hanging_indent() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        // 80 cols → text column 5..=76 (72 cells) on every row.
+        h.type_str(&"a".repeat(72));
+        h.type_str("bcd");
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert_eq!(bottom, top + 3, "two text rows");
+        assert_eq!(
+            sym(&buf, 76, top + 1),
+            "a",
+            "first row fills the text column"
+        );
+        assert_eq!(sym(&buf, 77, top + 1), " ", "right padding stays clear");
+        assert_eq!(
+            sym(&buf, 3, top + 2),
+            " ",
+            "no prompt glyph on continuation rows"
+        );
+        assert_eq!(
+            sym(&buf, 5, top + 2),
+            "b",
+            "continuation starts in the text column"
+        );
+    }
+
+    #[test]
+    fn streaming_swaps_the_prompt_for_a_spinner_and_hangs_a_status_tab() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.set_streaming(true);
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert!(
+            SPINNER_FRAMES.contains(&sym(&buf, 3, top + 1)),
+            "spinner in the prompt column, got {:?}",
+            sym(&buf, 3, top + 1)
+        );
+        let rim = row(&buf, bottom);
+        assert!(
+            rim.contains("working") && rim.contains("esc abort"),
+            "tab: {rim:?}"
+        );
+        assert!(
+            row(&buf, top + 1).contains("steer or queue"),
+            "streaming placeholder"
+        );
+    }
+
+    #[test]
+    fn empty_prompt_shows_the_placeholder() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        assert!(row(&buf, top + 1).contains("Ask anything"));
+    }
+
+    #[test]
+    fn ghost_completion_and_multiline_hang_their_hint_tabs() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("/them");
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert!(
+            row(&buf, top + 1).contains("/theme"),
+            "ghost completes inline"
+        );
+        assert!(row(&buf, bottom).contains("tab complete"));
+
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.paste("one\ntwo\nthree");
+        let buf = h.render().clone();
+        let (_, bottom) = rims(&buf);
+        assert!(
+            row(&buf, bottom).contains("3 lines"),
+            "{:?}",
+            row(&buf, bottom)
+        );
+    }
+
+    #[test]
+    fn cursor_is_a_lit_block_after_the_text() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("hi");
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        let (cursor, body) = (&buf[(7, top + 1)], &buf[(20, top + 1)]);
+        assert_ne!(cursor.style().bg, body.style().bg, "cursor cell is lit");
+    }
+
+    /// Idle costs nothing: the prompt stops asking for frames once it
+    /// settles, and a keystroke or a stream wakes it.
+    #[test]
+    fn prompt_animation_settles_and_wakes() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        assert!(h.prompt_animating(), "breathes after boot");
+        h.advance_clock_ms(8_000);
+        assert!(!h.prompt_animating(), "settled after idling");
+        h.type_str("x");
+        assert!(h.prompt_animating(), "a keystroke wakes it");
+        h.advance_clock_ms(8_000);
+        assert!(!h.prompt_animating());
+        h.set_streaming(true);
+        assert!(h.prompt_animating(), "always animates while streaming");
+    }
+
+    #[test]
+    #[serial]
+    fn transparent_canvas_leaves_the_margins_and_halo_unpainted() {
+        let prior = background_is_opaque();
+        let mut h = TestHarness::boot_with_size(W, H);
+
+        set_background_opaque(true);
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        assert!(matches!(buf[(0, top + 1)].style().bg, Some(Color::Rgb(..))));
+
+        set_background_opaque(false);
+        let buf = h.render().clone();
+        assert_eq!(buf[(0, top + 1)].style().bg, Some(Color::Reset), "margin");
+        assert_eq!(
+            buf[(10, top)].style().bg,
+            Some(Color::Reset),
+            "halo under the rim"
+        );
+        assert!(
+            matches!(buf[(10, top + 1)].style().bg, Some(Color::Rgb(..))),
+            "the slab body itself stays painted"
+        );
         set_background_opaque(prior);
     }
 }

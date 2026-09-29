@@ -126,6 +126,10 @@ fn handle_event_inner(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
+    if matches!(event, Event::Key(_) | Event::Paste(_)) {
+        let now = app.clock.now();
+        app.prompt_clock.touch(now, true);
+    }
     match event {
         Event::Key(key) => handle_key(key, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => handle_mouse(mouse, app, scroll_lines),
@@ -459,6 +463,8 @@ fn handle_key(
 
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
+    let now = app.clock.now();
+    app.prompt_clock.sent(now);
     if app.transcript.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
@@ -483,6 +489,8 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
 
 /// User pressed Enter with empty input but staged attachments.
 fn process_submit_attachment_only(app: &mut App) -> InputAction {
+    let now = app.clock.now();
+    app.prompt_clock.sent(now);
     if app.transcript.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
@@ -492,6 +500,8 @@ fn process_submit_attachment_only(app: &mut App) -> InputAction {
 
 /// User pressed Enter with non-empty input while streaming.
 fn process_streaming_submit(app: &mut App) -> InputAction {
+    let now = app.clock.now();
+    app.prompt_clock.sent(now);
     let input = app.input_text();
     app.input_history.push(input.clone());
     app.history_index = None;

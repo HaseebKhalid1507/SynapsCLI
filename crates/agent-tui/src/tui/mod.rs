@@ -22,6 +22,7 @@ mod lightbox;
 mod loop_arms;
 mod markdown;
 mod models;
+mod neon_prompt;
 mod plugins;
 pub mod quit_guard;
 mod render;
@@ -267,7 +268,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compacting || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compacting || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() || app.prompt_clock.animating(app.clock.now(), app.streaming) => {
                 if loop_arms::handle_animation_tick(
                     &mut app, &config, &registry, &render_handle,
                     &secret_prompt_rx, &boot_done, &exit_done,

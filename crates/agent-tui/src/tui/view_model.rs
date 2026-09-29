@@ -43,6 +43,8 @@ pub(crate) struct ViewInputs<'a> {
     /// flattening point.
     pub(crate) input: String,
     pub(crate) cursor_pos: usize,
+    /// Neon-prompt animation snapshot, advanced once per built frame.
+    pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── status / spinner / identity ──
     pub(crate) streaming: bool,
@@ -93,11 +95,13 @@ impl<'a> ViewInputs<'a> {
         // Flatten editor state before the disjoint field borrows below.
         let input = app.input_text();
         let cursor_pos = app.cursor_char_pos();
+        let prompt_fx = app.prompt_clock.frame(app.clock.now(), app.streaming);
         Self {
             gamba_active: app.gamba_child.is_some(),
             transcript: &mut app.transcript,
             input,
             cursor_pos,
+            prompt_fx,
             streaming: app.streaming,
             spinner_frame: app.spinner_frame,
             agent_name: &app.agent_name,
@@ -157,15 +161,21 @@ impl RenderPatch {
     }
 }
 
-/// Visual wrap metrics for the input editor: `(total_lines, cursor_row,
-/// cursor_col)` given an inner width. Free function so both the layout math
-/// in `build_render_model` (via [`ViewInputs`]) and `App::input_wrap_info`
-/// share one implementation.
+/// Display columns reserved at the start of every input row: the "❯ " prompt
+/// on the first row, a matching hanging indent on every other row, so the
+/// text stays in one column.
+pub(crate) const INPUT_PREFIX_WIDTH: usize = 2;
+
+/// Visual wrap metrics for the input editor: `(rows, cursor_row, cursor_col)`
+/// given an inner width. Every row (first, after `\n`, and soft-wrapped)
+/// starts after [`INPUT_PREFIX_WIDTH`]. `rows` includes the row the cursor
+/// moves to when it sits exactly on a wrap boundary, so layout always has
+/// room for it. Shared by the layout math in `build_render_model`, the
+/// render-side layout and the cursor placement in `draw.rs`.
 pub(crate) fn input_wrap_info(input: &str, cursor_pos: usize, inner_width: u16) -> (u16, u16, u16) {
     use super::text_metrics::char_width;
-    let w = inner_width.max(1) as usize;
-    // prefix "❯ " is 2 display columns (only on first line)
-    let prefix_width: usize = 2;
+    let w = (inner_width as usize).max(INPUT_PREFIX_WIDTH + 1);
+    let prefix_width = INPUT_PREFIX_WIDTH;
 
     let mut row: u16 = 0;
     let mut col: usize = prefix_width;
@@ -179,27 +189,60 @@ pub(crate) fn input_wrap_info(input: &str, cursor_pos: usize, inner_width: u16) 
         }
         if ch == '\n' {
             row += 1;
-            col = prefix_width; // continuation lines also have 2-char indent
+            col = prefix_width;
             continue;
         }
         let cw = char_width(ch);
-        if col + cw > w {
+        if col + cw > w && col > prefix_width {
             row += 1;
-            col = 0;
+            col = prefix_width;
         }
         col += cw;
     }
     // If cursor is at the end
-    if cursor_pos == input.chars().count() {
+    if cursor_pos >= input.chars().count() {
         cursor_row = row;
         cursor_col = col as u16;
-        // If cursor is exactly at the wrap boundary
+        // If cursor is exactly at the wrap boundary it moves to the next row.
         if col >= w {
             cursor_row += 1;
-            cursor_col = 0;
+            cursor_col = prefix_width as u16;
         }
     }
 
-    let total_lines = row + 1;
-    (total_lines, cursor_row, cursor_col)
+    let rows = (row + 1).max(cursor_row + 1);
+    (rows, cursor_row, cursor_col)
+}
+
+#[cfg(test)]
+mod input_wrap_tests {
+    use super::input_wrap_info;
+
+    #[test]
+    fn soft_wrapped_rows_keep_the_hanging_indent() {
+        // inner width 10 → 8 text cells per row after the 2-cell prefix.
+        let (rows, cr, cc) = input_wrap_info("abcdefghij", 10, 10);
+        assert_eq!(
+            (rows, cr, cc),
+            (2, 1, 4),
+            "2 chars carried to row 2, after the indent"
+        );
+    }
+
+    #[test]
+    fn newline_rows_keep_the_hanging_indent() {
+        assert_eq!(input_wrap_info("ab\ncd", 5, 10), (2, 1, 4));
+    }
+
+    #[test]
+    fn cursor_on_the_wrap_boundary_gets_a_row() {
+        // Exactly 8 cells fill row 1; the cursor moves to the start of row 2
+        // and layout must count that row.
+        assert_eq!(input_wrap_info("abcdefgh", 8, 10), (2, 1, 2));
+    }
+
+    #[test]
+    fn empty_input() {
+        assert_eq!(input_wrap_info("", 0, 10), (1, 0, 2));
+    }
 }

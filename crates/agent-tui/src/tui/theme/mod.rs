@@ -217,6 +217,12 @@ impl Theme {
         self.message_bg
     }
 
+    /// A builtin palette by name, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn builtin_for_test(name: &str) -> Self {
+        Self::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin theme"))
+    }
+
     /// Dispatcher for builtin themes
     fn builtin(name: &str) -> Option<Self> {
         match name {
