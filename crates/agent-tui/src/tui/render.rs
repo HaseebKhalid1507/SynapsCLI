@@ -16,35 +16,16 @@ use super::transcript::{
     ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
 };
 
-/// Lighten (or darken, with negative `amt`) an RGB colour additively per
-/// channel, clamped. Used to derive subtle panel backgrounds from the theme.
-fn lighten(c: Color, amt: i16) -> Color {
-    if let Color::Rgb(r, g, b) = c {
-        let f = |v: u8| (v as i16 + amt).clamp(0, 255) as u8;
-        Color::Rgb(f(r), f(g), f(b))
-    } else {
-        c
-    }
-}
-
-/// Input-panel background: the theme's `tool_input_bg`, or a subtle tint
-/// auto-derived from `bg` when it's left as `Color::Reset` (the default).
+/// Input-panel background: the theme's `tool_input_bg`, or derived from the
+/// palette when it's `Color::Reset` (see `Theme::tool_input_background`).
 fn input_panel_bg() -> Color {
-    let t = THEME.load();
-    match t.tool_input_bg {
-        Color::Reset => lighten(t.bg, 8),
-        c => c,
-    }
+    THEME.load().tool_input_background()
 }
 
-/// Output-panel background: the theme's `tool_output_bg`, or an auto-derived
-/// (slightly lighter) tint when left as `Color::Reset`.
+/// Output-panel background: the theme's `tool_output_bg`, or derived from the
+/// palette (see `Theme::tool_output_background`).
 fn output_panel_bg() -> Color {
-    let t = THEME.load();
-    match t.tool_output_bg {
-        Color::Reset => lighten(t.bg, 16),
-        c => c,
-    }
+    THEME.load().tool_output_background()
 }
 
 /// Tool panels span ~90% of the terminal, leaving ~5% margin on each side.
