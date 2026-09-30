@@ -477,8 +477,8 @@ pub enum CheckpointReason {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SessionCommand {
-    /// User-authored prompt. Actor: reset auto-turn counter, fold
-    /// abort_context, push user msg, start turn.
+    /// User-authored prompt. Actor: reset auto-turn counter, push user msg
+    /// verbatim, start turn.
     Submit {
         text: String,
         /// Pre-built canonical user content blocks (images, documents)
@@ -490,8 +490,9 @@ pub enum SessionCommand {
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
     Steer { text: String },
-    /// Esc. Cancel, capture abort context, dequeue, flush pending events,
-    /// cancel subagents, save.
+    /// Esc. Cancel, adopt the turn's partial history + append the
+    /// interruption marker (`engine::interrupt`), dequeue, flush pending
+    /// events, cancel subagents, save.
     Cancel,
     /// Answer to a PromptRequest. `None` = cancelled.
     /// NEVER journaled, NEVER replayed, NEVER traced.
@@ -516,8 +517,8 @@ pub enum SessionCommand {
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
     /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair
-    /// (+ optional user text) then a turn. Does NOT fold abort_context and
-    /// does NOT reset consecutive_auto_turns.
+    /// (+ optional user text) then a turn. Does NOT reset
+    /// consecutive_auto_turns.
     SubmitPrepared {
         messages: Vec<crate::SharedMessage>,
         #[serde(default)]
@@ -529,7 +530,7 @@ pub enum SessionCommand {
     /// (A3) `/resume`: save current, load `query`, restore model/reasoning/
     /// system prompt, swap conversation. Reply = `Resumed{id, ..}`.
     Resume { id: u64, query: String },
-    /// (B1, used by C3 reload) cancel any turn (abort_context captured),
+    /// (B1, used by C3 reload) cancel any turn (partial history + marker),
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
@@ -798,7 +799,8 @@ pub enum SessionEventWire {
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     /// Cancel landed. TUI: drop_empty_thinking, push Error(abort_msg),
-    /// subagents.clear(), streaming=false.
+    /// subagents.clear(), streaming=false. `context_saved` (name kept for
+    /// protocol v3): the interrupted turn's partial work is kept in history.
     Aborted { context_saved: bool },
     /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
     Cleared { session_id: String },
@@ -925,6 +927,8 @@ pub struct ConversationSnapshot {
     pub messages_len: usize,
     pub tokens: ConversationTokens,
     pub cost: f64,
+    /// Legacy (protocol v3 shape kept): always `None` — an interrupted turn
+    /// is recorded in `api_messages` (`engine::interrupt`), never as a recap.
     pub abort_context: Option<String>,
     pub queued_message: Option<String>,
     pub pending_events_len: usize,

@@ -7,9 +7,13 @@ use std::time::Duration;
 use super::DaemonState;
 use crate::session::{EndReason, SessionCommand};
 
-/// `session::budgets::TEARDOWN_TIMEOUT_SECS` (SAVE + HOOKS); shared across
-/// all sessions, not ×N.
-pub const SESSION_END_BUDGET: Duration = Duration::from_secs(crate::session::budgets::TEARDOWN_TIMEOUT_SECS);
+/// `session::budgets::TEARDOWN_TIMEOUT_SECS` (SAVE + HOOKS) plus the
+/// cancelled-stream drain a streaming session runs first; shared across all
+/// sessions, not ×N.
+pub const SESSION_END_BUDGET: Duration = Duration::from_secs(
+    crate::session::budgets::TEARDOWN_TIMEOUT_SECS
+        + crate::session::budgets::CANCEL_DRAIN_TIMEOUT_SECS,
+);
 /// `--force`: give the actors this long, then drop them.
 pub const FORCE_BUDGET: Duration = Duration::from_millis(500);
 

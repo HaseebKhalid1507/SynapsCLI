@@ -138,8 +138,8 @@ impl SessionActor {
     }
 
     /// dispatch.rs LoadSkill (:330-360): pre-built tool_use/tool_result pair
-    /// (+ optional user text) then a turn. Does NOT fold `abort_context` and
-    /// does NOT reset `consecutive_auto_turns`.
+    /// (+ optional user text) then a turn. Does NOT reset
+    /// `consecutive_auto_turns`.
     pub(crate) async fn submit_prepared(
         &mut self,
         messages: Vec<crate::SharedMessage>,

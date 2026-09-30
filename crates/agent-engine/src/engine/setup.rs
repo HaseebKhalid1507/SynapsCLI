@@ -83,7 +83,6 @@ pub struct EngineBoot {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
-    pub abort_context: Option<String>,
     pub continued: bool,
     pub continue_info: Option<ContinueInfo>,
     pub registry: Arc<CommandRegistry>,
@@ -167,7 +166,6 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         total_input_tokens: sb.total_input_tokens,
         total_output_tokens: sb.total_output_tokens,
         session_cost: sb.session_cost,
-        abort_context: sb.abort_context,
         continued: sb.continued,
         continue_info: sb.continue_info,
         registry,
@@ -380,7 +378,6 @@ pub(crate) struct SessionBootResult {
     pub(crate) total_input_tokens: u64,
     pub(crate) total_output_tokens: u64,
     pub(crate) session_cost: f64,
-    pub(crate) abort_context: Option<String>,
     pub(crate) continued: bool,
     pub(crate) continue_info: Option<ContinueInfo>,
 }
@@ -463,12 +460,28 @@ fn resolve_or_create_session(
                 }
             };
 
+            // Sessions saved before the interruption marker existed carry a
+            // recap in `abort_context`, meant to be prepended to the next user
+            // message. Migrate once, HERE — the single load path for actor
+            // create, unpark and `boot()` — and before the continuation seed
+            // below, so everything downstream sees the migrated history. The
+            // recap is dropped; the marker is appended (append-only: the
+            // cached prefix is untouched).
+            if crate::engine::interrupt::migrate_legacy_abort_context(
+                &mut session.api_messages,
+                &mut session.abort_context,
+            ) {
+                tracing::info!(
+                    session = %session.id,
+                    "migrated a legacy abort-context recap to an interruption marker"
+                );
+            }
+
             Ok(SessionBootResult {
                 api_messages: session.api_messages.clone(),
                 total_input_tokens: session.total_input_tokens,
                 total_output_tokens: session.total_output_tokens,
                 session_cost: session.session_cost,
-                abort_context: session.abort_context.clone(),
                 continued: true,
                 continue_info,
                 session,
@@ -486,7 +499,6 @@ fn resolve_or_create_session(
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 session_cost: 0.0,
-                abort_context: None,
                 continued: false,
                 continue_info: None,
             })

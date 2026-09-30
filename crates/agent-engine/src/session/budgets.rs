@@ -12,6 +12,19 @@ pub const TEARDOWN_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS;
 pub const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(SAVE_TIMEOUT_SECS);
 pub const HOOKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(HOOKS_TIMEOUT_SECS);
 
+/// `SessionActor::cancel_turn`: how long a cancelled turn's stream is drained
+/// for the engine's cancel-path history, final Usage and any in-flight
+/// context-head checkpoint. The engine's provider/tool awaits are
+/// cancellation-first, so the tail normally arrives in milliseconds; on
+/// expiry the actor keeps its last adopted (valid) history.
+pub const CANCEL_DRAIN_TIMEOUT_MS: u64 = 1_000;
+pub const CANCEL_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(CANCEL_DRAIN_TIMEOUT_MS);
+/// Whole-second ceiling of the drain, for the budget sums below/elsewhere.
+pub const CANCEL_DRAIN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_MS.div_ceil(1000);
+/// Worst case of `cancel_turn`: the drain plus its own bounded save.
+pub const CANCEL_TURN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS + SAVE_TIMEOUT_SECS;
+
 /// `SessionActor::create` bound on `EngineHost::extensions_ready()`: the
 /// loader guard should make this unreachable; it exists so a session can
 /// never hang on a loader that never reports (warns, then proceeds).
