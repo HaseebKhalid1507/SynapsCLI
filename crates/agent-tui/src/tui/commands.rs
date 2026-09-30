@@ -1352,6 +1352,15 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// Handle a slash command while streaming (limited set).
+/// Whether `cmd` (already prefix-resolved against [`STREAMING_COMMANDS`]) is
+/// one of the commands [`handle_streaming_command`] runs mid-stream. Some of
+/// them (`/theme`, `/attachments`, `/detach`) finish with
+/// `CommandAction::None`, which on its own can't be told apart from "not a
+/// streaming command" — the caller asks this before refusing.
+pub(super) fn is_streaming_command(cmd: &str) -> bool {
+    STREAMING_COMMANDS.contains(&cmd)
+}
+
 pub(super) fn handle_streaming_command(
     cmd: &str,
     full_input: &str,
@@ -2343,5 +2352,29 @@ mod tests {
         assert!(receipt.contains("saved:"), "missing savings line");
         assert!(receipt.contains("5m:"), "missing 5m split");
         assert!(receipt.contains("1h:"), "missing 1h split");
+    }
+}
+
+#[cfg(test)]
+mod streaming_command_tests {
+    use super::{is_streaming_command, resolve_prefix, to_owned_commands, STREAMING_COMMANDS};
+
+    /// Regression: `/theme` mid-stream applied the theme and then also said
+    /// "/theme can't run while streaming" — its `CommandAction::None` was
+    /// read as "not a streaming command". The caller now checks this first.
+    #[test]
+    fn theme_and_friends_are_streaming_commands() {
+        let cmds = to_owned_commands(STREAMING_COMMANDS);
+        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba"] {
+            let cmd = resolve_prefix(typed, &cmds);
+            assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");
+        }
+        for typed in ["settings", "model", "compact"] {
+            let cmd = resolve_prefix(typed, &cmds);
+            assert!(
+                !is_streaming_command(&cmd),
+                "/{typed} is refused mid-stream"
+            );
+        }
     }
 }
