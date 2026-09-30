@@ -252,6 +252,48 @@ impl Tool for OverlapProbe {
     }
 }
 
+/// A side-effecting probe (`NonIdempotent`) that reports whether a sibling
+/// ran at the same time. `independent` = declares `runs_independently`,
+/// like the blocking `subagent` tool.
+struct EffectfulOverlapProbe {
+    name: String,
+    gauge: Arc<ConcurrencyGauge>,
+    independent: bool,
+}
+
+#[async_trait]
+impl Tool for EffectfulOverlapProbe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    fn description(&self) -> &str {
+        "effectful overlap probe"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::NonIdempotent
+    }
+    fn runs_independently(&self) -> bool {
+        self.independent
+    }
+    async fn execute(&self, _p: Value, _c: ToolContext) -> Result<String> {
+        let now = self.gauge.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.gauge.peak.fetch_max(now, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+        while self.gauge.peak.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let overlapped = self.gauge.peak.load(Ordering::SeqCst) >= 2;
+        self.gauge.current.fetch_sub(1, Ordering::SeqCst);
+        Ok(if overlapped { "OVERLAP" } else { "SERIAL" }.to_string())
+    }
+}
+
 // ── runtime/event helpers ───────────────────────────────────────────────────
 
 async fn runtime_with(budget: Option<TurnBudget>, tools: Vec<Arc<dyn Tool>>) -> Runtime {
@@ -658,6 +700,49 @@ async fn independent_read_only_calls_overlap() {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].1, "OVERLAP", "read-only calls may overlap");
     assert_eq!(results[1].1, "OVERLAP", "read-only calls may overlap");
+}
+
+/// Regression: blocking `subagent` calls dispatched in one batch ran one at
+/// a time (they are `NonIdempotent`, so they shared the serial lane) — "send
+/// 4 subagents" showed one. Tools that declare `runs_independently` get a
+/// lane each; plain `NonIdempotent` tools still serialize.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn independent_effectful_calls_overlap_but_plain_ones_serialize() {
+    for (independent, expect) in [(true, "OVERLAP"), (false, "SERIAL")] {
+        let _guard = HomeGuard::new();
+        let body: &'static str = Box::leak(
+            sse_two_calls("fx_alpha", "toolu_x1", "fx_beta", "toolu_x2").into_boxed_str(),
+        );
+        let bodies: &'static [&'static str] = Box::leak(Box::new([body, ANTHROPIC_SSE]));
+        let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+        std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+        let gauge = Arc::new(ConcurrencyGauge::default());
+        let probe = |name: &str| -> Arc<dyn Tool> {
+            Arc::new(EffectfulOverlapProbe {
+                name: name.into(),
+                gauge: Arc::clone(&gauge),
+                independent,
+            })
+        };
+        let rt = runtime_with(None, vec![probe("fx_alpha"), probe("fx_beta")]).await;
+        let events = drive_runtime_turn(&rt, "two effectful calls", false).await;
+
+        let results = tool_result_contents(&final_history(&events));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1, expect, "independent={independent}");
+        assert_eq!(results[1].1, expect, "independent={independent}");
+    }
+}
+
+#[test]
+fn blocking_subagent_tool_runs_independently() {
+    assert!(synaps_cli::tools::SubagentTool.runs_independently());
+    assert_eq!(
+        synaps_cli::tools::SubagentTool.effect(),
+        ToolEffect::NonIdempotent
+    );
 }
 
 // ── §8 acceptance: ledger disposition (production surface) ──────────────────

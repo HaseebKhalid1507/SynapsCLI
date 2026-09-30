@@ -17,6 +17,13 @@ impl Tool for SubagentTool {
         "subagent"
     }
 
+    /// Each blocking subagent is its own actor: several dispatched in one
+    /// batch run side by side (the parent waits for all of them either way)
+    /// instead of one after another in the shared serial lane.
+    fn runs_independently(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
     }

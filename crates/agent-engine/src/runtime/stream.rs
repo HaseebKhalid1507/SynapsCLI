@@ -1636,6 +1636,13 @@ impl StreamMethods {
                                             (authorized, input)
                                         });
                                     let lane = match &gate {
+                                        Ok((authorized, _))
+                                            if authorized.implementation().runs_independently() =>
+                                        {
+                                            // Independent actors (subagents):
+                                            // one lane per call, concurrent.
+                                            LaneKind::Concurrent
+                                        }
                                         Ok((authorized, input)) => {
                                             let implementation = authorized.implementation();
                                             match implementation.effect() {
