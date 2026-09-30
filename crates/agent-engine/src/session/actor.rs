@@ -55,12 +55,12 @@ pub type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent
 /// `turn_replay` cap (envelopes). §6 #9: the 2 MiB text bound is day 3.
 const TURN_REPLAY_CAP: usize = 4096;
 
-/// The in-flight turn sidecar (`sessions/<id>.turn`, see
+/// The in-flight turn draft (`sessions/<id>.turn`, see
 /// `agent_core::core::session_draft`): what the actor last knew about the
 /// response being streamed, flushed at most once per 1 Hz turn tick.
 #[derive(Default)]
 pub(crate) struct TurnDraftState {
-    /// Session id the open sidecar lives under; `None` = no turn open.
+    /// Session id the open draft lives under; `None` = no turn open.
     open: Option<String>,
     /// History length the in-flight response continues from.
     base_len: usize,
@@ -344,7 +344,7 @@ pub struct SessionActor {
     /// cancel they would die with the steering channel; `cancel_turn` moves
     /// them into history after the interruption marker instead.
     pub(crate) turn_steered_events: Vec<String>,
-    /// In-flight turn sidecar for crash recovery (persisting sessions only).
+    /// In-flight turn draft for crash recovery (persisting sessions only).
     pub(crate) turn_draft: TurnDraftState,
     pub(crate) turn_draft_writer: agent_core::core::session_draft::TurnDraftWriter,
     // ── prompts ──
@@ -568,7 +568,7 @@ impl SessionActor {
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
         // Crash recovery (the last process died mid-turn): only the lock
-        // holder may persist the recovered history and remove the sidecar.
+        // holder may persist the recovered history and remove the draft.
         if let Some(recovered) = sb.turn_draft {
             if cfg.persist && session_lock.is_some() {
                 crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
@@ -2016,9 +2016,9 @@ impl SessionActor {
         self.update_attach_state();
     }
 
-    // ── in-flight turn sidecar (crash recovery) ──────────────────────────
+    // ── in-flight turn draft (crash recovery) ──────────────────────────
 
-    /// Turn start: the sidecar's existence is the "turn open" signal a
+    /// Turn start: the draft's existence is the "turn open" signal a
     /// loader uses to detect a process that died mid-turn.
     fn open_turn_draft(&mut self) {
         if !self.config.persist || !self.conv.is_live() {
@@ -2062,7 +2062,7 @@ impl SessionActor {
         self.flush_turn_draft();
     }
 
-    /// Write the sidecar if it changed (1 Hz turn tick; round checkpoints).
+    /// Write the draft if it changed (1 Hz turn tick; round checkpoints).
     /// Non-blocking and ordered (`TurnDraftWriter`).
     pub(crate) fn flush_turn_draft(&mut self) {
         let Some(open) = self.turn_draft.open.clone() else {
@@ -2087,7 +2087,7 @@ impl SessionActor {
         );
     }
 
-    /// Turn end (every path goes through `clear_stream`): remove the sidecar.
+    /// Turn end (every path goes through `clear_stream`): remove the draft.
     fn close_turn_draft(&mut self) {
         if let Some(id) = self.turn_draft.open.take() {
             self.turn_draft_writer.remove(&id);
@@ -2628,7 +2628,7 @@ impl SessionActor {
                 {
                     tracing::warn!(session = %self.id, "history checkpoint save timed out");
                 }
-                // The round is committed: the sidecar now continues from here.
+                // The round is committed: the draft now continues from here.
                 self.turn_draft_committed();
                 self.emit_conversation();
             }

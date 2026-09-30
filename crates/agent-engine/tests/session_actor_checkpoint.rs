@@ -305,24 +305,24 @@ async fn saved_mid_turn_history_is_valid_to_resume() {
     end(&mut a).await;
 }
 
-// ── crash recovery: the in-flight turn sidecar ───────────────────────────────
+// ── crash recovery: the in-flight turn draft ───────────────────────────────
 
 use agent_engine::core::session_draft::{read_turn_draft, TurnDraft};
 use agent_engine::core::session_lock::sessions_dir;
 use agent_engine::engine::interrupt::InterruptReason;
 use agent_engine::session::SessionCommand;
 
-/// Poll the sidecar until `pred` holds (flushed on the 1 Hz turn tick).
-async fn sidecar_until(id: &str, pred: impl Fn(Option<&TurnDraft>) -> bool) -> Option<TurnDraft> {
+/// Poll the draft until `pred` holds (flushed on the 1 Hz turn tick).
+async fn draft_until(id: &str, pred: impl Fn(Option<&TurnDraft>) -> bool) -> Option<TurnDraft> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let d = read_turn_draft(&sessions_dir(), id).expect("readable sidecar");
+        let d = read_turn_draft(&sessions_dir(), id).expect("readable draft");
         if pred(d.as_ref()) {
             return d;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "sidecar never reached the expected state: {d:?}"
+            "draft never reached the expected state: {d:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -370,7 +370,7 @@ async fn crash_mid_turn(
             .0
             .iter()
             .any(|(p, _)| p.extension().is_some_and(|e| e == "turn")),
-        "a running turn has a sidecar"
+        "a running turn has a draft"
     );
     end(a).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -404,11 +404,11 @@ fn text(m: &SharedMessage) -> String {
     }
 }
 
-/// The sidecar exists while a turn runs, carries the streamed reply, and is
+/// The draft exists while a turn runs, carries the streamed reply, and is
 /// gone once the turn ends — by completion or by cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn turn_sidecar_follows_the_reply_and_is_removed_at_turn_end() {
+async fn turn_draft_follows_the_reply_and_is_removed_at_turn_end() {
     let _h = Home::new();
     let (url, _) = stub(SSE_PREFIX, true).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -421,14 +421,14 @@ async fn turn_sidecar_follows_the_reply_and_is_removed_at_turn_end() {
 
     a.send(submit("stream something")).await.unwrap();
     until(&mut a, is_text).await;
-    let d = sidecar_until(&id, |d| d.is_some_and(|d| d.partial_text == "hi"))
+    let d = draft_until(&id, |d| d.is_some_and(|d| d.partial_text == "hi"))
         .await
         .unwrap();
     assert_eq!(d.base_len, 1, "continues from the saved prompt");
 
     a.send(SessionCommand::Cancel).await.unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
-    sidecar_until(&id, |d| d.is_none()).await;
+    draft_until(&id, |d| d.is_none()).await;
     end(&mut a).await;
 
     // Normal completion removes it too.
@@ -443,13 +443,13 @@ async fn turn_sidecar_follows_the_reply_and_is_removed_at_turn_end() {
         .unwrap();
     a.send(submit("quick one")).await.unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
-    sidecar_until(&id, |d| d.is_none()).await;
+    draft_until(&id, |d| d.is_none()).await;
     end(&mut a).await;
 }
 
 /// A long reply with no tool calls, cut by a crash: on `--continue` the
 /// streamed text comes back as a real assistant message, then the crash
-/// marker; the sidecar is gone and the recovery is on disk.
+/// marker; the draft is gone and the recovery is on disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn crash_mid_reply_is_recovered_on_continue() {
@@ -465,7 +465,7 @@ async fn crash_mid_reply_is_recovered_on_continue() {
 
     a.send(submit("write me an essay")).await.unwrap();
     until(&mut a, is_text).await;
-    sidecar_until(&id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
+    draft_until(&id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
     crash_mid_turn(&mut a, &handle, &id).await;
 
     let (mut b, snap) = continue_session(&host, &id).await;
@@ -477,7 +477,7 @@ async fn crash_mid_reply_is_recovered_on_continue() {
         "{msgs:#?}"
     );
     assert_eq!(msgs[1]["role"], "assistant");
-    sidecar_until(&id, |d| d.is_none()).await;
+    draft_until(&id, |d| d.is_none()).await;
     let saved = Session::load(&id).unwrap().api_messages;
     assert_eq!(saved.len(), 3, "the recovery was persisted");
     end(&mut b).await;
@@ -502,7 +502,7 @@ async fn crash_after_a_tool_round_keeps_the_round_and_the_partial_reply() {
 
     a.send(submit("read then explain")).await.unwrap();
     until(&mut a, is_text).await;
-    sidecar_until(&id, |d| {
+    draft_until(&id, |d| {
         d.is_some_and(|d| d.base_len == 3 && d.partial_text == "hi")
     })
     .await;
@@ -540,7 +540,7 @@ async fn resume_recovers_a_session_that_crashed_mid_turn() {
         .unwrap();
     a.send(submit("interrupted work")).await.unwrap();
     until(&mut a, is_text).await;
-    sidecar_until(&crashed_id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
+    draft_until(&crashed_id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
     crash_mid_turn(&mut a, &crashed, &crashed_id).await;
 
     let other = host.create_session(persist_cfg()).await.unwrap();
@@ -561,15 +561,15 @@ async fn resume_recovers_a_session_that_crashed_mid_turn() {
         ["interrupted work", "hi", InterruptReason::Crash.marker()],
         "{msgs:#?}"
     );
-    sidecar_until(&crashed_id, |d| d.is_none()).await;
+    draft_until(&crashed_id, |d| d.is_none()).await;
     end(&mut b).await;
 }
 
-/// A leftover sidecar from a turn that actually completed (only its removal
+/// A leftover draft from a turn that actually completed (only its removal
 /// was lost) never alters the history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn stale_sidecar_of_a_completed_turn_is_just_removed() {
+async fn stale_draft_of_a_completed_turn_is_just_removed() {
     let _h = Home::new();
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -596,6 +596,6 @@ async fn stale_sidecar_of_a_completed_turn_is_just_removed() {
 
     let (mut b, snap) = continue_session(&host, &id).await;
     assert_eq!(snap.conversation.api_messages, before, "history untouched");
-    sidecar_until(&id, |d| d.is_none()).await;
+    draft_until(&id, |d| d.is_none()).await;
     end(&mut b).await;
 }

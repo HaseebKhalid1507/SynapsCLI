@@ -37,7 +37,7 @@ pub enum InterruptReason {
     /// recap: the turn was interrupted, the reason is not recorded.
     Unknown,
     /// The process died with a turn open (crash, `kill -9`, power loss):
-    /// found on load via the in-flight turn sidecar (`session_draft`).
+    /// found on load via the in-flight turn draft (`session_draft`).
     Crash,
 }
 
@@ -116,7 +116,7 @@ pub fn migrate_legacy_abort_context(
     true
 }
 
-/// Fold an in-flight turn sidecar left by a process that died mid-turn
+/// Fold an in-flight turn draft left by a process that died mid-turn
 /// (`agent_core::core::session_draft`) into the loaded history.
 ///
 /// The saved history is valid (it is only ever saved at round boundaries),
@@ -124,14 +124,14 @@ pub fn migrate_legacy_abort_context(
 /// - the history already ends with an interruption marker → the turn was
 ///   already concluded (aborted, or recovered before): nothing to do;
 /// - it ends with an assistant message → the turn completed (its final
-///   history was saved) and only the sidecar's removal was lost: nothing to
+///   history was saved) and only the draft's removal was lost: nothing to
 ///   do;
 /// - otherwise the turn was cut off: the partial reply is appended as a real
-///   assistant message — only when the sidecar belongs to exactly this
+///   assistant message — only when the draft belongs to exactly this
 ///   history (`base_len`), never a stale one — then the `Crash` marker.
 ///
 /// Returns whether `messages` changed. Either way the caller removes the
-/// sidecar once the result is saved.
+/// draft once the result is saved.
 pub fn recover_crashed_turn(
     messages: &mut Vec<SharedMessage>,
     draft: &agent_core::core::session_draft::TurnDraft,
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_sidecar_never_contributes_its_text() {
+    fn a_stale_draft_never_contributes_its_text() {
         // The round the text belonged to was committed (history grew past
         // base_len) or its save never landed (history shorter): marker only.
         for base in [0, 2, 5] {
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn a_concluded_turn_is_left_alone() {
-        // Completed (final reply saved) — only the sidecar removal was lost.
+        // Completed (final reply saved) — only the draft removal was lost.
         let mut done = vec![user("do X"), assistant("done")];
         assert!(!recover_crashed_turn(&mut done, &draft(2, "done")));
         assert_eq!(done.len(), 2);

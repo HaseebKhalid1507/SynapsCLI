@@ -1,9 +1,9 @@
-//! The in-flight turn sidecar: `sessions/<id>.turn`.
+//! The in-flight turn draft: `sessions/<id>.turn`.
 //!
 //! The session snapshot is saved at every round boundary (the engine's round
 //! checkpoints), so it always holds a VALID history. What it cannot hold is
 //! the response still being streamed — partial text is not a valid history
-//! entry until the turn stops. This small sidecar carries it instead:
+//! entry until the turn stops. This small draft carries it instead:
 //!
 //! - written when a turn starts (the "turn is open" signal), then at most
 //!   once a second while text streams, and removed when the turn ends;
@@ -14,7 +14,7 @@
 //!   response (text only: unsigned thinking and unfinished tool calls are
 //!   never replayable).
 //!
-//! A sidecar found when a session is loaded means the process died with a
+//! A draft found when a session is loaded means the process died with a
 //! turn open; the loader folds it into history as a real assistant message
 //! plus an interruption marker (`agent_engine::engine::interrupt`).
 //!
@@ -47,7 +47,7 @@ fn artifact(id: &str) -> String {
     format!("{id}.turn")
 }
 
-/// Read the sidecar for `id`. `Ok(None)` when absent (the normal case).
+/// Read the draft for `id`. `Ok(None)` when absent (the normal case).
 pub fn read_turn_draft(dir: &Path, id: &str) -> std::io::Result<Option<TurnDraft>> {
     let Some(bytes) = read_artifact(dir, &artifact(id))? else {
         return Ok(None);
@@ -57,7 +57,7 @@ pub fn read_turn_draft(dir: &Path, id: &str) -> std::io::Result<Option<TurnDraft
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Atomically (re)write the sidecar for `id` (0600, confined).
+/// Atomically (re)write the draft for `id` (0600, confined).
 pub fn write_turn_draft(dir: &Path, id: &str, draft: &TurnDraft) -> std::io::Result<()> {
     let mut draft = draft.clone();
     truncate_on_char_boundary(&mut draft.partial_text, TURN_DRAFT_MAX_TEXT_BYTES);
@@ -65,7 +65,7 @@ pub fn write_turn_draft(dir: &Path, id: &str, draft: &TurnDraft) -> std::io::Res
     write_artifact(dir, &artifact(id), &bytes)
 }
 
-/// Remove the sidecar for `id`. Idempotent.
+/// Remove the draft for `id`. Idempotent.
 pub fn remove_turn_draft(dir: &Path, id: &str) -> std::io::Result<()> {
     match remove_artifact(dir, &artifact(id)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -83,13 +83,13 @@ fn truncate_on_char_boundary(s: &mut String, max: usize) {
     }
 }
 
-/// Non-blocking, per-session ORDERED writer for the sidecar.
+/// Non-blocking, per-session ORDERED writer for the draft.
 ///
 /// Each operation is stamped with a per-id sequence number at the call site
 /// (program order) and applied on the blocking pool under one lock; an
 /// operation older than the last applied one for the same id is skipped. So
 /// the file always ends in the state of the LAST call, even when blocking
-/// tasks run out of order — a late write can never resurrect a sidecar that
+/// tasks run out of order — a late write can never resurrect a draft that
 /// a later `remove` deleted. Never blocks the caller (the session actor's
 /// turn machine must stay responsive to Esc on a slow disk).
 pub struct TurnDraftWriter {
@@ -236,7 +236,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sidecar_is_private() {
+    fn draft_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("sessions");
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_sidecar_is_an_error_not_a_panic() {
+    fn corrupt_draft_is_an_error_not_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("sessions");
         write_turn_draft(&dir, "s1", &draft(0, "")).unwrap();
@@ -309,7 +309,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("sessions");
         let mut w = TurnDraftWriter::new(dir.clone());
-        w.remove("old"); // removing one session's sidecar …
+        w.remove("old"); // removing one session's draft …
         w.write("new", draft(2, "x")); // … must not suppress another's write
         let d = dir.clone();
         settle(move || read_turn_draft(&d, "new").unwrap().is_some()).await;

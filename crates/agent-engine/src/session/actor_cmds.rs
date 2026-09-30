@@ -249,7 +249,7 @@ impl SessionActor {
         };
         // F10: the journal lock follows the conversation (as NewSession and
         // compaction do). Crash recovery needs it: only the lock holder may
-        // fold a turn sidecar in and remove it — a sidecar under a lock held
+        // fold a turn draft in and remove it — a draft under a lock held
         // elsewhere belongs to a turn that is running right now.
         self.reacquire_session_lock(&new_id);
         let turn_draft = if self.session_lock.is_some() {
