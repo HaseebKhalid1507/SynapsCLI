@@ -1310,21 +1310,14 @@ pub(crate) fn render_frame_into(
             model.spinner_frame,
         );
 
-        let prompt_span = if model.streaming {
-            Span::styled(
-                format!("{} ", SPINNER_FRAMES[spinner_idx]),
-                Style::default()
-                    .fg(slab.spinner_fg())
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                "\u{276f} ",
-                Style::default()
-                    .fg(slab.prompt_fg())
-                    .add_modifier(Modifier::BOLD),
-            )
-        };
+        // The prompt glyph stays `❯` while a turn streams and breathes
+        // (neon_prompt::Slab::glyph_fg); the dimmed slab says who has the floor.
+        let prompt_span = Span::styled(
+            "\u{276f} ",
+            Style::default()
+                .fg(slab.glyph_fg())
+                .add_modifier(Modifier::BOLD),
+        );
         let text_style = Style::default().fg(slab.text_fg());
         let indent = || Span::raw(" ".repeat(INPUT_PREFIX_WIDTH));
         let mut rows: Vec<Vec<Span>> = Vec::new();
@@ -1895,7 +1888,6 @@ mod background_toggle_tests {
 mod neon_prompt_tests {
     //! The input is the neon slab (neon_prompt.rs): half-block shape, no
     //! box-drawing border, text in a fixed column with a hanging indent.
-    use super::super::app::SPINNER_FRAMES;
     use super::super::testing::TestHarness;
     use super::super::theme::{background_is_opaque, set_background_opaque, THEME};
     use ratatui::buffer::Buffer;
@@ -1986,15 +1978,15 @@ mod neon_prompt_tests {
     }
 
     #[test]
-    fn streaming_shows_a_spinner_with_no_status_tab_and_no_placeholder() {
+    fn streaming_keeps_the_prompt_glyph_with_no_status_tab_and_no_placeholder() {
         let mut h = TestHarness::boot_with_size(W, H);
         h.set_streaming(true);
         let buf = h.render().clone();
         let (top, bottom) = rims(&buf);
-        assert!(
-            SPINNER_FRAMES.contains(&sym(&buf, 3, top + 1)),
-            "spinner in the prompt column, got {:?}",
-            sym(&buf, 3, top + 1)
+        assert_eq!(
+            sym(&buf, 3, top + 1),
+            "\u{276f}",
+            "the prompt glyph stays (it breathes), no spinner"
         );
         let rim = row(&buf, bottom);
         assert!(
