@@ -1058,6 +1058,8 @@ mod tests {
                 cancel_requested: false,
                 elapsed_secs: 1.25,
                 finished_elapsed: Some(std::time::Duration::from_millis(1250)),
+                step: "$ cargo test".into(),
+                tools: 3,
             }]),
             S::Resumed { id: 2, old_id: "o".into(), new_id: "n".into(), via: Some("name".into()), clamp_notice: None },
             S::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Takeover },

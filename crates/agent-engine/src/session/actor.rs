@@ -2001,6 +2001,13 @@ impl SessionActor {
     /// `runtime.subagent_registry().display_rows()` → `SubagentRows`, only
     /// when there is something to show (the TUI's reconcile is a no-op on
     /// an empty registry).
+    ///
+    /// The 1 Hz tick that drives this starts with a turn and outlives it
+    /// while a background worker (`subagent_start`) is still running: those
+    /// workers' progress events rode the ended turn's stream, so these rows
+    /// (which carry each worker's step and tool count) are how clients keep
+    /// up. The tick stops once no worker is running after the turn, having
+    /// published the terminal rows.
     pub(crate) fn publish_subagent_rows(&mut self) {
         let rows = self
             .runtime
@@ -2008,9 +2015,26 @@ impl SessionActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .display_rows();
+        let running = rows
+            .iter()
+            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running));
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }
+        if !keep_subagent_tick(self.streaming, running) {
+            self.subagent_tick = None;
+        }
+    }
+
+    /// Whether any worker in the registry is still running.
+    fn subagents_running(&self) -> bool {
+        self.runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows()
+            .iter()
+            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
     }
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
@@ -2063,7 +2087,11 @@ impl SessionActor {
         self.cancel = None;
         self.steer_tx = None;
         self.streaming = false;
-        self.subagent_tick = None;
+        // Background workers outlive the turn: keep publishing their rows
+        // until the last one finishes (see `publish_subagent_rows`).
+        if !keep_subagent_tick(false, self.subagents_running()) {
+            self.subagent_tick = None;
+        }
         self.turn_log.clear();
         self.update_attach_state();
     }
@@ -3501,6 +3529,13 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
+/// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
+/// and after it while any worker is still running (a background worker's
+/// progress events rode the ended turn's stream; the rows carry it now).
+fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
+    streaming || any_running
+}
+
 async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
     match tick {
         Some(t) => {
@@ -3678,6 +3713,25 @@ mod abort_context_tests {
     fn empty_log_yields_no_context() {
         assert!(log(vec![]).abort_context().is_none());
         assert!(log(vec![TurnPart::Text(String::new())]).abort_context().is_none());
+    }
+}
+
+#[cfg(test)]
+mod subagent_tick_tests {
+    use super::keep_subagent_tick;
+
+    #[test]
+    fn rows_keep_flowing_after_the_turn_while_a_worker_runs() {
+        assert!(keep_subagent_tick(true, false), "during a turn, always");
+        assert!(keep_subagent_tick(true, true));
+        assert!(
+            keep_subagent_tick(false, true),
+            "after the turn, while a background worker runs"
+        );
+        assert!(
+            !keep_subagent_tick(false, false),
+            "stops once the turn is over and no worker runs"
+        );
     }
 }
 
