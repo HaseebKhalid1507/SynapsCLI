@@ -1246,8 +1246,11 @@ impl StreamMethods {
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
                 if tool_uses.is_empty() {
-                    let steered =
-                        HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    // A cancelled turn takes no new input: steering still in
+                    // the channel stays undelivered (the frontend dequeues it)
+                    // instead of entering history after the cancel.
+                    let steered = !cancel.is_cancelled()
+                        && HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
                     if !steered {
                         // No steering, truly done. Completion is still subject to the
                         // session orchestration policy (including streamed runs).
@@ -2060,8 +2063,11 @@ impl StreamMethods {
 
                 // Check for steering messages between tool rounds.
                 // These get injected as user messages before the next LLM call,
-                // allowing the user to redirect the agent mid-work.
-                HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                // allowing the user to redirect the agent mid-work. Not after
+                // a cancel: the loop top returns the history as-is.
+                if !cancel.is_cancelled() {
+                    HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                }
 
                 // Continue the loop to get Claude's response with tool results
             } else {

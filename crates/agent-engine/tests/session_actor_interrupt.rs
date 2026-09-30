@@ -225,6 +225,47 @@ async fn cancel_mid_reply_keeps_the_partial_reply_and_appends_the_marker() {
     end(&mut a).await;
 }
 
+/// A steer typed mid-reply and not yet delivered when Esc lands is DEQUEUED
+/// (the UI shows "dequeued: …") — it never enters history after the cancel,
+/// whichever point of the turn the cancel interrupts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn undelivered_steer_is_dequeued_not_slipped_into_history() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, is_text).await;
+    a.send(SessionCommand::Steer {
+        text: "actually do Y".into(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Steered { .. })).await;
+    let seen = cancel(&mut a).await;
+
+    assert!(
+        seen.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::Dequeued { text } if text == "actually do Y"
+        )),
+        "the undelivered steer is dequeued"
+    );
+    let conv = last_conversation(&seen);
+    assert!(conv.queued_message.is_none());
+    let texts: Vec<String> = conv.api_messages.iter().map(|m| text_of(m)).collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("actually do Y")),
+        "a dequeued steer never enters history: {texts:?}"
+    );
+    assert_eq!(texts.last().unwrap(), InterruptReason::User.marker());
+    end(&mut a).await;
+}
+
 /// The old recap dropped every completed tool round of the aborted turn.
 /// Now the round is kept verbatim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
