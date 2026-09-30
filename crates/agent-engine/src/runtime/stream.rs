@@ -2503,6 +2503,12 @@ mod tests {
         t.note_cancel_cause(CancelCause::Restart);
         t.note_cancel_cause(CancelCause::Driver); // first cause wins
         assert_eq!(t.cancel_phrase(), "Canceled (Synaps restarted)");
+        // A driver turn cancelled with no cause noted (the grant's deadline)
+        // was cut by the driver ending; the user's Esc still says so.
+        let driver_turn = TurnCompletion::with_default_cause(CancelCause::Driver);
+        assert_eq!(driver_turn.cancel_phrase(), "Canceled (session driver revoked)");
+        driver_turn.note_cancel_cause(CancelCause::User);
+        assert_eq!(driver_turn.cancel_phrase(), "Canceled by user");
         let v = canceled_tool_result_content(t.cancel_phrase(), Some("half".into()), false);
         assert!(
             v.as_str().unwrap().contains("[Canceled (Synaps restarted) before the tool finished"),

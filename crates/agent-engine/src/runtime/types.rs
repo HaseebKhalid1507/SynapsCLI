@@ -16,12 +16,17 @@ pub use agent_core::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 ///
 /// Host → engine: WHY the host cancelled the turn, noted before it cancels
 /// the token, so a canceled `tool_result` says so ("Canceled by user" only
-/// when it was the user). Unset = the user (the historical wording).
+/// when it was the user). Nothing noted = the turn's default cause: the
+/// user (the historical wording), or what the host chose at turn start
+/// (`with_default_cause`: a driver turn whose token something else cancels,
+/// e.g. the grant's deadline, was cut by the driver ending).
 #[derive(Debug, Clone, Default)]
 pub struct TurnCompletion {
     completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// `0` = unset, else `CancelCause as u8`.
     cancel_cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Used when nothing was noted; `None` = the user.
+    default_cause: Option<CancelCause>,
 }
 
 /// Why a host cancelled a turn, as far as a canceled tool result says.
@@ -66,6 +71,14 @@ impl TurnCompletion {
         Self::default()
     }
 
+    /// A turn whose un-noted cancels are `cause`'s (see the type docs).
+    pub fn with_default_cause(cause: CancelCause) -> Self {
+        Self {
+            default_cause: Some(cause),
+            ..Self::default()
+        }
+    }
+
     pub fn completed(&self) -> bool {
         self.completed.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -89,6 +102,7 @@ impl TurnCompletion {
     /// Leading words of this turn's canceled tool results.
     pub(crate) fn cancel_phrase(&self) -> &'static str {
         CancelCause::from_u8(self.cancel_cause.load(std::sync::atomic::Ordering::Acquire))
+            .or(self.default_cause)
             .unwrap_or(CancelCause::User)
             .phrase()
     }

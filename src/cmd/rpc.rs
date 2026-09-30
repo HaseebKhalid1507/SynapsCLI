@@ -1132,8 +1132,15 @@ pub async fn run(
     let session_lock = setup::lock_session(&boot.session.id, boot.continued, "rpc")
         .context("cannot continue this session")?;
     let mut runtime = boot.runtime;
-    let session = boot.session;
-    let initial_messages = boot.api_messages;
+    // The lock holder recovers a turn the previous holder died in.
+    let (session, initial_messages) = if boot.continued && session_lock.is_some() {
+        let mut conv = synaps_cli::engine::session::ConversationState::from_resumed(boot.session);
+        conv.api_messages = boot.api_messages;
+        setup::recover_turn_draft(&mut conv).await;
+        (conv.session, conv.api_messages)
+    } else {
+        (boot.session, boot.api_messages)
+    };
     let initial_in = boot.total_input_tokens;
     let initial_out = boot.total_output_tokens;
     let initial_cost = boot.session_cost;

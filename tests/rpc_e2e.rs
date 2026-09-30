@@ -611,6 +611,72 @@ mod tier1 {
         next.shutdown().await.expect("shutdown");
     }
 
+    /// rpc holds the session lock now, so it is the one to recover a turn
+    /// its previous holder died in: the partial reply comes back, then the
+    /// crash marker, and the draft is gone.
+    #[tokio::test]
+    async fn continue_recovers_a_turn_cut_by_a_crash() {
+        let shared_home = TempDir::new().expect("TempDir");
+        let home_path = shared_home.path().to_path_buf();
+        let sessions = home_path.join(".synaps-cli").join("sessions");
+        let mut session =
+            synaps_cli::core::session::Session::new("claude-sonnet-4-5", "low", None);
+        session.api_messages = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": "write me an essay"}),
+        )];
+        synaps_cli::core::session_journal::save_session_in_dir(
+            &sessions,
+            &session,
+            synaps_cli::core::session_journal::SessionPersistence::Json,
+        )
+        .expect("seed session");
+        synaps_cli::core::session_draft::write_turn_draft(
+            &sessions,
+            &session.id,
+            &synaps_cli::core::session_draft::TurnDraft {
+                base_len: 1,
+                partial_text: "Once upon a".into(),
+            },
+        )
+        .expect("seed draft");
+
+        let mut child = RpcChild::spawn_with_home(
+            &["--continue", &session.id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn");
+        child.recv().await.expect("Ready");
+        child
+            .send(&json!({"type": "get_messages", "id": "gm"}))
+            .await
+            .expect("send");
+        let resp = child.recv().await.expect("get_messages");
+        let texts: Vec<String> = resp["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| match &m["content"] {
+                Value::String(s) => s.clone(),
+                other => other[0]["text"].as_str().unwrap_or("").to_string(),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "write me an essay",
+                "Once upon a",
+                "[Request interrupted: Synaps stopped unexpectedly]"
+            ]
+        );
+        assert!(
+            !sessions.join(format!("{}.turn", session.id)).exists(),
+            "draft removed"
+        );
+        child.shutdown().await.expect("shutdown");
+    }
+
     /// `--continue <id>` resumes an existing session:
     /// * session_id is preserved across restart
     /// * model set in session A is preserved in session B (via Ready frame)

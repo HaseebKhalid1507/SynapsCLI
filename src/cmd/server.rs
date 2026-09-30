@@ -220,12 +220,16 @@ pub async fn run(
     let session_lock = setup::lock_session(&boot.session.id, boot.continued, "server")
         .context("cannot continue this session")?;
     let runtime = boot.runtime;
-    let initial_history = rebuild_history(&boot.api_messages);
-    let conv = if boot.continued {
+    let mut conv = if boot.continued {
         ConversationState::from_resumed(boot.session)
     } else {
         ConversationState::new(boot.session)
     };
+    // The lock holder recovers a turn the previous holder died in.
+    if boot.continued && session_lock.is_some() {
+        setup::recover_turn_draft(&mut conv).await;
+    }
+    let initial_history = rebuild_history(&conv.api_messages);
 
     let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);

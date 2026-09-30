@@ -1546,7 +1546,11 @@ impl SessionActor {
                                 .cancel
                                 .child_token();
                             self.cancel = Some(ct.clone());
-                            let completion = crate::runtime::TurnCompletion::new();
+                            // Cancelled by anything that notes no cause (the
+                            // grant's deadline task): the driver ending.
+                            let completion = crate::runtime::TurnCompletion::with_default_cause(
+                                crate::runtime::CancelCause::Driver,
+                            );
                             self.turn_completion = Some(completion.clone());
                             let (tx, rx) = mpsc::unbounded_channel();
                             self.steer_tx = Some(tx);
@@ -2238,10 +2242,19 @@ impl SessionActor {
         // `durability_blocked` anyway, but that leaves the user message
         // orphaned in history; refuse here, before it is pushed.
         if self.conv.context_head.is_blocked(&self.conv.session) {
-            self.emit(SessionEventWire::SystemNotice(
-                "context head is unverified after a failed checkpoint; reload the session                  (`--continue`) or start a new one before continuing"
-                    .into(),
-            ));
+            let reason = "context head is unverified after a failed checkpoint; reload the \
+                          session (`--continue`) or start a new one before continuing"
+                .to_string();
+            // Refused to the submitter (its editor text comes back and it
+            // stops expecting this turn), a notice for everyone else.
+            match from {
+                Some(client) => self.emit(SessionEventWire::Refused {
+                    client,
+                    command: "submit".into(),
+                    reason,
+                }),
+                None => self.emit(SessionEventWire::SystemNotice(reason)),
+            }
             return;
         }
         if self.streaming {
@@ -3778,6 +3791,12 @@ impl SessionActor {
             SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
             SessionCommand::Detach { client } => self.detach(client),
             SessionCommand::End { reason } => {
+                // `finish` cancels a running turn for this reason; note it
+                // before the revoke below cancels a driver turn first.
+                self.note_cancel_cause(match reason {
+                    EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+                    _ => crate::engine::interrupt::InterruptReason::Host,
+                });
                 if self.driver.is_some() {
                     self.driver_revoke("session ending");
                 }

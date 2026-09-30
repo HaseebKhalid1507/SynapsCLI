@@ -791,8 +791,7 @@ impl App {
     }
 
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
-        let response_start = self.response_preview.as_ref().map(|(start, _)| *start);
-        self.transcript.append_or_update_text(text, response_start);
+        self.transcript.append_or_update_text(text);
         self.needs_redraw = true;
     }
 
