@@ -1120,7 +1120,7 @@ pub(crate) fn render(
 
     let list = if lines.is_empty() {
         vec![if state.view == ModelsView::Favorites {
-            let mut l = hint_line(&p, "tab all  f favorite", width);
+            let mut l = hint_line(&p, "tab all  ctrl+f favorite", width);
             l.spans.insert(
                 0,
                 Span::styled("  No favorite models yet.   ", Style::default().fg(p.dim)),
@@ -1139,7 +1139,7 @@ pub(crate) fn render(
 
     hint_line(
         &p,
-        "\u{2191}\u{2193} select  enter use  f favorite  e expand  c collapse  esc close",
+        "\u{2191}\u{2193} select  enter use  ctrl+f favorite  ctrl+e catalog  \u{2190}\u{2192} fold  esc close",
         footer.width,
     )
     .render(footer, buf);
@@ -1311,7 +1311,7 @@ fn render_expanded_lightbox(
 
     hint_line(
         p,
-        "\u{2191}\u{2193} select  enter use  f favorite  esc back",
+        "\u{2191}\u{2193} select  enter use  ctrl+f favorite  esc back",
         footer.width,
     )
     .render(footer, buf);
