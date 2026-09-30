@@ -79,7 +79,10 @@ TUI gets a round of polish.
   two writers overwriting each other's history. Continuing it after the
   other process exits works as before. (#185)
 - After upgrading, run `synaps daemon reload` with no turn running to move
-  the daemon to the new binary; clients reconnect on their own.
+  the daemon to the new binary; clients reconnect on their own. Then
+  restart any client still open from 0.10.0: it shows the new interruption
+  marker as a message you sent. Sessions saved by 0.10.0 with an interrupted
+  turn are converted on load; nothing to do.
 
 ### Internal
 
