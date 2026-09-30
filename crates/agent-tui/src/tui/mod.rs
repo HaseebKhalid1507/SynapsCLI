@@ -21,6 +21,7 @@ mod lifecycle;
 mod lightbox;
 mod loop_arms;
 mod markdown;
+mod modal_kit;
 mod models;
 mod neon_prompt;
 mod plugins;

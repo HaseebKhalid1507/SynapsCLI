@@ -8,289 +8,51 @@
 //! The selected setting's description sits under it; hints follow the
 //! footer's rule: key bright, word dim.
 
-use super::super::theme::{ModalKind, Theme, THEME};
+use super::super::modal_kit::{
+    centered, cycler_spans, detail_lines, editor_spans, hint_line, open_modal, open_popup,
+    popup_lines, render_scrolled, row_line, section_title, value_span, Palette,
+};
+use super::super::theme::{ModalKind, THEME};
 use super::schema::{visible_categories, EditorKind, SettingDef};
 use super::{ActiveEditor, Focus, RuntimeSnapshot, SettingsState};
-use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 /// Sidebar width (bar + label).
 const SIDEBAR_W: u16 = 24;
 /// Label column width in the rows pane.
 const LABEL_W: usize = 22;
-/// How far the selection surface stands off the chrome.
-const SELECTED_STEP: f64 = 1.18;
-/// How far popups (pickers, custom editors) stand off the chrome.
-const POPUP_STEP: f64 = 1.32;
-/// Share of the way each colour behind the modal moves toward black.
-const BACKDROP_DIM: f32 = 0.5;
-
-/// The palette the modal draws with.
-struct Palette {
-    panel: Color,
-    selected: Color,
-    popup: Color,
-    accent: Color,
-    title: Color,
-    text: Color,
-    value: Color,
-    dim: Color,
-    error: Color,
-}
-
-impl Palette {
-    fn from_theme(t: &Theme) -> Self {
-        Self {
-            panel: t.bg,
-            selected: t.raised_surface(SELECTED_STEP),
-            popup: t.raised_surface(POPUP_STEP),
-            // P19.1 per-part overrides keep working: `settings.border` is the
-            // accent (there is no border any more), `settings.title` the title.
-            accent: t.modal_border(ModalKind::Settings),
-            title: t.modal_title(ModalKind::Settings).unwrap_or(t.claude_label),
-            text: t.claude_text,
-            value: t.claude_label,
-            dim: t.chrome_dim(),
-            error: t.error_color,
-        }
-    }
-}
-
-/// Darken every cell of `area` outside `keep` toward black: the modal's
-/// backdrop, so the modal reads as in front without a frame around it.
-fn dim_backdrop(buf: &mut Buffer, area: Rect, keep: Rect) {
-    let dim = |c: Color| match c {
-        Color::Rgb(r, g, b) => {
-            let f = |v: u8| (f32::from(v) * (1.0 - BACKDROP_DIM)).round() as u8;
-            Color::Rgb(f(r), f(g), f(b))
-        }
-        other => other,
-    };
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if keep.contains((x, y).into()) {
-                continue;
-            }
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                let (fg, bg) = (dim(cell.fg), dim(cell.bg));
-                cell.set_fg(fg).set_bg(bg);
-            }
-        }
-    }
-}
-
-/// Fill `rect` with `bg`.
-fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
-    buf.set_style(rect, Style::default().bg(bg));
-    for y in rect.top()..rect.bottom() {
-        for x in rect.left()..rect.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_symbol(" ");
-            }
-        }
-    }
-}
-
-/// One selectable row: `┃` bar (selected only), label column, value.
-/// Selected rows sit on the raised surface across the full `width`.
-fn row_line(
-    p: &Palette,
-    width: u16,
-    label: &str,
-    value: Vec<Span<'static>>,
-    selected: bool,
-    focused: bool,
-) -> Line<'static> {
-    let bg = if selected { p.selected } else { p.panel };
-    let bar = if selected {
-        Span::styled(
-            "\u{2503} ",
-            Style::default()
-                .fg(if focused { p.accent } else { p.dim })
-                .bg(bg),
-        )
-    } else {
-        Span::styled("  ", Style::default().bg(bg))
-    };
-    let label_style = if selected && focused {
-        Style::default()
-            .fg(p.text)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default().fg(p.text).bg(bg)
-    } else {
-        Style::default().fg(p.dim).bg(bg)
-    };
-    let mut spans = vec![
-        bar,
-        Span::styled(format!("{label:<LABEL_W$} "), label_style),
-    ];
-    spans.extend(value.into_iter().map(|s| {
-        let st = s.style.bg(bg);
-        s.style(st)
-    }));
-    pad_to(&mut spans, width, bg);
-    Line::from(spans)
-}
-
-/// Right-pad a line's spans with `bg` to `width` cells.
-fn pad_to(spans: &mut Vec<Span<'static>>, width: u16, bg: Color) {
-    let used: usize = spans
-        .iter()
-        .map(|s| super::super::text_metrics::width(&s.content))
-        .sum();
-    let pad = usize::from(width).saturating_sub(used);
-    if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
-    }
-}
-
-/// A plain value in the value colour (selected) or text colour.
-fn value_span(p: &Palette, v: String, selected: bool) -> Vec<Span<'static>> {
-    let fg = if selected { p.value } else { p.text };
-    vec![Span::styled(v, Style::default().fg(fg))]
-}
-
-/// Cycler value while selected: `‹ value ›` with dim arrows.
-fn cycler_spans(p: &Palette, v: String) -> Vec<Span<'static>> {
-    vec![
-        Span::styled("\u{2039} ", Style::default().fg(p.dim)),
-        Span::styled(v, Style::default().fg(p.value).add_modifier(Modifier::BOLD)),
-        Span::styled(" \u{203a}", Style::default().fg(p.dim)),
-    ]
-}
-
-/// An inline text editor: the buffer, a block cursor, and an optional error.
-fn editor_spans(p: &Palette, buffer: &str, error: Option<&String>) -> Vec<Span<'static>> {
-    let mut v = vec![
-        Span::styled(buffer.to_string(), Style::default().fg(p.value)),
-        Span::styled("\u{2588}", Style::default().fg(p.accent)),
-    ];
-    if let Some(err) = error {
-        v.push(Span::styled(
-            format!("  {err}"),
-            Style::default().fg(p.error),
-        ));
-    }
-    v
-}
-
-/// A detail line under the selected row (description, note, error),
-/// indented to the label column and wrapped to `width`.
-fn detail_lines(text: &str, fg: Color, width: u16, bg: Color) -> Vec<Line<'static>> {
-    let indent = "  ";
-    let w = usize::from(width).saturating_sub(indent.len() + 1).max(10);
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > w {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    out.into_iter()
-        .map(|l| {
-            let mut spans = vec![Span::styled(
-                format!("{indent}{l}"),
-                Style::default().fg(fg).bg(bg),
-            )];
-            pad_to(&mut spans, width, bg);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-/// Render `lines` into `area`, scrolled so rows `focus.0..focus.1` (the
-/// selected row and its details) stay in view.
-fn render_scrolled(
-    frame: &mut Frame,
-    area: Rect,
-    lines: Vec<Line<'static>>,
-    focus: (usize, usize),
-) {
-    let h = usize::from(area.height);
-    let offset = if focus.1 > h {
-        (focus.1 - h).min(focus.0)
-    } else {
-        0
-    };
-    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
-}
-
-/// Hints in the footer's style: segments separated by two spaces in the
-/// source strings; the first word of each is the key (bright), the rest dim.
-fn hint_line(p: &Palette, hint: &str, width: u16) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-    for (i, seg) in hint.split("  ").filter(|s| !s.is_empty()).enumerate() {
-        let (key, word) = seg.split_once(' ').unwrap_or((seg, ""));
-        let w = super::super::text_metrics::width(seg) + if i > 0 { 3 } else { 0 };
-        if used + w > usize::from(width) {
-            break; // drop whole segments when narrow
-        }
-        if i > 0 {
-            spans.push(Span::raw("   "));
-        }
-        spans.push(Span::styled(key.to_string(), Style::default().fg(p.text)));
-        if !word.is_empty() {
-            spans.push(Span::styled(format!(" {word}"), Style::default().fg(p.dim)));
-        }
-        used += w;
-    }
-    Line::from(spans)
-}
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
     let h = (area.height.saturating_mul(7) / 10)
         .max(20)
         .min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-
     let theme = THEME.load();
-    let p = Palette::from_theme(&theme);
-    dim_backdrop(frame.buffer_mut(), area, modal);
-    frame.render_widget(Clear, modal);
-    fill(frame.buffer_mut(), modal, p.panel);
-
-    // Padding: 2 columns, 1 row. Header, blank, body, blank, hints.
-    let inner = Rect {
-        x: modal.x + 2,
-        y: modal.y + 1,
-        width: modal.width.saturating_sub(4),
-        height: modal.height.saturating_sub(2),
-    };
-    if inner.height < 5 || inner.width < SIDEBAR_W + 10 {
+    let p = Palette::for_modal(&theme, Some(ModalKind::Settings));
+    let body = open_modal(
+        frame,
+        area,
+        centered(area, w, h),
+        &p,
+        "Settings",
+        "esc close",
+    );
+    // Body: sidebar | rows, a blank row, hints.
+    if body.height < 3 || body.width < SIDEBAR_W + 10 {
         return;
     }
-    let header = Rect { height: 1, ..inner };
     let footer = Rect {
-        y: inner.bottom() - 1,
+        y: body.bottom() - 1,
         height: 1,
-        ..inner
+        ..body
     };
     let body = Rect {
-        y: inner.y + 2,
-        height: inner.height.saturating_sub(4),
-        ..inner
+        height: body.height - 2,
+        ..body
     };
     let sidebar = Rect {
         width: SIDEBAR_W,
@@ -301,17 +63,6 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
         width: body.width.saturating_sub(SIDEBAR_W + 2),
         ..body
     };
-
-    let title = Line::from(vec![Span::styled(
-        "Settings",
-        Style::default().fg(p.title).add_modifier(Modifier::BOLD),
-    )]);
-    frame.render_widget(Paragraph::new(title), header);
-    let close = hint_line(&p, "esc close", header.width);
-    frame.render_widget(
-        Paragraph::new(close).alignment(ratatui::layout::Alignment::Right),
-        header,
-    );
 
     render_categories(frame, sidebar, state, snap, &p);
     render_settings(frame, main, state, snap, &p);
@@ -337,6 +88,7 @@ fn render_categories(
         lines.push(row_line(
             p,
             area.width,
+            LABEL_W,
             cat.label(),
             Vec::new(),
             i == state.category_idx,
@@ -346,7 +98,15 @@ fn render_categories(
     for (i, pcat) in snap.plugin_categories.iter().enumerate() {
         let selected = n_builtin + i == state.category_idx;
         // Source label: the plugin that owns it, dim, so users can audit.
-        let mut line = row_line(p, area.width, &pcat.label, Vec::new(), selected, focused);
+        let mut line = row_line(
+            p,
+            area.width,
+            LABEL_W,
+            &pcat.label,
+            Vec::new(),
+            selected,
+            focused,
+        );
         let owner = format!(" {}", pcat.plugin);
         if let Some(label) = line.spans.get_mut(1) {
             let trimmed = format!("{} ", pcat.label);
@@ -365,17 +125,6 @@ fn render_categories(
     }
     let sel = state.category_idx;
     render_scrolled(frame, area, lines, (sel, sel + 1));
-}
-
-/// The category title at the top of the rows pane, and a blank line.
-fn section_title(p: &Palette, title: &str) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![Span::styled(
-            title.to_string(),
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-    ]
 }
 
 /// A note / error attached to a row (`row_error`): notes dim, errors red.
@@ -446,7 +195,9 @@ fn render_settings(
             value_span(p, current_value, false)
         };
         let start = lines.len();
-        lines.push(row_line(p, area.width, def.label, value, selected, focused));
+        lines.push(row_line(
+            p, area.width, LABEL_W, def.label, value, selected, focused,
+        ));
         if selected {
             if !def.help.is_empty() {
                 lines.extend(detail_lines(def.help, p.dim, area.width, p.panel));
@@ -536,6 +287,7 @@ fn render_plugin_category(
         lines.push(row_line(
             p,
             area.width,
+            LABEL_W,
             &field.label,
             value,
             selected,
@@ -569,6 +321,7 @@ fn render_plugins_list(
     lines.push(row_line(
         p,
         area.width,
+        LABEL_W,
         "+ Plugin marketplace",
         if action_selected {
             vec![
@@ -613,7 +366,7 @@ fn render_plugins_list(
             focus = (lines.len(), lines.len() + 1);
         }
         lines.push(row_line(
-            p, area.width, &plug.name, value, selected, focused,
+            p, area.width, LABEL_W, &plug.name, value, selected, focused,
         ));
     }
 
@@ -656,6 +409,7 @@ fn render_providers_list(
     lines.push(row_line(
         p,
         area.width,
+        LABEL_W,
         "Local (Ollama/etc)",
         value,
         selected,
@@ -684,7 +438,9 @@ fn render_providers_list(
             _ => provider_status_spans(p, &provider_status(prov, snap)),
         };
         let start = lines.len();
-        lines.push(row_line(p, area.width, prov.name, value, selected, focused));
+        lines.push(row_line(
+            p, area.width, LABEL_W, prov.name, value, selected, focused,
+        ));
         if selected {
             if let Some((key, msg)) = &state.row_error {
                 if key == &format!("provider.{}", prov.key) {
@@ -767,49 +523,6 @@ fn provider_status_spans(p: &Palette, status: &str) -> Vec<Span<'static>> {
     }
 }
 
-/// A floating surface over the rows pane (pickers, custom editors): no
-/// border — one step brighter than the selection surface.
-fn popup_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width.saturating_sub(2)).max(1);
-    let h = height.min(area.height.saturating_sub(1)).max(1);
-    Rect {
-        x: area.x + 2.min(area.width.saturating_sub(w)),
-        y: area.y + 2.min(area.height.saturating_sub(h)),
-        width: w,
-        height: h,
-    }
-}
-
-/// Popup rows: selected gets the accent bar and bright text.
-fn popup_lines<'a>(
-    p: &Palette,
-    labels: impl Iterator<Item = (usize, &'a str, bool)>,
-    cursor: usize,
-    width: u16,
-) -> Vec<Line<'static>> {
-    labels
-        .map(|(i, label, selectable)| {
-            let selected = i == cursor;
-            let fg = if !selectable {
-                p.dim
-            } else if selected {
-                p.value
-            } else {
-                p.text
-            };
-            let mut spans = vec![
-                Span::styled(
-                    if selected { "\u{2503} " } else { "  " },
-                    Style::default().fg(p.accent).bg(p.popup),
-                ),
-                Span::styled(label.to_string(), Style::default().fg(fg).bg(p.popup)),
-            ];
-            pad_to(&mut spans, width, p.popup);
-            Line::from(spans)
-        })
-        .collect()
-}
-
 fn render_plugin_custom_editor(
     frame: &mut Frame,
     area: Rect,
@@ -822,16 +535,8 @@ fn render_plugin_custom_editor(
     let avail_w = area.width.saturating_sub(4).max(1);
     let w = avail_w.clamp(avail_w.min(40), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
     let needed = rows.len() as u16 + 3 + footer_lines;
-    let rect = popup_rect(area, w, needed.max(4));
-    frame.render_widget(Clear, rect);
-    fill(frame.buffer_mut(), rect, p.popup);
-    // Padding 1 row / 1 column; a title line; rows; optional footer.
-    let inner = Rect {
-        x: rect.x + 1,
-        y: rect.y + 1,
-        width: rect.width.saturating_sub(2),
-        height: rect.height.saturating_sub(2),
-    };
+    // A title line; rows; optional footer — inside the popup's padding.
+    let inner = open_popup(frame, area, w, needed.max(4), p);
     let title = Line::from(vec![
         Span::styled(
             session.plugin_id.clone(),
@@ -888,14 +593,12 @@ fn render_plugin_custom_editor(
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize, p: &Palette) {
     let avail_w = area.width.saturating_sub(4).max(1);
     let w = avail_w.clamp(avail_w.min(20), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
-    let rect = popup_rect(area, w, options.len() as u16 + 2);
-    frame.render_widget(Clear, rect);
-    fill(frame.buffer_mut(), rect, p.popup);
+    let popup = open_popup(frame, area, w, options.len() as u16 + 2, p);
+    // Rows run edge to edge (the bar sits in the padding column).
     let inner = Rect {
-        x: rect.x,
-        y: rect.y + 1,
-        width: rect.width,
-        height: rect.height.saturating_sub(2),
+        x: popup.x - 1,
+        width: popup.width + 2,
+        ..popup
     };
     let visible = usize::from(inner.height).max(1);
     let offset = cursor.saturating_sub(visible - 1);
