@@ -113,6 +113,9 @@ impl SessionActor {
     /// messages — persist the name change (commands.rs `saveas` arm).
     async fn session_name(&mut self, arg: &str) -> serde_json::Value {
         let trimmed = arg.trim();
+        // This saves `conv.session` directly (even with no messages): a
+        // queued save of it, without the new name, must not land after.
+        self.persister.flush().await;
         if trimmed.is_empty() {
             self.conv.session.clear_name();
             let _ = self.conv.session.save().await;
@@ -210,7 +213,10 @@ impl SessionActor {
             });
             return;
         }
-        let mut session = match crate::resolve_session(&query) {
+        // Queued saves first: resuming the CURRENT session reloads it from
+        // disk, which must hold its latest state.
+        self.persister.flush().await;
+        let session = match crate::resolve_session(&query) {
             Ok(s) => s,
             Err(e) => {
                 self.emit(SessionEventWire::QueryResult {
@@ -218,6 +224,37 @@ impl SessionActor {
                     value: serde_json::json!({ "kind": "error", "text": e.to_string() }),
                 });
                 return;
+            }
+        };
+        let old_id = self.conv.session.id.clone();
+        let new_id = session.id.clone();
+        // F10: the journal lock follows the conversation. Take the new lock
+        // FIRST, before anything changes: a session locked by another
+        // process (or another session of this daemon) is live there right
+        // now, and resuming it here would fork its history. The old lock is
+        // only released once the new one is held.
+        let new_lock = if new_id == old_id {
+            None // resuming the current session: keep its lock
+        } else {
+            match Self::try_lock_session(&new_id) {
+                Ok(lock) => Some(lock),
+                Err(e @ agent_core::session_lock::SessionLockError::Held { .. })
+                | Err(e @ agent_core::session_lock::SessionLockError::CompactedInto { .. }) => {
+                    self.emit(SessionEventWire::QueryResult {
+                        id,
+                        value: serde_json::json!({
+                            "kind": "error",
+                            "text": format!("cannot resume: {e}"),
+                        }),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    // I/O trouble (e.g. a read-only sessions dir): proceed
+                    // unlocked, as create/unpark do.
+                    tracing::warn!(session = %new_id, "resume: session lock: {e}");
+                    None
+                }
             }
         };
         self.runtime.set_model(session.model.clone());
@@ -238,8 +275,6 @@ impl SessionActor {
             self.runtime.set_system_prompt(sp.clone());
         }
         self.save().await;
-        let old_id = self.conv.session.id.clone();
-        let new_id = session.id.clone();
         let via = if crate::chain::load_chain(&query).is_ok() {
             Some(format!("chain '{}'", query))
         } else if crate::find_session_by_name(&query).is_ok() {
@@ -247,21 +282,14 @@ impl SessionActor {
         } else {
             None
         };
-        // F10: the journal lock follows the conversation (as NewSession and
-        // compaction do). Crash recovery needs it: only the lock holder may
-        // fold a turn draft in and remove it — a draft under a lock held
-        // elsewhere belongs to a turn that is running right now.
-        self.reacquire_session_lock(&new_id);
-        let turn_draft = if self.session_lock.is_some() {
-            crate::engine::setup::recover_turn_draft(&mut session)
-        } else {
-            None
-        };
+        if new_id != old_id {
+            // Drops (releases) the old lock; `None` = proceeding unlocked.
+            self.session_lock = new_lock;
+        }
         self.conv = Live::new(crate::engine::session::ConversationState::from_resumed(session));
-        if let Some(recovered) = turn_draft {
-            if self.config.persist {
-                crate::engine::setup::finish_turn_draft_recovery(&mut self.conv, recovered).await;
-            }
+        // Crash recovery is the lock holder's alone (`recover_turn_draft`).
+        if self.config.persist && self.session_lock.is_some() {
+            crate::engine::setup::recover_turn_draft(&mut self.conv).await;
         }
         if clamp_notice.is_some() {
             // Keep the session file in sync with the clamped runtime.

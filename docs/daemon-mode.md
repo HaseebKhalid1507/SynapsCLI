@@ -222,32 +222,56 @@ C: bye | socket close = Detach (turn keeps running)
   delivered steering, a labelled canceled `tool_result` for any unfinished call — plus the final
   `Usage` and any in-flight context-head checkpoint reach the actor. That history is adopted verbatim
   and ONE interruption marker is appended (`engine::interrupt`: `[Request interrupted by user]`, or
-  the cost-cap / restart / host variant). Nothing already sent is edited, so the provider's cached
-  prefix survives and the next request extends it. This replaces the old `abort_context` recap, which
-  re-described the model's own output inside the next user message and which current models refuse
-  as a prompt injection. Sessions saved with a recap are migrated on load (recap dropped, marker
+  the cost-cap / restart / host / driver variant). Nothing already sent is edited, so the provider's
+  cached prefix survives and the next request extends it. This replaces the old `abort_context` recap,
+  which re-described the model's own output inside the next user message and which current models
+  refuse as a prompt injection. Sessions saved with a recap are migrated on load (recap dropped, marker
   appended). Documented in `synaps chat /help` too.
+  - A turn the engine had already FINISHED when the cancel reached it (Esc a moment too late) is not
+    marked: the engine records a normal end (`TurnCompletion`), the complete answer is kept as is and
+    clients get `Done`, not `Aborted`.
+  - A driver turn cut by the driver's revocation (its token is a child of the driver's) ends the same
+    way, with `[Request interrupted: session driver revoked]`: on its `Done`, its stream's end, or after
+    the same 1 s budget — never through the normal post-turn path (queued auto-send, auto-compaction).
+  - Markers are matched EXACTLY (`is_interruption_marker`): user text that merely starts like one is
+    the user's.
 - **The session on disk follows a running turn.** The engine publishes the conversation at every
   round boundary — the prompt before the first request, each completed tool round (every
-  `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one (bounded
-  by `SAVE_TIMEOUT`, ordered by `session_save_order`). A crash / `kill -9` / power loss mid-turn
-  loses at most the round in flight, and what is on disk is always a valid history to resume from.
-  Cost: one save per round (≈1 ms for a 2.3 MB session in `json` mode, which rewrites the file;
-  `session_persistence = journal` appends only the new messages). Attach replays carry no per-round
-  `MessageHistory`: the snapshot already holds the latest history.
-- **A turn cut off by a crash is recovered on the next load.** While a turn runs, the actor keeps
-  a small draft `sessions/<id>.turn` (`agent_core::core::session_draft`): the text of the response
-  in flight plus the history length it continues from — written at turn start, at most once per
-  1 Hz turn tick while text streams, removed when the turn ends (ordered, non-blocking writes;
-  0600, confined, atomic; O(partial text) in either persistence mode). A draft found on load
-  (`--continue`, daemon create/unpark, `/resume` — which now takes the session lock like
-  `NewSession`) means the process died mid-turn: the partial text is appended as a real assistant
-  message (text only, like a cancel) followed by `[Request interrupted: Synaps stopped
-  unexpectedly]`, saved, then the draft is removed. A leftover draft of a turn that actually
-  concluded (history already ends with the model's final reply or an interruption marker) is just
-  removed; a stale one (its round already committed) contributes no text. Recovery only ever
-  appends, so the cached prefix is untouched. Written by the session actor (TUI, chat, daemon,
-  attach); rpc / server / legacy chat save every round but keep no draft.
+  `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one. Saves run
+  on the actor's background writer (`session::persister`), never inside the turn machine: latest wins
+  per session (if rounds come faster than the disk, only the newest history is written), an identical
+  snapshot is not queued twice, and every write is ordered with the others (`session_save_order`). The
+  actor waits for the writer (bounded by `SAVE_TIMEOUT`) only where the disk must be current: before
+  parking (a failed save keeps the session live), a durable context-head checkpoint, compaction,
+  `/resume`, `Checkpoint` and session end. A crash / `kill -9` / power loss mid-turn loses at most the
+  round in flight, and what is on disk is always a valid history to resume from.
+  Cost (`json` mode rewrites and fsyncs the whole file; measured on btrfs/NVMe with
+  `save_cost_bench` in `agent-core` — set `SYNAPS_SAVE_BENCH_DIR` to a real disk, NOT tmpfs, whose
+  fsync is free), release build, 3 runs: ~0.6–0.9 ms median for a 200 KB session, ~2.2–2.4 ms for
+  2.3 MB, ~6–7.5 ms for 10 MB, with a p95 of 5–17 ms (2.3 MB) and 9–21 ms (10 MB) and occasional
+  20–30 ms spikes (filesystem commits) — paid by the background writer, not the turn.
+  `session_persistence = journal` appends only the new messages, but at these sizes it is no cheaper
+  (each save re-hashes the saved prefix to validate it).
+  Attach replays carry no per-round `MessageHistory` or `Conversation` (the snapshot already holds the
+  latest history), and a round checkpoint drops the finished rounds' display events from the replay
+  ring, so a client attaching mid-turn sees each round once.
+- **A turn cut off by a crash is recovered on the next load — by the session lock holder only.** While
+  a turn runs, the actor keeps a small draft `sessions/<id>.turn` (`agent_core::core::session_draft`):
+  the text of the response in flight plus the history length it continues from — written at turn
+  start, at most once per 1 Hz turn tick while text streams, and removed when the turn ends, only
+  AFTER the history that ends the turn is saved (same background writer; a removal waits for a good
+  save). 0600, confined, atomic, bounded on read; O(partial text) in either persistence mode. Only the
+  holder of the session lock writes a draft or recovers one: daemon create/unpark, `--continue` in the
+  in-process TUI, and `/resume` (which takes the new session's lock BEFORE changing anything and
+  refuses a session locked by another process or another session of the daemon). A draft found by the
+  holder means the previous holder died mid-turn: the partial text is appended as a real assistant
+  message (text only, like a cancel) followed by `[Request interrupted: Synaps stopped unexpectedly]`,
+  saved, then the draft is removed (if that save fails, the draft stays for the next holder). A leftover
+  draft of a turn that actually concluded (history already ends with the model's final reply or an
+  interruption marker) is just removed; a stale one (its round already committed) contributes no text.
+  Recovery only ever appends, so the cached prefix is untouched. rpc / `synaps server` / legacy chat
+  save every round but keep no draft, never take the session lock, and never recover one (a draft
+  there may belong to a turn running elsewhere). Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)

@@ -136,10 +136,31 @@ impl ConversationState {
         }
     }
 
-    /// Save the current conversation state to disk.
-    pub async fn save(&mut self) {
+    /// Save the current conversation state to disk. Returns whether it was
+    /// written: `false` when there is nothing to save (empty history), the
+    /// context head is unverified (`context_head`), or the write failed
+    /// (logged).
+    pub async fn save(&mut self) -> bool {
+        let Some(session) = self.prepare_save() else {
+            return false;
+        };
+        match session.save().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("Failed to save session: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Fold the live state into `self.session` and return the snapshot to
+    /// write — or `None` when there is nothing to save (empty history) or
+    /// the context head is unverified. The session actor hands the snapshot
+    /// to its background writer (`session::persister`) instead of awaiting
+    /// the I/O. The clone is cheap: messages are `Arc`-shared.
+    pub fn prepare_save(&mut self) -> Option<Session> {
         if self.context_head.is_blocked(&self.session) || self.api_messages.is_empty() {
-            return;
+            return None;
         }
         self.session.api_messages = self.api_messages.clone();
         self.session.total_input_tokens = self.total_input_tokens;
@@ -150,9 +171,7 @@ impl ConversationState {
         self.session.abort_context = None;
         self.session.updated_at = chrono::Utc::now();
         self.session.auto_title();
-        if let Err(e) = self.session.save().await {
-            tracing::error!("Failed to save session: {}", e);
-        }
+        Some(self.session.clone())
     }
 
     /// Persist a runtime-requested head using host metadata and latest usage.
@@ -224,6 +243,7 @@ impl ConversationState {
             queued_message: self.queued_message.clone(),
             pending_events_len: self.pending_events.len(),
             consecutive_auto_turns,
+            messages_hash_memo: Default::default(),
         }
     }
 

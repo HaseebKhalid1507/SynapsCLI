@@ -39,6 +39,11 @@ pub enum InterruptReason {
     /// The process died with a turn open (crash, `kill -9`, power loss):
     /// found on load via the in-flight turn draft (`session_draft`).
     Crash,
+    /// A plugin session driver was running the turn and was revoked (the
+    /// user took over, competing work arrived, the driver failed a check).
+    /// The revocation reason itself goes to clients (`DriverRevoked`), never
+    /// into history.
+    Driver,
 }
 
 impl InterruptReason {
@@ -51,21 +56,30 @@ impl InterruptReason {
             InterruptReason::Host => "[Request interrupted: session stopped by the host]",
             InterruptReason::Unknown => "[Request interrupted]",
             InterruptReason::Crash => "[Request interrupted: Synaps stopped unexpectedly]",
+            InterruptReason::Driver => "[Request interrupted: session driver revoked]",
         }
     }
+
+    /// Every reason, i.e. every marker this build writes or recognises.
+    pub const ALL: [InterruptReason; 7] = [
+        InterruptReason::User,
+        InterruptReason::CostCap,
+        InterruptReason::Restart,
+        InterruptReason::Host,
+        InterruptReason::Unknown,
+        InterruptReason::Crash,
+        InterruptReason::Driver,
+    ];
 }
 
-const MARKER_PREFIX: &str = "[Request interrupted";
-
-/// True iff `text` is one of the interruption markers. Clients use this to
-/// render the marker as an "interrupted" line instead of a user bubble
-/// (the daemon's `DisplayItem` has no dedicated variant: adding one would
-/// break older clients, whose `DisplayItem` has no `#[serde(other)]`).
+/// True iff `text` is EXACTLY one of the interruption markers. Clients use
+/// this to render the marker as an "interrupted" line instead of a user
+/// bubble (the daemon's `DisplayItem` has no dedicated variant: adding one
+/// would break older clients, whose `DisplayItem` has no `#[serde(other)]`).
+/// Exact, not a prefix: a user message that merely starts like a marker is
+/// the user's, and is shown (and deduplicated) as such.
 pub fn is_interruption_marker(text: &str) -> bool {
-    text.starts_with(MARKER_PREFIX)
-        && text.ends_with(']')
-        && text.len() <= 96
-        && !text.contains('\n')
+    InterruptReason::ALL.iter().any(|r| r.marker() == text)
 }
 
 /// `"[Request interrupted by user]"` → `"Request interrupted by user"`, for
@@ -157,14 +171,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL: [InterruptReason; 6] = [
-        InterruptReason::User,
-        InterruptReason::CostCap,
-        InterruptReason::Restart,
-        InterruptReason::Host,
-        InterruptReason::Unknown,
-        InterruptReason::Crash,
-    ];
+    const ALL: [InterruptReason; 7] = InterruptReason::ALL;
 
     fn user(text: &str) -> SharedMessage {
         Arc::new(json!({"role": "user", "content": text}))
@@ -199,6 +206,10 @@ mod tests {
             "[Request interrupted by user]\nand more",
             "please [Request interrupted by user]",
             "[ABORT CONTEXT — your previous response was interrupted]",
+            // Shaped like a marker, but not one this build writes: the
+            // user's own text (it used to match a prefix rule).
+            "[Request interrupted: do Y instead]",
+            "[Request interrupted by user] ",
         ] {
             assert!(!is_interruption_marker(t), "{t:?}");
         }

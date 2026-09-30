@@ -636,3 +636,83 @@ async fn legacy_abort_context_session_is_migrated_on_continue() {
     assert!(saved.abort_context.is_none());
     end(&mut a).await;
 }
+
+/// `on_message_complete` handler that holds the engine between "the final
+/// response came back" and "the turn ended" until released: the exact
+/// window in which Esc lands a moment too late.
+struct GateHook {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl agent_engine::extensions::runtime::ExtensionHandler for GateHook {
+    fn id(&self) -> &str {
+        "gate-hook"
+    }
+    async fn handle(
+        &self,
+        _event: &agent_engine::extensions::hooks::events::HookEvent,
+    ) -> agent_engine::extensions::hooks::events::HookResult {
+        self.entered.notify_one();
+        self.release.notified().await;
+        agent_engine::extensions::hooks::events::HookResult::Continue
+    }
+    async fn shutdown(&self) {}
+}
+
+/// Esc a moment too late: the answer was complete (the engine is past the
+/// provider call, in the `on_message_complete` hook) when the cancel reached
+/// the turn. The complete answer is kept with NO interruption marker, and
+/// clients get the turn's `Done`, not `Aborted`. (Review finding: the drain
+/// used to append "[Request interrupted by user]" after a finished answer.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cancel_that_races_a_finished_answer_marks_nothing() {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let gate = Arc::new(GateHook {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
+    perms.grant(HookKind::OnMessageComplete.required_permission());
+    host.parts()
+        .hook_bus
+        .subscribe(HookKind::OnMessageComplete, gate.clone(), None, None, perms)
+        .await
+        .unwrap();
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("hello")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("the engine reached on_message_complete");
+    a.send(SessionCommand::Cancel).await.unwrap();
+    // Let the actor cancel the token and start draining, then let the
+    // engine finish its (already complete) turn inside the drain budget.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    gate.release.notify_one();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    assert!(aborted(&seen).is_empty(), "not an interruption: {seen:#?}");
+    assert!(
+        seen.iter().any(|e| matches!(
+            e.event,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done))
+        )),
+        "clients get the turn's Done"
+    );
+    let msgs = last_conversation(&seen).api_messages;
+    assert_eq!(msgs.len(), 2, "{msgs:#?}");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], json!([{"type": "text", "text": "hi"}]));
+    assert!(!msgs.iter().any(|m| m["content"]
+        .as_str()
+        .is_some_and(is_interruption_marker)));
+    end(&mut a).await;
+}
