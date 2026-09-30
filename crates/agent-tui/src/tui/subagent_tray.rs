@@ -1,6 +1,15 @@
-//! Subagent tray: running subagents live inside the neon prompt's slab, on a
-//! recessed strip above the input line (the synaps-dash web tray, in the
-//! terminal). No box and no title row: the header already counts the agents.
+//! Subagent tray: running subagents sit on a recessed tray resting on top
+//! of the neon prompt (the synaps-dash web tray, in the terminal). The input
+//! box is exactly as it is without agents: same corners, same padding. No
+//! title row: the header already counts the agents.
+//!
+//! The tray is half a cell narrower than the input on each side, and its
+//! half-cell bottom padding fills the upper half of the input's top rim row.
+//! That keeps every cell to two colours: the input's rim corners (▗ ▖) sit
+//! outside the tray, so the only cells the two share are the flat rim between
+//! them (tray above, input below). A full-width tray can't do this: its
+//! bottom corners would land on the input's corner cells, which would then
+//! need three colours (chrome, tray, input).
 //!
 //! One row per agent, lined up with the prompt: glyph under `❯`, name, what
 //! it is doing, tool count, elapsed time. A finished agent dims and shows its
@@ -27,8 +36,9 @@ const MAX_ROWS: usize = 6;
 /// the input line stays the brightest surface in the band.
 const TRAY_DEPTH: f32 = 0.55;
 
-/// Rows the tray adds above the prompt for `n` agents: the slab's top rim,
-/// then one row per agent (capped, plus "+N more").
+/// Rows the tray adds above the prompt for `n` agents: its top rim, then one
+/// row per agent (capped, plus "+N more"). Its bottom padding is the upper
+/// half of the input's own rim row.
 pub(crate) fn tray_height(n: usize) -> u16 {
     if n == 0 {
         return 0;
@@ -284,9 +294,10 @@ fn row(
     }
 }
 
-/// Extend the prompt slab (already painted over `input`) upward over `tray`
-/// and put the agents on it. `tray` is the strip directly above `input`,
-/// [`tray_height`] rows tall.
+/// Paint the tray over `tray` (the strip directly above `input`,
+/// [`tray_height`] rows tall) after the prompt's slab is painted. The tray
+/// spans the input's inner columns (half a cell in from its rounded sides);
+/// its bottom padding fills the upper half of the input's rim row.
 pub(crate) fn paint_tray(
     buf: &mut Buffer,
     tray: Rect,
@@ -296,54 +307,47 @@ pub(crate) fn paint_tray(
     snaps: &[SubagentSnap],
     spinner_frame: usize,
 ) {
-    if snaps.is_empty() || tray.height < 2 || tray.width < 12 || input.height < 3 {
+    if snaps.is_empty()
+        || tray.height < 2
+        || tray.width < 12
+        || input.height < 3
+        || tray.bottom() != input.y
+    {
         return;
     }
     let backdrop = slab.backdrop();
-    let (l, r) = (1u16, tray.width - 2); // the slab's rounded sides
+    // The input's rounded sides are at columns 1 and width-2; the tray fills
+    // the columns between them.
+    let (l, r) = (2u16, tray.width - 3);
     let tray_at = |rx: u16| mix(backdrop, slab.fill_at(rx), TRAY_DEPTH);
+    let top = tray.y;
 
     for y in tray.top()..tray.bottom() {
         put(buf, tray.x, y, " ", backdrop, backdrop);
         put(buf, tray.right() - 1, y, " ", backdrop, backdrop);
+        put(buf, tray.x + 1, y, " ", slab.halo_at(1), slab.halo_at(1));
+        let rr = tray.width - 2;
+        put(buf, tray.x + rr, y, " ", slab.halo_at(rr), slab.halo_at(rr));
     }
-    // The slab's top rim now crowns the tray.
+    // Top rim: the tray's upper half-cell of padding.
     for rx in l..=r {
-        let sym = if rx == l {
-            "\u{2597}" // ▗
-        } else if rx == r {
-            "\u{2596}" // ▖
-        } else {
-            "\u{2584}" // ▄
-        };
-        put(buf, tray.x + rx, tray.y, sym, tray_at(rx), slab.halo_at(rx));
+        put(
+            buf,
+            tray.x + rx,
+            top,
+            "\u{2584}",
+            tray_at(rx),
+            slab.halo_at(rx),
+        ); // ▄
     }
-    for y in tray.y + 1..tray.bottom() {
-        put(buf, tray.x + l, y, "\u{2590}", tray_at(l), slab.halo_at(l)); // ▐
-        put(buf, tray.x + r, y, "\u{258C}", tray_at(r), slab.halo_at(r)); // ▌
-        for rx in l + 1..r {
+    for y in top + 1..tray.bottom() {
+        for rx in l..=r {
             put(buf, tray.x + rx, y, " ", tray_at(rx), tray_at(rx));
         }
     }
-    // The input's own top rim becomes the half-cell step up from the tray
-    // to the brighter body.
-    put(
-        buf,
-        input.x + l,
-        input.y,
-        "\u{2590}",
-        tray_at(l),
-        slab.halo_at(l),
-    );
-    put(
-        buf,
-        input.x + r,
-        input.y,
-        "\u{258C}",
-        tray_at(r),
-        slab.halo_at(r),
-    );
-    for rx in l + 1..r {
+    // Bottom padding: the upper half of the input's rim row, between its
+    // corners (which stay as the slab drew them).
+    for rx in l..=r {
         put(
             buf,
             input.x + rx,
@@ -366,7 +370,7 @@ pub(crate) fn paint_tray(
         .max()
         .unwrap_or(4)
         .clamp(4, 16);
-    let mut y = tray.y + 1;
+    let mut y = top + 1;
     for s in snaps.iter().take(MAX_ROWS) {
         if y >= tray.bottom() {
             return;
@@ -399,9 +403,9 @@ mod tests {
     #[test]
     fn height_is_rim_plus_rows_capped() {
         assert_eq!(tray_height(0), 0);
-        assert_eq!(tray_height(1), 2);
+        assert_eq!(tray_height(1), 2, "top rim, one row");
         assert_eq!(tray_height(6), 7);
-        assert_eq!(tray_height(9), 8, "six rows, +N more, rim");
+        assert_eq!(tray_height(9), 8, "top rim, six rows, +N more");
     }
 
     #[test]
@@ -548,22 +552,44 @@ mod render_tests {
         );
     }
 
-    /// Row of the prompt's text line (column 3 holds ❯) and the slab's top
-    /// rim (column 1 holds ▗) above it.
-    fn prompt_and_rim(buf: &Buffer) -> (u16, u16) {
-        let prompt = (0..buf.area().height)
+    /// The prompt's text row (column 3 holds ❯).
+    fn prompt_row(buf: &Buffer) -> u16 {
+        (0..buf.area().height)
             .rev()
             .find(|&y| sym(buf, 3, y) == "\u{276f}")
-            .expect("prompt ❯");
-        let rim = (0..prompt)
-            .rev()
-            .find(|&y| sym(buf, 1, y) == "\u{2597}")
-            .expect("top rim ▗");
-        (prompt, rim)
+            .expect("prompt ❯")
+    }
+
+    /// (top rim, last agent row) of the tray, or None. The tray shows as
+    /// the colour above the input's rim between its corners; its top rim is
+    /// the ▄ row above the agent rows.
+    fn tray_rows(buf: &Buffer) -> Option<(u16, u16)> {
+        let rim = prompt_row(buf) - 1;
+        assert_eq!(sym(buf, 1, rim), "\u{2597}", "the input's own corner");
+        let tray_bg = buf[(2, rim)].bg;
+        if tray_bg == buf[(0, rim)].bg {
+            return None;
+        }
+        let mut top = rim - 1;
+        while buf[(2, top)].symbol() == " " && buf[(2, top)].bg == tray_bg {
+            top -= 1;
+        }
+        assert_eq!(sym(buf, 2, top), "\u{2584}", "the tray's top rim");
+        assert_eq!(buf[(2, top)].fg, tray_bg, "the top rim is tray-coloured");
+        Some((top, rim - 1))
+    }
+
+    fn cell(
+        buf: &Buffer,
+        x: u16,
+        y: u16,
+    ) -> (String, ratatui::style::Color, ratatui::style::Color) {
+        let c = &buf[(x, y)];
+        (c.symbol().to_string(), c.fg, c.bg)
     }
 
     #[test]
-    fn agents_ride_in_a_tray_on_the_prompt_slab() {
+    fn agents_ride_on_a_tray_resting_on_the_prompt() {
         let mut h = TestHarness::boot_with_size(W, H);
         start(&mut h, 1, "chrollo");
         update(&mut h, 1, "\u{2699} read (tool #4)");
@@ -571,40 +597,87 @@ mod render_tests {
         start(&mut h, 2, "spike");
         update(&mut h, 2, "$ cargo test -p synaps-tui");
         let buf = h.render().clone();
-        let (prompt, rim) = prompt_and_rim(&buf);
-
-        assert_eq!(prompt, rim + 4, "rim, two agent rows, the step, the input");
-        let step = prompt - 1;
-        assert_eq!(sym(&buf, 1, step), "\u{2590}");
-        assert_eq!(
-            sym(&buf, 40, step),
-            "\u{2584}",
-            "half-cell step up to the body"
-        );
-        assert_eq!(sym(&buf, W - 2, step), "\u{258C}");
+        let (top, last) = tray_rows(&buf).expect("a tray");
+        assert_eq!(last, top + 2, "top rim, two agent rows");
+        assert_eq!(prompt_row(&buf), last + 2, "the input's rim, then ❯");
 
         for (y, name, what) in [
-            (rim + 1, "chrollo", "reading oneshot.rs"),
-            (rim + 2, "spike", "$ cargo test -p synaps-tui"),
+            (top + 1, "chrollo", "reading oneshot.rs"),
+            (top + 2, "spike", "$ cargo test -p synaps-tui"),
         ] {
             let line = row(&buf, y);
             assert!(
                 SPINNER_FRAMES.contains(&sym(&buf, 3, y)),
                 "running glyph under ❯: {line:?}"
             );
-            assert_eq!(sym(&buf, 1, y), "\u{2590}", "slab side: {line:?}");
-            assert_eq!(sym(&buf, W - 2, y), "\u{258C}", "slab side: {line:?}");
-            assert!(line[..].contains(name) && line.contains(what), "{line:?}");
+            assert!(line.contains(name) && line.contains(what), "{line:?}");
         }
-        assert!(row(&buf, rim + 1).contains("4 tools"));
+        assert!(row(&buf, top + 1).contains("4 tools"));
 
-        // No box anywhere in the band.
-        for y in rim..=prompt {
+        // No box-drawing anywhere in the band.
+        for y in top..=prompt_row(&buf) {
             let line = row(&buf, y);
             for glyph in ['\u{256d}', '\u{256e}', '\u{2570}', '\u{256f}', '\u{2502}'] {
                 assert!(!line.contains(glyph), "box glyph {glyph:?} in {line:?}");
             }
         }
+    }
+
+    /// The input box is exactly as without agents (corners, padding, every
+    /// row) except that the chrome above its flat top edge is now the tray;
+    /// the tray's own edges are straight, half a cell in from the input's.
+    #[test]
+    fn the_input_is_unchanged_and_the_tray_is_a_clean_rectangle() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 1, "sleeper-1");
+        start(&mut h, 2, "sleeper-2");
+        let buf = h.render().clone();
+        let mut plain = TestHarness::boot_with_size(W, H);
+        let plain = plain.render().clone();
+        assert!(tray_rows(&plain).is_none());
+
+        let prompt = prompt_row(&buf);
+        assert_eq!(prompt_row(&plain), prompt, "the input doesn't move");
+        let rim = prompt - 1;
+        let bottom = (prompt..H)
+            .find(|&y| sym(&buf, 1, y) == "\u{259D}")
+            .expect("bottom rim");
+        // Every input row below its rim: identical.
+        for y in prompt..=bottom {
+            for x in 0..W {
+                assert_eq!(cell(&buf, x, y), cell(&plain, x, y), "input ({x},{y})");
+            }
+        }
+        // The rim: identical corners and outside; between them the same ▄ in
+        // the body colour, only the upper half (the tray's padding) differs.
+        let (top, _) = tray_rows(&buf).expect("a tray");
+        let tray_bg = buf[(2, top + 1)].bg;
+        for x in 0..W {
+            let (got, want) = (cell(&buf, x, rim), cell(&plain, x, rim));
+            if (2..=W - 3).contains(&x) {
+                assert_eq!((&got.0, got.1), (&want.0, want.1), "rim ({x})");
+                assert_eq!(got.2, tray_bg, "tray padding above the rim ({x})");
+            } else {
+                assert_eq!(got, want, "rim corner/outside ({x})");
+            }
+        }
+        // The tray: straight edges at columns 2 and W-3, chrome outside.
+        let chrome = buf[(0, top + 1)].bg;
+        for y in top + 1..rim {
+            assert_eq!(buf[(2, y)].bg, tray_bg, "left edge at {y}");
+            assert_eq!(buf[(W - 3, y)].bg, tray_bg, "right edge at {y}");
+            assert_eq!(buf[(1, y)].bg, chrome, "chrome outside at {y}");
+            assert_eq!(buf[(W - 2, y)].bg, chrome, "chrome outside at {y}");
+        }
+        for x in 2..=W - 3 {
+            assert_eq!(
+                cell(&buf, x, top),
+                ("\u{2584}".into(), tray_bg, chrome),
+                "top rim ({x})"
+            );
+        }
+        assert_eq!(buf[(1, top)].bg, chrome);
+        assert_eq!(buf[(1, top)].symbol(), " ", "no tray outside its columns");
     }
 
     #[test]
@@ -617,7 +690,7 @@ mod render_tests {
         start(&mut h, 3, "gif-recorder");
         done(&mut h, 3, "[TIMED OUT after 30s — partial results below]");
         let buf = h.render().clone();
-        let (_, rim) = prompt_and_rim(&buf);
+        let (rim, _) = tray_rows(&buf).expect("a tray");
         let failed = row(&buf, rim + 1);
         assert_eq!(sym(&buf, 3, rim + 1), "\u{2717}", "{failed:?}");
         assert!(
@@ -644,12 +717,9 @@ mod render_tests {
             start(&mut h, id, &format!("agent-{id}"));
         }
         let buf = h.render().clone();
-        let (prompt, rim) = prompt_and_rim(&buf);
-        assert_eq!(
-            prompt,
-            rim + 9,
-            "rim, six rows, +N more, the step, the input"
-        );
+        let (rim, last) = tray_rows(&buf).expect("a tray");
+        assert_eq!(last, rim + 7, "top rim, six rows, +N more");
+        assert_eq!(prompt_row(&buf), last + 2);
         assert!(row(&buf, rim + 6).contains("agent-6"));
         assert!(row(&buf, rim + 7).contains("+2 more"));
         assert!(!row(&buf, rim + 7).contains("agent-7"));
@@ -659,8 +729,7 @@ mod render_tests {
     fn no_agents_no_tray() {
         let mut h = TestHarness::boot_with_size(W, H);
         let buf = h.render().clone();
-        let (prompt, rim) = prompt_and_rim(&buf);
-        assert_eq!(prompt, rim + 1, "the plain slab: rim, then the input");
+        assert!(tray_rows(&buf).is_none(), "the plain slab only");
     }
 
     #[test]
@@ -671,7 +740,11 @@ mod render_tests {
             1,
             3,
         );
-        assert_eq!(areas.subagent.bottom(), areas.input.y, "tray on the slab");
+        assert_eq!(
+            areas.subagent.bottom(),
+            areas.input.y,
+            "tray right on the prompt"
+        );
         assert_eq!(
             areas.download.bottom(),
             areas.subagent.y,
