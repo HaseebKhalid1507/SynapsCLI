@@ -375,6 +375,26 @@ const TOOL_INPUT_CONTRAST: f64 = 1.14;
 const TOOL_OUTPUT_CONTRAST: f64 = 1.31;
 
 impl Theme {
+    /// A raised surface on the chrome (`bg`), for selected rows and popups in
+    /// modals (Noodle's `backgroundElement`): `bg` lifted toward `input_fg`
+    /// just until it stands `step` off the chrome (WCAG contrast).
+    pub(crate) fn raised_surface(&self, step: f64) -> Color {
+        let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (self.bg, self.input_fg) else {
+            return self.bg;
+        };
+        let mut out = self.bg;
+        for i in 1..=80u8 {
+            let t = f64::from(i) * 0.005;
+            let mix =
+                |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+            out = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+            if wcag_contrast(out, self.bg) >= step {
+                break;
+            }
+        }
+        out
+    }
+
     /// Tool-card argument panel: the explicit `tool_input_bg`, or derived
     /// from this palette when it is `Color::Reset`.
     pub(crate) fn tool_input_background(&self) -> Color {
