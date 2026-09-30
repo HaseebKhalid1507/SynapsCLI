@@ -41,6 +41,44 @@ pub fn activation_policy(
     }
 }
 
+/// Mid-turn history publication (see the ROUND CHECKPOINT site in
+/// `run_stream_internal`). Remembers what was last published so an
+/// unchanged history is never re-sent — each publish costs every consumer a
+/// session save.
+///
+/// Identity is `(len, address of the last message)`: history only ever grows
+/// by appending new `Arc`s within a turn, and a rollover head is a fresh
+/// vector of fresh `Arc`s, so any real change moves one of the two.
+#[derive(Default)]
+struct RoundCheckpoint {
+    last: Option<(usize, usize)>,
+}
+
+impl RoundCheckpoint {
+    fn key(messages: &[SharedMessage]) -> Option<(usize, usize)> {
+        messages
+            .last()
+            .map(|m| (messages.len(), Arc::as_ptr(m) as *const () as usize))
+    }
+
+    /// Send `MessageHistory` iff the history changed since the last publish.
+    fn publish(&mut self, tx: &mpsc::UnboundedSender<StreamEvent>, messages: &[SharedMessage]) {
+        let key = Self::key(messages);
+        if key.is_none() || key == self.last {
+            return;
+        }
+        self.last = key;
+        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(
+            messages.to_vec(),
+        )));
+    }
+
+    /// Record a history the caller published itself.
+    fn mark_published(&mut self, messages: &[SharedMessage]) {
+        self.last = Self::key(messages);
+    }
+}
+
 /// Pre-cancellation guard for provider IO. If `cancel.is_cancelled()` before
 /// the call, return `Err(Canceled)` without polling — no billed request.
 async fn await_provider_call<F>(cancel: &CancellationToken, call: F) -> Result<Value>
@@ -621,6 +659,7 @@ impl StreamMethods {
             }};
         }
 
+        let mut round_checkpoint = RoundCheckpoint::default();
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
@@ -632,6 +671,17 @@ impl StreamMethods {
             // reach the FIRST request, not wait until its tools have executed.
             // Subsequent rounds use the same path and normal request validation.
             HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+
+            // ═══ ROUND CHECKPOINT ═══
+            // Every iteration starts on a valid history (the prompt on the
+            // first pass, then each completed round with paired
+            // tool_results, drained steering, or a rollover head). Publish it
+            // so the frontend can persist the turn AS IT PROGRESSES: without
+            // this the only history a frontend saw was the terminal one, and a
+            // crash mid-turn lost the prompt and every completed round.
+            // Append-only (never rewrites a sent message) — no effect on the
+            // request bytes or the provider's cached prefix.
+            round_checkpoint.publish(&tx, &messages);
 
             // Budget pre-flight: wall clock, then the exact round cap —
             // BEFORE any provider call is spent. History is valid here
@@ -1087,6 +1137,9 @@ impl StreamMethods {
                                 let _ = tx.send(StreamEvent::Session(
                                     SessionEvent::MessageHistory(messages.clone()),
                                 ));
+                                // Already published: the next round checkpoint
+                                // must not re-send the identical head.
+                                round_checkpoint.mark_published(&messages);
                                 let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction."))));
                                 continue;
                             }
