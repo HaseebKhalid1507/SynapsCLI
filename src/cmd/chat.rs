@@ -328,6 +328,7 @@ async fn run_inline(
                     match cmd {
                         "clear" => {
                             conv.clear(&runtime).await;
+                            runtime.begin_conversation(Some(conv.session.id.clone()));
                             eprintln!("session cleared → {}", &conv.session.id[..8]);
                         }
                         "sessions" => match synaps_cli::list_recent_sessions(20) {

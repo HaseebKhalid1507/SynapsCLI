@@ -192,6 +192,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         before,
         None,
         false,
+        None,
     )
     .await;
     let input = match decision {
@@ -211,6 +212,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
                     watcher_exit_path: None,
@@ -384,6 +386,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
                     watcher_exit_path: None,
@@ -1284,6 +1287,51 @@ async fn on_message_complete_is_observe_only() {
     assert!(
         matches!(result, HookResult::Continue),
         "on_message_complete should ignore non-continue actions, got {result:?}"
+    );
+
+    // Advisory context_phase: with only privacy.llm_content the report is
+    // ignored (two-key gate) ...
+    let context_management = serde_json::json!({
+        "enabled": true, "band": "normal", "phase": "unknown"
+    });
+    let event = HookEvent::on_message_complete(
+        "Report phase",
+        serde_json::json!({"context_management": context_management}),
+    );
+    let result = bus.emit(&event).await;
+    assert!(
+        matches!(result, HookResult::Continue),
+        "context_phase without session.lifecycle must be ignored, got {result:?}"
+    );
+
+    // ... and with session.lifecycle as well, the report is accepted while
+    // a Block on the same hook is still ignored.
+    let bus = HookBus::new();
+    let mut perms = PermissionSet::new();
+    perms.grant(Permission::LlmContent);
+    perms.grant(Permission::SessionLifecycle);
+    bus.subscribe(
+        HookKind::OnMessageComplete,
+        handler.clone(),
+        None,
+        None,
+        perms,
+    )
+    .await
+    .expect("subscribe on_message_complete");
+    let result = bus.emit(&event).await;
+    assert_eq!(
+        result,
+        HookResult::ContextPhase {
+            phase: "new_task".into()
+        },
+        "context_phase with both keys must be returned (and the fixture must have seen data.context_management)"
+    );
+    let event = HookEvent::on_message_complete("Block me", serde_json::json!({}));
+    let result = bus.emit(&event).await;
+    assert!(
+        matches!(result, HookResult::Continue),
+        "block is still ignored on on_message_complete, got {result:?}"
     );
 
     handler.shutdown().await;

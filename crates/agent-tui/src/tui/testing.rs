@@ -481,6 +481,11 @@ impl TestHarness {
         self.activate_prompt_with_kind(synaps_cli::tools::PromptKind::Confirm, title, prompt)
     }
 
+    /// `Confirm` dialog: the focused button (`Deny` when none is active).
+    pub fn confirm_focus(&self) -> synaps_cli::tools::ConfirmChoice {
+        self.app.secret_prompts.confirm_focus()
+    }
+
     /// Whether a secret prompt is currently active (mirrors the SecretPrompt
     /// stack membership by the P7.8 sync invariant).
     pub fn secret_prompt_active(&self) -> bool {

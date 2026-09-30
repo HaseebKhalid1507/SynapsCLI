@@ -172,7 +172,7 @@ async fn confirm_activation_with_host(
     ids.sort_unstable();
     let question = format!(
         "The model requests session-scoped activation of {} exact tool id(s):\n{}\n\
-         Type y/yes to allow exactly these tools; anything else denies.",
+         Allow exactly these tools? Anything but Allow / y denies.",
         ids.len(),
         ids.join("\n")
     );
