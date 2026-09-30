@@ -303,6 +303,9 @@ pub(crate) struct Slab {
     /// Band colour under the half-cell edges, per column: the chrome, lit
     /// only under the shimmer.
     halo: Vec<Rgb>,
+    /// Colour of the thin corner brackets (`╭──` `──╮`) along the top edge,
+    /// or `None` while a turn streams (they fade out with the dim).
+    bracket: Option<Rgb>,
 }
 
 /// How far the body stands off the chrome when the prompt is ready (WCAG
@@ -324,6 +327,7 @@ impl Slab {
         let prompt = rgb(theme.prompt_fg, d.prompt_fg);
         let muted = rgb(theme.muted, d.muted);
         let stream = rgb(theme.status_streaming, d.status_streaming);
+        let accent = rgb(theme.border_active, d.border_active);
 
         // Chrome lifted toward the theme's text just far enough to read.
         let mut body = backdrop;
@@ -359,6 +363,13 @@ impl Slab {
             }
         }
         let typed = mix(text, body, DIM_TEXT * fx.dim);
+        // Ready: thin corner brackets in the theme's active-border colour,
+        // brightening with the "your turn" cue; they fade out as the prompt
+        // dims for a streaming turn and are gone once it has.
+        let bracket = (fx.dim < 1.0).then(|| {
+            let lit = mix(accent, text, 0.35 * fx.arrive);
+            mix(backdrop, lit, 1.0 - fx.dim)
+        });
         Self {
             backdrop,
             body,
@@ -367,6 +378,7 @@ impl Slab {
             prompt,
             muted,
             stream,
+            bracket,
             fx,
             fill,
             halo,
@@ -498,6 +510,21 @@ pub(crate) fn paint_slab(buf: &mut Buffer, area: Rect, slab: &Slab, cursor: Opti
         put(buf, area.x + rx, top, top_sym, fill, halo);
         put(buf, area.x + rx, bottom, bottom_sym, fill, halo);
     }
+    // Ready: thin brackets trace the slab's two top corners. The line sits
+    // at mid-cell, exactly on the half-block edge, and the corner curves
+    // down the middle of the side column, so it follows the slab's outline.
+    if let Some(bracket) = slab.bracket {
+        let span = bracket_span(area.width);
+        let fg = color(bracket);
+        for rx in l..=l + span {
+            let sym = if rx == l { "\u{256D}" } else { "\u{2500}" }; // ╭ ─
+            put(buf, area.x + rx, top, sym, fg, outside(rx, &slab.halo));
+        }
+        for rx in r - span..=r {
+            let sym = if rx == r { "\u{256E}" } else { "\u{2500}" }; // ╮ ─
+            put(buf, area.x + rx, top, sym, fg, outside(rx, &slab.halo));
+        }
+    }
     for y in top + 1..bottom {
         let halo_l = outside(l, &slab.halo);
         let halo_r = outside(r, &slab.halo);
@@ -526,6 +553,13 @@ pub(crate) fn paint_slab(buf: &mut Buffer, area: Rect, slab: &Slab, cursor: Opti
             put(buf, area.x + rx, y, " ", color(bg), color(bg));
         }
     }
+}
+
+/// Length of each corner bracket's straight run: an eighth of the width,
+/// kept between 4 and 14 cells, and never more than a third of the slab so
+/// the two brackets stay apart.
+fn bracket_span(width: u16) -> u16 {
+    (width / 8).clamp(4, 14).min(width.saturating_sub(4) / 3)
 }
 
 /// Light the cursor cell: a block in the cursor colour with the glyph under
@@ -1043,5 +1077,53 @@ mod ready_tests {
             calm.backdrop,
             "and glows around it"
         );
+    }
+}
+
+#[cfg(test)]
+mod bracket_tests {
+    use super::*;
+
+    #[test]
+    fn brackets_show_when_ready_and_fade_out_for_streaming() {
+        let theme = Theme::default();
+        let ready = Slab::new(&theme, PromptFx::default(), 80, None);
+        assert_eq!(
+            ready.bracket,
+            Some(rgb(theme.border_active, theme.border_active))
+        );
+        let half = Slab::new(
+            &theme,
+            PromptFx {
+                dim: 0.5,
+                ..PromptFx::default()
+            },
+            80,
+            None,
+        );
+        assert!(
+            half.bracket.is_some_and(|b| b != ready.bracket.unwrap()),
+            "fading"
+        );
+        let busy = Slab::new(
+            &theme,
+            PromptFx {
+                dim: 1.0,
+                ..PromptFx::default()
+            },
+            80,
+            None,
+        );
+        assert_eq!(busy.bracket, None, "gone while streaming");
+    }
+
+    #[test]
+    fn bracket_span_scales_and_stays_apart() {
+        assert_eq!(bracket_span(80), 10);
+        assert_eq!(bracket_span(200), 14);
+        assert_eq!(bracket_span(40), 5);
+        for w in 16..300u16 {
+            assert!(2 * bracket_span(w) + 2 < w - 2, "w={w}: brackets overlap");
+        }
     }
 }

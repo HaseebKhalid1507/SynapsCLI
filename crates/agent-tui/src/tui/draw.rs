@@ -2008,8 +2008,8 @@ mod neon_prompt_tests {
             .expect("bottom rim ▝");
         let top = (0..bottom)
             .rev()
-            .find(|&y| sym(buf, 1, y) == "\u{2597}")
-            .expect("top rim ▗");
+            .find(|&y| matches!(sym(buf, 1, y), "\u{2597}" | "\u{256D}"))
+            .expect("top rim ▗ (or its ╭ bracket when ready)");
         (top, bottom)
     }
 
@@ -2022,8 +2022,9 @@ mod neon_prompt_tests {
         assert_eq!(bottom, top + 2, "one text row between the rims");
         let text = top + 1;
         for (x, y, want) in [
-            (1, top, "\u{2597}"),
-            (W - 2, top, "\u{2596}"),
+            (1, top, "\u{256D}"),
+            (W - 2, top, "\u{256E}"),
+            (20, top, "\u{2584}"),
             (1, text, "\u{2590}"),
             (W - 2, text, "\u{258C}"),
             (1, bottom, "\u{259D}"),
@@ -2033,11 +2034,13 @@ mod neon_prompt_tests {
         ] {
             assert_eq!(sym(&buf, x, y), want, "({x},{y})");
         }
+        // The only line art is the two thin corner brackets on the top edge.
         for y in top..=bottom {
             for x in 0..W {
                 let c = sym(&buf, x, y).chars().next().unwrap_or(' ');
+                let bracket = y == top && (x <= 11 || x >= W - 12);
                 assert!(
-                    !('\u{2500}'..='\u{257F}').contains(&c),
+                    bracket || !('\u{2500}'..='\u{257F}').contains(&c),
                     "box-drawing {c:?} at ({x},{y})"
                 );
             }
@@ -2091,6 +2094,26 @@ mod neon_prompt_tests {
             row(&buf, top + 1).contains("steer or queue"),
             "streaming placeholder"
         );
+    }
+
+    /// Thin corner brackets on the top edge when ready; plain half-block
+    /// rim while a turn streams.
+    #[test]
+    fn corner_brackets_only_when_ready() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        let rim = row(&buf, top);
+        assert!(rim.starts_with(" \u{256D}\u{2500}"), "{rim:?}");
+        assert!(rim.ends_with("\u{2500}\u{256E} "), "{rim:?}");
+
+        h.set_streaming(true);
+        h.render();
+        h.advance_clock_ms(400); // past the dim fade
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        assert_eq!(sym(&buf, 1, top), "\u{2597}", "plain rim while streaming");
+        assert!(!row(&buf, top).contains('\u{2500}'));
     }
 
     #[test]
