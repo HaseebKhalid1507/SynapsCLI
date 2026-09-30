@@ -44,9 +44,8 @@ const PULSE_DECAY: f32 = 0.45;
 /// Seconds the prompt takes to dim when a turn starts streaming (and to come
 /// back when it ends).
 const DIM_FADE: f32 = 0.25;
-/// How far the dim goes: the body gives back this share of its lift off the
-/// chrome, and typed text moves this far toward the body (never below AA).
-const DIM_BODY: f32 = 0.6;
+/// How far the dim goes for typed text: this far toward the body (never
+/// below AA). The body's own dim is [`STREAM_CONTRAST`].
 const DIM_TEXT: f32 = 0.3;
 /// Seconds of the "your turn" cue when a turn ends: a wash of the theme's
 /// prompt colour over the slab (and a little around it) that fades out.
@@ -301,9 +300,12 @@ pub(crate) struct Slab {
 }
 
 /// How far the body stands off the chrome when the prompt is ready (WCAG
-/// contrast): clearly the brightest surface in the bottom band, the "ready for
-/// you" state. Streaming gives back [`DIM_BODY`] of it.
-const BODY_CONTRAST: f32 = 1.22;
+/// contrast): the brightest surface in the bottom band, the "ready for you"
+/// state, without shouting.
+const BODY_CONTRAST: f32 = 1.17;
+/// The body's step off the chrome while a turn streams: the prompt steps
+/// back, clearly dimmer than ready.
+const STREAM_CONTRAST: f32 = 1.08;
 /// Cap on the lift toward the text colour.
 const BODY_MAX_LIFT: f32 = 0.25;
 
@@ -320,16 +322,20 @@ impl Slab {
         let muted = rgb(theme.muted, d.muted);
         let stream = rgb(theme.status_streaming, d.status_streaming);
 
-        // Chrome lifted toward the theme's text just far enough to read.
-        let mut body = backdrop;
-        let mut lift = 0.0;
-        while lift < BODY_MAX_LIFT && contrast(body, backdrop) < BODY_CONTRAST {
-            lift += 0.01;
-            body = mix(backdrop, text, lift);
-        }
-        // Streaming: the agent has the floor, so the prompt steps back a
-        // little — the body gives back part of its lift.
-        body = mix(backdrop, text, lift * (1.0 - DIM_BODY * fx.dim));
+        // Chrome lifted toward the theme's text just far enough to reach a
+        // target step off the chrome.
+        let lift_for = |target: f32| {
+            let mut lift = 0.0;
+            while lift < BODY_MAX_LIFT && contrast(mix(backdrop, text, lift), backdrop) < target {
+                lift += 0.005;
+            }
+            lift
+        };
+        let ready_lift = lift_for(BODY_CONTRAST);
+        // Streaming: the agent has the floor, so the prompt steps back.
+        let stream_lift = lift_for(STREAM_CONTRAST).min(ready_lift);
+        let lift = ready_lift + (stream_lift - ready_lift) * fx.dim;
+        let body = mix(backdrop, text, lift);
         // Send flash: the body brightens toward the text colour for a moment.
         // "Your turn": when a turn ends the prompt colour washes over the
         // slab and fades, so the hand-back is felt, not just read.
