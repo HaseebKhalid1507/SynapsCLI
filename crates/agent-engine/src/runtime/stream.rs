@@ -1062,6 +1062,19 @@ impl StreamMethods {
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
                             Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
+                                // A cancel that landed while the successor was
+                                // being prepared must stop HERE: `persist_head`
+                                // latches `durability_blocked` before it asks
+                                // the frontend to save, and a frontend that is
+                                // tearing the turn down may never acknowledge.
+                                // Nothing has been published yet — the pre-
+                                // rollover history is still the valid head.
+                                if cancel.is_cancelled() {
+                                    let _ = tx.send(StreamEvent::Session(
+                                        SessionEvent::MessageHistory(messages),
+                                    ));
+                                    return Ok(());
+                                }
                                 super::continuation::persist_head(&prepared, &continuation, &tx)
                                     .await?;
                                 messages = prepared.commit(&continuation)?;
@@ -1543,12 +1556,21 @@ impl StreamMethods {
 
                         // Rich blocks bypass `truncate_tool_result` by construction:
                         // the image cap is the image's own budget.
-                        let content = select_tool_result_content(
-                            rich_blocks,
-                            history_result.map(|bounded| bounded.text),
-                            &result,
-                            max_tool_output,
-                        );
+                        // A canceled call must never look completed: any
+                        // partial output it streamed is kept but labelled.
+                        let content = if canceled {
+                            canceled_tool_result_content(
+                                history_result.map(|bounded| bounded.text),
+                                interrupted_side_effect.is_some(),
+                            )
+                        } else {
+                            select_tool_result_content(
+                                rich_blocks,
+                                history_result.map(|bounded| bounded.text),
+                                &result,
+                                max_tool_output,
+                            )
+                        };
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
@@ -1858,12 +1880,19 @@ impl StreamMethods {
                             let history_bounded = result.3.as_ref()
                                 .map(crate::tools::output::OutputHandle::model_history)
                                 .filter(|bounded| bounded.original_bytes > 0);
-                            let history: Value = select_tool_result_content(
-                                result.5,
-                                history_bounded.as_ref().map(|bounded| bounded.text.clone()),
-                                &result.2,
-                                max_tool_output,
-                            );
+                            let history: Value = if was_canceled {
+                                canceled_tool_result_content(
+                                    history_bounded.as_ref().map(|bounded| bounded.text.clone()),
+                                    interrupted.is_some(),
+                                )
+                            } else {
+                                select_tool_result_content(
+                                    result.5,
+                                    history_bounded.as_ref().map(|bounded| bounded.text.clone()),
+                                    &result.2,
+                                    max_tool_output,
+                                )
+                            };
                             if let (Some(request), Some((stable_tool_id, activation_basis, tool_call_started)), Some(call_effect)) = (request_correlation_inner.as_ref(), result.4, result.1) {
                                 let correlation =
                                     crate::runtime::trace::ExecutionCorrelation::from_request(
@@ -2079,6 +2108,36 @@ fn select_tool_result_content(
         (Some(blocks), _) => Value::Array(blocks),
         (None, Some(text)) => Value::String(text),
         (None, None) => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
+    }
+}
+
+/// History content for a tool call canceled mid-execution. The canceled
+/// result is the provider-protocol place to say what happened to the call,
+/// so the label lives HERE (a real `tool_result`), never in a user turn.
+///
+/// - `partial`: bounded model-history text the tool streamed before cancel
+///   (already capped by the output handle's model-history budget). Kept, so
+///   the model sees what really ran — but labelled, so it can never be read
+///   as a completed result.
+/// - `side_effect_possible`: the call STARTED and is `NonIdempotent` (the
+///   Task 25 ledger's `InterruptedAfterSideEffect` case) — say so, so the
+///   model does not blindly re-run it.
+///
+/// Every variant starts with / contains "Canceled", which the phase-4 bound
+/// tests key on.
+fn canceled_tool_result_content(partial: Option<String>, side_effect_possible: bool) -> Value {
+    let effects = if side_effect_possible {
+        " It had already started and may have partially applied its effects."
+    } else {
+        ""
+    };
+    match partial.filter(|p| !p.trim().is_empty()) {
+        Some(partial) => Value::String(format!(
+            "{partial}\n\n[Canceled by user before the tool finished; the output above is partial.{effects}]"
+        )),
+        // Byte-identical to the pre-existing canceled result.
+        None if !side_effect_possible => Value::String("Canceled by user".to_string()),
+        None => Value::String(format!("Canceled by user.{effects}")),
     }
 }
 
@@ -2314,6 +2373,38 @@ mod tests {
             0,
             "pre-cancellation must prevent tool dispatch"
         );
+    }
+
+    // ── canceled tool results never look completed ──────────────────────
+
+    #[test]
+    fn canceled_tool_without_output_keeps_the_existing_result_bytes() {
+        assert_eq!(canceled_tool_result_content(None, false), json!("Canceled by user"));
+        assert_eq!(
+            canceled_tool_result_content(Some("   \n".into()), false),
+            json!("Canceled by user"),
+            "whitespace-only output is no output"
+        );
+    }
+
+    #[test]
+    fn canceled_tool_with_partial_output_is_labelled_partial() {
+        let v = canceled_tool_result_content(Some("line 1\nline 2".into()), false);
+        let s = v.as_str().unwrap();
+        assert!(s.starts_with("line 1\nline 2\n\n"), "{s}");
+        assert!(s.contains("Canceled by user before the tool finished"), "{s}");
+        assert!(s.contains("partial"), "{s}");
+        assert!(!s.contains("effects"), "idempotent call must not claim side effects: {s}");
+    }
+
+    #[test]
+    fn canceled_non_idempotent_call_warns_about_effects() {
+        let with_output = canceled_tool_result_content(Some("wrote 3 files".into()), true);
+        assert!(with_output.as_str().unwrap().contains("may have partially applied its effects"));
+        let without = canceled_tool_result_content(None, true);
+        let s = without.as_str().unwrap();
+        assert!(s.starts_with("Canceled by user"), "{s}");
+        assert!(s.contains("may have partially applied its effects"), "{s}");
     }
 
     // ── guard framing: single source for both injection placements ────────
