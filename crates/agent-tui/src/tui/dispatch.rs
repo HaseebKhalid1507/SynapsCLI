@@ -1161,6 +1161,9 @@ pub(crate) async fn handle_input_action(
                 let streaming_cmds = commands::to_owned_commands(commands::STREAMING_COMMANDS);
                 let cmd = commands::resolve_prefix(raw_cmd, &streaming_cmds);
                 match commands::handle_streaming_command(&cmd, &input, app) {
+                    // A streaming command that finished in place (/theme,
+                    // /attachments, /detach): nothing more to do.
+                    CommandAction::None if commands::is_streaming_command(&cmd) => {}
                     CommandAction::None => {
                         // Not a streaming-safe command. If it's still a KNOWN
                         // command (settings, model, system, etc.), refuse with
