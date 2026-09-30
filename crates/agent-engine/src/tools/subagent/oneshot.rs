@@ -422,7 +422,7 @@ impl Tool for SubagentTool {
 
         let log_dir = crate::config::base_dir().join("logs").join("subagents");
         let _ = tokio::fs::create_dir_all(&log_dir).await;
-        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
 
         match result {
             Ok(Ok(sa_result)) => {
@@ -456,7 +456,7 @@ impl Tool for SubagentTool {
                     sa_result.cache_read, sa_result.cache_creation,
                     sa_result.tool_count, sa_result.text,
                 );
-                let log_path = log_dir.join(format!("{}-{}.md", timestamp, label));
+                let log_path = super::subagent_log_path(&log_dir, &timestamp, &label, false);
                 let _ = tokio::fs::write(&log_path, &log_content).await;
 
                 Ok(format!("[subagent:{}] {}", label, sa_result.text))
@@ -470,7 +470,7 @@ impl Tool for SubagentTool {
                         duration_secs: elapsed,
                     }));
                 }
-                let log_path = log_dir.join(format!("{}-{}-error.md", timestamp, label));
+                let log_path = super::subagent_log_path(&log_dir, &timestamp, &label, true);
                 let _ = tokio::fs::write(
                     &log_path,
                     format!(

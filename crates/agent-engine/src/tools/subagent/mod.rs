@@ -28,10 +28,43 @@ const MAX_LABEL_CHARS: usize = 32;
 /// falling back to "inline".
 pub(crate) fn subagent_label(agent: Option<&str>, name: Option<&str>) -> String {
     if let Some(agent) = agent {
+        // `resolve_agent_prompt` reads any agent containing '/' as a file
+        // path; label those by the file stem, not the whole path.
+        if agent.contains('/') {
+            return std::path::Path::new(agent)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(sanitize_label)
+                .unwrap_or_else(|| "agent".to_string());
+        }
         return agent.to_string();
     }
     name.and_then(sanitize_label)
         .unwrap_or_else(|| "inline".to_string())
+}
+
+/// Log file for a finished oneshot subagent:
+/// `<log_dir>/<timestamp>-<label>[-error].md`. Any label character outside
+/// letters, digits, `-` and `_` becomes `-`, so the file always lands directly
+/// in `log_dir` (a `plugin:agent` label or a stray separator can't redirect it).
+pub(crate) fn subagent_log_path(
+    log_dir: &std::path::Path,
+    timestamp: &str,
+    label: &str,
+    error: bool,
+) -> std::path::PathBuf {
+    let slug: String = label
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let suffix = if error { "-error" } else { "" };
+    log_dir.join(format!("{timestamp}-{slug}{suffix}.md"))
 }
 
 /// Reduce a caller-chosen name to `[A-Za-z0-9_-]` (whitespace becomes `-`),
@@ -715,7 +748,50 @@ mod forum_worker_tests {
 
 #[cfg(test)]
 mod label_tests {
-    use super::subagent_label;
+    use super::{subagent_label, subagent_log_path};
+    use std::path::Path;
+
+    #[test]
+    fn path_agent_is_labelled_by_its_file_stem() {
+        assert_eq!(subagent_label(Some("~/agents/foo.md"), None), "foo");
+        assert_eq!(
+            subagent_label(Some("/home/x/.synaps-cli/agents/my-reviewer.md"), Some("n")),
+            "my-reviewer"
+        );
+        assert_eq!(
+            subagent_label(Some("./agents/review er.md"), None),
+            "review-er"
+        );
+        assert_eq!(subagent_label(Some("~/agents/💀.md"), None), "agent");
+        // Plain and namespaced names are not paths and stay as they are.
+        assert_eq!(
+            subagent_label(Some("dev-tools:sage"), None),
+            "dev-tools:sage"
+        );
+    }
+
+    #[test]
+    fn log_path_always_lands_in_log_dir() {
+        let dir = Path::new("/tmp/synaps-logs/subagents");
+        for label in [
+            "inline",
+            "dev-tools:sage",
+            "~/agents/foo.md",
+            "../../etc/x",
+            "a\\b",
+        ] {
+            let path = subagent_log_path(dir, "20260929-224500", label, false);
+            assert_eq!(path.parent(), Some(dir), "{label:?} -> {path:?}");
+        }
+        assert_eq!(
+            subagent_log_path(dir, "20260929-224500", "dev-tools:sage", true),
+            dir.join("20260929-224500-dev-tools-sage-error.md")
+        );
+        assert_eq!(
+            subagent_log_path(dir, "20260929-224500", "spike", false),
+            dir.join("20260929-224500-spike.md")
+        );
+    }
 
     #[test]
     fn named_agent_keeps_its_name_and_ignores_name() {
