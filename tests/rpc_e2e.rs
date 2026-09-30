@@ -551,6 +551,66 @@ mod tier1 {
         child.shutdown().await.expect("clean shutdown");
     }
 
+    /// `rpc --continue X` while another process has X live (holds its
+    /// session lock) is REFUSED — no second writer on the same history. It
+    /// used to run anyway, and its saves overwrote the owner's. Once the
+    /// owner exits, continuing works.
+    #[tokio::test]
+    async fn continue_refuses_a_session_live_elsewhere() {
+        let shared_home = TempDir::new().expect("TempDir");
+        let home_path = shared_home.path().to_path_buf();
+        let sessions = home_path.join(".synaps-cli").join("sessions");
+        let mut session =
+            synaps_cli::core::session::Session::new("claude-sonnet-4-5", "low", None);
+        session.api_messages = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": "held elsewhere"}),
+        )];
+        synaps_cli::core::session_journal::save_session_in_dir(
+            &sessions,
+            &session,
+            synaps_cli::core::session_journal::SessionPersistence::Json,
+        )
+        .expect("seed session");
+        let id = session.id.clone();
+
+        let mut owner = RpcChild::spawn_with_home(
+            &["--continue", &id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn owner");
+        let ready = owner.recv().await.expect("owner Ready");
+        assert_eq!(ready["session_id"], id.as_str());
+
+        let mut second = RpcChild::spawn_with_home(
+            &["--continue", &id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn second");
+        let refused = second.recv_timeout(Duration::from_secs(20)).await;
+        assert!(refused.is_err(), "second writer started: {refused:?}");
+        let status = timeout(Duration::from_secs(10), second.child.wait())
+            .await
+            .expect("second exits")
+            .expect("wait");
+        assert!(!status.success(), "refused → non-zero exit");
+
+        owner.shutdown().await.expect("owner shutdown");
+        let mut next = RpcChild::spawn_with_home(
+            &["--continue", &id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn after owner");
+        let ready = next.recv().await.expect("Ready once the owner is gone");
+        assert_eq!(ready["session_id"], id.as_str());
+        next.shutdown().await.expect("shutdown");
+    }
+
     /// `--continue <id>` resumes an existing session:
     /// * session_id is preserved across restart
     /// * model set in session A is preserved in session B (via Ready frame)

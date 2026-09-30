@@ -90,6 +90,10 @@ struct RpcState {
     /// A round-checkpoint save timed out (bounded: it holds this state's
     /// lock): `terminal_flush` saves at the turn's end instead.
     save_owed: bool,
+    /// The session lock (`setup::lock_session`): follows `session` to a new
+    /// id (`new_session`); `None` = proceeding unlocked (best-effort).
+    #[allow(dead_code)] // held for RAII
+    session_lock: Option<synaps_cli::core::session_lock::SessionLock>,
 }
 
 impl RpcState {
@@ -896,6 +900,9 @@ async fn handle_new_session(
             st.runtime.system_prompt(),
         );
         let sid = new_sess.id.clone();
+        // The lock follows the conversation: new one first, then the old
+        // one is released (assignment drops it).
+        st.session_lock = setup::lock_session(&sid, false, "rpc").unwrap_or(None);
         st.session = new_sess;
         st.context_head = Default::default();
         st.api_messages.clear();
@@ -1121,6 +1128,9 @@ pub async fn run(
     .await
     .context("engine boot failed")?;
 
+    // Refuse to continue a session another process has live; lock ours.
+    let session_lock = setup::lock_session(&boot.session.id, boot.continued, "rpc")
+        .context("cannot continue this session")?;
     let mut runtime = boot.runtime;
     let session = boot.session;
     let initial_messages = boot.api_messages;
@@ -1187,6 +1197,7 @@ pub async fn run(
         events_auto_turn,
         auto_turn_cap,
         save_owed: false,
+        session_lock,
     }));
 
     // 5. Spawn the writer task that owns stdout.
@@ -1603,6 +1614,7 @@ mod context_head_tests {
             events_auto_turn: true,
             auto_turn_cap: 5,
             save_owed: false,
+            session_lock: None,
         };
         let (receipt, acknowledged) = synaps_cli::core::context_head::ContextHeadReceipt::channel();
         receipt.complete(st.persist_context_head("wrong-session", Vec::new()).await);
