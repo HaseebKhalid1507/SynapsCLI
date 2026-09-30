@@ -808,6 +808,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             // process_stream_event mutates conv fields in place. Hold the
             // write lock only for the call itself, then release before
             // broadcast / display_history work to keep latency low.
+            // A round checkpoint (or the final history): persist it now so
+            // the session on disk follows the turn as it progresses.
+            let is_history = matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_)));
             let (engine_event, completion) = {
                 let mut conv = state.conv.write().await;
                 let conv = &mut *conv;
@@ -827,6 +830,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                 )
             };
 
+            if is_history {
+                state.save_session().await;
+            }
             apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
 
             if let Some(msg) = engine_event_to_server_message(engine_event) {
@@ -1227,6 +1233,9 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
             }
             let ts = ServerState::timestamp();
 
+            // A round checkpoint (or the final history): persist it now so
+            // the session on disk follows the turn as it progresses.
+            let is_history = matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_)));
             let (engine_event, completion) = {
                 let mut conv = state.conv.write().await;
                 let conv = &mut *conv;
@@ -1246,6 +1255,9 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                 )
             };
 
+            if is_history {
+                state.save_session().await;
+            }
             apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
 
             if let Some(msg) = engine_event_to_server_message(engine_event) {

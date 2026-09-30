@@ -402,6 +402,10 @@ async fn run_inline(
                 let Some(event) = stream.next().await else {
                     break StreamCompletion::Done;
                 };
+                // Round checkpoints (and the final history) are persisted as
+                // they arrive, like the session actor does.
+                let is_history =
+                    matches!(event, synaps_cli::StreamEvent::Session(synaps_cli::SessionEvent::MessageHistory(_)));
                 let (engine_event, completion) = stream::process_stream_event(
                     event,
                     &mut conv.api_messages,
@@ -410,6 +414,9 @@ async fn run_inline(
                     &mut conv.pending_events,
                     turn_baseline,
                 );
+                if is_history {
+                    conv.save().await;
+                }
 
                 match engine_event {
                     EngineStreamEvent::Thinking(text) => {

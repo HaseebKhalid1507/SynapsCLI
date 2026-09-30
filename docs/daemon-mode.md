@@ -227,6 +227,27 @@ C: bye | socket close = Detach (turn keeps running)
   re-described the model's own output inside the next user message and which current models refuse
   as a prompt injection. Sessions saved with a recap are migrated on load (recap dropped, marker
   appended). Documented in `synaps chat /help` too.
+- **The session on disk follows a running turn.** The engine publishes the conversation at every
+  round boundary — the prompt before the first request, each completed tool round (every
+  `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one (bounded
+  by `SAVE_TIMEOUT`, ordered by `session_save_order`). A crash / `kill -9` / power loss mid-turn
+  loses at most the round in flight, and what is on disk is always a valid history to resume from.
+  Cost: one save per round (≈1 ms for a 2.3 MB session in `json` mode, which rewrites the file;
+  `session_persistence = journal` appends only the new messages). Attach replays carry no per-round
+  `MessageHistory`: the snapshot already holds the latest history.
+- **A turn cut off by a crash is recovered on the next load.** While a turn runs, the actor keeps
+  a small draft `sessions/<id>.turn` (`agent_core::core::session_draft`): the text of the response
+  in flight plus the history length it continues from — written at turn start, at most once per
+  1 Hz turn tick while text streams, removed when the turn ends (ordered, non-blocking writes;
+  0600, confined, atomic; O(partial text) in either persistence mode). A draft found on load
+  (`--continue`, daemon create/unpark, `/resume` — which now takes the session lock like
+  `NewSession`) means the process died mid-turn: the partial text is appended as a real assistant
+  message (text only, like a cancel) followed by `[Request interrupted: Synaps stopped
+  unexpectedly]`, saved, then the draft is removed. A leftover draft of a turn that actually
+  concluded (history already ends with the model's final reply or an interruption marker) is just
+  removed; a stale one (its round already committed) contributes no text. Recovery only ever
+  appends, so the cached prefix is untouched. Written by the session actor (TUI, chat, daemon,
+  attach); rpc / server / legacy chat save every round but keep no draft.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)

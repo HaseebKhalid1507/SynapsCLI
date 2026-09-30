@@ -55,6 +55,21 @@ pub type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent
 /// `turn_replay` cap (envelopes). §6 #9: the 2 MiB text bound is day 3.
 const TURN_REPLAY_CAP: usize = 4096;
 
+/// The in-flight turn draft (`sessions/<id>.turn`, see
+/// `agent_core::core::session_draft`): what the actor last knew about the
+/// response being streamed, flushed at most once per 1 Hz turn tick.
+#[derive(Default)]
+pub(crate) struct TurnDraftState {
+    /// Session id the open draft lives under; `None` = no turn open.
+    open: Option<String>,
+    /// History length the in-flight response continues from.
+    base_len: usize,
+    /// Text streamed in the in-flight response so far.
+    text: String,
+    /// Changed since the last flush.
+    dirty: bool,
+}
+
 /// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
 /// turn's stream.
 #[derive(Default)]
@@ -329,6 +344,9 @@ pub struct SessionActor {
     /// cancel they would die with the steering channel; `cancel_turn` moves
     /// them into history after the interruption marker instead.
     pub(crate) turn_steered_events: Vec<String>,
+    /// In-flight turn draft for crash recovery (persisting sessions only).
+    pub(crate) turn_draft: TurnDraftState,
+    pub(crate) turn_draft_writer: agent_core::core::session_draft::TurnDraftWriter,
     // ── prompts ──
     pub(crate) secret_prompt_handle: SecretPromptHandle,
     pub(crate) secret_prompt_rx: mpsc::UnboundedReceiver<SecretPromptRequest>,
@@ -549,6 +567,13 @@ impl SessionActor {
         conv.total_input_tokens = sb.total_input_tokens;
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
+        // Crash recovery (the last process died mid-turn): only the lock
+        // holder may persist the recovered history and remove the draft.
+        if let Some(recovered) = sb.turn_draft {
+            if cfg.persist && session_lock.is_some() {
+                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
+            }
+        }
 
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
@@ -588,6 +613,10 @@ impl SessionActor {
             turn_baseline: 0,
             consecutive_auto_turns: 0,
             turn_steered_events: Vec::new(),
+            turn_draft: TurnDraftState::default(),
+            turn_draft_writer: agent_core::core::session_draft::TurnDraftWriter::new(
+                agent_core::session_lock::sessions_dir(),
+            ),
             secret_prompt_handle: SecretPromptHandle::new(sp_tx),
             secret_prompt_rx,
             pending_prompts: VecDeque::new(),
@@ -638,7 +667,11 @@ impl SessionActor {
     // ── emit ─────────────────────────────────────────────────────────────
 
     /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
-    /// prompt traffic (never replayed) and per-client replies.
+    /// prompt traffic (never replayed), per-client replies, and full-history
+    /// `MessageHistory` envelopes: the engine publishes one per round, and an
+    /// attaching client already gets the LATEST adopted history in its
+    /// snapshot's `conversation` — replaying older ones would ship the whole
+    /// history once per round and roll its mirror back to a stale state.
     pub(crate) fn emit(&mut self, event: SessionEventWire) {
         let replay = self.streaming
             && !matches!(
@@ -647,6 +680,9 @@ impl SessionActor {
                     | SessionEventWire::PromptResolved { .. }
                     | SessionEventWire::Attached { .. }
                     | SessionEventWire::QueryResult { .. }
+                    | SessionEventWire::Stream(StreamEvent::Session(
+                        SessionEvent::MessageHistory(_)
+                    ))
             );
         let env = Envelope {
             session_id: self.id.clone(),
@@ -1369,6 +1405,7 @@ impl SessionActor {
                             self.turn_steered_events.clear();
                             self.turn_replay.clear();
                             self.streaming = true;
+                            self.open_turn_draft();
                             self.update_attach_state();
                             self.emit(SessionEventWire::TurnStarted {
                                 turn_baseline: self.turn_baseline,
@@ -1542,7 +1579,7 @@ impl SessionActor {
     }
 
     /// F10: release the old lock, acquire on `new_id`. Best-effort (log on failure).
-    fn reacquire_session_lock(&mut self, new_id: &str) {
+    pub(crate) fn reacquire_session_lock(&mut self, new_id: &str) {
         // Drop old lock first — release the flock.
         self.session_lock = None;
         let dir = agent_core::session_lock::sessions_dir();
@@ -1841,11 +1878,17 @@ impl SessionActor {
                 )))
             }
         };
+        let turn_draft = sb.turn_draft;
         let mut conv = ConversationState::from_resumed(sb.session);
         conv.api_messages = sb.api_messages;
         conv.total_input_tokens = sb.total_input_tokens;
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
+        if let Some(recovered) = turn_draft {
+            if self.config.persist && self.session_lock.is_some() {
+                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
+            }
+        }
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
         self.publish_view().await;
@@ -1919,6 +1962,7 @@ impl SessionActor {
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
         self.turn_baseline = self.conv.api_messages.len();
+        self.open_turn_draft();
         self.turn_steered_events.clear();
         self.turn_replay.clear();
         self.update_attach_state();
@@ -1968,7 +2012,87 @@ impl SessionActor {
             self.subagent_tick = None;
         }
         self.turn_steered_events.clear();
+        self.close_turn_draft();
         self.update_attach_state();
+    }
+
+    // ── in-flight turn draft (crash recovery) ──────────────────────────
+
+    /// Turn start: the draft's existence is the "turn open" signal a
+    /// loader uses to detect a process that died mid-turn.
+    fn open_turn_draft(&mut self) {
+        if !self.config.persist || !self.conv.is_live() {
+            return;
+        }
+        self.turn_draft = TurnDraftState {
+            open: Some(self.conv.session.id.clone()),
+            base_len: self.conv.api_messages.len(),
+            text: String::new(),
+            dirty: true,
+        };
+        self.flush_turn_draft();
+    }
+
+    fn turn_draft_text(&mut self, delta: &str) {
+        let d = &mut self.turn_draft;
+        if d.open.is_some()
+            && d.text.len() < agent_core::core::session_draft::TURN_DRAFT_MAX_TEXT_BYTES
+        {
+            d.text.push_str(delta);
+            d.dirty = true;
+        }
+    }
+
+    fn turn_draft_reset_text(&mut self) {
+        let d = &mut self.turn_draft;
+        if d.open.is_some() && !d.text.is_empty() {
+            d.text.clear();
+            d.dirty = true;
+        }
+    }
+
+    /// A round checkpoint was adopted and saved: later text continues from it.
+    fn turn_draft_committed(&mut self) {
+        if self.turn_draft.open.is_none() {
+            return;
+        }
+        self.turn_draft.base_len = self.conv.api_messages.len();
+        self.turn_draft.text.clear();
+        self.turn_draft.dirty = true;
+        self.flush_turn_draft();
+    }
+
+    /// Write the draft if it changed (1 Hz turn tick; round checkpoints).
+    /// Non-blocking and ordered (`TurnDraftWriter`).
+    pub(crate) fn flush_turn_draft(&mut self) {
+        let Some(open) = self.turn_draft.open.clone() else {
+            return;
+        };
+        if !self.turn_draft.dirty {
+            return;
+        }
+        // Defensive: follow the conversation if its id changed mid-turn.
+        let id = self.conv.session.id.clone();
+        if open != id {
+            self.turn_draft_writer.remove(&open);
+            self.turn_draft.open = Some(id.clone());
+        }
+        self.turn_draft.dirty = false;
+        self.turn_draft_writer.write(
+            &id,
+            agent_core::core::session_draft::TurnDraft {
+                base_len: self.turn_draft.base_len,
+                partial_text: self.turn_draft.text.clone(),
+            },
+        );
+    }
+
+    /// Turn end (every path goes through `clear_stream`): remove the draft.
+    fn close_turn_draft(&mut self) {
+        if let Some(id) = self.turn_draft.open.take() {
+            self.turn_draft_writer.remove(&id);
+        }
+        self.turn_draft = TurnDraftState::default();
     }
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
@@ -2483,10 +2607,29 @@ impl SessionActor {
         let mut after = After::Continue;
 
         match event {
+            StreamEvent::Llm(crate::LlmEvent::Text(text)) => self.turn_draft_text(&text),
+            // A new provider response (or a retry's reset): the in-flight
+            // text starts over.
+            StreamEvent::Llm(crate::LlmEvent::ResponseStart | crate::LlmEvent::ResponseReset) => {
+                self.turn_draft_reset_text()
+            }
             StreamEvent::Llm(_) => {}
             StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+                // Published at every round boundary as well as at the end of
+                // the turn (`runtime/stream.rs` ROUND CHECKPOINT): the session
+                // on disk follows the turn as it progresses. Bounded so a slow
+                // disk can never stall the turn machine (Esc/Cancel stays
+                // responsive); a timed-out write still lands, in order
+                // (`session_save_order`).
                 self.conv.api_messages = history;
-                self.save().await;
+                if tokio::time::timeout(budgets::SAVE_TIMEOUT, self.save())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session = %self.id, "history checkpoint save timed out");
+                }
+                // The round is committed: the draft now continues from here.
+                self.turn_draft_committed();
                 self.emit_conversation();
             }
             StreamEvent::Agent(AgentEvent::SteeringDelivered { ref message }) => {
@@ -3627,7 +3770,10 @@ impl SessionTask {
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 _ = queue.notified() => actor.on_queue_wake().await,
-                _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
+                _ = next_tick(&mut actor.subagent_tick) => {
+                    actor.publish_subagent_rows();
+                    actor.flush_turn_draft();
+                }
                 _ = park_timer(actor.park_deadline) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
