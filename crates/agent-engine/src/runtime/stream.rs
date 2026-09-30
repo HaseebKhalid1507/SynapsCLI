@@ -163,6 +163,10 @@ pub(super) struct StreamSession {
     /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
     /// turns/clones of one Runtime; never a persisted session id.
     pub(super) tool_session_id: crate::tools::activation::SessionId,
+    /// Runtime-owned slot retaining this tool session's `SessionToolSet`
+    /// across turns, so exact activations live for the session (as the
+    /// `activate_tools` contract says), not for one provider turn.
+    pub(super) retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
     /// Shared exact MCP lease manager (Task 19); `None` when MCP exact
     /// mode is not active.
     pub(super) mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
@@ -181,6 +185,53 @@ pub(super) struct StreamSession {
 }
 
 pub(super) struct StreamMethods;
+
+/// Turn-start set selection. Under progressive disclosure the runtime RETAINS
+/// one set per tool session across turns: a turn reuses it (same shared
+/// handle), re-deriving the core from `fresh` — the current catalog and
+/// context-management surface — and carrying every exact activation that still
+/// matches its pinned digest + provenance (`carry_activations_into`, the same
+/// checks as the round-top rebuild). Before this, every turn minted a fresh
+/// zero-activation set, so `activate_tools` grants silently expired at the end
+/// of the turn despite being documented as session-scoped.
+///
+/// Flag-off (full-schema) sessions keep the per-turn set: every trusted tool
+/// is already in their core. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores the
+/// zero-inherit behavior here too.
+fn retain_session_tool_set(
+    retained: &crate::tools::activation::RetainedSessionToolSet,
+    fresh: crate::tools::activation::SessionToolSet,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+) -> crate::tools::activation::SharedSessionToolSet {
+    if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        return std::sync::Arc::new(std::sync::RwLock::new(fresh));
+    }
+    let mut slot = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = slot.as_ref() {
+        let mut set = existing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.session() == fresh.session() {
+            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+            for d in &dropped {
+                tracing::warn!(
+                    tool = %d.id,
+                    reason = ?d.reason,
+                    "activation dropped at turn start"
+                );
+            }
+            *set = next;
+            drop(set);
+            return std::sync::Arc::clone(existing);
+        }
+    }
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
+    *slot = Some(std::sync::Arc::clone(&shared));
+    shared
+}
 
 fn assistant_text_from_content(content: &[Value]) -> String {
     content
@@ -374,6 +425,7 @@ impl StreamMethods {
             progressive_tool_disclosure,
             activation_confirm,
             tool_session_id,
+            retained_tool_set,
             mcp_runtime,
             mcp_session_scope,
             extension_runtime,
@@ -488,13 +540,18 @@ impl StreamMethods {
         // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            let set = super::continuation::context_tool_set(
+            let fresh = super::continuation::context_tool_set(
                 tool_session_id.clone(),
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
             );
-            std::sync::Arc::new(std::sync::RwLock::new(set))
+            retain_session_tool_set(
+                &retained_tool_set,
+                fresh,
+                registry.catalog(),
+                progressive_tool_disclosure,
+            )
         };
         // Thread the RETAINED handle into the extension-provider route so
         // its interior tool loop consumes the same set/generation as stream
@@ -2713,47 +2770,21 @@ mod rich_output_tests {
         drive_with_history(initial, tools_to_register, tool_uses, hook_bus).await
     }
 
-    async fn drive_with_history(
-        messages: Vec<SharedMessage>,
-        tools_to_register: Vec<Arc<dyn Tool>>,
-        tool_uses: &[(&str, &str)],
+    /// The harness's `StreamSession`, parameterized on what the progressive
+    /// activation tests vary across turns (shared tool session + retained set).
+    #[allow(clippy::too_many_arguments)]
+    fn harness_session(
+        base_url: String,
+        tools: Arc<RwLock<ToolRegistry>>,
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        session_manager: Arc<crate::tools::shell::SessionManager>,
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
-    ) -> Driven {
-        drive_with_model(
-            "claude-sonnet-4-6",
-            messages,
-            tools_to_register,
-            tool_uses,
-            hook_bus,
-        )
-        .await
-    }
-
-    async fn drive_with_model(
+        tool_session_id: crate::tools::activation::SessionId,
+        retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+        progressive: bool,
         model: &str,
-        messages: Vec<SharedMessage>,
-        tools_to_register: Vec<Arc<dyn Tool>>,
-        tool_uses: &[(&str, &str)],
-        hook_bus: Arc<crate::extensions::hooks::HookBus>,
-    ) -> Driven {
-        let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
-
-        let mut registry = ToolRegistry::new();
-        for t in tools_to_register {
-            registry.register(t);
-        }
-        let tools = Arc::new(RwLock::new(registry));
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
-        let session_manager =
-            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
-        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
-            "test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ))
-        .unwrap();
-
-        let session = StreamSession {
+    ) -> StreamSession {
+        StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
@@ -2806,9 +2837,10 @@ mod rich_output_tests {
             orchestration: None,
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
-            progressive_tool_disclosure: false,
+            progressive_tool_disclosure: progressive,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
+            retained_tool_set,
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -2816,7 +2848,60 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
-        };
+        }
+    }
+
+    async fn drive_with_history(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        drive_with_model(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+        )
+        .await
+    }
+
+    async fn drive_with_model(
+        model: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
+
+        let mut registry = ToolRegistry::new();
+        for t in tools_to_register {
+            registry.register(t);
+        }
+        let tools = Arc::new(RwLock::new(registry));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+
+        let session = harness_session(
+            base_url,
+            tools,
+            tx,
+            session_manager,
+            hook_bus,
+            tool_session_id,
+            Default::default(),
+            false,
+            model,
+        );
 
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -2852,6 +2937,238 @@ mod rich_output_tests {
             bodies,
             rejected,
         }
+    }
+
+    /// A deferred (non-core) tool: under progressive disclosure it is callable
+    /// only after an exact `activate_tools` grant.
+    struct DeferredProbe;
+    #[async_trait::async_trait]
+    impl Tool for DeferredProbe {
+        fn name(&self) -> &str {
+            "deferred_probe"
+        }
+        fn description(&self) -> &str {
+            "probe for session-scoped activation"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok("probe-ok".to_string())
+        }
+    }
+
+    /// Like `sse_tool_use_round`, but each tool use carries a real JSON
+    /// input: `(id, name, input_json)`.
+    fn sse_tool_use_round_with_input(tool_uses: &[(&str, &str, &str)]) -> String {
+        let mut s = String::from("data: ");
+        s.push_str(&json!({"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}).to_string());
+        s.push_str("\n\n");
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            for ev in [
+                json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":name}}),
+                json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":input}}),
+                json!({"type":"content_block_stop","index":i}),
+            ] {
+                s.push_str("data: ");
+                s.push_str(&ev.to_string());
+                s.push_str("\n\n");
+            }
+        }
+        s.push_str("data: ");
+        s.push_str(&json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}).to_string());
+        s.push_str("\n\ndata: {\"type\":\"message_stop\"}\n\n");
+        s
+    }
+
+    /// One stream turn on a SHARED registry, tool session and retained set —
+    /// what consecutive turns of one `Runtime` see.
+    async fn drive_turn(
+        tools: Arc<RwLock<ToolRegistry>>,
+        tool_uses: &[(&str, &str, &str)],
+        tool_session_id: crate::tools::activation::SessionId,
+        retained: crate::tools::activation::RetainedSessionToolSet,
+        progressive: bool,
+    ) -> Driven {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(tool_uses)).await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let session = harness_session(
+            base_url,
+            tools,
+            tx,
+            session_manager,
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            tool_session_id,
+            retained,
+            progressive,
+            "claude-sonnet-4-6",
+        );
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish");
+        let mut history = Vec::new();
+        let mut ui_results = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        Driven {
+            history,
+            ui_results,
+            bodies,
+            rejected: run.is_err(),
+        }
+    }
+
+    fn probe_registry() -> Arc<RwLock<ToolRegistry>> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DeferredProbe));
+        Arc::new(RwLock::new(registry))
+    }
+
+    fn fresh_tool_session() -> crate::tools::activation::SessionId {
+        crate::tools::activation::SessionId::parse(&format!(
+            "test-carry-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap()
+    }
+
+    const ACTIVATE_PROBE: &str = r#"{"tools":["builtin:deferred_probe"]}"#;
+
+    /// Regression: exact activations are SESSION-scoped (the `activate_tools`
+    /// contract). Before the fix every turn minted a fresh zero-activation
+    /// set, so a tool activated in turn 1 was denied in turn 2 with
+    /// "tool is not activated for this session".
+    #[tokio::test]
+    async fn exact_activation_survives_into_the_next_turn() {
+        let tools = probe_registry();
+        let sid = fresh_tool_session();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+
+        let t1 = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            sid.clone(),
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+        assert!(!t1.rejected, "turn 1 must run");
+        assert!(
+            t1.ui_results
+                .iter()
+                .any(|r| r.contains("builtin:deferred_probe")),
+            "turn 1 activates the probe: {:?}",
+            t1.ui_results
+        );
+
+        let t2 = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            sid,
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+        assert!(
+            t2.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "turn 2 may call the tool activated in turn 1: {:?}",
+            t2.ui_results
+        );
+        assert!(
+            !t2.ui_results.iter().any(|r| r.contains("not activated")),
+            "no denial in turn 2: {:?}",
+            t2.ui_results
+        );
+    }
+
+    /// Grants never cross tool sessions: a different runtime session with its
+    /// own (empty) retained slot is still denied.
+    #[tokio::test]
+    async fn activation_does_not_leak_into_another_tool_session() {
+        let tools = probe_registry();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+
+        let other = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Default::default(),
+            true,
+        )
+        .await;
+        assert!(
+            !other.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "another tool session must not inherit the grant: {:?}",
+            other.ui_results
+        );
+    }
+
+    /// The carried activation keeps counting activation batches: the second
+    /// turn's batch reports schema_generation 2, not a fresh set's 1.
+    #[tokio::test]
+    async fn schema_generation_continues_across_turns() {
+        let tools = probe_registry();
+        let sid = fresh_tool_session();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            sid.clone(),
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+        let slot = retained.lock().unwrap();
+        let set = slot.as_ref().expect("progressive turn retains its set");
+        let set = set.read().unwrap();
+        assert_eq!(set.schema_generation(), 1);
+        assert!(set
+            .activation(&crate::tools::catalog::ToolId::builtin("deferred_probe"))
+            .is_some());
+    }
+
+    /// Flag-off (full-schema) sessions are unchanged: nothing is retained.
+    #[tokio::test]
+    async fn flag_off_retains_nothing() {
+        let tools = probe_registry();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            false,
+        )
+        .await;
+        assert!(retained.lock().unwrap().is_none());
     }
 
     /// The user message carrying tool results, from the round-2 request body.
@@ -3427,6 +3744,7 @@ mod rich_output_tests {
             progressive_tool_disclosure: false,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
+            retained_tool_set: Default::default(),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,

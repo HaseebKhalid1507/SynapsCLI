@@ -268,3 +268,53 @@ fn kill_switch_restores_zero_inherit_rebuild() {
     let err = ExecutionGate::authorize(&catalog, &old, resolved(&a)).expect_err("zero-inherit");
     assert_eq!(err, ToolAuthorizationError::NotActivated(a));
 }
+
+// ── carry_activations_into: turn-start reconciliation of a RETAINED set ─────
+// (runtime/stream.rs `retain_session_tool_set`). A new turn re-derives the core
+// from the current surface and carries the session's exact activations into it
+// with the same checks as the round-top rebuild.
+
+#[test]
+fn turn_start_carry_keeps_activations_and_the_batch_counter() {
+    let (catalog, set, core, a, b) = fixture();
+    // A fresh core for the SAME session, same catalog: what the next turn
+    // builds before reconciling (it has zero activations of its own).
+    let fresh = SessionToolSet::new(set.session().clone(), vec![core], &catalog).unwrap();
+    assert_eq!(fresh.activated().count(), 0);
+
+    let (next, dropped) = set.carry_activations_into(fresh, &catalog);
+    assert!(dropped.is_empty());
+    assert!(next.activation(&a).is_some());
+    assert!(next.activation(&b).is_some());
+    assert_eq!(
+        next.schema_generation(),
+        set.schema_generation(),
+        "carrying is not an activation batch — the counter continues"
+    );
+    ExecutionGate::authorize(&catalog, &next, resolved(&a)).expect("carried grant authorizes");
+}
+
+#[test]
+fn turn_start_carry_re_derives_the_core_from_the_new_surface() {
+    let (catalog, set, _core, a, _b) = fixture();
+    // The new turn's surface promotes `alpha` to core (e.g. context tools
+    // toggled on): it is not duplicated as an activation, `beta` still carries.
+    let fresh = SessionToolSet::new(set.session().clone(), vec![a.clone()], &catalog).unwrap();
+    let (next, dropped) = set.carry_activations_into(fresh, &catalog);
+    assert!(dropped.is_empty());
+    assert!(next.is_core(&a));
+    assert!(next.activation(&a).is_none());
+    assert_eq!(next.activated().count(), 1);
+}
+
+#[test]
+fn turn_start_carry_never_crosses_sessions() {
+    let (catalog, set, core, a, _b) = fixture();
+    let other = SessionToolSet::new(session("s-other"), vec![core], &catalog).unwrap();
+    let (next, dropped) = set.carry_activations_into(other, &catalog);
+    assert!(dropped.is_empty());
+    assert_eq!(next.session(), &session("s-other"));
+    assert_eq!(next.activated().count(), 0, "grants never cross sessions");
+    let err = ExecutionGate::authorize(&catalog, &next, resolved(&a)).expect_err("other session");
+    assert_eq!(err, ToolAuthorizationError::NotActivated(a));
+}
