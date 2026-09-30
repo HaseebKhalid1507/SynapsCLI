@@ -275,10 +275,11 @@ C: bye | socket close = Detach (turn keeps running)
   draft of a turn that actually concluded (history already ends with the model's final reply or an
   interruption marker) is just removed; a stale one (its round already committed) contributes no text.
   Recovery only ever appends, so the cached prefix is untouched. rpc and `synaps server` save every
-  round but keep no draft and never recover one; they DO take the session lock
-  (`setup::lock_session`): continuing a session another process has live (a TUI, the daemon,
-  another rpc) is refused with the holder named, instead of running a second writer on the same
-  history. Legacy chat takes no lock. Deleting a session (and retention) removes its draft.
+  round but keep no draft; they DO take the session lock (`setup::lock_session`): continuing a
+  session another process has live (a TUI, the daemon, another rpc), or one already compacted into a
+  successor, is refused with the reason named, instead of running a second writer on the same
+  history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
+  lock. Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
