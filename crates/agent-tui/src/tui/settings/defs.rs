@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_glow_setting_is_an_appearance_cycler_defaulting_on() {
+    fn streaming_glow_setting_is_an_appearance_cycler() {
         let def = ALL_SETTINGS
             .iter()
             .find(|d| d.key == "tui_streaming_glow")
