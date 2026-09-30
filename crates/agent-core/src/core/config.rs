@@ -875,6 +875,8 @@ pub struct SynapsConfig {
     pub theme_transition: ThemeTransitionMode,
     /// Whether the TUI paints its own opaque background. `false` preserves the terminal background.
     pub tui_background_opaque: bool,
+    /// Whether the prompt shows a glow sweeping across it while a turn streams. Default on.
+    pub tui_streaming_glow: bool,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
@@ -944,6 +946,7 @@ impl Default for SynapsConfig {
             theme: None,
             theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
+            tui_streaming_glow: true,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -998,6 +1001,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "theme",
     "theme_transition",
     "tui_background_opaque",
+    "tui_streaming_glow",
     "agent_name",
     "identity",
     "disabled_plugins",
@@ -1422,6 +1426,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     } else {
                         "invisible"
                     }
+                )),
+            },
+            "tui_streaming_glow" => match val {
+                "true" | "1" | "on" | "yes" => config.tui_streaming_glow = true,
+                "false" | "0" | "off" | "no" => config.tui_streaming_glow = false,
+                _ => config.warnings.push(format!(
+                    "tui_streaming_glow = {val} — expected on or off; using on"
                 )),
             },
             "agent_name" => config.agent_name = Some(val.to_string()),
@@ -2137,6 +2148,19 @@ mod tests {
             assess_context(&config.context_management, &state, budget).action,
             ContextAction::Rollover
         );
+    }
+
+    #[test]
+    fn tui_streaming_glow_defaults_on_and_parses() {
+        assert!(super::load_config_from_str("").tui_streaming_glow);
+        assert!(super::load_config_from_str("tui_streaming_glow = on\n").tui_streaming_glow);
+        assert!(!super::load_config_from_str("tui_streaming_glow = off\n").tui_streaming_glow);
+        let invalid = super::load_config_from_str("tui_streaming_glow = sparkly\n");
+        assert!(invalid.tui_streaming_glow, "invalid keeps the default (on)");
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|w| w.contains("tui_streaming_glow")));
     }
 
     #[test]
@@ -2913,13 +2937,22 @@ context_window = 200k\n\
     }
 
     fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        // `base_dir()` reads SYNAPS_BASE_DIR before HOME: pin it too, or a value
+        // another test left set redirects the write away from `home`.
         let original = std::env::var("HOME").ok();
+        let original_base = std::env::var("SYNAPS_BASE_DIR").ok();
         std::env::set_var("HOME", home);
+        std::env::set_var("SYNAPS_BASE_DIR", home.join(".synaps-cli"));
         f();
         if let Some(h) = original {
             std::env::set_var("HOME", h);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(b) = original_base {
+            std::env::set_var("SYNAPS_BASE_DIR", b);
+        } else {
+            std::env::remove_var("SYNAPS_BASE_DIR");
         }
     }
 

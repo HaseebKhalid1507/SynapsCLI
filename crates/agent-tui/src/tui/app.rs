@@ -334,6 +334,9 @@ pub(crate) struct App {
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
+    /// Neon-prompt timing: input/stream events → per-frame animation
+    /// snapshot. Its `animating()` is one of the tick guard's terms.
+    pub(crate) prompt_clock: super::neon_prompt::PromptClock,
 
     /// Snapshot of `(transcript.messages().len(), last_msg)` captured on
     /// `ResponseStart`. `ResponseReset` rolls the transcript preview back
@@ -471,6 +474,7 @@ impl App {
             theme_transition: None,
             keybinds: None,
             response_preview: None,
+            prompt_clock: super::neon_prompt::PromptClock::new(clock.now()),
             clock,
         }
     }

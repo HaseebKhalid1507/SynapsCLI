@@ -2782,6 +2782,7 @@ mod rich_output_tests {
         tool_session_id: crate::tools::activation::SessionId,
         retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
         progressive: bool,
+        model: &str,
     ) -> StreamSession {
         StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
@@ -2806,7 +2807,7 @@ mod rich_output_tests {
             },
             api_retries: 0,
             refusal_retries: 0,
-            model: "claude-sonnet-4-6".into(),
+            model: model.into(),
             tools,
             system_prompt: None,
             thinking_budget: 0,
@@ -2856,6 +2857,23 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
+        drive_with_model(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+        )
+        .await
+    }
+
+    async fn drive_with_model(
+        model: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
         let mut registry = ToolRegistry::new();
@@ -2882,6 +2900,7 @@ mod rich_output_tests {
             tool_session_id,
             Default::default(),
             false,
+            model,
         );
 
         let run = tokio::time::timeout(
@@ -2990,6 +3009,7 @@ mod rich_output_tests {
             tool_session_id,
             retained,
             progressive,
+            "claude-sonnet-4-6",
         );
         let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
         let run = tokio::time::timeout(
@@ -3197,6 +3217,124 @@ mod rich_output_tests {
             .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
             .expect("history tool_result");
         assert!(hist_msg["content"][0]["content"].is_array());
+    }
+
+    /// Drives the REAL built-in `read` tool against a fixed on-disk file
+    /// (the mock provider always sends `{}` as tool input).
+    struct ReadFixedPath(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for ReadFixedPath {
+        fn name(&self) -> &str {
+            "read_fixed"
+        }
+        fn description(&self) -> &str {
+            "reads a fixed file through the built-in read tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+            self.execute_rich(params, ctx)
+                .await
+                .map(ToolOutput::into_summary)
+        }
+        async fn execute_rich(&self, _params: Value, ctx: ToolContext) -> Result<ToolOutput> {
+            crate::tools::ReadTool
+                .execute_rich(json!({"path": self.0.to_string_lossy()}), ctx)
+                .await
+        }
+    }
+
+    /// A real, decodable 1x1 PNG (IHDR + IDAT + IEND).
+    const REAL_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=";
+
+    fn real_png_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(REAL_PNG_B64)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    /// Regression: on Opus 5.5 the built-in `read` of a PNG used to come back
+    /// as "Attachment not sent: Selected model lacks exact image input
+    /// capability metadata" because the model was not an exact known native
+    /// Anthropic model. The image must now reach the provider as a
+    /// `tool_result` image block, with the bare native model id on the wire.
+    #[tokio::test]
+    async fn opus_5_5_real_read_tool_image_reaches_the_wire() {
+        let (_dir, path) = real_png_file();
+        let initial = vec![Arc::new(json!({"role":"user","content":"look"})) as SharedMessage];
+        let d = drive_with_model(
+            "anthropic/claude-opus-5-5",
+            initial,
+            vec![Arc::new(ReadFixedPath(path.clone()))],
+            &[("toolu_read", "read_fixed")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert!(!d.rejected);
+        assert_eq!(
+            d.bodies[1]["model"], "claude-opus-5-5",
+            "bare native id on the wire"
+        );
+
+        let tr = &tool_result_message(&d.bodies[1])["content"][0];
+        assert_eq!(tr["tool_use_id"], "toolu_read");
+        assert!(tr.get("is_error").is_none(), "{tr}");
+        let blocks = tr["content"]
+            .as_array()
+            .expect("rich array content, not an error string");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("Image: {} (1x1, image/png", path.display())));
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], REAL_PNG_B64);
+        assert!(!d
+            .ui_results
+            .iter()
+            .any(|r| r.contains("Attachment not sent")));
+    }
+
+    /// Negative control for the test above: the same real read on a
+    /// non-exact Opus id is still refused in-slot (the gate is live, and no
+    /// image bytes reach the provider).
+    #[tokio::test]
+    async fn unobserved_anthropic_id_real_read_image_stays_fail_closed() {
+        let (_dir, path) = real_png_file();
+        let initial = vec![Arc::new(json!({"role":"user","content":"look"})) as SharedMessage];
+        let d = drive_with_model(
+            "anthropic/claude-opus-5-5-unobserved",
+            initial,
+            vec![Arc::new(ReadFixedPath(path))],
+            &[("toolu_read", "read_fixed")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let tr = &tool_result_message(&d.bodies[1])["content"][0];
+        let text = tr["content"].as_str().expect("plain-text refusal");
+        assert!(
+            text.starts_with("Attachment not sent: Selected model lacks exact image input"),
+            "{text}"
+        );
+        assert!(!serde_json::to_string(&d.bodies[1])
+            .unwrap()
+            .contains(REAL_PNG_B64));
     }
 
     #[tokio::test]

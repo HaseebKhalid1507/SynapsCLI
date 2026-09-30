@@ -49,6 +49,12 @@ static TRANSITION_DEFAULT_MS: LazyLock<AtomicU64> = LazyLock::new(|| {
     )
 });
 
+/// Whether theme changes currently animate (the live `theme_transition`
+/// knob: anything but off / 0 ms).
+pub(crate) fn transition_enabled() -> bool {
+    TRANSITION_DEFAULT_MS.load(Ordering::Relaxed) > 0
+}
+
 /// Live-apply a new `theme_transition` mode (settings modal hot path).
 pub(crate) fn set_transition_mode(mode: ThemeTransitionMode) {
     TRANSITION_DEFAULT_MS.store(mode.duration_ms(), Ordering::Relaxed);

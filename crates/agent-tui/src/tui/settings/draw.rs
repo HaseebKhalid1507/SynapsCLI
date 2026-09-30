@@ -737,6 +737,7 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "on".to_string()),
         "startup.quick_start" => bool_config_display("startup.quick_start", true),
+        "tui_streaming_glow" => bool_config_display("tui_streaming_glow", true),
         "startup.extensions_ready_timeout_secs" => {
             u64_config_display("startup.extensions_ready_timeout_secs", 30)
         }
