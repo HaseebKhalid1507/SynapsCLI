@@ -568,11 +568,9 @@ impl SessionActor {
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
         // Crash recovery (the last process died mid-turn): only the lock
-        // holder may persist the recovered history and remove the draft.
-        if let Some(recovered) = sb.turn_draft {
-            if cfg.persist && session_lock.is_some() {
-                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
-            }
+        // holder may fold the turn draft in, persist it and remove it.
+        if sb.continued && cfg.persist && session_lock.is_some() {
+            crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
 
         let view = RuntimeView::from_runtime(&runtime).await;
@@ -1578,21 +1576,31 @@ impl SessionActor {
         }
     }
 
-    /// F10: release the old lock, acquire on `new_id`. Best-effort (log on failure).
+    /// F10: the session lock follows the conversation to `new_id` (a fresh
+    /// id from NewSession or compaction). Best-effort: on failure the old
+    /// lock is still released (the conversation left it) and the failure
+    /// logged. The new lock is taken BEFORE the old one is dropped.
     pub(crate) fn reacquire_session_lock(&mut self, new_id: &str) {
-        // Drop old lock first — release the flock.
-        self.session_lock = None;
+        match Self::try_lock_session(new_id) {
+            Ok(lock) => self.session_lock = Some(lock),
+            Err(e) => {
+                tracing::warn!(session = %new_id, "reacquire session lock: {e}");
+                self.session_lock = None;
+            }
+        }
+    }
+
+    /// Try to take the journal lock on `id` for this daemon process.
+    pub(crate) fn try_lock_session(
+        id: &str,
+    ) -> std::result::Result<agent_core::session_lock::SessionLock, agent_core::session_lock::SessionLockError>
+    {
         let dir = agent_core::session_lock::sessions_dir();
         let holder = agent_core::session_lock::LockHolder {
             pid: std::process::id(),
             kind: "daemon".to_string(),
         };
-        match agent_core::session_lock::SessionLock::try_acquire(&dir, new_id, holder) {
-            Ok(lock) => self.session_lock = Some(lock),
-            Err(e) => {
-                tracing::warn!(session = %new_id, "reacquire session lock: {e}");
-            }
-        }
+        agent_core::session_lock::SessionLock::try_acquire(&dir, id, holder)
     }
 
     /// F18: a session with NO history can never park (nothing to journal),
@@ -1878,16 +1886,13 @@ impl SessionActor {
                 )))
             }
         };
-        let turn_draft = sb.turn_draft;
         let mut conv = ConversationState::from_resumed(sb.session);
         conv.api_messages = sb.api_messages;
         conv.total_input_tokens = sb.total_input_tokens;
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
-        if let Some(recovered) = turn_draft {
-            if self.config.persist && self.session_lock.is_some() {
-                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
-            }
+        if journal_present && self.config.persist && self.session_lock.is_some() {
+            crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
@@ -2019,9 +2024,11 @@ impl SessionActor {
     // ── in-flight turn draft (crash recovery) ──────────────────────────
 
     /// Turn start: the draft's existence is the "turn open" signal a
-    /// loader uses to detect a process that died mid-turn.
+    /// loader uses to detect a process that died mid-turn. Only the session
+    /// lock holder writes one: without the lock another process may own
+    /// this session, and a draft is a claim that a turn is running HERE.
     fn open_turn_draft(&mut self) {
-        if !self.config.persist || !self.conv.is_live() {
+        if !self.config.persist || !self.conv.is_live() || self.session_lock.is_none() {
             return;
         }
         self.turn_draft = TurnDraftState {

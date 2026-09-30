@@ -34,6 +34,11 @@ use serde::{Deserialize, Serialize};
 /// model's max output tokens; this only guards pathological streams).
 pub const TURN_DRAFT_MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+/// Upper bound on a draft file read at load: the capped text JSON-escaped
+/// in the worst case (`\u00XX` = 6 bytes per input byte) plus framing. A
+/// larger file was not written by Synaps and is rejected unread.
+pub const TURN_DRAFT_MAX_FILE_BYTES: u64 = 6 * TURN_DRAFT_MAX_TEXT_BYTES as u64 + 4096;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnDraft {
     /// Messages in the saved history the in-flight response continues from.
@@ -47,11 +52,19 @@ fn artifact(id: &str) -> String {
     format!("{id}.turn")
 }
 
-/// Read the draft for `id`. `Ok(None)` when absent (the normal case).
+/// Read the draft for `id`. `Ok(None)` when absent (the normal case); an
+/// `InvalidData` error for an oversized (`TURN_DRAFT_MAX_FILE_BYTES`) or
+/// malformed file.
 pub fn read_turn_draft(dir: &Path, id: &str) -> std::io::Result<Option<TurnDraft>> {
     let Some(bytes) = read_artifact(dir, &artifact(id))? else {
         return Ok(None);
     };
+    if bytes.len() as u64 > TURN_DRAFT_MAX_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "turn draft exceeds its size limit",
+        ));
+    }
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -158,13 +171,15 @@ fn read_artifact(dir: &Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut file = match handle.open_file(&[name.to_string()]) {
+    let file = match handle.open_file(&[name.to_string()]) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    // Read at most one byte past the limit: enough to reject, never more.
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.take(TURN_DRAFT_MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     Ok(Some(bytes))
 }
 
@@ -190,7 +205,14 @@ fn read_artifact(dir: &Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
             "refusing symlinked session artifact {name:?}"
         ))),
         Err(e) => Err(e),
-        Ok(_) => std::fs::read(&path).map(Some),
+        Ok(_) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take(TURN_DRAFT_MAX_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        }
     }
 }
 
@@ -266,6 +288,24 @@ mod tests {
         write_turn_draft(&dir, "s1", &draft(0, "")).unwrap();
         std::fs::write(dir.join("s1.turn"), b"{not json").unwrap();
         assert!(read_turn_draft(&dir, "s1").is_err());
+    }
+
+    /// The largest draft Synaps can write reads back; anything bigger is
+    /// rejected without reading it whole.
+    #[test]
+    fn draft_reads_are_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        // Worst-case escaping: every byte a control character.
+        let worst = "\u{1}".repeat(TURN_DRAFT_MAX_TEXT_BYTES);
+        write_turn_draft(&dir, "s1", &draft(0, &worst)).unwrap();
+        assert!(std::fs::metadata(dir.join("s1.turn")).unwrap().len() <= TURN_DRAFT_MAX_FILE_BYTES);
+        assert_eq!(read_turn_draft(&dir, "s1").unwrap().unwrap().partial_text, worst);
+
+        let huge = vec![b' '; TURN_DRAFT_MAX_FILE_BYTES as usize + 1];
+        std::fs::write(dir.join("s2.turn"), huge).unwrap();
+        let err = read_turn_draft(&dir, "s2").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     async fn settle<F: Fn() -> bool>(cond: F) {

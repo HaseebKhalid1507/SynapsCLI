@@ -972,14 +972,16 @@ fn journal_meta_tail_from_handle(
 
 // ─── deletion ────────────────────────────────────────────────────────────────
 
-/// Remove a session's snapshot AND journal (compaction rollback, retention).
-/// Idempotent — missing files are not errors.
+/// Remove a session's snapshot, journal AND turn draft (`session_draft`)
+/// (compaction rollback, retention). Idempotent — missing files are not
+/// errors.
 pub fn delete_session_files_in_dir(dir: &Path, id: &str) -> std::io::Result<()> {
     let Some(handle) = open_sessions_dir(dir)? else {
         return Ok(()); // no directory — idempotently nothing to delete
     };
     remove_artifact_if_exists(&handle, &format!("{id}.json"))?;
-    remove_artifact_if_exists(&handle, &format!("{id}.journal"))
+    remove_artifact_if_exists(&handle, &format!("{id}.journal"))?;
+    remove_artifact_if_exists(&handle, &format!("{id}.turn"))
 }
 
 fn remove_artifact_if_exists(handle: &SessionsDirHandle, name: &str) -> std::io::Result<()> {
