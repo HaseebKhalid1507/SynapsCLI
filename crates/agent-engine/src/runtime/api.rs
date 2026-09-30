@@ -3966,7 +3966,11 @@ mod on401_tests {
     // RED: before C1 guard is restored this MUST fail (no retry → error).
     // GREEN: with C1 guard it retries once with the new token and succeeds.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn on401_remote_retries_once_and_succeeds() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let broker_url = spawn_mock_broker("sk-fresh-token").await;
         let (anthropic_url, counter) = spawn_mock_anthropic(1).await; // 1 × 401, then SSE
 
@@ -4008,7 +4012,11 @@ mod on401_tests {
     // Guard fires once: 2nd 401 must surface as a terminal error.
     // Anthropic endpoint must be called exactly 2 times total (no loop).
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn on401_remote_persistent_401_is_terminal_not_loop() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let broker_url = spawn_mock_broker("sk-fresh-but-useless").await;
         // All calls → 401 (fail_count=999 is effectively "always")
         let (anthropic_url, counter) = spawn_mock_anthropic(999).await;

@@ -400,7 +400,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn remote_source_fetches_and_populates_auth_state() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let url = spawn_broker(r#"{"access_token":"sk-broker-xyz","expires":9999999999999}"#).await;
         let source = CredentialSource::Remote {
             endpoint: url,
@@ -429,7 +433,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn remote_source_fast_path_when_token_still_fresh() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let url = spawn_broker(r#"{"access_token":"sk-1","expires":9999999999999}"#).await;
         let source = CredentialSource::Remote {
             endpoint: url,
@@ -463,7 +471,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn remote_fast_path_refetches_a_token_inside_the_margin() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         // AuthState holds a token that is valid but within the 5-min refetch
         // margin. The fast path must NOT serve it — it must refetch (board #1).
         let url = spawn_broker(r#"{"access_token":"sk-FRESH","expires":9999999999999}"#).await;
@@ -529,7 +541,11 @@ mod tests {
     /// the same broker: the fast path must not serve it — refetch for the
     /// selected account (config/source switch never keeps the old account).
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn switched_account_binding_is_never_served_from_the_fast_path() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let url = spawn_broker(r#"{"access_token":"sk-SELECTED","expires":9999999999999}"#).await;
         let source = CredentialSource::Remote {
             endpoint: url.clone(),
@@ -574,7 +590,11 @@ mod tests {
 
     /// Same broker, same account, fresh token: served without a refetch.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn matching_binding_serves_cached_token() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let url = spawn_broker(r#"{"access_token":"sk-REFETCHED","expires":9999999999999}"#).await;
         let source = CredentialSource::Remote {
             endpoint: url.clone(),
@@ -608,7 +628,11 @@ mod tests {
     /// account-aware refresh existed) is treated as unknown: refetch once, then
     /// bound.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn unbound_fresh_token_is_rebound_through_the_broker() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let url = spawn_broker(r#"{"access_token":"sk-BOUND","expires":9999999999999}"#).await;
         let source = CredentialSource::Remote {
             endpoint: url.clone(),
