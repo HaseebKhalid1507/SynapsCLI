@@ -356,6 +356,10 @@ pub(crate) struct SubagentState {
     pub(crate) duration_secs: Option<f64>,
     /// Stamped when this entry transitions to done — drives the 5s flash expiry.
     pub(crate) done_at: Option<std::time::Instant>,
+    /// Tool calls so far (the engine's "(tool #N)" updates).
+    pub(crate) tools: u32,
+    /// First line of the result once done (the tray's done/failed text).
+    pub(crate) result: Option<String>,
 }
 
 impl App {
@@ -1266,6 +1270,8 @@ mod tests {
             done: false,
             duration_secs: None,
             done_at: None,
+            tools: 0,
+            result: None,
         });
         app.spinner_frame = 2;
 
