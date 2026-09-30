@@ -95,7 +95,7 @@ fn rgb(c: Color, fallback: Color) -> Rgb {
 
 // ───────────────────────────── settings ────────────────────────────────────
 
-/// Settings → Appearance → "Streaming glow" (`tui_streaming_glow`, off by
+/// Settings → Appearance → "Streaming glow" (`tui_streaming_glow`, on by
 /// default): whether a glow sweeps across the prompt while a turn streams.
 static STREAMING_GLOW: LazyLock<AtomicBool> =
     LazyLock::new(|| AtomicBool::new(synaps_cli::config::load_config().tui_streaming_glow));

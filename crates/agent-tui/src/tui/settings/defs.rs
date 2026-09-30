@@ -167,7 +167,7 @@ define_settings! {
             SettingApply::Local(Ok(()))
         };
 
-    "tui_streaming_glow", "Streaming glow", Appearance, EditorKind::Cycler(&["off", "on"]),
+    "tui_streaming_glow", "Streaming glow", Appearance, EditorKind::Cycler(&["on", "off"]),
         "A soft glow in the context bar's colour sweeps across the prompt while a reply streams.",
         |_app, value| {
             match value {
@@ -265,14 +265,14 @@ mod tests {
     }
 
     #[test]
-    fn streaming_glow_setting_is_an_appearance_cycler_defaulting_off() {
+    fn streaming_glow_setting_is_an_appearance_cycler_defaulting_on() {
         let def = ALL_SETTINGS
             .iter()
             .find(|d| d.key == "tui_streaming_glow")
             .expect("tui_streaming_glow setting should be defined");
         assert_eq!(def.category, Category::Appearance);
         match def.editor {
-            EditorKind::Cycler(opts) => assert_eq!(opts, &["off", "on"]),
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
             _ => panic!("tui_streaming_glow editor should be a Cycler"),
         }
     }

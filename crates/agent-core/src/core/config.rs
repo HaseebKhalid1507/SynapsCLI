@@ -875,7 +875,7 @@ pub struct SynapsConfig {
     pub theme_transition: ThemeTransitionMode,
     /// Whether the TUI paints its own opaque background. `false` preserves the terminal background.
     pub tui_background_opaque: bool,
-    /// Whether the prompt shows a glow sweeping across it while a turn streams. Default off.
+    /// Whether the prompt shows a glow sweeping across it while a turn streams. Default on.
     pub tui_streaming_glow: bool,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
@@ -946,7 +946,7 @@ impl Default for SynapsConfig {
             theme: None,
             theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
-            tui_streaming_glow: false,
+            tui_streaming_glow: true,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -1432,7 +1432,7 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 "true" | "1" | "on" | "yes" => config.tui_streaming_glow = true,
                 "false" | "0" | "off" | "no" => config.tui_streaming_glow = false,
                 _ => config.warnings.push(format!(
-                    "tui_streaming_glow = {val} — expected on or off; using off"
+                    "tui_streaming_glow = {val} — expected on or off; using on"
                 )),
             },
             "agent_name" => config.agent_name = Some(val.to_string()),
@@ -2151,12 +2151,12 @@ mod tests {
     }
 
     #[test]
-    fn tui_streaming_glow_defaults_off_and_parses() {
-        assert!(!super::load_config_from_str("").tui_streaming_glow);
+    fn tui_streaming_glow_defaults_on_and_parses() {
+        assert!(super::load_config_from_str("").tui_streaming_glow);
         assert!(super::load_config_from_str("tui_streaming_glow = on\n").tui_streaming_glow);
         assert!(!super::load_config_from_str("tui_streaming_glow = off\n").tui_streaming_glow);
         let invalid = super::load_config_from_str("tui_streaming_glow = sparkly\n");
-        assert!(!invalid.tui_streaming_glow);
+        assert!(invalid.tui_streaming_glow, "invalid keeps the default (on)");
         assert!(invalid
             .warnings
             .iter()
