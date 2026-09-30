@@ -377,14 +377,10 @@ async fn run_inline(
                     continue;
                 }
 
-                // ── Regular user message ──
-                let message = if let Some(ctx) = conv.abort_context.take() {
-                    format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", trimmed, ctx)
-                } else {
-                    trimmed.to_string()
-                };
+                // ── Regular user message ── (an interrupted turn is already
+                // in history as partial messages + marker; never folded here)
                 conv.api_messages.push(std::sync::Arc::new(
-                    json!({"role": "user", "content": message}),
+                    json!({"role": "user", "content": trimmed}),
                 ));
             }
         }
@@ -796,7 +792,7 @@ mod actor {
                 SessionEventWire::Aborted { context_saved } => eprintln!(
                     "\x1b[2m{}\x1b[0m",
                     if context_saved {
-                        "aborted — context saved for next message"
+                        "aborted — partial work kept"
                     } else {
                         "aborted"
                     }
@@ -1226,7 +1222,7 @@ mod actor {
                         }
                         "help" => {
                             eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
-                            eprintln!("quitting (or EOF) mid-turn cancels the turn and saves an abort context for the next --continue");
+                            eprintln!("quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue");
                         }
                         _ => eprintln!("unknown command: /{} (try /help)", cmd),
                     },

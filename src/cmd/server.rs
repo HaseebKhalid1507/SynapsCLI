@@ -32,7 +32,7 @@ struct ServerState {
     allowed_origins: Vec<String>,
     /// Engine-level conversation state — single source of truth for
     /// session, api_messages, token counters (including cache_read /
-    /// cache_creation), cost, abort_context, queued_message,
+    /// cache_creation), cost, queued_message,
     /// pending_events. Replaces 5 separate RwLocks that diverged from
     /// engine pricing and silently dropped cache tokens.
     conv: RwLock<ConversationState>,
@@ -782,6 +782,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         let mut turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
+        let cancel_check = cancel.clone();
 
         let mut stream = {
             let rt = state.runtime.lock().await;
@@ -830,6 +831,19 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
             if let Some(msg) = engine_event_to_server_message(engine_event) {
                 let _ = broadcast.send(msg);
+            }
+
+            // `ClientMessage::Cancel`: whatever terminal the cancelled stream
+            // produced, the turn ends here — marked, saved, and never
+            // continued into a queued auto-send or an auto-triggered turn.
+            if cancel_check.is_cancelled() && !matches!(completion, StreamCompletion::Continue) {
+                if let StreamCompletion::AutoSendQueued(ref queued) = completion {
+                    let _ = broadcast.send(ServerMessage::System {
+                        message: format!("dequeued: {queued}"),
+                    });
+                }
+                finish_cancelled_turn(state).await;
+                break 'turn;
             }
 
             match completion {
@@ -896,6 +910,10 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         // Stream ended without an explicit completion (network drop or
         // similar). Save and exit — don't loop forever waiting for events
         // that won't come.
+        if cancel_check.is_cancelled() {
+            finish_cancelled_turn(state).await;
+            break 'turn;
+        }
         state.save_session().await;
         break 'turn;
     }
@@ -1187,6 +1205,7 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
         let mut turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
+        let cancel_check = cancel.clone();
 
         let mut stream = {
             let rt = state.runtime.lock().await;
@@ -1231,6 +1250,19 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
 
             if let Some(msg) = engine_event_to_server_message(engine_event) {
                 let _ = broadcast.send(msg);
+            }
+
+            // `ClientMessage::Cancel`: whatever terminal the cancelled stream
+            // produced, the turn ends here — marked, saved, and never
+            // continued into a queued auto-send or an auto-triggered turn.
+            if cancel_check.is_cancelled() && !matches!(completion, StreamCompletion::Continue) {
+                if let StreamCompletion::AutoSendQueued(ref queued) = completion {
+                    let _ = broadcast.send(ServerMessage::System {
+                        message: format!("dequeued: {queued}"),
+                    });
+                }
+                finish_cancelled_turn(state).await;
+                break 'turn;
             }
 
             match completion {
@@ -1284,11 +1316,31 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
             }
         }
 
+        if cancel_check.is_cancelled() {
+            finish_cancelled_turn(state).await;
+            break 'turn;
+        }
         state.save_session().await;
         break 'turn;
     }
 
     *state.cancel_token.write().await = None;
+}
+
+/// A turn ended by `ClientMessage::Cancel`. `process_stream_event` already
+/// adopted the engine's cancel-path history (partial assistant message,
+/// completed tool rounds, canceled results); append the interruption marker
+/// after it — append-only, so the provider's cached prefix is untouched —
+/// and save.
+async fn finish_cancelled_turn(state: &Arc<ServerState>) {
+    {
+        let mut conv = state.conv.write().await;
+        agent_engine::engine::interrupt::append_marker(
+            &mut conv.api_messages,
+            agent_engine::engine::interrupt::InterruptReason::User,
+        );
+    }
+    state.save_session().await;
 }
 
 /// Run an engine command and mirror any model/thinking change into `conv`

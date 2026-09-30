@@ -127,7 +127,7 @@ impl Client {
             SessionEventWire::Aborted { context_saved } => {
                 self.streaming = false;
                 self.quit_guard.reset();
-                self.out(if *context_saved { "[aborted — context saved for next message]\n" } else { "[aborted]\n" })
+                self.out(if *context_saved { "[aborted — partial work kept]\n" } else { "[aborted]\n" })
             }
             SessionEventWire::Cleared { session_id } => {
                 self.out(&format!("[session cleared → {}]\n", &session_id[..8.min(session_id.len())]))
