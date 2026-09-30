@@ -2,6 +2,92 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] — 2026-09-30
+
+Interrupting a turn no longer makes the model refuse your next message,
+sessions are saved while a turn runs and come back after a crash, and the
+TUI gets a round of polish.
+
+### Fixed
+
+- **Interrupting a turn made current models refuse to continue.** Esc,
+  quitting mid-turn, the cost cap and `synaps daemon reload`/`stop` folded an
+  "ABORT CONTEXT" recap of the model's own partial output into your next
+  message, and current models read that as a prompt injection. The
+  interrupted turn is now kept as real history: the partial reply, every
+  finished tool round, and a labelled partial result for a tool that was
+  cut. One short marker follows it, e.g. `[Request interrupted by user]`.
+  Nothing already sent is rewritten, so the prompt cache keeps working.
+  Sessions saved with a recap are migrated when loaded. (#182, #184)
+- Esc a moment after an answer finished no longer marks it interrupted.
+  (#184)
+- A canceled tool result says what canceled it, e.g. "Canceled (Synaps
+  restarted)"; "Canceled by user" only when it was you. (#185)
+- **Two clients on one session:** the second client now shows prompts typed
+  on the first, each reply is its own block, a notice arriving mid-reply no
+  longer splits it, and "input is owned by client #N" is shown only to the
+  client that joined. Attaching mid-turn no longer shows the finished rounds
+  twice. (#184, #185)
+- Socket clients could see a turn end mid-stream (an internal checkpoint
+  reached them as `Done`). (#184)
+- `/resume` of a session that is live elsewhere is refused instead of taking
+  it over. (#184)
+- Tools activated with `activate_tools` expired at the end of the turn; they
+  now last the whole session, as documented. (#162)
+- Several blocking subagents in one batch ran one after another; they now
+  run side by side. (#171)
+- A background subagent (`subagent_start`) showed `starting…` for its whole
+  run once the turn that started it had ended. (#180)
+- A subagent whose `agent` is a file path was labelled with the whole path,
+  and its log file could land outside the log directory. (#173)
+- An idle TUI redrew at about 60 fps forever; idle CPU is now zero. (#164)
+- Settings → Theme transition could not be turned back on. (#165)
+- `/theme` during a turn also printed "can't run while streaming". (#168)
+- Tool cards used the default theme's slate panels on every theme. (#167)
+
+### Added
+
+- **Sessions are saved while a turn runs.** The session is saved after
+  every round, in the background (a slow disk never delays the turn), and
+  the reply being streamed is kept in a small `sessions/<id>.turn` draft.
+  After a crash, `kill -9` or power loss, the next `--continue`, attach or
+  `/resume` brings the partial reply back, followed by `[Request
+  interrupted: Synaps stopped unexpectedly]`. (#183, #184)
+- **Claude Opus 5.5** as a native Anthropic model (image reads work). (#163)
+- An optional `name` for inline subagents (`subagent`, `subagent_start`),
+  shown in the tray, `subagent_status`/`subagent_collect` and the log file
+  name. (#172)
+
+### Changed
+
+- **TUI:** a neon prompt and a footer after Noodle; frameless Settings,
+  Plugins, Models and Help modals, toasts and prompts; running subagents sit
+  in a tray on the prompt; the prompt's `❯` breathes while a turn streams
+  instead of a spinner; an empty prompt shows only `❯`; event cards and
+  diffs take the theme's colours. (#166, #169, #170, #174–#178)
+- Models picker: every letter searches, ←/→ fold, Ctrl+E opens the catalog,
+  Ctrl+F toggles a favourite. (#169)
+- The streaming glow is off by default; `tui_streaming_glow = on` (or
+  Settings → Appearance) turns it back on, and a config that already says
+  `on` keeps it. (#179)
+
+### Upgrade notes
+
+- **`synaps rpc` and `synaps server` now take the session lock.**
+  `--continue` of a session that is live in another process (a TUI, the
+  daemon, another rpc) exits with an error naming the holder, instead of
+  two writers overwriting each other's history. Continuing it after the
+  other process exits works as before. (#185)
+- After upgrading, run `synaps daemon reload` with no turn running to move
+  the daemon to the new binary; clients reconnect on their own.
+
+### Internal
+
+- `save_cost_bench`: measures a session save on a real disk
+  (`SYNAPS_SAVE_BENCH_DIR`). (#184)
+- Test isolation: `follow_chain_*` tests no longer leak `SYNAPS_BASE_DIR`
+  (the `write_config_value` CI flake). (#160)
+
 ## [0.10.0] — 2026-09-27
 
 **It's Daemon Time.**
