@@ -398,8 +398,8 @@ async fn end(t: &mut LocalTransport) {
 }
 
 /// §11 #1: `Cancel` while idle is a no-op — at most an `Idle` echo. No
-/// "aborted" notice, no Conversation (= no abort_context, no save), and the
-/// next Submit carries no `[ABORT CONTEXT` prefix.
+/// "aborted" notice, no Conversation (= no interruption marker, no save),
+/// and the next Submit is appended verbatim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn cancel_while_idle_is_a_noop() {
@@ -438,11 +438,17 @@ async fn cancel_while_idle_is_a_noop() {
     assert_eq!(conv.api_messages.len(), 4);
     assert_eq!(conv.api_messages[2]["content"], "again");
     assert!(conv.abort_context.is_none());
+    assert!(
+        !conv.api_messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(agent_engine::engine::interrupt::is_interruption_marker)),
+        "an idle Cancel records no interruption"
+    );
     end(&mut a).await;
 }
 
-/// §11 #1: a `Cancel` that lands after `Done` must not scrape the finished
-/// turn into `abort_context` (turn_log is cleared with the stream).
+/// §11 #1: a `Cancel` that lands after `Done` sees `streaming=false`: it
+/// must not mark the finished turn as interrupted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn cancel_after_done_does_not_scrape_previous_turn() {
@@ -485,6 +491,7 @@ async fn cancel_after_done_does_not_scrape_previous_turn() {
     let conv = last_conversation(&seen);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
     assert_eq!(conv.api_messages[2]["content"], "second");
+    assert_eq!(conv.api_messages.len(), 4, "no marker between the turns");
     assert!(!conv.api_messages[2]["content"]
         .as_str()
         .unwrap()

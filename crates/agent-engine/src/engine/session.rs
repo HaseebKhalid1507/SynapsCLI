@@ -1,7 +1,7 @@
 //! Engine-level session management — save, load, resume, clear.
 //!
 //! Owns the conversation state that both TUI and headless modes need:
-//! messages, token counts, cost, abort context.
+//! messages, token counts, cost.
 
 use crate::pricing::calculate_cost_optional_split;
 use crate::SharedMessage;
@@ -90,7 +90,6 @@ pub struct ConversationState {
     pub total_cache_read_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub session_cost: f64,
-    pub abort_context: Option<String>,
     /// Message queued to send after current stream completes.
     pub queued_message: Option<String>,
     /// Events buffered during streaming — drained on stream completion.
@@ -109,14 +108,20 @@ impl ConversationState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             session_cost: 0.0,
-            abort_context: None,
             queued_message: None,
             pending_events: Vec::new(),
         }
     }
 
-    /// Create from a resumed session.
-    pub fn from_resumed(session: Session) -> Self {
+    /// Create from a resumed session. A session saved before interruption
+    /// markers existed (legacy `abort_context` recap) is migrated here too —
+    /// `/resume` loads sessions without going through `engine::setup` —
+    /// idempotently: an already-migrated session is untouched.
+    pub fn from_resumed(mut session: Session) -> Self {
+        crate::engine::interrupt::migrate_legacy_abort_context(
+            &mut session.api_messages,
+            &mut session.abort_context,
+        );
         Self {
             api_messages: session.api_messages.clone(),
             total_input_tokens: session.total_input_tokens,
@@ -124,7 +129,6 @@ impl ConversationState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             session_cost: session.session_cost,
-            abort_context: session.abort_context.clone(),
             queued_message: None,
             pending_events: Vec::new(),
             session,
@@ -141,7 +145,9 @@ impl ConversationState {
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
-        self.session.abort_context = self.abort_context.clone();
+        // Legacy field: an interrupted turn now lives in `api_messages`
+        // (`engine::interrupt`); never write a recap back.
+        self.session.abort_context = None;
         self.session.updated_at = chrono::Utc::now();
         self.session.auto_title();
         if let Err(e) = self.session.save().await {
@@ -162,7 +168,7 @@ impl ConversationState {
         candidate.total_input_tokens = self.total_input_tokens;
         candidate.total_output_tokens = self.total_output_tokens;
         candidate.session_cost = self.session_cost;
-        candidate.abort_context = self.abort_context.clone();
+        candidate.abort_context = None;
         candidate.updated_at = chrono::Utc::now();
         candidate.auto_title();
         self.context_head
@@ -185,7 +191,6 @@ impl ConversationState {
         self.total_cache_read_tokens = 0;
         self.total_cache_creation_tokens = 0;
         self.session_cost = 0.0;
-        self.abort_context = None;
         self.queued_message = None;
         self.pending_events.clear();
         self.session = Session::new(
@@ -214,7 +219,8 @@ impl ConversationState {
                 cache_creation: self.total_cache_creation_tokens,
             },
             cost: self.session_cost,
-            abort_context: self.abort_context.clone(),
+            // Wire-compat field (protocol v3); always `None` now.
+            abort_context: None,
             queued_message: self.queued_message.clone(),
             pending_events_len: self.pending_events.len(),
             consecutive_auto_turns,
@@ -360,6 +366,26 @@ mod context_head_tests {
         let mut other = session.clone();
         other.id = "new-session".into();
         assert!(!state.is_blocked(&other));
+    }
+
+    /// `/resume` builds its conversation with `from_resumed` directly: a
+    /// legacy recap is migrated (dropped, marker appended), never carried.
+    #[test]
+    fn from_resumed_migrates_a_legacy_abort_context() {
+        let mut legacy = Session::new("synthetic-model", "low", None);
+        legacy.api_messages = vec![Arc::new(json!({"role":"user","content":"do X"}))];
+        legacy.abort_context = Some("(System note — ABORT CONTEXT: …)".into());
+        let conv = ConversationState::from_resumed(legacy);
+        assert!(conv.session.abort_context.is_none());
+        assert_eq!(conv.api_messages.len(), 2);
+        assert_eq!(
+            conv.api_messages[1]["content"],
+            crate::engine::interrupt::InterruptReason::Unknown.marker()
+        );
+        assert_eq!(conv.session.api_messages, conv.api_messages);
+        // Idempotent for an already-migrated session.
+        let again = ConversationState::from_resumed(conv.session.clone());
+        assert_eq!(again.api_messages, conv.api_messages);
     }
 
     #[cfg(unix)]

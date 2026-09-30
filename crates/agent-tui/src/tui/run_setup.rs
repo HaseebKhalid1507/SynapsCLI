@@ -284,12 +284,6 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
             }
         }
     }
-    if app.abort_context.is_some() {
-        app.push_msg(ChatMessage::System(
-            "⚠ abort context from previous session will be injected into next message"
-                .to_string(),
-        ));
-    }
     app.last_turn_context_window = snapshot.view.context_window;
     app
 }

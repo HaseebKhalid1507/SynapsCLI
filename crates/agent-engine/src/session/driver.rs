@@ -181,21 +181,18 @@ pub(crate) fn history_with_steering(
 }
 
 /// Drain queued steering into api_messages before a driver turn starts.
+/// An interrupted previous turn is already recorded in `api_messages` (its
+/// partial history + the interruption marker), so the prompt is appended
+/// verbatim — nothing is folded into it.
 pub(crate) fn commit_submission(
     api_messages: &mut Vec<SharedMessage>,
     steering: &mut VecDeque<String>,
     prompt: &str,
-    abort_context: &mut Option<String>,
 ) {
     for text in steering.drain(..) {
         api_messages.push(Arc::new(serde_json::json!({"role": "user", "content": text})));
     }
-    let text = if let Some(context) = abort_context.take() {
-        format!("{context}\n\n{prompt}")
-    } else {
-        prompt.to_string()
-    };
-    api_messages.push(Arc::new(serde_json::json!({"role": "user", "content": text})));
+    api_messages.push(Arc::new(serde_json::json!({"role": "user", "content": prompt})));
 }
 
 /// Build the PollRequest for the next poll.
@@ -482,25 +479,12 @@ mod tests {
         let mut steering = VecDeque::new();
         steering.push_back("steer1".into());
         steering.push_back("steer2".into());
-        let mut abort = None;
-        commit_submission(&mut messages, &mut steering, "go", &mut abort);
+        commit_submission(&mut messages, &mut steering, "go");
         assert!(steering.is_empty());
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["content"], "steer1");
         assert_eq!(messages[1]["content"], "steer2");
         assert_eq!(messages[2]["content"], "go");
-    }
-
-    #[test]
-    fn commit_submission_prepends_abort_context() {
-        let mut messages: Vec<SharedMessage> = Vec::new();
-        let mut steering = VecDeque::new();
-        let mut abort = Some("aborted context".into());
-        commit_submission(&mut messages, &mut steering, "go", &mut abort);
-        assert!(abort.is_none());
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0]["content"].as_str().unwrap().contains("aborted context"));
-        assert!(messages[0]["content"].as_str().unwrap().contains("go"));
     }
 
     // ── capture_terminal / observe_terminal ─────────────────────────────

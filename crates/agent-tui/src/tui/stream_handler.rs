@@ -420,7 +420,12 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::External(ev) => on_external(app, &ev),
         SessionEventWire::AutoTurnCapReached { cap } => on_auto_turn_cap(app, cap),
-        SessionEventWire::Idle => {}
+        SessionEventWire::Idle => {
+            // A Cancel that raced a normal finish gets no `Aborted`.
+            if app.status_text.as_deref() == Some(ABORTING_STATUS) {
+                app.status_text = None;
+            }
+        }
         SessionEventWire::Steered { text, delivered } => {
             if delivered {
                 app.push_msg(ChatMessage::System(format!("→ steering: {}", text)));
@@ -473,10 +478,13 @@ pub(super) async fn handle_session_event_arm(
             app.streaming = false;
             app.quit_guard.reset();
             app.subagents.clear();
-            // The actor decided (`TurnLog::abort_context`); the mirror's
-            // `abort_context` only lands with the `Conversation` that follows.
+            if app.status_text.as_deref() == Some(ABORTING_STATUS) {
+                app.status_text = None;
+            }
+            // `context_saved` (wire name kept): the interrupted turn's partial
+            // work stays in history; the `Conversation` that follows carries it.
             let abort_msg = if context_saved {
-                "aborted — context saved for next message"
+                "aborted — partial work kept"
             } else {
                 "aborted"
             };
@@ -715,6 +723,10 @@ pub(super) fn apply_subagent_progress(
 
 /// How long a done entry stays visible before reconcile removes it.
 pub(super) const SUBAGENT_DONE_FLASH_SECS: f64 = 5.0;
+
+/// Status line between Esc and the actor's `Aborted` (it drains the
+/// cancelled stream first, bounded by `budgets::CANCEL_DRAIN_TIMEOUT`).
+pub(super) const ABORTING_STATUS: &str = "aborting…";
 
 /// Pure reconcile: align the HUD Vec<SubagentState> with the registry snapshot.
 ///

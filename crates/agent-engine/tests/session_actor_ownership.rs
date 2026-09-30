@@ -218,7 +218,7 @@ async fn owner_detach_passes_to_oldest_non_observer() {
 }
 
 /// `shell_start sleep <marker>` then `Checkpoint`: the PTY child is gone, the
-/// stream is cancelled with abort context, the reply lands on
+/// stream is cancelled (history kept + restart marker), the reply lands on
 /// `CHECKPOINT_QUERY_ID`, and the session is still alive.
 const SSE_SHELL_START: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"type\":\"message\",",
@@ -299,11 +299,20 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
     assert!(seen
         .iter()
         .any(|e| matches!(&e.event, SessionEventWire::Aborted { .. })));
+    // The checkpointed turn is kept as real history: the completed
+    // `shell_start` round, the partial second-round reply, then the
+    // restart marker. (The old recap dropped the tool round entirely.)
     let conv = last_conversation(&seen);
-    assert!(
-        conv.abort_context.as_deref().unwrap_or("").contains("you had started writing: hi"),
-        "abort context captured: {:?}",
-        conv.abort_context
+    assert!(conv.abort_context.is_none());
+    let msgs = &conv.api_messages;
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"], "{msgs:#?}");
+    assert_eq!(msgs[1]["content"][0]["name"], "shell_start");
+    assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+    assert_eq!(msgs[3]["content"], serde_json::json!([{"type": "text", "text": "hi"}]));
+    assert_eq!(
+        msgs[4]["content"],
+        agent_engine::engine::interrupt::InterruptReason::Restart.marker()
     );
     // PTY child killed (PtyHandle::drop) — allow the reap a moment.
     let mut gone = false;
@@ -317,7 +326,8 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
     assert!(gone, "shell_start child survived Checkpoint");
     assert!(handle.is_alive(), "checkpoint never ends the session");
     let saved = agent_engine::core::session::Session::load(handle.id.as_str()).expect("saved");
-    assert!(saved.abort_context.is_some());
+    assert!(saved.abort_context.is_none());
+    assert_eq!(saved.api_messages, conv.api_messages, "journal == adopted history");
     end(&mut a).await;
 }
 

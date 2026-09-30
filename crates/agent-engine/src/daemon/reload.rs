@@ -5,9 +5,9 @@
 //! BEFORE accepting.
 //!
 //! What reload cannot preserve (§2.8, stated once): in-flight turns
-//! (checkpointed = cancelled with abort context), pending prompts (answered
+//! (checkpointed = cancelled; partial history + restart marker kept), pending prompts (answered
 //! `None`), PTY/background shells (closed, announced), `turn_replay`,
-//! un-persisted `TurnLog`, input ownership (the owner reclaims it on
+//! input ownership (the owner reclaims it on
 //! reconnect via `was_owner`). What it preserves — each session's
 //! `Checkpoint{Reload}` reply carries a `SessionReloadRecord`: its journal
 //! and id (the rehydrated session continues the same journal), its
@@ -41,8 +41,13 @@ pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const CHECKPOINT_BUDGET: Duration =
-    Duration::from_secs(crate::session::budgets::SAVE_TIMEOUT_SECS + 1);
+/// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (drain + its bounded
+/// save) + the checkpoint's own bounded save + 1 s margin.
+const CHECKPOINT_BUDGET: Duration = Duration::from_secs(
+    crate::session::budgets::CANCEL_TURN_TIMEOUT_SECS
+        + crate::session::budgets::SAVE_TIMEOUT_SECS
+        + 1,
+);
 /// What clients are told to wait before reconnecting.
 pub const RETRY_AFTER_MS: u64 = 500;
 

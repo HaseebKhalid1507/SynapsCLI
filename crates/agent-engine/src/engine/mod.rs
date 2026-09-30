@@ -5,6 +5,7 @@
 //! all non-visual operations.
 
 pub mod commands;
+pub mod interrupt;
 pub mod reactor;
 pub mod session;
 pub mod setup;

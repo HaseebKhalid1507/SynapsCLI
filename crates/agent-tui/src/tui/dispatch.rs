@@ -204,10 +204,15 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::Abort => {
-            // The actor cancels the turn, captures abort context, dequeues,
-            // flushes pending events, cancels subagents and saves; the
-            // presentation ("dequeued: …", the aborted line, HUD clear)
-            // follows on `Dequeued` / `Aborted` (stream_handler).
+            // The actor cancels the turn, keeps its partial history (plus an
+            // interruption marker), dequeues, flushes pending events, cancels
+            // subagents and saves; the presentation ("dequeued: …", the
+            // aborted line, HUD clear) follows on `Dequeued` / `Aborted`
+            // (stream_handler). The actor drains the cancelled stream first
+            // (bounded), so acknowledge the keypress right away.
+            if app.streaming {
+                app.status_text = Some(super::stream_handler::ABORTING_STATUS.to_string());
+            }
             let _ = link.send(agent_engine::session::SessionCommand::Cancel).await;
         }
         InputAction::SlashCommand(cmd, arg) => {

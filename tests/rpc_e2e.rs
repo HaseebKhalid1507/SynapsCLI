@@ -990,6 +990,31 @@ mod tier2 {
             }
         }
 
+        // The aborted turn is recorded as history + the interruption marker
+        // (never a recap folded into the next prompt). `Abort` awaits the
+        // stream task, so the marker is in place once both responses landed.
+        let mut last_message = None;
+        if saw_abort_response && saw_prompt_response {
+            child
+                .send(&json!({"type": "get_messages", "id": "gm2"}))
+                .await
+                .expect("send get_messages");
+            for _ in 0..30 {
+                let Ok(frame) = child.recv_timeout(Duration::from_secs(10)).await else {
+                    break;
+                };
+                if frame["type"] == "response" && frame["command"] == "get_messages" {
+                    let messages = frame["messages"].as_array().cloned().unwrap_or_default();
+                    assert!(
+                        !serde_json::to_string(&messages).unwrap().contains("ABORT CONTEXT"),
+                        "no recap in history: {messages:?}"
+                    );
+                    last_message = messages.last().cloned();
+                    break;
+                }
+            }
+        }
+
         let _ = child.shutdown().await;
 
         assert!(
@@ -1000,6 +1025,9 @@ mod tier2 {
             saw_prompt_response,
             "expected Response {{ command: prompt }} after abort"
         );
+        let last = last_message.expect("get_messages response");
+        assert_eq!(last["role"], "user", "{last}");
+        assert_eq!(last["content"], "[Request interrupted by user]", "{last}");
     }
 
     /// `NewSession` while a stream is in-flight must be rejected with an

@@ -204,6 +204,21 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 /// allowed `terminal_flush` to increment `consecutive_auto_turns` and set
 /// `auto_turn_pending = true` while returning `Some(auto_id)` that was then
 /// silently discarded — leaving the session permanently stuck in busy state.
+/// A cancelled turn: the engine's cancel-path history (partial assistant
+/// message, completed tool rounds, canceled results) was already adopted
+/// from `MessageHistory`; append the interruption marker after it (before
+/// `terminal_flush` injects buffered events), exactly like the session
+/// actor. Append-only, so the provider's cached prefix is untouched.
+async fn mark_interrupted(state: &Mutex<RpcState>) {
+    let mut st = state.lock().await;
+    if agent_engine::engine::interrupt::append_marker(
+        &mut st.api_messages,
+        agent_engine::engine::interrupt::InterruptReason::User,
+    ) {
+        st.save_session().await;
+    }
+}
+
 async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<String> {
     let mut st = state.lock().await;
     st.in_flight = None;
@@ -392,24 +407,36 @@ async fn spawn_prompt(
                 }
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
+                    // A cancelled Anthropic turn ends Ok (history, then Done):
+                    // it is still an abort — mark it and never chain an
+                    // auto-turn onto it.
+                    let cancelled = cancel_check.is_cancelled();
                     let _ = wtx
                         .send(RpcEvent::AgentEnd {
                             usage: usage_acc.clone(),
                         })
                         .await;
+                    if cancelled {
+                        mark_interrupted(&state).await;
+                    }
                     // terminal_flush(allow_chain=true): Done path — eligible to
                     // reserve a post-flush auto-turn if conditions are met.
-                    let post_flush_id = terminal_flush(&state, true).await;
+                    let post_flush_id = terminal_flush(&state, !cancelled).await;
                     let resp_command = if pid.starts_with("auto:") {
                         "auto_turn"
                     } else {
                         "prompt"
                     };
+                    let body = if cancelled {
+                        serde_json::json!({ "ok": true, "cancelled": true })
+                    } else {
+                        serde_json::json!({ "ok": true })
+                    };
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
                             command: resp_command.to_string(),
-                            body: serde_json::json!({ "ok": true }),
+                            body,
                         })
                         .await;
                     // Schedule post-flush auto-turn via the scheduler channel.
@@ -447,6 +474,7 @@ async fn spawn_prompt(
                                 body: serde_json::json!({ "ok": true, "cancelled": true }),
                             })
                             .await;
+                        mark_interrupted(&state).await;
                         // Cancel path: terminal_flush(allow_chain=false) — never reserve auto-turn.
                         let _ = terminal_flush(&state, false).await;
                         return;
@@ -525,6 +553,9 @@ async fn spawn_prompt(
                 body,
             })
             .await;
+        if cancelled {
+            mark_interrupted(&state).await;
+        }
         // Silent-drop / abort path: terminal_flush(allow_chain=false) — never reserve auto-turn.
         let _ = terminal_flush(&state, false).await;
     });
