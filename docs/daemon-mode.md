@@ -227,6 +227,14 @@ C: bye | socket close = Detach (turn keeps running)
   re-described the model's own output inside the next user message and which current models refuse
   as a prompt injection. Sessions saved with a recap are migrated on load (recap dropped, marker
   appended). Documented in `synaps chat /help` too.
+- **The session on disk follows a running turn.** The engine publishes the conversation at every
+  round boundary — the prompt before the first request, each completed tool round (every
+  `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one (bounded
+  by `SAVE_TIMEOUT`, ordered by `session_save_order`). A crash / `kill -9` / power loss mid-turn
+  loses at most the round in flight, and what is on disk is always a valid history to resume from.
+  Cost: one save per round (≈1 ms for a 2.3 MB session in `json` mode, which rewrites the file;
+  `session_persistence = journal` appends only the new messages). Attach replays carry no per-round
+  `MessageHistory`: the snapshot already holds the latest history.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)

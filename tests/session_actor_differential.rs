@@ -843,9 +843,10 @@ async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
         })
         .collect();
     assert_eq!(texts, ["first", "partial", marker, "second", "partial", marker]);
-    // Saves: one per abort on both sides.
+    // Saves, per turn on both sides: the engine's prompt checkpoint (round
+    // boundary before the first request) + one at abort (dispatch.rs:191).
     std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(o.saves, 2, "one save per abort (dispatch.rs:191)");
+    assert_eq!(o.saves, 4, "prompt checkpoint + abort, per turn");
     assert_eq!(o.saves, o_s.count(), "sampler self-check");
     assert_eq!(o_s.count(), a_s.count(), "save count differs (oracle vs actor)");
     a.end().await;

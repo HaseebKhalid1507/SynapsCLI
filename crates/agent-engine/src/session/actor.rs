@@ -638,7 +638,11 @@ impl SessionActor {
     // ── emit ─────────────────────────────────────────────────────────────
 
     /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
-    /// prompt traffic (never replayed) and per-client replies.
+    /// prompt traffic (never replayed), per-client replies, and full-history
+    /// `MessageHistory` envelopes: the engine publishes one per round, and an
+    /// attaching client already gets the LATEST adopted history in its
+    /// snapshot's `conversation` — replaying older ones would ship the whole
+    /// history once per round and roll its mirror back to a stale state.
     pub(crate) fn emit(&mut self, event: SessionEventWire) {
         let replay = self.streaming
             && !matches!(
@@ -647,6 +651,9 @@ impl SessionActor {
                     | SessionEventWire::PromptResolved { .. }
                     | SessionEventWire::Attached { .. }
                     | SessionEventWire::QueryResult { .. }
+                    | SessionEventWire::Stream(StreamEvent::Session(
+                        SessionEvent::MessageHistory(_)
+                    ))
             );
         let env = Envelope {
             session_id: self.id.clone(),
@@ -2485,8 +2492,19 @@ impl SessionActor {
         match event {
             StreamEvent::Llm(_) => {}
             StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+                // Published at every round boundary as well as at the end of
+                // the turn (`runtime/stream.rs` ROUND CHECKPOINT): the session
+                // on disk follows the turn as it progresses. Bounded so a slow
+                // disk can never stall the turn machine (Esc/Cancel stays
+                // responsive); a timed-out write still lands, in order
+                // (`session_save_order`).
                 self.conv.api_messages = history;
-                self.save().await;
+                if tokio::time::timeout(budgets::SAVE_TIMEOUT, self.save())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session = %self.id, "history checkpoint save timed out");
+                }
                 self.emit_conversation();
             }
             StreamEvent::Agent(AgentEvent::SteeringDelivered { ref message }) => {
