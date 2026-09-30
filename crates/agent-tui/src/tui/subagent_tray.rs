@@ -751,4 +751,42 @@ mod render_tests {
             "download above it"
         );
     }
+
+    /// A background worker outlives the turn that started it: its progress
+    /// reaches the tray through the registry rows, not the ended stream.
+    #[test]
+    fn a_background_agent_keeps_moving_after_the_turn() {
+        use synaps_cli::runtime::subagent::SubagentStatus;
+        use synaps_cli::tools::SubagentDisplayRow;
+        // The agent's tray row, found by name (independent of tray geometry).
+        let agent_row = |buf: &Buffer| {
+            (0..buf.area().height)
+                .map(|y| row(buf, y))
+                .find(|l| l.contains("sleeper-1"))
+                .expect("the agent's tray row")
+        };
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 37, "sleeper-1");
+        let line = agent_row(&h.render().clone());
+        assert!(line.contains("starting"), "{line:?}");
+
+        // The turn is over; only the 1 Hz rows arrive now.
+        let rows = |step: &str, tools: u32| {
+            SessionEventWire::SubagentRows(vec![SubagentDisplayRow {
+                subagent_id: 37,
+                agent_name: "sleeper-1".into(),
+                status: SubagentStatus::Running,
+                cancel_requested: false,
+                elapsed_secs: 3.0,
+                finished_elapsed: None,
+                step: step.into(),
+                tools,
+            }])
+        };
+        h.feed_event(rows("$ date +%T; sleep 20; date +%T", 1));
+        let line = agent_row(&h.render().clone());
+        assert!(line.contains("$ date +%T; sleep 20"), "{line:?}");
+        assert!(line.contains("1 tool"), "{line:?}");
+        assert!(!line.contains("starting"), "{line:?}");
+    }
 }

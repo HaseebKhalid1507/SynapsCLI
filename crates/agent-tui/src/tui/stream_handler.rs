@@ -541,7 +541,12 @@ pub(super) async fn handle_session_event_arm(
             app.compacting = false;
             app.invalidate();
         }
-        SessionEventWire::SubagentRows(rows) => app.subagent_rows = rows,
+        SessionEventWire::SubagentRows(rows) => {
+            if apply_subagent_progress(&mut app.subagents, &rows) {
+                app.invalidate();
+            }
+            app.subagent_rows = rows;
+        }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
             if from == Some(me) && to != Some(me) {
@@ -674,6 +679,40 @@ fn sanitize_notice(text: &str) -> String {
 }
 
 // ── Flash expiry constant ──────────────────────────────────────────────────────
+/// Copy each running worker's live progress (step + tool count) from fresh
+/// registry rows into its HUD entry. Called when rows ARRIVE, never from the
+/// periodic reconcile: rows emitted at time T reflect every progress write
+/// before T, so a just-received row is never older than an update the
+/// stream already delivered, while the cached rows the 1 Hz reconcile reads
+/// can be. This is how a background worker (`subagent_start`) keeps moving
+/// in the tray after the turn that started it has ended (its
+/// `SubagentUpdate` events rode that turn's stream). Done, cancelling, and
+/// not-yet-updated entries are left alone. Returns true if anything changed.
+pub(super) fn apply_subagent_progress(
+    hud: &mut [SubagentState],
+    rows: &[synaps_cli::tools::SubagentDisplayRow],
+) -> bool {
+    use synaps_cli::runtime::subagent::SubagentStatus;
+    let mut changed = false;
+    for row in rows {
+        if !matches!(row.status, SubagentStatus::Running) || row.cancel_requested {
+            continue;
+        }
+        let Some(sa) = hud.iter_mut().find(|s| s.id == row.subagent_id && !s.done) else {
+            continue;
+        };
+        if !row.step.is_empty() && sa.status != row.step {
+            sa.status = row.step.clone();
+            changed = true;
+        }
+        if sa.tools != row.tools {
+            sa.tools = row.tools;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// How long a done entry stays visible before reconcile removes it.
 pub(super) const SUBAGENT_DONE_FLASH_SECS: f64 = 5.0;
 
@@ -810,7 +849,7 @@ mod tests {
 #[cfg(test)]
 mod reconcile_tests {
     use super::super::app::SubagentState;
-    use super::{reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
+    use super::{apply_subagent_progress, reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
     use std::time::{Duration, Instant};
     use synaps_cli::runtime::subagent::SubagentStatus;
     use synaps_cli::tools::SubagentDisplayRow;
@@ -823,6 +862,8 @@ mod reconcile_tests {
             cancel_requested,
             elapsed_secs: 1.5,
             finished_elapsed: None,
+            step: String::new(),
+            tools: 0,
         }
     }
 
@@ -842,6 +883,41 @@ mod reconcile_tests {
             tools: 0,
             result: None,
         }
+    }
+
+    /// Fresh rows move a running entry's step and tool count; done,
+    /// cancelling, unknown and not-yet-updated entries are left alone.
+    #[test]
+    fn progress_from_rows_moves_running_entries_only() {
+        let mut hud = vec![
+            make_hud_entry(1, false),
+            make_hud_entry(2, true),
+            make_hud_entry(3, false),
+        ];
+        hud[2].status = "starting: task".into();
+        let mut running = make_row(1, SubagentStatus::Running, false);
+        running.step = "$ sleep 20".into();
+        running.tools = 1;
+        let mut done = make_row(2, SubagentStatus::Completed, false);
+        done.step = "stale".into();
+        let quiet = make_row(3, SubagentStatus::Running, false); // no update yet
+        let mut cancelling = make_row(4, SubagentStatus::Running, true);
+        cancelling.step = "x".into();
+
+        assert!(apply_subagent_progress(
+            &mut hud,
+            &[running.clone(), done, quiet, cancelling]
+        ));
+        assert_eq!((hud[0].status.as_str(), hud[0].tools), ("$ sleep 20", 1));
+        assert_eq!(hud[1].status, "\u{2714} done", "done entry untouched");
+        assert_eq!(
+            hud[2].status, "starting: task",
+            "empty step keeps the placeholder"
+        );
+        assert!(
+            !apply_subagent_progress(&mut hud, &[running]),
+            "unchanged → false"
+        );
     }
 
     // R1: idle-finish — Running in HUD, terminal in registry → marked done
