@@ -83,7 +83,6 @@ pub struct EngineBoot {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
-    pub abort_context: Option<String>,
     pub continued: bool,
     pub continue_info: Option<ContinueInfo>,
     pub registry: Arc<CommandRegistry>,
@@ -167,7 +166,6 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         total_input_tokens: sb.total_input_tokens,
         total_output_tokens: sb.total_output_tokens,
         session_cost: sb.session_cost,
-        abort_context: sb.abort_context,
         continued: sb.continued,
         continue_info: sb.continue_info,
         registry,
@@ -380,9 +378,104 @@ pub(crate) struct SessionBootResult {
     pub(crate) total_input_tokens: u64,
     pub(crate) total_output_tokens: u64,
     pub(crate) session_cost: f64,
-    pub(crate) abort_context: Option<String>,
     pub(crate) continued: bool,
     pub(crate) continue_info: Option<ContinueInfo>,
+}
+
+/// The session lock for a `boot()` host that drives `Runtime` itself (rpc,
+/// `synaps server`). Continuing a session that another process (a TUI, the
+/// daemon, another rpc) holds is REFUSED: two writers would fork its history
+/// and the older one's saves would overwrite the newer's. So is continuing
+/// a session already compacted into a successor (its history is closed). A
+/// fresh session, or a lock that cannot be taken for another reason (e.g. a
+/// read-only sessions dir), proceeds best-effort, as the session actor does.
+/// The lock is held for the returned value's lifetime; a holder that
+/// continued a session runs crash recovery (`recover_turn_draft`).
+pub fn lock_session(
+    id: &str,
+    continued: bool,
+    kind: &str,
+) -> Result<Option<agent_core::session_lock::SessionLock>> {
+    let dir = agent_core::session_lock::sessions_dir();
+    let holder = agent_core::session_lock::LockHolder {
+        pid: std::process::id(),
+        kind: kind.to_string(),
+    };
+    match agent_core::session_lock::SessionLock::try_acquire(&dir, id, holder) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(
+            e @ (agent_core::session_lock::SessionLockError::Held { .. }
+            | agent_core::session_lock::SessionLockError::CompactedInto { .. }),
+        ) if continued => Err(crate::RuntimeError::Session(e.to_string())),
+        Err(e) => {
+            tracing::warn!(session = %id, "session lock: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Crash recovery: if `sessions/<id>.turn` exists, the process that last ran
+/// this session died with a turn open. Fold the draft into the history
+/// (`engine::interrupt::recover_crashed_turn`), persist that, THEN remove
+/// the draft.
+///
+/// Run ONLY by the holder of the session lock, after taking it (actor
+/// create, unpark and `/resume`; rpc and `synaps server` after
+/// `lock_session`): a draft under a lock held elsewhere belongs to a turn
+/// that is running right now. Legacy chat takes no lock and never recovers.
+/// Loading itself (`resolve_or_create_session`) leaves the draft alone.
+///
+/// The draft is removed only once the recovered history is on disk; if that
+/// save fails the draft stays, and the next holder retries (recovery is
+/// idempotent through its own marker).
+pub async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationState) {
+    let dir = agent_core::session_lock::sessions_dir();
+    let id = conv.session.id.clone();
+    let read = {
+        let (dir, id) = (dir.clone(), id.clone());
+        tokio::task::spawn_blocking(move || {
+            agent_core::core::session_draft::read_turn_draft(&dir, &id)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r)
+    };
+    let recovered = match read {
+        Ok(None) => return,
+        Ok(Some(draft)) => {
+            crate::engine::interrupt::recover_crashed_turn(&mut conv.api_messages, &draft)
+        }
+        Err(e) => {
+            // Unreadable draft: never block the load. The history stays
+            // exactly as saved; the draft is removed below.
+            tracing::warn!(session = %id, "unreadable turn draft, removing it: {e}");
+            false
+        }
+    };
+    if recovered {
+        tracing::warn!(
+            session = %id,
+            "session was interrupted mid-turn by an unexpected stop; recovered"
+        );
+        if !conv.save().await {
+            tracing::warn!(
+                session = %id,
+                "could not save the recovered history; keeping the turn draft"
+            );
+            return;
+        }
+    } else {
+        // The turn had concluded (or the draft was unreadable): the saved
+        // history is already right, only the draft's removal was lost.
+        tracing::info!(session = %id, "removing a stale turn draft");
+    }
+    let removed = tokio::task::spawn_blocking(move || {
+        agent_core::core::session_draft::remove_turn_draft(&dir, &id)
+    })
+    .await;
+    if let Ok(Err(e)) | Err(e) = removed.map_err(std::io::Error::other) {
+        tracing::warn!(session = %conv.session.id, "failed to remove turn draft: {e}");
+    }
 }
 
 fn resolve_or_create_session(
@@ -463,12 +556,31 @@ fn resolve_or_create_session(
                 }
             };
 
+            // Sessions saved before the interruption marker existed carry a
+            // recap in `abort_context`, meant to be prepended to the next user
+            // message. Migrate here, for actor create, unpark and `boot()`
+            // (`/resume` migrates in `ConversationState::from_resumed`), and
+            // before the continuation seed, so everything downstream sees the
+            // migrated history. The recap is dropped; the marker is appended
+            // (append-only: the cached prefix is untouched).
+            if crate::engine::interrupt::migrate_legacy_abort_context(
+                &mut session.api_messages,
+                &mut session.abort_context,
+            ) {
+                tracing::info!(
+                    session = %session.id,
+                    "migrated a legacy abort-context recap to an interruption marker"
+                );
+            }
+            // A turn draft (`sessions/<id>.turn`) is NOT folded in here:
+            // loading runs before (or without) the session lock. The lock
+            // holder does it (`recover_turn_draft`).
+
             Ok(SessionBootResult {
                 api_messages: session.api_messages.clone(),
                 total_input_tokens: session.total_input_tokens,
                 total_output_tokens: session.total_output_tokens,
                 session_cost: session.session_cost,
-                abort_context: session.abort_context.clone(),
                 continued: true,
                 continue_info,
                 session,
@@ -486,7 +598,6 @@ fn resolve_or_create_session(
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 session_cost: 0.0,
-                abort_context: None,
                 continued: false,
                 continue_info: None,
             })
@@ -498,6 +609,143 @@ fn resolve_or_create_session(
 mod tests {
     use super::*;
     use agent_core::reasoning::ReasoningLevel;
+
+    async fn saved_session(first: &str) -> Session {
+        let mut session = Session::new("claude-sonnet-4-5", "low", None);
+        session.api_messages = vec![std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": first}),
+        )];
+        session.save().await.unwrap();
+        session
+    }
+
+    /// Loading runs before (or without) the session lock, so it must never
+    /// fold a turn draft in: `rpc --continue` on a session whose turn is
+    /// running in another process would otherwise record a crash that never
+    /// happened. (Review finding: `boot()` callers never lock.)
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn loading_never_folds_or_touches_the_draft() {
+        use agent_core::core::session_draft::{read_turn_draft, write_turn_draft, TurnDraft};
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let session = saved_session("do X").await;
+        let draft = TurnDraft {
+            base_len: 1,
+            partial_text: "partial".into(),
+        };
+        write_turn_draft(&dir, &session.id, &draft).unwrap();
+
+        let mut runtime = Runtime::new_headless();
+        let sb = resolve_or_create_session(&mut runtime, &Some(Some(session.id.clone()))).unwrap();
+        assert_eq!(sb.api_messages.len(), 1, "history exactly as saved");
+        assert_eq!(
+            read_turn_draft(&dir, &session.id).unwrap(),
+            Some(draft),
+            "the draft is left for the lock holder"
+        );
+    }
+
+    /// The lock holder folds the draft in, saves, THEN removes the draft.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_lock_holder_recovers_saves_then_removes_the_draft() {
+        use agent_core::core::session_draft::{read_turn_draft, write_turn_draft, TurnDraft};
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let session = saved_session("do X").await;
+        let id = session.id.clone();
+        write_turn_draft(
+            &dir,
+            &id,
+            &TurnDraft {
+                base_len: 1,
+                partial_text: "partial".into(),
+            },
+        )
+        .unwrap();
+
+        let mut conv = crate::engine::session::ConversationState::from_resumed(session);
+        recover_turn_draft(&mut conv).await;
+        assert_eq!(conv.api_messages.len(), 3, "partial reply + marker");
+        let on_disk = Session::load(&id).unwrap();
+        assert_eq!(on_disk.api_messages, conv.api_messages, "saved before removal");
+        assert_eq!(read_turn_draft(&dir, &id).unwrap(), None, "draft removed");
+
+        // No draft: nothing to do.
+        recover_turn_draft(&mut conv).await;
+        assert_eq!(conv.api_messages.len(), 3);
+    }
+
+    /// An unreadable draft never blocks the load: history untouched, draft
+    /// removed.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_unreadable_draft_is_removed_and_history_kept() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let session = saved_session("do X").await;
+        let path = dir.join(format!("{}.turn", session.id));
+        std::fs::write(&path, b"{not json").unwrap();
+        let mut conv = crate::engine::session::ConversationState::from_resumed(session);
+        recover_turn_draft(&mut conv).await;
+        assert_eq!(conv.api_messages.len(), 1);
+        assert!(!path.exists());
+    }
+
+    /// If the recovered history cannot be saved, the draft stays: removing
+    /// it would lose the only record that the turn was cut off.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_failed_recovery_save_keeps_the_draft() {
+        use agent_core::core::session_draft::{read_turn_draft, write_turn_draft, TurnDraft};
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let session = saved_session("do X").await;
+        let id = session.id.clone();
+        let draft = TurnDraft {
+            base_len: 1,
+            partial_text: "partial".into(),
+        };
+        write_turn_draft(&dir, &id, &draft).unwrap();
+        // Make the snapshot unwritable: a non-empty directory where the
+        // `<id>.json` file goes (the atomic rename onto it fails).
+        let snapshot = dir.join(format!("{id}.json"));
+        std::fs::remove_file(&snapshot).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(snapshot.join("occupied"), b"x").unwrap();
+
+        let mut conv = crate::engine::session::ConversationState::from_resumed(session);
+        recover_turn_draft(&mut conv).await;
+        assert_eq!(read_turn_draft(&dir, &id).unwrap(), Some(draft), "draft kept");
+    }
+
+    /// A `boot()` host may not continue a session another holder has; a
+    /// fresh one is locked (and the lock is released on drop).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn boot_hosts_refuse_to_continue_a_session_held_elsewhere() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let held = lock_session("20260930-000000-held", true, "tui").unwrap();
+        assert!(held.is_some());
+        let err = lock_session("20260930-000000-held", true, "rpc").unwrap_err();
+        assert!(err.to_string().contains("20260930-000000-held"), "{err}");
+        // Not continuing (a fresh id) never refuses.
+        assert!(lock_session("20260930-000000-held", false, "rpc").unwrap().is_none());
+        drop(held);
+        assert!(lock_session("20260930-000000-held", true, "rpc").unwrap().is_some());
+
+        // A session compacted into a successor is closed: never continued.
+        let mut old = Session::new("claude-sonnet-4-5", "low", None);
+        old.api_messages = vec![std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "before compaction"}),
+        )];
+        old.compacted_into = Some("20260930-000001-next".into());
+        old.save().await.unwrap();
+        let err = lock_session(&old.id, true, "rpc").unwrap_err();
+        assert!(err.to_string().contains("20260930-000001-next"), "{err}");
+    }
 
     /// B1: --continue path must restore thinking_level from the saved session.
     /// Simulates what resolve_or_create_session does when a session is continued.

@@ -342,3 +342,48 @@ fn response_reset_shrinks_transcript_preview() {
         "Pre-start text should survive: {frame}"
     );
 }
+
+/// A MIRROR (a client that did not submit the turn) draws the prompt the
+/// actor sends in `TurnStarted.user_text`, and each turn's reply is its own
+/// block — before, the mirror showed no prompt and glued the second reply
+/// onto the first.
+#[test]
+fn session_mirror_sees_another_clients_prompt_and_separate_replies() {
+    let (frame, _) = frame_for(vec![
+        turn(TurnTrigger::User, Some("first question from A")),
+        text("first answer"),
+        done(),
+        W::Idle,
+        turn(TurnTrigger::User, Some("second question from A")),
+        text("second answer"),
+        done(),
+        W::Idle,
+    ]);
+    assert!(frame.contains("first question from A"), "{frame}");
+    assert!(frame.contains("second question from A"), "{frame}");
+    assert!(!frame.contains("first answersecond answer"), "glued: {frame}");
+    let first = frame.find("first answer").unwrap();
+    let prompt = frame.find("second question from A").unwrap();
+    let second = frame.find("second answer").unwrap();
+    assert!(first < prompt && prompt < second, "{frame}");
+}
+
+/// The client that SUBMITTED drew its own prompt at submit: the
+/// `user_text` echoed back in `TurnStarted` is not drawn a second time.
+#[test]
+fn session_submitter_does_not_draw_its_prompt_twice() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.type_str("unique submitted prompt");
+    h.key(KeyCode::Enter, KeyModifiers::empty());
+    h.feed_event(turn(TurnTrigger::User, Some("unique submitted prompt")).into());
+    h.feed_event(text("the answer").into());
+    h.feed_event(done().into());
+    let frame = h.snapshot();
+    assert_eq!(
+        frame.matches("unique submitted prompt").count(),
+        1,
+        "drawn once: {frame}"
+    );
+    assert!(frame.contains("the answer"), "{frame}");
+}

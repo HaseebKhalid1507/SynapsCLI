@@ -127,7 +127,7 @@ impl Client {
             SessionEventWire::Aborted { context_saved } => {
                 self.streaming = false;
                 self.quit_guard.reset();
-                self.out(if *context_saved { "[aborted — context saved for next message]\n" } else { "[aborted]\n" })
+                self.out(if *context_saved { "[aborted — partial work kept]\n" } else { "[aborted]\n" })
             }
             SessionEventWire::Cleared { session_id } => {
                 self.out(&format!("[session cleared → {}]\n", &session_id[..8.min(session_id.len())]))
@@ -345,6 +345,9 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow
         snap.conversation.api_messages.len(),
         if snap.streaming { "  streaming" } else { "" }
     ));
+    if let Some(owned) = snap.input_owned_elsewhere(c.t.client_id()) {
+        c.out(&format!("[system] {owned}\n"));
+    }
     for env in &snap.replay {
         c.render(env);
     }

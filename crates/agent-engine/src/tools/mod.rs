@@ -317,6 +317,15 @@ pub trait Tool: Send + Sync {
         crate::tools::catalog::ToolEffect::NonIdempotent
     }
 
+    /// Each call is its own independent actor (a subagent): sibling calls in
+    /// one batch each get their own scheduler lane and run concurrently,
+    /// instead of joining the shared serial lane that `NonIdempotent` tools
+    /// use. Scheduling only — the effect class, and with it the rule that an
+    /// interrupted call is never re-run automatically, is unchanged.
+    fn runs_independently(&self) -> bool {
+        false
+    }
+
     /// Key resolution derived from validated input. `Serialize` explicitly
     /// fails closed into the global mutation lane; `None` is the conservative
     /// default for tools with no key support.

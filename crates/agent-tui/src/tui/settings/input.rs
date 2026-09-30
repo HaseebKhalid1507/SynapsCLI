@@ -603,6 +603,24 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
+        "tui_streaming_glow" => {
+            if super::super::neon_prompt::streaming_glow_enabled() {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
+        // The live knob, not the file: this is what the cycler steps from.
+        // Without this arm the current value was "" → index 0 ("on") no
+        // matter what, so once set to off, Left was a no-op and Right re-wrote
+        // "off" — it could never be turned back on.
+        "theme_transition" => {
+            if super::super::theme::transition::transition_enabled() {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
         "startup.quick_start" => {
             let on = match synaps_cli::config::read_config_value("startup.quick_start")
                 .map(|v| v.trim().to_string())
@@ -704,6 +722,53 @@ mod tests {
             catalog_overrides: std::collections::BTreeMap::new(),
             reasoning_type: "budget (legacy)".into(),
         }
+    }
+
+    /// Every Cycler setting must report a current value that is one of its
+    /// options: the cycler steps Left/Right from that index, and an unknown
+    /// value silently pins it at index 0 (how `theme_transition` got stuck on
+    /// "off"). Checked against an empty config so user values can't mask it.
+    #[test]
+    fn every_cycler_reports_a_current_value_among_its_options() {
+        let _lock = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().expect("tempdir");
+        let old = std::env::var("SYNAPS_BASE_DIR").ok();
+        synaps_cli::config::set_base_dir_for_tests(home.path().to_path_buf());
+        let snap = snap();
+        let mut bad = Vec::new();
+        for def in super::super::defs::ALL_SETTINGS {
+            if let EditorKind::Cycler(opts) = def.editor {
+                let current = cycler_current_value(def.key, &snap);
+                if !opts.contains(&current.as_str()) {
+                    bad.push(format!("{} -> {current:?} not in {opts:?}", def.key));
+                }
+            }
+        }
+        match old {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        assert!(bad.is_empty(), "cyclers without a current value: {bad:#?}");
+    }
+
+    /// Regression: theme transition can be turned back on after off.
+    #[test]
+    #[serial_test::serial]
+    fn theme_transition_cycles_both_ways() {
+        use super::super::super::theme::transition::{set_transition_mode, transition_enabled};
+        use synaps_cli::config::ThemeTransitionMode;
+        let prior = transition_enabled();
+        set_transition_mode(ThemeTransitionMode::Off);
+        assert_eq!(cycler_current_value("theme_transition", &snap()), "off");
+        set_transition_mode(ThemeTransitionMode::On);
+        assert_eq!(cycler_current_value("theme_transition", &snap()), "on");
+        set_transition_mode(if prior {
+            ThemeTransitionMode::On
+        } else {
+            ThemeTransitionMode::Off
+        });
     }
 
     fn plugins_state_at(idx: usize) -> SettingsState {

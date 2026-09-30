@@ -402,7 +402,7 @@ impl ConversationDigest {
         Self {
             header: s.header.clone(),
             messages_len: s.api_messages.len(),
-            messages_hash: messages_hash(&s.api_messages),
+            messages_hash: s.messages_hash_memo.hash(&s.api_messages),
             tokens: s.tokens.clone(),
             cost: s.cost,
             abort_context: s.abort_context.clone(),
@@ -428,6 +428,7 @@ impl ConversationDigest {
             queued_message: self.queued_message,
             pending_events_len: self.pending_events_len,
             consecutive_auto_turns: self.consecutive_auto_turns,
+            messages_hash_memo: Default::default(),
         }
     }
 }
@@ -939,7 +940,32 @@ mod tests {
             queued_message: None,
             pending_events_len: 2,
             consecutive_auto_turns: 1,
+            messages_hash_memo: Default::default(),
         }
+    }
+
+    /// One snapshot fanned out to N socket clients is hashed ONCE (the memo
+    /// is shared by its clones), and a snapshot whose messages were replaced
+    /// afterwards is re-hashed, never served a stale hash.
+    #[test]
+    fn conversation_digest_hash_is_computed_once_and_never_stale() {
+        let a = conv();
+        let b = a.clone();
+        assert_eq!(ConversationDigest::of(&a), ConversationDigest::of(&b));
+        assert!(a.messages_hash_memo.0.lock().unwrap().is_some(), "memo shared");
+        assert_eq!(
+            ConversationDigest::of(&b).messages_hash,
+            messages_hash(&a.api_messages)
+        );
+        let mut c = a.clone();
+        c.api_messages = Vec::new();
+        assert_eq!(ConversationDigest::of(&c).messages_hash, messages_hash(&[]));
+        let mut d = a.clone();
+        d.api_messages.push(Arc::new(serde_json::json!({"role":"assistant","content":"yo"})));
+        assert_eq!(
+            ConversationDigest::of(&d).messages_hash,
+            messages_hash(&d.api_messages)
+        );
     }
 
     fn env(event: SessionEventWire) -> Envelope {
@@ -1058,6 +1084,8 @@ mod tests {
                 cancel_requested: false,
                 elapsed_secs: 1.25,
                 finished_elapsed: Some(std::time::Duration::from_millis(1250)),
+                step: "$ cargo test".into(),
+                tools: 3,
             }]),
             S::Resumed { id: 2, old_id: "o".into(), new_id: "n".into(), via: Some("name".into()), clamp_notice: None },
             S::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Takeover },

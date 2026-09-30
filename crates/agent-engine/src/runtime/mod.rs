@@ -46,7 +46,7 @@ use auth::AuthMethods;
 use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
-pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+pub use types::{AgentEvent, CancelCause, LlmEvent, SessionEvent, StreamEvent, TurnCompletion};
 pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.
@@ -489,6 +489,10 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// The `SessionToolSet` retained for `host_tool_session` across stream
+    /// turns (exact activations are session-scoped). Minted empty with the
+    /// runtime and shared by `Clone`, exactly like `host_tool_session`.
+    retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
     /// Conversation/session identity this runtime serves. Keys the
     /// `on_session_start` hook injection (Phase 2 keys everything).
     /// `None` = unkeyed (workers, tests) — reads no injection.
@@ -1024,6 +1028,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
+            retained_tool_set: Default::default(),
             session_id: None,
             cwd: None,
             env: None,
@@ -3875,6 +3880,29 @@ impl Runtime {
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
         auto_approve_confirms: bool,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_tracked(
+            messages,
+            cancel,
+            steering_rx,
+            secret_prompt,
+            auto_approve_confirms,
+            TurnCompletion::new(),
+        )
+        .await
+    }
+
+    /// [`Runtime::run_stream_with_messages`] that also reports, through
+    /// `completion`, whether the turn reached its normal end (see
+    /// [`TurnCompletion`]).
+    pub async fn run_stream_tracked(
+        &self,
+        messages: Vec<crate::SharedMessage>,
+        cancel: CancellationToken,
+        steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        secret_prompt: Option<crate::tools::SecretPromptHandle>,
+        auto_approve_confirms: bool,
+        completion: TurnCompletion,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         // CP-11 fix-2 (A): the caller-facing boundary is BOUNDED. The
         // internal producer keeps an unbounded sender for API stability;
         // the relay drains it eagerly, enforces the fixed preview-delta
@@ -4016,6 +4044,7 @@ impl Runtime {
             memory_backend: self.memory_backend.clone(),
             memory_context: self.memory_tool_capability(),
             final_capture_history: final_capture_history.clone(),
+            turn_completion: completion,
             context_window: self.context_window(),
             continuation: self.continuation.clone(),
             auth,
@@ -4056,6 +4085,7 @@ impl Runtime {
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
+            retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
             extension_runtime: self.extension_runtime.clone(),
@@ -4192,6 +4222,7 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),

@@ -16,35 +16,37 @@ use super::transcript::{
     ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
 };
 
-/// Lighten (or darken, with negative `amt`) an RGB colour additively per
-/// channel, clamped. Used to derive subtle panel backgrounds from the theme.
-fn lighten(c: Color, amt: i16) -> Color {
-    if let Color::Rgb(r, g, b) = c {
-        let f = |v: u8| (v as i16 + amt).clamp(0, 255) as u8;
-        Color::Rgb(f(r), f(g), f(b))
-    } else {
-        c
-    }
+/// Replace column 0 of a card row (always a space: transcript rows start
+/// with the 3-space margin) with a heavy `┃` in `accent`, flush with the
+/// card's left edge. Width and every other column are untouched; a row that
+/// doesn't start with a space is returned as is.
+fn with_bar(line: Line<'static>, accent: Color, band: Color) -> Line<'static> {
+    let mut spans = line.spans;
+    let Some(first) = spans.first_mut() else {
+        return Line::from(spans);
+    };
+    let text = first.content.to_string();
+    let Some(rest) = text.strip_prefix(' ') else {
+        return Line::from(spans);
+    };
+    *first = Span::styled(rest.to_string(), first.style);
+    spans.insert(
+        0,
+        Span::styled("\u{2503}", Style::default().fg(accent).bg(band)),
+    );
+    Line::from(spans)
 }
 
-/// Input-panel background: the theme's `tool_input_bg`, or a subtle tint
-/// auto-derived from `bg` when it's left as `Color::Reset` (the default).
+/// Input-panel background: the theme's `tool_input_bg`, or derived from the
+/// palette when it's `Color::Reset` (see `Theme::tool_input_background`).
 fn input_panel_bg() -> Color {
-    let t = THEME.load();
-    match t.tool_input_bg {
-        Color::Reset => lighten(t.bg, 8),
-        c => c,
-    }
+    THEME.load().tool_input_background()
 }
 
-/// Output-panel background: the theme's `tool_output_bg`, or an auto-derived
-/// (slightly lighter) tint when left as `Color::Reset`.
+/// Output-panel background: the theme's `tool_output_bg`, or derived from the
+/// palette (see `Theme::tool_output_background`).
 fn output_panel_bg() -> Color {
-    let t = THEME.load();
-    match t.tool_output_bg {
-        Color::Reset => lighten(t.bg, 16),
-        c => c,
-    }
+    THEME.load().tool_output_background()
 }
 
 /// Tool panels span ~90% of the terminal, leaving ~5% margin on each side.
@@ -111,6 +113,15 @@ struct LineSink {
 }
 
 impl LineSink {
+    /// Put the heavy `┃` bar (in `accent`, on `band`) at column 0 of every
+    /// row from `start` on — a card's left edge.
+    fn bar_rows(&mut self, start: usize, accent: Color, band: Color) {
+        for line in self.lines.iter_mut().skip(start) {
+            let taken = std::mem::take(line);
+            *line = with_bar(taken, accent, band);
+        }
+    }
+
     /// Push a decoration row (Chrome). The default on purpose: misclassified
     /// chrome fails loud (missing text on copy); misattributed ranges fail
     /// quiet — so quiet requires opting in.
@@ -695,9 +706,9 @@ impl TranscriptStore {
 
                                     // Diff-style markers for edit tool
                                     let (marker, marker_color) = match k.as_str() {
-                                        "old_string" => ("−", Color::Rgb(200, 60, 60)),
-                                        "new_string" => ("+", Color::Rgb(60, 200, 80)),
-                                        _ => ("│", THEME.load().muted),
+                                        "old_string" => ("\u{2212}", THEME.load().error_color),
+                                        "new_string" => ("+", THEME.load().tool_result_ok),
+                                        _ => ("\u{258f}", THEME.load().muted),
                                     };
 
                                     let label = match k.as_str() {
@@ -1109,10 +1120,13 @@ impl TranscriptStore {
                     "low" => ("🔵", theme.event_source),
                     _ => ("📨", theme.event_icon),
                 };
-                let event_bg = Color::Rgb(30, 35, 45);
+                // Theme surface (was a fixed slate), with the severity
+                // colour as a heavy bar down the card's left edge.
+                let event_bg = theme.raised_surface(1.18);
                 let bg = Style::default().bg(event_bg);
                 // Top spacing
                 lines.push(Line::from(""));
+                let event_start = lines.len();
                 // Top padding
                 lines.push(Line::from(Span::styled(
                     format!("{:<width$}", "", width = width),
@@ -1153,6 +1167,7 @@ impl TranscriptStore {
                     format!("{:<width$}", "", width = width),
                     bg,
                 )));
+                lines.bar_rows(event_start, sev_color, event_bg);
                 lines.push(Line::from(""));
             }
         }

@@ -19,6 +19,76 @@ pub use start::SubagentStartTool;
 pub use status::SubagentStatusTool;
 pub use steer::SubagentSteerTool;
 
+/// Longest display name kept for an inline subagent.
+const MAX_LABEL_CHARS: usize = 32;
+
+/// Label for a subagent in the panel, status/collect output, completion
+/// events and the oneshot log file name. A named agent is labelled by its
+/// agent name; an inline (`system_prompt`) agent by its optional `name`,
+/// falling back to "inline".
+pub(crate) fn subagent_label(agent: Option<&str>, name: Option<&str>) -> String {
+    if let Some(agent) = agent {
+        // `resolve_agent_prompt` reads any agent containing '/' as a file
+        // path; label those by the file stem, not the whole path.
+        if agent.contains('/') {
+            return std::path::Path::new(agent)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(sanitize_label)
+                .unwrap_or_else(|| "agent".to_string());
+        }
+        return agent.to_string();
+    }
+    name.and_then(sanitize_label)
+        .unwrap_or_else(|| "inline".to_string())
+}
+
+/// Log file for a finished oneshot subagent:
+/// `<log_dir>/<timestamp>-<label>[-error].md`. Any label character outside
+/// letters, digits, `-` and `_` becomes `-`, so the file always lands directly
+/// in `log_dir` (a `plugin:agent` label or a stray separator can't redirect it).
+pub(crate) fn subagent_log_path(
+    log_dir: &std::path::Path,
+    timestamp: &str,
+    label: &str,
+    error: bool,
+) -> std::path::PathBuf {
+    let slug: String = label
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let suffix = if error { "-error" } else { "" };
+    log_dir.join(format!("{timestamp}-{slug}{suffix}.md"))
+}
+
+/// Reduce a caller-chosen name to `[A-Za-z0-9_-]` (whitespace becomes `-`),
+/// capped at [`MAX_LABEL_CHARS`]. The label ends up in a log file name and in
+/// event text, so nothing else gets through. `None` when nothing is left.
+fn sanitize_label(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.trim().chars() {
+        let c = if c.is_whitespace() { '-' } else { c };
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            continue;
+        }
+        if c == '-' && (out.is_empty() || out.ends_with('-')) {
+            continue;
+        }
+        out.push(c);
+        if out.len() == MAX_LABEL_CHARS {
+            break;
+        }
+    }
+    let out = out.trim_end_matches('-');
+    (!out.is_empty()).then(|| out.to_string())
+}
+
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
 /// (which has already had `Runtime::new()` called), then **unconditionally
 /// force** the cache TTL to `FiveMinutes`.
@@ -673,5 +743,86 @@ mod forum_worker_tests {
         let mut worker_none = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None);
         assert!(!worker_none.memory_backend_for_test().exclusive());
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::{subagent_label, subagent_log_path};
+    use std::path::Path;
+
+    #[test]
+    fn path_agent_is_labelled_by_its_file_stem() {
+        assert_eq!(subagent_label(Some("~/agents/foo.md"), None), "foo");
+        assert_eq!(
+            subagent_label(Some("/home/x/.synaps-cli/agents/my-reviewer.md"), Some("n")),
+            "my-reviewer"
+        );
+        assert_eq!(
+            subagent_label(Some("./agents/review er.md"), None),
+            "review-er"
+        );
+        assert_eq!(subagent_label(Some("~/agents/💀.md"), None), "agent");
+        // Plain and namespaced names are not paths and stay as they are.
+        assert_eq!(
+            subagent_label(Some("dev-tools:sage"), None),
+            "dev-tools:sage"
+        );
+    }
+
+    #[test]
+    fn log_path_always_lands_in_log_dir() {
+        let dir = Path::new("/tmp/synaps-logs/subagents");
+        for label in [
+            "inline",
+            "dev-tools:sage",
+            "~/agents/foo.md",
+            "../../etc/x",
+            "a\\b",
+        ] {
+            let path = subagent_log_path(dir, "20260929-224500", label, false);
+            assert_eq!(path.parent(), Some(dir), "{label:?} -> {path:?}");
+        }
+        assert_eq!(
+            subagent_log_path(dir, "20260929-224500", "dev-tools:sage", true),
+            dir.join("20260929-224500-dev-tools-sage-error.md")
+        );
+        assert_eq!(
+            subagent_log_path(dir, "20260929-224500", "spike", false),
+            dir.join("20260929-224500-spike.md")
+        );
+    }
+
+    #[test]
+    fn named_agent_keeps_its_name_and_ignores_name() {
+        assert_eq!(subagent_label(Some("spike"), Some("gif-recorder")), "spike");
+        assert_eq!(subagent_label(Some("spike"), None), "spike");
+    }
+
+    #[test]
+    fn inline_agent_uses_name_or_falls_back() {
+        assert_eq!(subagent_label(None, Some("gif-recorder")), "gif-recorder");
+        assert_eq!(subagent_label(None, None), "inline");
+        for blank in ["", "   ", "\t\n", "\u{0}", "///", "..", "💀"] {
+            assert_eq!(subagent_label(None, Some(blank)), "inline", "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn name_is_reduced_to_a_safe_label() {
+        assert_eq!(
+            subagent_label(None, Some("  Rust reviewer ")),
+            "Rust-reviewer"
+        );
+        assert_eq!(subagent_label(None, Some("a  -  b")), "a-b");
+        assert_eq!(subagent_label(None, Some("../../etc/passwd")), "etcpasswd");
+        assert_eq!(subagent_label(None, Some("it's <b>\"x\"</b>")), "its-bxb");
+        assert_eq!(subagent_label(None, Some("-lead-")), "lead");
+        assert_eq!(subagent_label(None, Some("café_1")), "caf_1");
+        let long = subagent_label(None, Some(&"x".repeat(100)));
+        assert_eq!(long.len(), 32);
+        // A cut that lands on a separator leaves no trailing dash.
+        let cut = subagent_label(None, Some(&format!("{} tail", "y".repeat(31))));
+        assert_eq!(cut, "y".repeat(31));
     }
 }

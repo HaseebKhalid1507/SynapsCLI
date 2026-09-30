@@ -138,7 +138,7 @@ C: bye | socket close = Detach (turn keeps running)
 - `WireSessionEvent` mirrors `SessionEventWire` variant-for-variant (`StreamEvent`/`TurnError`/
   `ExtensionLoaderEvent` included; round-trip test covers every variant), with **one lossy variant**:
   `Conversation` goes over the wire as a `ConversationDigest` `{messages_len, messages_hash (FNV-1a),
-  tokens, cost, abort_context, queued_message, pending_events_len, consecutive_auto_turns}` — never the
+  tokens, cost, abort_context (legacy, always null), queued_message, pending_events_len, consecutive_auto_turns}` — never the
   messages. Full `api_messages` travel only in `Attached` and `QueryResult{Messages}`. `SocketTransport`
   keeps a local mirror (seeded by `Attached`, updated by `Stream(MessageHistory)`), fills the digest in
   when the hash matches, and on a miss (compaction, abort repair, flushed events) issues one
@@ -213,12 +213,74 @@ C: bye | socket close = Detach (turn keeps running)
 - **Compaction is inline in the actor**: `Attach`/`Detach`/`Cancel` wait behind a running `compact()`;
   `SocketTransport::attach` gives up after `ATTACH_TIMEOUT` (5 s) with "attach timed out" — retry.
   Spawned compaction is day 2.
-- **Quit mid-turn saves an abort context — default path, every host.** `End{ClientQuit}` (chat's
-  stdin EOF / `/quit`, the in-process TUI's quit — never `synaps attach`, which only detaches) and `daemon stop` while a turn
-  is streaming run `finish()` → `cancel_turn()`: the turn is cancelled **and** the partial output is
-  captured as `abort_context` and saved, so the next `--continue` prepends `[ABORT CONTEXT…]` — where the
-  pre-actor TUI/chat only cancelled the token. Defensible (the model is told the previous answer was cut);
-  `/clear` or a fresh session discards it. Documented in `synaps chat /help` too.
+- **An interrupted turn is kept as real history — every cancel path, every host.** Esc/`Cancel`,
+  `End{ClientQuit}` (chat's stdin EOF / `/quit`, the in-process TUI's quit — never `synaps attach`, which
+  only detaches), `daemon stop`, a reload `Checkpoint` and the session cost cap all run `cancel_turn()`:
+  the token is cancelled, pending prompts are answered `None`, and the still-live stream is drained
+  (bounded by `budgets::CANCEL_DRAIN_TIMEOUT`, 1 s) so the engine's cancel-path history — the partial
+  assistant message (text, signed thinking, completed tool calls), every completed tool round,
+  delivered steering, a labelled canceled `tool_result` for any unfinished call — plus the final
+  `Usage` and any in-flight context-head checkpoint reach the actor. That history is adopted verbatim
+  and ONE interruption marker is appended (`engine::interrupt`: `[Request interrupted by user]`, or
+  the cost-cap / restart / host / driver variant). Nothing already sent is edited, so the provider's
+  cached prefix survives and the next request extends it. This replaces the old `abort_context` recap,
+  which re-described the model's own output inside the next user message and which current models
+  refuse as a prompt injection. Sessions saved with a recap are migrated on load (recap dropped, marker
+  appended). Documented in `synaps chat /help` too.
+  - A turn the engine had already FINISHED when the cancel reached it (Esc a moment too late) is not
+    marked: the engine records a normal end (`TurnCompletion`), the complete answer is kept as is and
+    clients get `Done`, not `Aborted`.
+  - A driver turn cut by the driver's revocation (its token is a child of the driver's) ends the same
+    way, with `[Request interrupted: session driver revoked]`: on its `Done`, its stream's end, or after
+    the same 1 s budget — never through the normal post-turn path (queued auto-send, auto-compaction).
+  - Markers are matched EXACTLY (`is_interruption_marker`): user text that merely starts like one is
+    the user's.
+  - A canceled `tool_result` names the cause the same way (`CancelCause`, noted by the host before it
+    cancels): "Canceled by user" only for the user, else e.g. "Canceled (Synaps restarted)",
+    "Canceled (session cost cap reached)", "Canceled (session driver revoked)".
+- **The session on disk follows a running turn.** The engine publishes the conversation at every
+  round boundary — the prompt before the first request, each completed tool round (every
+  `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one. Saves run
+  on the actor's background writer (`session::persister`), never inside the turn machine: latest wins
+  per session (if rounds come faster than the disk, only the newest history is written), an identical
+  snapshot is not queued twice, and every write is ordered with the others (`session_save_order`). The
+  actor waits for the writer (bounded by `SAVE_TIMEOUT`) only where the disk must be current: at
+  the end of every turn, before it announces `Idle` (so `Idle` still means "saved", as in 0.10.0),
+  before parking (a failed save keeps the session live), a durable context-head checkpoint,
+  compaction, `/resume`, `Checkpoint` and session end. A crash / `kill -9` / power loss mid-turn loses at most the
+  round in flight, and what is on disk is always a valid history to resume from.
+  Cost (`json` mode rewrites and fsyncs the whole file; measured on btrfs/NVMe with
+  `save_cost_bench` in `agent-core` — set `SYNAPS_SAVE_BENCH_DIR` to a real disk, NOT tmpfs, whose
+  fsync is free), release build, 3 runs: ~0.6–0.9 ms median for a 200 KB session, ~2.2–2.4 ms for
+  2.3 MB, ~6–7.5 ms for 10 MB, with a p95 of 5–17 ms (2.3 MB) and 9–21 ms (10 MB) and occasional
+  20–30 ms spikes (filesystem commits) — paid by the background writer, not the turn.
+  `session_persistence = journal` appends only the new messages, but at these sizes it is no cheaper
+  (each save re-hashes the saved prefix to validate it).
+  Attach replays carry no per-round `MessageHistory` or `Conversation` (the snapshot already holds the
+  latest history), and a round checkpoint drops the finished rounds' display events from the replay
+  ring, so a client attaching mid-turn sees each round once. Every other attached client learns the
+  prompt that started a user turn (`TurnStarted.user_text`; the submitter drew its own card), each
+  turn's reply opens a new text block, and a notice landing mid-reply no longer splits the reply.
+- **A turn cut off by a crash is recovered on the next load — by the session lock holder only.** While
+  a turn runs, the actor keeps a small draft `sessions/<id>.turn` (`agent_core::core::session_draft`):
+  the text of the response in flight plus the history length it continues from — written at turn
+  start, at most once per 1 Hz turn tick while text streams, and removed when the turn ends, only
+  AFTER the history that ends the turn is saved (same background writer; a removal waits for a good
+  save). 0600, confined, atomic, bounded on read; O(partial text) in either persistence mode. Only the
+  holder of the session lock writes a draft or recovers one: daemon create/unpark, `--continue` in the
+  in-process TUI, and `/resume` (which takes the new session's lock BEFORE changing anything and
+  refuses a session locked by another process or another session of the daemon). A draft found by the
+  holder means the previous holder died mid-turn: the partial text is appended as a real assistant
+  message (text only, like a cancel) followed by `[Request interrupted: Synaps stopped unexpectedly]`,
+  saved, then the draft is removed (if that save fails, the draft stays for the next holder). A leftover
+  draft of a turn that actually concluded (history already ends with the model's final reply or an
+  interruption marker) is just removed; a stale one (its round already committed) contributes no text.
+  Recovery only ever appends, so the cached prefix is untouched. rpc and `synaps server` save every
+  round but keep no draft; they DO take the session lock (`setup::lock_session`): continuing a
+  session another process has live (a TUI, the daemon, another rpc), or one already compacted into a
+  successor, is refused with the reason named, instead of running a second writer on the same
+  history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
+  lock. Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
@@ -273,8 +335,8 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    first start — not `/proc/self/exe`, which reads "(deleted)" after an in-place rebuild) or `--exe`.
 2. **Drain**: `Attach::Create` → `Refused{Busy}`, `Submit`/`SubmitPrepared`/`Compact` → `Error("daemon
    reloading; retry in a moment")`; wait ≤ `--drain-secs` for every session to be idle; then
-   `Checkpoint{Reload}` every session concurrently (≤ `SAVE_TIMEOUT`+1 s each): cancel with abort context,
-   answer prompts `None`, save, close PTYs, notice.
+   `Checkpoint{Reload}` every session concurrently (≤ `CHECKPOINT_BUDGET` each): cancel (partial history
+   kept + restart marker), answer prompts `None`, save, close PTYs, notice.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
    (continue_session = journal_id, cwd, model), keep_warm, lifecycle}`.
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
@@ -296,9 +358,9 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    `reconnect(mode)` backs off, sends `Hello{reconnect_of}` and `Attach::Existing{id, Takeover iff
    was_owner else mode}` — two reconnecting mirrors cannot both take over.
 
-**Not preserved** (stated once): in-flight turns (checkpointed = cancelled with abort context), pending
-prompts (`None`), PTY/background shells (closed, announced before exec), `turn_replay`, un-persisted
-`TurnLog`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
+**Not preserved** (stated once): in-flight turns (checkpointed = cancelled; partial history + restart
+marker kept), pending prompts (`None`), PTY/background shells (closed, announced before exec),
+`turn_replay`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
 image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
 LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
@@ -316,7 +378,7 @@ in its metadata. Attach is refused with a message naming the lock holder's pid a
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
 owner again, second turn works; older `--exe` refused with the daemon still serving; a turn in flight is
-checkpointed and its abort context comes back from the journal; `/model` + `/context` + `/system` +
+checkpointed and its partial history + restart marker come back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
 
@@ -438,12 +500,12 @@ Honest list of behaviour changes on this branch on the plain in-process path (`s
    (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the
    inline engine halves (not a verbatim copy; it has no abort/prompt/save) on **three scenarios only**:
    plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
-   queue-while-busy, cancel/abort-context, secret-prompt round-trip are asserted by actor unit tests, not
-   by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
+   queue-while-busy, cancel (history + marker), secret-prompt round-trip are asserted by actor unit
+   tests, not by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
    stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
-   One byte-level difference: **chat's abort context is now `"{ctx}\n\n{msg}"` (context first, wrapper
-   applied once — the TUI shape)** where inline chat built `"{msg}\n\n[ABORT CONTEXT…{ctx}…]"` and
-   re-wrapped; only visible on `synaps chat --continue` of an aborted session.
+   Cancel diverges from the frozen oracle by design: the oracle folds an `ABORT CONTEXT` recap into the
+   next user message; the actor keeps the interrupted turn as history plus an interruption marker
+   (`cancel_keeps_real_history_where_the_oracle_folded_a_recap` pins both sides).
 2. **MCP descriptor cache write-back is ON by default, in-process too** (`docs/mcp.md`): after the first
    `tools/list` on an exact lease the listing is written to `~/.synaps-cli/mcp-descriptors.json`, so the
    *next* boot registers dormant MCP tools it did not know before → tool list, system prompt and the
@@ -453,8 +515,9 @@ Honest list of behaviour changes on this branch on the plain in-process path (`s
 3. Hook events carry `session_id` (additive; `SYNAPS_HOOK_SESSION_ID=0`).
 4. **`synaps chat` renders typed events**: `/compact` prints `compacting...`, the disclosure line and
    `[compacted → ~N tokens]` (one each — the actor emits `CompactionStarted/Applied/Failed/Cancelled`,
-   never a "compacting..." notice); `/abort`-equivalents render `Aborted{context_saved}`, `/clear` renders
-   `Cleared{session_id}`. Quit mid-turn saves an abort context (§Lifecycle above).
+   never a "compacting..." notice); `/abort`-equivalents render `Aborted{context_saved}` (now: partial
+   work kept), `/clear` renders `Cleared{session_id}`. Quit mid-turn keeps the partial turn in history
+   (§Lifecycle above).
 
 ## Memory acceptance — `DAEMON=1 SYNAPS_DAEMON=1 scripts/memprof/bench-sessions.sh BIN 1 2 3`
 

@@ -551,6 +551,132 @@ mod tier1 {
         child.shutdown().await.expect("clean shutdown");
     }
 
+    /// `rpc --continue X` while another process has X live (holds its
+    /// session lock) is REFUSED — no second writer on the same history. It
+    /// used to run anyway, and its saves overwrote the owner's. Once the
+    /// owner exits, continuing works.
+    #[tokio::test]
+    async fn continue_refuses_a_session_live_elsewhere() {
+        let shared_home = TempDir::new().expect("TempDir");
+        let home_path = shared_home.path().to_path_buf();
+        let sessions = home_path.join(".synaps-cli").join("sessions");
+        let mut session =
+            synaps_cli::core::session::Session::new("claude-sonnet-4-5", "low", None);
+        session.api_messages = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": "held elsewhere"}),
+        )];
+        synaps_cli::core::session_journal::save_session_in_dir(
+            &sessions,
+            &session,
+            synaps_cli::core::session_journal::SessionPersistence::Json,
+        )
+        .expect("seed session");
+        let id = session.id.clone();
+
+        let mut owner = RpcChild::spawn_with_home(
+            &["--continue", &id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn owner");
+        let ready = owner.recv().await.expect("owner Ready");
+        assert_eq!(ready["session_id"], id.as_str());
+
+        let mut second = RpcChild::spawn_with_home(
+            &["--continue", &id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn second");
+        let refused = second.recv_timeout(Duration::from_secs(20)).await;
+        assert!(refused.is_err(), "second writer started: {refused:?}");
+        let status = timeout(Duration::from_secs(10), second.child.wait())
+            .await
+            .expect("second exits")
+            .expect("wait");
+        assert!(!status.success(), "refused → non-zero exit");
+
+        owner.shutdown().await.expect("owner shutdown");
+        let mut next = RpcChild::spawn_with_home(
+            &["--continue", &id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn after owner");
+        let ready = next.recv().await.expect("Ready once the owner is gone");
+        assert_eq!(ready["session_id"], id.as_str());
+        next.shutdown().await.expect("shutdown");
+    }
+
+    /// rpc holds the session lock now, so it is the one to recover a turn
+    /// its previous holder died in: the partial reply comes back, then the
+    /// crash marker, and the draft is gone.
+    #[tokio::test]
+    async fn continue_recovers_a_turn_cut_by_a_crash() {
+        let shared_home = TempDir::new().expect("TempDir");
+        let home_path = shared_home.path().to_path_buf();
+        let sessions = home_path.join(".synaps-cli").join("sessions");
+        let mut session =
+            synaps_cli::core::session::Session::new("claude-sonnet-4-5", "low", None);
+        session.api_messages = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": "write me an essay"}),
+        )];
+        synaps_cli::core::session_journal::save_session_in_dir(
+            &sessions,
+            &session,
+            synaps_cli::core::session_journal::SessionPersistence::Json,
+        )
+        .expect("seed session");
+        synaps_cli::core::session_draft::write_turn_draft(
+            &sessions,
+            &session.id,
+            &synaps_cli::core::session_draft::TurnDraft {
+                base_len: 1,
+                partial_text: "Once upon a".into(),
+            },
+        )
+        .expect("seed draft");
+
+        let mut child = RpcChild::spawn_with_home(
+            &["--continue", &session.id],
+            &home_path,
+            TempDir::new().expect("dummy"),
+        )
+        .await
+        .expect("spawn");
+        child.recv().await.expect("Ready");
+        child
+            .send(&json!({"type": "get_messages", "id": "gm"}))
+            .await
+            .expect("send");
+        let resp = child.recv().await.expect("get_messages");
+        let texts: Vec<String> = resp["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| match &m["content"] {
+                Value::String(s) => s.clone(),
+                other => other[0]["text"].as_str().unwrap_or("").to_string(),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "write me an essay",
+                "Once upon a",
+                "[Request interrupted: Synaps stopped unexpectedly]"
+            ]
+        );
+        assert!(
+            !sessions.join(format!("{}.turn", session.id)).exists(),
+            "draft removed"
+        );
+        child.shutdown().await.expect("shutdown");
+    }
+
     /// `--continue <id>` resumes an existing session:
     /// * session_id is preserved across restart
     /// * model set in session A is preserved in session B (via Ready frame)
@@ -990,6 +1116,31 @@ mod tier2 {
             }
         }
 
+        // The aborted turn is recorded as history + the interruption marker
+        // (never a recap folded into the next prompt). `Abort` awaits the
+        // stream task, so the marker is in place once both responses landed.
+        let mut last_message = None;
+        if saw_abort_response && saw_prompt_response {
+            child
+                .send(&json!({"type": "get_messages", "id": "gm2"}))
+                .await
+                .expect("send get_messages");
+            for _ in 0..30 {
+                let Ok(frame) = child.recv_timeout(Duration::from_secs(10)).await else {
+                    break;
+                };
+                if frame["type"] == "response" && frame["command"] == "get_messages" {
+                    let messages = frame["messages"].as_array().cloned().unwrap_or_default();
+                    assert!(
+                        !serde_json::to_string(&messages).unwrap().contains("ABORT CONTEXT"),
+                        "no recap in history: {messages:?}"
+                    );
+                    last_message = messages.last().cloned();
+                    break;
+                }
+            }
+        }
+
         let _ = child.shutdown().await;
 
         assert!(
@@ -1000,6 +1151,9 @@ mod tier2 {
             saw_prompt_response,
             "expected Response {{ command: prompt }} after abort"
         );
+        let last = last_message.expect("get_messages response");
+        assert_eq!(last["role"], "user", "{last}");
+        assert_eq!(last["content"], "[Request interrupted by user]", "{last}");
     }
 
     /// `NewSession` while a stream is in-flight must be rejected with an

@@ -32,7 +32,7 @@ struct ServerState {
     allowed_origins: Vec<String>,
     /// Engine-level conversation state — single source of truth for
     /// session, api_messages, token counters (including cache_read /
-    /// cache_creation), cost, abort_context, queued_message,
+    /// cache_creation), cost, queued_message,
     /// pending_events. Replaces 5 separate RwLocks that diverged from
     /// engine pricing and silently dropped cache tokens.
     conv: RwLock<ConversationState>,
@@ -68,6 +68,9 @@ struct ServerState {
     consecutive_auto_turns: std::sync::atomic::AtomicU32,
     /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
     auto_turn_cap: u32,
+    /// The session lock (`setup::lock_session`); follows the conversation to
+    /// a new id (`/clear`). `None` = proceeding unlocked (best-effort).
+    session_lock: std::sync::Mutex<Option<synaps_cli::core::session_lock::SessionLock>>,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -213,13 +216,20 @@ pub async fn run(
         }
     });
 
+    // Refuse to continue a session another process has live; lock ours.
+    let session_lock = setup::lock_session(&boot.session.id, boot.continued, "server")
+        .context("cannot continue this session")?;
     let runtime = boot.runtime;
-    let initial_history = rebuild_history(&boot.api_messages);
-    let conv = if boot.continued {
+    let mut conv = if boot.continued {
         ConversationState::from_resumed(boot.session)
     } else {
         ConversationState::new(boot.session)
     };
+    // The lock holder recovers a turn the previous holder died in.
+    if boot.continued && session_lock.is_some() {
+        setup::recover_turn_draft(&mut conv).await;
+    }
+    let initial_history = rebuild_history(&conv.api_messages);
 
     let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
@@ -293,6 +303,7 @@ pub async fn run(
         auto_turn_tx,
         consecutive_auto_turns: std::sync::atomic::AtomicU32::new(0),
         auto_turn_cap,
+        session_lock: std::sync::Mutex::new(session_lock),
     });
 
     // ── Event drainer task (exactly one per Runtime) ──────────────────────
@@ -782,11 +793,22 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         let mut turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
+        let cancel_check = cancel.clone();
+        // Set by the engine at the turn's normal end: a Cancel that lands
+        // after it is not an interruption (`finish_cancelled_turn`).
+        let turn_completion = agent_engine::runtime::TurnCompletion::new();
 
         let mut stream = {
             let rt = state.runtime.lock().await;
-            rt.run_stream_with_messages(messages, cancel, None, None, state.auto_approve_confirms)
-                .await
+            rt.run_stream_tracked(
+                messages,
+                cancel,
+                None,
+                None,
+                state.auto_approve_confirms,
+                turn_completion.clone(),
+            )
+            .await
         };
 
         // Inner loop — process events from this turn's stream.
@@ -807,6 +829,13 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             // process_stream_event mutates conv fields in place. Hold the
             // write lock only for the call itself, then release before
             // broadcast / display_history work to keep latency low.
+            // A round checkpoint (or the final history): persist it now so
+            // the session on disk follows the turn as it progresses.
+            let is_history = matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_)));
+            // Events buffered during a CANCELLED turn go in after its marker
+            // (as in the session actor), so the terminal event must not flush
+            // them first.
+            let mut deferred_events: Vec<String> = Vec::new();
             let (engine_event, completion) = {
                 let mut conv = state.conv.write().await;
                 let conv = &mut *conv;
@@ -815,6 +844,14 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                         continue;
                     }
                     turn_baseline = conv.api_messages.len();
+                }
+                if cancel_check.is_cancelled()
+                    && matches!(
+                        event,
+                        StreamEvent::Session(SessionEvent::Done | SessionEvent::Error(_))
+                    )
+                {
+                    deferred_events = std::mem::take(&mut conv.pending_events);
                 }
                 stream::process_stream_event(
                     event,
@@ -826,10 +863,37 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                 )
             };
 
+            if is_history {
+                // Bounded: this save holds the conversation lock every other
+                // client waits on. A write already handed to the disk still
+                // lands, in order; the turn's final save below is unbounded.
+                if tokio::time::timeout(
+                    agent_engine::session::budgets::SAVE_TIMEOUT,
+                    state.save_session(),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("server: round checkpoint save timed out");
+                }
+            }
             apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
 
             if let Some(msg) = engine_event_to_server_message(engine_event) {
                 let _ = broadcast.send(msg);
+            }
+
+            // `ClientMessage::Cancel`: whatever terminal the cancelled stream
+            // produced, the turn ends here — marked, saved, and never
+            // continued into a queued auto-send or an auto-triggered turn.
+            if cancel_check.is_cancelled() && !matches!(completion, StreamCompletion::Continue) {
+                if let StreamCompletion::AutoSendQueued(ref queued) = completion {
+                    let _ = broadcast.send(ServerMessage::System {
+                        message: format!("dequeued: {queued}"),
+                    });
+                }
+                finish_cancelled_turn(state, &turn_completion, deferred_events).await;
+                break 'turn;
             }
 
             match completion {
@@ -896,6 +960,10 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         // Stream ended without an explicit completion (network drop or
         // similar). Save and exit — don't loop forever waiting for events
         // that won't come.
+        if cancel_check.is_cancelled() {
+            finish_cancelled_turn(state, &turn_completion, Vec::new()).await;
+            break 'turn;
+        }
         state.save_session().await;
         break 'turn;
     }
@@ -1187,11 +1255,22 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
         let mut turn_baseline = messages.len();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
+        let cancel_check = cancel.clone();
+        // Set by the engine at the turn's normal end: a Cancel that lands
+        // after it is not an interruption (`finish_cancelled_turn`).
+        let turn_completion = agent_engine::runtime::TurnCompletion::new();
 
         let mut stream = {
             let rt = state.runtime.lock().await;
-            rt.run_stream_with_messages(messages, cancel, None, None, state.auto_approve_confirms)
-                .await
+            rt.run_stream_tracked(
+                messages,
+                cancel,
+                None,
+                None,
+                state.auto_approve_confirms,
+                turn_completion.clone(),
+            )
+            .await
         };
 
         while let Some(event) = stream.next().await {
@@ -1208,6 +1287,13 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
             }
             let ts = ServerState::timestamp();
 
+            // A round checkpoint (or the final history): persist it now so
+            // the session on disk follows the turn as it progresses.
+            let is_history = matches!(event, StreamEvent::Session(SessionEvent::MessageHistory(_)));
+            // Events buffered during a CANCELLED turn go in after its marker
+            // (as in the session actor), so the terminal event must not flush
+            // them first.
+            let mut deferred_events: Vec<String> = Vec::new();
             let (engine_event, completion) = {
                 let mut conv = state.conv.write().await;
                 let conv = &mut *conv;
@@ -1216,6 +1302,14 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                         continue;
                     }
                     turn_baseline = conv.api_messages.len();
+                }
+                if cancel_check.is_cancelled()
+                    && matches!(
+                        event,
+                        StreamEvent::Session(SessionEvent::Done | SessionEvent::Error(_))
+                    )
+                {
+                    deferred_events = std::mem::take(&mut conv.pending_events);
                 }
                 stream::process_stream_event(
                     event,
@@ -1227,10 +1321,37 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                 )
             };
 
+            if is_history {
+                // Bounded: this save holds the conversation lock every other
+                // client waits on. A write already handed to the disk still
+                // lands, in order; the turn's final save below is unbounded.
+                if tokio::time::timeout(
+                    agent_engine::session::budgets::SAVE_TIMEOUT,
+                    state.save_session(),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("server: round checkpoint save timed out");
+                }
+            }
             apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
 
             if let Some(msg) = engine_event_to_server_message(engine_event) {
                 let _ = broadcast.send(msg);
+            }
+
+            // `ClientMessage::Cancel`: whatever terminal the cancelled stream
+            // produced, the turn ends here — marked, saved, and never
+            // continued into a queued auto-send or an auto-triggered turn.
+            if cancel_check.is_cancelled() && !matches!(completion, StreamCompletion::Continue) {
+                if let StreamCompletion::AutoSendQueued(ref queued) = completion {
+                    let _ = broadcast.send(ServerMessage::System {
+                        message: format!("dequeued: {queued}"),
+                    });
+                }
+                finish_cancelled_turn(state, &turn_completion, deferred_events).await;
+                break 'turn;
             }
 
             match completion {
@@ -1284,11 +1405,46 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
             }
         }
 
+        if cancel_check.is_cancelled() {
+            finish_cancelled_turn(state, &turn_completion, Vec::new()).await;
+            break 'turn;
+        }
         state.save_session().await;
         break 'turn;
     }
 
     *state.cancel_token.write().await = None;
+}
+
+/// A turn ended by `ClientMessage::Cancel`. `process_stream_event` already
+/// adopted the engine's cancel-path history (partial assistant message,
+/// completed tool rounds, canceled results); append the interruption marker
+/// after it — append-only, so the provider's cached prefix is untouched —
+/// then the events buffered during the turn (`deferred`, then any still
+/// pending), exactly like the session actor, and save. A turn the engine had
+/// already finished when the cancel reached it gets no marker.
+async fn finish_cancelled_turn(
+    state: &Arc<ServerState>,
+    completion: &agent_engine::runtime::TurnCompletion,
+    deferred: Vec<String>,
+) {
+    {
+        let mut conv = state.conv.write().await;
+        let conv = &mut *conv;
+        if !completion.completed() {
+            agent_engine::engine::interrupt::append_marker(
+                &mut conv.api_messages,
+                agent_engine::engine::interrupt::InterruptReason::User,
+            );
+        }
+        let pending = std::mem::take(&mut conv.pending_events);
+        for formatted in deferred.into_iter().chain(pending) {
+            conv.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": formatted}),
+            ));
+        }
+    }
+    state.save_session().await;
 }
 
 /// Run an engine command and mirror any model/thinking change into `conv`
@@ -1515,6 +1671,13 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 let rt = state.runtime.lock().await;
                 let mut conv = state.conv.write().await;
                 conv.clear(&rt).await;
+                // The lock follows the conversation to its new id: new one
+                // first, then the old one is released (assignment drops it).
+                let lock = setup::lock_session(&conv.session.id, false, "server").unwrap_or(None);
+                *state
+                    .session_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = lock;
             }
             state.display_history.write().await.clear();
             let _ = broadcast.send(ServerMessage::System {

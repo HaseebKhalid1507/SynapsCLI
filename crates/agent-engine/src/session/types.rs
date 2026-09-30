@@ -477,8 +477,8 @@ pub enum CheckpointReason {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SessionCommand {
-    /// User-authored prompt. Actor: reset auto-turn counter, fold
-    /// abort_context, push user msg, start turn.
+    /// User-authored prompt. Actor: reset auto-turn counter, push user msg
+    /// verbatim, start turn.
     Submit {
         text: String,
         /// Pre-built canonical user content blocks (images, documents)
@@ -490,8 +490,9 @@ pub enum SessionCommand {
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
     Steer { text: String },
-    /// Esc. Cancel, capture abort context, dequeue, flush pending events,
-    /// cancel subagents, save.
+    /// Esc. Cancel, adopt the turn's partial history + append the
+    /// interruption marker (`engine::interrupt`), dequeue, flush pending
+    /// events, cancel subagents, save.
     Cancel,
     /// Answer to a PromptRequest. `None` = cancelled.
     /// NEVER journaled, NEVER replayed, NEVER traced.
@@ -516,8 +517,8 @@ pub enum SessionCommand {
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
     /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair
-    /// (+ optional user text) then a turn. Does NOT fold abort_context and
-    /// does NOT reset consecutive_auto_turns.
+    /// (+ optional user text) then a turn. Does NOT reset
+    /// consecutive_auto_turns.
     SubmitPrepared {
         messages: Vec<crate::SharedMessage>,
         #[serde(default)]
@@ -529,7 +530,7 @@ pub enum SessionCommand {
     /// (A3) `/resume`: save current, load `query`, restore model/reasoning/
     /// system prompt, swap conversation. Reply = `Resumed{id, ..}`.
     Resume { id: u64, query: String },
-    /// (B1, used by C3 reload) cancel any turn (abort_context captured),
+    /// (B1, used by C3 reload) cancel any turn (partial history + marker),
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
@@ -756,8 +757,11 @@ pub enum EndReason {
 pub enum SessionEventWire {
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
-    /// `user_text` = the queued text on `QueuedAuto` (TUI pushes the User
-    /// card + scroll); `None` otherwise.
+    /// `user_text` = the prompt that started the turn: the queued text on
+    /// `QueuedAuto` (every client pushes the User card + scroll), the
+    /// submitted text on `User` (clients OTHER than the submitter push the
+    /// card; the submitter drew it at submit); `None` otherwise. The attach
+    /// replay ring stores it as `None` (the snapshot's history has it).
     TurnStarted {
         turn_baseline: usize,
         trigger: TurnTrigger,
@@ -798,7 +802,8 @@ pub enum SessionEventWire {
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     /// Cancel landed. TUI: drop_empty_thinking, push Error(abort_msg),
-    /// subagents.clear(), streaming=false.
+    /// subagents.clear(), streaming=false. `context_saved` (name kept for
+    /// protocol v3): the interrupted turn's partial work is kept in history.
     Aborted { context_saved: bool },
     /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
     Cleared { session_id: String },
@@ -911,6 +916,46 @@ pub struct ConversationTokens {
     pub cache_creation: u64,
 }
 
+/// Memo of `wire::messages_hash(api_messages)` shared by every clone of one
+/// snapshot: the daemon converts a `Conversation` to its wire digest once
+/// per socket client, and hashing serialises the whole history — now once
+/// per event, not once per client. Keyed on the history's length and last
+/// message identity (histories only grow), so a snapshot whose messages are
+/// replaced afterwards recomputes instead of reusing a stale hash.
+#[derive(Clone, Default)]
+pub struct MessagesHashMemo(pub(crate) std::sync::Arc<std::sync::Mutex<Option<HashedHistory>>>);
+
+/// `(len, last message, hash)` of the history a memo was computed for.
+type HashedHistory = (usize, Option<crate::SharedMessage>, u64);
+
+impl MessagesHashMemo {
+    pub fn hash(&self, messages: &[crate::SharedMessage]) -> u64 {
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((len, last, hash)) = memo.as_ref() {
+            let same_last = match (last, messages.last()) {
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if *len == messages.len() && same_last {
+                return *hash;
+            }
+        }
+        let hash = super::wire::messages_hash(messages);
+        *memo = Some((messages.len(), messages.last().cloned(), hash));
+        hash
+    }
+}
+
+impl std::fmt::Debug for MessagesHashMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MessagesHashMemo")
+    }
+}
+
 /// Serializable mirror of `ConversationState` (+ the actor's auto-turn
 /// counter). Clients MUST replace, never merge, on `Conversation(_)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -925,10 +970,15 @@ pub struct ConversationSnapshot {
     pub messages_len: usize,
     pub tokens: ConversationTokens,
     pub cost: f64,
+    /// Legacy (protocol v3 shape kept): always `None` — an interrupted turn
+    /// is recorded in `api_messages` (`engine::interrupt`), never as a recap.
     pub abort_context: Option<String>,
     pub queued_message: Option<String>,
     pub pending_events_len: usize,
     pub consecutive_auto_turns: u32,
+    /// Never serialised; see `MessagesHashMemo`.
+    #[serde(skip)]
+    pub messages_hash_memo: MessagesHashMemo,
 }
 
 /// `Session` minus `api_messages` and accounting: what a client mirrors.
@@ -978,6 +1028,28 @@ pub struct AttachSnapshot {
     /// Daemon-projected display tail — `Some` iff the client attached with
     /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
     pub display_tail: Option<crate::session::display::DisplayTail>,
+}
+
+impl AttachSnapshot {
+    /// For the client this snapshot was made for (`me`): who owns input, if
+    /// someone else does — "input is owned by client #1 (tui); attach with
+    /// --takeover to steal it". Rendered by each client from its OWN
+    /// snapshot; the actor used to broadcast it as a `SystemNotice`, which
+    /// every attached client (the owner included) and later attach replays
+    /// showed.
+    pub fn input_owned_elsewhere(&self, me: ClientId) -> Option<String> {
+        let owner = self.input_owner.filter(|o| *o != me)?;
+        let kind = self
+            .clients
+            .iter()
+            .find(|(c, _)| *c == owner)
+            .map(|(_, k)| format!("{k:?}").to_lowercase())
+            .unwrap_or_else(|| "?".into());
+        Some(format!(
+            "input is owned by client #{} ({kind}); attach with --takeover to steal it",
+            owner.0
+        ))
+    }
 }
 
 /// `ReasoningLevel` has no serde impls in agent-core; go through its

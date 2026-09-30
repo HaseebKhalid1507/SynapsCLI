@@ -167,6 +167,17 @@ define_settings! {
             SettingApply::Local(Ok(()))
         };
 
+    "tui_streaming_glow", "Streaming glow", Appearance, EditorKind::Cycler(&["on", "off"]),
+        "A soft glow in the context bar's colour sweeps across the prompt while a reply streams.",
+        |_app, value| {
+            match value {
+                "on" => super::super::neon_prompt::set_streaming_glow(true),
+                "off" => super::super::neon_prompt::set_streaming_glow(false),
+                _ => return SettingApply::Local(Err("expected on or off".to_string())),
+            }
+            SettingApply::Local(Ok(()))
+        };
+
     "theme_transition", "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
         "Animated cross-fade on theme changes (on = 350ms). Off = instant snap. Integer ms (0-2000) accepted in the config file.",
         |_app, value| {
@@ -250,6 +261,19 @@ mod tests {
         match def.editor {
             EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
             _ => panic!("theme_transition editor should be a Cycler"),
+        }
+    }
+
+    #[test]
+    fn streaming_glow_setting_is_an_appearance_cycler() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "tui_streaming_glow")
+            .expect("tui_streaming_glow setting should be defined");
+        assert_eq!(def.category, Category::Appearance);
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
+            _ => panic!("tui_streaming_glow editor should be a Cycler"),
         }
     }
 

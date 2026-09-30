@@ -608,23 +608,32 @@ fn delete_file(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
     Ok(())
 }
 
-/// True when `path` is a Task 35 session journal whose snapshot sibling
-/// still exists — such a journal is handled WITH its `.json` artifact,
-/// never as an independent retention candidate.
+/// Files that belong to a session snapshot `<id>.json` and live and die
+/// with it: the Task 35 journal and the in-flight turn draft
+/// (`session_draft`, `<id>.turn`).
+const PAIRED_SESSION_EXTENSIONS: [&str; 2] = ["journal", "turn"];
+
+/// True when `path` is a journal or turn draft whose snapshot sibling still
+/// exists — such a file is handled WITH its `.json` artifact, never as an
+/// independent retention candidate.
 fn is_paired_journal(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("journal")
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| PAIRED_SESSION_EXTENSIONS.contains(&e))
         && path.with_extension("json").exists()
 }
 
 /// Delete a session artifact: the file plus, for `.json` snapshots, any
-/// sibling journal (Task 35 — a session and its journal die together, so a
-/// sweep can never orphan journal state).
+/// sibling journal and turn draft (Task 35 — a session and its journal die
+/// together, so a sweep can never orphan journal state).
 fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
     delete_file(path, outcome)?;
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        let journal = path.with_extension("journal");
-        if journal.exists() {
-            delete_file(&journal, outcome)?;
+        for ext in PAIRED_SESSION_EXTENSIONS {
+            let paired = path.with_extension(ext);
+            if paired.exists() {
+                delete_file(&paired, outcome)?;
+            }
         }
     }
     Ok(())
@@ -857,15 +866,18 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
                 .sessions_dir()
                 .join(format!("{}.json", file.display()));
             fs::remove_file(path)?;
-            // Pair-delete the opt-in journal (Task 35) — forgetting a
-            // session must not leave replayable journal state behind.
-            let journal = roots
-                .sessions_dir()
-                .join(format!("{}.journal", file.display()));
-            match fs::remove_file(journal) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                other => other,
+            // Pair-delete the opt-in journal (Task 35) and any turn draft —
+            // forgetting a session must not leave replayable state behind.
+            for ext in PAIRED_SESSION_EXTENSIONS {
+                let paired = roots
+                    .sessions_dir()
+                    .join(format!("{}.{ext}", file.display()));
+                match fs::remove_file(paired) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    other => other?,
+                }
             }
+            Ok(())
         }
         RetentionDomain::Traces => {
             // Nested relative addressing with validated components and

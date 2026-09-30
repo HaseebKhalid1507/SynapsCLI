@@ -345,10 +345,9 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         snapshot.meta.id,
         transport.client_id().0,
         transport.mode(),
-        match snapshot.input_owner {
-            Some(owner) if owner != transport.client_id() =>
-                format!(" — input is owned by client #{}", owner.0),
-            _ => String::new(),
+        match snapshot.input_owned_elsewhere(transport.client_id()) {
+            Some(owned) => format!(" — {owned}"),
+            None => String::new(),
         }
     )));
     // Mid-turn attach: rebuild the partial turn from the replay ring, then

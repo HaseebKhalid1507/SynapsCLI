@@ -13,6 +13,7 @@ pub mod client_args;
 pub mod display;
 pub mod driver;
 pub mod handle;
+mod persister;
 pub mod socket_transport;
 pub mod transport;
 pub mod types;

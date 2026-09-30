@@ -7,9 +7,11 @@ use std::time::Duration;
 use super::DaemonState;
 use crate::session::{EndReason, SessionCommand};
 
-/// `session::budgets::TEARDOWN_TIMEOUT_SECS` (SAVE + HOOKS); shared across
-/// all sessions, not ×N.
-pub const SESSION_END_BUDGET: Duration = Duration::from_secs(crate::session::budgets::TEARDOWN_TIMEOUT_SECS);
+/// `session::budgets::SESSION_END_TIMEOUT_SECS`: the worst case of one
+/// session's `finish` (cancelled-turn drain, save, hooks, observability
+/// flush); sessions end concurrently, so it is shared, not ×N.
+pub const SESSION_END_BUDGET: Duration =
+    Duration::from_secs(crate::session::budgets::SESSION_END_TIMEOUT_SECS);
 /// `--force`: give the actors this long, then drop them.
 pub const FORCE_BUDGET: Duration = Duration::from_millis(500);
 

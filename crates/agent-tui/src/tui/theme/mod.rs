@@ -84,8 +84,9 @@ pub(crate) struct Theme {
     pub(crate) event_critical: Color,
 
     // Tool styling — per-tool gutter/accent colours + panel backgrounds.
-    // `tool_input_bg`/`tool_output_bg` default to `Color::Reset`, which means
-    // "auto-derive a subtle tint from `bg`"; set them in a theme to override.
+    // `tool_input_bg`/`tool_output_bg` set to `Color::Reset` mean "derive from
+    // this palette" (see `Theme::tool_input_background`); the default theme
+    // sets them explicitly, and a theme file can override either.
     pub(crate) tool_bash: Color,
     pub(crate) tool_read: Color,
     pub(crate) tool_write: Color,
@@ -217,6 +218,12 @@ impl Theme {
         self.message_bg
     }
 
+    /// A builtin palette by name, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn builtin_for_test(name: &str) -> Self {
+        Self::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin theme"))
+    }
+
     /// Dispatcher for builtin themes
     fn builtin(name: &str) -> Option<Self> {
         match name {
@@ -336,6 +343,114 @@ impl Theme {
             }
             _ => {} // unknown key, ignore
         }
+    }
+}
+
+/// WCAG 2 contrast ratio between two colours; non-RGB colours count as black.
+fn wcag_contrast(a: Color, b: Color) -> f64 {
+    fn lum(c: Color) -> f64 {
+        let Color::Rgb(r, g, b) = c else {
+            return 0.0;
+        };
+        let lin = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    }
+    let (la, lb) = (lum(a), lum(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Tool-card panels derived from a palette: how far each stands off the
+/// transcript canvas (WCAG contrast). Matched to the default theme's
+/// hand-tuned pair (argument panel 1.14, result panel 1.31), which keeps the
+/// two visibly distinct through SSH → tmux.
+const TOOL_INPUT_CONTRAST: f64 = 1.14;
+const TOOL_OUTPUT_CONTRAST: f64 = 1.31;
+
+impl Theme {
+    /// A raised surface on the chrome (`bg`), for selected rows and popups in
+    /// modals (Noodle's `backgroundElement`): `bg` lifted toward `input_fg`
+    /// just until it stands `step` off the chrome (WCAG contrast).
+    pub(crate) fn raised_surface(&self, step: f64) -> Color {
+        let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (self.bg, self.input_fg) else {
+            return self.bg;
+        };
+        let mut out = self.bg;
+        for i in 1..=80u8 {
+            let t = f64::from(i) * 0.005;
+            let mix =
+                |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+            out = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+            if wcag_contrast(out, self.bg) >= step {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Tool-card argument panel: the explicit `tool_input_bg`, or derived
+    /// from this palette when it is `Color::Reset`.
+    pub(crate) fn tool_input_background(&self) -> Color {
+        self.tool_panel(self.tool_input_bg, TOOL_INPUT_CONTRAST)
+    }
+
+    /// Tool-card result panel: the explicit `tool_output_bg`, or derived
+    /// (one step further off the canvas than the argument panel).
+    pub(crate) fn tool_output_background(&self) -> Color {
+        self.tool_panel(self.tool_output_bg, TOOL_OUTPUT_CONTRAST)
+    }
+
+    /// The canvas lifted toward the palette's own assistant text colour until
+    /// it reaches `target`, so panels carry the palette's hue (green on
+    /// phosphor, amber on amber) instead of a foreign slate.
+    fn tool_panel(&self, explicit: Color, target: f64) -> Color {
+        if explicit != Color::Reset {
+            return explicit;
+        }
+        let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) =
+            (self.message_background(), self.claude_text)
+        else {
+            return self.bg;
+        };
+        let canvas = Color::Rgb(r, g, b);
+        let mut out = canvas;
+        for step in 1..=80u8 {
+            let t = f64::from(step) * 0.005;
+            let mix =
+                |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+            out = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+            if wcag_contrast(out, canvas) >= target {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Secondary text on the chrome (`bg`): `muted` lifted toward `input_fg`
+    /// just until it reads at 4.5:1 (WCAG AA). Several palettes' `muted` and
+    /// `help_fg` sit near 2:1 on chrome, which is the "dimmed text is low
+    /// contrast" note from the Ratatui showcase review.
+    pub(crate) fn chrome_dim(&self) -> Color {
+        let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (self.muted, self.input_fg) else {
+            return self.muted;
+        };
+        for step in 0..=20u8 {
+            let t = f64::from(step) / 20.0;
+            let mix =
+                |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+            let c = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+            if wcag_contrast(c, self.bg) >= 4.5 {
+                return c;
+            }
+        }
+        self.input_fg
     }
 }
 
@@ -573,11 +688,75 @@ mod theme_tests {
 
     #[test]
     fn builtin_palettes_use_reset_tool_colors() {
-        // Other palettes should NOT inherit neon — they get Reset via Default.
+        // Other palettes should NOT inherit neon — they get Reset via Default —
+        // and their tool panels derive from the palette, not the default's
+        // slate.
         let t = Theme::builtin("dracula").expect("dracula exists");
         assert_eq!(t.tool_bash, Color::Reset);
-        assert_eq!(t.tool_input_bg, Color::Rgb(23, 28, 40));
-        assert_eq!(t.tool_output_bg, Color::Rgb(32, 40, 55));
+        assert_eq!(t.tool_input_bg, Color::Reset);
+        assert_eq!(t.tool_output_bg, Color::Reset);
+    }
+
+    /// Every builtin's tool panels: the default keeps its hand-tuned pair;
+    /// every other palette derives a pair in its own hue that stands off the
+    /// canvas like the default's does, with the result panel a clear step
+    /// beyond the argument panel.
+    #[test]
+    fn tool_panels_follow_each_palette() {
+        let d = Theme::default();
+        assert_eq!(d.tool_input_background(), Color::Rgb(23, 28, 40));
+        assert_eq!(d.tool_output_background(), Color::Rgb(32, 40, 55));
+        for name in [
+            "night-city",
+            "neon-rain",
+            "amber",
+            "phosphor",
+            "solarized-dark",
+            "blood",
+            "ocean",
+            "rose-pine",
+            "nord",
+            "dracula",
+            "monokai",
+            "gruvbox",
+            "catppuccin",
+            "tokyo-night",
+            "sunset",
+            "ice",
+            "forest",
+            "lavender",
+        ] {
+            let t = Theme::builtin(name).unwrap();
+            let canvas = t.message_background();
+            let (i, o) = (t.tool_input_background(), t.tool_output_background());
+            assert_ne!(i, Color::Rgb(23, 28, 40), "{name}: not the default slate");
+            let (ci, co) = (wcag_contrast(i, canvas), wcag_contrast(o, canvas));
+            assert!((1.12..1.30).contains(&ci), "{name}: input step {ci:.3}");
+            assert!(
+                co >= 1.28 && co - ci >= 0.1,
+                "{name}: output {co:.3} vs input {ci:.3}"
+            );
+        }
+        // myx is untouched: its panels are Myx's own surfaces, verbatim.
+        let m = Theme::builtin("myx").unwrap();
+        assert_eq!(
+            m.tool_input_background(),
+            Color::Rgb(0x1e, 0x20, 0x30),
+            "myx panel"
+        );
+        assert_eq!(
+            m.tool_output_background(),
+            Color::Rgb(0x22, 0x24, 0x36),
+            "myx element"
+        );
+        // The case that was reported: phosphor's panels are green, not slate.
+        let p = Theme::builtin("phosphor").unwrap();
+        for c in [p.tool_input_background(), p.tool_output_background()] {
+            let Color::Rgb(r, g, b) = c else {
+                unreachable!()
+            };
+            assert!(g > r && g > b, "phosphor panel {c:?} should be green");
+        }
     }
 
     // ---- Per-part chrome overrides (P19.1) --------------------------------
@@ -973,3 +1152,44 @@ mod message_canvas_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod chrome_dim_tests {
+    use super::*;
+
+    #[test]
+    fn chrome_dim_reads_at_aa_on_every_builtin_and_stays_below_text() {
+        for name in [
+            "default",
+            "night-city",
+            "neon-rain",
+            "amber",
+            "phosphor",
+            "solarized-dark",
+            "blood",
+            "ocean",
+            "rose-pine",
+            "nord",
+            "dracula",
+            "monokai",
+            "myx",
+            "gruvbox",
+            "catppuccin",
+            "tokyo-night",
+            "sunset",
+            "ice",
+            "forest",
+            "lavender",
+        ] {
+            let t = Theme::builtin_for_test(name);
+            let dim = t.chrome_dim();
+            let c = wcag_contrast(dim, t.bg);
+            assert!(c >= 4.5, "{name}: chrome_dim {c:.2}");
+            assert!(
+                c <= wcag_contrast(t.input_fg, t.bg) + 1e-9,
+                "{name}: dim text must not outshine the input text"
+            );
+        }
+    }
+}
+

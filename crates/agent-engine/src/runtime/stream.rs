@@ -41,6 +41,44 @@ pub fn activation_policy(
     }
 }
 
+/// Mid-turn history publication (see the ROUND CHECKPOINT site in
+/// `run_stream_internal`). Remembers what was last published so an
+/// unchanged history is never re-sent — each publish costs every consumer a
+/// session save.
+///
+/// Identity is `(len, address of the last message)`: history only ever grows
+/// by appending new `Arc`s within a turn, and a rollover head is a fresh
+/// vector of fresh `Arc`s, so any real change moves one of the two.
+#[derive(Default)]
+struct RoundCheckpoint {
+    last: Option<(usize, usize)>,
+}
+
+impl RoundCheckpoint {
+    fn key(messages: &[SharedMessage]) -> Option<(usize, usize)> {
+        messages
+            .last()
+            .map(|m| (messages.len(), Arc::as_ptr(m) as *const () as usize))
+    }
+
+    /// Send `MessageHistory` iff the history changed since the last publish.
+    fn publish(&mut self, tx: &mpsc::UnboundedSender<StreamEvent>, messages: &[SharedMessage]) {
+        let key = Self::key(messages);
+        if key.is_none() || key == self.last {
+            return;
+        }
+        self.last = key;
+        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(
+            messages.to_vec(),
+        )));
+    }
+
+    /// Record a history the caller published itself.
+    fn mark_published(&mut self, messages: &[SharedMessage]) {
+        self.last = Self::key(messages);
+    }
+}
+
 /// Pre-cancellation guard for provider IO. If `cancel.is_cancelled()` before
 /// the call, return `Err(Canceled)` without polling — no billed request.
 async fn await_provider_call<F>(cancel: &CancellationToken, call: F) -> Result<Value>
@@ -98,6 +136,8 @@ pub(super) struct StreamSession {
     /// Set only at a successful, non-cancelled terminal assistant boundary.
     /// Error/budget/cancel paths leave this empty, even when they return Ok.
     pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
+    /// Marked at the turn's normal end (see `TurnCompletion`).
+    pub(super) turn_completion: super::types::TurnCompletion,
     pub(super) context_window: u64,
     pub(super) continuation: super::continuation::SharedContinuation,
 
@@ -163,6 +203,10 @@ pub(super) struct StreamSession {
     /// per-stream `SessionToolSet` to (Task 16, spec §7.1). Shared across
     /// turns/clones of one Runtime; never a persisted session id.
     pub(super) tool_session_id: crate::tools::activation::SessionId,
+    /// Runtime-owned slot retaining this tool session's `SessionToolSet`
+    /// across turns, so exact activations live for the session (as the
+    /// `activate_tools` contract says), not for one provider turn.
+    pub(super) retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
     /// Shared exact MCP lease manager (Task 19); `None` when MCP exact
     /// mode is not active.
     pub(super) mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
@@ -181,6 +225,53 @@ pub(super) struct StreamSession {
 }
 
 pub(super) struct StreamMethods;
+
+/// Turn-start set selection. Under progressive disclosure the runtime RETAINS
+/// one set per tool session across turns: a turn reuses it (same shared
+/// handle), re-deriving the core from `fresh` — the current catalog and
+/// context-management surface — and carrying every exact activation that still
+/// matches its pinned digest + provenance (`carry_activations_into`, the same
+/// checks as the round-top rebuild). Before this, every turn minted a fresh
+/// zero-activation set, so `activate_tools` grants silently expired at the end
+/// of the turn despite being documented as session-scoped.
+///
+/// Flag-off (full-schema) sessions keep the per-turn set: every trusted tool
+/// is already in their core. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores the
+/// zero-inherit behavior here too.
+fn retain_session_tool_set(
+    retained: &crate::tools::activation::RetainedSessionToolSet,
+    fresh: crate::tools::activation::SessionToolSet,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+) -> crate::tools::activation::SharedSessionToolSet {
+    if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        return std::sync::Arc::new(std::sync::RwLock::new(fresh));
+    }
+    let mut slot = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = slot.as_ref() {
+        let mut set = existing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.session() == fresh.session() {
+            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+            for d in &dropped {
+                tracing::warn!(
+                    tool = %d.id,
+                    reason = ?d.reason,
+                    "activation dropped at turn start"
+                );
+            }
+            *set = next;
+            drop(set);
+            return std::sync::Arc::clone(existing);
+        }
+    }
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
+    *slot = Some(std::sync::Arc::clone(&shared));
+    shared
+}
 
 fn assistant_text_from_content(content: &[Value]) -> String {
     content
@@ -334,6 +425,7 @@ impl StreamMethods {
             memory_backend,
             memory_context,
             final_capture_history,
+            turn_completion,
             context_window,
             continuation,
             auth,
@@ -374,6 +466,7 @@ impl StreamMethods {
             progressive_tool_disclosure,
             activation_confirm,
             tool_session_id,
+            retained_tool_set,
             mcp_runtime,
             mcp_session_scope,
             extension_runtime,
@@ -488,13 +581,18 @@ impl StreamMethods {
         // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            let set = super::continuation::context_tool_set(
+            let fresh = super::continuation::context_tool_set(
                 tool_session_id.clone(),
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
             );
-            std::sync::Arc::new(std::sync::RwLock::new(set))
+            retain_session_tool_set(
+                &retained_tool_set,
+                fresh,
+                registry.catalog(),
+                progressive_tool_disclosure,
+            )
         };
         // Thread the RETAINED handle into the extension-provider route so
         // its interior tool loop consumes the same set/generation as stream
@@ -564,6 +662,7 @@ impl StreamMethods {
             }};
         }
 
+        let mut round_checkpoint = RoundCheckpoint::default();
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
@@ -575,6 +674,17 @@ impl StreamMethods {
             // reach the FIRST request, not wait until its tools have executed.
             // Subsequent rounds use the same path and normal request validation.
             HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+
+            // ═══ ROUND CHECKPOINT ═══
+            // Every iteration starts on a valid history (the prompt on the
+            // first pass, then each completed round with paired
+            // tool_results, drained steering, or a rollover head). Publish it
+            // so the frontend can persist the turn AS IT PROGRESSES: without
+            // this the only history a frontend saw was the terminal one, and a
+            // crash mid-turn lost the prompt and every completed round.
+            // Append-only (never rewrites a sent message) — no effect on the
+            // request bytes or the provider's cached prefix.
+            round_checkpoint.publish(&tx, &messages);
 
             // Budget pre-flight: wall clock, then the exact round cap —
             // BEFORE any provider call is spent. History is valid here
@@ -1005,6 +1115,19 @@ impl StreamMethods {
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
                             Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
+                                // A cancel that landed while the successor was
+                                // being prepared must stop HERE: `persist_head`
+                                // latches `durability_blocked` before it asks
+                                // the frontend to save, and a frontend that is
+                                // tearing the turn down may never acknowledge.
+                                // Nothing has been published yet — the pre-
+                                // rollover history is still the valid head.
+                                if cancel.is_cancelled() {
+                                    let _ = tx.send(StreamEvent::Session(
+                                        SessionEvent::MessageHistory(messages),
+                                    ));
+                                    return Ok(());
+                                }
                                 super::continuation::persist_head(&prepared, &continuation, &tx)
                                     .await?;
                                 messages = prepared.commit(&continuation)?;
@@ -1017,6 +1140,9 @@ impl StreamMethods {
                                 let _ = tx.send(StreamEvent::Session(
                                     SessionEvent::MessageHistory(messages.clone()),
                                 ));
+                                // Already published: the next round checkpoint
+                                // must not re-send the identical head.
+                                round_checkpoint.mark_published(&messages);
                                 let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction."))));
                                 continue;
                             }
@@ -1082,6 +1208,12 @@ impl StreamMethods {
                     return Err(e);
                 }
             };
+            // Whether this response was cut by a cancel. Read HERE, as the
+            // provider call returns: a cancel that lands later (e.g. during
+            // the `on_message_complete` hook below) did not cut it, and a
+            // response that asks for nothing more is then the turn's
+            // normal end (`TurnCompletion`).
+            let response_cancelled = cancel.is_cancelled();
 
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
@@ -1114,6 +1246,7 @@ impl StreamMethods {
                         // Legitimate empty end_turn after tool results — clean finish.
                         // A clean finish is a terminal completion: publish the
                         // history for memory capture like the normal end_turn path.
+                        turn_completion.mark_completed();
                         *final_capture_history
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1176,8 +1309,11 @@ impl StreamMethods {
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
                 if tool_uses.is_empty() {
-                    let steered =
-                        HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    // A cancelled turn takes no new input: steering still in
+                    // the channel stays undelivered (the frontend dequeues it)
+                    // instead of entering history after the cancel.
+                    let steered = !cancel.is_cancelled()
+                        && HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
                     if !steered {
                         // No steering, truly done. Completion is still subject to the
                         // session orchestration policy (including streamed runs).
@@ -1210,6 +1346,9 @@ impl StreamMethods {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(messages.clone());
+                        }
+                        if !response_cancelled {
+                            turn_completion.mark_completed();
                         }
                         let _ =
                             tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
@@ -1261,7 +1400,7 @@ impl StreamMethods {
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": "Canceled by user"
+                                "content": turn_completion.cancel_phrase()
                             }));
                         }
                     }
@@ -1438,7 +1577,7 @@ impl StreamMethods {
                                             {
                                                 interrupted_side_effect = Some(tool_id.clone());
                                             }
-                                            ("Canceled by user".to_string(), None)
+                                            (turn_completion.cancel_phrase().to_string(), None)
                                         }
                                     }
                                 }
@@ -1486,12 +1625,22 @@ impl StreamMethods {
 
                         // Rich blocks bypass `truncate_tool_result` by construction:
                         // the image cap is the image's own budget.
-                        let content = select_tool_result_content(
-                            rich_blocks,
-                            history_result.map(|bounded| bounded.text),
-                            &result,
-                            max_tool_output,
-                        );
+                        // A canceled call must never look completed: any
+                        // partial output it streamed is kept but labelled.
+                        let content = if canceled {
+                            canceled_tool_result_content(
+                                turn_completion.cancel_phrase(),
+                                history_result.map(|bounded| bounded.text),
+                                interrupted_side_effect.is_some(),
+                            )
+                        } else {
+                            select_tool_result_content(
+                                rich_blocks,
+                                history_result.map(|bounded| bounded.text),
+                                &result,
+                                max_tool_output,
+                            )
+                        };
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
@@ -1579,6 +1728,13 @@ impl StreamMethods {
                                             (authorized, input)
                                         });
                                     let lane = match &gate {
+                                        Ok((authorized, _))
+                                            if authorized.implementation().runs_independently() =>
+                                        {
+                                            // Independent actors (subagents):
+                                            // one lane per call, concurrent.
+                                            LaneKind::Concurrent
+                                        }
                                         Ok((authorized, input)) => {
                                             let implementation = authorized.implementation();
                                             match implementation.effect() {
@@ -1638,6 +1794,7 @@ impl StreamMethods {
                         let delegation_parent_inner = delegation_parent.clone();
                         let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
+                        let turn_completion_inner = turn_completion.clone();
                         let exit_path = watcher_exit_path.clone();
                         let tool_reg_tx_inner = tool_reg_tx.clone();
                         let session_mgr = session_manager.clone();
@@ -1756,7 +1913,7 @@ impl StreamMethods {
                                             (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
-                                            (true, started.then_some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
+                                            (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }
                                     } // close else from Block check
@@ -1794,12 +1951,20 @@ impl StreamMethods {
                             let history_bounded = result.3.as_ref()
                                 .map(crate::tools::output::OutputHandle::model_history)
                                 .filter(|bounded| bounded.original_bytes > 0);
-                            let history: Value = select_tool_result_content(
-                                result.5,
-                                history_bounded.as_ref().map(|bounded| bounded.text.clone()),
-                                &result.2,
-                                max_tool_output,
-                            );
+                            let history: Value = if was_canceled {
+                                canceled_tool_result_content(
+                                    turn_completion_inner.cancel_phrase(),
+                                    history_bounded.as_ref().map(|bounded| bounded.text.clone()),
+                                    interrupted.is_some(),
+                                )
+                            } else {
+                                select_tool_result_content(
+                                    result.5,
+                                    history_bounded.as_ref().map(|bounded| bounded.text.clone()),
+                                    &result.2,
+                                    max_tool_output,
+                                )
+                            };
                             if let (Some(request), Some((stable_tool_id, activation_basis, tool_call_started)), Some(call_effect)) = (request_correlation_inner.as_ref(), result.4, result.1) {
                                 let correlation =
                                     crate::runtime::trace::ExecutionCorrelation::from_request(
@@ -1878,7 +2043,9 @@ impl StreamMethods {
                             // never pass through `truncate_tool_result`.
                             let content = results_map
                                 .remove(tool_id)
-                                .unwrap_or_else(|| Value::String("Canceled by user".to_string()));
+                                .unwrap_or_else(|| {
+                                    Value::String(turn_completion.cancel_phrase().to_string())
+                                });
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
@@ -1967,8 +2134,11 @@ impl StreamMethods {
 
                 // Check for steering messages between tool rounds.
                 // These get injected as user messages before the next LLM call,
-                // allowing the user to redirect the agent mid-work.
-                HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                // allowing the user to redirect the agent mid-work. Not after
+                // a cancel: the loop top returns the history as-is.
+                if !cancel.is_cancelled() {
+                    HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                }
 
                 // Continue the loop to get Claude's response with tool results
             } else {
@@ -2015,6 +2185,41 @@ fn select_tool_result_content(
         (Some(blocks), _) => Value::Array(blocks),
         (None, Some(text)) => Value::String(text),
         (None, None) => Value::String(HelperMethods::truncate_tool_result(result, max_tool_output)),
+    }
+}
+
+/// History content for a tool call canceled mid-execution. The canceled
+/// result is the provider-protocol place to say what happened to the call,
+/// so the label lives HERE (a real `tool_result`), never in a user turn.
+///
+/// - `partial`: bounded model-history text the tool streamed before cancel
+///   (already capped by the output handle's model-history budget). Kept, so
+///   the model sees what really ran — but labelled, so it can never be read
+///   as a completed result.
+/// - `side_effect_possible`: the call STARTED and is `NonIdempotent` (the
+///   Task 25 ledger's `InterruptedAfterSideEffect` case) — say so, so the
+///   model does not blindly re-run it.
+///
+/// `phrase` says who or what canceled it (`CancelCause::phrase`; "Canceled
+/// by user" for the user). Every variant starts with "Canceled", which the
+/// phase-4 bound tests key on.
+fn canceled_tool_result_content(
+    phrase: &str,
+    partial: Option<String>,
+    side_effect_possible: bool,
+) -> Value {
+    let effects = if side_effect_possible {
+        " It had already started and may have partially applied its effects."
+    } else {
+        ""
+    };
+    match partial.filter(|p| !p.trim().is_empty()) {
+        Some(partial) => Value::String(format!(
+            "{partial}\n\n[{phrase} before the tool finished; the output above is partial.{effects}]"
+        )),
+        // For the user: byte-identical to the pre-existing canceled result.
+        None if !side_effect_possible => Value::String(phrase.to_string()),
+        None => Value::String(format!("{phrase}.{effects}")),
     }
 }
 
@@ -2250,6 +2455,75 @@ mod tests {
             0,
             "pre-cancellation must prevent tool dispatch"
         );
+    }
+
+    // ── canceled tool results never look completed ──────────────────────
+
+    const USER: &str = "Canceled by user";
+
+    #[test]
+    fn canceled_tool_without_output_keeps_the_existing_result_bytes() {
+        assert_eq!(canceled_tool_result_content(USER, None, false), json!("Canceled by user"));
+        assert_eq!(
+            canceled_tool_result_content(USER, Some("   \n".into()), false),
+            json!("Canceled by user"),
+            "whitespace-only output is no output"
+        );
+    }
+
+    #[test]
+    fn canceled_tool_with_partial_output_is_labelled_partial() {
+        let v = canceled_tool_result_content(USER, Some("line 1\nline 2".into()), false);
+        let s = v.as_str().unwrap();
+        assert!(s.starts_with("line 1\nline 2\n\n"), "{s}");
+        assert!(s.contains("Canceled by user before the tool finished"), "{s}");
+        assert!(s.contains("partial"), "{s}");
+        assert!(!s.contains("effects"), "idempotent call must not claim side effects: {s}");
+    }
+
+    #[test]
+    fn canceled_non_idempotent_call_warns_about_effects() {
+        let with_output = canceled_tool_result_content(USER, Some("wrote 3 files".into()), true);
+        assert!(with_output.as_str().unwrap().contains("may have partially applied its effects"));
+        let without = canceled_tool_result_content(USER, None, true);
+        let s = without.as_str().unwrap();
+        assert!(s.starts_with("Canceled by user"), "{s}");
+        assert!(s.contains("may have partially applied its effects"), "{s}");
+    }
+
+    /// A cancel that was not the user's says what it was; the user's keeps
+    /// the historical wording (also when the host noted nothing). Every
+    /// wording starts with "Canceled".
+    #[test]
+    fn canceled_tool_results_name_the_cause() {
+        use super::super::types::{CancelCause, TurnCompletion};
+        let unset = TurnCompletion::new();
+        assert_eq!(unset.cancel_phrase(), "Canceled by user");
+        let t = TurnCompletion::new();
+        t.note_cancel_cause(CancelCause::Restart);
+        t.note_cancel_cause(CancelCause::Driver); // first cause wins
+        assert_eq!(t.cancel_phrase(), "Canceled (Synaps restarted)");
+        // A driver turn cancelled with no cause noted (the grant's deadline)
+        // was cut by the driver ending; the user's Esc still says so.
+        let driver_turn = TurnCompletion::with_default_cause(CancelCause::Driver);
+        assert_eq!(driver_turn.cancel_phrase(), "Canceled (session driver revoked)");
+        driver_turn.note_cancel_cause(CancelCause::User);
+        assert_eq!(driver_turn.cancel_phrase(), "Canceled by user");
+        let v = canceled_tool_result_content(t.cancel_phrase(), Some("half".into()), false);
+        assert!(
+            v.as_str().unwrap().contains("[Canceled (Synaps restarted) before the tool finished"),
+            "{v}"
+        );
+        for cause in [
+            CancelCause::User,
+            CancelCause::CostCap,
+            CancelCause::Restart,
+            CancelCause::Host,
+            CancelCause::Driver,
+        ] {
+            assert!(cause.phrase().starts_with("Canceled"), "{cause:?}");
+            assert!(!cause.phrase().to_lowercase().contains("you"), "{cause:?}");
+        }
     }
 
     // ── guard framing: single source for both injection placements ────────
@@ -2713,33 +2987,25 @@ mod rich_output_tests {
         drive_with_history(initial, tools_to_register, tool_uses, hook_bus).await
     }
 
-    async fn drive_with_history(
-        messages: Vec<SharedMessage>,
-        tools_to_register: Vec<Arc<dyn Tool>>,
-        tool_uses: &[(&str, &str)],
+    /// The harness's `StreamSession`, parameterized on what the progressive
+    /// activation tests vary across turns (shared tool session + retained set).
+    #[allow(clippy::too_many_arguments)]
+    fn harness_session(
+        base_url: String,
+        tools: Arc<RwLock<ToolRegistry>>,
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        session_manager: Arc<crate::tools::shell::SessionManager>,
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
-    ) -> Driven {
-        let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
-
-        let mut registry = ToolRegistry::new();
-        for t in tools_to_register {
-            registry.register(t);
-        }
-        let tools = Arc::new(RwLock::new(registry));
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
-        let session_manager =
-            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
-        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
-            "test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ))
-        .unwrap();
-
-        let session = StreamSession {
+        tool_session_id: crate::tools::activation::SessionId,
+        retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+        progressive: bool,
+        model: &str,
+    ) -> StreamSession {
+        StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
+            turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
@@ -2759,7 +3025,7 @@ mod rich_output_tests {
             },
             api_retries: 0,
             refusal_retries: 0,
-            model: "claude-sonnet-4-6".into(),
+            model: model.into(),
             tools,
             system_prompt: None,
             thinking_budget: 0,
@@ -2789,9 +3055,10 @@ mod rich_output_tests {
             orchestration: None,
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
-            progressive_tool_disclosure: false,
+            progressive_tool_disclosure: progressive,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
+            retained_tool_set,
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -2799,7 +3066,60 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
-        };
+        }
+    }
+
+    async fn drive_with_history(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        drive_with_model(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+        )
+        .await
+    }
+
+    async fn drive_with_model(
+        model: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
+
+        let mut registry = ToolRegistry::new();
+        for t in tools_to_register {
+            registry.register(t);
+        }
+        let tools = Arc::new(RwLock::new(registry));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+
+        let session = harness_session(
+            base_url,
+            tools,
+            tx,
+            session_manager,
+            hook_bus,
+            tool_session_id,
+            Default::default(),
+            false,
+            model,
+        );
 
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -2835,6 +3155,238 @@ mod rich_output_tests {
             bodies,
             rejected,
         }
+    }
+
+    /// A deferred (non-core) tool: under progressive disclosure it is callable
+    /// only after an exact `activate_tools` grant.
+    struct DeferredProbe;
+    #[async_trait::async_trait]
+    impl Tool for DeferredProbe {
+        fn name(&self) -> &str {
+            "deferred_probe"
+        }
+        fn description(&self) -> &str {
+            "probe for session-scoped activation"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok("probe-ok".to_string())
+        }
+    }
+
+    /// Like `sse_tool_use_round`, but each tool use carries a real JSON
+    /// input: `(id, name, input_json)`.
+    fn sse_tool_use_round_with_input(tool_uses: &[(&str, &str, &str)]) -> String {
+        let mut s = String::from("data: ");
+        s.push_str(&json!({"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}).to_string());
+        s.push_str("\n\n");
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            for ev in [
+                json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":name}}),
+                json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":input}}),
+                json!({"type":"content_block_stop","index":i}),
+            ] {
+                s.push_str("data: ");
+                s.push_str(&ev.to_string());
+                s.push_str("\n\n");
+            }
+        }
+        s.push_str("data: ");
+        s.push_str(&json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}).to_string());
+        s.push_str("\n\ndata: {\"type\":\"message_stop\"}\n\n");
+        s
+    }
+
+    /// One stream turn on a SHARED registry, tool session and retained set —
+    /// what consecutive turns of one `Runtime` see.
+    async fn drive_turn(
+        tools: Arc<RwLock<ToolRegistry>>,
+        tool_uses: &[(&str, &str, &str)],
+        tool_session_id: crate::tools::activation::SessionId,
+        retained: crate::tools::activation::RetainedSessionToolSet,
+        progressive: bool,
+    ) -> Driven {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(tool_uses)).await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let session = harness_session(
+            base_url,
+            tools,
+            tx,
+            session_manager,
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            tool_session_id,
+            retained,
+            progressive,
+            "claude-sonnet-4-6",
+        );
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish");
+        let mut history = Vec::new();
+        let mut ui_results = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        Driven {
+            history,
+            ui_results,
+            bodies,
+            rejected: run.is_err(),
+        }
+    }
+
+    fn probe_registry() -> Arc<RwLock<ToolRegistry>> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DeferredProbe));
+        Arc::new(RwLock::new(registry))
+    }
+
+    fn fresh_tool_session() -> crate::tools::activation::SessionId {
+        crate::tools::activation::SessionId::parse(&format!(
+            "test-carry-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap()
+    }
+
+    const ACTIVATE_PROBE: &str = r#"{"tools":["builtin:deferred_probe"]}"#;
+
+    /// Regression: exact activations are SESSION-scoped (the `activate_tools`
+    /// contract). Before the fix every turn minted a fresh zero-activation
+    /// set, so a tool activated in turn 1 was denied in turn 2 with
+    /// "tool is not activated for this session".
+    #[tokio::test]
+    async fn exact_activation_survives_into_the_next_turn() {
+        let tools = probe_registry();
+        let sid = fresh_tool_session();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+
+        let t1 = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            sid.clone(),
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+        assert!(!t1.rejected, "turn 1 must run");
+        assert!(
+            t1.ui_results
+                .iter()
+                .any(|r| r.contains("builtin:deferred_probe")),
+            "turn 1 activates the probe: {:?}",
+            t1.ui_results
+        );
+
+        let t2 = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            sid,
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+        assert!(
+            t2.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "turn 2 may call the tool activated in turn 1: {:?}",
+            t2.ui_results
+        );
+        assert!(
+            !t2.ui_results.iter().any(|r| r.contains("not activated")),
+            "no denial in turn 2: {:?}",
+            t2.ui_results
+        );
+    }
+
+    /// Grants never cross tool sessions: a different runtime session with its
+    /// own (empty) retained slot is still denied.
+    #[tokio::test]
+    async fn activation_does_not_leak_into_another_tool_session() {
+        let tools = probe_registry();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+
+        let other = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Default::default(),
+            true,
+        )
+        .await;
+        assert!(
+            !other.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "another tool session must not inherit the grant: {:?}",
+            other.ui_results
+        );
+    }
+
+    /// The carried activation keeps counting activation batches: the second
+    /// turn's batch reports schema_generation 2, not a fresh set's 1.
+    #[tokio::test]
+    async fn schema_generation_continues_across_turns() {
+        let tools = probe_registry();
+        let sid = fresh_tool_session();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            sid.clone(),
+            Arc::clone(&retained),
+            true,
+        )
+        .await;
+        let slot = retained.lock().unwrap();
+        let set = slot.as_ref().expect("progressive turn retains its set");
+        let set = set.read().unwrap();
+        assert_eq!(set.schema_generation(), 1);
+        assert!(set
+            .activation(&crate::tools::catalog::ToolId::builtin("deferred_probe"))
+            .is_some());
+    }
+
+    /// Flag-off (full-schema) sessions are unchanged: nothing is retained.
+    #[tokio::test]
+    async fn flag_off_retains_nothing() {
+        let tools = probe_registry();
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            false,
+        )
+        .await;
+        assert!(retained.lock().unwrap().is_none());
     }
 
     /// The user message carrying tool results, from the round-2 request body.
@@ -2883,6 +3435,124 @@ mod rich_output_tests {
             .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
             .expect("history tool_result");
         assert!(hist_msg["content"][0]["content"].is_array());
+    }
+
+    /// Drives the REAL built-in `read` tool against a fixed on-disk file
+    /// (the mock provider always sends `{}` as tool input).
+    struct ReadFixedPath(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl Tool for ReadFixedPath {
+        fn name(&self) -> &str {
+            "read_fixed"
+        }
+        fn description(&self) -> &str {
+            "reads a fixed file through the built-in read tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+            self.execute_rich(params, ctx)
+                .await
+                .map(ToolOutput::into_summary)
+        }
+        async fn execute_rich(&self, _params: Value, ctx: ToolContext) -> Result<ToolOutput> {
+            crate::tools::ReadTool
+                .execute_rich(json!({"path": self.0.to_string_lossy()}), ctx)
+                .await
+        }
+    }
+
+    /// A real, decodable 1x1 PNG (IHDR + IDAT + IEND).
+    const REAL_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=";
+
+    fn real_png_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(REAL_PNG_B64)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    /// Regression: on Opus 5.5 the built-in `read` of a PNG used to come back
+    /// as "Attachment not sent: Selected model lacks exact image input
+    /// capability metadata" because the model was not an exact known native
+    /// Anthropic model. The image must now reach the provider as a
+    /// `tool_result` image block, with the bare native model id on the wire.
+    #[tokio::test]
+    async fn opus_5_5_real_read_tool_image_reaches_the_wire() {
+        let (_dir, path) = real_png_file();
+        let initial = vec![Arc::new(json!({"role":"user","content":"look"})) as SharedMessage];
+        let d = drive_with_model(
+            "anthropic/claude-opus-5-5",
+            initial,
+            vec![Arc::new(ReadFixedPath(path.clone()))],
+            &[("toolu_read", "read_fixed")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert!(!d.rejected);
+        assert_eq!(
+            d.bodies[1]["model"], "claude-opus-5-5",
+            "bare native id on the wire"
+        );
+
+        let tr = &tool_result_message(&d.bodies[1])["content"][0];
+        assert_eq!(tr["tool_use_id"], "toolu_read");
+        assert!(tr.get("is_error").is_none(), "{tr}");
+        let blocks = tr["content"]
+            .as_array()
+            .expect("rich array content, not an error string");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("Image: {} (1x1, image/png", path.display())));
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], REAL_PNG_B64);
+        assert!(!d
+            .ui_results
+            .iter()
+            .any(|r| r.contains("Attachment not sent")));
+    }
+
+    /// Negative control for the test above: the same real read on a
+    /// non-exact Opus id is still refused in-slot (the gate is live, and no
+    /// image bytes reach the provider).
+    #[tokio::test]
+    async fn unobserved_anthropic_id_real_read_image_stays_fail_closed() {
+        let (_dir, path) = real_png_file();
+        let initial = vec![Arc::new(json!({"role":"user","content":"look"})) as SharedMessage];
+        let d = drive_with_model(
+            "anthropic/claude-opus-5-5-unobserved",
+            initial,
+            vec![Arc::new(ReadFixedPath(path))],
+            &[("toolu_read", "read_fixed")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let tr = &tool_result_message(&d.bodies[1])["content"][0];
+        let text = tr["content"].as_str().expect("plain-text refusal");
+        assert!(
+            text.starts_with("Attachment not sent: Selected model lacks exact image input"),
+            "{text}"
+        );
+        assert!(!serde_json::to_string(&d.bodies[1])
+            .unwrap()
+            .contains(REAL_PNG_B64));
     }
 
     #[tokio::test]
@@ -3240,6 +3910,7 @@ mod rich_output_tests {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
+            turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
@@ -3292,6 +3963,7 @@ mod rich_output_tests {
             progressive_tool_disclosure: false,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
+            retained_tool_set: Default::default(),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,

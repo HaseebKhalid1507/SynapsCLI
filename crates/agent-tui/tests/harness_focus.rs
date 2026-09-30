@@ -176,7 +176,7 @@ fn scenario_05_secret_prompt_paints_over_modal() {
         "prompt title must be visible topmost:\n{frame}"
     );
     assert!(
-        frame.contains("Enter submit"),
+        frame.to_lowercase().contains("enter submit"),
         "prompt footer must paint above the modal:\n{frame}"
     );
 }
@@ -197,7 +197,7 @@ fn scenario_06_prompt_paints_over_center_toast() {
     let frame = h.snapshot();
     // Prompt chrome is on top…
     assert!(
-        frame.contains("Enter submit"),
+        frame.to_lowercase().contains("enter submit"),
         "prompt must paint above the centre toast:\n{frame}"
     );
     // …and the centred toast beneath it is Clear-ed away.

@@ -649,7 +649,7 @@
     }
   },
   {
-    "description": "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "description": "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly; give an inline subagent a short name so it is recognisable in the subagent panel.",
     "name": "subagent",
     "parameters": {
       "properties": {
@@ -659,6 +659,10 @@
         },
         "model": {
           "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
           "type": "string"
         },
         "role": {
@@ -805,7 +809,7 @@
     }
   },
   {
-    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background and is REACTIVE: when it finishes, a completion event is pushed into your queue and you are woken with its status — do NOT sleep, busy-wait, or poll in a loop waiting for it. After dispatching, end your turn or keep doing other work; on the completion event call subagent_collect once with reconciled=true. subagent_status is for an occasional progress peek, and subagent_steer injects guidance mid-run. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation that must block, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background and is REACTIVE: when it finishes, a completion event is pushed into your queue and you are woken with its status — do NOT sleep, busy-wait, or poll in a loop waiting for it. After dispatching, end your turn or keep doing other work; on the completion event call subagent_collect once with reconciled=true. subagent_status is for an occasional progress peek, and subagent_steer injects guidance mid-run. Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation that must block, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly; give an inline subagent a short name so it is recognisable in the subagent panel.",
     "name": "subagent_start",
     "parameters": {
       "properties": {
@@ -815,6 +819,10 @@
         },
         "model": {
           "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
           "type": "string"
         },
         "role": {
