@@ -82,6 +82,10 @@ impl Theme {
             tool_subagent: Color::Rgb(210, 120, 230), // soft magenta
             tool_ext: YELLOW,                         // electric yellow
             tool_generic: Color::Rgb(132, 150, 180),  // dim steel
+            // Tool cards take this palette's colours (Theme::tool_*_background)
+            // instead of inheriting the default theme's slate panels.
+            tool_input_bg: Color::Reset,
+            tool_output_bg: Color::Reset,
             ..Self::default()
         }
     }
