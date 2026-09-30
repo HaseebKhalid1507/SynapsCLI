@@ -27,10 +27,9 @@ pub const CANCEL_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(CANCEL_DRAIN_TIMEOUT_MS);
 /// Whole-second ceiling of the drain, for the budget sums below/elsewhere.
 pub const CANCEL_DRAIN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_MS.div_ceil(1000);
-/// Worst case of `cancel_turn`: the drain. Its save is queued on the
-/// persister, not awaited; the caller's own bounded save (`checkpoint`,
-/// `finish`) waits for it.
-pub const CANCEL_TURN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS;
+/// Worst case of `cancel_turn`: the drain, then the bounded wait for the
+/// interrupted turn's save before it announces `Idle` (`announce_idle`).
+pub const CANCEL_TURN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS + SAVE_TIMEOUT_SECS;
 
 /// Session end's bounded observability flush (`finish` STEP 3).
 pub const OBSERVABILITY_FLUSH_TIMEOUT_SECS: u64 =
