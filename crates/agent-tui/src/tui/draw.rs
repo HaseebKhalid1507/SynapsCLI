@@ -38,11 +38,13 @@ impl AppAreas {
         download_height: u16,
         input_height: u16,
     ) -> Self {
-        let [header, body, subagent, download, input, footer] = Layout::vertical([
+        // The subagent tray sits directly on the prompt (it extends the
+        // prompt's slab), so the download row goes above it.
+        let [header, body, download, subagent, input, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(subagent_height),
             Constraint::Length(download_height),
+            Constraint::Length(subagent_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
@@ -525,12 +527,7 @@ pub(crate) fn build_render_model(
     }
 
     // ── 2. Layout math (mirrors draw.rs pre-closure block) ────────────────────
-    let has_subagents = !inputs.subagents.is_empty();
-    let subagent_height: u16 = if has_subagents {
-        (inputs.subagents.len() as u16 + 2).min(8)
-    } else {
-        0
-    };
+    let subagent_height = super::subagent_tray::tray_height(inputs.subagents.len());
     let input_inner_width = term_size
         .width
         .saturating_sub(2 * super::neon_prompt::INSET_X);
@@ -585,6 +582,8 @@ pub(crate) fn build_render_model(
                 .duration_secs
                 .unwrap_or_else(|| sa.start_time.elapsed().as_secs_f64()),
             done: sa.done,
+            tools: sa.tools,
+            result: sa.result.clone(),
         })
         .collect();
 
@@ -868,11 +867,7 @@ pub(crate) fn render_frame_into(
 
     // ── Layout ────────────────────────────────────────────────────────────
     let has_subagents = !model.subagents.is_empty();
-    let subagent_height: u16 = if has_subagents {
-        (model.subagents.len() as u16 + 2).min(8)
-    } else {
-        0
-    };
+    let subagent_height = super::subagent_tray::tray_height(model.subagents.len());
     let input_inner_width = frame
         .area()
         .width
@@ -1265,105 +1260,6 @@ pub(crate) fn render_frame_into(
         frame.render_widget(indicator_widget, indicator_area);
     }
 
-    // ── Subagent Panel ────────────────────────────────────────────────────
-    if has_subagents {
-        let spinner_idx2 = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
-        let mut agent_lines: Vec<ratatui::text::Line> = Vec::new();
-        for sa in &model.subagents {
-            let elapsed_s = sa.elapsed_secs;
-            let time_str = if elapsed_s < 60.0 {
-                format!("{:.1}s", elapsed_s)
-            } else {
-                format!("{}m{:.0}s", (elapsed_s / 60.0) as u32, elapsed_s % 60.0)
-            };
-            if sa.done {
-                let is_timeout = sa.status.contains("timed out");
-                let is_error = sa.status.starts_with("\u{2718}");
-                let done_color = if is_timeout {
-                    THEME.load().warning_color
-                } else if is_error {
-                    THEME.load().error_color
-                } else {
-                    THEME.load().subagent_done
-                };
-                let icon = if is_timeout {
-                    "  \u{26a0} "
-                } else if is_error {
-                    "  \u{2718} "
-                } else {
-                    "  \u{2714} "
-                };
-                agent_lines.push(ratatui::text::Line::from(vec![
-                    Span::styled(icon, Style::default().fg(done_color)),
-                    Span::styled(
-                        format!("{} ", sa.name),
-                        Style::default()
-                            .fg(THEME.load().subagent_name)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        &sa.status,
-                        Style::default().fg(done_color).add_modifier(Modifier::DIM),
-                    ),
-                    Span::styled(
-                        format!("  {}", time_str),
-                        Style::default().fg(THEME.load().subagent_time),
-                    ),
-                ]));
-            } else {
-                let spinner = SPINNER_FRAMES[spinner_idx2];
-                agent_lines.push(ratatui::text::Line::from(vec![
-                    Span::styled(
-                        format!("  {} ", spinner),
-                        Style::default().fg(THEME.load().subagent_name),
-                    ),
-                    Span::styled(
-                        format!("{} ", sa.name),
-                        Style::default()
-                            .fg(THEME.load().subagent_name)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        &sa.status,
-                        Style::default().fg(THEME.load().subagent_status),
-                    ),
-                    Span::styled(
-                        format!("  {}", time_str),
-                        Style::default().fg(THEME.load().subagent_time),
-                    ),
-                ]));
-            }
-        }
-        let active = model.subagents.iter().filter(|s| !s.done).count();
-        let done = model.subagents.iter().filter(|s| s.done).count();
-        let title = if done > 0 && active > 0 {
-            format!(" \u{25c8} {} running, {} done ", active, done)
-        } else if active > 0 {
-            format!(
-                " \u{25c8} {} agent{} ",
-                active,
-                if active != 1 { "s" } else { "" }
-            )
-        } else {
-            format!(" \u{2714} {} done ", done)
-        };
-        let agent_block = Block::default()
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(THEME.load().subagent_name)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(THEME.load().subagent_border))
-            .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(
-            Paragraph::new(agent_lines).block(agent_block),
-            subagent_area,
-        );
-    }
-
     // ── Input ─────────────────────────────────────────────────────────────
     // Neon prompt (neon_prompt.rs): a soft-edged slab of light with no drawn
     // border. The text sits in a fixed column `INSET_X` in from the edge, with
@@ -1403,6 +1299,16 @@ pub(crate) fn render_frame_into(
             y: text_area.y + cursor_row - input_scroll,
         });
         neon::paint_slab(frame.buffer_mut(), input_area, &slab, cursor_at);
+        // Running subagents: a recessed tray on the same slab, above the input.
+        super::subagent_tray::paint_tray(
+            frame.buffer_mut(),
+            subagent_area,
+            input_area,
+            &slab,
+            &theme,
+            &model.subagents,
+            model.spinner_frame,
+        );
 
         let prompt_span = if model.streaming {
             Span::styled(

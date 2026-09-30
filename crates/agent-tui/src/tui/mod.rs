@@ -35,6 +35,7 @@ mod settings;
 mod sidecar;
 mod signals;
 mod stream_handler;
+mod subagent_tray;
 /// P16.1: terminal capability facts (env-only detection; inert seam).
 mod termcaps;
 /// Headless test harness — see [`testing::TestHarness`]. Compiled only for

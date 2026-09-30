@@ -75,6 +75,8 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 done: false,
                 duration_secs: None,
                 done_at: None,
+                tools: 0,
+                result: None,
             });
             app.invalidate();
         }
@@ -84,6 +86,13 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             ..
         }) => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+                // "⚙ <tool> (tool #N)" marks a new tool call.
+                if let Some((_, n)) = status
+                    .strip_prefix("\u{2699} ")
+                    .and_then(|rest| rest.rsplit_once(" (tool #"))
+                {
+                    sa.tools = n.trim_end_matches(')').parse().unwrap_or(sa.tools + 1);
+                }
                 sa.status = status;
             }
             app.invalidate();
@@ -106,6 +115,14 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 } else {
                     sa.status = format!("\u{2714} {}", preview);
                 }
+                // The tray shows the first real line of the result.
+                let first = result_preview
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with('#'))
+                    .unwrap_or("");
+                let first = first.strip_prefix("ERROR: ").unwrap_or(first);
+                sa.result = Some(first.chars().take(120).collect());
             }
             app.invalidate();
         }
@@ -763,6 +780,8 @@ pub(super) fn reconcile_subagents(
                 done: false,
                 duration_secs: None,
                 done_at: None,
+                tools: 0,
+                result: None,
             });
         }
     }
@@ -820,6 +839,8 @@ mod reconcile_tests {
             done,
             duration_secs: if done { Some(1.5) } else { None },
             done_at: if done { Some(Instant::now()) } else { None },
+            tools: 0,
+            result: None,
         }
     }
 

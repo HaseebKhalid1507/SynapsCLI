@@ -32,7 +32,7 @@ use ratatui::{
 
 use super::theme::Theme;
 
-type Rgb = (u8, u8, u8);
+pub(super) type Rgb = (u8, u8, u8);
 
 /// Columns between the input area's edge and the text column's prompt glyph:
 /// canvas margin, half-block side, padding.
@@ -55,13 +55,13 @@ const FRAME: Duration = Duration::from_millis(40);
 
 // ───────────────────────────── colour helpers ──────────────────────────────
 
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+pub(super) fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
     let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
     (f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
 }
 
-fn luminance(c: Rgb) -> f32 {
+pub(super) fn luminance(c: Rgb) -> f32 {
     let ch = |v: u8| {
         let v = f32::from(v) / 255.0;
         if v <= 0.04045 {
@@ -73,19 +73,19 @@ fn luminance(c: Rgb) -> f32 {
     0.2126 * ch(c.0) + 0.7152 * ch(c.1) + 0.0722 * ch(c.2)
 }
 
-fn contrast(a: Rgb, b: Rgb) -> f32 {
+pub(super) fn contrast(a: Rgb, b: Rgb) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
     (hi + 0.05) / (lo + 0.05)
 }
 
-fn color(c: Rgb) -> Color {
+pub(super) fn color(c: Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
 /// Theme colours are RGB for every builtin, user theme file and MXC feed;
 /// anything else falls back to the default palette's value.
-fn rgb(c: Color, fallback: Color) -> Rgb {
+pub(super) fn rgb(c: Color, fallback: Color) -> Rgb {
     match (c, fallback) {
         (Color::Rgb(r, g, b), _) | (_, Color::Rgb(r, g, b)) => (r, g, b),
         _ => (0, 0, 0),
@@ -389,6 +389,16 @@ impl Slab {
     /// Body fill at column `x` (relative to the input area).
     pub(crate) fn fill_at(&self, x: u16) -> Rgb {
         Self::at(&self.fill, x)
+    }
+
+    /// The chrome the slab floats on (the subagent tray paints on it too).
+    pub(super) fn backdrop(&self) -> Rgb {
+        self.backdrop
+    }
+
+    /// Band colour under the half-cell edges at column `x`.
+    pub(super) fn halo_at(&self, x: u16) -> Rgb {
+        Self::at(&self.halo, x)
     }
 
     /// `c` mixed toward the theme's text colour just until it reads at

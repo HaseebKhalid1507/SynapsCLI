@@ -127,6 +127,10 @@ pub(crate) struct SubagentSnap {
     /// pre-computed so the render thread doesn't need `Instant`.
     pub(crate) elapsed_secs: f64,
     pub(crate) done: bool,
+    /// Tool calls so far.
+    pub(crate) tools: u32,
+    /// First line of the result once done.
+    pub(crate) result: Option<String>,
 }
 
 /// Pre-computed ghost-hint for slash-command completion in the input box.
