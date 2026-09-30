@@ -1450,17 +1450,13 @@ pub(crate) fn render_frame_into(
                 if hint.match_badge.is_none() && !hint.ghost_text.is_empty() {
                     last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
                 }
-            } else if model.input.is_empty() {
+            } else if model.input.is_empty() && !model.streaming {
                 // Placeholder: the prompt in dim italic, then hints that
                 // fit whole (Noodle: key bright, word dim), dropped from the
-                // right when narrow.
+                // right when narrow. None while streaming: the box stays
+                // empty while the agent has the floor.
                 let room = w.saturating_sub(INPUT_PREFIX_WIDTH + 1);
-                let lead = if model.streaming {
-                    "agent is working \u{2014} type to steer or queue a follow-up"
-                } else {
-                    "Ask anything"
-                };
-                let lead: String = lead.chars().take(room).collect();
+                let lead: String = "Ask anything".chars().take(room).collect();
                 let mut used = display_width(&lead);
                 last_row.push(Span::styled(
                     lead,
@@ -1468,19 +1464,17 @@ pub(crate) fn render_frame_into(
                         .fg(slab.dim_fg())
                         .add_modifier(Modifier::ITALIC),
                 ));
-                if !model.streaming {
-                    let key = Style::default().fg(slab.tone_fg(neon::Tone::SoftKey));
-                    let word = Style::default().fg(slab.dim_fg());
-                    for (k, wd) in [("/", " commands"), ("alt+enter", " newline")] {
-                        let seg = 3 + display_width(k) + display_width(wd);
-                        if used + seg > room {
-                            break;
-                        }
-                        last_row.push(Span::raw("   "));
-                        last_row.push(Span::styled(k, key));
-                        last_row.push(Span::styled(wd, word));
-                        used += seg;
+                let key = Style::default().fg(slab.tone_fg(neon::Tone::SoftKey));
+                let word = Style::default().fg(slab.dim_fg());
+                for (k, wd) in [("/", " commands"), ("alt+enter", " newline")] {
+                    let seg = 3 + display_width(k) + display_width(wd);
+                    if used + seg > room {
+                        break;
                     }
+                    last_row.push(Span::raw("   "));
+                    last_row.push(Span::styled(k, key));
+                    last_row.push(Span::styled(wd, word));
+                    used += seg;
                 }
             }
         }
@@ -2086,7 +2080,7 @@ mod neon_prompt_tests {
     }
 
     #[test]
-    fn streaming_swaps_the_prompt_for_a_spinner_with_no_status_tab() {
+    fn streaming_shows_a_spinner_with_no_status_tab_and_no_placeholder() {
         let mut h = TestHarness::boot_with_size(W, H);
         h.set_streaming(true);
         let buf = h.render().clone();
@@ -2103,9 +2097,11 @@ mod neon_prompt_tests {
                 .all(|c| c == '\u{2580}'),
             "bottom edge is plain while streaming: {rim:?}"
         );
+        // Text column is 5..=76 at 80 cols (see wrapped_input_keeps_a_hanging_indent).
+        let text: String = (5..=76).map(|x| sym(&buf, x, top + 1)).collect();
         assert!(
-            row(&buf, top + 1).contains("steer or queue"),
-            "streaming placeholder"
+            text.trim().is_empty(),
+            "no placeholder while streaming: {text:?}"
         );
     }
 
