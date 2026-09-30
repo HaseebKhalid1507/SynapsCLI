@@ -306,6 +306,11 @@ const BODY_CONTRAST: f32 = 1.17;
 /// The body's step off the chrome while a turn streams: the prompt steps
 /// back, clearly dimmer than ready.
 const STREAM_CONTRAST: f32 = 1.08;
+/// A dash of colour: the body leans this far toward the theme's `prompt_fg`
+/// (half as far while a turn streams), so the slab carries the theme's hue
+/// instead of reading as plain grey. Brightness is still set by the contrast
+/// targets.
+const BODY_TINT: f32 = 0.07;
 /// Cap on the lift toward the text colour.
 const BODY_MAX_LIFT: f32 = 0.25;
 
@@ -322,20 +327,23 @@ impl Slab {
         let muted = rgb(theme.muted, d.muted);
         let stream = rgb(theme.status_streaming, d.status_streaming);
 
-        // Chrome lifted toward the theme's text just far enough to reach a
-        // target step off the chrome.
-        let lift_for = |target: f32| {
+        // The body: chrome lifted toward the theme's text, with a dash of the
+        // prompt colour, lifted just far enough to reach a target step off
+        // the chrome (the tint counts toward the step, so colour never makes
+        // it brighter than intended).
+        let body_for = |target: f32, tint: f32| {
+            let at = |lift: f32| mix(mix(backdrop, text, lift), prompt, tint);
             let mut lift = 0.0;
-            while lift < BODY_MAX_LIFT && contrast(mix(backdrop, text, lift), backdrop) < target {
+            while lift < BODY_MAX_LIFT && contrast(at(lift), backdrop) < target {
                 lift += 0.005;
             }
-            lift
+            at(lift)
         };
-        let ready_lift = lift_for(BODY_CONTRAST);
-        // Streaming: the agent has the floor, so the prompt steps back.
-        let stream_lift = lift_for(STREAM_CONTRAST).min(ready_lift);
-        let lift = ready_lift + (stream_lift - ready_lift) * fx.dim;
-        let body = mix(backdrop, text, lift);
+        let ready_body = body_for(BODY_CONTRAST, BODY_TINT);
+        // Streaming: the agent has the floor, so the prompt steps back and
+        // keeps only half the colour.
+        let stream_body = body_for(STREAM_CONTRAST, BODY_TINT / 2.0);
+        let body = mix(ready_body, stream_body, fx.dim);
         // Send flash: the body brightens toward the text colour for a moment.
         // "Your turn": when a turn ends the prompt colour washes over the
         // slab and fades, so the hand-back is felt, not just read.
@@ -1006,6 +1014,49 @@ mod ready_tests {
             let (r, b) = (contrast(ready.body, chrome), contrast(busy.body, chrome));
             assert!(r >= 1.15, "{name}: ready step {r:.3}");
             assert!(r - b >= 0.08, "{name}: ready {r:.3} vs streaming {b:.3}");
+        }
+    }
+
+    /// A dash of colour: the body leans toward the theme's prompt colour,
+    /// less while streaming.
+    #[test]
+    fn body_carries_a_dash_of_the_prompt_colour() {
+        // How closely the body's step off the chrome points the same way as
+        // the prompt colour does (cosine in RGB): hue lean, not brightness.
+        let lean = |c: Rgb, chrome: Rgb, prompt: Rgb| {
+            let v = |a: Rgb| {
+                [
+                    f32::from(a.0) - f32::from(chrome.0),
+                    f32::from(a.1) - f32::from(chrome.1),
+                    f32::from(a.2) - f32::from(chrome.2),
+                ]
+            };
+            let (a, b) = (v(c), v(prompt));
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm = |x: [f32; 3]| x.iter().map(|v| v * v).sum::<f32>().sqrt();
+            dot / (norm(a) * norm(b)).max(1e-6)
+        };
+        for name in PALETTES {
+            let theme = super::super::theme::Theme::builtin_for_test(name);
+            let rgb3 = |c: Color| match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => unreachable!(),
+            };
+            let (chrome, text, prompt) =
+                (rgb3(theme.bg), rgb3(theme.input_fg), rgb3(theme.prompt_fg));
+            let ready = Slab::new(&theme, PromptFx::default(), 80, None);
+            // The same brightness step with no tint.
+            let mut plain = chrome;
+            let mut lift = 0.0;
+            while contrast(plain, chrome) < BODY_CONTRAST && lift < BODY_MAX_LIFT {
+                lift += 0.005;
+                plain = mix(chrome, text, lift);
+            }
+            assert!(
+                lean(ready.body, chrome, prompt) > lean(plain, chrome, prompt),
+                "{name}: body {:?} should lean toward prompt {prompt:?} more than plain {plain:?}",
+                ready.body
+            );
         }
     }
 
