@@ -14,14 +14,16 @@
 //!   any draft operation, so a draft removal can never land before the
 //!   history that ends its turn (a crash in between leaves a draft next to
 //!   a concluded history, which recovery treats as stale).
-//! - **a removal waits for a good save**: if the snapshot for an id failed
-//!   to write, removing that id's draft is deferred until a later save of
-//!   the id succeeds. The draft is the only record that a turn was open.
+//! - **a removal waits for a good save**: while the latest save of an id
+//!   has failed, removing that id's draft is deferred until a later save of
+//!   the id succeeds — across batches, not just within one. The draft is
+//!   the only record that a turn was open.
 //! - **ordered with every other in-process writer**: `Session::save` holds
 //!   the per-session save-order guard (`session_save_order`) for its I/O.
 //!
 //! `flush` is the barrier: it resolves once everything requested so far has
-//! been applied, and reports whether the last batch saved cleanly. The actor
+//! been applied, and reports whether every session's latest save succeeded
+//! (a failure stays reported until that session saves cleanly). The actor
 //! flushes before anything that needs the disk to be current: parking
 //! (drops the in-memory conversation), a durable context-head checkpoint,
 //! compaction, `/resume`, checkpoint and teardown.
@@ -55,7 +57,7 @@ struct Pending {
 struct Progress {
     /// The `requested` value the last applied batch covered.
     done: u64,
-    /// Every save in the last applied batch succeeded.
+    /// No session's latest save attempt has failed.
     ok: bool,
 }
 
@@ -165,9 +167,10 @@ impl Persister {
         self.shared.wake.notify_one();
     }
 
-    /// Wait until everything requested so far is applied. `true` when the
-    /// batch that covered it saved cleanly; `false` on a failed save or a
-    /// dead task. Unbounded: callers wrap it in their own budget.
+    /// Wait until everything requested so far is applied. `true` when every
+    /// session's latest save succeeded; `false` while any has failed (until
+    /// a later save of it succeeds) or when the task is dead. Unbounded:
+    /// callers wrap it in their own budget.
     pub(crate) async fn flush(&self) -> bool {
         let target = self.shared.lock().requested;
         let mut rx = self.progress.clone();
@@ -184,8 +187,9 @@ impl Persister {
         }
     }
 
-    /// Every save of the last applied batch succeeded (`true` before any).
-    pub(crate) fn last_batch_ok(&self) -> bool {
+    /// No session's latest save attempt has failed (as of the last applied
+    /// batch; `true` before any).
+    pub(crate) fn saves_ok(&self) -> bool {
         self.progress.borrow().ok
     }
 
@@ -208,7 +212,11 @@ impl Drop for Persister {
 }
 
 async fn run(shared: Arc<Shared>, progress: watch::Sender<Progress>) {
-    // Draft removals held back because their snapshot failed to save.
+    // Sessions whose LATEST save attempt failed. Sticky across batches: a
+    // later batch with no save of them (a draft write, a removal) must not
+    // report success or release their draft removal.
+    let mut failed: HashSet<String> = HashSet::new();
+    // Draft removals held back because their session's save failed.
     let mut deferred_removes: HashSet<String> = HashSet::new();
     loop {
         let batch = {
@@ -233,11 +241,11 @@ async fn run(shared: Arc<Shared>, progress: watch::Sender<Progress>) {
             continue;
         };
 
-        let mut failed: HashSet<String> = HashSet::new();
         let mut saved: HashSet<String> = HashSet::new();
         for session in saves {
             match session.save().await {
                 Ok(()) => {
+                    failed.remove(&session.id);
                     saved.insert(session.id.clone());
                 }
                 Err(e) => {
@@ -389,6 +397,36 @@ mod tests {
         assert!(p.flush().await);
         assert_eq!(on_disk(&s.id), 2);
         assert_eq!(read_turn_draft(&dir, &s.id).unwrap(), None, "removed after the good save");
+    }
+
+    /// A failure is sticky: after a failed save, a batch with no save of
+    /// that session (a draft write, then a lone removal) neither reports
+    /// success nor releases the removal. (Review finding: `failed` used to
+    /// be per batch, so the removal went through and `flush` said `true`.)
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_failed_save_stays_failed_until_a_save_succeeds() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let s = session_with(2);
+        let snapshot = dir.join(format!("{}.json", s.id));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("occupied"), b"x").unwrap();
+        let p = Persister::new(dir.clone());
+        p.save(s.clone());
+        assert!(!p.flush().await);
+        p.write_draft(&s.id, draft(2));
+        assert!(!p.flush().await, "a draft-only batch does not clear the failure");
+        assert!(!p.saves_ok());
+        p.remove_draft(&s.id);
+        assert!(!p.flush().await);
+        assert_eq!(read_turn_draft(&dir, &s.id).unwrap(), Some(draft(2)), "draft kept");
+
+        std::fs::remove_dir_all(&snapshot).unwrap();
+        p.save(s.clone());
+        assert!(p.flush().await, "the good save clears it");
+        assert_eq!(read_turn_draft(&dir, &s.id).unwrap(), None, "and releases the removal");
     }
 
     /// A new turn's draft supersedes a removal that was held back.

@@ -764,7 +764,7 @@ impl SessionActor {
         let key = super::persister::SnapshotKey::of(&session);
         // This exact state is already queued or on disk — unless the last
         // write failed, in which case it is queued again.
-        if self.last_queued_save.as_ref() == Some(&key) && self.persister.last_batch_ok() {
+        if self.last_queued_save.as_ref() == Some(&key) && self.persister.saves_ok() {
             return;
         }
         self.last_queued_save = Some(key);
@@ -834,7 +834,9 @@ impl SessionActor {
 
         // A queued ordinary save must not land after (and over) the durable
         // head: drain the persister first.
-        self.persister.flush().await;
+        if !self.persister.flush().await {
+            tracing::warn!(session = %self.id, "context head checkpoint: an earlier save failed");
+        }
         let result = self.conv.persist_context_head(&session_id, messages).await;
         if let Err(ref e) = result {
             tracing::error!(session = %session_id, "context head checkpoint save failed: {e}");
@@ -1216,14 +1218,10 @@ impl SessionActor {
         use crate::extensions::session_driver::Outcome;
 
         // ── 1. Cleanup cancelled stream setup ────────────────────────────
-        if self.stream.is_none()
-            && self
-                .cancel
-                .as_ref()
-                .is_some_and(|ct| ct.is_cancelled())
-        {
-            self.clear_stream();
-            self.emit(SessionEventWire::Idle);
+        // (e.g. the grant's deadline cancelled the driver token before the
+        // turn's stream started): an interrupted turn, ended like any other.
+        if self.stream.is_none() && self.turn_cancelled() {
+            self.finish_revoked_turn(false);
         }
 
         // ── 2. Validate lifecycle ────────────────────────────────────────
@@ -2132,6 +2130,9 @@ impl SessionActor {
             let undelivered = std::mem::take(&mut self.turn_steered_events);
             self.conv.pending_events.splice(0..0, undelivered);
         }
+        // The history that ends the turn — whether or not a draft is open
+        // (no draft without the session lock) — then the draft removal.
+        self.request_save();
         self.close_turn_draft();
         self.update_attach_state();
     }
@@ -2209,14 +2210,13 @@ impl SessionActor {
         );
     }
 
-    /// Turn end (every path goes through `clear_stream`): save the history
-    /// that ends the turn, THEN remove the draft. Queued in that order, and
-    /// the persister never removes a draft after a failed save of its
-    /// session, so the draft cannot disappear before the history that
-    /// concludes its turn is on disk.
+    /// Turn end (every path goes through `clear_stream`, which has just
+    /// queued the save of the history that ends the turn): remove the draft.
+    /// Queued after that save, and the persister never removes a draft while
+    /// its session's latest save has failed, so the draft cannot disappear
+    /// before the history that concludes its turn is on disk.
     fn close_turn_draft(&mut self) {
         if let Some(id) = self.turn_draft.open.take() {
-            self.request_save();
             self.persister.remove_draft(&id);
         }
         self.turn_draft = TurnDraftState::default();
@@ -2497,7 +2497,8 @@ impl SessionActor {
 
     /// A turn whose token was cancelled from OUTSIDE `cancel_turn` — a
     /// driver revocation drops `DriverState`, cancelling the driver turn's
-    /// child token — ends here: on its `Done`, its stream's end, or when
+    /// child token (the grant's deadline task cancels that token too; the
+    /// next `driver_tick` then revokes and arms the deadline) — ends here: on its `Done`, its stream's end, or when
     /// `revoked_turn_deadline` passes (a tool that ignores the cancel must
     /// not keep the session busy forever; the same budget as
     /// `drain_cancelled_stream`). What is left of the stream is dropped.
@@ -3093,7 +3094,9 @@ impl SessionActor {
                 // The transition rewrites the predecessor on disk (its
                 // `compacted_into` link): a queued save of it must land
                 // first, never after.
-                self.persister.flush().await;
+                if !self.persister.flush().await {
+                    tracing::warn!(session = %self.id, "compaction: an earlier save failed");
+                }
                 let policy: CompactionPolicy = self.config.compaction_policy.into();
                 let queued = self.conv.queued_message.clone();
                 let applied = apply_compaction(
@@ -3164,7 +3167,9 @@ impl SessionActor {
         let applied = match outcome {
             Ok(outcome) => {
                 // Queued saves land before the transition rewrites the file.
-                self.persister.flush().await;
+                if !self.persister.flush().await {
+                    tracing::warn!(session = %self.id, "compaction: an earlier save failed");
+                }
                 apply_compaction(
                     &self.runtime,
                     &self.conv.session,
