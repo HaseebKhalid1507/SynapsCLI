@@ -379,7 +379,54 @@ pub(crate) struct SessionBootResult {
     pub(crate) total_output_tokens: u64,
     pub(crate) session_cost: f64,
     pub(crate) continued: bool,
+    /// A `sessions/<id>.turn` sidecar was found (and folded into
+    /// `session.api_messages`). The lock holder must save, then remove it
+    /// (`finish_turn_draft_recovery`).
+    pub(crate) turn_draft_found: bool,
     pub(crate) continue_info: Option<ContinueInfo>,
+}
+
+/// Crash recovery on load: if `sessions/<id>.turn` exists, the process that
+/// last ran this session died with a turn open. Fold the sidecar into
+/// `session.api_messages` (`engine::interrupt::recover_crashed_turn`) and
+/// report that one was found. The sidecar itself is left in place — only a
+/// caller holding the session lock may remove it, after saving.
+pub(crate) fn recover_turn_draft(session: &mut crate::Session) -> bool {
+    let dir = agent_core::session_lock::sessions_dir();
+    match agent_core::core::session_draft::read_turn_draft(&dir, &session.id) {
+        Ok(Some(draft)) => {
+            if crate::engine::interrupt::recover_crashed_turn(&mut session.api_messages, &draft) {
+                tracing::warn!(
+                    session = %session.id,
+                    "session was interrupted mid-turn by an unexpected stop; recovered"
+                );
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            // Unreadable sidecar: never block the load. Leave it for the
+            // lock holder to remove; the history stays exactly as saved.
+            tracing::warn!(session = %session.id, "unreadable turn sidecar: {e}");
+            true
+        }
+    }
+}
+
+/// Second half of crash recovery, run by the session-lock holder: persist the
+/// recovered history, THEN remove the sidecar (a crash in between leaves the
+/// marker on disk, which makes the next recovery a no-op).
+pub(crate) async fn finish_turn_draft_recovery(conv: &mut crate::engine::session::ConversationState) {
+    conv.save().await;
+    let dir = agent_core::session_lock::sessions_dir();
+    let id = conv.session.id.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        agent_core::core::session_draft::remove_turn_draft(&dir, &id)
+    })
+    .await;
+    if let Ok(Err(e)) | Err(e) = removed.map_err(std::io::Error::other) {
+        tracing::warn!(session = %conv.session.id, "failed to remove turn sidecar: {e}");
+    }
 }
 
 fn resolve_or_create_session(
@@ -476,6 +523,10 @@ fn resolve_or_create_session(
                     "migrated a legacy abort-context recap to an interruption marker"
                 );
             }
+            // A turn sidecar means the last process died with a turn open.
+            // Fold it in here, in memory; the caller that holds the session
+            // lock saves the result and removes the sidecar.
+            let turn_draft_found = recover_turn_draft(&mut session);
 
             Ok(SessionBootResult {
                 api_messages: session.api_messages.clone(),
@@ -483,6 +534,7 @@ fn resolve_or_create_session(
                 total_output_tokens: session.total_output_tokens,
                 session_cost: session.session_cost,
                 continued: true,
+                turn_draft_found,
                 continue_info,
                 session,
             })
@@ -500,6 +552,7 @@ fn resolve_or_create_session(
                 total_output_tokens: 0,
                 session_cost: 0.0,
                 continued: false,
+                turn_draft_found: false,
                 continue_info: None,
             })
         }

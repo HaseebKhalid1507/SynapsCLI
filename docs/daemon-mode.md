@@ -235,6 +235,19 @@ C: bye | socket close = Detach (turn keeps running)
   Cost: one save per round (≈1 ms for a 2.3 MB session in `json` mode, which rewrites the file;
   `session_persistence = journal` appends only the new messages). Attach replays carry no per-round
   `MessageHistory`: the snapshot already holds the latest history.
+- **A turn cut off by a crash is recovered on the next load.** While a turn runs, the actor keeps
+  a small sidecar `sessions/<id>.turn` (`agent_core::core::session_draft`): the text of the response
+  in flight plus the history length it continues from — written at turn start, at most once per
+  1 Hz turn tick while text streams, removed when the turn ends (ordered, non-blocking writes;
+  0600, confined, atomic; O(partial text) in either persistence mode). A sidecar found on load
+  (`--continue`, daemon create/unpark, `/resume` — which now takes the session lock like
+  `NewSession`) means the process died mid-turn: the partial text is appended as a real assistant
+  message (text only, like a cancel) followed by `[Request interrupted: Synaps stopped
+  unexpectedly]`, saved, then the sidecar is removed. A leftover sidecar of a turn that actually
+  concluded (history already ends with the model's final reply or an interruption marker) is just
+  removed; a stale one (its round already committed) contributes no text. Recovery only ever
+  appends, so the cached prefix is untouched. Written by the session actor (TUI, chat, daemon,
+  attach); rpc / server / legacy chat save every round but keep no sidecar.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)

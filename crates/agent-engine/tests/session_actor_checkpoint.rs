@@ -304,3 +304,298 @@ async fn saved_mid_turn_history_is_valid_to_resume() {
     assert_eq!(saved.last().unwrap()["role"], "user");
     end(&mut a).await;
 }
+
+// ── crash recovery: the in-flight turn sidecar ───────────────────────────────
+
+use agent_engine::core::session_draft::{read_turn_draft, TurnDraft};
+use agent_engine::core::session_lock::sessions_dir;
+use agent_engine::engine::interrupt::InterruptReason;
+use agent_engine::session::SessionCommand;
+
+/// Poll the sidecar until `pred` holds (flushed on the 1 Hz turn tick).
+async fn sidecar_until(id: &str, pred: impl Fn(Option<&TurnDraft>) -> bool) -> Option<TurnDraft> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let d = read_turn_draft(&sessions_dir(), id).expect("readable sidecar");
+        if pred(d.as_ref()) {
+            return d;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sidecar never reached the expected state: {d:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The session's files exactly as they were at one instant.
+struct DiskState(Vec<(std::path::PathBuf, Vec<u8>)>);
+
+impl DiskState {
+    fn capture(id: &str) -> Self {
+        let dir = sessions_dir();
+        DiskState(
+            ["json", "journal", "turn"]
+                .iter()
+                .map(|ext| dir.join(format!("{id}.{ext}")))
+                .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+                .collect(),
+        )
+    }
+    /// Put the files back as captured: the disk state at the "crash".
+    fn restore(&self, id: &str) {
+        let dir = sessions_dir();
+        for ext in ["json", "journal", "turn"] {
+            let _ = std::fs::remove_file(dir.join(format!("{id}.{ext}")));
+        }
+        for (path, bytes) in &self.0 {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// Simulate `kill -9` mid-turn: capture the disk while the turn runs, let the
+/// session end (its graceful cleanup is what a crash never gets to do), wait
+/// until the actor is really gone (`Ended` precedes the task's exit, and a
+/// `--continue` in that window attaches to the dying actor), then put the
+/// captured files back.
+async fn crash_mid_turn(
+    a: &mut LocalTransport,
+    handle: &agent_engine::session::SessionHandle,
+    id: &str,
+) {
+    let at_crash = DiskState::capture(id);
+    assert!(
+        at_crash
+            .0
+            .iter()
+            .any(|(p, _)| p.extension().is_some_and(|e| e == "turn")),
+        "a running turn has a sidecar"
+    );
+    end(a).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while handle.is_alive() {
+        assert!(tokio::time::Instant::now() < deadline, "actor never exited");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    at_crash.restore(id);
+}
+
+async fn continue_session(
+    host: &Arc<agent_engine::EngineHost>,
+    id: &str,
+) -> (LocalTransport, agent_engine::session::AttachSnapshot) {
+    let handle = host
+        .create_session(SessionConfig {
+            continue_session: Some(Some(id.to_string())),
+            ..persist_cfg()
+        })
+        .await
+        .unwrap();
+    LocalTransport::attach(handle, ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap()
+}
+
+fn text(m: &SharedMessage) -> String {
+    match &m["content"] {
+        serde_json::Value::String(s) => s.clone(),
+        other => other[0]["text"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// The sidecar exists while a turn runs, carries the streamed reply, and is
+/// gone once the turn ends — by completion or by cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn turn_sidecar_follows_the_reply_and_is_removed_at_turn_end() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let h1 = host().await;
+    let handle = h1.create_session(persist_cfg()).await.unwrap();
+    let id = handle.journal_id();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+
+    a.send(submit("stream something")).await.unwrap();
+    until(&mut a, is_text).await;
+    let d = sidecar_until(&id, |d| d.is_some_and(|d| d.partial_text == "hi"))
+        .await
+        .unwrap();
+    assert_eq!(d.base_len, 1, "continues from the saved prompt");
+
+    a.send(SessionCommand::Cancel).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    sidecar_until(&id, |d| d.is_none()).await;
+    end(&mut a).await;
+
+    // Normal completion removes it too.
+    let _h2 = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host2 = host().await;
+    let handle = host2.create_session(persist_cfg()).await.unwrap();
+    let id = handle.journal_id();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("quick one")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    sidecar_until(&id, |d| d.is_none()).await;
+    end(&mut a).await;
+}
+
+/// A long reply with no tool calls, cut by a crash: on `--continue` the
+/// streamed text comes back as a real assistant message, then the crash
+/// marker; the sidecar is gone and the recovery is on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn crash_mid_reply_is_recovered_on_continue() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(persist_cfg()).await.unwrap();
+    let id = handle.journal_id();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+
+    a.send(submit("write me an essay")).await.unwrap();
+    until(&mut a, is_text).await;
+    sidecar_until(&id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
+    crash_mid_turn(&mut a, &handle, &id).await;
+
+    let (mut b, snap) = continue_session(&host, &id).await;
+    let msgs = &snap.conversation.api_messages;
+    let texts: Vec<String> = msgs.iter().map(text).collect();
+    assert_eq!(
+        texts,
+        ["write me an essay", "hi", InterruptReason::Crash.marker()],
+        "{msgs:#?}"
+    );
+    assert_eq!(msgs[1]["role"], "assistant");
+    sidecar_until(&id, |d| d.is_none()).await;
+    let saved = Session::load(&id).unwrap().api_messages;
+    assert_eq!(saved.len(), 3, "the recovery was persisted");
+    end(&mut b).await;
+}
+
+/// A crash between rounds: the completed round is kept (round checkpoint),
+/// the in-flight reply's text comes back after it, then the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn crash_after_a_tool_round_keeps_the_round_and_the_partial_reply() {
+    let _h = Home::new();
+    let bodies: &'static [&'static str] =
+        Box::leak(Box::new([sse_read_round("toolu_c1"), SSE_PREFIX]));
+    let (url, _) = stub_seq_endless_last(bodies).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(persist_cfg()).await.unwrap();
+    let id = handle.journal_id();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+
+    a.send(submit("read then explain")).await.unwrap();
+    until(&mut a, is_text).await;
+    sidecar_until(&id, |d| {
+        d.is_some_and(|d| d.base_len == 3 && d.partial_text == "hi")
+    })
+    .await;
+    on_disk_until(&id, |m| m.len() == 3).await;
+    crash_mid_turn(&mut a, &handle, &id).await;
+
+    let (mut b, snap) = continue_session(&host, &id).await;
+    let msgs = &snap.conversation.api_messages;
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user", "assistant", "user"],
+        "{msgs:#?}"
+    );
+    assert_eq!(tool_use_ids(msgs), ["toolu_c1"]);
+    assert!(has_result_for(msgs, "toolu_c1"));
+    assert_eq!(text(&msgs[3]), "hi");
+    assert_eq!(text(&msgs[4]), InterruptReason::Crash.marker());
+    end(&mut b).await;
+}
+
+/// `/resume` into a session that crashed mid-turn recovers it the same way
+/// (it now takes the session lock first, as NewSession does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resume_recovers_a_session_that_crashed_mid_turn() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let crashed = host.create_session(persist_cfg()).await.unwrap();
+    let crashed_id = crashed.journal_id();
+    let (mut a, _) = LocalTransport::attach(crashed.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("interrupted work")).await.unwrap();
+    until(&mut a, is_text).await;
+    sidecar_until(&crashed_id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
+    crash_mid_turn(&mut a, &crashed, &crashed_id).await;
+
+    let other = host.create_session(persist_cfg()).await.unwrap();
+    let (mut b, _) = LocalTransport::attach(other.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    b.send(SessionCommand::Resume {
+        id: 7,
+        query: crashed_id.clone(),
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Conversation(_))).await;
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(text).collect();
+    assert_eq!(
+        texts,
+        ["interrupted work", "hi", InterruptReason::Crash.marker()],
+        "{msgs:#?}"
+    );
+    sidecar_until(&crashed_id, |d| d.is_none()).await;
+    end(&mut b).await;
+}
+
+/// A leftover sidecar from a turn that actually completed (only its removal
+/// was lost) never alters the history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn stale_sidecar_of_a_completed_turn_is_just_removed() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(persist_cfg()).await.unwrap();
+    let id = handle.journal_id();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("done quickly")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut a).await;
+    let before = Session::load(&id).unwrap().api_messages;
+    assert_eq!(before.last().unwrap()["role"], "assistant");
+    agent_engine::core::session_draft::write_turn_draft(
+        &sessions_dir(),
+        &id,
+        &TurnDraft {
+            base_len: 1,
+            partial_text: "hi".into(),
+        },
+    )
+    .unwrap();
+
+    let (mut b, snap) = continue_session(&host, &id).await;
+    assert_eq!(snap.conversation.api_messages, before, "history untouched");
+    sidecar_until(&id, |d| d.is_none()).await;
+    end(&mut b).await;
+}
