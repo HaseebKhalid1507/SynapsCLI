@@ -136,6 +136,8 @@ pub(super) struct StreamSession {
     /// Set only at a successful, non-cancelled terminal assistant boundary.
     /// Error/budget/cancel paths leave this empty, even when they return Ok.
     pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
+    /// Marked at the turn's normal end (see `TurnCompletion`).
+    pub(super) turn_completion: super::types::TurnCompletion,
     pub(super) context_window: u64,
     pub(super) continuation: super::continuation::SharedContinuation,
 
@@ -423,6 +425,7 @@ impl StreamMethods {
             memory_backend,
             memory_context,
             final_capture_history,
+            turn_completion,
             context_window,
             continuation,
             auth,
@@ -1205,6 +1208,12 @@ impl StreamMethods {
                     return Err(e);
                 }
             };
+            // Whether this response was cut by a cancel. Read HERE, as the
+            // provider call returns: a cancel that lands later (e.g. during
+            // the `on_message_complete` hook below) did not cut it, and a
+            // response that asks for nothing more is then the turn's
+            // normal end (`TurnCompletion`).
+            let response_cancelled = cancel.is_cancelled();
 
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
@@ -1237,6 +1246,7 @@ impl StreamMethods {
                         // Legitimate empty end_turn after tool results — clean finish.
                         // A clean finish is a terminal completion: publish the
                         // history for memory capture like the normal end_turn path.
+                        turn_completion.mark_completed();
                         *final_capture_history
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1336,6 +1346,9 @@ impl StreamMethods {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(messages.clone());
+                        }
+                        if !response_cancelled {
+                            turn_completion.mark_completed();
                         }
                         let _ =
                             tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
@@ -2945,6 +2958,7 @@ mod rich_output_tests {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
+            turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
@@ -3849,6 +3863,7 @@ mod rich_output_tests {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
+            turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),

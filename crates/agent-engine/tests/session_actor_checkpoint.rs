@@ -225,9 +225,11 @@ async fn completed_tool_rounds_are_on_disk_while_the_turn_runs() {
     end(&mut a).await;
 }
 
-/// A client attaching mid-turn gets the latest history in its snapshot and
-/// NO per-round `MessageHistory` in the replay (which would re-ship the whole
-/// history once per round and roll its mirror back).
+/// A client attaching mid-turn gets the latest history in its snapshot and a
+/// replay of ONLY the round in flight: no per-round `MessageHistory` or
+/// `Conversation` (which would re-ship the whole history once per round and
+/// roll its mirror back), and none of the completed rounds' display events
+/// (already in the snapshot's history: they rendered twice).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mid_turn_attach_replays_no_stale_histories() {
@@ -270,8 +272,34 @@ async fn mid_turn_attach_replays_no_stale_histories() {
         .count();
     assert_eq!(stale, 0, "no MessageHistory in the turn replay");
     assert!(
+        !snap
+            .replay
+            .iter()
+            .any(|e| matches!(e.event, SessionEventWire::Conversation(_))),
+        "no stale Conversation in the turn replay"
+    );
+    // The completed rounds are in the snapshot's history: replaying their
+    // tool calls too showed every finished round twice on attach.
+    let replayed_calls: Vec<&str> = snap
+        .replay
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEventWire::Stream(StreamEvent::Llm(
+                LlmEvent::ToolUse { tool_id, .. } | LlmEvent::ToolUseStart { tool_id, .. },
+            )) => Some(tool_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(replayed_calls.is_empty(), "completed rounds replayed: {replayed_calls:?}");
+    assert!(
         snap.replay.iter().any(|e| is_text(&e.event)),
-        "the turn's display events are still replayed"
+        "the round in flight is still replayed"
+    );
+    assert!(
+        snap.replay
+            .iter()
+            .any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })),
+        "the turn start is kept"
     );
     drop(b);
     end(&mut a).await;
@@ -563,6 +591,117 @@ async fn resume_recovers_a_session_that_crashed_mid_turn() {
     );
     draft_until(&crashed_id, |d| d.is_none()).await;
     end(&mut b).await;
+}
+
+/// `/resume` of a session that is live in another actor (it holds the
+/// session lock, its turn is running and its draft is open) is REFUSED, and
+/// nothing changes on either side. It used to warn, drop its own lock, and
+/// fold the live turn's draft in as a crash that never happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resume_refuses_a_session_live_elsewhere() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let live = host.create_session(persist_cfg()).await.unwrap();
+    let live_id = live.journal_id();
+    let (mut a, _) = LocalTransport::attach(live.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("busy here")).await.unwrap();
+    until(&mut a, is_text).await;
+    let draft = draft_until(&live_id, |d| d.is_some_and(|d| d.partial_text == "hi")).await;
+
+    let other = host.create_session(persist_cfg()).await.unwrap();
+    let other_id = other.journal_id();
+    let (mut b, _) = LocalTransport::attach(other.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    b.send(SessionCommand::Resume {
+        id: 7,
+        query: live_id.clone(),
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| {
+        matches!(e, SessionEventWire::QueryResult { id: 7, .. } | SessionEventWire::Resumed { .. })
+    })
+    .await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::QueryResult { value, .. } => {
+            assert_eq!(value["kind"], "error", "{value}");
+            assert!(
+                value["text"].as_str().unwrap().contains("cannot resume"),
+                "{value}"
+            );
+        }
+        other => panic!("resumed a session live elsewhere: {other:?}"),
+    }
+    assert_eq!(other.journal_id(), other_id, "B stayed on its own session");
+    assert_eq!(
+        read_turn_draft(&sessions_dir(), &live_id).unwrap(),
+        draft,
+        "the live turn's draft is untouched"
+    );
+    let on_disk = Session::load(&live_id).unwrap().api_messages;
+    assert!(
+        !on_disk.iter().map(text).any(|t| t == InterruptReason::Crash.marker()),
+        "no crash recorded for a live turn: {on_disk:#?}"
+    );
+
+    // The live session is unaffected: its own cancel still works normally.
+    a.send(SessionCommand::Cancel).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let msgs = last_conversation(&seen).api_messages;
+    assert_eq!(text(msgs.last().unwrap()), InterruptReason::User.marker());
+    end(&mut b).await;
+    end(&mut a).await;
+}
+
+/// A turn's draft is removed only AFTER the history that ends the turn is
+/// on disk: at no instant is the draft gone while the saved history still
+/// lacks the turn's end (the marker, here). `cancel_turn` used to remove the
+/// draft first, then save — and a save that timed out was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_draft_outlives_the_save_that_ends_its_turn() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(persist_cfg()).await.unwrap();
+    let id = handle.journal_id();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    a.send(submit("stream something")).await.unwrap();
+    until(&mut a, is_text).await;
+    draft_until(&id, |d| d.is_some()).await;
+
+    // Watch the disk from before the cancel until the draft is gone.
+    let dir = sessions_dir();
+    let watch_id = id.clone();
+    let watcher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let draft = dir.join(format!("{watch_id}.turn")).exists();
+            if !draft {
+                // Gone: the concluding history must already be saved.
+                let saved = Session::load(&watch_id).unwrap().api_messages;
+                return saved.last().map(text);
+            }
+            assert!(std::time::Instant::now() < deadline, "draft never removed");
+            std::thread::yield_now();
+        }
+    });
+    a.send(SessionCommand::Cancel).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let last_saved = tokio::task::spawn_blocking(move || watcher.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(last_saved.as_deref(), Some(InterruptReason::User.marker()));
+    end(&mut a).await;
 }
 
 /// A leftover draft from a turn that actually completed (only its removal

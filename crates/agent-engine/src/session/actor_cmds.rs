@@ -113,6 +113,9 @@ impl SessionActor {
     /// messages — persist the name change (commands.rs `saveas` arm).
     async fn session_name(&mut self, arg: &str) -> serde_json::Value {
         let trimmed = arg.trim();
+        // This saves `conv.session` directly (even with no messages): a
+        // queued save of it, without the new name, must not land after.
+        self.persister.flush().await;
         if trimmed.is_empty() {
             self.conv.session.clear_name();
             let _ = self.conv.session.save().await;
@@ -210,6 +213,9 @@ impl SessionActor {
             });
             return;
         }
+        // Queued saves first: resuming the CURRENT session reloads it from
+        // disk, which must hold its latest state.
+        self.persister.flush().await;
         let session = match crate::resolve_session(&query) {
             Ok(s) => s,
             Err(e) => {

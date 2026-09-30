@@ -87,6 +87,9 @@ struct RpcState {
     events_auto_turn: bool,
     /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
     auto_turn_cap: u32,
+    /// A round-checkpoint save timed out (bounded: it holds this state's
+    /// lock): `terminal_flush` saves at the turn's end instead.
+    save_owed: bool,
 }
 
 impl RpcState {
@@ -180,6 +183,30 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 
 // ─── Terminal-path helper ─────────────────────────────────────────────────────
 
+/// A cancelled turn: the engine's cancel-path history (partial assistant
+/// message, completed tool rounds, canceled results) was already adopted
+/// from `MessageHistory`; append the interruption marker after it (before
+/// `terminal_flush` injects buffered events), exactly like the session
+/// actor. Append-only, so the provider's cached prefix is untouched.
+///
+/// A turn the engine had already finished when the cancel reached it
+/// (`TurnCompletion`) is not interrupted: nothing is appended.
+async fn mark_interrupted(
+    state: &Mutex<RpcState>,
+    completion: &agent_engine::runtime::TurnCompletion,
+) {
+    if completion.completed() {
+        return;
+    }
+    let mut st = state.lock().await;
+    if agent_engine::engine::interrupt::append_marker(
+        &mut st.api_messages,
+        agent_engine::engine::interrupt::InterruptReason::User,
+    ) {
+        st.save_session().await;
+    }
+}
+
 /// Atomically close out a terminal path: clear `in_flight`, clear
 /// `auto_turn_pending`, and flush any buffered `pending_events` into
 /// `api_messages` — all under **one** mutex acquisition.
@@ -204,21 +231,6 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 /// allowed `terminal_flush` to increment `consecutive_auto_turns` and set
 /// `auto_turn_pending = true` while returning `Some(auto_id)` that was then
 /// silently discarded — leaving the session permanently stuck in busy state.
-/// A cancelled turn: the engine's cancel-path history (partial assistant
-/// message, completed tool rounds, canceled results) was already adopted
-/// from `MessageHistory`; append the interruption marker after it (before
-/// `terminal_flush` injects buffered events), exactly like the session
-/// actor. Append-only, so the provider's cached prefix is untouched.
-async fn mark_interrupted(state: &Mutex<RpcState>) {
-    let mut st = state.lock().await;
-    if agent_engine::engine::interrupt::append_marker(
-        &mut st.api_messages,
-        agent_engine::engine::interrupt::InterruptReason::User,
-    ) {
-        st.save_session().await;
-    }
-}
-
 async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<String> {
     let mut st = state.lock().await;
     st.in_flight = None;
@@ -229,6 +241,11 @@ async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<St
         st.api_messages.push(std::sync::Arc::new(
             serde_json::json!({"role": "user", "content": formatted}),
         ));
+    }
+    // The injected events are history now, and a timed-out round save is
+    // still owed: persist the turn's end.
+    if had_buffered || std::mem::take(&mut st.save_owed) {
+        st.save_session().await;
     }
 
     // Only attempt to reserve a post-flush auto-turn on the Done path.
@@ -303,6 +320,7 @@ async fn spawn_prompt(
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let cancel_check = cancel.clone();
+    let turn_completion = agent_engine::runtime::TurnCompletion::new();
     let pid = prompt_id.clone();
     let wtx = writer_tx.clone();
 
@@ -358,7 +376,14 @@ async fn spawn_prompt(
         let mut stream = {
             let st = state.lock().await;
             st.runtime
-                .run_stream_with_messages(messages, cancel_clone, None, None, false)
+                .run_stream_tracked(
+                    messages,
+                    cancel_clone,
+                    None,
+                    None,
+                    false,
+                    turn_completion.clone(),
+                )
                 .await
         };
 
@@ -388,7 +413,20 @@ async fn spawn_prompt(
             if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
                 let mut st = state.lock().await;
                 st.api_messages = msgs;
-                st.save_session().await;
+                // Round checkpoint, bounded: it holds the state lock every
+                // command (Abort included) waits on. A write already handed
+                // to the disk still lands, in order; otherwise the turn's end
+                // saves (`terminal_flush`).
+                if tokio::time::timeout(
+                    agent_engine::session::budgets::SAVE_TIMEOUT,
+                    st.save_session(),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("rpc: round checkpoint save timed out");
+                    st.save_owed = true;
+                }
                 continue;
             }
             match &ev {
@@ -417,7 +455,7 @@ async fn spawn_prompt(
                         })
                         .await;
                     if cancelled {
-                        mark_interrupted(&state).await;
+                        mark_interrupted(&state, &turn_completion).await;
                     }
                     // terminal_flush(allow_chain=true): Done path — eligible to
                     // reserve a post-flush auto-turn if conditions are met.
@@ -474,7 +512,7 @@ async fn spawn_prompt(
                                 body: serde_json::json!({ "ok": true, "cancelled": true }),
                             })
                             .await;
-                        mark_interrupted(&state).await;
+                        mark_interrupted(&state, &turn_completion).await;
                         // Cancel path: terminal_flush(allow_chain=false) — never reserve auto-turn.
                         let _ = terminal_flush(&state, false).await;
                         return;
@@ -554,7 +592,7 @@ async fn spawn_prompt(
             })
             .await;
         if cancelled {
-            mark_interrupted(&state).await;
+            mark_interrupted(&state, &turn_completion).await;
         }
         // Silent-drop / abort path: terminal_flush(allow_chain=false) — never reserve auto-turn.
         let _ = terminal_flush(&state, false).await;
@@ -1148,6 +1186,7 @@ pub async fn run(
         auto_turn_pending: false,
         events_auto_turn,
         auto_turn_cap,
+        save_owed: false,
     }));
 
     // 5. Spawn the writer task that owns stdout.
@@ -1563,6 +1602,7 @@ mod context_head_tests {
             auto_turn_pending: false,
             events_auto_turn: true,
             auto_turn_cap: 5,
+            save_owed: false,
         };
         let (receipt, acknowledged) = synaps_cli::core::context_head::ContextHeadReceipt::channel();
         receipt.complete(st.persist_context_head("wrong-session", Vec::new()).await);

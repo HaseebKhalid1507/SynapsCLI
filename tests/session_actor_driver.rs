@@ -1599,3 +1599,76 @@ async fn s9_unarmed_auto_approve_bypasses_activation_gate() {
     );
     a.end().await;
 }
+
+// ── a revoked driver turn ends as an interrupted turn ───────────────────────
+
+/// A driver revoked MID-TURN (here: an explicit restart of the driver)
+/// cancels the driver turn's token without going through `cancel_turn`. The
+/// turn must still end the one way every interrupted turn ends: the partial
+/// reply kept, one interruption marker appended, `Aborted` to clients —
+/// never the normal post-turn path (queued auto-send, auto-compaction) it
+/// used to take when its `Done` arrived. (Review finding.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_driver_revoked_mid_turn_ends_as_an_interrupted_turn() {
+    use agent_engine::engine::interrupt::InterruptReason;
+    let guard = HomeGuard::new();
+    let (host, _temp) = stub_host(&guard, Script::Endless(support::ANTHROPIC_SSE_PREFIX), "").await;
+    let mut actor = session_cfg(
+        &host,
+        SessionConfig {
+            model_override: Some(MODEL.into()),
+            persist: false,
+            ..SessionConfig::default()
+        },
+    )
+    .await;
+    actor.arm().await;
+    actor
+        .until(|e| matches!(e, SessionEventWire::TurnStarted { .. }))
+        .await;
+    actor
+        .until(|e| {
+            matches!(
+                e,
+                SessionEventWire::Stream(agent_engine::StreamEvent::Llm(
+                    agent_engine::LlmEvent::Text(_)
+                ))
+            )
+        })
+        .await;
+
+    // Restarting the driver revokes the running one mid-stream.
+    actor.driver_start().await;
+    let seen = tokio::time::timeout(
+        Duration::from_secs(5),
+        actor.collect_until(|e| matches!(e, SessionEventWire::Aborted { .. })),
+    )
+    .await
+    .expect("the revoked turn never ended");
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            SessionEventWire::DriverRevoked { reason, .. } if reason == "explicit command"
+        )),
+        "{seen:#?}"
+    );
+    assert!(
+        matches!(seen.last(), Some(SessionEventWire::Aborted { context_saved: true })),
+        "partial work kept: {:?}",
+        seen.last()
+    );
+    let conv = match actor
+        .until(|e| matches!(e, SessionEventWire::Conversation(_)))
+        .await
+    {
+        SessionEventWire::Conversation(c) => c,
+        _ => unreachable!(),
+    };
+    let last = conv.api_messages.last().expect("history");
+    assert_eq!(last["role"], "user");
+    assert_eq!(last["content"], InterruptReason::Driver.marker());
+    let partial = &conv.api_messages[conv.api_messages.len() - 2];
+    assert_eq!(partial["role"], "assistant", "the partial reply is kept");
+    actor.end().await;
+}

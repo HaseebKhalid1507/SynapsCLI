@@ -14,19 +14,23 @@
 //!   response (text only: unsigned thinking and unfinished tool calls are
 //!   never replayable).
 //!
-//! A draft found when a session is loaded means the process died with a
-//! turn open; the loader folds it into history as a real assistant message
-//! plus an interruption marker (`agent_engine::engine::interrupt`).
+//! Only the holder of the session lock writes a draft, and only the holder
+//! reads one back: a draft found when the holder loads the session means the
+//! previous holder died with a turn open, and it is folded into history as a
+//! real assistant message plus an interruption marker
+//! (`agent_engine::engine::interrupt`). The session actor's background
+//! writer (`agent_engine::session::persister`) applies draft writes and
+//! removals in order with the snapshot saves: the draft is removed only
+//! after the history that ends its turn is saved.
 //!
 //! Separate from the snapshot on purpose: O(partial text) bytes per write in
 //! every persistence mode, and the snapshot bytes stay exactly those of the
 //! last completed round. Same confined, private (0600), atomic writes as the
-//! snapshot. The `.turn` name keeps the session id as the file stem (retention
-//! pairs artifacts on the stem) and is invisible to `*.json` listings.
+//! snapshot. The `.turn` name keeps the session id as the file stem and is
+//! invisible to `*.json` listings; deleting a session (and retention)
+//! removes its draft with it.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -93,71 +97,6 @@ fn truncate_on_char_boundary(s: &mut String, max: usize) {
             cut -= 1;
         }
         s.truncate(cut);
-    }
-}
-
-/// Non-blocking, per-session ORDERED writer for the draft.
-///
-/// Each operation is stamped with a per-id sequence number at the call site
-/// (program order) and applied on the blocking pool under one lock; an
-/// operation older than the last applied one for the same id is skipped. So
-/// the file always ends in the state of the LAST call, even when blocking
-/// tasks run out of order — a late write can never resurrect a draft that
-/// a later `remove` deleted. Never blocks the caller (the session actor's
-/// turn machine must stay responsive to Esc on a slow disk).
-pub struct TurnDraftWriter {
-    dir: PathBuf,
-    next_seq: HashMap<String, u64>,
-    applied: Arc<Mutex<HashMap<String, u64>>>,
-}
-
-impl TurnDraftWriter {
-    pub fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            next_seq: HashMap::new(),
-            applied: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub fn write(&mut self, id: &str, draft: TurnDraft) {
-        self.submit(id, Some(draft));
-    }
-
-    pub fn remove(&mut self, id: &str) {
-        self.submit(id, None);
-    }
-
-    fn submit(&mut self, id: &str, op: Option<TurnDraft>) {
-        let seq = {
-            let n = self.next_seq.entry(id.to_string()).or_insert(0);
-            *n += 1;
-            *n
-        };
-        let (dir, id, applied) = (self.dir.clone(), id.to_string(), Arc::clone(&self.applied));
-        let apply = move || {
-            let mut applied = applied
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let last = applied.entry(id.clone()).or_insert(0);
-            if seq <= *last {
-                return; // superseded by a later operation already applied
-            }
-            *last = seq;
-            let result = match &op {
-                Some(draft) => write_turn_draft(&dir, &id, draft),
-                None => remove_turn_draft(&dir, &id),
-            };
-            if let Err(e) = result {
-                tracing::warn!(session = %id, "turn draft {}: {e}", if op.is_some() { "write" } else { "remove" });
-            }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn_blocking(apply);
-            }
-            Err(_) => apply(), // no runtime (sync callers/tests): apply inline
-        }
     }
 }
 
@@ -231,7 +170,6 @@ fn remove_artifact(dir: &Path, name: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn draft(base_len: usize, text: &str) -> TurnDraft {
         TurnDraft {
@@ -306,52 +244,5 @@ mod tests {
         std::fs::write(dir.join("s2.turn"), huge).unwrap();
         let err = read_turn_draft(&dir, "s2").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    async fn settle<F: Fn() -> bool>(cond: F) {
-        for _ in 0..200 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("writer never settled");
-    }
-
-    #[tokio::test]
-    async fn writer_ends_in_the_state_of_the_last_call() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("sessions");
-        let mut w = TurnDraftWriter::new(dir.clone());
-        for i in 0..50 {
-            w.write("s1", draft(i, "streaming"));
-        }
-        w.remove("s1");
-        // Give every blocking op time to run, in whatever order.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            read_turn_draft(&dir, "s1").unwrap(),
-            None,
-            "a late write resurrected it"
-        );
-
-        w.write("s1", draft(7, "next turn"));
-        let d = dir.clone();
-        settle(move || read_turn_draft(&d, "s1").unwrap().is_some()).await;
-        assert_eq!(
-            read_turn_draft(&dir, "s1").unwrap(),
-            Some(draft(7, "next turn"))
-        );
-    }
-
-    #[tokio::test]
-    async fn writer_orders_per_session_independently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("sessions");
-        let mut w = TurnDraftWriter::new(dir.clone());
-        w.remove("old"); // removing one session's draft …
-        w.write("new", draft(2, "x")); // … must not suppress another's write
-        let d = dir.clone();
-        settle(move || read_turn_draft(&d, "new").unwrap().is_some()).await;
     }
 }

@@ -141,6 +141,30 @@ async fn actor_with(host: &Arc<EngineHost>, persist: bool) -> ActorRun {
 }
 
 impl ActorRun {
+    /// Barrier: every save the actor has queued is on disk. Commands run in
+    /// order and `Save` waits for the persister, so the `Status` reply that
+    /// follows it proves the flush (no sleep).
+    async fn flushed(&mut self) {
+        const ID: u64 = 0x5a7e;
+        self.t.send(SessionCommand::Save).await.unwrap();
+        self.t
+            .send(SessionCommand::Query {
+                id: ID,
+                query: agent_engine::session::SessionQuery::Status,
+            })
+            .await
+            .unwrap();
+        loop {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(10), self.t.next_event())
+                .await
+                .expect("actor hung")
+                .expect("actor alive");
+            if matches!(env.event, SessionEventWire::QueryResult { id: ID, .. }) {
+                return;
+            }
+        }
+    }
+
     /// Pump until `Idle` (the actor's own "turn machine parked" signal).
     async fn drive_to_idle(&mut self) {
         let mut expect_conv = false;
@@ -507,14 +531,25 @@ fn assert_saves(
     o_path: &std::path::Path,
     a_path: &std::path::Path,
 ) {
-    // Let the last rename land before reading.
+    // The actor side is flushed by the caller (`ActorRun::flushed`); this
+    // only lets the polling samplers observe the last rename.
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(
         o.saves,
         o_s.count(),
         "sampler self-check: oracle logical saves != sampled saves"
     );
-    assert_eq!(o_s.count(), a_s.count(), "save count differs (oracle vs actor)");
+    // The actor queues its saves on a background writer that writes only the
+    // LATEST state when saves pile up (and never re-queues an identical
+    // one), so it may write fewer times than the oracle — never more. What
+    // must match is the state it leaves on disk.
+    assert!(
+        a_s.count() <= o_s.count(),
+        "actor wrote more often than the oracle: {} > {}",
+        a_s.count(),
+        o_s.count()
+    );
+    assert_eq!(o.saves > 0, a_s.count() > 0, "one side never saved");
     if o.saves > 0 {
         assert_eq!(
             journal_fields(o_path),
@@ -660,6 +695,7 @@ async fn tool_loop() {
         a.api_messages.iter().any(|m| m.to_string().contains("fixture-ok")),
         "tool result reached the history"
     );
+    a.flushed().await;
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
     assert_eq!(o.saves, histories, "one save per MessageHistory (stream_handler.rs:77)");
     a.end().await;
@@ -707,6 +743,7 @@ async fn steer_mid_stream() {
     assert_eq!(delivered_at(&o.r.seen), delivered_at(&a.seen));
     assert_same_ext(&o, &a);
     assert!(a.api_messages.iter().any(|m| m["content"] == "redirect"));
+    a.flushed().await;
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
     a.end().await;
 }
@@ -751,6 +788,7 @@ async fn event_injection_busy_steered() {
             .iter()
             .any(|m| m["content"].as_str().is_some_and(|c| c.contains("event 0")))
     );
+    a.flushed().await;
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
     a.end().await;
 }
@@ -845,10 +883,18 @@ async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
     assert_eq!(texts, ["first", "partial", marker, "second", "partial", marker]);
     // Saves, per turn on both sides: the engine's prompt checkpoint (round
     // boundary before the first request) + one at abort (dispatch.rs:191).
-    std::thread::sleep(Duration::from_millis(50));
+    a.flushed().await;
+    std::thread::sleep(Duration::from_millis(50)); // oracle sampler catch-up
     assert_eq!(o.saves, 4, "prompt checkpoint + abort, per turn");
     assert_eq!(o.saves, o_s.count(), "sampler self-check");
-    assert_eq!(o_s.count(), a_s.count(), "save count differs (oracle vs actor)");
+    // Coalescing writer: at most as many writes, never more (see
+    // `assert_saves`).
+    assert!(
+        (1..=o_s.count()).contains(&a_s.count()),
+        "actor saves {} vs oracle {}",
+        a_s.count(),
+        o_s.count()
+    );
     a.end().await;
 }
 
@@ -910,6 +956,7 @@ async fn secret_prompt_roundtrip() {
     );
     assert!(a.seen.iter().any(|s| s.contains("answered:6")));
     assert_same_ext(&o, &a);
+    a.flushed().await;
     assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
     a.end().await;
 }

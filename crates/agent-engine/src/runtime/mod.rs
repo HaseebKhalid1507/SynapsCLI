@@ -46,7 +46,7 @@ use auth::AuthMethods;
 use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
-pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnCompletion};
 pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.
@@ -3880,6 +3880,29 @@ impl Runtime {
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
         auto_approve_confirms: bool,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_tracked(
+            messages,
+            cancel,
+            steering_rx,
+            secret_prompt,
+            auto_approve_confirms,
+            TurnCompletion::new(),
+        )
+        .await
+    }
+
+    /// [`Runtime::run_stream_with_messages`] that also reports, through
+    /// `completion`, whether the turn reached its normal end (see
+    /// [`TurnCompletion`]).
+    pub async fn run_stream_tracked(
+        &self,
+        messages: Vec<crate::SharedMessage>,
+        cancel: CancellationToken,
+        steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        secret_prompt: Option<crate::tools::SecretPromptHandle>,
+        auto_approve_confirms: bool,
+        completion: TurnCompletion,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         // CP-11 fix-2 (A): the caller-facing boundary is BOUNDED. The
         // internal producer keeps an unbounded sender for API stability;
         // the relay drains it eagerly, enforces the fixed preview-delta
@@ -4021,6 +4044,7 @@ impl Runtime {
             memory_backend: self.memory_backend.clone(),
             memory_context: self.memory_tool_capability(),
             final_capture_history: final_capture_history.clone(),
+            turn_completion: completion,
             context_window: self.context_window(),
             continuation: self.continuation.clone(),
             auth,
