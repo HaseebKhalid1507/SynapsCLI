@@ -244,9 +244,10 @@ C: bye | socket close = Detach (turn keeps running)
   on the actor's background writer (`session::persister`), never inside the turn machine: latest wins
   per session (if rounds come faster than the disk, only the newest history is written), an identical
   snapshot is not queued twice, and every write is ordered with the others (`session_save_order`). The
-  actor waits for the writer (bounded by `SAVE_TIMEOUT`) only where the disk must be current: before
-  parking (a failed save keeps the session live), a durable context-head checkpoint, compaction,
-  `/resume`, `Checkpoint` and session end. A crash / `kill -9` / power loss mid-turn loses at most the
+  actor waits for the writer (bounded by `SAVE_TIMEOUT`) only where the disk must be current: at
+  the end of every turn, before it announces `Idle` (so `Idle` still means "saved", as in 0.10.0),
+  before parking (a failed save keeps the session live), a durable context-head checkpoint,
+  compaction, `/resume`, `Checkpoint` and session end. A crash / `kill -9` / power loss mid-turn loses at most the
   round in flight, and what is on disk is always a valid history to resume from.
   Cost (`json` mode rewrites and fsyncs the whole file; measured on btrfs/NVMe with
   `save_cost_bench` in `agent-core` — set `SYNAPS_SAVE_BENCH_DIR` to a real disk, NOT tmpfs, whose

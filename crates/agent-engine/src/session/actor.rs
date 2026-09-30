@@ -797,6 +797,16 @@ impl SessionActor {
         self.flush_saves().await
     }
 
+    /// A turn is over: announce `Idle` only once everything it queued is on
+    /// disk (bounded, `flush_saves`). `Idle` has always meant "the session
+    /// is saved": a client or script that reads the session, quits or
+    /// hands off on `Idle` must never see the previous state. Per-round
+    /// saves stay in the background; this waits once per turn.
+    pub(crate) async fn announce_idle(&mut self) {
+        self.flush_saves().await;
+        self.emit(SessionEventWire::Idle);
+    }
+
     /// Wall 1 — actor-owned context-head checkpoint persistence.
     ///
     /// The receipt stays in-process (actor task → runtime stream task).
@@ -1225,7 +1235,7 @@ impl SessionActor {
         // (e.g. the grant's deadline cancelled the driver token before the
         // turn's stream started): an interrupted turn, ended like any other.
         if self.stream.is_none() && self.turn_cancelled() {
-            self.finish_revoked_turn(false);
+            self.finish_revoked_turn(false).await;
         }
 
         // ── 2. Validate lifecycle ────────────────────────────────────────
@@ -2434,7 +2444,7 @@ impl SessionActor {
         // Complete only if the drain consumed the whole stream: the final
         // history is published right after the completion is recorded.
         let completed = drain.closed && self.turn_completed();
-        self.finish_interrupted_turn(reason, completed);
+        self.finish_interrupted_turn(reason, completed).await;
     }
 
     /// The engine recorded the running turn's normal end (`TurnCompletion`).
@@ -2464,7 +2474,7 @@ impl SessionActor {
     /// `completed`: the engine had finished the turn normally before the
     /// cancel reached it — the history is a complete answer, so no marker is
     /// appended and clients get the `Done` they would have had.
-    fn finish_interrupted_turn(
+    async fn finish_interrupted_turn(
         &mut self,
         reason: crate::engine::interrupt::InterruptReason,
         completed: bool,
@@ -2525,7 +2535,7 @@ impl SessionActor {
             });
         }
         self.emit_conversation();
-        self.emit(SessionEventWire::Idle);
+        self.announce_idle().await;
     }
 
     /// A turn whose token was cancelled from OUTSIDE `cancel_turn` — a
@@ -2535,13 +2545,14 @@ impl SessionActor {
     /// `revoked_turn_deadline` passes (a tool that ignores the cancel must
     /// not keep the session busy forever; the same budget as
     /// `drain_cancelled_stream`). What is left of the stream is dropped.
-    fn finish_revoked_turn(&mut self, stream_closed: bool) {
+    async fn finish_revoked_turn(&mut self, stream_closed: bool) {
         if !self.streaming {
             return;
         }
         let completed = stream_closed && self.turn_completed();
         self.stream = None;
-        self.finish_interrupted_turn(crate::engine::interrupt::InterruptReason::Driver, completed);
+        self.finish_interrupted_turn(crate::engine::interrupt::InterruptReason::Driver, completed)
+            .await;
     }
 
     /// Whether the running turn's token has been cancelled (by `cancel_turn`
@@ -2799,7 +2810,7 @@ impl SessionActor {
         if self.turn_cancelled() {
             match event {
                 StreamEvent::Session(SessionEvent::Done) => {
-                    self.finish_revoked_turn(true);
+                    self.finish_revoked_turn(true).await;
                     return;
                 }
                 // Swallowed as in `drain_cancelled_stream`; `Done` follows.
@@ -2936,7 +2947,7 @@ impl SessionActor {
                     }
                     // A spawned compaction emits Idle when it lands.
                     if self.compact.is_none() {
-                        self.emit(SessionEventWire::Idle);
+                        self.announce_idle().await;
                     }
                 }
             }
@@ -2969,7 +2980,7 @@ impl SessionActor {
                     self.post_turn_chat().await;
                 }
                 if self.compact.is_none() {
-                    self.emit(SessionEventWire::Idle);
+                    self.announce_idle().await;
                 }
             }
             After::AutoSendQueued(queued) => {
@@ -3004,7 +3015,7 @@ impl SessionActor {
                     self.start_turn(TurnTrigger::EventAuto, None).await;
                 } else {
                     self.emit(SessionEventWire::AutoTurnCapReached { cap: auto_turn_cap });
-                    self.emit(SessionEventWire::Idle);
+                    self.announce_idle().await;
                 }
             }
         }
@@ -3186,7 +3197,7 @@ impl SessionActor {
         }
         self.emit_conversation();
         self.update_attach_state();
-        self.emit(SessionEventWire::Idle);
+        self.announce_idle().await;
     }
 
     /// #107 inline body (kill-switch only).
@@ -4078,12 +4089,12 @@ impl SessionTask {
                     actor.driver_tick().await;
                 }
                 _ = revoked_turn_timer(actor.revoked_turn_deadline) => {
-                    actor.finish_revoked_turn(false);
+                    actor.finish_revoked_turn(false).await;
                 }
                 ev = next_stream_event(&mut actor.stream) => match ev {
                     Some(ev) => actor.on_stream_event(ev).await,
                     // A revoked turn's stream ending is its end.
-                    None if actor.turn_cancelled() => actor.finish_revoked_turn(true),
+                    None if actor.turn_cancelled() => actor.finish_revoked_turn(true).await,
                     None => {
                         // Stream ended without a terminal event: defensive reset.
                         // P5: capture_terminal(None) = EOF → revoke driver.
@@ -4113,7 +4124,7 @@ impl SessionTask {
                         }
                         actor.clear_stream();
                         actor.emit_conversation();
-                        actor.emit(SessionEventWire::Idle);
+                        actor.announce_idle().await;
                     }
                 },
             }
