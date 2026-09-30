@@ -569,8 +569,10 @@ impl SessionActor {
         conv.session_cost = sb.session_cost;
         // Crash recovery (the last process died mid-turn): only the lock
         // holder may persist the recovered history and remove the sidecar.
-        if sb.turn_draft_found && cfg.persist && session_lock.is_some() {
-            crate::engine::setup::finish_turn_draft_recovery(&mut conv).await;
+        if let Some(recovered) = sb.turn_draft {
+            if cfg.persist && session_lock.is_some() {
+                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
+            }
         }
 
         let view = RuntimeView::from_runtime(&runtime).await;
@@ -1876,14 +1878,16 @@ impl SessionActor {
                 )))
             }
         };
-        let turn_draft_found = sb.turn_draft_found;
+        let turn_draft = sb.turn_draft;
         let mut conv = ConversationState::from_resumed(sb.session);
         conv.api_messages = sb.api_messages;
         conv.total_input_tokens = sb.total_input_tokens;
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
-        if turn_draft_found && self.config.persist && self.session_lock.is_some() {
-            crate::engine::setup::finish_turn_draft_recovery(&mut conv).await;
+        if let Some(recovered) = turn_draft {
+            if self.config.persist && self.session_lock.is_some() {
+                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
+            }
         }
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);

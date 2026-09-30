@@ -252,11 +252,16 @@ impl SessionActor {
         // fold a turn sidecar in and remove it — a sidecar under a lock held
         // elsewhere belongs to a turn that is running right now.
         self.reacquire_session_lock(&new_id);
-        let turn_draft_found =
-            self.session_lock.is_some() && crate::engine::setup::recover_turn_draft(&mut session);
+        let turn_draft = if self.session_lock.is_some() {
+            crate::engine::setup::recover_turn_draft(&mut session)
+        } else {
+            None
+        };
         self.conv = Live::new(crate::engine::session::ConversationState::from_resumed(session));
-        if turn_draft_found && self.config.persist {
-            crate::engine::setup::finish_turn_draft_recovery(&mut self.conv).await;
+        if let Some(recovered) = turn_draft {
+            if self.config.persist {
+                crate::engine::setup::finish_turn_draft_recovery(&mut self.conv, recovered).await;
+            }
         }
         if clamp_notice.is_some() {
             // Keep the session file in sync with the clamped runtime.

@@ -379,44 +379,55 @@ pub(crate) struct SessionBootResult {
     pub(crate) total_output_tokens: u64,
     pub(crate) session_cost: f64,
     pub(crate) continued: bool,
-    /// A `sessions/<id>.turn` sidecar was found (and folded into
-    /// `session.api_messages`). The lock holder must save, then remove it
-    /// (`finish_turn_draft_recovery`).
-    pub(crate) turn_draft_found: bool,
+    /// `Some(recovered)`: a `sessions/<id>.turn` sidecar was found (and,
+    /// when `recovered`, folded into `session.api_messages`). The lock
+    /// holder must save, then remove it (`finish_turn_draft_recovery`).
+    pub(crate) turn_draft: Option<bool>,
     pub(crate) continue_info: Option<ContinueInfo>,
 }
 
 /// Crash recovery on load: if `sessions/<id>.turn` exists, the process that
 /// last ran this session died with a turn open. Fold the sidecar into
-/// `session.api_messages` (`engine::interrupt::recover_crashed_turn`) and
-/// report that one was found. The sidecar itself is left in place — only a
-/// caller holding the session lock may remove it, after saving.
-pub(crate) fn recover_turn_draft(session: &mut crate::Session) -> bool {
+/// `session.api_messages` (`engine::interrupt::recover_crashed_turn`).
+/// Returns `None` without a sidecar, else `Some(recovered)`.
+///
+/// Pure in-memory and silent on purpose: this runs BEFORE the session lock
+/// is taken, and a load refused by the lock (the turn is running in another
+/// process right now) must neither touch the sidecar nor claim a recovery.
+/// Reporting and cleanup belong to `finish_turn_draft_recovery`, which only
+/// the lock holder runs.
+pub(crate) fn recover_turn_draft(session: &mut crate::Session) -> Option<bool> {
     let dir = agent_core::session_lock::sessions_dir();
     match agent_core::core::session_draft::read_turn_draft(&dir, &session.id) {
-        Ok(Some(draft)) => {
-            if crate::engine::interrupt::recover_crashed_turn(&mut session.api_messages, &draft) {
-                tracing::warn!(
-                    session = %session.id,
-                    "session was interrupted mid-turn by an unexpected stop; recovered"
-                );
-            }
-            true
-        }
-        Ok(None) => false,
+        Ok(Some(draft)) => Some(crate::engine::interrupt::recover_crashed_turn(
+            &mut session.api_messages,
+            &draft,
+        )),
+        Ok(None) => None,
         Err(e) => {
-            // Unreadable sidecar: never block the load. Leave it for the
-            // lock holder to remove; the history stays exactly as saved.
-            tracing::warn!(session = %session.id, "unreadable turn sidecar: {e}");
-            true
+            // Unreadable sidecar: never block the load; the history stays
+            // exactly as saved and the lock holder removes the file.
+            tracing::debug!(session = %session.id, "unreadable turn sidecar: {e}");
+            Some(false)
         }
     }
 }
 
-/// Second half of crash recovery, run by the session-lock holder: persist the
-/// recovered history, THEN remove the sidecar (a crash in between leaves the
-/// marker on disk, which makes the next recovery a no-op).
-pub(crate) async fn finish_turn_draft_recovery(conv: &mut crate::engine::session::ConversationState) {
+/// Second half of crash recovery, run ONLY by the session-lock holder:
+/// persist the recovered history, THEN remove the sidecar (a crash in
+/// between leaves the marker on disk, which makes the next recovery a no-op).
+pub(crate) async fn finish_turn_draft_recovery(
+    conv: &mut crate::engine::session::ConversationState,
+    recovered: bool,
+) {
+    if recovered {
+        tracing::warn!(
+            session = %conv.session.id,
+            "session was interrupted mid-turn by an unexpected stop; recovered"
+        );
+    } else {
+        tracing::info!(session = %conv.session.id, "removing a stale turn sidecar");
+    }
     conv.save().await;
     let dir = agent_core::session_lock::sessions_dir();
     let id = conv.session.id.clone();
@@ -526,7 +537,7 @@ fn resolve_or_create_session(
             // A turn sidecar means the last process died with a turn open.
             // Fold it in here, in memory; the caller that holds the session
             // lock saves the result and removes the sidecar.
-            let turn_draft_found = recover_turn_draft(&mut session);
+            let turn_draft = recover_turn_draft(&mut session);
 
             Ok(SessionBootResult {
                 api_messages: session.api_messages.clone(),
@@ -534,7 +545,7 @@ fn resolve_or_create_session(
                 total_output_tokens: session.total_output_tokens,
                 session_cost: session.session_cost,
                 continued: true,
-                turn_draft_found,
+                turn_draft,
                 continue_info,
                 session,
             })
@@ -552,7 +563,7 @@ fn resolve_or_create_session(
                 total_output_tokens: 0,
                 session_cost: 0.0,
                 continued: false,
-                turn_draft_found: false,
+                turn_draft: None,
                 continue_info: None,
             })
         }
@@ -563,6 +574,47 @@ fn resolve_or_create_session(
 mod tests {
     use super::*;
     use agent_core::reasoning::ReasoningLevel;
+
+    /// Loading runs BEFORE the session lock is taken. A load that the lock
+    /// then refuses (the turn is running in another process right now) must
+    /// not have touched the sidecar: `recover_turn_draft` is in-memory only.
+    /// (Sandbox finding: it used to log a recovery for a live session.)
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn loading_folds_the_sidecar_in_memory_and_never_touches_the_file() {
+        use agent_core::core::session_draft::{read_turn_draft, write_turn_draft, TurnDraft};
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let mut session = Session::new("claude-sonnet-4-5", "low", None);
+        session.api_messages = vec![std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "do X"}),
+        )];
+        let draft = TurnDraft {
+            base_len: 1,
+            partial_text: "partial".into(),
+        };
+        write_turn_draft(&dir, &session.id, &draft).unwrap();
+
+        assert_eq!(recover_turn_draft(&mut session), Some(true));
+        assert_eq!(session.api_messages.len(), 3, "folded in memory");
+        assert_eq!(
+            read_turn_draft(&dir, &session.id).unwrap(),
+            Some(draft),
+            "the sidecar is left for the lock holder"
+        );
+
+        // No sidecar: nothing to do.
+        let mut other = Session::new("claude-sonnet-4-5", "low", None);
+        assert_eq!(recover_turn_draft(&mut other), None);
+
+        // Unreadable sidecar: found (so the lock holder removes it), history
+        // untouched.
+        let mut corrupt = Session::new("claude-sonnet-4-5", "low", None);
+        corrupt.api_messages = session.api_messages[..1].to_vec();
+        std::fs::write(dir.join(format!("{}.turn", corrupt.id)), b"{not json").unwrap();
+        assert_eq!(recover_turn_draft(&mut corrupt), Some(false));
+        assert_eq!(corrupt.api_messages.len(), 1);
+    }
 
     /// B1: --continue path must restore thinking_level from the saved session.
     /// Simulates what resolve_or_create_session does when a session is continued.
