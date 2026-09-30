@@ -113,8 +113,15 @@ impl ConversationState {
         }
     }
 
-    /// Create from a resumed session.
-    pub fn from_resumed(session: Session) -> Self {
+    /// Create from a resumed session. A session saved before interruption
+    /// markers existed (legacy `abort_context` recap) is migrated here too —
+    /// `/resume` loads sessions without going through `engine::setup` —
+    /// idempotently: an already-migrated session is untouched.
+    pub fn from_resumed(mut session: Session) -> Self {
+        crate::engine::interrupt::migrate_legacy_abort_context(
+            &mut session.api_messages,
+            &mut session.abort_context,
+        );
         Self {
             api_messages: session.api_messages.clone(),
             total_input_tokens: session.total_input_tokens,
@@ -359,6 +366,26 @@ mod context_head_tests {
         let mut other = session.clone();
         other.id = "new-session".into();
         assert!(!state.is_blocked(&other));
+    }
+
+    /// `/resume` builds its conversation with `from_resumed` directly: a
+    /// legacy recap is migrated (dropped, marker appended), never carried.
+    #[test]
+    fn from_resumed_migrates_a_legacy_abort_context() {
+        let mut legacy = Session::new("synthetic-model", "low", None);
+        legacy.api_messages = vec![Arc::new(json!({"role":"user","content":"do X"}))];
+        legacy.abort_context = Some("(System note — ABORT CONTEXT: …)".into());
+        let conv = ConversationState::from_resumed(legacy);
+        assert!(conv.session.abort_context.is_none());
+        assert_eq!(conv.api_messages.len(), 2);
+        assert_eq!(
+            conv.api_messages[1]["content"],
+            crate::engine::interrupt::InterruptReason::Unknown.marker()
+        );
+        assert_eq!(conv.session.api_messages, conv.api_messages);
+        // Idempotent for an already-migrated session.
+        let again = ConversationState::from_resumed(conv.session.clone());
+        assert_eq!(again.api_messages, conv.api_messages);
     }
 
     #[cfg(unix)]
