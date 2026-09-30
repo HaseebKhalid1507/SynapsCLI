@@ -4274,6 +4274,13 @@ mod on401_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod anthropic_failover_tests {
+    // Every test in this module drives the OAuth 429 path, so each one can be
+    // the first to hit the "schema capture" `warn!` callsite. tracing-core
+    // caches a callsite's interest globally, and while only one scoped
+    // subscriber is registered a callsite first hit on ANOTHER thread is
+    // cached as `never` (that thread has no subscriber). That silently hid
+    // the line `schema_capture_logs_headers_once_and_never_the_body` counts
+    // and failed CI once. Serializing the module removes the race.
     use axum::{
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
@@ -4570,6 +4577,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn pre_output_rejected_429_hops_once_and_succeeds_on_seat_2() {
         let upstream =
             spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }, Reply::SseOk])
@@ -4621,6 +4629,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn post_output_rejected_429_reports_cooldown_but_never_hops() {
         // Attempt 1 streams partial text then dies transiently; the retry
         // (attempt 2) is refused with a rejected window.
@@ -4656,6 +4665,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn two_rejected_429s_hop_once_then_end_the_turn() {
         let upstream = spawn_upstream(vec![
             Reply::Rejected429 { reset_in_secs: 3 * 3600 },
@@ -4681,6 +4691,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn explicit_selector_reports_cooldown_and_ends_without_lookup() {
         let upstream =
             spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
@@ -4702,6 +4713,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn same_seat_back_or_no_candidate_never_loops() {
         for answer in [Ok(None), Ok(Some(pinned("claude4"))), Err("broker down".to_string())] {
             let upstream =
@@ -4720,6 +4732,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn ordinary_429_keeps_the_existing_retry_path() {
         let upstream =
             spawn_upstream(vec![Reply::Plain429 { retry_after: 1 }, Reply::SseOk]).await;
@@ -4743,6 +4756,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn short_reset_exhaustion_without_hop_falls_through_to_retry() {
         // Explicit account, window rejected but the reset is under the
         // long-reset threshold: report, notify, then today's backoff retry.
@@ -4774,6 +4788,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn schema_capture_logs_headers_once_and_never_the_body() {
         let upstream = spawn_upstream(vec![
             Reply::Rejected429 { reset_in_secs: 3 * 3600 },
@@ -4819,6 +4834,7 @@ mod anthropic_failover_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
     async fn api_key_auth_never_classifies_or_reports() {
         // Same rejected headers, but api-key auth has no seats: the loop
         // must take today's plain backoff path and touch no seat logic.
