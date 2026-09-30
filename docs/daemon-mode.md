@@ -235,6 +235,9 @@ C: bye | socket close = Detach (turn keeps running)
     the same 1 s budget — never through the normal post-turn path (queued auto-send, auto-compaction).
   - Markers are matched EXACTLY (`is_interruption_marker`): user text that merely starts like one is
     the user's.
+  - A canceled `tool_result` names the cause the same way (`CancelCause`, noted by the host before it
+    cancels): "Canceled by user" only for the user, else e.g. "Canceled (Synaps restarted)",
+    "Canceled (session cost cap reached)", "Canceled (session driver revoked)".
 - **The session on disk follows a running turn.** The engine publishes the conversation at every
   round boundary — the prompt before the first request, each completed tool round (every
   `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one. Saves run
@@ -254,7 +257,9 @@ C: bye | socket close = Detach (turn keeps running)
   (each save re-hashes the saved prefix to validate it).
   Attach replays carry no per-round `MessageHistory` or `Conversation` (the snapshot already holds the
   latest history), and a round checkpoint drops the finished rounds' display events from the replay
-  ring, so a client attaching mid-turn sees each round once.
+  ring, so a client attaching mid-turn sees each round once. Every other attached client learns the
+  prompt that started a user turn (`TurnStarted.user_text`; the submitter drew its own card), each
+  turn's reply opens a new text block, and a notice landing mid-reply no longer splits the reply.
 - **A turn cut off by a crash is recovered on the next load — by the session lock holder only.** While
   a turn runs, the actor keeps a small draft `sessions/<id>.turn` (`agent_core::core::session_draft`):
   the text of the response in flight plus the history length it continues from — written at turn
@@ -269,9 +274,11 @@ C: bye | socket close = Detach (turn keeps running)
   saved, then the draft is removed (if that save fails, the draft stays for the next holder). A leftover
   draft of a turn that actually concluded (history already ends with the model's final reply or an
   interruption marker) is just removed; a stale one (its round already committed) contributes no text.
-  Recovery only ever appends, so the cached prefix is untouched. rpc / `synaps server` / legacy chat
-  save every round but keep no draft, never take the session lock, and never recover one (a draft
-  there may belong to a turn running elsewhere). Deleting a session (and retention) removes its draft.
+  Recovery only ever appends, so the cached prefix is untouched. rpc and `synaps server` save every
+  round but keep no draft and never recover one; they DO take the session lock
+  (`setup::lock_session`): continuing a session another process has live (a TUI, the daemon,
+  another rpc) is refused with the holder named, instead of running a second writer on the same
+  history. Legacy chat takes no lock. Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
