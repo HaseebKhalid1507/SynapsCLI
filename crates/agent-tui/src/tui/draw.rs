@@ -1299,7 +1299,7 @@ pub(crate) fn render_frame_into(
             y: text_area.y + cursor_row - input_scroll,
         });
         neon::paint_slab(frame.buffer_mut(), input_area, &slab, cursor_at);
-        // Running subagents: a recessed tray on the same slab, above the input.
+        // Running subagents: a recessed tray resting on the input's top edge.
         super::subagent_tray::paint_tray(
             frame.buffer_mut(),
             subagent_area,
