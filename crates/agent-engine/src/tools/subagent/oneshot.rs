@@ -25,7 +25,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
+        "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly; give an inline subagent a short name so it is recognisable in the subagent panel."
     }
 
     fn parameters(&self) -> Value {
@@ -39,6 +39,10 @@ impl Tool for SubagentTool {
                 "system_prompt": {
                     "type": "string",
                     "description": "Inline system prompt for the subagent. Use when you don't have a named agent file."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\"."
                 },
                 "task": {
                     "type": "string",
@@ -109,7 +113,7 @@ impl Tool for SubagentTool {
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
 
-        let label = agent_name.as_deref().unwrap_or("inline").to_string();
+        let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
         let task_preview: String = task.chars().take(80).collect();
 
         tracing::info!(
@@ -275,9 +279,9 @@ impl Tool for SubagentTool {
                                             format!("ls {}", short)
                                         }
                                         "subagent" => {
-                                            let name = input["agent"].as_str()
-                                                .or_else(|| input["system_prompt"].as_str().map(|s| if s.len() > 20 { "inline" } else { s }))
-                                                .unwrap_or("?");
+                                            let agent = input["agent"].as_str()
+                                                .filter(|s| !s.trim().is_empty());
+                                            let name = super::subagent_label(agent, input["name"].as_str());
                                             format!("spawning {}", name)
                                         }
                                         other => {

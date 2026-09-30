@@ -19,6 +19,43 @@ pub use start::SubagentStartTool;
 pub use status::SubagentStatusTool;
 pub use steer::SubagentSteerTool;
 
+/// Longest display name kept for an inline subagent.
+const MAX_LABEL_CHARS: usize = 32;
+
+/// Label for a subagent in the panel, status/collect output, completion
+/// events and the oneshot log file name. A named agent is labelled by its
+/// agent name; an inline (`system_prompt`) agent by its optional `name`,
+/// falling back to "inline".
+pub(crate) fn subagent_label(agent: Option<&str>, name: Option<&str>) -> String {
+    if let Some(agent) = agent {
+        return agent.to_string();
+    }
+    name.and_then(sanitize_label)
+        .unwrap_or_else(|| "inline".to_string())
+}
+
+/// Reduce a caller-chosen name to `[A-Za-z0-9_-]` (whitespace becomes `-`),
+/// capped at [`MAX_LABEL_CHARS`]. The label ends up in a log file name and in
+/// event text, so nothing else gets through. `None` when nothing is left.
+fn sanitize_label(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.trim().chars() {
+        let c = if c.is_whitespace() { '-' } else { c };
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            continue;
+        }
+        if c == '-' && (out.is_empty() || out.ends_with('-')) {
+            continue;
+        }
+        out.push(c);
+        if out.len() == MAX_LABEL_CHARS {
+            break;
+        }
+    }
+    let out = out.trim_end_matches('-');
+    (!out.is_empty()).then(|| out.to_string())
+}
+
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
 /// (which has already had `Runtime::new()` called), then **unconditionally
 /// force** the cache TTL to `FiveMinutes`.
@@ -673,5 +710,43 @@ mod forum_worker_tests {
         let mut worker_none = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None);
         assert!(!worker_none.memory_backend_for_test().exclusive());
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::subagent_label;
+
+    #[test]
+    fn named_agent_keeps_its_name_and_ignores_name() {
+        assert_eq!(subagent_label(Some("spike"), Some("gif-recorder")), "spike");
+        assert_eq!(subagent_label(Some("spike"), None), "spike");
+    }
+
+    #[test]
+    fn inline_agent_uses_name_or_falls_back() {
+        assert_eq!(subagent_label(None, Some("gif-recorder")), "gif-recorder");
+        assert_eq!(subagent_label(None, None), "inline");
+        for blank in ["", "   ", "\t\n", "\u{0}", "///", "..", "💀"] {
+            assert_eq!(subagent_label(None, Some(blank)), "inline", "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn name_is_reduced_to_a_safe_label() {
+        assert_eq!(
+            subagent_label(None, Some("  Rust reviewer ")),
+            "Rust-reviewer"
+        );
+        assert_eq!(subagent_label(None, Some("a  -  b")), "a-b");
+        assert_eq!(subagent_label(None, Some("../../etc/passwd")), "etcpasswd");
+        assert_eq!(subagent_label(None, Some("it's <b>\"x\"</b>")), "its-bxb");
+        assert_eq!(subagent_label(None, Some("-lead-")), "lead");
+        assert_eq!(subagent_label(None, Some("café_1")), "caf_1");
+        let long = subagent_label(None, Some(&"x".repeat(100)));
+        assert_eq!(long.len(), 32);
+        // A cut that lands on a separator leaves no trailing dash.
+        let cut = subagent_label(None, Some(&format!("{} tail", "y".repeat(31))));
+        assert_eq!(cut, "y".repeat(31));
     }
 }
