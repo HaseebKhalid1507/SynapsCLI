@@ -531,7 +531,9 @@ pub(crate) fn build_render_model(
     } else {
         0
     };
-    let input_inner_width = term_size.width.saturating_sub(2);
+    let input_inner_width = term_size
+        .width
+        .saturating_sub(2 * super::neon_prompt::INSET_X);
     let (input_lines, _, _) =
         super::view_model::input_wrap_info(&inputs.input, inputs.cursor_pos, input_inner_width);
     let max_input_lines: u16 = 10;
@@ -641,7 +643,7 @@ pub(crate) fn build_render_model(
             } else if prefix_matches.len() > 1 {
                 Some(GhostHint {
                     ghost_text: String::new(),
-                    match_badge: Some(format!("  {} matches · Tab search", prefix_matches.len())),
+                    match_badge: Some(format!("{} matches", prefix_matches.len())),
                 })
             } else {
                 None
@@ -723,6 +725,7 @@ pub(crate) fn build_render_model(
         input: inputs.input.clone(),
         cursor_pos: inputs.cursor_pos,
         ghost_hint,
+        prompt_fx: inputs.prompt_fx,
         show_full_output: inputs.transcript.show_full_output(),
         session_cost: inputs.session_cost,
         total_input_tokens: inputs.total_input_tokens,
@@ -744,6 +747,21 @@ pub(crate) fn build_render_model(
         protected_bottom_rows,
     });
     Some((model, patch))
+}
+
+/// The footer context bar's colour for this much of the window used:
+/// `border_active` under 50%, `status_streaming` under 75%, `error_color`
+/// above. With no turn yet (the bar is hidden) it is the under-50% colour.
+/// Shared with the prompt's streaming glow.
+fn context_bar_color(theme: &super::theme::Theme, context: u64, window: u64) -> Color {
+    let ratio = (context as f64 / window.max(1) as f64).min(1.0);
+    if ratio < 0.5 {
+        theme.border_active
+    } else if ratio < 0.75 {
+        theme.status_streaming
+    } else {
+        theme.error_color
+    }
 }
 
 /// Render one frame from a [`RenderModel`] snapshot.
@@ -855,31 +873,13 @@ pub(crate) fn render_frame_into(
     } else {
         0
     };
-    let input_inner_width = frame.area().width.saturating_sub(2);
+    let input_inner_width = frame
+        .area()
+        .width
+        .saturating_sub(2 * super::neon_prompt::INSET_X);
     let max_input_lines: u16 = 10;
-
-    // Recompute input_lines for layout using the snapshot input + cursor_pos.
-    let (input_lines, _, _) = {
-        let w = input_inner_width.max(1) as usize;
-        let prefix_width: usize = 2;
-        let mut total_lines: u16 = 1;
-        let mut col: usize = prefix_width;
-        for ch in model.input.chars() {
-            if ch == '\n' {
-                total_lines += 1;
-                col = prefix_width;
-                continue;
-            }
-            let cw = char_width(ch);
-            if col + cw > w {
-                total_lines += 1;
-                col = 0;
-            }
-            col += cw;
-        }
-        // cursor_row / cursor_col not needed for layout — use dummy values.
-        (total_lines, 0u16, 0u16)
-    };
+    let (input_lines, cursor_row, cursor_col) =
+        super::view_model::input_wrap_info(&model.input, model.cursor_pos, input_inner_width);
     let input_height = input_lines.min(max_input_lines) + 2;
     let download_height: u16 = if !model.active_tasks.is_empty() { 1 } else { 0 };
 
@@ -1365,118 +1365,185 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Input ─────────────────────────────────────────────────────────────
-    let input_border_color = if model.streaming {
-        THEME.load().border
-    } else {
-        THEME.load().border_active
-    };
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(input_border_color))
-        .style(Style::default().bg(THEME.load().bg));
-    let w = input_inner_width.max(1) as usize;
-    let prefix_width: usize = 2;
-    let prompt_style = Style::default().fg(THEME.load().prompt_fg);
-    let input_style = Style::default().fg(THEME.load().input_fg);
-    let input_lines_vec: Vec<ratatui::text::Line> = {
+    // Neon prompt (neon_prompt.rs): a soft-edged slab of light with no drawn
+    // border. The text sits in a fixed column `INSET_X` in from the edge, with
+    // a hanging indent on every row after the first, so wrapped and
+    // multi-line input stays aligned. Wrap math: view_model::input_wrap_info.
+    {
+        use super::neon_prompt::{self as neon, CursorAt};
+        use super::view_model::INPUT_PREFIX_WIDTH;
+
+        let inset = neon::INSET_X;
+        let theme = THEME.load();
+        // Optional streaming glow (Settings → Streaming glow): it wears the
+        // context bar's colour, so it shifts with the bar as the window fills.
+        let glow = (model.streaming && neon::streaming_glow_enabled()).then(|| {
+            context_bar_color(
+                &theme,
+                model.last_turn_context,
+                model.last_turn_context_window,
+            )
+        });
+        let slab = neon::Slab::new(&theme, model.prompt_fx, input_area.width, glow);
+        let text_area = ratatui::layout::Rect {
+            x: input_area.x.saturating_add(inset),
+            y: input_area.y.saturating_add(1),
+            width: input_area.width.saturating_sub(2 * inset),
+            height: input_area.height.saturating_sub(2),
+        };
+        let w = (input_inner_width as usize).max(INPUT_PREFIX_WIDTH + 1);
+        let visible_lines = text_area.height.max(1);
+        let input_scroll: u16 = if cursor_row >= visible_lines {
+            cursor_row - visible_lines + 1
+        } else {
+            0
+        };
+        let cursor_at = (text_area.height > 0).then(|| CursorAt {
+            x: text_area.x + cursor_col,
+            y: text_area.y + cursor_row - input_scroll,
+        });
+        neon::paint_slab(frame.buffer_mut(), input_area, &slab, cursor_at);
+
+        let prompt_span = if model.streaming {
+            Span::styled(
+                format!("{} ", SPINNER_FRAMES[spinner_idx]),
+                Style::default()
+                    .fg(slab.spinner_fg())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "\u{276f} ",
+                Style::default()
+                    .fg(slab.prompt_fg())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let text_style = Style::default().fg(slab.text_fg());
+        let indent = || Span::raw(" ".repeat(INPUT_PREFIX_WIDTH));
         let mut rows: Vec<Vec<Span>> = Vec::new();
-        let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
-        let mut col: usize = prefix_width;
+        let mut current_row: Vec<Span> = vec![prompt_span];
+        let mut col: usize = INPUT_PREFIX_WIDTH;
         for ch in model.input.chars() {
             if ch == '\n' {
-                rows.push(std::mem::take(&mut current_row));
-                current_row = vec![Span::styled("  ", prompt_style)];
-                col = prefix_width;
+                rows.push(std::mem::replace(&mut current_row, vec![indent()]));
+                col = INPUT_PREFIX_WIDTH;
                 continue;
             }
             let cw = char_width(ch);
-            if col + cw > w {
-                rows.push(std::mem::take(&mut current_row));
-                current_row = Vec::new();
-                col = 0;
+            if col + cw > w && col > INPUT_PREFIX_WIDTH {
+                rows.push(std::mem::replace(&mut current_row, vec![indent()]));
+                col = INPUT_PREFIX_WIDTH;
             }
-            let mut s = String::new();
-            s.push(ch);
-            current_row.push(Span::styled(s, input_style));
+            current_row.push(Span::styled(ch.to_string(), text_style));
             col += cw;
         }
         rows.push(current_row);
 
-        // Apply ghost hint from model
-        if let Some(ref hint) = model.ghost_hint {
-            let ghost_style = Style::default()
-                .fg(THEME.load().border)
-                .add_modifier(Modifier::DIM);
-            if let Some(last_row) = rows.last_mut() {
-                if let Some(ref badge) = hint.match_badge {
-                    last_row.push(Span::styled(badge.clone(), ghost_style));
-                } else if !hint.ghost_text.is_empty() {
+        if let Some(last_row) = rows.last_mut() {
+            if let Some(ref hint) = model.ghost_hint {
+                let ghost_style = Style::default()
+                    .fg(slab.ghost_fg())
+                    .add_modifier(Modifier::ITALIC);
+                // Several matches: the count and "tab search" hang in the
+                // status tab instead (see below).
+                if hint.match_badge.is_none() && !hint.ghost_text.is_empty() {
                     last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
+                }
+            } else if model.input.is_empty() {
+                // Placeholder: the prompt in dim italic, then hints that
+                // fit whole (Noodle: key bright, word dim), dropped from the
+                // right when narrow.
+                let room = w.saturating_sub(INPUT_PREFIX_WIDTH + 1);
+                let lead = if model.streaming {
+                    "agent is working \u{2014} type to steer or queue a follow-up"
+                } else {
+                    "Ask anything"
+                };
+                let lead: String = lead.chars().take(room).collect();
+                let mut used = display_width(&lead);
+                last_row.push(Span::styled(
+                    lead,
+                    Style::default()
+                        .fg(slab.dim_fg())
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                if !model.streaming {
+                    let key = Style::default().fg(slab.tone_fg(neon::Tone::SoftKey));
+                    let word = Style::default().fg(slab.dim_fg());
+                    for (k, wd) in [("/", " commands"), ("alt+enter", " newline")] {
+                        let seg = 3 + display_width(k) + display_width(wd);
+                        if used + seg > room {
+                            break;
+                        }
+                        last_row.push(Span::raw("   "));
+                        last_row.push(Span::styled(k, key));
+                        last_row.push(Span::styled(wd, word));
+                        used += seg;
+                    }
                 }
             }
         }
-        rows.into_iter().map(ratatui::text::Line::from).collect()
-    };
+        let lines: Vec<ratatui::text::Line> =
+            rows.into_iter().map(ratatui::text::Line::from).collect();
+        // No block and no base style: the text patches only its foreground, so
+        // the slab painted underneath shows through.
+        frame.render_widget(Paragraph::new(lines).scroll((input_scroll, 0)), text_area);
 
-    // Cursor position for scroll offset
-    let (_, cursor_row, cursor_col) = {
-        let w2 = input_inner_width.max(1) as usize;
-        let mut total_rows: u16 = 1;
-        let mut cur_row: u16 = 0;
-        let mut cur_col: u16 = 0;
-        let mut col: usize = prefix_width;
-        for (i, ch) in model.input.chars().enumerate() {
-            if i == model.cursor_pos {
-                cur_row = total_rows - 1;
-                cur_col = col as u16;
+        // Scroll arrows in the prompt column (hanging-indent rows only).
+        if text_area.height > 0 {
+            let buf = frame.buffer_mut();
+            if input_scroll > 0 {
+                if let Some(cell) = buf.cell_mut((text_area.x, text_area.y)) {
+                    cell.set_symbol("\u{2191}").set_fg(slab.dim_fg());
+                }
             }
-            if ch == '\n' {
-                total_rows += 1;
-                col = prefix_width;
-                continue;
+            let below = input_lines > input_scroll + text_area.height;
+            if below && (text_area.height > 1 || input_scroll > 0) {
+                if let Some(cell) = buf.cell_mut((text_area.x, text_area.bottom() - 1)) {
+                    cell.set_symbol("\u{2193}").set_fg(slab.dim_fg());
+                }
             }
-            let cw = char_width(ch);
-            if col + cw > w2 {
-                total_rows += 1;
-                col = 0;
-            }
-            col += cw;
         }
-        if model.cursor_pos >= model.input.chars().count() {
-            cur_row = total_rows - 1;
-            cur_col = col as u16;
+
+        if let Some(at) = cursor_at {
+            neon::paint_cursor(frame.buffer_mut(), input_area, &slab, at);
         }
-        (total_rows, cur_row, cur_col)
-    };
 
-    let visible_lines = max_input_lines;
-    let input_scroll: u16 = if cursor_row >= visible_lines {
-        cursor_row - visible_lines + 1
-    } else {
-        0
-    };
-    let input_widget = Paragraph::new(input_lines_vec)
-        .scroll((input_scroll, 0))
-        .block(input_block);
-    frame.render_widget(input_widget, input_area);
-
-    // Software cursor
-    let cursor_x = input_area.x + 1 + cursor_col;
-    let cursor_y = input_area.y + 1 + cursor_row - input_scroll;
-    if cursor_x < input_area.x.saturating_add(input_area.width)
-        && cursor_y < input_area.y.saturating_add(input_area.height)
-    {
-        if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
-            let symbol = cell.symbol().to_string();
-            let cursor_symbol = if symbol.trim().is_empty() {
-                " "
-            } else {
-                symbol.as_str()
-            };
-            cell.set_symbol(cursor_symbol)
-                .set_fg(THEME.load().bg)
-                .set_bg(THEME.load().input_fg);
+        // Hint tab hanging off the bottom edge (key bright, word dim). None
+        // while streaming: the spinner in the prompt column says it all.
+        use neon::Tone::{Key, SoftKey, Word};
+        let tab: Option<Vec<(String, neon::Tone)>> = if model.streaming {
+            None
+        } else if model
+            .ghost_hint
+            .as_ref()
+            .is_some_and(|h| !h.ghost_text.is_empty())
+        {
+            Some(vec![("tab".into(), Key), (" complete".into(), Word)])
+        } else if let Some(count) = model
+            .ghost_hint
+            .as_ref()
+            .and_then(|h| h.match_badge.clone())
+        {
+            Some(vec![
+                (count, Word),
+                ("   ".into(), Word),
+                ("tab".into(), Key),
+                (" search".into(), Word),
+            ])
+        } else if input_lines > 1 {
+            Some(vec![
+                (format!("{input_lines} lines"), Word),
+                ("   ".into(), Word),
+                ("alt+enter".into(), SoftKey),
+                (" newline".into(), Word),
+            ])
+        } else {
+            None
+        };
+        if let Some(tab) = tab {
+            neon::paint_tab(frame.buffer_mut(), input_area, &slab, &tab);
         }
     }
 
@@ -1487,41 +1554,12 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Footer ────────────────────────────────────────────────────────────
-    let [keybinds_area, info_area] = Layout::horizontal([
-        Constraint::Min(1),
-        Constraint::Length(model.runtime_model.len() as u16 + 75),
-    ])
-    .areas(footer_area);
-
-    let key_style = Style::default().fg(THEME.load().muted);
-    let label_style = Style::default().fg(THEME.load().help_fg);
-    let dot_style = Style::default().fg(THEME.load().help_fg);
-    let keybinds = Paragraph::new(ratatui::text::Line::from(vec![
-        Span::styled(" ctrl+c ", key_style),
-        Span::styled("quit", label_style),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("esc ", key_style),
-        Span::styled("abort", label_style),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("shift+\u{2191}\u{2193} ", key_style),
-        Span::styled("scroll", label_style),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("ctrl+o ", key_style),
-        Span::styled(
-            if model.show_full_output {
-                "full"
-            } else {
-                "compact"
-            },
-            label_style,
-        ),
-        Span::styled(" \u{00b7} ", dot_style),
-        Span::styled("enter ", key_style),
-        Span::styled("send", label_style),
-    ]))
-    .style(Style::default().bg(THEME.load().bg));
-    frame.render_widget(keybinds, keybinds_area);
-
+    // Noodle's status bar: keys bright, words at a legible dim, segments set
+    // apart by space instead of dots or pipes. The info block takes only its
+    // real width, and hints that don't fit are dropped whole instead of
+    // clipped mid-word.
+    let theme = THEME.load();
+    let dim = theme.chrome_dim();
     let cost_str = if model.session_cost > 0.0 {
         format!("${:.4} ", model.session_cost)
     } else {
@@ -1553,9 +1591,9 @@ pub(crate) fn render_frame_into(
     } else {
         String::new()
     };
-    let info = Paragraph::new(ratatui::text::Line::from(vec![
-        Span::styled(&cost_str, Style::default().fg(THEME.load().cost_color)),
-        Span::styled(&token_str, Style::default().fg(THEME.load().muted)),
+    let info_line = ratatui::text::Line::from(vec![
+        Span::styled(&cost_str, Style::default().fg(theme.cost_color)),
+        Span::styled(&token_str, Style::default().fg(dim)),
         {
             let turn_context = model.last_turn_context;
             let context_window = model.last_turn_context_window.max(1);
@@ -1564,13 +1602,7 @@ pub(crate) fn render_frame_into(
                 let bar_width: usize = 14;
                 let filled = (usage_ratio * bar_width as f64).round() as usize;
                 let empty = bar_width.saturating_sub(filled);
-                let bar_color = if usage_ratio < 0.5 {
-                    THEME.load().border_active
-                } else if usage_ratio < 0.75 {
-                    THEME.load().status_streaming
-                } else {
-                    THEME.load().error_color
-                };
+                let bar_color = context_bar_color(&theme, turn_context, context_window);
                 let pct = (usage_ratio * 100.0) as u32;
                 Span::styled(
                     format!(
@@ -1585,21 +1617,65 @@ pub(crate) fn render_frame_into(
                 Span::raw("")
             }
         },
-        Span::styled("\u{03b8}:", Style::default().fg(THEME.load().muted)),
+        Span::styled("\u{03b8} ", Style::default().fg(dim)),
         Span::styled(
             model.runtime_thinking.clone(),
-            Style::default().fg(THEME.load().help_fg),
+            Style::default().fg(theme.claude_text),
         ),
-        Span::styled(" \u{2502} ", Style::default().fg(THEME.load().border)),
+        Span::raw("   "),
         Span::styled(
             model.runtime_model.clone(),
-            Style::default().fg(THEME.load().header_fg),
+            Style::default().fg(theme.header_fg),
         ),
         Span::styled(" ", Style::default()),
-    ]))
-    .alignment(Alignment::Right)
-    .style(Style::default().bg(THEME.load().bg));
-    frame.render_widget(info, info_area);
+    ]);
+    let info_width = (info_line.width() as u16).min(footer_area.width);
+    let [keybinds_area, info_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(info_width)]).areas(footer_area);
+
+    let key_style = Style::default().fg(theme.claude_text);
+    let label_style = Style::default().fg(dim);
+    let hints: [(&str, &str); 5] = [
+        ("ctrl+c", "quit"),
+        ("esc", "abort"),
+        ("shift+\u{2191}\u{2193}", "scroll"),
+        (
+            "ctrl+o",
+            if model.show_full_output {
+                "full"
+            } else {
+                "compact"
+            },
+        ),
+        ("enter", "send"),
+    ];
+    // One cell of air before the info block.
+    let room = usize::from(keybinds_area.width).saturating_sub(1);
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1;
+    for (i, (key, label)) in hints.iter().enumerate() {
+        let sep = if i > 0 { 3 } else { 0 };
+        let seg = sep + display_width(key) + 1 + display_width(label);
+        if used + seg > room {
+            break;
+        }
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(format!("{key} "), key_style));
+        spans.push(Span::styled(*label, label_style));
+        used += seg;
+    }
+    frame.render_widget(
+        Paragraph::new(ratatui::text::Line::from(spans)).style(Style::default().bg(theme.bg)),
+        keybinds_area,
+    );
+    frame.render_widget(
+        Paragraph::new(info_line)
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(theme.bg)),
+        info_area,
+    );
 
     // ── Effects ───────────────────────────────────────────────────────────
     // Process only. Clearing a finished boot effect belongs to the render
@@ -1893,6 +1969,321 @@ mod background_toggle_tests {
         );
 
         set_background_opaque(prior);
+    }
+}
+
+#[cfg(test)]
+mod neon_prompt_tests {
+    //! The input is the neon slab (neon_prompt.rs): half-block shape, no
+    //! box-drawing border, text in a fixed column with a hanging indent.
+    use super::super::app::SPINNER_FRAMES;
+    use super::super::testing::TestHarness;
+    use super::super::theme::{background_is_opaque, set_background_opaque, THEME};
+    use ratatui::buffer::Buffer;
+    use serial_test::serial;
+
+    const W: u16 = 80;
+    const H: u16 = 16;
+
+    fn sym(buf: &Buffer, x: u16, y: u16) -> &str {
+        buf[(x, y)].symbol()
+    }
+
+    fn row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area().width).map(|x| sym(buf, x, y)).collect()
+    }
+
+    /// (top rim, bottom rim) rows of the slab: the rows whose column 1 holds
+    /// the top-left / bottom-left quadrant.
+    fn rims(buf: &Buffer) -> (u16, u16) {
+        let h = buf.area().height;
+        let bottom = (0..h)
+            .rev()
+            .find(|&y| sym(buf, 1, y) == "\u{259D}")
+            .expect("bottom rim ▝");
+        let top = (0..bottom)
+            .rev()
+            .find(|&y| sym(buf, 1, y) == "\u{2597}")
+            .expect("top rim ▗");
+        (top, bottom)
+    }
+
+    #[test]
+    fn prompt_is_a_half_block_slab_without_box_drawing() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("hello");
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert_eq!(bottom, top + 2, "one text row between the rims");
+        let text = top + 1;
+        for (x, y, want) in [
+            (1, top, "\u{2597}"),
+            (W - 2, top, "\u{2596}"),
+            (1, text, "\u{2590}"),
+            (W - 2, text, "\u{258C}"),
+            (1, bottom, "\u{259D}"),
+            (W - 2, bottom, "\u{2598}"),
+            (3, text, "\u{276f}"),
+            (5, text, "h"),
+        ] {
+            assert_eq!(sym(&buf, x, y), want, "({x},{y})");
+        }
+        for y in top..=bottom {
+            for x in 0..W {
+                let c = sym(&buf, x, y).chars().next().unwrap_or(' ');
+                assert!(
+                    !('\u{2500}'..='\u{257F}').contains(&c),
+                    "box-drawing {c:?} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_input_keeps_a_hanging_indent() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        // 80 cols → text column 5..=76 (72 cells) on every row.
+        h.type_str(&"a".repeat(72));
+        h.type_str("bcd");
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert_eq!(bottom, top + 3, "two text rows");
+        assert_eq!(
+            sym(&buf, 76, top + 1),
+            "a",
+            "first row fills the text column"
+        );
+        assert_eq!(sym(&buf, 77, top + 1), " ", "right padding stays clear");
+        assert_eq!(
+            sym(&buf, 3, top + 2),
+            " ",
+            "no prompt glyph on continuation rows"
+        );
+        assert_eq!(
+            sym(&buf, 5, top + 2),
+            "b",
+            "continuation starts in the text column"
+        );
+    }
+
+    #[test]
+    fn streaming_swaps_the_prompt_for_a_spinner_with_no_status_tab() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.set_streaming(true);
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert!(
+            SPINNER_FRAMES.contains(&sym(&buf, 3, top + 1)),
+            "spinner in the prompt column, got {:?}",
+            sym(&buf, 3, top + 1)
+        );
+        let rim = row(&buf, bottom);
+        assert!(
+            rim.trim_matches(|c| c == ' ' || c == '\u{259D}' || c == '\u{2598}')
+                .chars()
+                .all(|c| c == '\u{2580}'),
+            "bottom edge is plain while streaming: {rim:?}"
+        );
+        assert!(
+            row(&buf, top + 1).contains("steer or queue"),
+            "streaming placeholder"
+        );
+    }
+
+    #[test]
+    fn empty_prompt_shows_the_placeholder() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        assert!(row(&buf, top + 1).contains("Ask anything"));
+    }
+
+    #[test]
+    fn ghost_completion_and_multiline_hang_their_hint_tabs() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("/them");
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        assert!(
+            row(&buf, top + 1).contains("/theme"),
+            "ghost completes inline"
+        );
+        assert!(row(&buf, bottom).contains("tab complete"));
+
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.paste("one\ntwo\nthree");
+        let buf = h.render().clone();
+        let (_, bottom) = rims(&buf);
+        assert!(
+            row(&buf, bottom).contains("3 lines"),
+            "{:?}",
+            row(&buf, bottom)
+        );
+    }
+
+    #[test]
+    fn several_matches_hang_a_search_tab() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("/s"); // several commands start with s
+        let buf = h.render().clone();
+        let (top, bottom) = rims(&buf);
+        let rim = row(&buf, bottom);
+        assert!(
+            rim.contains(" matches") && rim.contains("tab search"),
+            "{rim:?}"
+        );
+        assert!(
+            !row(&buf, top + 1).contains("matches"),
+            "not inline any more"
+        );
+    }
+
+    #[test]
+    fn cursor_is_a_lit_block_after_the_text() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.type_str("hi");
+        let buf = h.render().clone();
+        let (top, _) = rims(&buf);
+        let (cursor, body) = (&buf[(7, top + 1)], &buf[(20, top + 1)]);
+        assert_ne!(cursor.style().bg, body.style().bg, "cursor cell is lit");
+    }
+
+    /// No motion while idle: the prompt asks for frames only while a
+    /// keystroke's trail fades, or while a turn streams.
+    #[test]
+    fn prompt_is_still_when_idle() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        assert!(!h.prompt_animating(), "still at boot");
+        h.type_str("x");
+        assert!(h.prompt_animating(), "a keystroke lights the trail");
+        h.advance_clock_ms(1_000);
+        assert!(!h.prompt_animating(), "still again once it fades");
+        h.set_streaming(true);
+        assert!(h.prompt_animating(), "animates while streaming");
+    }
+
+    /// The streaming glow is off unless the setting turns it on.
+    #[test]
+    #[serial]
+    fn streaming_glow_follows_the_setting() {
+        use super::super::neon_prompt::{set_streaming_glow, streaming_glow_enabled};
+        let prior = streaming_glow_enabled();
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.set_streaming(true);
+        h.render(); // the stream clock starts on the first streaming frame
+        h.advance_clock_ms(950); // half a sweep: its centre is mid-slab
+        let body_varies = |h: &mut TestHarness| {
+            let buf = h.render().clone();
+            let (top, _) = rims(&buf);
+            // The top rim's body half, across the slab (no cursor there).
+            let fills: Vec<_> = (3..W - 3).map(|x| buf[(x, top)].style().fg).collect();
+            fills.iter().any(|f| *f != fills[0])
+        };
+        set_streaming_glow(false);
+        assert!(!body_varies(&mut h), "no sweep with the glow off");
+        set_streaming_glow(true);
+        assert!(
+            body_varies(&mut h),
+            "a sweep across the slab with the glow on"
+        );
+        set_streaming_glow(prior);
+    }
+
+    #[test]
+    #[serial]
+    fn backdrop_is_full_width_chrome_like_the_footer() {
+        let prior = background_is_opaque();
+        let mut h = TestHarness::boot_with_size(W, H);
+        for opaque in [true, false] {
+            set_background_opaque(opaque);
+            let chrome = Some(THEME.load().bg);
+            let buf = h.render().clone();
+            let (top, bottom) = rims(&buf);
+            assert_eq!(buf[(0, H - 1)].style().bg, chrome, "footer row is chrome");
+            for y in top..=bottom {
+                for x in [0, W - 1] {
+                    assert_eq!(buf[(x, y)].style().bg, chrome, "({x},{y}) opaque={opaque}");
+                }
+            }
+        }
+        set_background_opaque(prior);
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::super::testing::TestHarness;
+    use super::super::theme::THEME;
+
+    const HINTS: &[&str] = &[
+        "ctrl+c quit",
+        "esc abort",
+        "shift+\u{2191}\u{2193} scroll",
+        "ctrl+o compact",
+        "enter send",
+    ];
+
+    fn footer(h: &mut TestHarness, w: u16) -> String {
+        let buf = h.render();
+        (0..w).map(|x| buf[(x, 23)].symbol()).collect()
+    }
+
+    /// Hints are dropped whole when narrow — never clipped mid-word (the
+    /// old footer showed "ctrl+c qui" in the README GIF and nothing at all at
+    /// 80 columns).
+    #[test]
+    fn hints_fit_whole_or_not_at_all() {
+        for w in [40u16, 60, 80, 100, 120, 200] {
+            let mut h = TestHarness::boot_with_size(w, 24);
+            let row = footer(&mut h, w);
+            let shown = HINTS.iter().filter(|hint| row.contains(*hint)).count();
+            for hint in HINTS {
+                let key = hint.split(' ').next().unwrap();
+                if row.contains(&format!("{key} ")) {
+                    assert!(row.contains(hint), "w={w}: clipped {hint:?} in {row:?}");
+                }
+            }
+            assert!(
+                !row.contains('\u{00b7}') && !row.contains('\u{2502}'),
+                "no dots or pipes: {row:?}"
+            );
+            if w >= 80 {
+                assert!(shown >= 2, "w={w}: hints visible at common widths: {row:?}");
+            }
+            if w >= 120 {
+                assert_eq!(shown, HINTS.len(), "w={w}: all hints fit: {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keys_are_bright_and_words_legible() {
+        let mut h = TestHarness::boot_with_size(120, 24);
+        let theme = THEME.load();
+        let buf = h.render();
+        let row: String = (0..120).map(|x| buf[(x, 23)].symbol()).collect();
+        let key_x = row.find("ctrl+c").expect("hint shown") as u16;
+        let word_x = row.find("quit").expect("hint shown") as u16;
+        assert_eq!(buf[(key_x, 23)].style().fg, Some(theme.claude_text));
+        assert_eq!(buf[(word_x, 23)].style().fg, Some(theme.chrome_dim()));
+    }
+}
+
+#[cfg(test)]
+mod context_bar_color_tests {
+    use super::super::theme::Theme;
+    use super::context_bar_color;
+
+    #[test]
+    fn follows_the_usage_thresholds() {
+        let t = Theme::default();
+        assert_eq!(context_bar_color(&t, 0, 0), t.border_active, "no turn yet");
+        assert_eq!(context_bar_color(&t, 49, 100), t.border_active);
+        assert_eq!(context_bar_color(&t, 50, 100), t.status_streaming);
+        assert_eq!(context_bar_color(&t, 74, 100), t.status_streaming);
+        assert_eq!(context_bar_color(&t, 75, 100), t.error_color);
+        assert_eq!(context_bar_color(&t, 500, 100), t.error_color, "clamped");
     }
 }
 

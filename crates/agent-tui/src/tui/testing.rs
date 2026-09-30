@@ -388,6 +388,14 @@ impl TestHarness {
         self.app.input_text()
     }
 
+    /// Whether the neon prompt currently wants animation frames — the term it
+    /// contributes to the main loop's tick guard.
+    pub fn prompt_animating(&self) -> bool {
+        self.app
+            .prompt_clock
+            .animating(self.app.clock.now(), self.app.streaming)
+    }
+
     /// Whether a `Quit` action was dispatched (the real loop would start the
     /// exit animation and tear down).
     pub fn quit_requested(&self) -> bool {

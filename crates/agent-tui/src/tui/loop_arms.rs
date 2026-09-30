@@ -671,6 +671,12 @@ pub(crate) async fn handle_animation_tick(
     {
         app.request_redraw();
     }
+    // Neon prompt: breathing/shimmer/trail are time-based; ask for a frame at
+    // its own throttled cadence until it settles (then the guard goes false).
+    let now = app.clock.now();
+    if app.prompt_clock.wants_frame(now, app.streaming) {
+        app.request_redraw();
+    }
     app.secret_prompts.poll_requests(secret_prompt_rx);
     // Animated theme cross-fade: advance the active transition one frame
     // through the SAME set_theme path every other apply uses. On landing,

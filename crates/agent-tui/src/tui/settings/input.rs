@@ -603,6 +603,13 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
+        "tui_streaming_glow" => {
+            if super::super::neon_prompt::streaming_glow_enabled() {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
         // The live knob, not the file: this is what the cycler steps from.
         // Without this arm the current value was "" → index 0 ("on") no
         // matter what, so once set to off, Left was a no-op and Right re-wrote

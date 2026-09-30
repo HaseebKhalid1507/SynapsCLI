@@ -61,6 +61,8 @@ pub(crate) struct RenderModel {
     pub(crate) cursor_pos: usize,
     /// Pre-computed ghost-hint for slash-command completion.
     pub(crate) ghost_hint: Option<GhostHint>,
+    /// This frame's neon-prompt animation snapshot.
+    pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── Footer ───────────────────────────────────────────────────────────────
     pub(crate) show_full_output: bool,
