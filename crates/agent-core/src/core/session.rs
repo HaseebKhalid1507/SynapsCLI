@@ -1546,11 +1546,35 @@ mod tests {
         .unwrap();
     }
 
+    /// Sets `SYNAPS_BASE_DIR` for one test and restores it on drop. `base_dir()`
+    /// reads it BEFORE `HOME`, so a value left behind silently redirects every
+    /// later config read/write in this test process — which made
+    /// `config::tests::write_config_value_*` fail whenever a `follow_chain_*`
+    /// test happened to run first (order-dependent CI flake).
+    struct BaseDirGuard(Option<String>);
+
+    impl BaseDirGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let old = std::env::var("SYNAPS_BASE_DIR").ok();
+            std::env::set_var("SYNAPS_BASE_DIR", path);
+            Self(old)
+        }
+    }
+
+    impl Drop for BaseDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("SYNAPS_BASE_DIR", value),
+                None => std::env::remove_var("SYNAPS_BASE_DIR"),
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn follow_chain_no_compaction_is_identity() {
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        let _base_dir = BaseDirGuard::set(&dir.path().join(".synaps-cli"));
         std::fs::create_dir_all(dir.path().join(".synaps-cli/sessions")).unwrap();
         let s = Session::new("m", "brief", None);
         save_test_session(&dir.path().join(".synaps-cli/sessions"), &s);
@@ -1564,7 +1588,7 @@ mod tests {
     fn follow_chain_of_three() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".synaps-cli/sessions");
-        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        let _base_dir = BaseDirGuard::set(&dir.path().join(".synaps-cli"));
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
         let mut a = Session::new("m", "brief", None);
@@ -1596,7 +1620,7 @@ mod tests {
     fn follow_chain_cycle_guard() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".synaps-cli/sessions");
-        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        let _base_dir = BaseDirGuard::set(&dir.path().join(".synaps-cli"));
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
         let mut a = Session::new("m", "brief", None);
@@ -1623,7 +1647,7 @@ mod tests {
     fn follow_chain_missing_successor_error() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".synaps-cli/sessions");
-        std::env::set_var("SYNAPS_BASE_DIR", dir.path().join(".synaps-cli"));
+        let _base_dir = BaseDirGuard::set(&dir.path().join(".synaps-cli"));
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
         let mut a = Session::new("m", "brief", None);

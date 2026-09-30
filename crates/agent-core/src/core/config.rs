@@ -2937,13 +2937,22 @@ context_window = 200k\n\
     }
 
     fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        // `base_dir()` reads SYNAPS_BASE_DIR before HOME: pin it too, or a value
+        // another test left set redirects the write away from `home`.
         let original = std::env::var("HOME").ok();
+        let original_base = std::env::var("SYNAPS_BASE_DIR").ok();
         std::env::set_var("HOME", home);
+        std::env::set_var("SYNAPS_BASE_DIR", home.join(".synaps-cli"));
         f();
         if let Some(h) = original {
             std::env::set_var("HOME", h);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(b) = original_base {
+            std::env::set_var("SYNAPS_BASE_DIR", b);
+        } else {
+            std::env::remove_var("SYNAPS_BASE_DIR");
         }
     }
 
