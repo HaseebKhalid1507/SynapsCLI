@@ -1356,33 +1356,9 @@ pub(crate) fn render_frame_into(
                 if hint.match_badge.is_none() && !hint.ghost_text.is_empty() {
                     last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
                 }
-            } else if model.input.is_empty() && !model.streaming {
-                // Placeholder: the prompt in dim italic, then hints that
-                // fit whole (Noodle: key bright, word dim), dropped from the
-                // right when narrow. None while streaming: the box stays
-                // empty while the agent has the floor.
-                let room = w.saturating_sub(INPUT_PREFIX_WIDTH + 1);
-                let lead: String = "Ask anything".chars().take(room).collect();
-                let mut used = display_width(&lead);
-                last_row.push(Span::styled(
-                    lead,
-                    Style::default()
-                        .fg(slab.dim_fg())
-                        .add_modifier(Modifier::ITALIC),
-                ));
-                let key = Style::default().fg(slab.tone_fg(neon::Tone::SoftKey));
-                let word = Style::default().fg(slab.dim_fg());
-                for (k, wd) in [("/", " commands"), ("alt+enter", " newline")] {
-                    let seg = 3 + display_width(k) + display_width(wd);
-                    if used + seg > room {
-                        break;
-                    }
-                    last_row.push(Span::raw("   "));
-                    last_row.push(Span::styled(k, key));
-                    last_row.push(Span::styled(wd, word));
-                    used += seg;
-                }
             }
+            // An empty prompt shows nothing but ❯ and the cursor, idle or
+            // streaming: no placeholder, no hints (the footer lists the keys).
         }
         let lines: Vec<ratatui::text::Line> =
             rows.into_iter().map(ratatui::text::Line::from).collect();
@@ -2012,11 +1988,14 @@ mod neon_prompt_tests {
     }
 
     #[test]
-    fn empty_prompt_shows_the_placeholder() {
+    fn empty_prompt_shows_only_the_glyph() {
         let mut h = TestHarness::boot_with_size(W, H);
         let buf = h.render().clone();
         let (top, _) = rims(&buf);
-        assert!(row(&buf, top + 1).contains("Ask anything"));
+        assert_eq!(sym(&buf, 3, top + 1), "\u{276f}");
+        // Text column is 5..=76 at 80 cols; the cursor block sits at 5.
+        let text: String = (6..=76).map(|x| sym(&buf, x, top + 1)).collect();
+        assert!(text.trim().is_empty(), "no placeholder or hints: {text:?}");
     }
 
     #[test]
