@@ -102,6 +102,14 @@ pub struct SubagentState {
     /// Read by finalize_subagent to label the terminal status correctly.
     pub cancel_requested: bool,
     pub terminal: Option<TerminalDiagnostic>,
+    /// What the worker is doing right now: the same text as its latest
+    /// `SubagentUpdate` ("💭 thinking...", "⚙ bash (tool #2)", "$ cargo test").
+    /// Those events ride the stream of the turn that started the worker; a
+    /// background worker outlives that turn, so clients read its progress
+    /// from here (via `SubagentDisplayRow`) once the turn has ended.
+    pub step: String,
+    /// Tool calls started so far (the "tool #N" in `step`).
+    pub tools: u32,
 }
 
 impl SubagentState {
@@ -114,7 +122,16 @@ impl SubagentState {
             finished_at: None,
             cancel_requested: false,
             terminal: None,
+            step: String::new(),
+            tools: 0,
         }
+    }
+
+    /// Record the worker's latest progress line and tool count.
+    pub fn note_progress(&mut self, step: &str, tools: u32) {
+        self.step.clear();
+        self.step.push_str(step);
+        self.tools = tools;
     }
 
     /// Persist only typed, allowlisted failure data. Raw provider errors never enter state.
@@ -144,6 +161,13 @@ pub struct SubagentDisplayRow {
     pub cancel_requested: bool,
     pub elapsed_secs: f64,
     pub finished_elapsed: Option<std::time::Duration>,
+    /// The worker's latest progress line (`SubagentState::step`); empty until
+    /// its first update. Absent from older peers.
+    #[serde(default)]
+    pub step: String,
+    /// Tool calls started so far. Absent from older peers.
+    #[serde(default)]
+    pub tools: u32,
 }
 
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
@@ -535,6 +559,8 @@ impl SubagentRegistry {
                     cancel_requested: s.cancel_requested,
                     elapsed_secs: h.started_at.elapsed().as_secs_f64(),
                     finished_elapsed: s.finished_at.map(|t| t.elapsed()),
+                    step: s.step.clone(),
+                    tools: s.tools,
                 }
             })
             .collect()
@@ -719,6 +745,37 @@ mod tests {
             s.finished_at = Some(std::time::Instant::now());
         }
         h
+    }
+
+    /// A worker's live progress rides its display row, so clients can follow
+    /// a background worker after the turn that started it has ended.
+    #[test]
+    fn display_rows_carry_the_live_step_and_tool_count() {
+        let mut registry = SubagentRegistry::new();
+        let h = make_handle("sa_7");
+        let state = Arc::clone(&h.state);
+        registry.register(h);
+        let row = |r: &SubagentRegistry| r.display_rows().into_iter().next().unwrap();
+        assert_eq!(row(&registry).step, "", "no progress yet");
+        assert_eq!(row(&registry).tools, 0);
+
+        state
+            .write()
+            .unwrap()
+            .note_progress("\u{2699} bash (tool #1)", 1);
+        state.write().unwrap().note_progress("$ sleep 20", 1);
+        let r = row(&registry);
+        assert_eq!(r.subagent_id, 7);
+        assert_eq!((r.step.as_str(), r.tools), ("$ sleep 20", 1));
+    }
+
+    /// Rows from a peer that predates `step`/`tools` still deserialize.
+    #[test]
+    fn display_row_without_progress_fields_deserializes() {
+        let old = r#"{"subagent_id":3,"agent_name":"a","status":"running",
+            "cancel_requested":false,"elapsed_secs":1.0,"finished_elapsed":null}"#;
+        let row: SubagentDisplayRow = serde_json::from_str(old).expect("old row");
+        assert_eq!((row.step.as_str(), row.tools), ("", 0));
     }
 
     #[test]

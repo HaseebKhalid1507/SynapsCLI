@@ -158,8 +158,6 @@ pub(crate) struct App {
     /// Active subagent status for the live panel
     pub(crate) subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
-    /// Saved context from an aborted response — injected into the next user message
-    pub(crate) abort_context: Option<String>,
     /// Message queued while streaming — auto-sent when current response finishes
     pub(crate) queued_message: Option<String>,
     /// Tracks paste state: snapshot of input before first paste, and total pasted char count
@@ -334,6 +332,9 @@ pub(crate) struct App {
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
+    /// Neon-prompt timing: input/stream events → per-frame animation
+    /// snapshot. Its `animating()` is one of the tick guard's terms.
+    pub(crate) prompt_clock: super::neon_prompt::PromptClock,
 
     /// Snapshot of `(transcript.messages().len(), last_msg)` captured on
     /// `ResponseStart`. `ResponseReset` rolls the transcript preview back
@@ -353,6 +354,10 @@ pub(crate) struct SubagentState {
     pub(crate) duration_secs: Option<f64>,
     /// Stamped when this entry transitions to done — drives the 5s flash expiry.
     pub(crate) done_at: Option<std::time::Instant>,
+    /// Tool calls so far (the engine's "(tool #N)" updates).
+    pub(crate) tools: u32,
+    /// First line of the result once done (the tray's done/failed text).
+    pub(crate) result: Option<String>,
 }
 
 impl App {
@@ -415,7 +420,6 @@ impl App {
                 Some(0.0)
             },
             subagents: Vec::new(),
-            abort_context: None,
             queued_message: None,
             input_before_paste: None,
             pasted_char_count: 0,
@@ -471,6 +475,7 @@ impl App {
             theme_transition: None,
             keybinds: None,
             response_preview: None,
+            prompt_clock: super::neon_prompt::PromptClock::new(clock.now()),
             clock,
         }
     }
@@ -586,7 +591,6 @@ impl App {
         self.total_cache_read_tokens = conv.tokens.cache_read;
         self.total_cache_creation_tokens = conv.tokens.cache_creation;
         self.session_cost = conv.cost;
-        self.abort_context = conv.abort_context.clone();
         self.queued_message = conv.queued_message.clone();
         self.pending_events_len = conv.pending_events_len;
         self.consecutive_auto_turns = conv.consecutive_auto_turns;
@@ -1262,6 +1266,8 @@ mod tests {
             done: false,
             duration_secs: None,
             done_at: None,
+            tools: 0,
+            result: None,
         });
         app.spinner_frame = 2;
 

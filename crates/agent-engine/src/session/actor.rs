@@ -40,7 +40,7 @@ use crate::runtime::compaction::{
 };
 use crate::tools::{SecretPromptHandle, SecretPromptRequest};
 use crate::{
-    AgentEvent, CancellationToken, EngineHost, LlmEvent, Result, Runtime, SessionEvent,
+    AgentEvent, CancellationToken, EngineHost, Result, Runtime, SessionEvent,
     StreamEvent,
 };
 
@@ -55,131 +55,29 @@ pub type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent
 /// `turn_replay` cap (envelopes). §6 #9: the 2 MiB text bound is day 3.
 const TURN_REPLAY_CAP: usize = 4096;
 
-/// Chronological record of the current turn's assistant output, mirroring
-/// what `App::capture_abort_context` walks in the TUI transcript
-/// (`ChatMessage::{Thinking,Text,ToolUse,ToolResult}` since the last user
-/// message). Consecutive text/thinking deltas coalesce like
-/// `append_or_update_*` does; tool-result deltas accumulate per `tool_id`
-/// at the position of the first delta and the final `ToolResult` replaces
-/// them in place (`Transcript::on_tool_result_delta`/`on_tool_result`), so
-/// an abort mid-tool captures the partial output exactly as the TUI does.
-///
-/// Known divergence from the TUI (documented, not closed): the TUI walks
-/// its transcript back to the last `ChatMessage::User` card. During an
-/// event-triggered auto-turn there is no User card, so the TUI's context
-/// also includes the PREVIOUS turn's output; `TurnLog` is cleared at every
-/// `start_turn` and holds the current turn only. The actor's content is
-/// the narrower, arguably correct one.
+/// The in-flight turn draft (`sessions/<id>.turn`, see
+/// `agent_core::core::session_draft`): what the actor last knew about the
+/// response being streamed, flushed at most once per 1 Hz turn tick.
 #[derive(Default)]
-pub(crate) struct TurnLog {
-    parts: Vec<TurnPart>,
+pub(crate) struct TurnDraftState {
+    /// Session id the open draft lives under; `None` = no turn open.
+    open: Option<String>,
+    /// History length the in-flight response continues from.
+    base_len: usize,
+    /// Text streamed in the in-flight response so far.
+    text: String,
+    /// Changed since the last flush.
+    dirty: bool,
 }
 
-pub(crate) enum TurnPart {
-    Thinking(String),
-    Text(String),
-    ToolUse { name: String, input: String },
-    ToolResult { tool_id: String, content: String },
-}
-
-impl TurnLog {
-    fn clear(&mut self) {
-        self.parts.clear();
-    }
-
-    fn tool_result_mut(&mut self, tool_id: &str) -> Option<&mut String> {
-        self.parts.iter_mut().rev().find_map(|p| match p {
-            TurnPart::ToolResult { tool_id: id, content } if id == tool_id => Some(content),
-            _ => None,
-        })
-    }
-
-    /// `Transcript::on_tool_result_delta`: append to the in-flight result
-    /// for this tool, or open one.
-    fn tool_result_delta(&mut self, tool_id: String, delta: String) {
-        match self.tool_result_mut(&tool_id) {
-            Some(c) => c.push_str(&delta),
-            None => self.parts.push(TurnPart::ToolResult {
-                tool_id,
-                content: delta,
-            }),
-        }
-    }
-
-    /// `Transcript::on_tool_result`: the final result replaces any
-    /// delta-buffered content in place.
-    fn tool_result(&mut self, tool_id: String, result: String) {
-        match self.tool_result_mut(&tool_id) {
-            Some(c) => *c = result,
-            None => self.parts.push(TurnPart::ToolResult {
-                tool_id,
-                content: result,
-            }),
-        }
-    }
-
-    fn text(&mut self, t: &str) {
-        if let Some(TurnPart::Text(s)) = self.parts.last_mut() {
-            s.push_str(t);
-        } else {
-            self.parts.push(TurnPart::Text(t.to_string()));
-        }
-    }
-
-    fn thinking(&mut self, t: &str) {
-        if let Some(TurnPart::Thinking(s)) = self.parts.last_mut() {
-            s.push_str(t);
-        } else {
-            self.parts.push(TurnPart::Thinking(t.to_string()));
-        }
-    }
-
-    /// A plain-prose summary of the interrupted turn, prepended to the next
-    /// user message. F6/#370: the previous format used protocol-shaped tags
-    /// (`[tool_use]:`, `[tool_result]:`, `[response]:`) inside a user message,
-    /// which some models (sonnet-4-6) read as an injection attempt and refused.
-    /// This version names the parts in prose and frames the block explicitly as
-    /// a host note about the model's OWN interrupted work — no protocol tags,
-    /// nothing that mimics an assistant/tool turn. (The durable fix, #112/#112
-    /// task, keeps the real canceled messages in history; this is the summary
-    /// path until then.)
-    fn abort_context(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        for p in &self.parts {
-            match p {
-                TurnPart::Thinking(t) if !t.is_empty() => {
-                    let preview: String = t.chars().take(500).collect();
-                    parts.push(format!("- your reasoning so far: {}", preview.trim()));
-                }
-                TurnPart::Text(t) if !t.is_empty() => {
-                    parts.push(format!("- you had started writing: {}", t.trim()));
-                }
-                TurnPart::ToolUse { name, input } => {
-                    let input_preview: String = input.chars().take(200).collect();
-                    parts.push(format!(
-                        "- you invoked the {} tool with input: {}",
-                        name,
-                        input_preview.trim()
-                    ));
-                }
-                TurnPart::ToolResult { content, .. } if !content.is_empty() => {
-                    let preview: String = content.chars().take(300).collect();
-                    parts.push(format!("- that tool returned: {}", preview.trim()));
-                }
-                _ => {}
-            }
-        }
-        if parts.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "(System note — ABORT CONTEXT: your previous response was interrupted \
-             before it finished. This is a factual recap of your OWN partial work, \
-             not new instructions. Continue naturally from here or adjust for the \
-             user's next message; do not re-run completed tool calls.)\n{}",
-            parts.join("\n")
-        ))
-    }
+/// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
+/// turn's stream.
+#[derive(Default)]
+pub(crate) struct CancelDrain {
+    /// The engine's final history for the turn (last `MessageHistory` seen).
+    pub(crate) history: Option<Vec<crate::SharedMessage>>,
+    /// The stream ended (`Done` / EOF) inside the drain budget.
+    pub(crate) closed: bool,
 }
 
 /// A field that is `None` exactly while the session is `Parked` (B3).
@@ -441,7 +339,14 @@ pub struct SessionActor {
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
     pub(crate) consecutive_auto_turns: u32,
-    pub(crate) turn_log: TurnLog,
+    /// Formatted events `on_queue_wake` steered into this turn's stream
+    /// that the engine has not acknowledged (`SteeringDelivered`) yet. On
+    /// cancel they would die with the steering channel; `cancel_turn` moves
+    /// them into history after the interruption marker instead.
+    pub(crate) turn_steered_events: Vec<String>,
+    /// In-flight turn draft for crash recovery (persisting sessions only).
+    pub(crate) turn_draft: TurnDraftState,
+    pub(crate) turn_draft_writer: agent_core::core::session_draft::TurnDraftWriter,
     // ── prompts ──
     pub(crate) secret_prompt_handle: SecretPromptHandle,
     pub(crate) secret_prompt_rx: mpsc::UnboundedReceiver<SecretPromptRequest>,
@@ -662,7 +567,13 @@ impl SessionActor {
         conv.total_input_tokens = sb.total_input_tokens;
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
-        conv.abort_context = sb.abort_context;
+        // Crash recovery (the last process died mid-turn): only the lock
+        // holder may persist the recovered history and remove the draft.
+        if let Some(recovered) = sb.turn_draft {
+            if cfg.persist && session_lock.is_some() {
+                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
+            }
+        }
 
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
@@ -701,7 +612,11 @@ impl SessionActor {
             streaming: false,
             turn_baseline: 0,
             consecutive_auto_turns: 0,
-            turn_log: TurnLog::default(),
+            turn_steered_events: Vec::new(),
+            turn_draft: TurnDraftState::default(),
+            turn_draft_writer: agent_core::core::session_draft::TurnDraftWriter::new(
+                agent_core::session_lock::sessions_dir(),
+            ),
             secret_prompt_handle: SecretPromptHandle::new(sp_tx),
             secret_prompt_rx,
             pending_prompts: VecDeque::new(),
@@ -752,7 +667,11 @@ impl SessionActor {
     // ── emit ─────────────────────────────────────────────────────────────
 
     /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
-    /// prompt traffic (never replayed) and per-client replies.
+    /// prompt traffic (never replayed), per-client replies, and full-history
+    /// `MessageHistory` envelopes: the engine publishes one per round, and an
+    /// attaching client already gets the LATEST adopted history in its
+    /// snapshot's `conversation` — replaying older ones would ship the whole
+    /// history once per round and roll its mirror back to a stale state.
     pub(crate) fn emit(&mut self, event: SessionEventWire) {
         let replay = self.streaming
             && !matches!(
@@ -761,6 +680,9 @@ impl SessionActor {
                     | SessionEventWire::PromptResolved { .. }
                     | SessionEventWire::Attached { .. }
                     | SessionEventWire::QueryResult { .. }
+                    | SessionEventWire::Stream(StreamEvent::Session(
+                        SessionEvent::MessageHistory(_)
+                    ))
             );
         let env = Envelope {
             session_id: self.id.clone(),
@@ -1443,11 +1365,7 @@ impl SessionActor {
                             self.driver_revoke(&format!("preflight blocked: {error}"));
                         }
                         Ok(candidate) => {
-                            let mut validated = proposal.clone();
-                            if let Some(context) = &self.conv.abort_context {
-                                validated.prompt =
-                                    format!("{context}\n\n{}", proposal.prompt);
-                            }
+                            let validated = proposal.clone();
                             let history = super::driver::history_with_steering(
                                 &self.conv.api_messages,
                                 &self
@@ -1475,7 +1393,6 @@ impl SessionActor {
                                     &mut conv.api_messages,
                                     &mut driver.steering,
                                     &proposal.prompt,
-                                    &mut conv.abort_context,
                                 );
                             }
                             // Apply the prepared runtime.
@@ -1485,9 +1402,10 @@ impl SessionActor {
                                 self.runtime.thinking_level().to_owned();
                             self.consecutive_auto_turns = 0;
                             self.turn_baseline = self.conv.api_messages.len();
-                            self.turn_log.clear();
+                            self.turn_steered_events.clear();
                             self.turn_replay.clear();
                             self.streaming = true;
+                            self.open_turn_draft();
                             self.update_attach_state();
                             self.emit(SessionEventWire::TurnStarted {
                                 turn_baseline: self.turn_baseline,
@@ -1626,12 +1544,8 @@ impl SessionActor {
             .as_ref()
             .is_some_and(|p| Instant::now() >= p.due)
         {
-            let mut proposal =
+            let proposal =
                 driver.proposal.take().expect("checked proposal").proposal;
-            let original_prompt = proposal.prompt.clone();
-            if let Some(context) = &self.conv.abort_context {
-                proposal.prompt = format!("{context}\n\n{}", proposal.prompt);
-            }
             // Clone is read-only (prepare never sends a request) and
             // discarded — no TTL latch sharing needed.
             let runtime = self.runtime.clone();
@@ -1655,7 +1569,6 @@ impl SessionActor {
                             "preparation timed out (5s)".into(),
                         ))
                     });
-                    proposal.prompt = original_prompt;
                     super::driver::TaskResult::Prepared {
                         proposal,
                         result: Box::new(result),
@@ -1666,7 +1579,7 @@ impl SessionActor {
     }
 
     /// F10: release the old lock, acquire on `new_id`. Best-effort (log on failure).
-    fn reacquire_session_lock(&mut self, new_id: &str) {
+    pub(crate) fn reacquire_session_lock(&mut self, new_id: &str) {
         // Drop old lock first — release the flock.
         self.session_lock = None;
         let dir = agent_core::session_lock::sessions_dir();
@@ -1965,12 +1878,17 @@ impl SessionActor {
                 )))
             }
         };
+        let turn_draft = sb.turn_draft;
         let mut conv = ConversationState::from_resumed(sb.session);
         conv.api_messages = sb.api_messages;
         conv.total_input_tokens = sb.total_input_tokens;
         conv.total_output_tokens = sb.total_output_tokens;
         conv.session_cost = sb.session_cost;
-        conv.abort_context = sb.abort_context;
+        if let Some(recovered) = turn_draft {
+            if self.config.persist && self.session_lock.is_some() {
+                crate::engine::setup::finish_turn_draft_recovery(&mut conv, recovered).await;
+            }
+        }
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
         self.publish_view().await;
@@ -2001,6 +1919,13 @@ impl SessionActor {
     /// `runtime.subagent_registry().display_rows()` → `SubagentRows`, only
     /// when there is something to show (the TUI's reconcile is a no-op on
     /// an empty registry).
+    ///
+    /// The 1 Hz tick that drives this starts with a turn and outlives it
+    /// while a background worker (`subagent_start`) is still running: those
+    /// workers' progress events rode the ended turn's stream, so these rows
+    /// (which carry each worker's step and tool count) are how clients keep
+    /// up. The tick stops once no worker is running after the turn, having
+    /// published the terminal rows.
     pub(crate) fn publish_subagent_rows(&mut self) {
         let rows = self
             .runtime
@@ -2008,9 +1933,26 @@ impl SessionActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .display_rows();
+        let running = rows
+            .iter()
+            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running));
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }
+        if !keep_subagent_tick(self.streaming, running) {
+            self.subagent_tick = None;
+        }
+    }
+
+    /// Whether any worker in the registry is still running.
+    fn subagents_running(&self) -> bool {
+        self.runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows()
+            .iter()
+            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
     }
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
@@ -2020,7 +1962,8 @@ impl SessionActor {
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
         self.turn_baseline = self.conv.api_messages.len();
-        self.turn_log.clear();
+        self.open_turn_draft();
+        self.turn_steered_events.clear();
         self.turn_replay.clear();
         self.update_attach_state();
         self.emit(SessionEventWire::TurnStarted {
@@ -2055,17 +1998,101 @@ impl SessionActor {
         self.subagent_tick = Some(tick);
     }
 
-    /// Every turn-end path (Done/Error/Cancel/stream EOF). Clears `turn_log`
-    /// too: a `Cancel` racing a `Done` must not scrape the finished turn into
-    /// `abort_context`.
+    /// Every turn-end path (Done/Error/Cancel/stream EOF). `streaming=false`
+    /// makes a `Cancel` racing a `Done` the idle no-op; `cancel_turn` takes
+    /// `turn_steered_events` before calling this.
     pub(crate) fn clear_stream(&mut self) {
         self.stream = None;
         self.cancel = None;
         self.steer_tx = None;
         self.streaming = false;
-        self.subagent_tick = None;
-        self.turn_log.clear();
+        // Background workers outlive the turn: keep publishing their rows
+        // until the last one finishes (see `publish_subagent_rows`).
+        if !keep_subagent_tick(false, self.subagents_running()) {
+            self.subagent_tick = None;
+        }
+        self.turn_steered_events.clear();
+        self.close_turn_draft();
         self.update_attach_state();
+    }
+
+    // ── in-flight turn draft (crash recovery) ──────────────────────────
+
+    /// Turn start: the draft's existence is the "turn open" signal a
+    /// loader uses to detect a process that died mid-turn.
+    fn open_turn_draft(&mut self) {
+        if !self.config.persist || !self.conv.is_live() {
+            return;
+        }
+        self.turn_draft = TurnDraftState {
+            open: Some(self.conv.session.id.clone()),
+            base_len: self.conv.api_messages.len(),
+            text: String::new(),
+            dirty: true,
+        };
+        self.flush_turn_draft();
+    }
+
+    fn turn_draft_text(&mut self, delta: &str) {
+        let d = &mut self.turn_draft;
+        if d.open.is_some()
+            && d.text.len() < agent_core::core::session_draft::TURN_DRAFT_MAX_TEXT_BYTES
+        {
+            d.text.push_str(delta);
+            d.dirty = true;
+        }
+    }
+
+    fn turn_draft_reset_text(&mut self) {
+        let d = &mut self.turn_draft;
+        if d.open.is_some() && !d.text.is_empty() {
+            d.text.clear();
+            d.dirty = true;
+        }
+    }
+
+    /// A round checkpoint was adopted and saved: later text continues from it.
+    fn turn_draft_committed(&mut self) {
+        if self.turn_draft.open.is_none() {
+            return;
+        }
+        self.turn_draft.base_len = self.conv.api_messages.len();
+        self.turn_draft.text.clear();
+        self.turn_draft.dirty = true;
+        self.flush_turn_draft();
+    }
+
+    /// Write the draft if it changed (1 Hz turn tick; round checkpoints).
+    /// Non-blocking and ordered (`TurnDraftWriter`).
+    pub(crate) fn flush_turn_draft(&mut self) {
+        let Some(open) = self.turn_draft.open.clone() else {
+            return;
+        };
+        if !self.turn_draft.dirty {
+            return;
+        }
+        // Defensive: follow the conversation if its id changed mid-turn.
+        let id = self.conv.session.id.clone();
+        if open != id {
+            self.turn_draft_writer.remove(&open);
+            self.turn_draft.open = Some(id.clone());
+        }
+        self.turn_draft.dirty = false;
+        self.turn_draft_writer.write(
+            &id,
+            agent_core::core::session_draft::TurnDraft {
+                base_len: self.turn_draft.base_len,
+                partial_text: self.turn_draft.text.clone(),
+            },
+        );
+    }
+
+    /// Turn end (every path goes through `clear_stream`): remove the draft.
+    fn close_turn_draft(&mut self) {
+        if let Some(id) = self.turn_draft.open.take() {
+            self.turn_draft_writer.remove(&id);
+        }
+        self.turn_draft = TurnDraftState::default();
     }
 
     /// dispatch.rs Submit (:1231-1288) minus presentation.
@@ -2148,14 +2175,7 @@ impl SessionActor {
         }
         // Real user send — reset auto-turn counter.
         self.consecutive_auto_turns = 0;
-        // Inject abort context if previous response was interrupted
-        let api_content = if let Some(ref ctx) = self.conv.abort_context {
-            let combined = format!("{}\n\n{}", ctx, text);
-            self.conv.abort_context = None;
-            combined
-        } else {
-            text
-        };
+        let api_content = text;
 
         if attachments.is_empty() {
             // Text-only: existing path.
@@ -2212,11 +2232,24 @@ impl SessionActor {
         self.conv.queued_message = Some(text);
     }
 
-    /// dispatch.rs Abort (:134-192) verbatim minus presentation, behind the
-    /// TUI's `if streaming` guard (input.rs:350): a `Cancel` while idle is a
-    /// no-op that only re-announces `Idle` — it must never touch
-    /// `abort_context`, save, or emit `Aborted`.
-    pub(crate) async fn cancel_turn(&mut self) {
+    /// Every cancel path — `Cancel` (Esc), quit mid-turn (`finish`), the cost
+    /// cap, a reload/host checkpoint — behind the TUI's `if streaming` guard
+    /// (input.rs:350): a `Cancel` while idle is a no-op that only re-announces
+    /// `Idle` — it must never touch history, save, or emit `Aborted`.
+    ///
+    /// The interrupted turn is recorded as REAL history, never as a recap:
+    /// 1. the token is cancelled, then pending host prompts are answered
+    ///    `None` (a tool or `before_tool_call` hook blocked on one must unwind);
+    /// 2. the still-live stream is drained for a
+    ///    bounded time (`drain_cancelled_stream`) so the engine's cancel-path
+    ///    history — partial assistant message, completed tool rounds,
+    ///    delivered steering, canceled `tool_result`s — plus its final Usage
+    ///    and any in-flight context-head checkpoint reach the actor;
+    /// 3. that history is adopted verbatim (else the last adopted history is
+    ///    kept — every history the engine publishes is valid), then ONE
+    ///    interruption marker is APPENDED (`engine::interrupt`). Nothing
+    ///    already sent is edited, so the provider's cached prefix survives.
+    pub(crate) async fn cancel_turn(&mut self, reason: crate::engine::interrupt::InterruptReason) {
         if !self.streaming {
             if self.compact.is_some() {
                 self.abort_compaction();
@@ -2231,19 +2264,44 @@ impl SessionActor {
         if let Some(ref ct) = self.cancel {
             ct.cancel();
         }
-        self.conv.abort_context = self.turn_log.abort_context();
+        // After the cancel, so a tool awaiting a prompt observes the cancel
+        // (not a `None` it could read as "declined"); a `before_tool_call`
+        // hook awaiting a confirm prompt is not cancel-aware and needs this
+        // answer to unwind at all.
+        self.resolve_pending_prompts();
+        let drain = self.drain_cancelled_stream().await;
+        match drain.history {
+            Some(history) => self.conv.api_messages = history,
+            None if !drain.closed => tracing::warn!(
+                session = %self.id,
+                budget_ms = budgets::CANCEL_DRAIN_TIMEOUT_MS,
+                "cancelled turn did not publish its history within the drain budget; \
+                 keeping the last adopted history"
+            ),
+            None => {}
+        }
+        // Defensive: only trailing invalid messages this turn appended.
+        crate::engine::stream::repair_history_after_failure(
+            &mut self.conv.api_messages,
+            self.turn_baseline,
+        );
+        let kept_partial = self.conv.api_messages.len() > self.turn_baseline;
+        crate::engine::interrupt::append_marker(&mut self.conv.api_messages, reason);
+        // A user steer the engine never picked up was not delivered.
         if let Some(q) = self.conv.queued_message.take() {
             self.emit(SessionEventWire::Dequeued { text: q });
         }
-        // Flush any events that arrived during streaming
+        // Events that arrived during the turn go in after the marker: first
+        // those steered into the stream but never drained by the engine
+        // (otherwise lost with the channel), then those buffered.
         {
+            let undelivered = std::mem::take(&mut self.turn_steered_events);
             let conv: &mut ConversationState = &mut self.conv;
-            for formatted in conv.pending_events.drain(..) {
-                conv.api_messages
-                    .push(std::sync::Arc::new(serde_json::json!({
-                        "role": "user",
-                        "content": formatted
-                    })));
+            for formatted in undelivered.into_iter().chain(conv.pending_events.drain(..)) {
+                conv.api_messages.push(std::sync::Arc::new(serde_json::json!({
+                    "role": "user",
+                    "content": formatted
+                })));
             }
         }
         self.clear_stream();
@@ -2265,13 +2323,158 @@ impl SessionActor {
                 }
             }
         }
-        // Typed event; clients render "aborted[ — context saved …]".
+        // Typed event. `context_saved` (wire name kept for compatibility)
+        // now means "the turn's partial work is kept in history".
         self.emit(SessionEventWire::Aborted {
-            context_saved: self.conv.abort_context.is_some(),
+            context_saved: kept_partial,
         });
-        self.save().await;
+        if tokio::time::timeout(budgets::SAVE_TIMEOUT, self.save())
+            .await
+            .is_err()
+        {
+            tracing::warn!(session = %self.id, "cancel_turn: save timed out");
+        }
         self.emit_conversation();
         self.emit(SessionEventWire::Idle);
+    }
+
+    /// Answer every pending host prompt `None` (same as `checkpoint`/`finish`).
+    fn resolve_pending_prompts(&mut self) {
+        if self.pending_prompts.is_empty() {
+            return;
+        }
+        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
+            let _ = tx.send(None);
+            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        }
+        self.publish_presence();
+        self.rearm_prompt_abandon();
+    }
+
+    /// Consume what a CANCELLED turn's stream still carries, for at most
+    /// `budgets::CANCEL_DRAIN_TIMEOUT`, then drop it.
+    ///
+    /// Deliberately NOT `on_stream_event`: that handler would re-check the
+    /// cost cap on the final `Usage` (recursive `cancel_turn`), run the
+    /// failure path on the engine's typed `Canceled` error, and treat `Done`
+    /// as a normal completion (queued auto-send, auto-compaction).
+    ///
+    /// Forwarded to clients: display events (partial text, tool results —
+    /// the history being adopted contains them), `Usage`, agent events.
+    /// Handled: `MessageHistory` (kept, last wins), `ContextHeadCheckpoint`
+    /// (serviced — dropping its receipt would latch `durability_blocked`),
+    /// `SteeringDelivered`. Swallowed: `Done`, the `Canceled` error. A typed
+    /// `InterruptedAfterSideEffect` becomes a notice (it is not a failure of
+    /// the turn; the canceled `tool_result` already tells the model).
+    async fn drain_cancelled_stream(&mut self) -> CancelDrain {
+        let mut out = CancelDrain::default();
+        let Some(mut stream) = self.stream.take() else {
+            out.closed = true;
+            return out;
+        };
+        let deadline = tokio::time::Instant::now() + budgets::CANCEL_DRAIN_TIMEOUT;
+        loop {
+            // A tool that raised a prompt before observing the cancel.
+            while let Ok(req) = self.secret_prompt_rx.try_recv() {
+                let _ = req.response_tx.send(None);
+            }
+            let event = match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) => break,
+                Ok(None) => {
+                    out.closed = true;
+                    break;
+                }
+                Ok(Some(event)) => event,
+            };
+            match event {
+                StreamEvent::Session(SessionEvent::Done) => {
+                    out.closed = true;
+                    break;
+                }
+                StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+                    out.history = Some(history);
+                }
+                StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
+                    session_id,
+                    messages,
+                    receipt,
+                }) => {
+                    self.handle_context_head_checkpoint(session_id, messages, receipt)
+                        .await;
+                    // The adopted head is the actor's history now; a later
+                    // `MessageHistory` (if any) still wins.
+                }
+                StreamEvent::Session(SessionEvent::Error(err)) => match err.outcome {
+                    crate::TurnOutcome::Canceled => {}
+                    crate::TurnOutcome::InterruptedAfterSideEffect { .. } => {
+                        self.emit(SessionEventWire::SystemNotice(err.message));
+                    }
+                    _ => {
+                        tracing::warn!(
+                            session = %self.id,
+                            category = err.category_label(),
+                            "cancelled turn reported an error while draining"
+                        );
+                    }
+                },
+                StreamEvent::Agent(AgentEvent::SteeringDelivered { ref message }) => {
+                    self.note_steering_delivered(message);
+                    self.emit(SessionEventWire::Stream(event));
+                }
+                StreamEvent::Session(SessionEvent::Usage { .. }) => {
+                    self.record_usage(&event);
+                    self.emit(SessionEventWire::Stream(event));
+                }
+                other => self.emit(SessionEventWire::Stream(other)),
+            }
+        }
+        drop(stream);
+        out
+    }
+
+    /// `SteeringDelivered`: the engine injected `message` into history.
+    fn note_steering_delivered(&mut self, message: &str) {
+        if self.conv.queued_message.as_deref() == Some(message) {
+            self.conv.queued_message = None;
+            self.emit_conversation();
+        }
+        // P5/P6: pop the driver's steering FIFO on delivery ack.
+        if let Some(driver) = self.driver.as_mut() {
+            if driver.steering.front().map(String::as_str) == Some(message) {
+                driver.steering.pop_front();
+            }
+        }
+        if let Some(pos) = self.turn_steered_events.iter().position(|e| e == message) {
+            self.turn_steered_events.remove(pos);
+        }
+    }
+
+    /// Accumulate one `SessionEvent::Usage` into the conversation totals.
+    fn record_usage(&mut self, event: &StreamEvent) {
+        if let StreamEvent::Session(SessionEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
+            model: usage_model,
+        }) = event
+        {
+            let model_for_pricing = usage_model
+                .as_deref()
+                .unwrap_or(self.runtime.model())
+                .to_string();
+            self.conv.add_usage(
+                *input_tokens,
+                *output_tokens,
+                *cache_read_input_tokens,
+                *cache_creation_input_tokens,
+                *cache_creation_5m,
+                *cache_creation_1h,
+                &model_for_pricing,
+            );
+        }
     }
 
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
@@ -2299,6 +2502,9 @@ impl SessionActor {
             return;
         }
         for de in &drained {
+            if de.disposition == EventDisposition::Steered {
+                self.turn_steered_events.push(de.formatted.clone());
+            }
             self.emit(SessionEventWire::External(de.event.clone()));
         }
         let injected = drained
@@ -2401,64 +2607,37 @@ impl SessionActor {
         let mut after = After::Continue;
 
         match event {
-            StreamEvent::Llm(LlmEvent::Thinking(text)) => self.turn_log.thinking(&text),
-            StreamEvent::Llm(LlmEvent::Text(text)) => self.turn_log.text(&text),
-            StreamEvent::Llm(LlmEvent::ToolUse {
-                tool_name, input, ..
-            }) => {
-                let input_str = serde_json::to_string(&input).unwrap_or_default();
-                self.turn_log.parts.push(TurnPart::ToolUse {
-                    name: tool_name,
-                    input: input_str,
-                });
-            }
-            StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id, delta }) => {
-                self.turn_log.tool_result_delta(tool_id, delta);
-            }
-            StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
-                self.turn_log.tool_result(tool_id, result);
+            StreamEvent::Llm(crate::LlmEvent::Text(text)) => self.turn_draft_text(&text),
+            // A new provider response (or a retry's reset): the in-flight
+            // text starts over.
+            StreamEvent::Llm(crate::LlmEvent::ResponseStart | crate::LlmEvent::ResponseReset) => {
+                self.turn_draft_reset_text()
             }
             StreamEvent::Llm(_) => {}
             StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+                // Published at every round boundary as well as at the end of
+                // the turn (`runtime/stream.rs` ROUND CHECKPOINT): the session
+                // on disk follows the turn as it progresses. Bounded so a slow
+                // disk can never stall the turn machine (Esc/Cancel stays
+                // responsive); a timed-out write still lands, in order
+                // (`session_save_order`).
                 self.conv.api_messages = history;
-                self.save().await;
+                if tokio::time::timeout(budgets::SAVE_TIMEOUT, self.save())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session = %self.id, "history checkpoint save timed out");
+                }
+                // The round is committed: the draft now continues from here.
+                self.turn_draft_committed();
                 self.emit_conversation();
             }
-            StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
-                if self.conv.queued_message.as_ref() == Some(&message) {
-                    self.conv.queued_message = None;
-                    self.emit_conversation();
-                }
-                // P5/P6: pop the driver's steering FIFO on delivery ack.
-                if let Some(driver) = self.driver.as_mut() {
-                    if driver.steering.front() == Some(&message) {
-                        driver.steering.pop_front();
-                    }
-                }
+            StreamEvent::Agent(AgentEvent::SteeringDelivered { ref message }) => {
+                self.note_steering_delivered(message);
             }
             StreamEvent::Agent(_) => {}
-            StreamEvent::Session(SessionEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cache_read_input_tokens,
-                cache_creation_input_tokens,
-                cache_creation_5m,
-                cache_creation_1h,
-                model: usage_model,
-            }) => {
-                let model_for_pricing = usage_model
-                    .as_deref()
-                    .unwrap_or(self.runtime.model())
-                    .to_string();
-                self.conv.add_usage(
-                    input_tokens,
-                    output_tokens,
-                    cache_read_input_tokens,
-                    cache_creation_input_tokens,
-                    cache_creation_5m,
-                    cache_creation_1h,
-                    &model_for_pricing,
-                );
+            StreamEvent::Session(SessionEvent::Usage { .. }) => {
+                self.record_usage(&event);
                 // (E-P7, §S3) Host-owned spend circuit breaker. Checked after
                 // every Usage event — a breach cancels the in-flight turn,
                 // revokes any armed driver (so it cannot re-poll and keep
@@ -2472,7 +2651,8 @@ impl SessionActor {
                     if self.driver.is_some() || self.driver_pending.is_some() {
                         self.driver_revoke(&format!("{scope} cost cap reached (${cost:.4} ≥ ${cap:.4})"));
                     }
-                    self.cancel_turn().await;
+                    self.cancel_turn(crate::engine::interrupt::InterruptReason::CostCap)
+                        .await;
                     return;
                 }
             }
@@ -2553,15 +2733,8 @@ impl SessionActor {
                 // Auto-send the queued message (user-authored — reset counter)
                 self.consecutive_auto_turns = 0;
                 let user_text = queued.clone();
-                let api_content = if let Some(ref ctx) = self.conv.abort_context {
-                    let combined = format!("{}\n\n{}", ctx, queued);
-                    self.conv.abort_context = None;
-                    combined
-                } else {
-                    queued
-                };
                 self.conv.api_messages.push(std::sync::Arc::new(
-                    serde_json::json!({"role": "user", "content": api_content}),
+                    serde_json::json!({"role": "user", "content": queued}),
                 ));
                 self.start_turn(TurnTrigger::QueuedAuto, Some(user_text)).await;
             }
@@ -3181,7 +3354,7 @@ impl SessionActor {
     }
 
     /// B1 (used by C3 reload): checkpoint the session without ending it —
-    /// cancel any turn (abort_context captured), abort compaction, answer
+    /// cancel any turn (partial history kept + interruption marker), abort compaction, answer
     /// pending prompts `None`, save, close PTYs. Replies on
     /// `CHECKPOINT_QUERY_ID` so `reload.rs` can await it per session.
     pub(crate) async fn checkpoint(&mut self, reason: CheckpointReason) {
@@ -3190,7 +3363,11 @@ impl SessionActor {
             self.driver_revoke("daemon reloaded");
         }
         if self.streaming {
-            self.cancel_turn().await;
+            let interrupt = match reason {
+                CheckpointReason::Reload => crate::engine::interrupt::InterruptReason::Restart,
+                CheckpointReason::HostRequest => crate::engine::interrupt::InterruptReason::Host,
+            };
+            self.cancel_turn(interrupt).await;
         }
         self.abort_compaction();
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
@@ -3311,7 +3488,8 @@ impl SessionActor {
                 if self.driver.is_some() {
                     self.driver_revoke("canceled");
                 }
-                self.cancel_turn().await;
+                self.cancel_turn(crate::engine::interrupt::InterruptReason::User)
+                    .await;
             }
             SessionCommand::Answer { prompt_id, value } => self.answer(prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
@@ -3409,7 +3587,13 @@ impl SessionActor {
             self.driver_revoke("session ending");
         }
         if self.streaming {
-            self.cancel_turn().await;
+            // Quitting the client mid-turn is the user's interruption; every
+            // other end reason is the host's.
+            let interrupt = match reason {
+                EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+                _ => crate::engine::interrupt::InterruptReason::Host,
+            };
+            self.cancel_turn(interrupt).await;
         }
         self.abort_compaction();
         // Outstanding prompts are cancelled (tool sees `None`).
@@ -3501,6 +3685,13 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
+/// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
+/// and after it while any worker is still running (a background worker's
+/// progress events rode the ended turn's stream; the rows carry it now).
+fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
+    streaming || any_running
+}
+
 async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
     match tick {
         Some(t) => {
@@ -3579,7 +3770,10 @@ impl SessionTask {
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 _ = queue.notified() => actor.on_queue_wake().await,
-                _ = next_tick(&mut actor.subagent_tick) => actor.publish_subagent_rows(),
+                _ = next_tick(&mut actor.subagent_tick) => {
+                    actor.publish_subagent_rows();
+                    actor.flush_turn_draft();
+                }
                 _ = park_timer(actor.park_deadline) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
@@ -3642,42 +3836,21 @@ impl SessionTask {
 }
 
 #[cfg(test)]
-mod abort_context_tests {
-    use super::{TurnLog, TurnPart};
-
-    fn log(parts: Vec<TurnPart>) -> TurnLog {
-        TurnLog { parts }
-    }
-
-    /// F6/#370: the abort recap must NOT contain protocol-shaped tags that a
-    /// model can read as an injected assistant/tool turn.
-    #[test]
-    fn abort_context_uses_prose_not_protocol_tags() {
-        let ctx = log(vec![
-            TurnPart::Thinking("weighing options".into()),
-            TurnPart::Text("Here is the".into()),
-            TurnPart::ToolUse { name: "bash".into(), input: "{\"command\":\"ls\"}".into() },
-            TurnPart::ToolResult { tool_id: "t1".into(), content: "a b c".into() },
-        ])
-        .abort_context()
-        .expect("non-empty log yields context");
-
-        for forbidden in ["[tool_use]", "[tool_result]", "[response]", "[thinking]"] {
-            assert!(!ctx.contains(forbidden), "protocol tag leaked: {forbidden} in {ctx}");
-        }
-        // Keeps the human-readable ABORT CONTEXT header and frames it as a note.
-        assert!(ctx.contains("ABORT CONTEXT"));
-        assert!(ctx.contains("System note"));
-        assert!(ctx.contains("not new instructions"));
-        // The actual partial work is still recapped.
-        assert!(ctx.contains("bash"));
-        assert!(ctx.contains("a b c"));
-    }
+mod subagent_tick_tests {
+    use super::keep_subagent_tick;
 
     #[test]
-    fn empty_log_yields_no_context() {
-        assert!(log(vec![]).abort_context().is_none());
-        assert!(log(vec![TurnPart::Text(String::new())]).abort_context().is_none());
+    fn rows_keep_flowing_after_the_turn_while_a_worker_runs() {
+        assert!(keep_subagent_tick(true, false), "during a turn, always");
+        assert!(keep_subagent_tick(true, true));
+        assert!(
+            keep_subagent_tick(false, true),
+            "after the turn, while a background worker runs"
+        );
+        assert!(
+            !keep_subagent_tick(false, false),
+            "stops once the turn is over and no worker runs"
+        );
     }
 }
 

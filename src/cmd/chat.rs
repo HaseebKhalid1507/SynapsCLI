@@ -377,14 +377,10 @@ async fn run_inline(
                     continue;
                 }
 
-                // ── Regular user message ──
-                let message = if let Some(ctx) = conv.abort_context.take() {
-                    format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", trimmed, ctx)
-                } else {
-                    trimmed.to_string()
-                };
+                // ── Regular user message ── (an interrupted turn is already
+                // in history as partial messages + marker; never folded here)
                 conv.api_messages.push(std::sync::Arc::new(
-                    json!({"role": "user", "content": message}),
+                    json!({"role": "user", "content": trimmed}),
                 ));
             }
         }
@@ -406,6 +402,10 @@ async fn run_inline(
                 let Some(event) = stream.next().await else {
                     break StreamCompletion::Done;
                 };
+                // Round checkpoints (and the final history) are persisted as
+                // they arrive, like the session actor does.
+                let is_history =
+                    matches!(event, synaps_cli::StreamEvent::Session(synaps_cli::SessionEvent::MessageHistory(_)));
                 let (engine_event, completion) = stream::process_stream_event(
                     event,
                     &mut conv.api_messages,
@@ -414,6 +414,9 @@ async fn run_inline(
                     &mut conv.pending_events,
                     turn_baseline,
                 );
+                if is_history {
+                    conv.save().await;
+                }
 
                 match engine_event {
                     EngineStreamEvent::Thinking(text) => {
@@ -796,7 +799,7 @@ mod actor {
                 SessionEventWire::Aborted { context_saved } => eprintln!(
                     "\x1b[2m{}\x1b[0m",
                     if context_saved {
-                        "aborted — context saved for next message"
+                        "aborted — partial work kept"
                     } else {
                         "aborted"
                     }
@@ -1226,7 +1229,7 @@ mod actor {
                         }
                         "help" => {
                             eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
-                            eprintln!("quitting (or EOF) mid-turn cancels the turn and saves an abort context for the next --continue");
+                            eprintln!("quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue");
                         }
                         _ => eprintln!("unknown command: /{} (try /help)", cmd),
                     },

@@ -288,11 +288,32 @@ impl SessionToolSet {
         catalog: &ToolCatalog,
         progressive: bool,
     ) -> (Self, Vec<DroppedActivation>) {
-        let mut next = if progressive {
+        let next = if progressive {
             Self::progressive_core_for_catalog(self.session.clone(), catalog)
         } else {
             Self::default_core_for_catalog(self.session.clone(), catalog)
         };
+        self.carry_activations_into(next, catalog)
+    }
+
+    /// Carry this set's exact activations into `next` — a freshly built core
+    /// for the SAME session against `catalog` — with exactly the checks
+    /// [`Self::rebuilt_for_catalog`] applies (pinned digest + provenance
+    /// unchanged and source trust intact; promoted-to-core ids are not
+    /// carried; drifted/removed ones are dropped and reported). Shared by the
+    /// round-top rebuild and the turn-start reconciliation of a retained
+    /// set, so the two paths can never drift.
+    ///
+    /// A `next` built for a different session inherits nothing: grants never
+    /// cross sessions.
+    pub fn carry_activations_into(
+        &self,
+        mut next: SessionToolSet,
+        catalog: &ToolCatalog,
+    ) -> (Self, Vec<DroppedActivation>) {
+        if next.session != self.session {
+            return (next, Vec::new());
+        }
         let mut dropped = Vec::new();
         for old in self.activated.values() {
             let id = old.grant().tool_id().clone();
@@ -981,6 +1002,15 @@ fn check_source_trust(record: &CapabilityRecord) -> Result<(), ToolAuthorization
 /// set the `ExecutionGate` and the next provider round consume. Interior
 /// critical sections are short and never held across `.await`.
 pub type SharedSessionToolSet = Arc<std::sync::RwLock<SessionToolSet>>;
+
+/// The per-runtime slot that RETAINS a session's [`SharedSessionToolSet`]
+/// across stream turns. Exact activations are session-scoped (the
+/// `activate_tools` contract says so), so the set that holds them must outlive
+/// a single provider turn: every turn of the same runtime tool session
+/// reconciles and reuses the retained set instead of minting a fresh,
+/// zero-activation one. Shared by `Runtime` clones exactly like
+/// `host_tool_session`; empty until the first progressive turn.
+pub type RetainedSessionToolSet = Arc<std::sync::Mutex<Option<SharedSessionToolSet>>>;
 
 /// Typed failure for deterministic bulk activation ([`SessionToolSet::activate_many`]).
 /// Every variant fails the WHOLE batch with zero partial mutation.

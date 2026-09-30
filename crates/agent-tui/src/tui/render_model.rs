@@ -61,6 +61,8 @@ pub(crate) struct RenderModel {
     pub(crate) cursor_pos: usize,
     /// Pre-computed ghost-hint for slash-command completion.
     pub(crate) ghost_hint: Option<GhostHint>,
+    /// This frame's neon-prompt animation snapshot.
+    pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── Footer ───────────────────────────────────────────────────────────────
     pub(crate) show_full_output: bool,
@@ -125,6 +127,10 @@ pub(crate) struct SubagentSnap {
     /// pre-computed so the render thread doesn't need `Instant`.
     pub(crate) elapsed_secs: f64,
     pub(crate) done: bool,
+    /// Tool calls so far.
+    pub(crate) tools: u32,
+    /// First line of the result once done.
+    pub(crate) result: Option<String>,
 }
 
 /// Pre-computed ghost-hint for slash-command completion in the input box.

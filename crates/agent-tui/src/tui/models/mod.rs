@@ -87,11 +87,10 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
 }
 
 use ratatui::{
-    buffer::Buffer,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Clear, Paragraph, Widget},
 };
 
 use super::theme::{ModalKind, THEME};
@@ -968,292 +967,301 @@ pub(crate) fn selected_model<'a>(
     }
 }
 
+/// Models modal — borderless, after Noodle (see `tui/modal_kit.rs`): a dimmed
+/// backdrop, a flat surface, a search field on a raised surface, view tabs as
+/// chips, provider sections, `┃` bar selection, and a borderless lightbox for
+/// a provider's live catalog.
 pub(crate) fn render(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     state: &ModelsModalState,
     current_model: &str,
 ) {
+    use super::modal_kit::{centered, hint_line, open_modal, Palette};
     let sections = build_sections(current_model, state);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        ModelsModalWidget {
-            state,
-            sections,
-            current_model,
-        },
-        area,
-    );
-}
+    let theme = THEME.load();
+    let p = Palette::for_modal(&theme, Some(ModalKind::Models));
+    let w = (area.width.saturating_mul(9) / 10).max(60).min(area.width);
+    let h = (area.height.saturating_mul(9) / 10)
+        .max(16)
+        .min(area.height);
+    let modal = centered(area, w, h);
+    let body = open_modal(frame, area, modal, &p, "Models", "esc close");
+    if body.height < 7 {
+        return;
+    }
 
-struct ModelsModalWidget<'a> {
-    state: &'a ModelsModalState,
-    sections: Vec<ModelSection>,
-    current_model: &'a str,
-}
+    let rows = visible_rows(&sections, state);
+    let model_count: usize = sections.iter().map(|s| s.entries.len()).sum();
+    let favorite_count = state.favorites.len();
 
-impl Widget for ModelsModalWidget<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let theme = THEME.load();
-        // P19.1: `models.border` override (else `border_active` base token);
-        // `models.title` applied only when set (else title unchanged).
-        let mut block = Block::default()
-            .title(" Models ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.modal_border(ModalKind::Models)))
-            .padding(Padding {
-                left: 2,
-                right: 2,
-                top: 1,
-                bottom: 1,
-            });
-        if let Some(tc) = theme.modal_title(ModalKind::Models) {
-            block = block.title_style(Style::default().fg(tc));
-        }
-        let inner = block.inner(area);
-        block.render(area, buf);
+    let [meta, _, search_bar, view_bar, _, list_area, _, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(body);
 
-        let rows = visible_rows(&self.sections, self.state);
-        let model_count: usize = self.sections.iter().map(|s| s.entries.len()).sum();
-        let favorite_count = self.state.favorites.len();
-        let view = match self.state.view {
-            ModelsView::All => "[✦ All]  ★ Favorites",
-            ModelsView::Favorites => "✦ All  [★ Favorites]",
-        };
+    let buf = frame.buffer_mut();
+    Paragraph::new(Line::from(vec![
+        Span::styled(model_count.to_string(), Style::default().fg(p.text)),
+        Span::styled(" available   ", Style::default().fg(p.dim)),
+        Span::styled(favorite_count.to_string(), Style::default().fg(p.text)),
+        Span::styled(" \u{2605} favorites   ", Style::default().fg(p.dim)),
+        Span::styled("current ", Style::default().fg(p.dim)),
+        Span::styled(current_model.to_string(), Style::default().fg(p.value)),
+    ]))
+    .render(meta, buf);
 
-        let [title, search_bar, view_bar, list_area, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .areas(inner);
+    search_field(&p, &state.search, "type to search").render(search_bar, buf);
 
-        Paragraph::new(Line::from(vec![
+    // View tabs as chips: the active one on the raised surface.
+    let chip = |label: &str, active: bool| {
+        if active {
             Span::styled(
-                "◇ Switch model",
+                format!(" {label} "),
                 Style::default()
-                    .fg(theme.header_fg)
+                    .fg(p.value)
+                    .bg(p.selected)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · {model_count} available · {favorite_count} ★ favorites"),
-                Style::default().fg(theme.muted),
-            ),
-        ]))
-        .render(title, buf);
+            )
+        } else {
+            Span::styled(format!(" {label} "), Style::default().fg(p.dim))
+        }
+    };
+    let mut tabs = vec![
+        chip("\u{2726} All", state.view == ModelsView::All),
+        Span::raw(" "),
+        chip("\u{2605} Favorites", state.view == ModelsView::Favorites),
+        Span::raw("   "),
+    ];
+    tabs.extend(hint_line(&p, "tab switch", view_bar.width).spans);
+    Paragraph::new(Line::from(tabs)).render(view_bar, buf);
 
-        Paragraph::new(Line::from(vec![
-            Span::styled("Search: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                if self.state.search.is_empty() {
-                    "▎".to_string()
-                } else {
-                    format!("{}▎", self.state.search)
-                },
-                Style::default().fg(theme.header_fg),
-            ),
-        ]))
-        .render(search_bar, buf);
-
-        Paragraph::new(Line::from(vec![
-            Span::styled("View:   ", Style::default().fg(theme.muted)),
-            Span::styled(view, Style::default().fg(theme.help_fg)),
-            Span::styled(
-                format!("   current: {}", self.current_model),
-                Style::default().fg(theme.muted),
-            ),
-        ]))
-        .render(view_bar, buf);
-
-        let list_height = list_area.height as usize;
-        let offset = self
-            .state
-            .cursor
-            .saturating_sub(list_height.saturating_sub(1));
-        let lines: Vec<Line> = rows
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(list_height)
-            .map(|(row_idx, row)| match row {
+    let list_height = list_area.height as usize;
+    let offset = state.cursor.saturating_sub(list_height.saturating_sub(1));
+    let width = list_area.width;
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(list_height)
+        .map(|(row_idx, row)| {
+            let selected = row_idx == state.cursor;
+            let bg = if selected { p.selected } else { p.panel };
+            let mut spans = vec![Span::styled(
+                if selected { "\u{2503} " } else { "  " },
+                Style::default().fg(p.accent).bg(bg),
+            )];
+            match row {
                 VisibleRow::Section { idx } => {
-                    let section = &self.sections[*idx];
-                    let selected = row_idx == self.state.cursor;
-                    let glyph = if self.state.collapsed.contains(&section.provider_key) {
-                        "▸"
+                    let section = &sections[*idx];
+                    let glyph = if state.collapsed.contains(&section.provider_key) {
+                        "\u{25b8}"
                     } else {
-                        "▾"
+                        "\u{25be}"
                     };
-                    let style = if selected {
+                    spans.push(Span::styled(
+                        format!("{glyph} {}", section.provider_name),
                         Style::default()
-                            .fg(theme.header_fg)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.help_fg)
-                    };
-                    Line::from(vec![
-                        Span::styled(
-                            if selected { "● " } else { "  " },
-                            Style::default().fg(theme.border_active),
-                        ),
-                        Span::styled(format!("{glyph} {}", section.provider_name), style),
-                        Span::styled(
-                            format!(" ({})", section.entries.len()),
-                            Style::default().fg(theme.muted),
-                        ),
-                    ])
+                            .fg(p.text)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!("  {}", section.entries.len()),
+                        Style::default().fg(p.dim).bg(bg),
+                    ));
                 }
                 VisibleRow::Model { section, idx } => {
-                    let entry = &self.sections[*section].entries[*idx];
-                    let selected = row_idx == self.state.cursor;
-                    let marker = if selected { "●" } else { "○" };
-                    let fav = if entry.is_favorite { "★" } else { " " };
-                    let current = if entry.is_current { " default" } else { "" };
-                    let tier = if entry.tier.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {}", entry.tier)
-                    };
-                    let style = if selected {
+                    let entry = &sections[*section].entries[*idx];
+                    let id_style = if selected {
                         Style::default()
-                            .fg(theme.header_fg)
+                            .fg(p.value)
+                            .bg(bg)
                             .add_modifier(Modifier::BOLD)
                     } else if entry.is_current {
-                        Style::default().fg(theme.status_ready)
+                        Style::default().fg(p.value).bg(bg)
                     } else {
-                        Style::default().fg(theme.input_fg)
+                        Style::default().fg(p.text).bg(bg)
                     };
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  {marker} "),
-                            Style::default().fg(theme.border_active),
-                        ),
-                        Span::styled(format!("{:<38}", entry.id), style),
-                        Span::styled(
-                            format!(" — {}", entry.label),
-                            Style::default().fg(theme.muted),
-                        ),
-                        Span::styled(
-                            format!(" {fav}"),
-                            Style::default().fg(theme.status_streaming),
-                        ),
-                        Span::styled(tier, Style::default().fg(theme.muted)),
-                        Span::styled(current, Style::default().fg(theme.status_ready)),
-                    ])
+                    spans.push(Span::styled(
+                        if entry.is_favorite { "\u{2605} " } else { "  " },
+                        Style::default().fg(theme.status_streaming).bg(bg),
+                    ));
+                    spans.push(Span::styled(format!("{:<38}", entry.id), id_style));
+                    spans.push(Span::styled(
+                        format!(" {}", entry.label),
+                        Style::default().fg(p.dim).bg(bg),
+                    ));
+                    if !entry.tier.is_empty() {
+                        spans.push(Span::styled(
+                            format!("   {}", entry.tier),
+                            Style::default().fg(p.dim).bg(bg),
+                        ));
+                    }
+                    if entry.is_current {
+                        spans.push(Span::styled(
+                            "   \u{25cf} default",
+                            Style::default().fg(p.value).bg(bg),
+                        ));
+                    }
                 }
-            })
-            .collect();
+            }
+            super::modal_kit::pad_to(&mut spans, width, bg);
+            Line::from(spans)
+        })
+        .collect();
 
-        let empty_line = if self.state.view == ModelsView::Favorites {
-            "No favorite models yet — press Tab for All, then f to favorite."
+    let list = if lines.is_empty() {
+        vec![if state.view == ModelsView::Favorites {
+            let mut l = hint_line(&p, "tab all  ctrl+f favorite", width);
+            l.spans.insert(
+                0,
+                Span::styled("  No favorite models yet.   ", Style::default().fg(p.dim)),
+            );
+            l
         } else {
-            "No configured models match the current search."
-        };
-        let list = if lines.is_empty() {
-            vec![Line::from(Span::styled(
-                empty_line,
-                Style::default().fg(theme.muted),
-            ))]
-        } else {
-            lines
-        };
-        Paragraph::new(list).render(list_area, buf);
+            Line::from(Span::styled(
+                "  No configured models match the search.",
+                Style::default().fg(p.dim),
+            ))
+        }]
+    } else {
+        lines
+    };
+    Paragraph::new(list).render(list_area, buf);
 
-        Paragraph::new(
-            "↑/↓ select • Enter use • f favorite • e expand • Tab view • c collapse • Esc close",
-        )
-        .style(Style::default().fg(theme.muted))
-        .alignment(Alignment::Center)
-        .render(footer, buf);
+    hint_line(
+        &p,
+        "\u{2191}\u{2193} select  enter use  ctrl+f favorite  ctrl+e catalog  \u{2190}\u{2192} fold  esc close",
+        footer.width,
+    )
+    .render(footer, buf);
 
-        if let Some(expanded) = self.state.expanded.as_ref() {
-            render_expanded_lightbox(area, buf, self.state, expanded);
-        }
+    if let Some(expanded) = state.expanded.as_ref() {
+        render_expanded_lightbox(frame, modal, state, expanded, &p);
     }
+}
+
+/// A search field on the raised surface (Noodle's input): `⌕`, the query,
+/// a block cursor, or a dim italic placeholder.
+fn search_field(
+    p: &super::modal_kit::Palette,
+    query: &str,
+    placeholder: &str,
+) -> Paragraph<'static> {
+    let bg = p.selected;
+    let mut spans = vec![Span::styled(
+        " \u{2315} ",
+        Style::default().fg(p.dim).bg(bg),
+    )];
+    if query.is_empty() {
+        spans.push(Span::styled(
+            "\u{2588}",
+            Style::default().fg(p.accent).bg(bg),
+        ));
+        spans.push(Span::styled(
+            format!(" {placeholder}"),
+            Style::default()
+                .fg(p.dim)
+                .bg(bg)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        spans.push(Span::styled(
+            query.to_string(),
+            Style::default().fg(p.text).bg(bg),
+        ));
+        spans.push(Span::styled(
+            "\u{2588}",
+            Style::default().fg(p.accent).bg(bg),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(bg))
 }
 
 fn render_expanded_lightbox(
+    frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    buf: &mut Buffer,
     state: &ModelsModalState,
     expanded: &ExpandedModelsState,
+    p: &super::modal_kit::Palette,
 ) {
-    let theme = THEME.load();
-    let width = area.width.saturating_sub(10).min(110);
-    let height = area.height.saturating_sub(6).min(28);
+    use super::modal_kit::{centered, fill, hint_line, pad_to};
+    let width = area.width.saturating_sub(8).min(110);
+    let height = area.height.saturating_sub(4).min(28);
     // Guard against tiny terminals where popup dimensions collapse to
     // zero or near-zero, which can panic in layout splits or produce garbage.
-    if width < 20 || height < 6 {
+    if width < 20 || height < 8 {
         return;
     }
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect {
-        x,
-        y,
-        width,
-        height,
+    let popup = centered(area, width, height);
+    frame.render_widget(Clear, popup);
+    fill(frame.buffer_mut(), popup, p.popup);
+    let inner = Rect {
+        x: popup.x + 2,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(4),
+        height: popup.height.saturating_sub(2),
     };
 
-    Clear.render(popup, buf);
     let status = match &expanded.load_state {
-        ExpandedLoadState::Loading => "loading…".to_string(),
+        ExpandedLoadState::Loading => "loading\u{2026}".to_string(),
         ExpandedLoadState::Ready(models) => format!("{} loaded", models.len()),
         ExpandedLoadState::Error(_) => "error".to_string(),
     };
-    let block = Block::default()
-        .title(format!(" {} models · {} ", expanded.provider_name, status))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border_active))
-        .padding(Padding {
-            left: 2,
-            right: 2,
-            top: 1,
-            bottom: 1,
-        });
-    let inner = block.inner(popup);
-    block.render(popup, buf);
-
-    let [search_bar, list, footer] = Layout::vertical([
+    let [title, _, search_bar, _, list, _, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
 
+    let buf = frame.buffer_mut();
     Paragraph::new(Line::from(vec![
-        Span::styled("Search: ", Style::default().fg(theme.muted)),
         Span::styled(
-            if expanded.search.is_empty() {
-                "▎".to_string()
-            } else {
-                format!("{}▎", expanded.search)
-            },
-            Style::default().fg(theme.header_fg),
+            format!("{} models", expanded.provider_name),
+            Style::default()
+                .fg(p.title)
+                .bg(p.popup)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   {status}"),
+            Style::default().fg(p.dim).bg(p.popup),
         ),
     ]))
-    .render(search_bar, buf);
+    .render(title, buf);
 
+    search_field(p, &expanded.search, "type to fuzzy-search").render(search_bar, buf);
+
+    let theme = THEME.load();
     let list_height = list.height as usize;
     let visible = expanded_visible_models(state);
     let offset = expanded
         .cursor
         .saturating_sub(list_height.saturating_sub(1));
+    let dim_line = |t: String, fg| Line::from(Span::styled(t, Style::default().fg(fg).bg(p.popup)));
     let lines = match &expanded.load_state {
-        ExpandedLoadState::Loading => vec![Line::from(Span::styled(
-            "Loading provider models…",
-            Style::default().fg(theme.muted),
-        ))],
-        ExpandedLoadState::Error(err) => vec![Line::from(Span::styled(
-            format!("Failed to load models: {err}"),
-            Style::default().fg(theme.error_color),
-        ))],
-        ExpandedLoadState::Ready(_) if visible.is_empty() => vec![Line::from(Span::styled(
-            "No models match the current search.",
-            Style::default().fg(theme.muted),
-        ))],
+        ExpandedLoadState::Loading => {
+            vec![dim_line("Loading provider models\u{2026}".into(), p.dim)]
+        }
+        ExpandedLoadState::Error(err) => {
+            vec![dim_line(format!("Failed to load models: {err}"), p.error)]
+        }
+        ExpandedLoadState::Ready(_) if visible.is_empty() => {
+            vec![dim_line("No models match the search.".into(), p.dim)]
+        }
         ExpandedLoadState::Ready(_) => visible
             .iter()
             .enumerate()
@@ -1261,45 +1269,52 @@ fn render_expanded_lightbox(
             .take(list_height)
             .map(|(idx, model)| {
                 let selected = idx == expanded.cursor;
-                let marker = if selected { "●" } else { "○" };
-                let fav = if model.is_favorite { "★" } else { " " };
-                let style = if selected {
-                    Style::default()
-                        .fg(theme.header_fg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.input_fg)
-                };
+                let bg = if selected { p.selected } else { p.popup };
                 let meta = model.metadata_label();
-                let meta_text = if meta.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {meta}")
-                };
-                Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
-                        format!("{marker} "),
-                        Style::default().fg(theme.border_active),
-                    ),
-                    Span::styled(format!("{:<48}", model.id), style),
-                    Span::styled(
-                        format!(" — {}{}", model.label, meta_text),
-                        Style::default().fg(theme.muted),
+                        if selected { "\u{2503} " } else { "  " },
+                        Style::default().fg(p.accent).bg(bg),
                     ),
                     Span::styled(
-                        format!(" {fav}"),
-                        Style::default().fg(theme.status_streaming),
+                        if model.is_favorite { "\u{2605} " } else { "  " },
+                        Style::default().fg(theme.status_streaming).bg(bg),
                     ),
-                ])
+                    Span::styled(
+                        format!("{:<46}", model.id),
+                        if selected {
+                            Style::default()
+                                .fg(p.value)
+                                .bg(bg)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(p.text).bg(bg)
+                        },
+                    ),
+                    Span::styled(
+                        format!(" {}", model.label),
+                        Style::default().fg(p.dim).bg(bg),
+                    ),
+                ];
+                if !meta.is_empty() {
+                    spans.push(Span::styled(
+                        format!("   {meta}"),
+                        Style::default().fg(p.dim).bg(bg),
+                    ));
+                }
+                pad_to(&mut spans, list.width, bg);
+                Line::from(spans)
             })
             .collect(),
     };
     Paragraph::new(lines).render(list, buf);
 
-    Paragraph::new("type to fuzzy-search • ↑/↓ select • Enter use • f favorite • Esc back")
-        .style(Style::default().fg(theme.muted))
-        .alignment(Alignment::Center)
-        .render(footer, buf);
+    hint_line(
+        p,
+        "\u{2191}\u{2193} select  enter use  ctrl+f favorite  esc back",
+        footer.width,
+    )
+    .render(footer, buf);
 }
 
 #[cfg(test)]
@@ -2273,5 +2288,33 @@ mod tests {
             vec![("claude-sonnet-4-7".to_string(), "Sonnet 4.7".to_string())],
             "anthropic dynamic override rows must keep working"
         );
+    }
+}
+
+#[cfg(test)]
+mod noodle_tests {
+    //! The models modal is borderless (after Noodle): no frame, a search
+    //! field and view chips, `┃` bar selection, key-bright/word-dim hints.
+    use crate::tui::testing::TestHarness;
+
+    #[test]
+    fn models_modal_is_borderless_with_bar_selection() {
+        let mut h = TestHarness::boot_with_size(110, 30);
+        h.open_models_modal();
+        let f = h.snapshot();
+        assert!(f.contains("Models") && f.contains("esc close"), "{f}");
+        let frame_glyphs = f
+            .lines()
+            .skip(2)
+            .flat_map(str::chars)
+            .filter(|c| "╭╮╰╯│┌┐└┘".contains(*c))
+            .count();
+        assert_eq!(frame_glyphs, 0, "no frame: {f}");
+        assert!(f.contains("\u{2315}"), "search field: {f}");
+        assert!(
+            f.contains("\u{2726} All") && f.contains("\u{2605} Favorites"),
+            "{f}"
+        );
+        assert!(f.contains("\u{2503} "), "bar on the cursor row: {f}");
     }
 }

@@ -1091,7 +1091,9 @@ impl PrivateDir {
         use crate::core::private_fs::DIR_MODE;
         use std::os::unix::fs::PermissionsExt;
         let name = c_name(name)?;
-        let created = unsafe { libc::mkdirat(self.fd(), name.as_ptr(), DIR_MODE) } == 0;
+        // `mode_t` is u16 on macOS, u32 on Linux; DIR_MODE (0o700) fits both.
+        let created =
+            unsafe { libc::mkdirat(self.fd(), name.as_ptr(), DIR_MODE as libc::mode_t) } == 0;
         if !created {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EEXIST) {

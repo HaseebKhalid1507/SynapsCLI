@@ -760,15 +760,16 @@ impl<'a> SessionSnapshotRef<'a> {
 }
 
 /// Full-snapshot JSON with a fresh `message_count`, without cloning.
-/// Drop every pair whose key matches the secret denylist. Shared by the
-/// `.json` snapshot and the journal meta tail so neither artifact can carry
-/// a credential value, whatever the client sent.
+/// Drop every pair whose key matches the secret denylist OR whose value
+/// carries credentials (a URL with userinfo). Shared by the `.json` snapshot
+/// and the journal meta tail so neither artifact can carry a credential
+/// value, whatever the client sent.
 fn scrub_secret_env(env: Option<&Vec<(String, String)>>) -> Option<Vec<(String, String)>> {
-    use crate::core::config::is_secret_key;
+    use crate::core::config::is_secret_env;
     env.map(|pairs| {
         pairs
             .iter()
-            .filter(|(k, _)| !is_secret_key(k))
+            .filter(|(k, v)| !is_secret_env(k, v))
             .cloned()
             .collect()
     })
@@ -1107,6 +1108,50 @@ mod tests {
             !env.iter().any(|(k, _)| k == "GH_TOKEN"),
             "secret key must be scrubbed from env pairs"
         );
+    }
+
+    #[test]
+    fn credential_url_values_never_reach_disk_whatever_the_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", None);
+        s.env = Some(vec![
+            ("PATH".into(), "/usr/bin".into()),
+            (
+                "DATABASE_URL".into(),
+                "postgres://app:hunter2@db/prod".into(),
+            ),
+            (
+                "SENTRY_DSN".into(),
+                "https://abc123dsnkey@o1.ingest.sentry.io/42".into(),
+            ),
+        ]);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        // Every file the save wrote (snapshot + journal) — none may carry the credential.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("hunter2"),
+                "credential URL leaked to {}",
+                path.display()
+            );
+            assert!(
+                !text.contains("abc123dsnkey"),
+                "DSN key leaked to {}",
+                path.display()
+            );
+        }
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        let env = loaded.env.as_ref().expect("env must round-trip");
+        assert!(
+            env.iter().any(|(k, _)| k == "PATH"),
+            "non-secret key must survive"
+        );
+        assert!(!env
+            .iter()
+            .any(|(k, _)| k == "DATABASE_URL" || k == "SENTRY_DSN"));
     }
 
     fn with_messages(n: usize) -> Session {

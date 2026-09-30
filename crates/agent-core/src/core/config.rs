@@ -896,6 +896,8 @@ pub struct SynapsConfig {
     pub theme_transition: ThemeTransitionMode,
     /// Whether the TUI paints its own opaque background. `false` preserves the terminal background.
     pub tui_background_opaque: bool,
+    /// Whether the prompt shows a glow sweeping across it while a turn streams. Default off.
+    pub tui_streaming_glow: bool,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
@@ -965,6 +967,7 @@ impl Default for SynapsConfig {
             theme: None,
             theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
+            tui_streaming_glow: false,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -1019,6 +1022,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "theme",
     "theme_transition",
     "tui_background_opaque",
+    "tui_streaming_glow",
     "agent_name",
     "identity",
     "disabled_plugins",
@@ -1457,6 +1461,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     }
                 )),
             },
+            "tui_streaming_glow" => match val {
+                "true" | "1" | "on" | "yes" => config.tui_streaming_glow = true,
+                "false" | "0" | "off" | "no" => config.tui_streaming_glow = false,
+                _ => config.warnings.push(format!(
+                    "tui_streaming_glow = {val} — expected on or off; using off"
+                )),
+            },
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
@@ -1803,6 +1814,44 @@ pub fn is_secret_key(key: &str) -> bool {
         || upper.contains("SECRET")
         || upper.contains("PASSWORD")
         || upper.contains("PASSWD")
+        || upper.ends_with("_PAT")
+        || upper.ends_with("_DSN")
+}
+
+/// Whether an env VALUE carries a credential regardless of its key name:
+/// any URL with userinfo (`scheme://user:pass@host`, `scheme://key@host`),
+/// anywhere in the value — `DATABASE_URL`, `HTTPS_PROXY`, a Sentry DSN or a
+/// JDBC option string all qualify. The key-name denylist alone missed these,
+/// so their credentials reached the daemon and the session files on disk.
+/// A username-only URL (`ssh://git@host/…`) is treated as a secret too:
+/// rare in an environment, and failing safe beats a guess.
+pub fn is_secret_env_value(value: &str) -> bool {
+    let mut rest = value;
+    while let Some(i) = rest.find("://") {
+        let scheme_ok = rest[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        let after = &rest[i + 3..];
+        // The authority ends at the path, query or fragment, or at a list /
+        // option separator when several URLs share one value.
+        let end = after
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | ',' | ';' | '"' | '\'') || c.is_whitespace()
+            })
+            .unwrap_or(after.len());
+        if scheme_ok && after[..end].rfind('@').is_some_and(|at| at > 0) {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Whether an env pair must never reach the daemon or disk: a secret key
+/// name OR a value carrying credentials (see [`is_secret_env_value`]).
+pub fn is_secret_env(key: &str, value: &str) -> bool {
+    is_secret_key(key) || is_secret_env_value(value)
 }
 
 /// Resolve the system prompt from CLI flag, config file, or default.
@@ -1838,6 +1887,51 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secret_env_value_detects_credential_urls() {
+        use super::is_secret_env_value as v;
+        // user:password in the authority
+        assert!(v("postgres://app:hunter2@db.internal:5432/prod"));
+        assert!(v("redis://:pw@cache:6379/0"));
+        assert!(v("http://user:pass@proxy.corp:3128"));
+        assert!(v(
+            "mongodb+srv://u:p@cluster0.example.net/db?retryWrites=true"
+        ));
+        // a key as the username, no password (Sentry DSN)
+        assert!(v("https://abc123def456@o1.ingest.sentry.io/42"));
+        // anywhere in the value, not only at the start; lists
+        assert!(v("-Dspring.datasource.url=jdbc:postgresql://u:p@h/db"));
+        assert!(v("redis://h1:6379,redis://u:p@h2:6379"));
+        // no userinfo → not a secret
+        assert!(!v("https://api.example.com/v1/items?q=a@b"));
+        assert!(!v("http://host/path/with@sign"));
+        assert!(!v("https://@host/empty-userinfo"));
+        assert!(!v("git@github.com:org/repo.git"));
+        assert!(!v("mailto:someone@example.com"));
+        assert!(!v("someone@example.com"));
+        assert!(!v("/usr/local/bin:/usr/bin"));
+        assert!(!v(""));
+    }
+
+    #[test]
+    fn secret_key_covers_pat_and_dsn() {
+        assert!(super::is_secret_key("GITHUB_PAT"));
+        assert!(super::is_secret_key("gh_pat"));
+        assert!(super::is_secret_key("SENTRY_DSN"));
+        assert!(!super::is_secret_key("PATH"));
+        assert!(!super::is_secret_key("PATTERN_DIR"));
+    }
+
+    #[test]
+    fn secret_env_is_key_or_value() {
+        assert!(super::is_secret_env(
+            "DATABASE_URL",
+            "postgres://app:hunter2@db/prod"
+        ));
+        assert!(super::is_secret_env("GH_TOKEN", "anything"));
+        assert!(!super::is_secret_env("DATABASE_URL", "postgres://db/prod"));
+        assert!(!super::is_secret_env("HOME", "/home/u"));
+    }
     #[test]
     fn startup_and_daemon_defaults() {
         let c = super::load_config_from_str("");
@@ -2099,6 +2193,22 @@ mod tests {
             assess_context(&config.context_management, &state, budget).action,
             ContextAction::Rollover
         );
+    }
+
+    #[test]
+    fn tui_streaming_glow_defaults_off_and_parses() {
+        assert!(!super::load_config_from_str("").tui_streaming_glow);
+        assert!(super::load_config_from_str("tui_streaming_glow = on\n").tui_streaming_glow);
+        assert!(!super::load_config_from_str("tui_streaming_glow = off\n").tui_streaming_glow);
+        let invalid = super::load_config_from_str("tui_streaming_glow = sparkly\n");
+        assert!(
+            !invalid.tui_streaming_glow,
+            "invalid keeps the default (off)"
+        );
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|w| w.contains("tui_streaming_glow")));
     }
 
     #[test]
@@ -2875,13 +2985,22 @@ context_window = 200k\n\
     }
 
     fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        // `base_dir()` reads SYNAPS_BASE_DIR before HOME: pin it too, or a value
+        // another test left set redirects the write away from `home`.
         let original = std::env::var("HOME").ok();
+        let original_base = std::env::var("SYNAPS_BASE_DIR").ok();
         std::env::set_var("HOME", home);
+        std::env::set_var("SYNAPS_BASE_DIR", home.join(".synaps-cli"));
         f();
         if let Some(h) = original {
             std::env::set_var("HOME", h);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(b) = original_base {
+            std::env::set_var("SYNAPS_BASE_DIR", b);
+        } else {
+            std::env::remove_var("SYNAPS_BASE_DIR");
         }
     }
 

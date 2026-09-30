@@ -183,6 +183,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 /// prepends the identical sentinel `cap_resumed_display` produced at
 /// 741b6b60 (same text, same position).
 pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app: &mut App) {
+    use agent_engine::engine::interrupt::interruption_label;
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
@@ -193,7 +194,12 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
     }
     for item in &tail.items {
         app.push_msg(match item {
-            DisplayItem::User { text } => ChatMessage::User(text.clone()),
+            // The interruption marker is history for the model, not something
+            // the user typed: show it as the aborted line it replaced.
+            DisplayItem::User { text } => match interruption_label(text) {
+                Some(label) => ChatMessage::Error(label.to_lowercase()),
+                None => ChatMessage::User(text.clone()),
+            },
             DisplayItem::Thinking { text } => ChatMessage::Thinking(text.clone()),
             DisplayItem::Text { text } => ChatMessage::Text(text.clone()),
             DisplayItem::ToolUse {

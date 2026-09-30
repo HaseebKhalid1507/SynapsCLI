@@ -75,6 +75,8 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 done: false,
                 duration_secs: None,
                 done_at: None,
+                tools: 0,
+                result: None,
             });
             app.invalidate();
         }
@@ -84,6 +86,13 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             ..
         }) => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+                // "⚙ <tool> (tool #N)" marks a new tool call.
+                if let Some((_, n)) = status
+                    .strip_prefix("\u{2699} ")
+                    .and_then(|rest| rest.rsplit_once(" (tool #"))
+                {
+                    sa.tools = n.trim_end_matches(')').parse().unwrap_or(sa.tools + 1);
+                }
                 sa.status = status;
             }
             app.invalidate();
@@ -106,6 +115,14 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 } else {
                     sa.status = format!("\u{2714} {}", preview);
                 }
+                // The tray shows the first real line of the result.
+                let first = result_preview
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with('#'))
+                    .unwrap_or("");
+                let first = first.strip_prefix("ERROR: ").unwrap_or(first);
+                sa.result = Some(first.chars().take(120).collect());
             }
             app.invalidate();
         }
@@ -403,7 +420,12 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::External(ev) => on_external(app, &ev),
         SessionEventWire::AutoTurnCapReached { cap } => on_auto_turn_cap(app, cap),
-        SessionEventWire::Idle => {}
+        SessionEventWire::Idle => {
+            // A Cancel that raced a normal finish gets no `Aborted`.
+            if app.status_text.as_deref() == Some(ABORTING_STATUS) {
+                app.status_text = None;
+            }
+        }
         SessionEventWire::Steered { text, delivered } => {
             if delivered {
                 app.push_msg(ChatMessage::System(format!("→ steering: {}", text)));
@@ -456,10 +478,13 @@ pub(super) async fn handle_session_event_arm(
             app.streaming = false;
             app.quit_guard.reset();
             app.subagents.clear();
-            // The actor decided (`TurnLog::abort_context`); the mirror's
-            // `abort_context` only lands with the `Conversation` that follows.
+            if app.status_text.as_deref() == Some(ABORTING_STATUS) {
+                app.status_text = None;
+            }
+            // `context_saved` (wire name kept): the interrupted turn's partial
+            // work stays in history; the `Conversation` that follows carries it.
             let abort_msg = if context_saved {
-                "aborted — context saved for next message"
+                "aborted — partial work kept"
             } else {
                 "aborted"
             };
@@ -524,7 +549,12 @@ pub(super) async fn handle_session_event_arm(
             app.compacting = false;
             app.invalidate();
         }
-        SessionEventWire::SubagentRows(rows) => app.subagent_rows = rows,
+        SessionEventWire::SubagentRows(rows) => {
+            if apply_subagent_progress(&mut app.subagents, &rows) {
+                app.invalidate();
+            }
+            app.subagent_rows = rows;
+        }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
             if from == Some(me) && to != Some(me) {
@@ -657,8 +687,46 @@ fn sanitize_notice(text: &str) -> String {
 }
 
 // ── Flash expiry constant ──────────────────────────────────────────────────────
+/// Copy each running worker's live progress (step + tool count) from fresh
+/// registry rows into its HUD entry. Called when rows ARRIVE, never from the
+/// periodic reconcile: rows emitted at time T reflect every progress write
+/// before T, so a just-received row is never older than an update the
+/// stream already delivered, while the cached rows the 1 Hz reconcile reads
+/// can be. This is how a background worker (`subagent_start`) keeps moving
+/// in the tray after the turn that started it has ended (its
+/// `SubagentUpdate` events rode that turn's stream). Done, cancelling, and
+/// not-yet-updated entries are left alone. Returns true if anything changed.
+pub(super) fn apply_subagent_progress(
+    hud: &mut [SubagentState],
+    rows: &[synaps_cli::tools::SubagentDisplayRow],
+) -> bool {
+    use synaps_cli::runtime::subagent::SubagentStatus;
+    let mut changed = false;
+    for row in rows {
+        if !matches!(row.status, SubagentStatus::Running) || row.cancel_requested {
+            continue;
+        }
+        let Some(sa) = hud.iter_mut().find(|s| s.id == row.subagent_id && !s.done) else {
+            continue;
+        };
+        if !row.step.is_empty() && sa.status != row.step {
+            sa.status = row.step.clone();
+            changed = true;
+        }
+        if sa.tools != row.tools {
+            sa.tools = row.tools;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// How long a done entry stays visible before reconcile removes it.
 pub(super) const SUBAGENT_DONE_FLASH_SECS: f64 = 5.0;
+
+/// Status line between Esc and the actor's `Aborted` (it drains the
+/// cancelled stream first, bounded by `budgets::CANCEL_DRAIN_TIMEOUT`).
+pub(super) const ABORTING_STATUS: &str = "aborting…";
 
 /// Pure reconcile: align the HUD Vec<SubagentState> with the registry snapshot.
 ///
@@ -763,6 +831,8 @@ pub(super) fn reconcile_subagents(
                 done: false,
                 duration_secs: None,
                 done_at: None,
+                tools: 0,
+                result: None,
             });
         }
     }
@@ -791,7 +861,7 @@ mod tests {
 #[cfg(test)]
 mod reconcile_tests {
     use super::super::app::SubagentState;
-    use super::{reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
+    use super::{apply_subagent_progress, reconcile_subagents, SUBAGENT_DONE_FLASH_SECS};
     use std::time::{Duration, Instant};
     use synaps_cli::runtime::subagent::SubagentStatus;
     use synaps_cli::tools::SubagentDisplayRow;
@@ -804,6 +874,8 @@ mod reconcile_tests {
             cancel_requested,
             elapsed_secs: 1.5,
             finished_elapsed: None,
+            step: String::new(),
+            tools: 0,
         }
     }
 
@@ -820,7 +892,44 @@ mod reconcile_tests {
             done,
             duration_secs: if done { Some(1.5) } else { None },
             done_at: if done { Some(Instant::now()) } else { None },
+            tools: 0,
+            result: None,
         }
+    }
+
+    /// Fresh rows move a running entry's step and tool count; done,
+    /// cancelling, unknown and not-yet-updated entries are left alone.
+    #[test]
+    fn progress_from_rows_moves_running_entries_only() {
+        let mut hud = vec![
+            make_hud_entry(1, false),
+            make_hud_entry(2, true),
+            make_hud_entry(3, false),
+        ];
+        hud[2].status = "starting: task".into();
+        let mut running = make_row(1, SubagentStatus::Running, false);
+        running.step = "$ sleep 20".into();
+        running.tools = 1;
+        let mut done = make_row(2, SubagentStatus::Completed, false);
+        done.step = "stale".into();
+        let quiet = make_row(3, SubagentStatus::Running, false); // no update yet
+        let mut cancelling = make_row(4, SubagentStatus::Running, true);
+        cancelling.step = "x".into();
+
+        assert!(apply_subagent_progress(
+            &mut hud,
+            &[running.clone(), done, quiet, cancelling]
+        ));
+        assert_eq!((hud[0].status.as_str(), hud[0].tools), ("$ sleep 20", 1));
+        assert_eq!(hud[1].status, "\u{2714} done", "done entry untouched");
+        assert_eq!(
+            hud[2].status, "starting: task",
+            "empty step keeps the placeholder"
+        );
+        assert!(
+            !apply_subagent_progress(&mut hud, &[running]),
+            "unchanged → false"
+        );
     }
 
     // R1: idle-finish — Running in HUD, terminal in registry → marked done

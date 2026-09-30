@@ -281,6 +281,7 @@ impl Tool for SubagentResumeTool {
                                 let Some(event) = event else { break };
                                 match event {
                                     crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
+                                        state_a.write().unwrap().note_progress("💭 thinking...", tool_count);
                                         if let Some(ref tx) = tx_events_a {
                                             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                                 subagent_id,
@@ -298,12 +299,14 @@ impl Tool for SubagentResumeTool {
                                         s.partial_text.truncate(response_baseline.0);
                                         s.tool_log.truncate(response_baseline.1);
                                         tool_count = response_baseline.2;
+                                        s.tools = tool_count;
                                     }
                                     crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                         state_a.write().unwrap().partial_text.push_str(&text);
                                     }
                                     crate::StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
                                         tool_count += 1;
+                                        state_a.write().unwrap().note_progress(&format!("⚙ {} (tool #{})", name, tool_count), tool_count);
                                         if let Some(ref tx) = tx_events_a {
                                             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                                 subagent_id,
@@ -337,6 +340,7 @@ impl Tool for SubagentResumeTool {
                                                 }
                                             }
                                         };
+                                        state_a.write().unwrap().note_progress(&detail, tool_count);
                                         if let Some(ref tx) = tx_events_a {
                                             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                                 subagent_id,

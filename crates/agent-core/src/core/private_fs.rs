@@ -291,6 +291,97 @@ mod tests {
         ensure_private_dir(&dir).unwrap();
         assert_eq!(mode_of(&dir), 0o700);
     }
+
+    /// Restores a directory's mode on drop so TempDir cleanup can list it.
+    struct ModeGuard(std::path::PathBuf);
+    impl ModeGuard {
+        fn set(path: &Path, mode: u32) -> Self {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Self(path.to_path_buf())
+        }
+    }
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Root bypasses DAC, so permission-shaped tests prove nothing as root.
+    fn dac_enforced() -> bool {
+        unsafe { libc::geteuid() != 0 }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_walks_through_traverse_only_ancestor() {
+        if !dac_enforced() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let gate = root.join("gate"); // like a 0711 multi-tenant `instances/`
+        std::fs::create_dir_all(gate.join("inner")).unwrap();
+        let _g = ModeGuard::set(&gate, 0o111);
+        assert!(std::fs::read_dir(&gate).is_err(), "precondition: gate unreadable");
+
+        let sessions = gate.join("inner/sessions");
+        let handle = ConfinedDir::create_absolute_no_symlinks(&sessions).unwrap();
+        handle.write_atomic("s.json", b"{}").unwrap();
+        assert_eq!(std::fs::read(sessions.join("s.json")).unwrap(), b"{}");
+        assert_eq!(mode_of(&sessions), 0o700);
+        // Durable variant: nothing is created INSIDE the unreadable gate, so the
+        // walk only needs to sync readable parents.
+        ConfinedDir::create_absolute_no_symlinks_durable(&gate.join("inner/durable")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn traverse_only_fallback_still_refuses_symlinks() {
+        if !dac_enforced() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let victim = root.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let gate = root.join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        std::os::unix::fs::symlink(&victim, gate.join("link")).unwrap();
+        let _g = ModeGuard::set(&gate, 0o111);
+        assert!(ConfinedDir::create_absolute_no_symlinks(&gate.join("link/sessions")).is_err());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_refuses_to_create_inside_unreadable_dir() {
+        if !dac_enforced() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let gate = root.join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        let _g = ModeGuard::set(&gate, 0o311); // writable + searchable, not readable
+        let err = ConfinedDir::create_absolute_no_symlinks_durable(&gate.join("new/sessions"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // Non-durable callers may still create there.
+        ConfinedDir::create_absolute_no_symlinks(&gate.join("other/sessions")).unwrap();
+    }
+
+    #[test]
+    fn unreadable_leaf_is_still_refused() {
+        if !dac_enforced() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let leaf = root.join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        let _g = ModeGuard::set(&leaf, 0o111);
+        assert!(ConfinedDir::create_absolute_no_symlinks(&leaf).is_err());
+    }
 }
 
 // ─── CP-13 fix2: directory-handle-relative confined creation ─────────────────
@@ -388,10 +479,25 @@ impl ConfinedDir {
 
     fn create_absolute_no_symlinks_impl(path: &Path, durable: bool) -> std::io::Result<Self> {
         let components = absolute_real_components(path)?;
+        let last = components.len().saturating_sub(1);
         let mut dir = Self::open_dir_nofollow_at_path(Path::new("/"))?;
-        for component in &components {
-            let next = match dir.open_child_dir_nofollow(component) {
-                Ok(next) => next,
+        // `dir` was reached through a traverse-only ancestor fallback: it is an
+        // `O_PATH` handle, valid as a `*at` dirfd but not readable/syncable.
+        let mut dir_path_only = false;
+        for (i, component) in components.iter().enumerate() {
+            let mut created = false;
+            let (next, next_path_only) = match dir.open_child_dir_nofollow(component) {
+                Ok(next) => (next, false),
+                // A traverse-only ANCESTOR (e.g. 0711, as multi-tenant layouts use
+                // to hide sibling names): descending needs only search
+                // permission, but `O_RDONLY` also demands read. Descend with
+                // `O_PATH | O_DIRECTORY | O_NOFOLLOW` instead — still handle-
+                // relative and still symlink-refusing (a symlink is not a
+                // directory → ENOTDIR). The LEAF must stay a real handle
+                // (fchmod/sync/file ops), so it never takes this path.
+                Err(e) if i < last && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    (dir.open_child_dir_path_only(component)?, true)
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     let c_name = validated_component_cstring(component)?;
                     let rc = unsafe { libc::mkdirat(dir.fd(), c_name.as_ptr(), 0o700) };
@@ -401,14 +507,28 @@ impl ConfinedDir {
                             return Err(err);
                         }
                     }
-                    dir.open_child_dir_nofollow(component)?
+                    created = true;
+                    (dir.open_child_dir_nofollow(component)?, false)
                 }
                 Err(e) => return Err(e),
             };
             if durable {
-                dir.sync_all()?;
+                if dir_path_only {
+                    // An O_PATH handle cannot be fsync'ed. Syncing an ancestor we
+                    // did not modify buys nothing, but a NEW entry in an
+                    // unreadable directory cannot be made durable: refuse.
+                    if created {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("{component:?}: cannot durably create inside an unreadable directory"),
+                        ));
+                    }
+                } else {
+                    dir.sync_all()?;
+                }
             }
             dir = next;
+            dir_path_only = next_path_only;
         }
         dir.fchmod_private()?;
         Ok(dir)
@@ -438,6 +558,41 @@ impl ConfinedDir {
         Ok(Self {
             handle: unsafe { File::from_raw_fd(fd) },
         })
+    }
+
+    /// Open one existing DIRECT child directory for TRAVERSAL only:
+    /// `O_PATH | O_DIRECTORY | O_NOFOLLOW` needs search permission on the
+    /// parent chain but not read on the child, and still refuses a symlinked
+    /// component (a symlink is not a directory → `ENOTDIR`). The handle is a
+    /// valid `*at` dirfd but cannot be read, fsync'ed or fchmod'ed — callers
+    /// use it only to descend.
+    #[cfg(target_os = "linux")]
+    fn open_child_dir_path_only(&self, name: &str) -> std::io::Result<Self> {
+        let c_name = validated_component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                c_name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(confinement_error(name, &err));
+        }
+        use std::os::unix::io::FromRawFd;
+        Ok(Self {
+            handle: unsafe { File::from_raw_fd(fd) },
+        })
+    }
+
+    /// No `O_PATH` here: a traverse-only ancestor stays a permission error.
+    #[cfg(not(target_os = "linux"))]
+    fn open_child_dir_path_only(&self, name: &str) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{name:?}: directory is not readable"),
+        ))
     }
 
     fn open_dir_nofollow_at_path(path: &Path) -> std::io::Result<Self> {

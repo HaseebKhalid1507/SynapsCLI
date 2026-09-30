@@ -281,6 +281,30 @@ impl TestHarness {
         self.terminal.backend().buffer()
     }
 
+    /// Render one frame with a boot effect in flight, exactly as the render
+    /// thread passes it to `render_frame_into`. Regression hook for the
+    /// idle-redraw bug: the frame body must never consume the boot effect —
+    /// the render thread's done-check owns clearing it (and signals
+    /// `boot_done`).
+    pub fn render_with_boot_fx(
+        &mut self,
+        boot_fx: &mut Option<tachyonfx::Effect>,
+        elapsed: std::time::Duration,
+    ) {
+        let (model, patch) = build_render_model(
+            &mut super::view_model::ViewInputs::from_app(&mut self.app),
+            &**self.link.view(),
+            &self.registry,
+            self.size,
+        )
+        .expect("build_render_model returned None — gamba never runs headless");
+        patch.apply(&mut self.app);
+        let mut exit_fx = None;
+        self.terminal
+            .draw(|frame| render_frame_into(frame, &model, boot_fx, &mut exit_fx, elapsed))
+            .expect("TestBackend draw is infallible");
+    }
+
     /// Render one frame through `CrosstermBackend<Vec<u8>>` and return the
     /// raw ANSI byte stream (P5 spike).
     ///
@@ -364,6 +388,14 @@ impl TestHarness {
         self.app.input_text()
     }
 
+    /// Whether the neon prompt currently wants animation frames — the term it
+    /// contributes to the main loop's tick guard.
+    pub fn prompt_animating(&self) -> bool {
+        self.app
+            .prompt_clock
+            .animating(self.app.clock.now(), self.app.streaming)
+    }
+
     /// Whether a `Quit` action was dispatched (the real loop would start the
     /// exit animation and tear down).
     pub fn quit_requested(&self) -> bool {
@@ -386,6 +418,18 @@ impl TestHarness {
 
     /// Seed a raw-markdown assistant `Text` message. Used by the P10
     /// copy-fidelity pins, which need known markdown source in the transcript.
+    /// Seed a user turn into the transcript.
+    pub fn push_user_message(&mut self, text: &str) -> &mut Self {
+        self.app.push_msg(ChatMessage::User(text.to_string()));
+        self
+    }
+
+    /// Seed a thinking block into the transcript.
+    pub fn push_thinking_message(&mut self, text: &str) -> &mut Self {
+        self.app.push_msg(ChatMessage::Thinking(text.to_string()));
+        self
+    }
+
     pub fn push_text_message(&mut self, text: &str) -> &mut Self {
         self.app.push_msg(ChatMessage::Text(text.to_string()));
         self

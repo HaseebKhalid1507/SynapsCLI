@@ -20,8 +20,8 @@
 //! | steer_mid_stream                  | Steer lands mid-stream (paced SSE) → SteeringDelivered position, 2nd     | delivered=false / auto-send (unreachable       |
 //! |                                   | round, api_messages, saves                                               | deterministically — ext header #2)             |
 //! | event_injection_busy_steered      | inject via real UDS mid-stream → Steered disposition, api_messages, saves| Buffered disposition (ext header #3)           |
-//! | cancel_captures_abort_context     | abort_context text equal, save at abort, Dequeued of a queued steer,     | partial ToolResultDelta fold (ext header #1)   |
-//! |                                   | next Submit's request body (fold) equal, file abort_context equal        |                                                |
+//! | cancel_keeps_real_history_…       | RETIRED byte-identity: the oracle's recap fold is the removed behaviour. | history/journal equality (diverge by design)   |
+//! |                                   | Dequeue, saves, 1st request equal; divergence pinned both ways           |                                                |
 //! | secret_prompt_roundtrip           | Some(handle) on both sides; tool result equal; actor replay to a 2nd     |                                                |
 //! |                                   | client carries no Answer/value; saves                                    |                                                |
 //!
@@ -755,9 +755,22 @@ async fn event_injection_busy_steered() {
     a.end().await;
 }
 
+/// RETIRED as a byte-identity scenario. The frozen oracle (sha-pinned,
+/// never edited) folds an "ABORT CONTEXT" recap of the model's own partial
+/// output into the NEXT user message — exactly the behaviour removed here,
+/// because current models refuse a user turn impersonating their output as
+/// a prompt injection. The actor now keeps the interrupted turn as REAL
+/// history plus one interruption marker (`engine::interrupt`).
+///
+/// Still asserted equal: the dequeue of an undelivered steer, one save per
+/// abort (oracle logical == sampled oracle == sampled actor), and the first
+/// request. Pinned as an intentional divergence: the oracle's second
+/// request folds the recap; the actor's re-sends the partial reply as an
+/// assistant message and appends marker + prompt, extending (never
+/// rewriting) the first request's messages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn cancel_captures_abort_context() {
+async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
     let guard = HomeGuard::new();
     let (url, _hits, bodies) = spawn_stub(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -792,30 +805,50 @@ async fn cancel_captures_abort_context() {
     a.t.send(SessionCommand::Cancel).await.unwrap();
     a.until(|e| matches!(e, SessionEventWire::Idle)).await;
     assert_eq!(a.dequeued, vec!["queued-then-dropped".to_string()]);
-    assert_eq!(a.abort_context.as_deref(), Some(o_ctx.as_str()));
+    assert!(a.abort_context.is_none(), "no recap on the actor side");
     a.submit("second").await;
     a.until(is_text).await;
     a.t.send(SessionCommand::Cancel).await.unwrap();
     a.until(|e| matches!(e, SessionEventWire::Idle)).await;
 
-    // Both saw exactly the prefix events per turn (Endless never terminates).
-    assert_eq!(normalise(&o.r.seen), normalise(&a.seen));
-    assert_eq!(o.r.abort_context, a.abort_context, "second abort context");
-    // The fold: the second request's messages (captured at the stub) are
-    // identical — oracle = hit 1, actor = hit 3.
+    let marker = synaps_cli::engine::interrupt::InterruptReason::User.marker();
     {
-    let bodies = bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 4);
-    let msgs = |i: usize| -> serde_json::Value {
-        serde_json::from_slice::<serde_json::Value>(&bodies[i]).unwrap()["messages"].clone()
-    };
-    assert_eq!(msgs(1), msgs(3), "abort-context fold differs");
-    assert!(msgs(1)[0].to_string().contains("ABORT CONTEXT"), "{}", msgs(1)[0]);
-    assert_eq!(o.r.api_messages.len(), a.api_messages.len());
-    assert_eq!(msgs_json(&o.r.api_messages), msgs_json(&a.api_messages));
-    assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
-    assert_eq!(o.saves, 2, "one save per abort (dispatch.rs:191)");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        let msgs = |i: usize| -> serde_json::Value {
+            serde_json::from_slice::<serde_json::Value>(&bodies[i]).unwrap()["messages"].clone()
+        };
+        // First requests: identical on both sides.
+        assert_eq!(msgs(0), msgs(2), "first request differs");
+        // Oracle (hit 1) folds the recap — the removed behaviour.
+        assert!(msgs(1)[0].to_string().contains("ABORT CONTEXT"), "{}", msgs(1)[0]);
+        // Actor (hit 3): first prompt unchanged, then the REAL partial reply,
+        // then marker + new prompt (merged into one user turn on the wire).
+        let a2 = msgs(3);
+        assert!(!a2.to_string().contains("ABORT CONTEXT"), "{a2}");
+        assert_eq!(a2.as_array().unwrap().len(), 3, "{a2:#}");
+        assert_eq!(a2[0]["content"], "first");
+        assert_eq!(a2[1]["role"], "assistant");
+        assert_eq!(a2[1]["content"][0]["text"], "partial");
+        assert_eq!(a2[2]["content"][0]["text"], marker);
+        assert_eq!(a2[2]["content"][1]["text"], "second");
     }
+    // Final actor history: both interrupted turns kept, each marked.
+    let texts: Vec<String> = a
+        .api_messages
+        .iter()
+        .map(|m| match &m["content"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => other[0]["text"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+    assert_eq!(texts, ["first", "partial", marker, "second", "partial", marker]);
+    // Saves, per turn on both sides: the engine's prompt checkpoint (round
+    // boundary before the first request) + one at abort (dispatch.rs:191).
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(o.saves, 4, "prompt checkpoint + abort, per turn");
+    assert_eq!(o.saves, o_s.count(), "sampler self-check");
+    assert_eq!(o_s.count(), a_s.count(), "save count differs (oracle vs actor)");
     a.end().await;
 }
 

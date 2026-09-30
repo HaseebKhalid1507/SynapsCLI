@@ -562,11 +562,13 @@ pub fn parse_anthropic_catalog_models(body: &str) -> Result<Vec<CatalogModel>, s
 /// Conservative exact static fallback descriptors for the source-controlled
 /// known-model list (`agent_core::models::KNOWN_MODELS`). Exact ids only —
 /// never substring-based. Evidence: adaptive-thinking notes in
-/// `crates/agent-core/src/core/models.rs` (Opus 4.7+ / Fable 5 adaptive+effort;
-/// Sonnet 4.6, Opus 4.6, Haiku 4.5 fixed-budget thinking).
+/// `crates/agent-core/src/core/models.rs` (Opus 4.7+ / Opus 5.5 / Fable 5
+/// adaptive+effort; Sonnet 4.6, Opus 4.6, Haiku 4.5 fixed-budget thinking).
+/// Max/UltraCode are NOT implied here — they stay locked to the dedicated
+/// mode manifest (`anthropic_mode_capabilities`).
 pub fn anthropic_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     match model_id {
-        "claude-opus-4-7" | "claude-fable-5" | "claude-fable-5-1" => {
+        "claude-opus-5-5" | "claude-opus-4-7" | "claude-fable-5" | "claude-fable-5-1" => {
             Some(ReasoningSupport::AnthropicAdaptive { adaptive: true })
         }
         "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-haiku-4-5-20251001" => {
@@ -646,6 +648,9 @@ mod tests {
         for denied in [
             "anthropic/claude-fable-5-preview",
             "anthropic/claude-opus-4-7",
+            // Opus 5.5 is a known native model (adaptive effort, vision) but
+            // has no evidence-backed Max/UltraCode row yet.
+            "anthropic/claude-opus-5-5",
             "openai/claude-fable-5",
             "claude-fable-5",
             "anthropic/fable-5",
@@ -807,7 +812,7 @@ mod tests {
 
     #[test]
     fn static_capability_covers_exact_known_models_only() {
-        for id in ["claude-opus-4-7", "claude-fable-5"] {
+        for id in ["claude-opus-5-5", "claude-opus-4-7", "claude-fable-5"] {
             assert_eq!(
                 anthropic_static_capability(id),
                 Some(ReasoningSupport::AnthropicAdaptive { adaptive: true }),
@@ -830,6 +835,9 @@ mod tests {
             "claude-opus-4-7-preview",
             "claude-haiku-4-5",
             "opus-4-7",
+            "claude-opus-5.5",
+            "claude-opus-5-5-preview",
+            "opus-5-5",
             "",
         ] {
             assert_eq!(anthropic_static_capability(id), None, "{id}");

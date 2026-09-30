@@ -138,7 +138,7 @@ C: bye | socket close = Detach (turn keeps running)
 - `WireSessionEvent` mirrors `SessionEventWire` variant-for-variant (`StreamEvent`/`TurnError`/
   `ExtensionLoaderEvent` included; round-trip test covers every variant), with **one lossy variant**:
   `Conversation` goes over the wire as a `ConversationDigest` `{messages_len, messages_hash (FNV-1a),
-  tokens, cost, abort_context, queued_message, pending_events_len, consecutive_auto_turns}` — never the
+  tokens, cost, abort_context (legacy, always null), queued_message, pending_events_len, consecutive_auto_turns}` — never the
   messages. Full `api_messages` travel only in `Attached` and `QueryResult{Messages}`. `SocketTransport`
   keeps a local mirror (seeded by `Attached`, updated by `Stream(MessageHistory)`), fills the digest in
   when the hash matches, and on a miss (compaction, abort repair, flushed events) issues one
@@ -213,12 +213,41 @@ C: bye | socket close = Detach (turn keeps running)
 - **Compaction is inline in the actor**: `Attach`/`Detach`/`Cancel` wait behind a running `compact()`;
   `SocketTransport::attach` gives up after `ATTACH_TIMEOUT` (5 s) with "attach timed out" — retry.
   Spawned compaction is day 2.
-- **Quit mid-turn saves an abort context — default path, every host.** `End{ClientQuit}` (chat's
-  stdin EOF / `/quit`, the in-process TUI's quit — never `synaps attach`, which only detaches) and `daemon stop` while a turn
-  is streaming run `finish()` → `cancel_turn()`: the turn is cancelled **and** the partial output is
-  captured as `abort_context` and saved, so the next `--continue` prepends `[ABORT CONTEXT…]` — where the
-  pre-actor TUI/chat only cancelled the token. Defensible (the model is told the previous answer was cut);
-  `/clear` or a fresh session discards it. Documented in `synaps chat /help` too.
+- **An interrupted turn is kept as real history — every cancel path, every host.** Esc/`Cancel`,
+  `End{ClientQuit}` (chat's stdin EOF / `/quit`, the in-process TUI's quit — never `synaps attach`, which
+  only detaches), `daemon stop`, a reload `Checkpoint` and the session cost cap all run `cancel_turn()`:
+  the token is cancelled, pending prompts are answered `None`, and the still-live stream is drained
+  (bounded by `budgets::CANCEL_DRAIN_TIMEOUT`, 1 s) so the engine's cancel-path history — the partial
+  assistant message (text, signed thinking, completed tool calls), every completed tool round,
+  delivered steering, a labelled canceled `tool_result` for any unfinished call — plus the final
+  `Usage` and any in-flight context-head checkpoint reach the actor. That history is adopted verbatim
+  and ONE interruption marker is appended (`engine::interrupt`: `[Request interrupted by user]`, or
+  the cost-cap / restart / host variant). Nothing already sent is edited, so the provider's cached
+  prefix survives and the next request extends it. This replaces the old `abort_context` recap, which
+  re-described the model's own output inside the next user message and which current models refuse
+  as a prompt injection. Sessions saved with a recap are migrated on load (recap dropped, marker
+  appended). Documented in `synaps chat /help` too.
+- **The session on disk follows a running turn.** The engine publishes the conversation at every
+  round boundary — the prompt before the first request, each completed tool round (every
+  `tool_use` paired with its `tool_result`), rollover heads — and the actor saves each one (bounded
+  by `SAVE_TIMEOUT`, ordered by `session_save_order`). A crash / `kill -9` / power loss mid-turn
+  loses at most the round in flight, and what is on disk is always a valid history to resume from.
+  Cost: one save per round (≈1 ms for a 2.3 MB session in `json` mode, which rewrites the file;
+  `session_persistence = journal` appends only the new messages). Attach replays carry no per-round
+  `MessageHistory`: the snapshot already holds the latest history.
+- **A turn cut off by a crash is recovered on the next load.** While a turn runs, the actor keeps
+  a small draft `sessions/<id>.turn` (`agent_core::core::session_draft`): the text of the response
+  in flight plus the history length it continues from — written at turn start, at most once per
+  1 Hz turn tick while text streams, removed when the turn ends (ordered, non-blocking writes;
+  0600, confined, atomic; O(partial text) in either persistence mode). A draft found on load
+  (`--continue`, daemon create/unpark, `/resume` — which now takes the session lock like
+  `NewSession`) means the process died mid-turn: the partial text is appended as a real assistant
+  message (text only, like a cancel) followed by `[Request interrupted: Synaps stopped
+  unexpectedly]`, saved, then the draft is removed. A leftover draft of a turn that actually
+  concluded (history already ends with the model's final reply or an interruption marker) is just
+  removed; a stale one (its round already committed) contributes no text. Recovery only ever
+  appends, so the cached prefix is untouched. Written by the session actor (TUI, chat, daemon,
+  attach); rpc / server / legacy chat save every round but keep no draft.
 - Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
@@ -273,8 +302,8 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    first start — not `/proc/self/exe`, which reads "(deleted)" after an in-place rebuild) or `--exe`.
 2. **Drain**: `Attach::Create` → `Refused{Busy}`, `Submit`/`SubmitPrepared`/`Compact` → `Error("daemon
    reloading; retry in a moment")`; wait ≤ `--drain-secs` for every session to be idle; then
-   `Checkpoint{Reload}` every session concurrently (≤ `SAVE_TIMEOUT`+1 s each): cancel with abort context,
-   answer prompts `None`, save, close PTYs, notice.
+   `Checkpoint{Reload}` every session concurrently (≤ `CHECKPOINT_BUDGET` each): cancel (partial history
+   kept + restart marker), answer prompts `None`, save, close PTYs, notice.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
    (continue_session = journal_id, cwd, model), keep_warm, lifecycle}`.
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
@@ -296,9 +325,9 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    `reconnect(mode)` backs off, sends `Hello{reconnect_of}` and `Attach::Existing{id, Takeover iff
    was_owner else mode}` — two reconnecting mirrors cannot both take over.
 
-**Not preserved** (stated once): in-flight turns (checkpointed = cancelled with abort context), pending
-prompts (`None`), PTY/background shells (closed, announced before exec), `turn_replay`, un-persisted
-`TurnLog`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
+**Not preserved** (stated once): in-flight turns (checkpointed = cancelled; partial history + restart
+marker kept), pending prompts (`None`), PTY/background shells (closed, announced before exec),
+`turn_replay`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
 image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
 LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
@@ -316,7 +345,7 @@ in its metadata. Attach is refused with a message naming the lock holder's pid a
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
 owner again, second turn works; older `--exe` refused with the daemon still serving; a turn in flight is
-checkpointed and its abort context comes back from the journal; `/model` + `/context` + `/system` +
+checkpointed and its partial history + restart marker come back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
 
@@ -337,8 +366,18 @@ thing: the daemon itself.
 1. **Client captures env at Hello.** `Hello::new()` calls `capture_client_env()`
    which snapshots `std::env::vars()`, sorts by key, and strips:
    - Client-only prefixes: `SYNAPS_CLIENT_*`, `SYNAPS_TUI_*`, `SYNAPS_DAEMON_*`, `SYNAPS_MEM_TRACE*`
-   - Secrets (case-insensitive): `*_API_KEY`, `*_TOKEN`, `*_SECRET*`, `*PASSWORD*`,
-     `AWS_SECRET_*`, `*_CREDENTIALS`
+   - Secret **names** (case-insensitive, `config::is_secret_key`): `*_KEY` (so `*_API_KEY`),
+     `*_TOKEN`, `*_CREDENTIALS`, `*_PAT`, `*_DSN`, `*SECRET*`, `*PASSWORD*`, `*PASSWD*`.
+     Suffix-anchored where it says so: `SSH_KEY_PATH` and `API_TOKEN_TTL_SECS` are kept.
+   - Secret **values**, whatever the key is called (`config::is_secret_env_value`): any URL
+     with userinfo, anywhere in the value — `scheme://user:pass@host` or `scheme://key@host`
+     (`DATABASE_URL=postgres://u:p@h`, an authenticated `HTTPS_PROXY`, a Sentry DSN, a JDBC
+     option string, a list of URLs). A username-only URL (`ssh://git@host`) counts too.
+   - Stripped secrets are recorded **by name** in `env_stripped`; their values go nowhere.
+     Consequence: the session's tools do not see them. A command that fails while
+     referencing one gets the notice below; an authenticated `HTTPS_PROXY` is used
+     implicitly by curl/git, so it fails without one. For a workflow that needs a secret
+     in the agent's shell, run in-process (`SYNAPS_DAEMON=0`).
 2. **Daemon copies `hello.env` → `config.env` on `Attach::Create` only.**
    Attaching to an existing session never changes its env (creator's env is final).
 3. **`SessionConfig.env` → `Runtime.env` → `ToolCapabilities.env`** — same pipe as cwd.
@@ -407,8 +446,9 @@ env on `--continue` is written back so the next restart sees the latest.
 3. The daemon's own process env is **never** used for a daemon-hosted session.
 
 **Belt-and-braces:** the journal-side write runs every env pair through
-`is_secret_key` — a value for a denylisted key is dropped even if a future
-client forgets to strip.  The `env_stripped` list records **names only**.
+`is_secret_env` — the name denylist **or** a credential-carrying value — so a
+secret is dropped even if a future client forgets to strip. The `env_stripped`
+list records **names only**.
 
 **Loud notices:** when a bash command exits non-zero AND the script text
 references a name from `env_stripped` as a whole identifier (`$NAME`,
@@ -427,12 +467,12 @@ Honest list of behaviour changes on this branch on the plain in-process path (`s
    (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the
    inline engine halves (not a verbatim copy; it has no abort/prompt/save) on **three scenarios only**:
    plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
-   queue-while-busy, cancel/abort-context, secret-prompt round-trip are asserted by actor unit tests, not
-   by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
+   queue-while-busy, cancel (history + marker), secret-prompt round-trip are asserted by actor unit
+   tests, not by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
    stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
-   One byte-level difference: **chat's abort context is now `"{ctx}\n\n{msg}"` (context first, wrapper
-   applied once — the TUI shape)** where inline chat built `"{msg}\n\n[ABORT CONTEXT…{ctx}…]"` and
-   re-wrapped; only visible on `synaps chat --continue` of an aborted session.
+   Cancel diverges from the frozen oracle by design: the oracle folds an `ABORT CONTEXT` recap into the
+   next user message; the actor keeps the interrupted turn as history plus an interruption marker
+   (`cancel_keeps_real_history_where_the_oracle_folded_a_recap` pins both sides).
 2. **MCP descriptor cache write-back is ON by default, in-process too** (`docs/mcp.md`): after the first
    `tools/list` on an exact lease the listing is written to `~/.synaps-cli/mcp-descriptors.json`, so the
    *next* boot registers dormant MCP tools it did not know before → tool list, system prompt and the
@@ -442,8 +482,9 @@ Honest list of behaviour changes on this branch on the plain in-process path (`s
 3. Hook events carry `session_id` (additive; `SYNAPS_HOOK_SESSION_ID=0`).
 4. **`synaps chat` renders typed events**: `/compact` prints `compacting...`, the disclosure line and
    `[compacted → ~N tokens]` (one each — the actor emits `CompactionStarted/Applied/Failed/Cancelled`,
-   never a "compacting..." notice); `/abort`-equivalents render `Aborted{context_saved}`, `/clear` renders
-   `Cleared{session_id}`. Quit mid-turn saves an abort context (§Lifecycle above).
+   never a "compacting..." notice); `/abort`-equivalents render `Aborted{context_saved}` (now: partial
+   work kept), `/clear` renders `Cleared{session_id}`. Quit mid-turn keeps the partial turn in history
+   (§Lifecycle above).
 
 ## Memory acceptance — `DAEMON=1 SYNAPS_DAEMON=1 scripts/memprof/bench-sessions.sh BIN 1 2 3`
 

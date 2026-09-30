@@ -421,7 +421,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 biased;
                 r = rx.recv() => r,
                 // C3: reload announced — the checkpoint's events (abort
-                // notice, Conversation with abort_context) are already in
+                // notice, Conversation with the kept partial history) are already in
                 // the broadcast; drain what is there, then stop.
                 _ = fwd_announce.cancelled() => {
                     while let Ok(env) = rx.try_recv() {

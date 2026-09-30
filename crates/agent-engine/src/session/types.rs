@@ -61,12 +61,24 @@ const ENV_STRIP_PREFIXES: &[&str] = &[
 /// The stripped names are ONLY the secrets (not `SYNAPS_*` prefixes, those are noise).
 /// Used by thin clients before `Hello`.
 pub fn capture_client_env() -> (SessionEnv, Vec<String>) {
+    strip_client_env(std::env::vars())
+}
+
+/// The pure part of [`capture_client_env`]: filter `vars` (unit-testable
+/// without touching the process environment).
+pub fn strip_client_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> (SessionEnv, Vec<String>) {
     let mut env: SessionEnv = Vec::new();
     let mut stripped: Vec<String> = Vec::new();
-    for (k, v) in std::env::vars() {
-        if should_strip_env(&k) {
+    for (k, v) in vars {
+        // A credential VALUE is stripped whatever its key is called
+        // (`DATABASE_URL=postgres://u:p@h`): the name denylist alone let it
+        // through to the daemon and the session files.
+        let secret_value = agent_core::core::config::is_secret_env_value(&v);
+        if should_strip_env(&k) || secret_value {
             // Only record secret names, not SYNAPS_* prefix noise.
-            if is_secret_key(&k) {
+            if is_secret_key(&k) || secret_value {
                 stripped.push(k);
             }
         } else {
@@ -465,8 +477,8 @@ pub enum CheckpointReason {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SessionCommand {
-    /// User-authored prompt. Actor: reset auto-turn counter, fold
-    /// abort_context, push user msg, start turn.
+    /// User-authored prompt. Actor: reset auto-turn counter, push user msg
+    /// verbatim, start turn.
     Submit {
         text: String,
         /// Pre-built canonical user content blocks (images, documents)
@@ -478,8 +490,9 @@ pub enum SessionCommand {
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
     Steer { text: String },
-    /// Esc. Cancel, capture abort context, dequeue, flush pending events,
-    /// cancel subagents, save.
+    /// Esc. Cancel, adopt the turn's partial history + append the
+    /// interruption marker (`engine::interrupt`), dequeue, flush pending
+    /// events, cancel subagents, save.
     Cancel,
     /// Answer to a PromptRequest. `None` = cancelled.
     /// NEVER journaled, NEVER replayed, NEVER traced.
@@ -504,8 +517,8 @@ pub enum SessionCommand {
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
     /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair
-    /// (+ optional user text) then a turn. Does NOT fold abort_context and
-    /// does NOT reset consecutive_auto_turns.
+    /// (+ optional user text) then a turn. Does NOT reset
+    /// consecutive_auto_turns.
     SubmitPrepared {
         messages: Vec<crate::SharedMessage>,
         #[serde(default)]
@@ -517,7 +530,7 @@ pub enum SessionCommand {
     /// (A3) `/resume`: save current, load `query`, restore model/reasoning/
     /// system prompt, swap conversation. Reply = `Resumed{id, ..}`.
     Resume { id: u64, query: String },
-    /// (B1, used by C3 reload) cancel any turn (abort_context captured),
+    /// (B1, used by C3 reload) cancel any turn (partial history + marker),
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
@@ -786,7 +799,8 @@ pub enum SessionEventWire {
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     /// Cancel landed. TUI: drop_empty_thinking, push Error(abort_msg),
-    /// subagents.clear(), streaming=false.
+    /// subagents.clear(), streaming=false. `context_saved` (name kept for
+    /// protocol v3): the interrupted turn's partial work is kept in history.
     Aborted { context_saved: bool },
     /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
     Cleared { session_id: String },
@@ -913,6 +927,8 @@ pub struct ConversationSnapshot {
     pub messages_len: usize,
     pub tokens: ConversationTokens,
     pub cost: f64,
+    /// Legacy (protocol v3 shape kept): always `None` — an interrupted turn
+    /// is recorded in `api_messages` (`engine::interrupt`), never as a recap.
     pub abort_context: Option<String>,
     pub queued_message: Option<String>,
     pub pending_events_len: usize,
@@ -1063,6 +1079,45 @@ mod tests {
     }
 
     #[test]
+    fn strip_client_env_drops_credential_values_whatever_the_key() {
+        let vars = vec![
+            ("HOME".to_string(), "/home/u".to_string()),
+            (
+                "DATABASE_URL".to_string(),
+                "postgres://app:hunter2@db/prod".to_string(),
+            ),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://user:pass@proxy:3128".to_string(),
+            ),
+            (
+                "SENTRY_DSN".to_string(),
+                "https://abc123@o1.ingest.sentry.io/42".to_string(),
+            ),
+            ("GITHUB_PAT".to_string(), "ghp_x".to_string()),
+            (
+                "API_BASE_URL".to_string(),
+                "https://api.example.com/v1".to_string(),
+            ),
+        ];
+        let (env, stripped) = strip_client_env(vars);
+        let kept: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["API_BASE_URL", "HOME"],
+            "only non-secrets survive"
+        );
+        assert!(env.iter().all(|(_, v)| !v.contains("hunter2")
+            && !v.contains("user:pass")
+            && !v.contains("abc123")));
+        assert_eq!(
+            stripped,
+            vec!["DATABASE_URL", "GITHUB_PAT", "HTTPS_PROXY", "SENTRY_DSN"],
+            "stripped names are recorded"
+        );
+    }
+
+    #[test]
     fn capture_client_env_is_sorted_and_stripped() {
         // We can't fully control the process env in a unit test, but we can
         // verify the output is sorted and that known strip-list vars are absent.
@@ -1070,16 +1125,29 @@ mod tests {
         // Every stripped name is a secret by our own rule, and none of them
         // survived into the kept env.
         for name in &stripped {
-            assert!(is_secret_key(name), "stripped non-secret: {name}");
-            assert!(env.iter().all(|(k, _)| k != name), "stripped name leaked: {name}");
+            let by_value = std::env::var(name)
+                .map(|v| agent_core::core::config::is_secret_env_value(&v))
+                .unwrap_or(false);
+            assert!(
+                is_secret_key(name) || by_value,
+                "stripped non-secret: {name}"
+            );
+            assert!(
+                env.iter().all(|(k, _)| k != name),
+                "stripped name leaked: {name}"
+            );
         }
         // Sorted
         for w in env.windows(2) {
             assert!(w[0].0 <= w[1].0, "not sorted: {:?} > {:?}", w[0].0, w[1].0);
         }
         // No secrets or client-only vars
-        for (k, _) in &env {
+        for (k, v) in &env {
             assert!(!should_strip_env(k), "should have been stripped: {k}");
+            assert!(
+                !agent_core::core::config::is_secret_env_value(v),
+                "credential value kept: {k}"
+            );
         }
     }
 

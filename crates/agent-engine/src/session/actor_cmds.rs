@@ -138,8 +138,8 @@ impl SessionActor {
     }
 
     /// dispatch.rs LoadSkill (:330-360): pre-built tool_use/tool_result pair
-    /// (+ optional user text) then a turn. Does NOT fold `abort_context` and
-    /// does NOT reset `consecutive_auto_turns`.
+    /// (+ optional user text) then a turn. Does NOT reset
+    /// `consecutive_auto_turns`.
     pub(crate) async fn submit_prepared(
         &mut self,
         messages: Vec<crate::SharedMessage>,
@@ -210,7 +210,7 @@ impl SessionActor {
             });
             return;
         }
-        let session = match crate::resolve_session(&query) {
+        let mut session = match crate::resolve_session(&query) {
             Ok(s) => s,
             Err(e) => {
                 self.emit(SessionEventWire::QueryResult {
@@ -247,7 +247,22 @@ impl SessionActor {
         } else {
             None
         };
+        // F10: the journal lock follows the conversation (as NewSession and
+        // compaction do). Crash recovery needs it: only the lock holder may
+        // fold a turn draft in and remove it — a draft under a lock held
+        // elsewhere belongs to a turn that is running right now.
+        self.reacquire_session_lock(&new_id);
+        let turn_draft = if self.session_lock.is_some() {
+            crate::engine::setup::recover_turn_draft(&mut session)
+        } else {
+            None
+        };
         self.conv = Live::new(crate::engine::session::ConversationState::from_resumed(session));
+        if let Some(recovered) = turn_draft {
+            if self.config.persist {
+                crate::engine::setup::finish_turn_draft_recovery(&mut self.conv, recovered).await;
+            }
+        }
         if clamp_notice.is_some() {
             // Keep the session file in sync with the clamped runtime.
             self.conv.session.thinking_level = self.runtime.thinking_level().to_string();

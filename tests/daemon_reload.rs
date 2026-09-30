@@ -204,7 +204,7 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
+async fn reload_with_turn_in_flight_checkpoints_and_keeps_the_partial_turn() {
     let guard = HomeGuard::new();
     let (url, _hits, _) = spawn_stub(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
     let d = spawn_daemon(&guard, &url).await;
@@ -213,7 +213,7 @@ async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
     let (mut t, _snap) = attach_create(&d.paths, guard.home.path()).await;
     let sid = t.session_id().clone();
     t.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![] }).await.unwrap();
-    // Wait for the partial text so the checkpoint has something to fold.
+    // Wait for the partial text so the checkpoint has partial work to keep.
     loop {
         let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.unwrap().unwrap();
         if matches!(env.event, SessionEventWire::Stream(agent_engine::StreamEvent::Llm(agent_engine::LlmEvent::Text(_)))) {
@@ -225,9 +225,9 @@ async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
     assert_eq!(gen, 2);
     // Checkpoint before the announce: the client sees the abort notice
     // (the `Conversation` that follows arrives as a digest the mirror must
-    // re-query, and the connection is gone before the answer — so the
-    // abort context itself is asserted from the reconnect snapshot, i.e.
-    // from the journal), then Reloading, then EOF.
+    // re-query, and the connection is gone before the answer — so the kept
+    // history itself is asserted from the reconnect snapshot, i.e. from the
+    // journal), then Reloading, then EOF.
     let mut notices = Vec::new();
     let mut aborted = false;
     while let Some(env) = tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce") {
@@ -244,9 +244,18 @@ async fn reload_with_turn_in_flight_checkpoints_and_saves_abort_context() {
     assert_eq!(t.welcome.pid, pid_before);
     assert_eq!(t.session_id(), &sid);
     assert!(!snap.streaming, "the turn was checkpointed, not resumed");
-    let ctx = snap.conversation.abort_context.clone().expect("abort context came back from the journal");
-    assert!(ctx.contains("you had started writing: partial"), "{ctx}");
-    assert_eq!(snap.conversation.api_messages.len(), 1, "the interrupted assistant turn is not in the history");
+    // The interrupted turn came back from the journal as REAL history: the
+    // partial assistant reply, then the restart marker — no recap.
+    assert!(snap.conversation.abort_context.is_none());
+    let msgs = &snap.conversation.api_messages;
+    assert_eq!(msgs.len(), 3, "{msgs:#?}");
+    assert_eq!(msgs[0]["content"], "never finishes");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"][0]["text"], "partial");
+    assert_eq!(
+        msgs[2]["content"],
+        agent_engine::engine::interrupt::InterruptReason::Restart.marker()
+    );
 
     t.detach().await;
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();

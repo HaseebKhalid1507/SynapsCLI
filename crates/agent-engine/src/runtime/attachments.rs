@@ -653,6 +653,34 @@ mod tests {
         assert!(transport.permits(AttachmentKind::Pdf).is_ok());
     }
 
+    /// Regression: before Opus 5.5 was an exact known native model, every
+    /// `read` of an image on it came back as
+    /// "Attachment not sent: Selected model lacks exact image input capability metadata".
+    #[test]
+    fn opus_5_5_native_accepts_image_tool_results_pdf_and_text() {
+        for model in ["anthropic/claude-opus-5-5", "claude-opus-5-5"] {
+            assert!(validate_tool_blocks(model, &[image()]).is_ok(), "{model}");
+            assert!(
+                validate_messages(model, &[message(vec![image(), pdf(), text("hello")])]).is_ok(),
+                "{model}"
+            );
+            let bounded = bounded_tool_results(
+                model,
+                &[],
+                vec![json!({"type":"tool_result","tool_use_id":"toolu_read","content":[image()]})],
+            );
+            assert!(bounded["content"][0]["content"].is_array(), "{model}");
+            assert!(bounded["content"][0].get("is_error").is_none(), "{model}");
+        }
+        // Exact ids only: dotted or suffixed spellings stay fail-closed.
+        for model in [
+            "anthropic/claude-opus-5.5",
+            "anthropic/claude-opus-5-5-preview",
+        ] {
+            assert!(check(model, image()).is_err(), "{model}");
+        }
+    }
+
     #[test]
     fn exact_live_cache_support_and_revocation_are_rechecked_for_generic_and_codex() {
         // Unique IDs avoid modifying real catalog rows or clearing shared cache

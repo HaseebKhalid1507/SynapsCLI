@@ -36,6 +36,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo build --features testing
 
+  # Every other job runs on Linux, so macOS-only breakage (e.g. `libc::mode_t`
+  # is u16 there, u32 on Linux) first surfaced in the v0.10.0 release build.
+  # This compiles what a release compiles — workspace libs + bins — on a Mac.
+  macos-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo check --workspace --locked
+
   ignore-ratchet:
     runs-on: ubuntu-latest
     steps:

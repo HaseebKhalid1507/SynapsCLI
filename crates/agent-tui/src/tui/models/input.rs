@@ -1,4 +1,27 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Keys: every printable character types into the search (the picker says
+/// "type to search", so no letter may be stolen by a command). Commands are
+/// arrows, Tab, Enter, Esc and Ctrl chords: ↑↓ move, ←/→ collapse / open a
+/// provider section, Ctrl+E expand the provider's live catalog, Ctrl+F
+/// favorite.
+fn ctrl(key: &KeyEvent, ch: char) -> bool {
+    key.code == KeyCode::Char(ch) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// A character to type into a search field: no Ctrl/Alt chord.
+fn typed_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(ch)
+        }
+        _ => None,
+    }
+}
 
 use super::{
     build_sections, expanded_visible_models, normalize_favorite_id, remove_favorite_compat,
@@ -29,13 +52,54 @@ pub(crate) fn handle_event(
 
     let sections = build_sections(current_model, state);
     let row_count = visible_rows(&sections, state).len();
+    if ctrl(&key, 'e') {
+        if let Some(provider) = selected_provider(&sections, state) {
+            let (provider_key, provider_name) = (
+                provider.provider_key.clone(),
+                provider.provider_name.clone(),
+            );
+            return open_expanded_provider(state, provider_key, provider_name);
+        }
+        return InputOutcome::None;
+    }
+    if ctrl(&key, 'f') {
+        if let Some(model) = selected_model(&sections, state) {
+            let trusted = if model.is_favorite {
+                remove_favorite_compat(&model.favorite_id);
+                None
+            } else {
+                let _ = synaps_cli::config::add_favorite_model(&normalize_favorite_id(
+                    &model.favorite_id,
+                ));
+                // Runtime-qualified identity of the visible row — the same
+                // exact ID that Apply uses — for the live policy grant.
+                Some(model.id.clone())
+            };
+            state.refresh_favorites();
+            let new_len = visible_rows(&build_sections(current_model, state), state).len();
+            if new_len == 0 {
+                state.cursor = 0;
+            } else if state.cursor >= new_len {
+                state.cursor = new_len - 1;
+            }
+            if let Some(model_id) = trusted {
+                return InputOutcome::Trusted(model_id);
+            }
+        }
+        return InputOutcome::None;
+    }
+    if let Some(ch) = typed_char(&key) {
+        state.search.push(ch);
+        state.cursor = 0;
+        return InputOutcome::None;
+    }
     match key.code {
         KeyCode::Esc => InputOutcome::Close,
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             state.cursor = state.cursor.saturating_sub(1);
             InputOutcome::None
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             if row_count > 0 {
                 state.cursor = (state.cursor + 1).min(row_count - 1);
             }
@@ -49,49 +113,16 @@ pub(crate) fn handle_event(
             state.cursor = 0;
             InputOutcome::None
         }
-        KeyCode::Char('c') => {
+        // ← collapses the provider section under the cursor, → opens it.
+        KeyCode::Left | KeyCode::Right => {
             let rows = visible_rows(&sections, state);
             if let Some(super::VisibleRow::Section { idx }) = rows.get(state.cursor) {
                 if let Some(section) = sections.get(*idx) {
-                    if !state.collapsed.remove(&section.provider_key) {
+                    if key.code == KeyCode::Left {
                         state.collapsed.insert(section.provider_key.clone());
+                    } else {
+                        state.collapsed.remove(&section.provider_key);
                     }
-                }
-            }
-            InputOutcome::None
-        }
-        KeyCode::Char('e') => {
-            if let Some(provider) = selected_provider(&sections, state) {
-                let (provider_key, provider_name) = (
-                    provider.provider_key.clone(),
-                    provider.provider_name.clone(),
-                );
-                return open_expanded_provider(state, provider_key, provider_name);
-            }
-            InputOutcome::None
-        }
-        KeyCode::Char('f') => {
-            if let Some(model) = selected_model(&sections, state) {
-                let trusted = if model.is_favorite {
-                    remove_favorite_compat(&model.favorite_id);
-                    None
-                } else {
-                    let _ = synaps_cli::config::add_favorite_model(&normalize_favorite_id(
-                        &model.favorite_id,
-                    ));
-                    // Runtime-qualified identity of the visible row — the same
-                    // exact ID that Apply uses — for the live policy grant.
-                    Some(model.id.clone())
-                };
-                state.refresh_favorites();
-                let new_len = visible_rows(&build_sections(current_model, state), state).len();
-                if new_len == 0 {
-                    state.cursor = 0;
-                } else if state.cursor >= new_len {
-                    state.cursor = new_len - 1;
-                }
-                if let Some(model_id) = trusted {
-                    return InputOutcome::Trusted(model_id);
                 }
             }
             InputOutcome::None
@@ -108,16 +139,6 @@ pub(crate) fn handle_event(
         KeyCode::Backspace => {
             state.search.pop();
             state.cursor = 0;
-            InputOutcome::None
-        }
-        KeyCode::Char(ch) => {
-            if !key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                state.search.push(ch);
-                state.cursor = 0;
-            }
             InputOutcome::None
         }
         _ => InputOutcome::None,
@@ -152,18 +173,41 @@ pub(crate) fn open_expanded_provider(
 }
 
 fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOutcome {
+    if ctrl(&key, 'f') {
+        if let Some(model) = selected_expanded_model(state) {
+            let trusted = if model.is_favorite {
+                remove_favorite_compat(&model.id);
+                None
+            } else {
+                let _ = synaps_cli::config::add_favorite_model(&normalize_favorite_id(&model.id));
+                Some(model.id.clone())
+            };
+            state.refresh_favorites();
+            if let Some(model_id) = trusted {
+                return InputOutcome::Trusted(model_id);
+            }
+        }
+        return InputOutcome::None;
+    }
+    if let Some(ch) = typed_char(&key) {
+        if let Some(expanded) = state.expanded.as_mut() {
+            expanded.search.push(ch);
+            expanded.cursor = 0;
+        }
+        return InputOutcome::None;
+    }
     match key.code {
         KeyCode::Esc => {
             state.expanded = None;
             InputOutcome::None
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             if let Some(expanded) = state.expanded.as_mut() {
                 expanded.cursor = expanded.cursor.saturating_sub(1);
             }
             InputOutcome::None
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             let visible_len = expanded_visible_models(state).len();
             if let Some(expanded) = state.expanded.as_mut() {
                 if visible_len > 0 {
@@ -179,39 +223,10 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
                 InputOutcome::None
             }
         }
-        KeyCode::Char('f') => {
-            if let Some(model) = selected_expanded_model(state) {
-                let trusted = if model.is_favorite {
-                    remove_favorite_compat(&model.id);
-                    None
-                } else {
-                    let _ =
-                        synaps_cli::config::add_favorite_model(&normalize_favorite_id(&model.id));
-                    Some(model.id.clone())
-                };
-                state.refresh_favorites();
-                if let Some(model_id) = trusted {
-                    return InputOutcome::Trusted(model_id);
-                }
-            }
-            InputOutcome::None
-        }
         KeyCode::Backspace => {
             if let Some(expanded) = state.expanded.as_mut() {
                 expanded.search.pop();
                 expanded.cursor = 0;
-            }
-            InputOutcome::None
-        }
-        KeyCode::Char(ch) => {
-            if !key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                if let Some(expanded) = state.expanded.as_mut() {
-                    expanded.search.push(ch);
-                    expanded.cursor = 0;
-                }
             }
             InputOutcome::None
         }
@@ -336,7 +351,15 @@ mod tests {
     /// `expanding_anthropic_still_requests_live_catalog` and the static-OAuth
     /// test above; this one pins the routing.
     #[test]
-    fn e_opens_expanded_provider_browser() {
+    fn ctrl_e_opens_expanded_provider_browser() {
+        // Host state is read TWICE (the expectation below, then again inside
+        // handle_event). Config-env tests swap SYNAPS_BASE_DIR to an empty
+        // tempdir under CONFIG_ENV_TEST_LOCK; without the lock one of those
+        // can land between the reads, and a logged-in provider (anthropic)
+        // vanishes from the second read only.
+        let _guard = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
         let sections = crate::tui::models::build_sections("claude-opus-4-7", &state);
@@ -345,7 +368,11 @@ mod tests {
             .provider_key
             .clone();
 
-        let outcome = handle_event(&mut state, key(KeyCode::Char('e')), "claude-opus-4-7");
+        let outcome = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            "claude-opus-4-7",
+        );
         assert_eq!(outcome, InputOutcome::ExpandProvider(expected.clone()));
         let expanded = state.expanded.expect("expanded state");
         assert_eq!(expanded.provider_key, expected);
@@ -426,5 +453,56 @@ mod tests {
         assert_eq!(state.search, "qw");
         handle_event(&mut state, key(KeyCode::Backspace), "claude-opus-4-7");
         assert_eq!(state.search, "q");
+    }
+
+    /// Regression: the picker says "type to search", so every letter —
+    /// including the old single-key commands c / e / f / j / k — types.
+    #[test]
+    fn every_letter_types_into_the_search() {
+        let _guard = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut state = ModelsModalState::new();
+        for ch in "codex fjk".chars() {
+            let outcome = handle_event(&mut state, key(KeyCode::Char(ch)), "claude-opus-4-7");
+            assert_eq!(outcome, InputOutcome::None, "{ch:?} is not a command");
+        }
+        assert_eq!(state.search, "codex fjk");
+        assert!(state.expanded.is_none(), "e no longer opens the catalog");
+        assert!(state.collapsed.is_empty(), "c no longer folds a section");
+
+        // Same inside the expanded catalog.
+        state.expanded = Some(ExpandedModelsState {
+            provider_key: "openai-codex".into(),
+            provider_name: "OpenAI Codex".into(),
+            cursor: 0,
+            search: String::new(),
+            load_state: ExpandedLoadState::Loading,
+        });
+        for ch in "fjk".chars() {
+            handle_event(&mut state, key(KeyCode::Char(ch)), "claude-opus-4-7");
+        }
+        assert_eq!(state.expanded.as_ref().unwrap().search, "fjk");
+    }
+
+    #[test]
+    fn left_folds_and_right_opens_a_provider_section() {
+        let _guard = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut state = ModelsModalState::new();
+        state.view = ModelsView::All;
+        state.cursor = 0; // the first row is a provider section
+        let sections = build_sections("claude-opus-4-7", &state);
+        let Some(super::super::VisibleRow::Section { idx }) =
+            visible_rows(&sections, &state).first().cloned()
+        else {
+            panic!("first row should be a section");
+        };
+        let provider = sections[idx].provider_key.clone();
+        handle_event(&mut state, key(KeyCode::Left), "claude-opus-4-7");
+        assert!(state.collapsed.contains(&provider), "← folds");
+        handle_event(&mut state, key(KeyCode::Right), "claude-opus-4-7");
+        assert!(!state.collapsed.contains(&provider), "→ opens");
     }
 }

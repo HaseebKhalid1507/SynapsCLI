@@ -15,7 +15,8 @@
 //! - semantic terminal/control/tool-call events (tool_use, tool_result,
 //!   session history, errors, Done, agent events) are NEVER dropped or
 //!   reordered — their volume is structurally bounded by the turn budget
-//!   (calls × `max_tool_output`, rounds, one history per turn);
+//!   (calls × `max_tool_output`, rounds, one history per round — each a
+//!   vector of shared `Arc`s, not a copy of the history);
 //! - a dropped caller stream cancels the turn token so provider tasks are
 //!   released instead of streaming into the void.
 //!

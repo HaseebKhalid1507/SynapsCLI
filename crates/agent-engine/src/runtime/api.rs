@@ -66,6 +66,10 @@ struct ParseState {
     current_thinking: String,
     current_thinking_signature: String,
     in_thinking: bool,
+    /// Set by `finalize()` when it flushed a `tool_use` whose input was still
+    /// streaming (no `content_block_stop`). Always the LAST accumulated block.
+    /// Only `take_outcome_content(cancelled = true)` acts on it.
+    flushed_partial_tool: bool,
     // ── Telemetry captures ──
     telem_msg_id: Option<String>,
     telem_ttft: Option<u64>,
@@ -173,6 +177,7 @@ impl ParseState {
             current_thinking: String::new(),
             current_thinking_signature: String::new(),
             in_thinking: false,
+            flushed_partial_tool: false,
             telem_msg_id: None,
             telem_ttft: None,
             telem_stop_reason: None,
@@ -217,6 +222,7 @@ impl ParseState {
                 "input": input
             }));
             self.in_tool_use = false;
+            self.flushed_partial_tool = true;
         } else if !self.current_text.is_empty() {
             self.accumulated_content.push(json!({
                 "type": "text",
@@ -224,6 +230,37 @@ impl ParseState {
             }));
         }
         self.current_text.clear();
+    }
+
+    /// The content handed to `classify_stream_outcome`.
+    ///
+    /// Uncancelled streams: exactly `accumulated_content`, unchanged.
+    ///
+    /// Cancelled streams keep only what the model verifiably produced, so the
+    /// interrupted assistant turn can stay in history as a REAL message
+    /// (never a user-side recap — see `session::actor::cancel_turn`):
+    /// - partial text is kept verbatim (it is what the model said);
+    /// - thinking without a signature is dropped — a block cut off before its
+    ///   `signature_delta` cannot be replayed to the provider;
+    /// - a `tool_use` whose input was still streaming is dropped — the model
+    ///   never finished making that call, and its truncated JSON would be
+    ///   recorded as `{"__parse_error": …}`. Completed calls stay (the tool
+    ///   loop pairs them with a canceled result).
+    fn take_outcome_content(&mut self, cancelled: bool) -> Vec<Value> {
+        let mut content = std::mem::take(&mut self.accumulated_content);
+        if cancelled {
+            if self.flushed_partial_tool
+                && content.last().and_then(|b| b["type"].as_str()) == Some("tool_use")
+            {
+                content.pop();
+            }
+            content.retain(|b| {
+                b["type"].as_str() != Some("thinking")
+                    || b["signature"].as_str().is_some_and(|s| !s.is_empty())
+            });
+        }
+        self.flushed_partial_tool = false;
+        content
     }
 }
 
@@ -1846,6 +1883,7 @@ impl ApiMethods {
             let has_stop_reason = state.stop_reason_seen;
             let stop_reason_is_refusal = state.stop_reason_is_refusal;
             let cancelled = cancel.is_cancelled();
+            let outcome_content = state.take_outcome_content(cancelled);
 
             // ═══ TRACE: finish this attempt's monotonic clock + captures ═══
             clock.mark_stream_end();
@@ -1921,7 +1959,7 @@ impl ApiMethods {
 
             match classify_stream_outcome(
                 stream_error,
-                std::mem::take(&mut state.accumulated_content),
+                outcome_content,
                 has_stop_reason,
                 stop_reason_is_refusal,
                 cancelled,
@@ -2767,6 +2805,90 @@ mod tests {
             state.accumulated_content,
             vec![json!({"type":"tool_use","id":"toolu_cut","name":"grep","input":{"pattern":"x"}})]
         );
+    }
+
+    // ── take_outcome_content: cancel keeps only verifiable model output ──
+
+    const THINK_START: &str = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#;
+    const THINK_DELTA: &str = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weighing it"}}"#;
+    const THINK_SIG: &str = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_ok"}}"#;
+    const STOP0: &str = r#"data: {"type":"content_block_stop","index":0}"#;
+    const TEXT_START1: &str = r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#;
+    const TEXT_DELTA1: &str = r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Let me check"}}"#;
+    const STOP1: &str = r#"data: {"type":"content_block_stop","index":1}"#;
+    const TOOL_START2: &str = r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_done","name":"grep"}}"#;
+    const TOOL_DELTA2: &str = r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"x\"}"}}"#;
+    const STOP2: &str = r#"data: {"type":"content_block_stop","index":2}"#;
+    const TOOL_START3: &str = r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_cut","name":"bash"}}"#;
+    const TOOL_DELTA3: &str = r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"rm -"}}"#;
+
+    fn outcome_after(lines: &[&str], cancelled: bool) -> Vec<Value> {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(lines, &mut state, &ctx);
+        state.finalize();
+        state.take_outcome_content(cancelled)
+    }
+
+    #[test]
+    fn cancelled_outcome_keeps_partial_text_verbatim() {
+        let content = outcome_after(&[TEXT_START1, TEXT_DELTA1], true);
+        assert_eq!(content, vec![json!({"type":"text","text":"Let me check"})]);
+    }
+
+    #[test]
+    fn cancelled_outcome_drops_unsigned_thinking() {
+        let content = outcome_after(&[THINK_START, THINK_DELTA], true);
+        assert!(content.is_empty(), "unsigned thinking must not survive a cancel: {content:?}");
+    }
+
+    #[test]
+    fn cancelled_outcome_keeps_signed_thinking_and_completed_blocks() {
+        let content = outcome_after(
+            &[THINK_START, THINK_DELTA, THINK_SIG, STOP0, TEXT_START1, TEXT_DELTA1, STOP1],
+            true,
+        );
+        assert_eq!(
+            content,
+            vec![
+                json!({"type":"thinking","thinking":"weighing it","signature":"sig_ok"}),
+                json!({"type":"text","text":"Let me check"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelled_outcome_drops_only_the_in_flight_tool_call() {
+        let content = outcome_after(
+            &[
+                TEXT_START1, TEXT_DELTA1, STOP1,
+                TOOL_START2, TOOL_DELTA2, STOP2,
+                TOOL_START3, TOOL_DELTA3,
+            ],
+            true,
+        );
+        assert_eq!(
+            content,
+            vec![
+                json!({"type":"text","text":"Let me check"}),
+                json!({"type":"tool_use","id":"toolu_done","name":"grep","input":{"pattern":"x"}}),
+            ],
+            "the completed call stays; the half-streamed one (truncated JSON) is dropped"
+        );
+    }
+
+    #[test]
+    fn uncancelled_outcome_is_byte_identical_to_accumulated_content() {
+        // Same inputs, not cancelled: nothing filtered (existing finalize
+        // semantics and every non-cancel path stay exactly as before).
+        let lines = [THINK_START, THINK_DELTA, STOP0, TOOL_START3, TOOL_DELTA3];
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(&lines, &mut state, &ctx);
+        state.finalize();
+        let expected = state.accumulated_content.clone();
+        assert_eq!(expected.len(), 2, "fixture: unsigned thinking + partial tool");
+        assert_eq!(state.take_outcome_content(false), expected);
     }
 
     #[test]
