@@ -533,6 +533,10 @@ pub(crate) const SCROLLBACK_SENTINEL_MARK: &str = "(scrollback cap ";
 /// inline mode on this extraction.
 pub(crate) struct TranscriptStore {
     messages: Vec<TimestampedMsg>,
+    /// A turn started: its first text delta opens a NEW text block even if
+    /// the transcript still ends with the previous turn's text (a client
+    /// that did not submit the turn has no user card in between).
+    text_sealed: bool,
 
     // ── Scroll state (moved in slice c) ──────────────────────────────────────
     /// Viewport offset from the bottom (0 = pinned to latest line).
@@ -655,6 +659,7 @@ impl TranscriptStore {
         Self {
             clock,
             messages: Vec::new(),
+            text_sealed: false,
             scroll_back: 0,
             scroll_pinned: true,
             last_line_count: 0,
@@ -2569,20 +2574,51 @@ impl TranscriptStore {
 
     // ── Streaming text mutations (moved in slice b′) ─────────────────────────
 
-    pub(crate) fn append_or_update_text(&mut self, text: &str) {
+    /// Append a text delta to the reply being streamed.
+    ///
+    /// - After `seal_text_block` (a turn started) the delta opens a new block.
+    /// - Otherwise it extends the last message when that is text — or, when
+    ///   `response_start` is the index the current provider response began
+    ///   at, that response's OWN text block even if system lines landed
+    ///   after it mid-reply (a notice must not split one reply into two
+    ///   agent blocks). Never a block from before `response_start`, so a
+    ///   `ResponseReset` rollback (which removes every text message from
+    ///   `response_start` on) stays exact.
+    pub(crate) fn append_or_update_text(&mut self, text: &str, response_start: Option<usize>) {
         // Model produced real output — clear any empty thinking placeholder
         // so its spinner stops.
         self.drop_empty_thinking();
-        if let Some(TimestampedMsg {
-            msg: ChatMessage::Text(ref mut existing),
-            ..
-        }) = self.messages.last_mut()
-        {
-            existing.push_str(text);
-        } else {
-            self.push_msg(ChatMessage::Text(text.to_string()));
+        if !std::mem::take(&mut self.text_sealed) {
+            if let Some(TimestampedMsg {
+                msg: ChatMessage::Text(ref mut existing),
+                ..
+            }) = self.messages.last_mut()
+            {
+                existing.push_str(text);
+                self.invalidate_last();
+                return;
+            }
+            let own_block = self
+                .messages
+                .iter()
+                .rposition(|m| !matches!(m.msg, ChatMessage::System(_)))
+                .filter(|&i| response_start.is_some_and(|start| i >= start));
+            if let Some(i) = own_block {
+                if let ChatMessage::Text(ref mut existing) = self.messages[i].msg {
+                    existing.push_str(text);
+                    // Not the tail: re-measure from here down.
+                    self.invalidate();
+                    return;
+                }
+            }
         }
+        self.push_msg(ChatMessage::Text(text.to_string()));
         self.invalidate_last();
+    }
+
+    /// A new turn started: its text must not extend the previous turn's.
+    pub(crate) fn seal_text_block(&mut self) {
+        self.text_sealed = true;
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
@@ -2699,6 +2735,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.text_sealed = false;
         self.clear_selection();
         self.cache = CacheState::Missing;
         // Scrollback bookkeeping restarts with the transcript (L3): the next
@@ -4536,7 +4573,7 @@ mod response_reset_tests {
         let start = store.messages().len();
         let last = store.messages().last().map(|m| m.msg.clone());
         // Simulate a failed continuation attempt
-        store.append_or_update_text(" failed continuation");
+        store.append_or_update_text(" failed continuation", Some(start));
         store.on_tool_use_start("failed_call".into(), "write".into());
         assert!(store.messages().len() > start);
         store.reset_response_preview(start, last);
@@ -4552,7 +4589,7 @@ mod response_reset_tests {
         store.push_msg(ChatMessage::Text("previous round".into()));
         let start = store.messages().len();
         let last = store.messages().last().map(|m| m.msg.clone());
-        store.append_or_update_text(" failed continuation");
+        store.append_or_update_text(" failed continuation", Some(start));
         store.on_tool_use_start("failed_call".into(), "write".into());
         // Human steering and system notices survive the reset
         store.push_msg(ChatMessage::User("human steering".into()));
@@ -4563,10 +4600,60 @@ mod response_reset_tests {
         assert_eq!(store.messages()[2].msg.source_text(), "human steering");
         assert!(store.tool_start_time.is_none());
         // New response can start cleanly after reset
-        store.append_or_update_text("new response");
+        store.append_or_update_text("new response", Some(store.messages().len()));
         assert_eq!(
             store.messages().last().unwrap().msg.source_text(),
             "new response"
         );
+    }
+
+    /// A system line landing mid-reply (e.g. the attach notice) must not
+    /// split the reply into two agent blocks: the response keeps growing its
+    /// OWN text block. It never reaches back into a block from before the
+    /// response began, so a reset still removes exactly the response.
+    #[test]
+    fn a_notice_mid_reply_does_not_split_the_reply() {
+        let mut store = TranscriptStore::default();
+        store.push_msg(ChatMessage::User("question".into()));
+        store.push_msg(ChatMessage::Text("earlier reply".into()));
+        store.push_msg(ChatMessage::System("a notice between turns".into()));
+        let start = store.messages().len();
+        store.append_or_update_text("The quick ", Some(start));
+        assert_eq!(store.messages().len(), start + 1, "new block: the old one predates the response");
+        store.push_msg(ChatMessage::System("input is owned by client #1".into()));
+        store.append_or_update_text("brown fox", Some(start));
+        let texts: Vec<String> = store
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.msg, ChatMessage::Text(_)))
+            .map(|m| m.msg.source_text().to_string())
+            .collect();
+        assert_eq!(texts, ["earlier reply", "The quick brown fox"], "one block for the reply");
+        store.reset_response_preview(start, None);
+        let texts: Vec<String> = store
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.msg, ChatMessage::Text(_)))
+            .map(|m| m.msg.source_text().to_string())
+            .collect();
+        assert_eq!(texts, ["earlier reply"], "the reset removes exactly the response");
+    }
+
+    /// A new turn never extends the previous turn's text, even with nothing
+    /// in between (a client that did not submit it has no user card).
+    #[test]
+    fn a_new_turn_opens_a_new_text_block() {
+        let mut store = TranscriptStore::default();
+        store.push_msg(ChatMessage::Text("first turn's reply".into()));
+        store.seal_text_block();
+        store.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        store.append_or_update_text("second turn", Some(1));
+        store.append_or_update_text("'s reply", Some(1));
+        let texts: Vec<String> = store
+            .messages()
+            .iter()
+            .map(|m| m.msg.source_text().to_string())
+            .collect();
+        assert_eq!(texts, ["first turn's reply", "second turn's reply"]);
     }
 }

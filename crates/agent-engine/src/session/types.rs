@@ -757,8 +757,11 @@ pub enum EndReason {
 pub enum SessionEventWire {
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
-    /// `user_text` = the queued text on `QueuedAuto` (TUI pushes the User
-    /// card + scroll); `None` otherwise.
+    /// `user_text` = the prompt that started the turn: the queued text on
+    /// `QueuedAuto` (every client pushes the User card + scroll), the
+    /// submitted text on `User` (clients OTHER than the submitter push the
+    /// card; the submitter drew it at submit); `None` otherwise. The attach
+    /// replay ring stores it as `None` (the snapshot's history has it).
     TurnStarted {
         turn_baseline: usize,
         trigger: TurnTrigger,

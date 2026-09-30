@@ -348,12 +348,25 @@ pub(super) async fn handle_session_event_arm(
             turn_baseline,
             trigger,
             user_text,
-        } => match trigger {
+        } => {
+            // A new turn: its reply never extends the previous turn's text.
+            app.transcript.seal_text_block();
+            match trigger {
             TurnTrigger::User | TurnTrigger::PluginCommand => {
                 // Pre-send presentation (User card, "connecting…",
                 // streaming=true, spinner, frame) already happened in the
-                // dispatch arm; this is the tail after the stream opened.
-                app.last_submitted = None;
+                // dispatch arm of the client that SUBMITTED; this is the
+                // tail after the stream opened. Every other attached client
+                // (a mirror) draws the prompt here — the actor sends it as
+                // `user_text` (older daemons send none: nothing drawn, as
+                // before).
+                let mine = app.last_submitted.take();
+                if let Some(text) =
+                    user_text.filter(|t| !t.is_empty() && mine.as_deref() != Some(t.as_str()))
+                {
+                    app.push_msg(ChatMessage::User(text));
+                    app.transcript.scroll_to_bottom();
+                }
                 // The turn was accepted: the attachment drafts it carried are
                 // consumed now (a `Refused` would have left them for a retry).
                 app.pending_attachments.clear();
@@ -389,7 +402,8 @@ pub(super) async fn handle_session_event_arm(
                 app.spinner_frame = 0;
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
             }
-        },
+            }
+        }
         SessionEventWire::Conversation(snap) => {
             app.apply_conversation(&snap);
             if let Some(applied) = app.compaction_applied.take() {

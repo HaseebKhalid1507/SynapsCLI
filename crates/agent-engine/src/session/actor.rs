@@ -2302,6 +2302,8 @@ impl SessionActor {
         }
         // Real user send — reset auto-turn counter.
         self.consecutive_auto_turns = 0;
+        // For every OTHER attached client: the submitter drew its own card.
+        let user_text = text.clone();
         let api_content = text;
 
         if attachments.is_empty() {
@@ -2342,7 +2344,7 @@ impl SessionActor {
             }
             self.conv.api_messages.push(candidate);
         }
-        self.start_turn(TurnTrigger::User, None).await;
+        self.start_turn(TurnTrigger::User, Some(user_text)).await;
     }
 
     /// dispatch.rs StreamingInput plain-text branch (:1369-1378).
