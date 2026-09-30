@@ -1400,7 +1400,7 @@ impl StreamMethods {
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": "Canceled by user"
+                                "content": turn_completion.cancel_phrase()
                             }));
                         }
                     }
@@ -1577,7 +1577,7 @@ impl StreamMethods {
                                             {
                                                 interrupted_side_effect = Some(tool_id.clone());
                                             }
-                                            ("Canceled by user".to_string(), None)
+                                            (turn_completion.cancel_phrase().to_string(), None)
                                         }
                                     }
                                 }
@@ -1629,6 +1629,7 @@ impl StreamMethods {
                         // partial output it streamed is kept but labelled.
                         let content = if canceled {
                             canceled_tool_result_content(
+                                turn_completion.cancel_phrase(),
                                 history_result.map(|bounded| bounded.text),
                                 interrupted_side_effect.is_some(),
                             )
@@ -1793,6 +1794,7 @@ impl StreamMethods {
                         let delegation_parent_inner = delegation_parent.clone();
                         let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
+                        let turn_completion_inner = turn_completion.clone();
                         let exit_path = watcher_exit_path.clone();
                         let tool_reg_tx_inner = tool_reg_tx.clone();
                         let session_mgr = session_manager.clone();
@@ -1911,7 +1913,7 @@ impl StreamMethods {
                                             (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
-                                            (true, started.then_some(call_effect), "Canceled by user".to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
+                                            (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }
                                     } // close else from Block check
@@ -1951,6 +1953,7 @@ impl StreamMethods {
                                 .filter(|bounded| bounded.original_bytes > 0);
                             let history: Value = if was_canceled {
                                 canceled_tool_result_content(
+                                    turn_completion_inner.cancel_phrase(),
                                     history_bounded.as_ref().map(|bounded| bounded.text.clone()),
                                     interrupted.is_some(),
                                 )
@@ -2040,7 +2043,9 @@ impl StreamMethods {
                             // never pass through `truncate_tool_result`.
                             let content = results_map
                                 .remove(tool_id)
-                                .unwrap_or_else(|| Value::String("Canceled by user".to_string()));
+                                .unwrap_or_else(|| {
+                                    Value::String(turn_completion.cancel_phrase().to_string())
+                                });
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
@@ -2195,9 +2200,14 @@ fn select_tool_result_content(
 ///   Task 25 ledger's `InterruptedAfterSideEffect` case) — say so, so the
 ///   model does not blindly re-run it.
 ///
-/// Every variant starts with / contains "Canceled", which the phase-4 bound
-/// tests key on.
-fn canceled_tool_result_content(partial: Option<String>, side_effect_possible: bool) -> Value {
+/// `phrase` says who or what canceled it (`CancelCause::phrase`; "Canceled
+/// by user" for the user). Every variant starts with "Canceled", which the
+/// phase-4 bound tests key on.
+fn canceled_tool_result_content(
+    phrase: &str,
+    partial: Option<String>,
+    side_effect_possible: bool,
+) -> Value {
     let effects = if side_effect_possible {
         " It had already started and may have partially applied its effects."
     } else {
@@ -2205,11 +2215,11 @@ fn canceled_tool_result_content(partial: Option<String>, side_effect_possible: b
     };
     match partial.filter(|p| !p.trim().is_empty()) {
         Some(partial) => Value::String(format!(
-            "{partial}\n\n[Canceled by user before the tool finished; the output above is partial.{effects}]"
+            "{partial}\n\n[{phrase} before the tool finished; the output above is partial.{effects}]"
         )),
-        // Byte-identical to the pre-existing canceled result.
-        None if !side_effect_possible => Value::String("Canceled by user".to_string()),
-        None => Value::String(format!("Canceled by user.{effects}")),
+        // For the user: byte-identical to the pre-existing canceled result.
+        None if !side_effect_possible => Value::String(phrase.to_string()),
+        None => Value::String(format!("{phrase}.{effects}")),
     }
 }
 
@@ -2449,11 +2459,13 @@ mod tests {
 
     // ── canceled tool results never look completed ──────────────────────
 
+    const USER: &str = "Canceled by user";
+
     #[test]
     fn canceled_tool_without_output_keeps_the_existing_result_bytes() {
-        assert_eq!(canceled_tool_result_content(None, false), json!("Canceled by user"));
+        assert_eq!(canceled_tool_result_content(USER, None, false), json!("Canceled by user"));
         assert_eq!(
-            canceled_tool_result_content(Some("   \n".into()), false),
+            canceled_tool_result_content(USER, Some("   \n".into()), false),
             json!("Canceled by user"),
             "whitespace-only output is no output"
         );
@@ -2461,7 +2473,7 @@ mod tests {
 
     #[test]
     fn canceled_tool_with_partial_output_is_labelled_partial() {
-        let v = canceled_tool_result_content(Some("line 1\nline 2".into()), false);
+        let v = canceled_tool_result_content(USER, Some("line 1\nline 2".into()), false);
         let s = v.as_str().unwrap();
         assert!(s.starts_with("line 1\nline 2\n\n"), "{s}");
         assert!(s.contains("Canceled by user before the tool finished"), "{s}");
@@ -2471,12 +2483,47 @@ mod tests {
 
     #[test]
     fn canceled_non_idempotent_call_warns_about_effects() {
-        let with_output = canceled_tool_result_content(Some("wrote 3 files".into()), true);
+        let with_output = canceled_tool_result_content(USER, Some("wrote 3 files".into()), true);
         assert!(with_output.as_str().unwrap().contains("may have partially applied its effects"));
-        let without = canceled_tool_result_content(None, true);
+        let without = canceled_tool_result_content(USER, None, true);
         let s = without.as_str().unwrap();
         assert!(s.starts_with("Canceled by user"), "{s}");
         assert!(s.contains("may have partially applied its effects"), "{s}");
+    }
+
+    /// A cancel that was not the user's says what it was; the user's keeps
+    /// the historical wording (also when the host noted nothing). Every
+    /// wording starts with "Canceled".
+    #[test]
+    fn canceled_tool_results_name_the_cause() {
+        use super::super::types::{CancelCause, TurnCompletion};
+        let unset = TurnCompletion::new();
+        assert_eq!(unset.cancel_phrase(), "Canceled by user");
+        let t = TurnCompletion::new();
+        t.note_cancel_cause(CancelCause::Restart);
+        t.note_cancel_cause(CancelCause::Driver); // first cause wins
+        assert_eq!(t.cancel_phrase(), "Canceled (Synaps restarted)");
+        // A driver turn cancelled with no cause noted (the grant's deadline)
+        // was cut by the driver ending; the user's Esc still says so.
+        let driver_turn = TurnCompletion::with_default_cause(CancelCause::Driver);
+        assert_eq!(driver_turn.cancel_phrase(), "Canceled (session driver revoked)");
+        driver_turn.note_cancel_cause(CancelCause::User);
+        assert_eq!(driver_turn.cancel_phrase(), "Canceled by user");
+        let v = canceled_tool_result_content(t.cancel_phrase(), Some("half".into()), false);
+        assert!(
+            v.as_str().unwrap().contains("[Canceled (Synaps restarted) before the tool finished"),
+            "{v}"
+        );
+        for cause in [
+            CancelCause::User,
+            CancelCause::CostCap,
+            CancelCause::Restart,
+            CancelCause::Host,
+            CancelCause::Driver,
+        ] {
+            assert!(cause.phrase().starts_with("Canceled"), "{cause:?}");
+            assert!(!cause.phrase().to_lowercase().contains("you"), "{cause:?}");
+        }
     }
 
     // ── guard framing: single source for both injection placements ────────

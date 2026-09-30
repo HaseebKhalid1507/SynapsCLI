@@ -382,21 +382,53 @@ pub(crate) struct SessionBootResult {
     pub(crate) continue_info: Option<ContinueInfo>,
 }
 
+/// The session lock for a `boot()` host that drives `Runtime` itself (rpc,
+/// `synaps server`). Continuing a session that another process (a TUI, the
+/// daemon, another rpc) holds is REFUSED: two writers would fork its history
+/// and the older one's saves would overwrite the newer's. So is continuing
+/// a session already compacted into a successor (its history is closed). A
+/// fresh session, or a lock that cannot be taken for another reason (e.g. a
+/// read-only sessions dir), proceeds best-effort, as the session actor does.
+/// The lock is held for the returned value's lifetime; a holder that
+/// continued a session runs crash recovery (`recover_turn_draft`).
+pub fn lock_session(
+    id: &str,
+    continued: bool,
+    kind: &str,
+) -> Result<Option<agent_core::session_lock::SessionLock>> {
+    let dir = agent_core::session_lock::sessions_dir();
+    let holder = agent_core::session_lock::LockHolder {
+        pid: std::process::id(),
+        kind: kind.to_string(),
+    };
+    match agent_core::session_lock::SessionLock::try_acquire(&dir, id, holder) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(
+            e @ (agent_core::session_lock::SessionLockError::Held { .. }
+            | agent_core::session_lock::SessionLockError::CompactedInto { .. }),
+        ) if continued => Err(crate::RuntimeError::Session(e.to_string())),
+        Err(e) => {
+            tracing::warn!(session = %id, "session lock: {e}");
+            Ok(None)
+        }
+    }
+}
+
 /// Crash recovery: if `sessions/<id>.turn` exists, the process that last ran
 /// this session died with a turn open. Fold the draft into the history
 /// (`engine::interrupt::recover_crashed_turn`), persist that, THEN remove
 /// the draft.
 ///
 /// Run ONLY by the holder of the session lock, after taking it (actor
-/// create, unpark and `/resume`): a draft under a lock held elsewhere
-/// belongs to a turn that is running right now, and `boot()` callers (rpc,
-/// `synaps server`, legacy chat) never lock, so they never recover. Loading
-/// itself (`resolve_or_create_session`) leaves the draft alone.
+/// create, unpark and `/resume`; rpc and `synaps server` after
+/// `lock_session`): a draft under a lock held elsewhere belongs to a turn
+/// that is running right now. Legacy chat takes no lock and never recovers.
+/// Loading itself (`resolve_or_create_session`) leaves the draft alone.
 ///
 /// The draft is removed only once the recovered history is on disk; if that
 /// save fails the draft stays, and the next holder retries (recovery is
 /// idempotent through its own marker).
-pub(crate) async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationState) {
+pub async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationState) {
     let dir = agent_core::session_lock::sessions_dir();
     let id = conv.session.id.clone();
     let read = {
@@ -687,6 +719,32 @@ mod tests {
         let mut conv = crate::engine::session::ConversationState::from_resumed(session);
         recover_turn_draft(&mut conv).await;
         assert_eq!(read_turn_draft(&dir, &id).unwrap(), Some(draft), "draft kept");
+    }
+
+    /// A `boot()` host may not continue a session another holder has; a
+    /// fresh one is locked (and the lock is released on drop).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn boot_hosts_refuse_to_continue_a_session_held_elsewhere() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let held = lock_session("20260930-000000-held", true, "tui").unwrap();
+        assert!(held.is_some());
+        let err = lock_session("20260930-000000-held", true, "rpc").unwrap_err();
+        assert!(err.to_string().contains("20260930-000000-held"), "{err}");
+        // Not continuing (a fresh id) never refuses.
+        assert!(lock_session("20260930-000000-held", false, "rpc").unwrap().is_none());
+        drop(held);
+        assert!(lock_session("20260930-000000-held", true, "rpc").unwrap().is_some());
+
+        // A session compacted into a successor is closed: never continued.
+        let mut old = Session::new("claude-sonnet-4-5", "low", None);
+        old.api_messages = vec![std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "before compaction"}),
+        )];
+        old.compacted_into = Some("20260930-000001-next".into());
+        old.save().await.unwrap();
+        let err = lock_session(&old.id, true, "rpc").unwrap_err();
+        assert!(err.to_string().contains("20260930-000001-next"), "{err}");
     }
 
     /// B1: --continue path must restore thinking_level from the saved session.

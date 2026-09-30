@@ -38,14 +38,19 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
 
     let (mut b, snap_b) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
     assert_eq!(snap_b.input_owner, Some(a.client_id()), "a keeps input");
-    let seen = until(&mut b, |e| matches!(e, SessionEventWire::SystemNotice(_))).await;
-    match &seen.last().unwrap().event {
-        SessionEventWire::SystemNotice(n) => {
-            assert!(n.contains("input is owned by client #1"), "{n}");
-            assert!(n.contains("--takeover"), "{n}");
-        }
-        _ => unreachable!(),
-    }
+    // b learns it from ITS snapshot; the owner is told nothing.
+    let owned = snap_b.input_owned_elsewhere(b.client_id()).expect("owned elsewhere");
+    assert!(owned.contains("input is owned by client #1 (tui)"), "{owned}");
+    assert!(owned.contains("--takeover"), "{owned}");
+    assert_eq!(snap_a.input_owned_elsewhere(a.client_id()), None, "a owns it");
+    let a_saw = drain_for(&mut a, std::time::Duration::from_millis(300)).await;
+    assert!(
+        !a_saw.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n.contains("owned by")
+        )),
+        "the owner is not told its own input is owned: {a_saw:#?}"
+    );
 
     // b's Submit is refused with no side effect: no TurnStarted, no stub hit.
     b.send_from_self(submit("hello")).await.unwrap();

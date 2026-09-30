@@ -757,8 +757,11 @@ pub enum EndReason {
 pub enum SessionEventWire {
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
-    /// `user_text` = the queued text on `QueuedAuto` (TUI pushes the User
-    /// card + scroll); `None` otherwise.
+    /// `user_text` = the prompt that started the turn: the queued text on
+    /// `QueuedAuto` (every client pushes the User card + scroll), the
+    /// submitted text on `User` (clients OTHER than the submitter push the
+    /// card; the submitter drew it at submit); `None` otherwise. The attach
+    /// replay ring stores it as `None` (the snapshot's history has it).
     TurnStarted {
         turn_baseline: usize,
         trigger: TurnTrigger,
@@ -1025,6 +1028,28 @@ pub struct AttachSnapshot {
     /// Daemon-projected display tail — `Some` iff the client attached with
     /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
     pub display_tail: Option<crate::session::display::DisplayTail>,
+}
+
+impl AttachSnapshot {
+    /// For the client this snapshot was made for (`me`): who owns input, if
+    /// someone else does — "input is owned by client #1 (tui); attach with
+    /// --takeover to steal it". Rendered by each client from its OWN
+    /// snapshot; the actor used to broadcast it as a `SystemNotice`, which
+    /// every attached client (the owner included) and later attach replays
+    /// showed.
+    pub fn input_owned_elsewhere(&self, me: ClientId) -> Option<String> {
+        let owner = self.input_owner.filter(|o| *o != me)?;
+        let kind = self
+            .clients
+            .iter()
+            .find(|(c, _)| *c == owner)
+            .map(|(_, k)| format!("{k:?}").to_lowercase())
+            .unwrap_or_else(|| "?".into());
+        Some(format!(
+            "input is owned by client #{} ({kind}); attach with --takeover to steal it",
+            owner.0
+        ))
+    }
 }
 
 /// `ReasoningLevel` has no serde impls in agent-core; go through its

@@ -68,6 +68,9 @@ struct ServerState {
     consecutive_auto_turns: std::sync::atomic::AtomicU32,
     /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
     auto_turn_cap: u32,
+    /// The session lock (`setup::lock_session`); follows the conversation to
+    /// a new id (`/clear`). `None` = proceeding unlocked (best-effort).
+    session_lock: std::sync::Mutex<Option<synaps_cli::core::session_lock::SessionLock>>,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -213,13 +216,20 @@ pub async fn run(
         }
     });
 
+    // Refuse to continue a session another process has live; lock ours.
+    let session_lock = setup::lock_session(&boot.session.id, boot.continued, "server")
+        .context("cannot continue this session")?;
     let runtime = boot.runtime;
-    let initial_history = rebuild_history(&boot.api_messages);
-    let conv = if boot.continued {
+    let mut conv = if boot.continued {
         ConversationState::from_resumed(boot.session)
     } else {
         ConversationState::new(boot.session)
     };
+    // The lock holder recovers a turn the previous holder died in.
+    if boot.continued && session_lock.is_some() {
+        setup::recover_turn_draft(&mut conv).await;
+    }
+    let initial_history = rebuild_history(&conv.api_messages);
 
     let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
@@ -293,6 +303,7 @@ pub async fn run(
         auto_turn_tx,
         consecutive_auto_turns: std::sync::atomic::AtomicU32::new(0),
         auto_turn_cap,
+        session_lock: std::sync::Mutex::new(session_lock),
     });
 
     // ── Event drainer task (exactly one per Runtime) ──────────────────────
@@ -1660,6 +1671,13 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 let rt = state.runtime.lock().await;
                 let mut conv = state.conv.write().await;
                 conv.clear(&rt).await;
+                // The lock follows the conversation to its new id: new one
+                // first, then the old one is released (assignment drops it).
+                let lock = setup::lock_session(&conv.session.id, false, "server").unwrap_or(None);
+                *state
+                    .session_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = lock;
             }
             state.display_history.write().await.clear();
             let _ = broadcast.send(ServerMessage::System {

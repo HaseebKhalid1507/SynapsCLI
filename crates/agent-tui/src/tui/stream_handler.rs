@@ -170,6 +170,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             app.push_msg(ChatMessage::System(sanitize_notice(&text)));
         }
         StreamEvent::Session(SessionEvent::Done) => {
+            app.transcript.end_response();
             app.streaming = false;
             app.quit_guard.reset();
             app.drop_empty_thinking();
@@ -187,6 +188,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             // actor's; it announces the next turn with `TurnStarted`.
         }
         StreamEvent::Session(SessionEvent::Error(err)) => {
+            app.transcript.end_response();
             app.drop_empty_thinking();
             // Typed spec §5.2 outcome from the engine — surface the message
             // plus the terminal category + correlation ID, never re-derived.
@@ -212,12 +214,15 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 app.transcript.messages().len(),
                 app.transcript.messages().last().map(|m| m.msg.clone()),
             ));
+            app.transcript.begin_response();
         }
         // ResponseReset: roll the in-flight response preview back to the
         // ResponseStart snapshot. Orphaned resets (no prior start) are
-        // silently ignored (G Q2).
+        // silently ignored (G Q2). The transcript's own start index is
+        // preferred: it stays exact when scrollback drains the front.
         StreamEvent::Llm(LlmEvent::ResponseReset) => {
             if let Some((start, last)) = app.response_preview.take() {
+                let start = app.transcript.response_start().unwrap_or(start);
                 app.transcript.reset_response_preview(start, last);
                 app.invalidate();
             }
@@ -348,12 +353,25 @@ pub(super) async fn handle_session_event_arm(
             turn_baseline,
             trigger,
             user_text,
-        } => match trigger {
+        } => {
+            // A new turn: its reply never extends the previous turn's text.
+            app.transcript.seal_text_block();
+            match trigger {
             TurnTrigger::User | TurnTrigger::PluginCommand => {
                 // Pre-send presentation (User card, "connecting…",
                 // streaming=true, spinner, frame) already happened in the
-                // dispatch arm; this is the tail after the stream opened.
-                app.last_submitted = None;
+                // dispatch arm of the client that SUBMITTED; this is the
+                // tail after the stream opened. Every other attached client
+                // (a mirror) draws the prompt here — the actor sends it as
+                // `user_text` (older daemons send none: nothing drawn, as
+                // before).
+                let mine = app.last_submitted.take();
+                if let Some(text) =
+                    user_text.filter(|t| !t.is_empty() && mine.as_deref() != Some(t.as_str()))
+                {
+                    app.push_msg(ChatMessage::User(text));
+                    app.transcript.scroll_to_bottom();
+                }
                 // The turn was accepted: the attachment drafts it carried are
                 // consumed now (a `Refused` would have left them for a retry).
                 app.pending_attachments.clear();
@@ -389,7 +407,8 @@ pub(super) async fn handle_session_event_arm(
                 app.spinner_frame = 0;
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
             }
-        },
+            }
+        }
         SessionEventWire::Conversation(snap) => {
             app.apply_conversation(&snap);
             if let Some(applied) = app.compaction_applied.take() {
@@ -475,6 +494,7 @@ pub(super) async fn handle_session_event_arm(
         | SessionEventWire::ClientLeft { .. } => {}
         SessionEventWire::Ended { .. } => return ArmFlow::Ended,
         SessionEventWire::Aborted { context_saved } => {
+            app.transcript.end_response();
             app.streaming = false;
             app.quit_guard.reset();
             app.subagents.clear();

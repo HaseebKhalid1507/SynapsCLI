@@ -60,6 +60,20 @@ impl InterruptReason {
         }
     }
 
+    /// How a canceled `tool_result` of this turn words the cancel. `None`
+    /// for reasons that are never a live cancel (found on load).
+    pub fn cancel_cause(self) -> Option<crate::runtime::CancelCause> {
+        use crate::runtime::CancelCause;
+        match self {
+            InterruptReason::User => Some(CancelCause::User),
+            InterruptReason::CostCap => Some(CancelCause::CostCap),
+            InterruptReason::Restart => Some(CancelCause::Restart),
+            InterruptReason::Host => Some(CancelCause::Host),
+            InterruptReason::Driver => Some(CancelCause::Driver),
+            InterruptReason::Unknown | InterruptReason::Crash => None,
+        }
+    }
+
     /// Every reason, i.e. every marker this build writes or recognises.
     pub const ALL: [InterruptReason; 7] = [
         InterruptReason::User,

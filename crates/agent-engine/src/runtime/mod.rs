@@ -46,7 +46,7 @@ use auth::AuthMethods;
 use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
-pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnCompletion};
+pub use types::{AgentEvent, CancelCause, LlmEvent, SessionEvent, StreamEvent, TurnCompletion};
 pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.

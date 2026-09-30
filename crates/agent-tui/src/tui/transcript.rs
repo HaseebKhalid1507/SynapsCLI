@@ -533,6 +533,13 @@ pub(crate) const SCROLLBACK_SENTINEL_MARK: &str = "(scrollback cap ";
 /// inline mode on this extraction.
 pub(crate) struct TranscriptStore {
     messages: Vec<TimestampedMsg>,
+    /// A turn started: its first text delta opens a NEW text block even if
+    /// the transcript still ends with the previous turn's text (a client
+    /// that did not submit the turn has no user card in between).
+    text_sealed: bool,
+    /// Index the provider response being streamed began at (`begin_response`
+    /// on `ResponseStart`); kept exact when scrollback drains the front.
+    response_start: Option<usize>,
 
     // ── Scroll state (moved in slice c) ──────────────────────────────────────
     /// Viewport offset from the bottom (0 = pinned to latest line).
@@ -655,6 +662,8 @@ impl TranscriptStore {
         Self {
             clock,
             messages: Vec::new(),
+            text_sealed: false,
+            response_start: None,
             scroll_back: 0,
             scroll_pinned: true,
             last_line_count: 0,
@@ -763,6 +772,7 @@ impl TranscriptStore {
         };
         self.messages.insert(0, sentinel);
         // Net index shift: −n (drained) +1 (sentinel).
+        self.response_start = self.response_start.and_then(|s| (s >= n).then(|| s - n + 1));
         self.scroll_anchor = match self.scroll_anchor.take() {
             Some(a) if a.msg_idx >= n => Some(ScrollAnchor { msg_idx: a.msg_idx - n + 1, row_in_msg: a.row_in_msg }),
             _ => None,
@@ -2569,20 +2579,69 @@ impl TranscriptStore {
 
     // ── Streaming text mutations (moved in slice b′) ─────────────────────────
 
+    /// Append a text delta to the reply being streamed.
+    ///
+    /// - After `seal_text_block` (a turn started) the delta opens a new block.
+    /// - Otherwise it extends the last message when that is text — or the
+    ///   current provider response's OWN text block (`begin_response`) even
+    ///   if system lines landed after it mid-reply (a notice must not split
+    ///   one reply into two agent blocks). Never a block from before the
+    ///   response began, so a `ResponseReset` rollback (which removes every
+    ///   text message from the response start on) stays exact.
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
+        let response_start = self.response_start;
         // Model produced real output — clear any empty thinking placeholder
         // so its spinner stops.
         self.drop_empty_thinking();
-        if let Some(TimestampedMsg {
-            msg: ChatMessage::Text(ref mut existing),
-            ..
-        }) = self.messages.last_mut()
-        {
-            existing.push_str(text);
-        } else {
-            self.push_msg(ChatMessage::Text(text.to_string()));
+        if !std::mem::take(&mut self.text_sealed) {
+            if let Some(TimestampedMsg {
+                msg: ChatMessage::Text(ref mut existing),
+                ..
+            }) = self.messages.last_mut()
+            {
+                existing.push_str(text);
+                self.invalidate_last();
+                return;
+            }
+            let own_block = self
+                .messages
+                .iter()
+                .rposition(|m| !matches!(m.msg, ChatMessage::System(_)))
+                .filter(|&i| response_start.is_some_and(|start| i >= start));
+            if let Some(i) = own_block {
+                if let ChatMessage::Text(ref mut existing) = self.messages[i].msg {
+                    existing.push_str(text);
+                    // Not the tail: re-measure from this message down only.
+                    self.invalidate_from(i);
+                    return;
+                }
+            }
         }
+        self.push_msg(ChatMessage::Text(text.to_string()));
         self.invalidate_last();
+    }
+
+    /// A new turn started: its text must not extend the previous turn's.
+    pub(crate) fn seal_text_block(&mut self) {
+        self.text_sealed = true;
+        self.response_start = None;
+    }
+
+    /// A provider response starts streaming at the current end.
+    pub(crate) fn begin_response(&mut self) {
+        self.response_start = Some(self.messages.len());
+    }
+
+    /// The streamed response ended (Done / Error / Aborted).
+    pub(crate) fn end_response(&mut self) {
+        self.response_start = None;
+    }
+
+    /// Where the response being streamed began (`begin_response`), shifted
+    /// with the transcript; `None` when none is streaming or its start was
+    /// dropped from scrollback.
+    pub(crate) fn response_start(&self) -> Option<usize> {
+        self.response_start
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
@@ -2699,6 +2758,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.response_start = None;
         self.clear_selection();
         self.cache = CacheState::Missing;
         // Scrollback bookkeeping restarts with the transcript (L3): the next
@@ -4536,6 +4596,7 @@ mod response_reset_tests {
         let start = store.messages().len();
         let last = store.messages().last().map(|m| m.msg.clone());
         // Simulate a failed continuation attempt
+        store.begin_response();
         store.append_or_update_text(" failed continuation");
         store.on_tool_use_start("failed_call".into(), "write".into());
         assert!(store.messages().len() > start);
@@ -4552,6 +4613,7 @@ mod response_reset_tests {
         store.push_msg(ChatMessage::Text("previous round".into()));
         let start = store.messages().len();
         let last = store.messages().last().map(|m| m.msg.clone());
+        store.begin_response();
         store.append_or_update_text(" failed continuation");
         store.on_tool_use_start("failed_call".into(), "write".into());
         // Human steering and system notices survive the reset
@@ -4563,10 +4625,101 @@ mod response_reset_tests {
         assert_eq!(store.messages()[2].msg.source_text(), "human steering");
         assert!(store.tool_start_time.is_none());
         // New response can start cleanly after reset
+        store.begin_response();
         store.append_or_update_text("new response");
         assert_eq!(
             store.messages().last().unwrap().msg.source_text(),
             "new response"
         );
+    }
+
+    /// A system line landing mid-reply (e.g. the attach notice) must not
+    /// split the reply into two agent blocks: the response keeps growing its
+    /// OWN text block. It never reaches back into a block from before the
+    /// response began, so a reset still removes exactly the response.
+    #[test]
+    fn a_notice_mid_reply_does_not_split_the_reply() {
+        let mut store = TranscriptStore::default();
+        store.push_msg(ChatMessage::User("question".into()));
+        store.push_msg(ChatMessage::Text("earlier reply".into()));
+        store.push_msg(ChatMessage::System("a notice between turns".into()));
+        let start = store.messages().len();
+        store.begin_response();
+        store.append_or_update_text("The quick ");
+        assert_eq!(store.messages().len(), start + 1, "new block: the old one predates the response");
+        store.push_msg(ChatMessage::System("input is owned by client #1".into()));
+        store.append_or_update_text("brown fox");
+        let texts: Vec<String> = store
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.msg, ChatMessage::Text(_)))
+            .map(|m| m.msg.source_text().to_string())
+            .collect();
+        assert_eq!(texts, ["earlier reply", "The quick brown fox"], "one block for the reply");
+        store.reset_response_preview(start, None);
+        let texts: Vec<String> = store
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.msg, ChatMessage::Text(_)))
+            .map(|m| m.msg.source_text().to_string())
+            .collect();
+        assert_eq!(texts, ["earlier reply"], "the reset removes exactly the response");
+    }
+
+    /// Scrollback draining the front keeps the response's start exact: the
+    /// reply still grows its own block across a notice, and a reset still
+    /// removes exactly the response. (Review finding: the start index went
+    /// stale on drain.)
+    #[test]
+    fn the_response_start_survives_a_scrollback_drain() {
+        let mut store = TranscriptStore::default();
+        for i in 0..10 {
+            store.push_msg(ChatMessage::User(format!("old {i}")));
+        }
+        store.begin_response();
+        store.append_or_update_text("reply part one");
+        store.push_msg(ChatMessage::System("a notice".into()));
+        store.drain_front(6);
+        let start = store.response_start().expect("start kept");
+        assert!(matches!(store.messages()[start].msg, ChatMessage::Text(_)));
+        store.append_or_update_text(", part two");
+        assert_eq!(
+            store.messages()[start].msg.source_text(),
+            "reply part one, part two",
+            "one block after the drain"
+        );
+        store.reset_response_preview(start, None);
+        assert!(
+            !store
+                .messages()
+                .iter()
+                .any(|m| matches!(m.msg, ChatMessage::Text(_))),
+            "the reset removed exactly the response"
+        );
+        // A response whose own messages were drained away has no start any
+        // more (a reset then falls back to the caller's snapshot).
+        store.begin_response();
+        store.append_or_update_text("doomed");
+        store.drain_front(store.messages().len());
+        assert_eq!(store.response_start(), None);
+    }
+
+    /// A new turn never extends the previous turn's text, even with nothing
+    /// in between (a client that did not submit it has no user card).
+    #[test]
+    fn a_new_turn_opens_a_new_text_block() {
+        let mut store = TranscriptStore::default();
+        store.push_msg(ChatMessage::Text("first turn's reply".into()));
+        store.seal_text_block();
+        store.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        store.begin_response();
+        store.append_or_update_text("second turn");
+        store.append_or_update_text("'s reply");
+        let texts: Vec<String> = store
+            .messages()
+            .iter()
+            .map(|m| m.msg.source_text().to_string())
+            .collect();
+        assert_eq!(texts, ["first turn's reply", "second turn's reply"]);
     }
 }

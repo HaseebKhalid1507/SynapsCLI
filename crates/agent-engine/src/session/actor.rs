@@ -964,6 +964,10 @@ impl SessionActor {
             .map(|d| d.steering.drain(..).collect::<Vec<_>>())
             .unwrap_or_default();
         let was_active = self.driver.is_some() || self.driver_pending.is_some();
+        // Dropping the driver below cancels the driver turn's token.
+        if self.driver.as_ref().is_some_and(|d| d.awaiting_terminal) {
+            self.note_cancel_cause(crate::engine::interrupt::InterruptReason::Driver);
+        }
         if let Some(driver) = &self.driver {
             self.driver_interrupted_owner = Some(driver.grant.plugin_id.clone());
             self.host
@@ -1542,7 +1546,11 @@ impl SessionActor {
                                 .cancel
                                 .child_token();
                             self.cancel = Some(ct.clone());
-                            let completion = crate::runtime::TurnCompletion::new();
+                            // Cancelled by anything that notes no cause (the
+                            // grant's deadline task): the driver ending.
+                            let completion = crate::runtime::TurnCompletion::with_default_cause(
+                                crate::runtime::CancelCause::Driver,
+                            );
                             self.turn_completion = Some(completion.clone());
                             let (tx, rx) = mpsc::unbounded_channel();
                             self.steer_tx = Some(tx);
@@ -2234,10 +2242,19 @@ impl SessionActor {
         // `durability_blocked` anyway, but that leaves the user message
         // orphaned in history; refuse here, before it is pushed.
         if self.conv.context_head.is_blocked(&self.conv.session) {
-            self.emit(SessionEventWire::SystemNotice(
-                "context head is unverified after a failed checkpoint; reload the session                  (`--continue`) or start a new one before continuing"
-                    .into(),
-            ));
+            let reason = "context head is unverified after a failed checkpoint; reload the \
+                          session (`--continue`) or start a new one before continuing"
+                .to_string();
+            // Refused to the submitter (its editor text comes back and it
+            // stops expecting this turn), a notice for everyone else.
+            match from {
+                Some(client) => self.emit(SessionEventWire::Refused {
+                    client,
+                    command: "submit".into(),
+                    reason,
+                }),
+                None => self.emit(SessionEventWire::SystemNotice(reason)),
+            }
             return;
         }
         if self.streaming {
@@ -2302,6 +2319,8 @@ impl SessionActor {
         }
         // Real user send — reset auto-turn counter.
         self.consecutive_auto_turns = 0;
+        // For every OTHER attached client: the submitter drew its own card.
+        let user_text = text.clone();
         let api_content = text;
 
         if attachments.is_empty() {
@@ -2342,7 +2361,7 @@ impl SessionActor {
             }
             self.conv.api_messages.push(candidate);
         }
-        self.start_turn(TurnTrigger::User, None).await;
+        self.start_turn(TurnTrigger::User, Some(user_text)).await;
     }
 
     /// dispatch.rs StreamingInput plain-text branch (:1369-1378).
@@ -2392,6 +2411,7 @@ impl SessionActor {
             self.emit(SessionEventWire::Idle);
             return;
         }
+        self.note_cancel_cause(reason);
         if let Some(ref ct) = self.cancel {
             ct.cancel();
         }
@@ -2420,6 +2440,19 @@ impl SessionActor {
     /// The engine recorded the running turn's normal end (`TurnCompletion`).
     fn turn_completed(&self) -> bool {
         self.turn_completion.as_ref().is_some_and(|c| c.completed())
+    }
+
+    /// Tell the engine why the running turn is being cancelled, BEFORE its
+    /// token is: its canceled tool results say so ("Canceled by user" only
+    /// for the user). First cause wins, so a teardown that revokes a driver
+    /// and then cancels notes its own cause first.
+    fn note_cancel_cause(&self, reason: crate::engine::interrupt::InterruptReason) {
+        if !self.streaming {
+            return;
+        }
+        if let (Some(turn), Some(cause)) = (&self.turn_completion, reason.cancel_cause()) {
+            turn.note_cancel_cause(cause);
+        }
     }
 
     /// The ONE tail of every interrupted turn, once its stream has been
@@ -2865,6 +2898,7 @@ impl SessionActor {
                         cost,
                         cap,
                     });
+                    self.note_cancel_cause(crate::engine::interrupt::InterruptReason::CostCap);
                     if self.driver.is_some() || self.driver_pending.is_some() {
                         self.driver_revoke(&format!("{scope} cost cap reached (${cost:.4} ≥ ${cap:.4})"));
                     }
@@ -3482,23 +3516,16 @@ impl SessionActor {
         self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
-        let mut notice: Option<String> = None;
         match mode {
             AttachMode::Observe => {}
-            AttachMode::Mirror => match self.input_owner {
-                None => owner_change = Some((None, OwnerChangeReason::Attach)),
-                Some(owner) => {
-                    let owner_kind = self
-                        .attached
-                        .get(&owner)
-                        .map(|a| format!("{:?}", a.meta.kind).to_lowercase())
-                        .unwrap_or_else(|| "?".into());
-                    notice = Some(format!(
-                        "input is owned by client #{} ({}); attach with --takeover to steal it",
-                        owner.0, owner_kind
-                    ));
+            // Input owned elsewhere: the joiner learns it from its snapshot
+            // (`AttachSnapshot::input_owned_elsewhere`), never from a notice
+            // broadcast to every client.
+            AttachMode::Mirror => {
+                if self.input_owner.is_none() {
+                    owner_change = Some((None, OwnerChangeReason::Attach));
                 }
-            },
+            }
             AttachMode::Takeover => {
                 let reason = if self.input_owner.is_some() {
                     OwnerChangeReason::Takeover
@@ -3523,9 +3550,6 @@ impl SessionActor {
             snapshot,
         });
         self.emit(SessionEventWire::ClientJoined { client: cid, kind });
-        if let Some(n) = notice {
-            self.emit(SessionEventWire::SystemNotice(n));
-        }
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
@@ -3586,15 +3610,17 @@ impl SessionActor {
     /// pending prompts `None`, save, close PTYs. Replies on
     /// `CHECKPOINT_QUERY_ID` so `reload.rs` can await it per session.
     pub(crate) async fn checkpoint(&mut self, reason: CheckpointReason) {
+        let interrupt = match reason {
+            CheckpointReason::Reload => crate::engine::interrupt::InterruptReason::Restart,
+            CheckpointReason::HostRequest => crate::engine::interrupt::InterruptReason::Host,
+        };
+        // Before the revoke below cancels a driver turn.
+        self.note_cancel_cause(interrupt);
         // E-P3: driver does NOT survive reload (§3 S2/S5).
         if self.driver.is_some() {
             self.driver_revoke("daemon reloaded");
         }
         if self.streaming {
-            let interrupt = match reason {
-                CheckpointReason::Reload => crate::engine::interrupt::InterruptReason::Restart,
-                CheckpointReason::HostRequest => crate::engine::interrupt::InterruptReason::Host,
-            };
             self.cancel_turn(interrupt).await;
         }
         self.abort_compaction();
@@ -3712,6 +3738,9 @@ impl SessionActor {
                 }
             }
             SessionCommand::Cancel => {
+                // The user's cancel, even of a driver's turn: noted before
+                // the revoke below cancels that turn.
+                self.note_cancel_cause(crate::engine::interrupt::InterruptReason::User);
                 if self.driver.is_some() {
                     self.driver_revoke("canceled");
                 }
@@ -3752,6 +3781,12 @@ impl SessionActor {
             SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
             SessionCommand::Detach { client } => self.detach(client),
             SessionCommand::End { reason } => {
+                // `finish` cancels a running turn for this reason; note it
+                // before the revoke below cancels a driver turn first.
+                self.note_cancel_cause(match reason {
+                    EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+                    _ => crate::engine::interrupt::InterruptReason::Host,
+                });
                 if self.driver.is_some() {
                     self.driver_revoke("session ending");
                 }
@@ -3814,17 +3849,19 @@ impl SessionActor {
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
         );
+        // Quitting the client mid-turn is the user's interruption; every
+        // other end reason is the host's.
+        let interrupt = match reason {
+            EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+            _ => crate::engine::interrupt::InterruptReason::Host,
+        };
+        // Before the revoke below cancels a driver turn.
+        self.note_cancel_cause(interrupt);
         // E-P3: clean up driver before teardown.
         if self.driver.is_some() {
             self.driver_revoke("session ending");
         }
         if self.streaming {
-            // Quitting the client mid-turn is the user's interruption; every
-            // other end reason is the host's.
-            let interrupt = match reason {
-                EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
-                _ => crate::engine::interrupt::InterruptReason::Host,
-            };
             self.cancel_turn(interrupt).await;
         }
         self.abort_compaction();
