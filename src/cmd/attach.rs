@@ -345,6 +345,9 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow
         snap.conversation.api_messages.len(),
         if snap.streaming { "  streaming" } else { "" }
     ));
+    if let Some(owned) = snap.input_owned_elsewhere(c.t.client_id()) {
+        c.out(&format!("[system] {owned}\n"));
+    }
     for env in &snap.replay {
         c.render(env);
     }

@@ -3516,23 +3516,16 @@ impl SessionActor {
         self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
-        let mut notice: Option<String> = None;
         match mode {
             AttachMode::Observe => {}
-            AttachMode::Mirror => match self.input_owner {
-                None => owner_change = Some((None, OwnerChangeReason::Attach)),
-                Some(owner) => {
-                    let owner_kind = self
-                        .attached
-                        .get(&owner)
-                        .map(|a| format!("{:?}", a.meta.kind).to_lowercase())
-                        .unwrap_or_else(|| "?".into());
-                    notice = Some(format!(
-                        "input is owned by client #{} ({}); attach with --takeover to steal it",
-                        owner.0, owner_kind
-                    ));
+            // Input owned elsewhere: the joiner learns it from its snapshot
+            // (`AttachSnapshot::input_owned_elsewhere`), never from a notice
+            // broadcast to every client.
+            AttachMode::Mirror => {
+                if self.input_owner.is_none() {
+                    owner_change = Some((None, OwnerChangeReason::Attach));
                 }
-            },
+            }
             AttachMode::Takeover => {
                 let reason = if self.input_owner.is_some() {
                     OwnerChangeReason::Takeover
@@ -3557,9 +3550,6 @@ impl SessionActor {
             snapshot,
         });
         self.emit(SessionEventWire::ClientJoined { client: cid, kind });
-        if let Some(n) = notice {
-            self.emit(SessionEventWire::SystemNotice(n));
-        }
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
