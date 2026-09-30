@@ -1786,47 +1786,53 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
         width,
         height,
     };
+    // Borderless (Noodle): the screen behind dims, the prompt is a raised
+    // surface with a heavy warning-coloured bar down its left edge; the
+    // title leads the text. The border rows/columns become padding.
+    let theme = THEME.load();
+    let surface = theme.raised_surface(1.32);
+    let warn = theme.warning_color;
+    super::modal_kit::dim_backdrop(frame.buffer_mut(), area, modal_area);
     frame.render_widget(Clear, modal_area);
     let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", prompt.title),
-            Style::default()
-                .fg(THEME.load().warning_color)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.load().warning_color))
-        .style(Style::default().bg(THEME.load().bg));
-    let mut text: Vec<ratatui::text::Line<'_>> = prompt
-        .prompt
-        .lines()
-        .map(|l| {
-            ratatui::text::Line::from(Span::styled(
-                l.to_string(),
-                Style::default().fg(THEME.load().help_fg),
-            ))
+        .padding(ratatui::widgets::Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
         })
-        .collect();
+        .style(Style::default().bg(surface));
+    let mut text: Vec<ratatui::text::Line<'_>> = vec![ratatui::text::Line::from(Span::styled(
+        prompt.title.clone(),
+        Style::default().fg(warn).add_modifier(Modifier::BOLD),
+    ))];
+    text.extend(prompt.prompt.lines().map(|l| {
+        ratatui::text::Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme.claude_text),
+        ))
+    }));
     if text.is_empty() {
         text.push(ratatui::text::Line::from(""));
     }
     text.push(ratatui::text::Line::from(""));
+    let p = super::modal_kit::Palette::for_modal(&theme, None);
+    let hint = |h: &str| super::modal_kit::hint_line(&p, h, modal_area.width.saturating_sub(3));
     if is_confirm {
-        text.push(ratatui::text::Line::from(Span::styled(
-            "y allow · n/esc deny · server.auto_approve_confirms=true skips this",
-            Style::default().fg(THEME.load().muted),
-        )));
+        let mut l = hint("y allow  n/esc deny");
+        l.spans.push(Span::styled(
+            "   server.auto_approve_confirms=true skips this",
+            Style::default().fg(p.dim),
+        ));
+        text.push(l);
     } else {
         let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
         text.push(ratatui::text::Line::from(vec![
-            Span::styled("password: ", Style::default().fg(THEME.load().muted)),
-            Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
+            Span::styled("password: ", Style::default().fg(p.dim)),
+            Span::styled(masked, Style::default().fg(theme.input_fg)),
+            Span::styled("\u{2588}", Style::default().fg(warn)),
         ]));
-        text.push(ratatui::text::Line::from(Span::styled(
-            "Enter submit · Esc cancel",
-            Style::default().fg(THEME.load().muted),
-        )));
+        text.push(hint("enter submit  esc cancel"));
     }
     frame.render_widget(
         Paragraph::new(text)
@@ -1835,6 +1841,11 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
             .wrap(ratatui::widgets::Wrap { trim: false }),
         modal_area,
     );
+    for y in modal_area.top()..modal_area.bottom() {
+        if let Some(cell) = frame.buffer_mut().cell_mut((modal_area.x, y)) {
+            cell.set_symbol("\u{2503}").set_fg(warn).set_bg(surface);
+        }
+    }
 }
 
 /// Toast box dimensions, clamped so they ALWAYS fit a terminal of any size.
@@ -1870,27 +1881,35 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
         // toast_dims (a tiny tmux resize used to panic here with min > max).
         let (width, height) = toast_dims(content_width, lines.len(), area.width, area.height);
         let rect = super::toast::toast_rect(area, width, height, toast.position);
+        // Borderless (Noodle): a raised surface with a heavy accent bar down
+        // its left edge; the box's border cells become padding. P19.2:
+        // extension widgets may carry an accent (`ext.<id>.accent`); None =>
+        // border_active.
+        let theme = THEME.load();
+        let surface = theme.raised_surface(1.32);
+        let accent = toast.accent.unwrap_or(theme.border_active);
         let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            // P19.2: extension widgets may carry an accent resolved from
-            // `ext.<id>.accent`; None => border_active, identical to before.
-            .border_style(Style::default().fg(toast.accent.unwrap_or(THEME.load().border_active)))
-            .style(Style::default().bg(THEME.load().bg));
+            .padding(ratatui::widgets::Padding::uniform(1))
+            .style(Style::default().bg(surface));
         frame.render_widget(Clear, rect);
         let paragraph = if toast.has_rich_lines() {
             Paragraph::new(lines)
                 .block(block)
                 .wrap(Wrap { trim: false })
                 .alignment(ratatui::layout::Alignment::Center)
-                .style(Style::default().bg(THEME.load().bg))
+                .style(Style::default().bg(surface))
         } else {
             Paragraph::new(lines)
                 .block(block)
                 .wrap(Wrap { trim: true })
-                .style(Style::default().fg(THEME.load().help_fg))
+                .style(Style::default().fg(theme.claude_text).bg(surface))
         };
         frame.render_widget(paragraph, rect);
+        for y in rect.top()..rect.bottom() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((rect.x, y)) {
+                cell.set_symbol("\u{2503}").set_fg(accent).set_bg(surface);
+            }
+        }
     }
 }
 

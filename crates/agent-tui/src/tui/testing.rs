@@ -418,6 +418,18 @@ impl TestHarness {
 
     /// Seed a raw-markdown assistant `Text` message. Used by the P10
     /// copy-fidelity pins, which need known markdown source in the transcript.
+    /// Seed a user turn into the transcript.
+    pub fn push_user_message(&mut self, text: &str) -> &mut Self {
+        self.app.push_msg(ChatMessage::User(text.to_string()));
+        self
+    }
+
+    /// Seed a thinking block into the transcript.
+    pub fn push_thinking_message(&mut self, text: &str) -> &mut Self {
+        self.app.push_msg(ChatMessage::Thinking(text.to_string()));
+        self
+    }
+
     pub fn push_text_message(&mut self, text: &str) -> &mut Self {
         self.app.push_msg(ChatMessage::Text(text.to_string()));
         self

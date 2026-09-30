@@ -1958,7 +1958,10 @@ fn scenario_confirm_prompt_renders_dialog_not_password_box() {
     ] {
         assert!(frame.contains(line), "body line {line:?} must render:\n{frame}");
     }
-    assert!(frame.contains("y allow · n/esc deny"), "footer:\n{frame}");
+    assert!(
+        frame.contains("y allow") && frame.contains("n/esc deny"),
+        "footer:\n{frame}"
+    );
     assert!(
         !frame.contains("password:"),
         "confirm must NOT render the masked field:\n{frame}"
