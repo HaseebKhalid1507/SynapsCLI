@@ -37,7 +37,9 @@ impl Tool for SubagentStartTool {
          mid-run. Use this for parallel execution or when you want to continue \
          working while the subagent runs. For simple sequential delegation that \
          must block, use subagent instead. Provide either an agent name (resolves \
-         from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
+         from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly; \
+         give an inline subagent a short name so it is recognisable in the \
+         subagent panel."
     }
 
     fn parameters(&self) -> Value {
@@ -51,6 +53,10 @@ impl Tool for SubagentStartTool {
                 "system_prompt": {
                     "type": "string",
                     "description": "Inline system prompt for the subagent. Use when you don't have a named agent file."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\"."
                 },
                 "task": {
                     "type": "string",
@@ -145,7 +151,7 @@ impl Tool for SubagentStartTool {
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
 
-        let label = agent_name.as_deref().unwrap_or("inline").to_string();
+        let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
         let task_preview: String = task.chars().take(80).collect();
         let task_full = task.clone();
 
@@ -598,5 +604,31 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .starts_with("sa_"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_start_inline_name_labels_the_handle() {
+        let tool = SubagentStartTool;
+        let mut ctx = create_tool_context();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+
+        let params = json!({
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "name": "gif recorder",
+            "task": "Say ok",
+            "model": "anthropic/claude-sonnet-4-6",
+            "timeout": 1
+        });
+
+        let result = tool.execute(params, ctx).await.expect("dispatch");
+        let body: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(body["agent_name"], "gif-recorder");
+        let handle_id = body["handle_id"].as_str().unwrap();
+        let reg = registry.lock().unwrap();
+        assert_eq!(
+            reg.get(handle_id).expect("registered").agent_name,
+            "gif-recorder"
+        );
     }
 }
