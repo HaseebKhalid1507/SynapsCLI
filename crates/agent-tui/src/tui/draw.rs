@@ -1510,16 +1510,11 @@ pub(crate) fn render_frame_into(
             neon::paint_cursor(frame.buffer_mut(), input_area, &slab, at);
         }
 
-        // Status tab hanging off the bottom edge (key bright, word dim).
-        use neon::Tone::{Key, Live, SoftKey, Word};
+        // Hint tab hanging off the bottom edge (key bright, word dim). None
+        // while streaming: the spinner in the prompt column says it all.
+        use neon::Tone::{Key, SoftKey, Word};
         let tab: Option<Vec<(String, neon::Tone)>> = if model.streaming {
-            Some(vec![
-                (format!("{} working ", SPINNER_FRAMES[spinner_idx]), Live),
-                (format!("{:.1}s", model.prompt_fx.stream_secs), Word),
-                ("   ".into(), Word),
-                ("esc".into(), Key),
-                (" abort".into(), Word),
-            ])
+            None
         } else if model
             .ghost_hint
             .as_ref()
@@ -2075,7 +2070,7 @@ mod neon_prompt_tests {
     }
 
     #[test]
-    fn streaming_swaps_the_prompt_for_a_spinner_and_hangs_a_status_tab() {
+    fn streaming_swaps_the_prompt_for_a_spinner_with_no_status_tab() {
         let mut h = TestHarness::boot_with_size(W, H);
         h.set_streaming(true);
         let buf = h.render().clone();
@@ -2087,8 +2082,10 @@ mod neon_prompt_tests {
         );
         let rim = row(&buf, bottom);
         assert!(
-            rim.contains("working") && rim.contains("esc abort"),
-            "tab: {rim:?}"
+            rim.trim_matches(|c| c == ' ' || c == '\u{259D}' || c == '\u{2598}')
+                .chars()
+                .all(|c| c == '\u{2580}'),
+            "bottom edge is plain while streaming: {rim:?}"
         );
         assert!(
             row(&buf, top + 1).contains("steer or queue"),

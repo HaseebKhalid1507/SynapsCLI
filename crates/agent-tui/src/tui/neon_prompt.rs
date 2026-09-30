@@ -121,8 +121,6 @@ pub(crate) struct PromptFx {
     pub(crate) trail: f32,
     /// 0..1 flash after sending.
     pub(crate) pulse: f32,
-    /// Seconds the current turn has been streaming.
-    pub(crate) stream_secs: f32,
     /// 0..1 how dimmed the prompt is: 1 while a turn streams (the agent has
     /// the floor), 0 when idle, eased between over [`DIM_FADE`].
     pub(crate) dim: f32,
@@ -252,10 +250,8 @@ impl PromptClock {
             }
         }
         let streamed = Self::secs(now, self.stream_since);
-        let stream_secs = if streaming { streamed } else { 0.0 };
         if !self.enabled {
             return PromptFx {
-                stream_secs,
                 dim: if streaming { 1.0 } else { 0.0 },
                 ..PromptFx::default()
             };
@@ -268,7 +264,6 @@ impl PromptClock {
             },
             trail: self.trail(now),
             pulse: self.pulse(now),
-            stream_secs,
             dim: self.dim(now, streaming),
             arrive: self.arrive(now, streaming),
         }
@@ -594,8 +589,6 @@ pub(crate) enum Tone {
     SoftKey,
     /// The explaining word, a count, a time (the legible dim).
     Word,
-    /// Live activity (`status_streaming`).
-    Live,
 }
 
 impl Slab {
@@ -609,7 +602,6 @@ impl Slab {
                 color(mix(key, word, 0.5))
             }
             Tone::Word => self.dim_fg(),
-            Tone::Live => self.spinner_fg(),
         }
     }
 }
@@ -831,26 +823,26 @@ mod tests {
         assert_eq!(
             fx,
             PromptFx {
-                stream_secs: fx.stream_secs,
                 dim: 1.0,
                 ..PromptFx::default()
             },
-            "no motion when disabled: the elapsed clock, and the dim snaps"
+            "no motion when disabled: the dim snaps"
         );
     }
 
     #[test]
-    fn stream_start_resets_the_stream_clock() {
+    fn stream_start_restarts_the_sweep() {
         let t0 = Instant::now();
         let mut clock = PromptClock::with_enabled(t0, true);
         let t1 = t0 + Duration::from_secs(30);
-        assert_eq!(clock.frame(t1, true).stream_secs, 0.0);
-        let fx = clock.frame(t1 + Duration::from_millis(4200), true);
-        assert!((fx.stream_secs - 4.2).abs() < 0.01);
         assert_eq!(
-            clock.frame(t1 + Duration::from_secs(5), false).stream_secs,
-            0.0
+            clock.frame(t1, true).shimmer,
+            0.0,
+            "sweep starts at the edge"
         );
+        let fx = clock.frame(t1 + Duration::from_secs_f32(SHIMMER_PERIOD / 2.0), true);
+        assert!((fx.shimmer - 0.5).abs() < 0.01);
+        assert_eq!(clock.frame(t1 + Duration::from_secs(5), false).shimmer, 0.0);
     }
 }
 
