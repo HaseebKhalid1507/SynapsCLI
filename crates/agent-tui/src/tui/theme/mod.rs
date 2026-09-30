@@ -367,6 +367,26 @@ fn wcag_contrast(a: Color, b: Color) -> f64 {
 }
 
 impl Theme {
+    /// A raised surface on the chrome (`bg`), for selected rows and popups in
+    /// modals (Noodle's `backgroundElement`): `bg` lifted toward `input_fg`
+    /// just until it stands `step` off the chrome (WCAG contrast).
+    pub(crate) fn raised_surface(&self, step: f64) -> Color {
+        let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (self.bg, self.input_fg) else {
+            return self.bg;
+        };
+        let mut out = self.bg;
+        for i in 1..=80u8 {
+            let t = f64::from(i) * 0.005;
+            let mix =
+                |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+            out = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+            if wcag_contrast(out, self.bg) >= step {
+                break;
+            }
+        }
+        out
+    }
+
     /// Secondary text on the chrome (`bg`): `muted` lifted toward `input_fg`
     /// just until it reads at 4.5:1 (WCAG AA). Several palettes' `muted` and
     /// `help_fg` sit near 2:1 on chrome, which is the "dimmed text is low

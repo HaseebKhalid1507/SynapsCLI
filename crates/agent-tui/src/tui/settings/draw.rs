@@ -1,10 +1,255 @@
-use super::super::theme::{ModalKind, THEME};
+//! Settings modal — borderless, after Noodle's settings view
+//! (github.com/wilfredinni/noodle, `src/ui/settings/SettingsView.tsx`).
+//!
+//! The screen behind dims (Noodle's modal backdrop); the modal is a plain
+//! chrome-coloured surface with no box. A sidebar of categories sits beside
+//! the category's rows. Selection is a raised surface plus a heavy `┃` bar on
+//! the left — in the accent colour for the focused pane, muted for the other.
+//! The selected setting's description sits under it; hints follow the
+//! footer's rule: key bright, word dim.
+
+use super::super::theme::{ModalKind, Theme, THEME};
 use super::schema::{visible_categories, EditorKind, SettingDef};
 use super::{ActiveEditor, Focus, RuntimeSnapshot, SettingsState};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+
+/// Sidebar width (bar + label).
+const SIDEBAR_W: u16 = 24;
+/// Label column width in the rows pane.
+const LABEL_W: usize = 22;
+/// How far the selection surface stands off the chrome.
+const SELECTED_STEP: f64 = 1.18;
+/// How far popups (pickers, custom editors) stand off the chrome.
+const POPUP_STEP: f64 = 1.32;
+/// Share of the way each colour behind the modal moves toward black.
+const BACKDROP_DIM: f32 = 0.5;
+
+/// The palette the modal draws with.
+struct Palette {
+    panel: Color,
+    selected: Color,
+    popup: Color,
+    accent: Color,
+    title: Color,
+    text: Color,
+    value: Color,
+    dim: Color,
+    error: Color,
+}
+
+impl Palette {
+    fn from_theme(t: &Theme) -> Self {
+        Self {
+            panel: t.bg,
+            selected: t.raised_surface(SELECTED_STEP),
+            popup: t.raised_surface(POPUP_STEP),
+            // P19.1 per-part overrides keep working: `settings.border` is the
+            // accent (there is no border any more), `settings.title` the title.
+            accent: t.modal_border(ModalKind::Settings),
+            title: t.modal_title(ModalKind::Settings).unwrap_or(t.claude_label),
+            text: t.claude_text,
+            value: t.claude_label,
+            dim: t.chrome_dim(),
+            error: t.error_color,
+        }
+    }
+}
+
+/// Darken every cell of `area` outside `keep` toward black: the modal's
+/// backdrop, so the modal reads as in front without a frame around it.
+fn dim_backdrop(buf: &mut Buffer, area: Rect, keep: Rect) {
+    let dim = |c: Color| match c {
+        Color::Rgb(r, g, b) => {
+            let f = |v: u8| (f32::from(v) * (1.0 - BACKDROP_DIM)).round() as u8;
+            Color::Rgb(f(r), f(g), f(b))
+        }
+        other => other,
+    };
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if keep.contains((x, y).into()) {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                let (fg, bg) = (dim(cell.fg), dim(cell.bg));
+                cell.set_fg(fg).set_bg(bg);
+            }
+        }
+    }
+}
+
+/// Fill `rect` with `bg`.
+fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
+    buf.set_style(rect, Style::default().bg(bg));
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(" ");
+            }
+        }
+    }
+}
+
+/// One selectable row: `┃` bar (selected only), label column, value.
+/// Selected rows sit on the raised surface across the full `width`.
+fn row_line(
+    p: &Palette,
+    width: u16,
+    label: &str,
+    value: Vec<Span<'static>>,
+    selected: bool,
+    focused: bool,
+) -> Line<'static> {
+    let bg = if selected { p.selected } else { p.panel };
+    let bar = if selected {
+        Span::styled(
+            "\u{2503} ",
+            Style::default()
+                .fg(if focused { p.accent } else { p.dim })
+                .bg(bg),
+        )
+    } else {
+        Span::styled("  ", Style::default().bg(bg))
+    };
+    let label_style = if selected && focused {
+        Style::default()
+            .fg(p.text)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default().fg(p.text).bg(bg)
+    } else {
+        Style::default().fg(p.dim).bg(bg)
+    };
+    let mut spans = vec![
+        bar,
+        Span::styled(format!("{label:<LABEL_W$} "), label_style),
+    ];
+    spans.extend(value.into_iter().map(|s| {
+        let st = s.style.bg(bg);
+        s.style(st)
+    }));
+    pad_to(&mut spans, width, bg);
+    Line::from(spans)
+}
+
+/// Right-pad a line's spans with `bg` to `width` cells.
+fn pad_to(spans: &mut Vec<Span<'static>>, width: u16, bg: Color) {
+    let used: usize = spans
+        .iter()
+        .map(|s| super::super::text_metrics::width(&s.content))
+        .sum();
+    let pad = usize::from(width).saturating_sub(used);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    }
+}
+
+/// A plain value in the value colour (selected) or text colour.
+fn value_span(p: &Palette, v: String, selected: bool) -> Vec<Span<'static>> {
+    let fg = if selected { p.value } else { p.text };
+    vec![Span::styled(v, Style::default().fg(fg))]
+}
+
+/// Cycler value while selected: `‹ value ›` with dim arrows.
+fn cycler_spans(p: &Palette, v: String) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("\u{2039} ", Style::default().fg(p.dim)),
+        Span::styled(v, Style::default().fg(p.value).add_modifier(Modifier::BOLD)),
+        Span::styled(" \u{203a}", Style::default().fg(p.dim)),
+    ]
+}
+
+/// An inline text editor: the buffer, a block cursor, and an optional error.
+fn editor_spans(p: &Palette, buffer: &str, error: Option<&String>) -> Vec<Span<'static>> {
+    let mut v = vec![
+        Span::styled(buffer.to_string(), Style::default().fg(p.value)),
+        Span::styled("\u{2588}", Style::default().fg(p.accent)),
+    ];
+    if let Some(err) = error {
+        v.push(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(p.error),
+        ));
+    }
+    v
+}
+
+/// A detail line under the selected row (description, note, error),
+/// indented to the label column and wrapped to `width`.
+fn detail_lines(text: &str, fg: Color, width: u16, bg: Color) -> Vec<Line<'static>> {
+    let indent = "  ";
+    let w = usize::from(width).saturating_sub(indent.len() + 1).max(10);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > w {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out.into_iter()
+        .map(|l| {
+            let mut spans = vec![Span::styled(
+                format!("{indent}{l}"),
+                Style::default().fg(fg).bg(bg),
+            )];
+            pad_to(&mut spans, width, bg);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Render `lines` into `area`, scrolled so rows `focus.0..focus.1` (the
+/// selected row and its details) stay in view.
+fn render_scrolled(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+) {
+    let h = usize::from(area.height);
+    let offset = if focus.1 > h {
+        (focus.1 - h).min(focus.0)
+    } else {
+        0
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
+}
+
+/// Hints in the footer's style: segments separated by two spaces in the
+/// source strings; the first word of each is the key (bright), the rest dim.
+fn hint_line(p: &Palette, hint: &str, width: u16) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (i, seg) in hint.split("  ").filter(|s| !s.is_empty()).enumerate() {
+        let (key, word) = seg.split_once(' ').unwrap_or((seg, ""));
+        let w = super::super::text_metrics::width(seg) + if i > 0 { 3 } else { 0 };
+        if used + w > usize::from(width) {
+            break; // drop whole segments when narrow
+        }
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(key.to_string(), Style::default().fg(p.text)));
+        if !word.is_empty() {
+            spans.push(Span::styled(format!(" {word}"), Style::default().fg(p.dim)));
+        }
+        used += w;
+    }
+    Line::from(spans)
+}
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
@@ -20,87 +265,138 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
         height: h,
     };
 
-    frame.render_widget(Clear, modal);
-    // P19.1: per-part chrome. Border resolves to the `settings.border`
-    // override if set, else the shared `border_active` base token (identical
-    // to pre-P19.1). Title style is applied ONLY when `settings.title` is set,
-    // so the unset path leaves the title exactly as before.
     let theme = THEME.load();
-    let mut block = Block::default()
-        .title(" Settings ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.modal_border(ModalKind::Settings)))
-        .style(Style::default().bg(theme.bg));
-    if let Some(tc) = theme.modal_title(ModalKind::Settings) {
-        block = block.title_style(Style::default().fg(tc));
+    let p = Palette::from_theme(&theme);
+    dim_backdrop(frame.buffer_mut(), area, modal);
+    frame.render_widget(Clear, modal);
+    fill(frame.buffer_mut(), modal, p.panel);
+
+    // Padding: 2 columns, 1 row. Header, blank, body, blank, hints.
+    let inner = Rect {
+        x: modal.x + 2,
+        y: modal.y + 1,
+        width: modal.width.saturating_sub(4),
+        height: modal.height.saturating_sub(2),
+    };
+    if inner.height < 5 || inner.width < SIDEBAR_W + 10 {
+        return;
     }
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+    let header = Rect { height: 1, ..inner };
+    let footer = Rect {
+        y: inner.bottom() - 1,
+        height: 1,
+        ..inner
+    };
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(4),
+        ..inner
+    };
+    let sidebar = Rect {
+        width: SIDEBAR_W,
+        ..body
+    };
+    let main = Rect {
+        x: body.x + SIDEBAR_W + 2,
+        width: body.width.saturating_sub(SIDEBAR_W + 2),
+        ..body
+    };
 
-    let [content, footer_bar] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-    let [sidebar, main] =
-        Layout::horizontal([Constraint::Length(20), Constraint::Min(1)]).areas(content);
+    let title = Line::from(vec![Span::styled(
+        "Settings",
+        Style::default().fg(p.title).add_modifier(Modifier::BOLD),
+    )]);
+    frame.render_widget(Paragraph::new(title), header);
+    let close = hint_line(&p, "esc close", header.width);
+    frame.render_widget(
+        Paragraph::new(close).alignment(ratatui::layout::Alignment::Right),
+        header,
+    );
 
-    render_categories(frame, sidebar, state, snap);
-    render_settings(frame, main, state, snap);
-    render_footer(frame, footer_bar, state, snap);
+    render_categories(frame, sidebar, state, snap, &p);
+    render_settings(frame, main, state, snap, &p);
+    render_footer(frame, footer, state, snap, &p);
 
     if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
-        render_plugin_custom_editor(frame, main, render);
+        render_plugin_custom_editor(frame, main, render, &p);
     }
 }
 
-fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+fn render_categories(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    snap: &RuntimeSnapshot,
+    p: &Palette,
+) {
+    let focused = state.focus == Focus::Left;
     let mut lines = Vec::new();
     let cats = visible_categories(&snap.lifecycle_claims);
     let n_builtin = cats.len();
     for (i, cat) in cats.iter().enumerate() {
-        let marker = if i == state.category_idx {
-            "▸ "
-        } else {
-            "  "
-        };
-        let style = if i == state.category_idx && state.focus == Focus::Left {
-            Style::default().fg(THEME.load().claude_label)
-        } else if i == state.category_idx {
-            Style::default().fg(THEME.load().claude_text)
-        } else {
-            Style::default().fg(THEME.load().help_fg)
-        };
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("{}{}", marker, cat.label()), style),
-        ]));
+        lines.push(row_line(
+            p,
+            area.width,
+            cat.label(),
+            Vec::new(),
+            i == state.category_idx,
+            focused,
+        ));
     }
     for (i, pcat) in snap.plugin_categories.iter().enumerate() {
-        let abs = n_builtin + i;
-        let marker = if abs == state.category_idx {
-            "▸ "
-        } else {
-            "  "
-        };
-        let style = if abs == state.category_idx && state.focus == Focus::Left {
-            Style::default().fg(THEME.load().claude_label)
-        } else if abs == state.category_idx {
-            Style::default().fg(THEME.load().claude_text)
-        } else {
-            Style::default().fg(THEME.load().help_fg)
-        };
-        // Source label: "<Label> (<plugin>)" so users can tell who owns it.
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                format!("{}{} ({})", marker, pcat.label, pcat.plugin),
-                style,
+        let selected = n_builtin + i == state.category_idx;
+        // Source label: the plugin that owns it, dim, so users can audit.
+        let mut line = row_line(p, area.width, &pcat.label, Vec::new(), selected, focused);
+        let owner = format!(" {}", pcat.plugin);
+        if let Some(label) = line.spans.get_mut(1) {
+            let trimmed = format!("{} ", pcat.label);
+            *label = Span::styled(trimmed, label.style);
+        }
+        line.spans.insert(
+            2,
+            Span::styled(
+                owner,
+                Style::default()
+                    .fg(p.dim)
+                    .bg(if selected { p.selected } else { p.panel }),
             ),
-        ]));
+        );
+        lines.push(line);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    let sel = state.category_idx;
+    render_scrolled(frame, area, lines, (sel, sel + 1));
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+/// The category title at the top of the rows pane, and a blank line.
+fn section_title(p: &Palette, title: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![Span::styled(
+            title.to_string(),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+    ]
+}
+
+/// A note / error attached to a row (`row_error`): notes dim, errors red.
+fn note_lines(p: &Palette, msg: &str, width: u16) -> Vec<Line<'static>> {
+    let color = if msg.starts_with("saved") {
+        p.dim
+    } else {
+        p.error
+    };
+    detail_lines(msg, color, width, p.panel)
+}
+
+fn render_settings(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    snap: &RuntimeSnapshot,
+    p: &Palette,
+) {
     if state.is_plugin_category(snap) {
-        render_plugin_category(frame, area, state, snap);
+        render_plugin_category(frame, area, state, snap, p);
         return;
     }
     let current_cat = visible_categories(&snap.lifecycle_claims)
@@ -108,25 +404,22 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         .copied()
         .unwrap_or(super::schema::Category::Plugins);
     if current_cat == super::schema::Category::Plugins {
-        render_plugins_list(frame, area, state, snap);
+        render_plugins_list(frame, area, state, snap, p);
         return;
     }
     if current_cat == super::schema::Category::Providers {
-        render_providers_list(frame, area, state, snap);
+        render_providers_list(frame, area, state, snap, p);
         return;
     }
+    let focused = state.focus == Focus::Right;
     let settings = state.current_settings(snap);
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
-    let mut lines = Vec::new();
+    let mut lines = section_title(p, current_cat.label());
+    let mut focus = (0, 0);
     for (i, def) in settings.iter().enumerate() {
-        let selected = i == state.setting_idx && state.focus == Focus::Right;
-        let style = if selected {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
+        let selected = i == state.setting_idx && focused;
         let current_value = current_value_for(def, snap);
-        let value_display = if selected {
+        let value = if selected && focused {
             match (&state.edit_mode, &def.editor) {
                 (
                     Some(ActiveEditor::Text {
@@ -136,54 +429,43 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
                         ..
                     }),
                     _,
-                ) if *setting_key == def.key => {
-                    let mut s = format!("[{}_]", buffer);
-                    if let Some(err) = error {
-                        s.push_str(&format!("  ! {}", err));
-                    }
-                    s
-                }
+                ) if *setting_key == def.key => editor_spans(p, buffer, error.as_ref()),
                 (
                     Some(ActiveEditor::CustomModel {
                         buffer,
                         setting_key,
                     }),
                     _,
-                ) if *setting_key == def.key => {
-                    format!("[{}_]", buffer)
-                }
+                ) if *setting_key == def.key => editor_spans(p, buffer, None),
                 (None, EditorKind::Cycler(_)) | (None, EditorKind::DynamicCycler) => {
-                    format!("◀ {} ▶", current_value)
+                    cycler_spans(p, current_value)
                 }
-                _ => current_value,
+                _ => value_span(p, current_value, true),
             }
         } else {
-            current_value
+            value_span(p, current_value, false)
         };
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("  {:<20} {}", def.label, value_display), style),
-        ]));
-        if let Some((key, msg)) = &state.row_error {
-            if selected_key == Some(key.as_str()) && i == state.setting_idx {
-                let is_note = msg.starts_with("saved");
-                let color = if is_note {
-                    THEME.load().help_fg
-                } else {
-                    THEME.load().error_color
-                };
-                lines.push(ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
-                ]));
+        let start = lines.len();
+        lines.push(row_line(p, area.width, def.label, value, selected, focused));
+        if selected {
+            if !def.help.is_empty() {
+                lines.extend(detail_lines(def.help, p.dim, area.width, p.panel));
             }
+            if let Some((key, msg)) = &state.row_error {
+                if selected_key == Some(key.as_str()) {
+                    lines.extend(note_lines(p, msg, area.width));
+                }
+            }
+            focus = (start, lines.len());
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    render_scrolled(frame, area, lines, focus);
 
     if let Some(ActiveEditor::Picker {
         options, cursor, ..
     }) = &state.edit_mode
     {
-        render_picker(frame, area, options, *cursor);
+        render_picker(frame, area, options, *cursor, p);
     }
 }
 
@@ -192,30 +474,29 @@ fn render_plugin_category(
     area: Rect,
     state: &SettingsState,
     snap: &RuntimeSnapshot,
+    p: &Palette,
 ) {
     use super::input::plugin_field_current_value;
     let cat = match state.current_plugin_category(snap) {
         Some(c) => c,
         None => return,
     };
-    let mut lines: Vec<ratatui::text::Line> = Vec::new();
-    // Header — makes the source explicit so users can audit.
-    lines.push(ratatui::text::Line::from(vec![
-        ratatui::text::Span::styled(
-            format!("  Plugin: {}", cat.plugin),
-            Style::default().fg(THEME.load().help_fg),
-        ),
-    ]));
+    let focused = state.focus == Focus::Right;
+    let mut lines = section_title(p, &cat.label);
+    // The source, explicit, so users can audit what they're changing.
+    lines.insert(
+        1,
+        Line::from(vec![
+            Span::styled("from ", Style::default().fg(p.dim)),
+            Span::styled(cat.plugin.clone(), Style::default().fg(p.text)),
+        ]),
+    );
+    let mut focus = (0, 0);
     for (i, field) in cat.fields.iter().enumerate() {
-        let selected = i == state.setting_idx && state.focus == Focus::Right;
-        let style = if selected {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
+        let selected = i == state.setting_idx && focused;
         let current = plugin_field_current_value(&cat.plugin, field);
         use synaps_cli::skills::registry::PluginSettingsEditor as PE;
-        let display = if selected {
+        let value = if selected && focused {
             match (&state.edit_mode, &field.editor) {
                 (
                     Some(super::ActiveEditor::PluginText {
@@ -227,13 +508,9 @@ fn render_plugin_category(
                     }),
                     _,
                 ) if *plugin_id == cat.plugin && *key == field.key => {
-                    let mut s = format!("[{}_]", buffer);
-                    if let Some(err) = error {
-                        s.push_str(&format!("  ! {}", err));
-                    }
-                    s
+                    editor_spans(p, buffer, error.as_ref())
                 }
-                (None, PE::Cycler { .. }) => format!("◀ {} ▶", current),
+                (None, PE::Cycler { .. }) => cycler_spans(p, current),
                 (
                     Some(super::ActiveEditor::PluginCustom {
                         plugin_id,
@@ -242,35 +519,38 @@ fn render_plugin_category(
                     }),
                     PE::Custom,
                 ) if *plugin_id == cat.plugin && *active_field == field.key => {
-                    "(custom editor open)".to_string()
+                    value_span(p, "editing\u{2026}".to_string(), true)
                 }
-                (_, PE::Custom) => "(custom — Enter to edit)".to_string(),
-                _ => current.clone(),
+                (_, PE::Custom) => vec![
+                    Span::styled("enter", Style::default().fg(p.text)),
+                    Span::styled(" to edit", Style::default().fg(p.dim)),
+                ],
+                _ => value_span(p, current.clone(), true),
             }
         } else if matches!(field.editor, PE::Custom) {
-            "(custom)".to_string()
+            vec![Span::styled("custom", Style::default().fg(p.dim))]
         } else {
-            current.clone()
+            value_span(p, current.clone(), false)
         };
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("  {:<20} {}", field.label, display), style),
-        ]));
-        if let Some((rk, msg)) = &state.row_error {
-            let want = format!("plugin.{}.{}", cat.plugin, field.key);
-            if selected && rk == &want {
-                let is_note = msg.starts_with("saved");
-                let color = if is_note {
-                    THEME.load().help_fg
-                } else {
-                    THEME.load().error_color
-                };
-                lines.push(ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
-                ]));
+        let start = lines.len();
+        lines.push(row_line(
+            p,
+            area.width,
+            &field.label,
+            value,
+            selected,
+            focused,
+        ));
+        if selected {
+            if let Some((rk, msg)) = &state.row_error {
+                if rk == &format!("plugin.{}.{}", cat.plugin, field.key) {
+                    lines.extend(note_lines(p, msg, area.width));
+                }
             }
+            focus = (start, lines.len());
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    render_scrolled(frame, area, lines, focus);
 }
 
 fn render_plugins_list(
@@ -278,68 +558,66 @@ fn render_plugins_list(
     area: Rect,
     state: &SettingsState,
     snap: &RuntimeSnapshot,
+    p: &Palette,
 ) {
-    let mut lines = Vec::new();
+    let focused = state.focus == Focus::Right;
+    let mut lines = section_title(p, "Plugins");
 
-    // Row 0 — action row. Styled distinctly so it reads as a button, not a plugin.
-    let action_selected = state.setting_idx == 0 && state.focus == Focus::Right;
-    let action_style = if action_selected {
-        Style::default()
-            .fg(THEME.load().claude_label)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(THEME.load().claude_text)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    };
-    lines.push(ratatui::text::Line::from(vec![
-        ratatui::text::Span::styled("  + Open Plugin Marketplace…", action_style),
-    ]));
-
-    // Surface load errors / notes attached to the action row.
+    // Row 0 — the marketplace action, styled as an action, not a plugin.
+    let start = lines.len();
+    let action_selected = state.setting_idx == 0 && focused;
+    lines.push(row_line(
+        p,
+        area.width,
+        "+ Plugin marketplace",
+        if action_selected {
+            vec![
+                Span::styled("enter", Style::default().fg(p.text)),
+                Span::styled(" to open", Style::default().fg(p.dim)),
+            ]
+        } else {
+            Vec::new()
+        },
+        action_selected,
+        focused,
+    ));
+    // Load errors / notes attached to the action row.
     if let Some((key, msg)) = &state.row_error {
         if key == "plugins" {
-            let is_note = msg.starts_with("saved");
-            let color = if is_note {
-                THEME.load().help_fg
-            } else {
-                THEME.load().error_color
-            };
-            lines.push(ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
-            ]));
+            lines.extend(note_lines(p, msg, area.width));
         }
     }
+    let mut focus = if action_selected {
+        (start, lines.len())
+    } else {
+        (0, 0)
+    };
 
     // Rows 1..=n — installed plugins at snap.plugins[idx - 1].
-    for (i, p) in snap.plugins.iter().enumerate() {
+    for (i, plug) in snap.plugins.iter().enumerate() {
         let row_idx = i + 1;
-        let disabled = snap.disabled_plugins.iter().any(|d| d == &p.name);
-        let status = if disabled {
-            "✗ disabled"
+        let disabled = snap.disabled_plugins.iter().any(|d| d == &plug.name);
+        let selected = row_idx == state.setting_idx && focused;
+        let mut value = vec![if disabled {
+            Span::styled("\u{25cb} disabled", Style::default().fg(p.dim))
         } else {
-            "✓ enabled"
-        };
-        let skills_part = if p.skill_count > 0 {
-            format!("  ({} skills)", p.skill_count)
-        } else {
-            String::new()
-        };
-        let selected = row_idx == state.setting_idx && state.focus == Focus::Right;
-        let style = if selected {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                format!("  {:<20} {}{}", p.name, status, skills_part),
-                style,
-            ),
-        ]));
+            Span::styled("\u{25cf} enabled", Style::default().fg(p.value))
+        }];
+        if plug.skill_count > 0 {
+            value.push(Span::styled(
+                format!("   {} skills", plug.skill_count),
+                Style::default().fg(p.dim),
+            ));
+        }
+        if selected {
+            focus = (lines.len(), lines.len() + 1);
+        }
+        lines.push(row_line(
+            p, area.width, &plug.name, value, selected, focused,
+        ));
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    render_scrolled(frame, area, lines, focus);
 }
 
 fn render_providers_list(
@@ -347,147 +625,76 @@ fn render_providers_list(
     area: Rect,
     state: &SettingsState,
     snap: &RuntimeSnapshot,
+    p: &Palette,
 ) {
+    let focused = state.focus == Focus::Right;
     let providers = synaps_cli::runtime::openai::registry::providers();
-    let total_rows = providers.len() + 1; // +1 for Local
-    let visible_height = area.height as usize;
-    let selected = if state.focus == Focus::Right {
-        state.setting_idx
-    } else {
-        usize::MAX
-    };
+    let mut lines = section_title(p, "Providers");
+    let mut focus = (0, 0);
 
-    // Scroll offset — keep selected row in view (no scroll when focus is on left pane)
-    let scroll_offset = if selected == usize::MAX {
-        0
-    } else if selected >= visible_height {
-        selected.saturating_sub(visible_height - 1)
-    } else {
-        0
-    };
-
-    let mut lines = Vec::new();
-
-    // Row 0: Local models
-    if scroll_offset == 0 {
-        let is_selected = 0 == selected;
-        let style = if is_selected {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
-        let local_url = snap
-            .local_url_explicit
-            .clone()
-            .unwrap_or_else(|| "localhost:11434".to_string());
-
-        let local_status = if snap.local_url_explicit.is_some() {
-            format!("✅ {}", local_url)
-        } else {
-            format!("⬚ default ({})", local_url)
-        };
-
-        // Show editor if active on this row
-        let display = if let Some(ActiveEditor::ApiKey {
+    // Row 0: local models.
+    let selected = state.setting_idx == 0 && focused;
+    let local_url = snap
+        .local_url_explicit
+        .clone()
+        .unwrap_or_else(|| "localhost:11434".to_string());
+    let value = match &state.edit_mode {
+        Some(ActiveEditor::ApiKey {
             provider_id,
             buffer,
-        }) = &state.edit_mode
-        {
-            if provider_id == "local.url" {
-                format!("[{}_]", buffer)
-            } else {
-                local_status
-            }
-        } else {
-            local_status
-        };
-
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                format!("  {:<20} {}", "Local (Ollama/etc)", display),
-                style,
-            ),
-        ]));
-
+        }) if provider_id == "local.url" => editor_spans(p, buffer, None),
+        _ if snap.local_url_explicit.is_some() => vec![
+            Span::styled("\u{25cf} ", Style::default().fg(p.value)),
+            Span::styled(local_url, Style::default().fg(p.text)),
+        ],
+        _ => vec![
+            Span::styled("\u{25cb} default ", Style::default().fg(p.dim)),
+            Span::styled(local_url, Style::default().fg(p.dim)),
+        ],
+    };
+    let start = lines.len();
+    lines.push(row_line(
+        p,
+        area.width,
+        "Local (Ollama/etc)",
+        value,
+        selected,
+        focused,
+    ));
+    if selected {
         if let Some((key, msg)) = &state.row_error {
-            if key == "provider.local.url" && is_selected {
-                let is_note = msg.starts_with("saved");
-                let color = if is_note {
-                    THEME.load().help_fg
-                } else {
-                    THEME.load().error_color
-                };
-                lines.push(ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
-                ]));
+            if key == "provider.local.url" {
+                lines.extend(note_lines(p, msg, area.width));
             }
         }
+        focus = (start, lines.len());
     }
 
-    // Rows 1..=N: Registry providers
-    for (i, p) in providers.iter().enumerate() {
-        let row_idx = i + 1; // offset by 1 for Local row
-        if row_idx < scroll_offset || row_idx >= scroll_offset + visible_height {
-            continue;
-        }
-        let is_selected = row_idx == selected;
-        let style = if is_selected {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
-
-        let status = if let Some(ActiveEditor::ApiKey {
-            provider_id,
-            buffer,
-        }) = &state.edit_mode
-        {
-            if provider_id == p.key {
+    // Rows 1..=N: registry providers.
+    for (i, prov) in providers.iter().enumerate() {
+        let selected = i + 1 == state.setting_idx && focused;
+        let value = match &state.edit_mode {
+            Some(ActiveEditor::ApiKey {
+                provider_id,
+                buffer,
+            }) if provider_id == prov.key => {
                 let masked: String = "*".repeat(buffer.len().min(32));
-                format!("[{}_]", masked)
-            } else {
-                provider_status(p, snap)
+                editor_spans(p, &masked, None)
             }
-        } else {
-            provider_status(p, snap)
+            _ => provider_status_spans(p, &provider_status(prov, snap)),
         };
-
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("  {:<20} {}", p.name, status), style),
-        ]));
-
-        if let Some((key, msg)) = &state.row_error {
-            if key == &format!("provider.{}", p.key) && is_selected {
-                let is_note = msg.starts_with("saved");
-                let color = if is_note {
-                    THEME.load().help_fg
-                } else {
-                    THEME.load().error_color
-                };
-                lines.push(ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
-                ]));
+        let start = lines.len();
+        lines.push(row_line(p, area.width, prov.name, value, selected, focused));
+        if selected {
+            if let Some((key, msg)) = &state.row_error {
+                if key == &format!("provider.{}", prov.key) {
+                    lines.extend(note_lines(p, msg, area.width));
+                }
             }
+            focus = (start, lines.len());
         }
     }
-
-    // Scroll indicators
-    if scroll_offset > 0 {
-        lines.insert(
-            0,
-            ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-                "  ▲ more",
-                Style::default().fg(THEME.load().help_fg),
-            )]),
-        );
-    }
-    if scroll_offset + visible_height < total_rows {
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled("  ▼ more", Style::default().fg(THEME.load().help_fg)),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(lines), area);
+    render_scrolled(frame, area, lines, focus);
 }
 
 fn provider_status(
@@ -536,130 +743,183 @@ fn provider_status(
     format!("{}{}", key_status, ping_str)
 }
 
+/// `provider_status` text as spans: set / from env / not set as a dot, the
+/// ping summary dim.
+fn provider_status_spans(p: &Palette, status: &str) -> Vec<Span<'static>> {
+    if let Some(rest) = status.strip_prefix("\u{2705} ") {
+        let (main, ping) = rest.split_once("  ").unwrap_or((rest, ""));
+        let mut v = vec![
+            Span::styled("\u{25cf} ", Style::default().fg(p.value)),
+            Span::styled(main.to_string(), Style::default().fg(p.text)),
+        ];
+        if !ping.is_empty() {
+            v.push(Span::styled(
+                format!("   {ping}"),
+                Style::default().fg(p.dim),
+            ));
+        }
+        v
+    } else {
+        vec![Span::styled(
+            status.replace("\u{2b1a}", "\u{25cb}"),
+            Style::default().fg(p.dim),
+        )]
+    }
+}
+
+/// A floating surface over the rows pane (pickers, custom editors): no
+/// border — one step brighter than the selection surface.
+fn popup_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width.saturating_sub(2)).max(1);
+    let h = height.min(area.height.saturating_sub(1)).max(1);
+    Rect {
+        x: area.x + 2.min(area.width.saturating_sub(w)),
+        y: area.y + 2.min(area.height.saturating_sub(h)),
+        width: w,
+        height: h,
+    }
+}
+
+/// Popup rows: selected gets the accent bar and bright text.
+fn popup_lines<'a>(
+    p: &Palette,
+    labels: impl Iterator<Item = (usize, &'a str, bool)>,
+    cursor: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    labels
+        .map(|(i, label, selectable)| {
+            let selected = i == cursor;
+            let fg = if !selectable {
+                p.dim
+            } else if selected {
+                p.value
+            } else {
+                p.text
+            };
+            let mut spans = vec![
+                Span::styled(
+                    if selected { "\u{2503} " } else { "  " },
+                    Style::default().fg(p.accent).bg(p.popup),
+                ),
+                Span::styled(label.to_string(), Style::default().fg(fg).bg(p.popup)),
+            ];
+            pad_to(&mut spans, width, p.popup);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_plugin_custom_editor(
     frame: &mut Frame,
     area: Rect,
     session: &super::plugin_editor::PluginEditorSession,
+    p: &Palette,
 ) {
     let rows = &session.render.rows;
     let cursor = session.render.cursor.unwrap_or(0);
-    let footer_lines: u16 = if session.render.footer.is_some() {
-        1
-    } else {
-        0
-    };
+    let footer_lines: u16 = u16::from(session.render.footer.is_some());
     let avail_w = area.width.saturating_sub(4).max(1);
     let w = avail_w.clamp(avail_w.min(40), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
-    let needed = rows.len() as u16 + 2 + footer_lines;
-    let h = needed.clamp(3, area.height.saturating_sub(2).max(3));
-    let rect = Rect {
-        x: area.x + 2,
-        y: area.y + 2,
-        width: w,
-        height: h,
-    };
+    let needed = rows.len() as u16 + 3 + footer_lines;
+    let rect = popup_rect(area, w, needed.max(4));
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(format!(" {} · {} ", session.plugin_id, session.field))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.load().border_active))
-        .style(Style::default().bg(THEME.load().bg));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let (list_area, footer_area) = if footer_lines > 0 {
-        let [body, foot] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(footer_lines)]).areas(inner);
-        (body, Some(foot))
-    } else {
-        (inner, None)
+    fill(frame.buffer_mut(), rect, p.popup);
+    // Padding 1 row / 1 column; a title line; rows; optional footer.
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
     };
-
-    let visible_height = list_area.height as usize;
-    let scroll_offset = if cursor >= visible_height {
-        cursor - visible_height + 1
-    } else {
-        0
+    let title = Line::from(vec![
+        Span::styled(
+            session.plugin_id.clone(),
+            Style::default()
+                .fg(p.title)
+                .bg(p.popup)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", session.field),
+            Style::default().fg(p.dim).bg(p.popup),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title), Rect { height: 1, ..inner });
+    let list = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1 + footer_lines),
+        ..inner
     };
-    let mut lines = Vec::new();
-    for (i, row) in rows
+    let visible = usize::from(list.height).max(1);
+    let offset = cursor.saturating_sub(visible - 1);
+    let marked: Vec<String> = rows
         .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-    {
-        let mut style = if i == cursor {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
+        .map(|r| match r.marker.as_deref() {
+            Some(m) if !m.trim().is_empty() => format!("{m} {}", r.label),
+            _ => r.label.clone(),
+        })
+        .collect();
+    let lines = popup_lines(
+        p,
+        rows.iter()
+            .zip(&marked)
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+            .map(|(i, (r, l))| (i, l.as_str(), r.selectable)),
+        cursor,
+        list.width,
+    );
+    frame.render_widget(Paragraph::new(lines), list);
+    if let Some(footer) = &session.render.footer {
+        let foot = Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
         };
-        if !row.selectable {
-            style = Style::default().fg(THEME.load().help_fg);
-        }
-        let marker = row.marker.as_deref().unwrap_or(" ");
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("{}  {}", marker, row.label), style),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), list_area);
-    if let (Some(area), Some(footer)) = (footer_area, &session.render.footer) {
         frame.render_widget(
-            Paragraph::new(footer.clone()).style(Style::default().fg(THEME.load().help_fg)),
-            area,
+            Paragraph::new(footer.clone()).style(Style::default().fg(p.dim).bg(p.popup)),
+            foot,
         );
     }
 }
 
-fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
+fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize, p: &Palette) {
     let avail_w = area.width.saturating_sub(4).max(1);
     let w = avail_w.clamp(avail_w.min(20), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
-    let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
-    let x = area.x + 2;
-    let y = area.y + 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let rect = popup_rect(area, w, options.len() as u16 + 2);
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.load().border_active))
-        .style(Style::default().bg(THEME.load().bg));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let visible_height = inner.height as usize;
-    let scroll_offset = if cursor >= visible_height {
-        cursor - visible_height + 1
-    } else {
-        0
+    fill(frame.buffer_mut(), rect, p.popup);
+    let inner = Rect {
+        x: rect.x,
+        y: rect.y + 1,
+        width: rect.width,
+        height: rect.height.saturating_sub(2),
     };
-
-    let mut lines = Vec::new();
-    for (i, opt) in options
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-    {
-        let style = if i == cursor {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
-        let marker = if i == cursor { "▸ " } else { "  " };
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("{}{}", marker, opt), style),
-        ]));
-    }
+    let visible = usize::from(inner.height).max(1);
+    let offset = cursor.saturating_sub(visible - 1);
+    let lines = popup_lines(
+        p,
+        options
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+            .map(|(i, o)| (i, o.as_str(), true)),
+        cursor,
+        inner.width,
+    );
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    snap: &RuntimeSnapshot,
+    p: &Palette,
+) {
     let cats = visible_categories(&snap.lifecycle_claims);
     let cat = cats
         .get(state.category_idx)
@@ -670,20 +930,17 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &Ru
         cat == super::schema::Category::Providers && state.focus == Focus::Right;
     let in_api_key_editor = matches!(state.edit_mode, Some(ActiveEditor::ApiKey { .. }));
     let hint = if in_api_key_editor {
-        "type key  Enter save  Esc cancel"
+        "type key  enter save  esc cancel"
     } else if on_plugins_right && state.setting_idx == 0 {
-        "↑↓ navigate  Tab switch pane  Enter open marketplace  Esc close"
+        "\u{2191}\u{2193} navigate  tab switch pane  enter open marketplace  esc close"
     } else if on_plugins_right && state.setting_idx > 0 {
-        "↑↓ navigate  Tab switch pane  Space toggle  Esc close"
+        "\u{2191}\u{2193} navigate  tab switch pane  space toggle  esc close"
     } else if on_providers_right {
-        "↑↓ navigate  Tab switch pane  Enter set key  d/Del clear  p ping  Esc close"
+        "\u{2191}\u{2193} navigate  tab switch pane  enter set key  d/del clear  p ping  esc close"
     } else {
-        "↑↓ navigate  Tab switch pane  Enter edit  Esc close"
+        "\u{2191}\u{2193} navigate  tab switch pane  enter edit  esc close"
     };
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(THEME.load().help_fg)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(hint_line(p, hint, area.width)), area);
 }
 
 /// Read a bool config key as "on"/"off" for settings display, defaulting when
@@ -878,5 +1135,119 @@ mod tui_safety_tests {
         assert_eq!(picker_w(80), 76);
         // 24-wide → avail = 20, clamp(min(20,20), 100) = 20
         assert_eq!(picker_w(24), 20);
+    }
+}
+
+#[cfg(test)]
+mod noodle_tests {
+    //! The settings modal is borderless (after Noodle): no box-drawing frame,
+    //! a dimmed backdrop, selection as a raised row with a `┃` bar.
+    use crate::tui::testing::TestHarness;
+    use crate::tui::theme::{ModalKind, THEME};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+
+    const W: u16 = 110;
+    const H: u16 = 32;
+
+    /// The modal rect, as `render` computes it.
+    fn modal() -> ratatui::layout::Rect {
+        let w = (W * 8 / 10).clamp(60, W);
+        let h = (H * 7 / 10).clamp(20, H);
+        ratatui::layout::Rect::new((W - w) / 2, (H - h) / 2, w, h)
+    }
+
+    fn find(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buf.area().height {
+            let row: String = (0..buf.area().width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            if let Some(i) = row.find(needle) {
+                // byte index → column (rows are ASCII up to the needle here)
+                let col = row[..i].chars().count() as u16;
+                return Some((col, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn modal_has_no_frame() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.open_settings_modal();
+        let buf = h.render().clone();
+        let m = modal();
+        for y in m.top()..m.bottom() {
+            for x in m.left()..m.right() {
+                let c = buf[(x, y)].symbol().chars().next().unwrap_or(' ');
+                assert!(
+                    !"╭╮╰╯─│┌┐└┘├┤┬┴┼═║".contains(c),
+                    "frame glyph {c:?} at ({x},{y})"
+                );
+            }
+        }
+        assert!(find(&buf, "Settings").is_some(), "title");
+        // The whole modal is one flat chrome surface at its edges.
+        let bg = Some(THEME.load().bg);
+        for (x, y) in [(m.left(), m.top()), (m.right() - 1, m.bottom() - 1)] {
+            assert_eq!(buf[(x, y)].style().bg, bg, "({x},{y})");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backdrop_dims_behind_the_modal() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        let before = h.render().clone();
+        h.open_settings_modal();
+        let after = h.render().clone();
+        let lum = |c: Option<Color>| match c {
+            Some(Color::Rgb(r, g, b)) => u32::from(r) + u32::from(g) + u32::from(b),
+            _ => 0,
+        };
+        // A footer cell below the modal: its colours darken.
+        let (x, y) = (2, H - 1);
+        assert!(
+            lum(after[(x, y)].style().fg) < lum(before[(x, y)].style().fg),
+            "backdrop text dims"
+        );
+        assert!(
+            lum(after[(x, y)].style().bg) <= lum(before[(x, y)].style().bg),
+            "backdrop surface dims"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn selection_is_a_bar_in_the_focused_pane() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.open_settings_modal();
+        let accent = Some(THEME.load().modal_border(ModalKind::Settings));
+        let buf = h.render().clone();
+        let (x, y) = find(&buf, "\u{2503} Model").expect("selected category");
+        assert_eq!(
+            buf[(x, y)].style().fg,
+            accent,
+            "focused sidebar bar is the accent"
+        );
+        let selected_bg = buf[(x + 3, y)].style().bg;
+        assert_ne!(selected_bg, Some(THEME.load().bg), "selected row is raised");
+
+        // Move into the rows pane: the sidebar bar goes muted, the row gets it.
+        h.key(KeyCode::Tab, KeyModifiers::empty());
+        h.key(KeyCode::Down, KeyModifiers::empty());
+        let buf = h.render().clone();
+        assert_ne!(
+            buf[(x, y)].style().fg,
+            accent,
+            "sidebar bar muted when unfocused"
+        );
+        let (rx, ry) = find(&buf, "\u{2503} Thinking").expect("selected setting");
+        assert_eq!(buf[(rx, ry)].style().fg, accent);
+        // Its description sits under it.
+        let below: String = (rx..W).map(|x| buf[(x, ry + 1)].symbol()).collect();
+        assert!(below.contains("Thinking depth"), "{below:?}");
     }
 }
