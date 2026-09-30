@@ -1602,12 +1602,14 @@ pub(crate) fn render_frame_into(
     frame.render_widget(info, info_area);
 
     // ── Effects ───────────────────────────────────────────────────────────
+    // Process only. Clearing a finished boot effect belongs to the render
+    // thread's done-check, which is also what signals `boot_done` to the main
+    // loop; clearing it here meant `boot_done` was never set, `boot_fx_sent`
+    // stayed true, and the 16 ms animation tick redrew the whole frame forever
+    // while idle.
     if let Some(ref mut fx) = boot_fx {
         let area = frame.area();
         fx.process(elapsed.into(), frame.buffer_mut(), area);
-        if fx.done() {
-            *boot_fx = None;
-        }
     }
     if let Some(ref mut fx) = exit_fx {
         let area = frame.area();
@@ -1891,5 +1893,27 @@ mod background_toggle_tests {
         );
 
         set_background_opaque(prior);
+    }
+}
+
+#[cfg(test)]
+mod boot_fx_tests {
+    use super::super::testing::TestHarness;
+    use std::time::Duration;
+    use tachyonfx::fx;
+
+    /// Regression: the frame body must leave a finished boot effect in place
+    /// so the render thread's done-check can see it, signal `boot_done`, and
+    /// let the main loop's animation tick stop. When the frame body cleared
+    /// it, every idle TUI redrew at the tick rate forever.
+    #[test]
+    fn frame_body_never_consumes_the_boot_effect() {
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let mut boot = Some(fx::sleep(10));
+        h.render_with_boot_fx(&mut boot, Duration::from_millis(50));
+        let fx = boot
+            .as_ref()
+            .expect("the render thread owns clearing the effect");
+        assert!(fx.done(), "and it is visibly done for that check");
     }
 }
