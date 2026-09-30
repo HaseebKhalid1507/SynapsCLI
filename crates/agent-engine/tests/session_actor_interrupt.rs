@@ -716,3 +716,96 @@ async fn cancel_that_races_a_finished_answer_marks_nothing() {
         .is_some_and(is_interruption_marker)));
     end(&mut a).await;
 }
+
+/// A cancel that was not the user's says so in the canceled tool result:
+/// a reload's checkpoint cuts a running tool and the result reads "Canceled
+/// (Synaps restarted)…", matching the marker — never "Canceled by user".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_tool_cut_by_a_reload_says_so_not_by_user() {
+    use agent_engine::session::CheckpointReason;
+    let _h = Home::new();
+    let bash = sse_tool(
+        "toolu_bash",
+        "bash",
+        r#"{"command":"printf 'partial-out\\n'; sleep 30"}"#,
+    );
+    let bodies: &'static [&'static str] = Box::leak(Box::new([bash, SSE_HI]));
+    let (url, _) = stub_seq(bodies).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("run it")).await.unwrap();
+    until(&mut a, |e| {
+        matches!(
+            e,
+            SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, .. }))
+                if delta.contains("partial-out")
+        )
+    })
+    .await;
+    a.send(SessionCommand::Checkpoint {
+        reason: CheckpointReason::Reload,
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    let conv = last_conversation(&seen);
+    let results = tool_results(&conv);
+    assert_eq!(results.len(), 1, "{:#?}", conv.api_messages);
+    let r = &results[0];
+    assert!(r.starts_with("partial-out"), "partial output kept: {r}");
+    assert!(
+        r.contains("[Canceled (Synaps restarted) before the tool finished; the output above is partial."),
+        "the cause, not the user: {r}"
+    );
+    assert!(!r.contains("by user"), "{r}");
+    assert_eq!(
+        conv.api_messages.last().unwrap()["content"],
+        InterruptReason::Restart.marker()
+    );
+    end(&mut a).await;
+}
+
+/// Every OTHER attached client learns the prompt that started a user turn
+/// (`TurnStarted.user_text`): a mirror never saw it, and the next reply's
+/// text glued onto the previous one. The attach replay's copy carries none
+/// (the snapshot's history already has it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn every_client_learns_the_prompt_of_a_user_turn() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_PREFIX, true).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle).await;
+    let mut b = attach(&handle).await;
+
+    a.send(submit("hello from A")).await.unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::TurnStarted { user_text, .. } => {
+            assert_eq!(user_text.as_deref(), Some("hello from A"));
+        }
+        _ => unreachable!(),
+    }
+    until(&mut a, is_text).await;
+    let (_c, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    let replayed = snap
+        .replay
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEventWire::TurnStarted { user_text, .. } => Some(user_text.clone()),
+            _ => None,
+        })
+        .expect("the turn start is replayed");
+    assert_eq!(replayed, None, "the replay does not repeat the prompt");
+    drop(b);
+    end(&mut a).await;
+}
