@@ -39,6 +39,8 @@ pub(super) type Rgb = (u8, u8, u8);
 pub(crate) const INSET_X: u16 = 3;
 
 const SHIMMER_PERIOD: f32 = 1.9;
+/// Seconds per breath of the prompt glyph while a turn streams.
+const BREATH_PERIOD: f32 = 2.2;
 const TRAIL_DECAY: f32 = 0.7;
 const PULSE_DECAY: f32 = 0.45;
 /// Seconds the prompt takes to dim when a turn starts streaming (and to come
@@ -126,6 +128,11 @@ pub(crate) struct PromptFx {
     /// 0..1 the "your turn" cue right after a turn ends, fading out over
     /// [`ARRIVE_DECAY`].
     pub(crate) arrive: f32,
+    /// 0..1 the prompt glyph's breath while a turn streams (1 = the prompt
+    /// colour, 0 = the dim), over [`BREATH_PERIOD`]. It starts at 1 so the
+    /// `❯` carries on from idle, and holds its last value when the turn
+    /// ends while the dim fades out.
+    pub(crate) breath: f32,
 }
 
 /// Input/stream event times → per-frame [`PromptFx`]. Lives on `App`.
@@ -141,6 +148,8 @@ pub(crate) struct PromptClock {
     /// When the last turn ended (drives the "your turn" cue).
     ready_at: Instant,
     was_streaming: bool,
+    /// The breath at the last streaming frame (held while the dim fades).
+    last_breath: f32,
 }
 
 impl PromptClock {
@@ -160,6 +169,7 @@ impl PromptClock {
             stream_changed: long_ago,
             ready_at: long_ago,
             was_streaming: false,
+            last_breath: 0.0,
         }
     }
 
@@ -265,7 +275,21 @@ impl PromptClock {
             pulse: self.pulse(now),
             dim: self.dim(now, streaming),
             arrive: self.arrive(now, streaming),
+            breath: self.breath(now, streamed, streaming),
         }
+    }
+
+    /// Computed while streaming; held while the dim fades out after the
+    /// turn; 0 at rest (where the glyph ignores it), so the resting frame
+    /// stays `PromptFx::default()`.
+    fn breath(&mut self, now: Instant, streamed: f32, streaming: bool) -> f32 {
+        if streaming {
+            let phase = std::f32::consts::TAU * streamed / BREATH_PERIOD;
+            self.last_breath = 0.5 + 0.5 * phase.cos();
+        } else if self.dim(now, false) == 0.0 {
+            self.last_breath = 0.0;
+        }
+        self.last_breath
     }
 }
 
@@ -290,7 +314,6 @@ pub(crate) struct Slab {
     typed: Rgb,
     prompt: Rgb,
     muted: Rgb,
-    stream: Rgb,
     fx: PromptFx,
     /// Fill of the slab body, per column (varies only under the shimmer).
     fill: Vec<Rgb>,
@@ -325,7 +348,6 @@ impl Slab {
         let text = rgb(theme.input_fg, d.input_fg);
         let prompt = rgb(theme.prompt_fg, d.prompt_fg);
         let muted = rgb(theme.muted, d.muted);
-        let stream = rgb(theme.status_streaming, d.status_streaming);
 
         // The body: chrome lifted toward the theme's text, with a dash of the
         // prompt colour, lifted just far enough to reach a target step off
@@ -375,7 +397,6 @@ impl Slab {
             typed,
             prompt,
             muted,
-            stream,
             fx,
             fill,
             halo,
@@ -442,14 +463,22 @@ impl Slab {
             .unwrap_or(self.body)
     }
 
-    /// Prompt glyph: the theme's `prompt_fg`.
+    /// The theme's `prompt_fg` made legible on the body (what the glyph
+    /// wears at rest).
+    #[cfg(test)]
     pub(crate) fn prompt_fg(&self) -> Color {
         color(self.legible(self.prompt, self.brightest(), 3.0))
     }
 
-    /// Spinner while streaming: the theme's `status_streaming`.
-    pub(crate) fn spinner_fg(&self) -> Color {
-        color(self.legible(self.stream, self.brightest(), 3.0))
+    /// The prompt glyph `❯`: the theme's `prompt_fg` at rest. While a turn
+    /// streams it breathes between that and the dim ([`PromptFx::breath`]),
+    /// blended in and out with the slab's own dim so neither edge of a turn
+    /// jumps.
+    pub(crate) fn glyph_fg(&self) -> Color {
+        let prompt = self.legible(self.prompt, self.brightest(), 3.0);
+        let dim = self.legible(self.muted, self.brightest(), 4.5);
+        let breathing = mix(dim, prompt, self.fx.breath);
+        color(mix(prompt, breathing, self.fx.dim))
     }
 
     /// Secondary text on the body (placeholder, scroll arrows, hint tabs):
@@ -683,6 +712,7 @@ mod tests {
                 PromptFx {
                     shimmer: i as f32 / 10.0,
                     dim: 1.0,
+                    breath: i as f32 / 9.0,
                     ..PromptFx::default()
                 },
                 true,
@@ -712,7 +742,7 @@ mod tests {
                     ("dim", slab.dim_fg(), 4.5),
                     ("ghost", slab.ghost_fg(), 3.6),
                     ("prompt", slab.prompt_fg(), 3.0),
-                    ("spinner", slab.spinner_fg(), 3.0),
+                    ("glyph", slab.glyph_fg(), 3.0),
                 ] {
                     let c = contrast(rgb_of(fg), bg);
                     assert!(
@@ -1102,5 +1132,60 @@ mod ready_tests {
             calm.backdrop,
             "and glows around it"
         );
+    }
+}
+
+#[cfg(test)]
+mod breath_tests {
+    use super::*;
+
+    #[test]
+    fn breath_starts_at_the_prompt_colour_and_swells() {
+        let t0 = Instant::now();
+        let mut clock = PromptClock::with_enabled(t0, true);
+        let at = |s: f32| t0 + Duration::from_secs_f32(s);
+        assert_eq!(clock.frame(t0, false).breath, 0.0, "no breath at rest");
+        assert!(
+            (clock.frame(at(0.01), true).breath - 1.0).abs() < 0.01,
+            "turn starts bright"
+        );
+        let low = clock.frame(at(0.01 + BREATH_PERIOD / 2.0), true).breath;
+        assert!(low < 0.01, "half a breath in: the dim ({low})");
+        let high = clock.frame(at(0.01 + BREATH_PERIOD), true).breath;
+        assert!(
+            high > 0.99,
+            "a full breath: back to the prompt colour ({high})"
+        );
+        // The turn ends mid-breath: the breath holds while the dim fades.
+        let mid = clock.frame(at(0.01 + BREATH_PERIOD * 1.25), true).breath;
+        let after = clock.frame(at(0.02 + BREATH_PERIOD * 1.25), false);
+        assert_eq!(after.breath, mid);
+        assert!(after.dim > 0.9, "dim still fading out");
+    }
+
+    #[test]
+    fn glyph_is_the_prompt_colour_at_rest_and_breathes_to_the_dim() {
+        let theme = Theme::default();
+        let slab = |dim: f32, breath: f32| {
+            Slab::new(
+                &theme,
+                PromptFx {
+                    dim,
+                    breath,
+                    ..PromptFx::default()
+                },
+                80,
+                None,
+            )
+        };
+        for breath in [0.0, 0.5, 1.0] {
+            let rest = slab(0.0, breath);
+            assert_eq!(rest.glyph_fg(), rest.prompt_fg(), "idle ignores the breath");
+        }
+        let top = slab(1.0, 1.0);
+        assert_eq!(top.glyph_fg(), top.prompt_fg());
+        let bottom = slab(1.0, 0.0);
+        assert_eq!(bottom.glyph_fg(), bottom.dim_fg());
+        assert_ne!(slab(1.0, 0.5).glyph_fg(), top.glyph_fg(), "it moves");
     }
 }
