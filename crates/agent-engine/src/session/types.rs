@@ -913,6 +913,46 @@ pub struct ConversationTokens {
     pub cache_creation: u64,
 }
 
+/// Memo of `wire::messages_hash(api_messages)` shared by every clone of one
+/// snapshot: the daemon converts a `Conversation` to its wire digest once
+/// per socket client, and hashing serialises the whole history — now once
+/// per event, not once per client. Keyed on the history's length and last
+/// message identity (histories only grow), so a snapshot whose messages are
+/// replaced afterwards recomputes instead of reusing a stale hash.
+#[derive(Clone, Default)]
+pub struct MessagesHashMemo(pub(crate) std::sync::Arc<std::sync::Mutex<Option<HashedHistory>>>);
+
+/// `(len, last message, hash)` of the history a memo was computed for.
+type HashedHistory = (usize, Option<crate::SharedMessage>, u64);
+
+impl MessagesHashMemo {
+    pub fn hash(&self, messages: &[crate::SharedMessage]) -> u64 {
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((len, last, hash)) = memo.as_ref() {
+            let same_last = match (last, messages.last()) {
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if *len == messages.len() && same_last {
+                return *hash;
+            }
+        }
+        let hash = super::wire::messages_hash(messages);
+        *memo = Some((messages.len(), messages.last().cloned(), hash));
+        hash
+    }
+}
+
+impl std::fmt::Debug for MessagesHashMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MessagesHashMemo")
+    }
+}
+
 /// Serializable mirror of `ConversationState` (+ the actor's auto-turn
 /// counter). Clients MUST replace, never merge, on `Conversation(_)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -933,6 +973,9 @@ pub struct ConversationSnapshot {
     pub queued_message: Option<String>,
     pub pending_events_len: usize,
     pub consecutive_auto_turns: u32,
+    /// Never serialised; see `MessagesHashMemo`.
+    #[serde(skip)]
+    pub messages_hash_memo: MessagesHashMemo,
 }
 
 /// `Session` minus `api_messages` and accounting: what a client mirrors.

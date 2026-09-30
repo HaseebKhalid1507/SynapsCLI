@@ -243,6 +243,7 @@ impl ConversationState {
             queued_message: self.queued_message.clone(),
             pending_events_len: self.pending_events.len(),
             consecutive_auto_turns,
+            messages_hash_memo: Default::default(),
         }
     }
 

@@ -41,8 +41,9 @@ pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (drain + its bounded
-/// save) + the checkpoint's own bounded save + 1 s margin.
+/// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (the drain) + the
+/// checkpoint's one bounded save (which covers the cancelled turn's) + 1 s
+/// margin.
 const CHECKPOINT_BUDGET: Duration = Duration::from_secs(
     crate::session::budgets::CANCEL_TURN_TIMEOUT_SECS
         + crate::session::budgets::SAVE_TIMEOUT_SECS

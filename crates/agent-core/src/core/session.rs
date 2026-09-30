@@ -43,7 +43,12 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_stripped: Vec<String>,
     pub api_messages: Vec<SharedMessage>,
-    /// Saved abort context — injected into the next user message on /continue
+    /// Legacy: the "ABORT CONTEXT" recap older Synaps saved for an
+    /// interrupted turn, to prepend to the next user message. Never written
+    /// now (an interrupted turn is real history plus a marker,
+    /// `agent_engine::engine::interrupt`) and never injected: a session that
+    /// still carries one is migrated when it is loaded (recap dropped,
+    /// marker appended).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

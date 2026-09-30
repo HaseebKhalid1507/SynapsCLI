@@ -1581,3 +1581,70 @@ mod tests {
         }
     }
 }
+
+/// What one session save costs ON A REAL DISK — the number the per-round
+/// save (`agent_engine` round checkpoints) pays. Not run by default: set
+/// `SYNAPS_SAVE_BENCH_DIR` to a directory on the filesystem to measure (NOT
+/// tmpfs, whose fsync is free), then
+/// `cargo test -p synaps-core --release --lib save_cost_bench -- --ignored --nocapture`.
+#[cfg(test)]
+mod save_cost_bench {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn session(bytes: usize) -> Session {
+        let mut s = Session::new("claude-sonnet-4-5", "low", None);
+        // ~4 KiB messages, alternating roles: a realistic mix of short
+        // turns and tool output.
+        let chunk = "x".repeat(4000);
+        let n = bytes / 4096;
+        s.api_messages = (0..n)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                Arc::new(serde_json::json!({"role": role, "content": format!("{i} {chunk}")}))
+            })
+            .collect();
+        s
+    }
+
+    fn pct(sorted: &[Duration], p: f64) -> Duration {
+        sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+    }
+
+    #[test]
+    #[ignore = "benchmark: needs SYNAPS_SAVE_BENCH_DIR on a real disk"]
+    fn save_cost_bench() {
+        let Ok(root) = std::env::var("SYNAPS_SAVE_BENCH_DIR") else {
+            eprintln!("SYNAPS_SAVE_BENCH_DIR not set; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir_in(root).unwrap();
+        for (label, bytes) in [("200 KB", 200_000), ("2.3 MB", 2_300_000), ("10 MB", 10_000_000)] {
+            for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+                let mut s = session(bytes);
+                save_session_in_dir(dir.path(), &s, mode).unwrap(); // warm up
+                let mut samples = Vec::new();
+                for round in 0..40 {
+                    // Each round appends an assistant reply + tool result.
+                    for role in ["assistant", "user"] {
+                        s.api_messages.push(Arc::new(
+                            serde_json::json!({"role": role, "content": format!("round {round}")}),
+                        ));
+                    }
+                    let t = Instant::now();
+                    save_session_in_dir(dir.path(), &s, mode).unwrap();
+                    samples.push(t.elapsed());
+                }
+                samples.sort();
+                eprintln!(
+                    "{label:>7} {mode:?}: p50 {:?}  p95 {:?}  max {:?}",
+                    pct(&samples, 0.5),
+                    pct(&samples, 0.95),
+                    samples[samples.len() - 1]
+                );
+                let _ = delete_session_files_in_dir(dir.path(), &s.id);
+            }
+        }
+    }
+}
