@@ -186,6 +186,10 @@ impl ApiMethods {
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        // Whole-request image limits (>20 images → each ≤ 2000 px; ≤ 100
+        // images). Outgoing copy only; healthy histories are untouched. Runs
+        // before the cache marker so the marker lands on the final shape.
+        super::image_limits::enforce_image_limits(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old
@@ -394,6 +398,7 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
                                         t.failed_terminal(&format!("http_{}", status.as_u16()));
@@ -407,13 +412,12 @@ impl ApiMethods {
                                     );
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                                return Err(RuntimeError::Tool(
-                                    crate::core::error::humanize_api_error_with_reset(
-                                        status.as_u16(),
-                                        &error_text,
-                                        hint,
-                                    ),
-                                ));
+                                return Err(RuntimeError::Tool(super::api::terminal_http_error(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                    log_rid.as_ref(),
+                                )));
                             }
 
                             last_reset_hint = reset_hint.clone();
@@ -798,6 +802,7 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
                                         t.failed_terminal(&format!("http_{}", status.as_u16()));
@@ -811,13 +816,12 @@ impl ApiMethods {
                                     );
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                                return Err(RuntimeError::Tool(
-                                    crate::core::error::humanize_api_error_with_reset(
-                                        status.as_u16(),
-                                        &error_text,
-                                        hint,
-                                    ),
-                                ));
+                                return Err(RuntimeError::Tool(super::api::terminal_http_error(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                    log_rid.as_ref(),
+                                )));
                             }
 
                             last_reset_hint = reset_hint;

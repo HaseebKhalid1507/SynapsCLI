@@ -877,6 +877,29 @@ pub(super) fn provider_request_id_from_headers(
         .and_then(|s| crate::runtime::trace::TraceId::new(s).ok())
 }
 
+/// Humanize a terminal (not retried) HTTP failure AND log it. Without the log
+/// line the only record of a 400 is the TUI banner, so a session that fails
+/// every request leaves nothing in `synaps.log` to diagnose from.
+///
+/// SECURITY (spec §5.1): `body` is untrusted and can echo the request. Only
+/// the numeric status, the provider request id (validated `TraceId`) and OUR
+/// humanized text, built from vetted static strings, are logged. Never the body.
+pub(super) fn terminal_http_error(
+    status: u16,
+    body: &str,
+    reset_hint: Option<&str>,
+    request_id: Option<&crate::runtime::trace::TraceId>,
+) -> String {
+    let message = crate::core::error::humanize_api_error_with_reset(status, body, reset_hint);
+    tracing::warn!(
+        status,
+        request_id = request_id.map_or("-", |id| id.as_str()),
+        error = %message,
+        "API request failed (not retried)"
+    );
+    message
+}
+
 /// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
 /// is disabled or any structural identity is unrepresentable — tracing can
 /// never fail the request. `body_bytes` MUST be the exact buffer handed to
@@ -1145,6 +1168,10 @@ impl ApiMethods {
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        // Whole-request image limits (>20 images → each ≤ 2000 px; ≤ 100
+        // images). Outgoing copy only; healthy histories are untouched. Runs
+        // before the cache marker so the marker lands on the final shape.
+        super::image_limits::enforce_image_limits(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Derive the thinking level from the budget for effort mapping.
@@ -1380,6 +1407,7 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
                                         t.failed_terminal(&format!("http_{}", status.as_u16()));
@@ -1393,13 +1421,12 @@ impl ApiMethods {
                                     );
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                                return Err(RuntimeError::ApiStatus(
-                                    crate::core::error::humanize_api_error_with_reset(
-                                        status.as_u16(),
-                                        &error_text,
-                                        hint,
-                                    ),
-                                ));
+                                return Err(RuntimeError::ApiStatus(terminal_http_error(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                    log_rid.as_ref(),
+                                )));
                             }
 
                             last_status = Some(status.as_u16());
