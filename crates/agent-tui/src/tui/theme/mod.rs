@@ -77,7 +77,8 @@ pub(crate) struct Theme {
     pub(crate) subagent_done: Color,
     pub(crate) subagent_time: Color,
 
-    // Event bus
+    // Event bus. `Color::Reset` = derive from this palette (the default);
+    // read them through `event_accent`/`event_label`/`event_body`.
     pub(crate) event_icon: Color,
     pub(crate) event_source: Color,
     pub(crate) event_text: Color,
@@ -171,10 +172,13 @@ impl Default for Theme {
             subagent_done: Color::Rgb(50, 195, 190),
             subagent_time: Color::Rgb(80, 95, 120),
 
-            event_icon: Color::Rgb(255, 180, 50),
-            event_source: Color::Rgb(120, 180, 255),
-            event_text: Color::Rgb(200, 200, 210),
-            event_critical: Color::Rgb(255, 80, 80),
+            // Event cards derive from the palette (Reset sentinel, like the
+            // tool_* fields): see `event_accent`/`event_label`/`event_body`.
+            // A palette sets these only to override (night_city, myx).
+            event_icon: Color::Reset,
+            event_source: Color::Reset,
+            event_text: Color::Reset,
+            event_critical: Color::Reset,
 
             // Tool styling — accent colours default to Reset (sentinel: derive
             // from this theme's own palette via tool_accent()).  Only
@@ -397,6 +401,28 @@ impl Theme {
 
     /// Tool-card argument panel: the explicit `tool_input_bg`, or derived
     /// from this palette when it is `Color::Reset`.
+    /// Event-card accent (left bar + glyph) for a severity: the explicit
+    /// `event_*` colour, or the palette's own — error for `critical`, the
+    /// active accent for `high`/`medium`/unknown, system text for `low`.
+    pub(crate) fn event_accent(&self, severity: &str) -> Color {
+        match severity {
+            "critical" => derive_reset(self.event_critical, self.error_color),
+            "low" => derive_reset(self.event_source, self.system_msg),
+            _ => derive_reset(self.event_icon, self.border_active),
+        }
+    }
+
+    /// Event-card `[source]` label: explicit `event_source`, or the tool-card
+    /// label colour so an event reads like the cards around it.
+    pub(crate) fn event_label(&self) -> Color {
+        derive_reset(self.event_source, self.tool_label)
+    }
+
+    /// Event-card body text: explicit `event_text`, or the tool-result colour.
+    pub(crate) fn event_body(&self) -> Color {
+        derive_reset(self.event_text, self.tool_result_color)
+    }
+
     pub(crate) fn tool_input_background(&self) -> Color {
         self.tool_panel(self.tool_input_bg, TOOL_INPUT_CONTRAST)
     }
@@ -561,6 +587,15 @@ fn parse_hex_color(s: &str) -> Option<Color> {
             Some(Color::Rgb(r * 17, g * 17, b * 17)) // 0xF -> 0xFF
         }
         _ => None,
+    }
+}
+
+/// `Color::Reset` means "derive": use `derived`; anything else is explicit.
+fn derive_reset(raw: Color, derived: Color) -> Color {
+    if raw == Color::Reset {
+        derived
+    } else {
+        raw
     }
 }
 
@@ -1151,6 +1186,38 @@ mod message_canvas_tests {
             );
         }
     }
+
+    /// Event cards (subagent completions, inbox events) take each palette's
+    /// own colours. Every builtin used to share one orange/blue/grey set.
+    #[test]
+    fn event_cards_take_the_palette_colours() {
+        const EXPLICIT: &[&str] = &["night-city", "myx"];
+        for name in BUILTINS.iter().filter(|n| !EXPLICIT.contains(n)) {
+            let t = Theme::builtin_for_test(name);
+            assert_eq!(t.event_accent("high"), t.border_active, "{name} high");
+            assert_eq!(t.event_accent("medium"), t.border_active, "{name} medium");
+            assert_eq!(t.event_accent("whatever"), t.border_active, "{name} unknown");
+            assert_eq!(t.event_accent("critical"), t.error_color, "{name} critical");
+            assert_eq!(t.event_accent("low"), t.system_msg, "{name} low");
+            assert_eq!(t.event_label(), t.tool_label, "{name} label");
+            assert_eq!(t.event_body(), t.tool_result_color, "{name} body");
+            for c in [t.event_accent("high"), t.event_accent("critical"), t.event_label(), t.event_body()] {
+                rgb(c); // resolves to a real colour, never the Reset sentinel
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_event_colours_still_win() {
+        for name in ["night-city", "myx"] {
+            let t = Theme::builtin_for_test(name);
+            assert_ne!(t.event_icon, Color::Reset, "{name} sets its own");
+            assert_eq!(t.event_accent("high"), t.event_icon, "{name}");
+            assert_eq!(t.event_accent("critical"), t.event_critical, "{name}");
+            assert_eq!(t.event_label(), t.event_source, "{name}");
+            assert_eq!(t.event_body(), t.event_text, "{name}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1192,4 +1259,3 @@ mod chrome_dim_tests {
         }
     }
 }
-
