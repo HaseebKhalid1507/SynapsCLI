@@ -621,6 +621,8 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
 pub struct TurnBudgetOverrides {
     pub max_provider_rounds: Option<u32>,
     pub max_tool_calls: Option<u32>,
+    /// Wall-clock limit for one turn, in seconds. Unset = no limit (the
+    /// default for every role); `0` also means no limit.
     pub max_elapsed_secs: Option<u64>,
     pub max_accumulated_tool_result_bytes: Option<usize>,
     pub max_context_tokens: Option<u64>,

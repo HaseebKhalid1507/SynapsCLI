@@ -294,7 +294,7 @@ pub(crate) fn observe_terminal(
         }
         Terminal::Failure(Outcome::TimeCheckpoint, kind)
             if driver.grant.time_checkpoints_enabled()
-                && !runtime.turn_budget().max_elapsed.is_zero() =>
+                && runtime.turn_budget().has_time_limit() =>
         {
             driver.completed_feedback = "unknown";
             driver.feedback = feedback::Tracker::default();

@@ -300,7 +300,7 @@ async fn wall_clock_budget_stops_before_any_provider_call() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_elapsed: Duration::ZERO,
+        max_elapsed: Some(Duration::ZERO),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (rt, executions) = runtime_with_fixture(budget, 8).await;
@@ -318,8 +318,8 @@ async fn wall_clock_budget_stops_before_any_provider_call() {
     assert_history_pairing(&final_history(&events));
 }
 
-/// Wall-clock exhaustion emits the enhanced error message with elapsed/limit,
-/// `/budget status` instructions, and history-retained notice. After `/budget
+/// Wall-clock exhaustion (when a limit is configured) says what stopped the
+/// turn, that history is kept, and how to remove the limit. After `/budget
 /// time` extends the allowance, a follow-up turn succeeds with the retained
 /// history prefix intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -330,7 +330,7 @@ async fn wall_clock_exhaustion_can_resume_retained_history_after_explicit_extens
     let (url, hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let budget = TurnBudget {
-        max_elapsed: Duration::ZERO,
+        max_elapsed: Some(Duration::ZERO),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (mut rt, executions) = runtime_with_fixture(budget, 8).await;
@@ -343,9 +343,9 @@ async fn wall_clock_exhaustion_can_resume_retained_history_after_explicit_extens
             _ => None,
         })
         .expect("budget failure");
-    assert!(error.message.contains("/ limit 0s"));
-    assert!(error.message.contains("History retained"));
-    assert!(error.message.contains("/budget status"));
+    assert!(error.message.contains("its 0s time limit"));
+    assert!(error.message.contains("History is kept"));
+    assert!(error.message.contains("/budget time off"));
     assert!(!error.message.contains("retained-budget-history-sentinel"));
     let mut retained = final_history(&events);
     assert!(retained.iter().any(|message| message
@@ -386,7 +386,10 @@ fn per_role_defaults_and_auto_turn_composition() {
     let worker = TurnBudget::for_role(TurnRole::Worker);
     assert!(fg.max_provider_rounds > auto.max_provider_rounds);
     assert!(worker.max_provider_rounds <= fg.max_provider_rounds);
-    assert!(auto.max_elapsed < fg.max_elapsed);
+    assert_eq!(
+        (fg.max_elapsed, auto.max_elapsed, worker.max_elapsed),
+        (None, None, None)
+    );
     assert!(fg.max_context_tokens.is_none() && fg.max_cost_usd.is_none());
 
     // Typed config overrides per role.

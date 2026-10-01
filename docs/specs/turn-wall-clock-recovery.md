@@ -2,7 +2,7 @@
 
 ## Diagnosis and corrected behavior
 
-`budget_exceeded dimension=WallClock` is a local elapsed-time boundary, not a provider/account failure. Compiled defaults remain foreground 7,200 seconds, autonomous/watcher 900 seconds and delegated worker 3,600 seconds. The local TUI's external `/auto` plugin drives the foreground runtime; it is not the watcher execution role.
+`budget_exceeded dimension=WallClock` is a local elapsed-time boundary, not a provider/account failure. **There is no wall-clock limit by default** for any role (it used to be foreground 7,200 s, autonomous/watcher 900 s, worker 3,600 s, which cut off turns that were still making progress). A limit applies only when configured with `turn_budget.<role>.max_elapsed_secs = N` (`0` = no limit) or `/budget time <duration>`; everything below describes behavior when one is set. Provider rounds, tool calls and tool-result bytes still bound every role. The local TUI's external `/auto` plugin drives the foreground runtime; it is not the watcher execution role.
 
 Previously the original stream's meter survived all context rollovers, eventually stopping legitimate long-running work. The first patch added explicit `/budget` recovery only. The user clarified that **automatic continuation** is required in `/auto` or `/context auto`; the behavior below supersedes the original manual-only design.
 
@@ -28,6 +28,7 @@ The plugin proposes a fresh turn on the same exact model/effort after its ordina
 ## Manual recovery remains available
 
 - `/budget` or `/budget status`: configured limits for future turns, not live usage.
+- `/budget time off`: remove the elapsed limit for future turns in this runtime.
 - `/budget time 4h`: only the elapsed allowance for future turns in this runtime. Positive whole numbers with lowercase `s`, `m` or `h`; 1 second through 24 hours. Zero, signs, fractions, compounds, missing units, unknown subcommands, overflow and extra arguments are rejected atomically.
 - The command does not write config/session storage, start inference, mutate history, change workers or alter already-running budget snapshots. Available in the shared engine command handler (idle local TUI, headless chat, WebSocket server), with builtin reservation/completion/help. No model-callable renewal tool or new RPC operation.
 - Explicit `/budget` commands retain the local driver's existing control-command revocation behavior; reauthorize `/auto start` if needed.
