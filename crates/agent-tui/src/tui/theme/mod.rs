@@ -1118,6 +1118,20 @@ mod message_canvas_tests {
         }
     }
 
+    /// User turns paint `user_bg` over the canvas. If the two match, user
+    /// messages have no surface at all (ocean shipped like this).
+    #[test]
+    fn user_turns_stand_off_the_canvas() {
+        for name in BUILTINS {
+            let t = Theme::builtin_for_test(name);
+            assert_ne!(
+                t.user_bg,
+                t.message_background(),
+                "{name}: user_bg must differ from the canvas"
+            );
+        }
+    }
+
     /// Every non-flush theme must clear the perceptibility floor.
     #[test]
     fn elevated_themes_separate_canvas_from_chrome() {

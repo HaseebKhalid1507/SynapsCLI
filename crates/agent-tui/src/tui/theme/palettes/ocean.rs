@@ -22,8 +22,9 @@ impl Theme {
             system_msg: Color::Rgb(100, 150, 190),
 
             user_color: Color::Rgb(170, 210, 245),
-            // User turns share the header/footer chrome surface.
-            user_bg: Color::Rgb(3, 8, 16),
+            // The input field's streaming colour (neon_prompt Slab body), so
+            // a sent message looks like the input it came from.
+            user_bg: Color::Rgb(9, 21, 29),
             claude_label: Color::Rgb(64, 224, 208),
             claude_text: Color::Rgb(176, 216, 230),
             thinking_color: Color::Rgb(35, 65, 95),
