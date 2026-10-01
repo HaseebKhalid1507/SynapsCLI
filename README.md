@@ -23,7 +23,13 @@
 ---
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/c8a444e6-6975-474a-bc87-f02e744975ed" alt="SynapsCLI — a crew of agents running in parallel" width="100%" />
+  <img src="https://github.com/user-attachments/assets/4e470c8c-a53a-4fae-acb4-15a56be105b3" alt="SynapsCLI — a crew of agents running in parallel" width="100%" />
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/c5892efb-5f79-4648-9746-43bf316a87d3" alt="ice" width="32%" />
+  <img src="https://github.com/user-attachments/assets/b6b03e4f-4868-48e2-b5c5-bbd84e81f77c" alt="phosphor" width="32%" />
+  <img src="https://github.com/user-attachments/assets/9d06c56e-ce20-4f35-aca0-ea274507d7dc" alt="dracula" width="32%" />
 </p>
 
 Synaps is an agent runtime written in Rust. It runs agents with built-in tools, subagents, and extensions against any model, from Claude and ChatGPT to a local Ollama. A background daemon owns the engine and every session, and the terminal UI is a thin client of it: several terminals can share one live session, and a session outlives the window that started it. `synaps rpc` speaks JSON-RPC over stdio, so other programs can drive the engine too. Extend it with plugins in any language and MCP servers.
