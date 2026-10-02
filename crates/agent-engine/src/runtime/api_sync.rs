@@ -186,6 +186,9 @@ impl ApiMethods {
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        // The sync transport sends the full registry and never defers, so any
+        // `tool_reference` in the history is stripped (it would be a 400).
+        HelperMethods::wire_tool_references(&mut cleaned_messages, &|_| None);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old
@@ -196,6 +199,7 @@ impl ApiMethods {
             model,
             &cleaned_messages,
             &tools_schema,
+            &[],
             system_prompt,
             &auth_type,
             thinking_budget,

@@ -197,6 +197,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.deferred_loading` (Anthropic deferred tool definitions).
+    pub(super) deferred_tool_loading: bool,
     /// `tools.activation_confirm` policy (auto | prompt | deny).
     pub(super) activation_confirm: agent_core::config::ActivationConfirm,
     /// Runtime-scoped tool-session identity the execution gate scopes the
@@ -464,6 +466,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            deferred_tool_loading,
             activation_confirm,
             tool_session_id,
             retained_tool_set,
@@ -957,10 +960,19 @@ impl StreamMethods {
                             "session schema projection dropped a pinned member for this round"
                         );
                     }
-                    report.schema
+                    let split = deferred_tool_loading.then(|| {
+                        let referenced =
+                            super::helpers::HelperMethods::referenced_tool_ids(request_messages);
+                        std::sync::Arc::new(
+                            tools_snapshot.deferred_tool_split(&session_set, &referenced),
+                        )
+                    });
+                    (report.schema, split)
                 };
+                let (projection, anthropic_tool_split) = projection;
                 projected_options = super::api::ApiOptions {
                     request_tools_schema: Some(std::sync::Arc::new(projection)),
+                    anthropic_tool_split,
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     ..options.clone()
@@ -3056,6 +3068,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set,
@@ -3961,6 +3974,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set: Default::default(),
