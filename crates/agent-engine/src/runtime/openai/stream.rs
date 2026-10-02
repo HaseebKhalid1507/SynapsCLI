@@ -98,6 +98,20 @@ async fn wait_stream_retry(
 
 pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection interrupted before response completed (stream retry budget exhausted)";
 
+/// The endpoint one `send_with_retries` call talks to: its log label, the
+/// URL (for the localhost-refusal fast-fail) and whether its 429 responses
+/// carry Codex quota semantics worth probing. Static per call site; the
+/// retry budget and trace clock are threaded separately because they mutate.
+#[derive(Clone, Copy)]
+struct SendTarget<'a> {
+    label: &'a str,
+    url: &'a str,
+    /// Codex only: read a bounded slice of a 429 body to distinguish proven
+    /// quota exhaustion (fail fast → account failover) from a generic 429
+    /// (normal transport retry). Every other endpoint drops the body unread.
+    quota_probe: bool,
+}
+
 /// Send a provider streaming request, retrying transient failures.
 ///
 /// Parity fix: the Anthropic path retries transient errors with backoff
@@ -118,14 +132,22 @@ pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection i
 /// re-send. Terminal failures emit their final record here; on success the
 /// caller finishes the attempt after consuming the stream.
 async fn send_with_retries(
-    label: &str,
-    url: &str,
+    target: SendTarget<'_>,
     build: impl Fn() -> reqwest::RequestBuilder,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
     retries_used: &mut u32,
     trace_attempt: &mut tr::StreamAttempt,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    use super::account_routing::{
+        classify_codex_429, read_body_for_classification, Codex429, CodexQuotaExhausted,
+        QUOTA_PROBE_BODY_CAP,
+    };
+    let SendTarget {
+        label,
+        url,
+        quota_probe,
+    } = target;
     loop {
         if cancel.is_cancelled() {
             return Err("request canceled".into());
@@ -148,14 +170,51 @@ async fn send_with_retries(
                 let status = resp.status();
                 // Provider-assigned request id from validated headers only.
                 let trace_rid = tr::provider_request_id_from_headers(resp.headers());
-                let retryable =
+                let mut retryable =
                     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
-                // Privacy (spec §5.1): the response body is provider-controlled
-                // and may echo the full request (prompts, system text, tool
-                // schemas, credentials). Drop it unread — it must never be
-                // stored, surfaced, or logged at any level. `status` Display
-                // uses the canonical reason phrase, never server bytes.
-                drop(resp);
+                if quota_probe && status.as_u16() == 429 {
+                    // Codex only: a 429 that PROVES the account's usage
+                    // window is spent must not burn the transport retry
+                    // budget (minutes of backoff that cannot succeed). The
+                    // body is read into a bounded buffer purely to produce
+                    // the classification enum and is dropped unread beyond
+                    // that — never stored, surfaced, or logged.
+                    let headers = resp.headers().clone();
+                    let body = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            trace_attempt.finish_canceled(Some(429), None);
+                            return Err("request canceled".into());
+                        }
+                        body = read_body_for_classification(resp, QUOTA_PROBE_BODY_CAP) => body,
+                    };
+                    match classify_codex_429(&headers, &body) {
+                        Codex429::QuotaExhausted(evidence) => {
+                            tracing::warn!(
+                                signal = ?evidence.signal,
+                                reset_after_secs = ?evidence.reset_after_secs,
+                                "{label} 429 is provider-declared quota exhaustion (no transport retry)"
+                            );
+                            return Err(Box::new(CodexQuotaExhausted {
+                                evidence,
+                                request_id: trace_rid,
+                            }));
+                        }
+                        Codex429::UsageNotIncluded => {
+                            // Deterministic for this account: retrying never helps.
+                            tracing::warn!("{label} 429: account has no Codex usage entitlement");
+                            retryable = false;
+                        }
+                        Codex429::Generic => {}
+                    }
+                } else {
+                    // Privacy (spec §5.1): the response body is provider-controlled
+                    // and may echo the full request (prompts, system text, tool
+                    // schemas, credentials). Drop it unread — it must never be
+                    // stored, surfaced, or logged at any level. `status` Display
+                    // uses the canonical reason phrase, never server bytes.
+                    drop(resp);
+                }
                 let code = format!("http_{}", status.as_u16());
                 if !retryable || *retries_used >= max_retries {
                     trace_attempt.finish_failed(&code, Some(status.as_u16()), trace_rid);
@@ -533,6 +592,141 @@ pub(crate) async fn call_codex_stream_inner(
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    // Account selection crosses the broker boundary through the router seam:
+    // the broker vends one (credential, access token) pair, never a refresh
+    // token, and this path never opens auth.json.
+    let router = super::account_routing::BrokerCodexRouter::new(std::sync::Arc::clone(broker));
+    call_codex_stream_with_router(
+        cfg,
+        client,
+        &router,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        temperature,
+        max_tokens,
+        reasoning_level,
+        codex_request_role,
+        cancel,
+        max_retries,
+        trace,
+    )
+    .await
+}
+
+/// What the failover gate judges: the recognized exhaustion on the current
+/// attempt and the two runtime facts that can veto a switch. Built at each
+/// of the two detection sites (429 probe, in-stream terminal error) so both
+/// go through the identical invariant check.
+#[derive(Clone, Copy)]
+struct FailoverRequest<'a> {
+    evidence: &'a super::account_routing::CodexQuotaEvidence,
+    /// Any content-bearing model event reached the decoder on this attempt
+    /// (text, tool, reasoning — forwarded or not). Always false on the 429
+    /// path: no response body was streamed.
+    output_started: bool,
+    /// Account switches already spent on this logical request.
+    prior_failovers: u32,
+}
+
+/// Attempt a single bounded account failover after recognized quota
+/// exhaustion on `failed`. Always reports the exhaustion to the router
+/// (cooldown sink, best effort) — even when the runtime then refuses to
+/// switch — so the broker stops advertising the seat. Returns the new pinned
+/// account only when every runtime invariant holds: `Auto` selection, no
+/// output produced, budget unspent, a candidate the router deems fresh and
+/// eligible, and that candidate is a DIFFERENT account than the one that
+/// failed. Anything else → `Ok(None)` and the caller ends the turn with the
+/// static quota message. Never loops.
+async fn try_codex_account_failover(
+    router: &dyn super::account_routing::CodexAccountRouter,
+    model: &str,
+    failed: &super::account_routing::PinnedAccount,
+    request: FailoverRequest<'_>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<super::account_routing::PinnedAccount>, super::net::BoxedProviderError> {
+    use super::account_routing::failover_gate;
+    use crate::runtime::api::await_or_cancel;
+    let FailoverRequest {
+        evidence,
+        output_started,
+        prior_failovers,
+    } = request;
+    await_or_cancel(cancel, router.report_exhausted(failed, evidence))
+        .await
+        .map_err(|_| "request canceled")?;
+    if let Err(blocked) = failover_gate(failed.auto, output_started, prior_failovers) {
+        tracing::info!(
+            account = %failed.credential,
+            reason = blocked.as_str(),
+            "codex quota exhausted; account failover not permitted"
+        );
+        return Ok(None);
+    }
+    let candidate = await_or_cancel(
+        cancel,
+        router.failover(model, failed, evidence, prior_failovers),
+    )
+    .await
+    .map_err(|_| "request canceled")?;
+    match candidate {
+        Ok(Some(next)) if next.credential != failed.credential => {
+            tracing::warn!(
+                from = %failed.credential,
+                to = %next.credential,
+                "codex quota exhausted; switching account (one-time failover, no output replayed)"
+            );
+            let _ = tx.send(StreamEvent::Session(crate::SessionEvent::Notice(format!(
+                "Codex usage quota exhausted on account '{}' — switched to account '{}' (one-time failover; no output was replayed).",
+                failed.label(),
+                next.label()
+            ))));
+            Ok(Some(next))
+        }
+        Ok(Some(_same)) => {
+            tracing::warn!(
+                account = %failed.credential,
+                "codex failover candidate is the exhausted account itself; refusing to retry"
+            );
+            Ok(None)
+        }
+        Ok(None) => {
+            tracing::info!(
+                account = %failed.credential,
+                "codex quota exhausted; no distinct account with fresh capacity"
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            tracing::warn!(
+                account = %failed.credential,
+                error = %e,
+                "codex failover candidate resolution failed; not retrying"
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_codex_stream_with_router(
+    cfg: &ProviderConfig,
+    client: &reqwest::Client,
+    router: &dyn super::account_routing::CodexAccountRouter,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Build the exact provider-qualified plan before any credential or network
     // access. Logical Ultra is lowered here, never in the generic level enum.
     use crate::runtime::openai::catalog::plan_codex_execution;
@@ -584,20 +778,15 @@ pub(crate) async fn call_codex_stream_inner(
         network_attempted = false,
         "Codex execution plan allowed"
     );
-    // Every Codex credential, local or remote, crosses the broker boundary:
-    // the broker vends an access token + expiry only (refresh tokens are
-    // broker-owned), and this path never opens auth.json.
-    let access = crate::runtime::api::await_or_cancel(
-        cancel,
-        broker.access_token(crate::auth::OAuthProviderId::OpenAiCodex),
-    )
-    .await
-    .map_err(|_| "request canceled")?
-    .map_err(|e| e.to_string())?
-    .token;
-    // Account id is provider-owned metadata carried inside the Codex JWT.
-    let account_id = crate::auth::extract_codex_account_id(&access)
-        .ok_or("Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`")?;
+    // Exactly one pinned (account, token) pair per attempt. The
+    // `chatgpt-account-id` header is derived from THIS token's JWT claims, so
+    // bearer and header always name the same credential — a second lookup
+    // could race a policy change and pair account A's header with account
+    // B's token.
+    let mut pinned = crate::runtime::api::await_or_cancel(cancel, router.pin(&cfg.model))
+        .await
+        .map_err(|_| "request canceled")??;
+    let mut account_id = codex_account_id_for(&pinned)?;
 
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
     // Codex already receives the effective system prompt in `instructions`.
@@ -662,18 +851,25 @@ pub(crate) async fn call_codex_stream_inner(
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
     let mut stream_retry = 0u32;
+    // Account switches spent on this logical request. Bounded by
+    // `MAX_CODEX_ACCOUNT_FAILOVERS`; independent of the transport retry
+    // budget (a failover neither consumes nor resets `stream_retry`).
+    let mut failovers = 0u32;
 
     loop {
         if cancel.is_cancelled() {
             return Err("request canceled".into());
         }
-        let resp = send_with_retries(
-            "codex",
-            &url,
+        let sent = send_with_retries(
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || {
                 client
                     .post(&url)
-                    .bearer_auth(&access)
+                    .bearer_auth(&pinned.token)
                     .header("chatgpt-account-id", account_id.as_str())
                     .header("originator", "synaps")
                     .header("OpenAI-Beta", "responses=experimental")
@@ -686,7 +882,52 @@ pub(crate) async fn call_codex_stream_inner(
             &mut stream_retry,
             &mut attempt,
         )
-        .await?;
+        .await;
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(error) => match error.downcast::<super::account_routing::CodexQuotaExhausted>() {
+                // A 429 that proved exhaustion arrives before any response
+                // body was streamed: nothing was produced on this attempt, so
+                // the pre-output invariant holds by construction.
+                Ok(quota) => {
+                    match try_codex_account_failover(
+                        router,
+                        &cfg.model,
+                        &pinned,
+                        FailoverRequest {
+                            evidence: &quota.evidence,
+                            output_started: false,
+                            prior_failovers: failovers,
+                        },
+                        tx,
+                        cancel,
+                    )
+                    .await?
+                    {
+                        Some(next) => {
+                            attempt.attempt_failed(
+                                crate::runtime::trace::RetryClass::RateLimited,
+                                std::time::Duration::ZERO,
+                                Some(429),
+                                quota.request_id.clone(),
+                                "account_failover",
+                            );
+                            account_id = codex_account_id_for(&next)?;
+                            pinned = next;
+                            failovers += 1;
+                            attempt.restart_clock();
+                            continue;
+                        }
+                        None => {
+                            let message = quota.to_string();
+                            attempt.finish_failed("quota_exhausted", Some(429), quota.request_id);
+                            return Err(message.into());
+                        }
+                    }
+                }
+                Err(other) => return Err(other),
+            },
+        };
         // Direct HTTP: upstream status and provider request id are observed.
         let http_status = Some(resp.status().as_u16());
         let trace_rid = tr::provider_request_id_from_headers(resp.headers());
@@ -759,6 +1000,51 @@ pub(crate) async fn call_codex_stream_inner(
             attempt.mark_first_model_event();
         }
         if let Err(failure) = parser.terminal_result() {
+            if failure.code == "responses_quota" {
+                // In-stream quota exhaustion (HTTP 200 + terminal quota
+                // error). Failover only if the model produced nothing on this
+                // attempt — text, tool, reasoning or any content-bearing
+                // event makes the failure terminal (no cross-account replay).
+                let output_started =
+                    !accumulated_text.is_empty() || parser.model_produced_output();
+                let evidence = super::account_routing::CodexQuotaEvidence {
+                    signal: super::account_routing::QuotaSignal::StreamQuotaEvent,
+                    reset_after_secs: None,
+                };
+                match try_codex_account_failover(
+                    router,
+                    &cfg.model,
+                    &pinned,
+                    FailoverRequest {
+                        evidence: &evidence,
+                        output_started,
+                        prior_failovers: failovers,
+                    },
+                    tx,
+                    cancel,
+                )
+                .await?
+                {
+                    Some(next) => {
+                        attempt.attempt_failed(
+                            crate::runtime::trace::RetryClass::RateLimited,
+                            std::time::Duration::ZERO,
+                            http_status,
+                            trace_rid,
+                            "account_failover",
+                        );
+                        account_id = codex_account_id_for(&next)?;
+                        pinned = next;
+                        failovers += 1;
+                        attempt.restart_clock();
+                        continue;
+                    }
+                    None => {
+                        attempt.finish_failed(failure.code, http_status, trace_rid);
+                        return Err(failure.message.into());
+                    }
+                }
+            }
             if failure.code == "responses_empty" && stream_retry < max_retries {
                 stream_retry += 1;
                 let delay = retry_delay(stream_retry);
@@ -799,6 +1085,18 @@ pub(crate) async fn call_codex_stream_inner(
             "content": content,
         }));
     }
+}
+
+/// The `chatgpt-account-id` header value for a pinned account: provider-owned
+/// metadata carried inside THAT token's JWT. Deriving it from the same bearer
+/// the request will present is what keeps header and token paired.
+fn codex_account_id_for(
+    pinned: &super::account_routing::PinnedAccount,
+) -> Result<String, super::net::BoxedProviderError> {
+    crate::auth::extract_codex_account_id(&pinned.token)
+        .ok_or_else(|| {
+            "Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`".into()
+        })
 }
 
 /// Stable prompt-cache routing key for this conversation.
@@ -1087,6 +1385,13 @@ struct CodexSseDecoder {
     terminal_success: bool,
     terminal_failure: Option<ResponsesStreamFailure>,
     emitted_output: bool,
+    /// The model produced ANY content on this attempt — including events the
+    /// decoder does not forward to the UI (reasoning / reasoning-summary
+    /// deltas, output items, content parts). Replaying such a request on a
+    /// second account would double-spend, so account failover keys on this,
+    /// not merely on what reached the UI. Metadata-only events
+    /// (`response.created`, `response.in_progress`) never set it.
+    saw_content_output: bool,
     /// Trace (Task 10A): provider-reported usage from `response.completed`
     /// (input including cached, output, cached slice). `None` until observed.
     observed_usage: Option<(u64, u64, u64)>,
@@ -1195,7 +1500,9 @@ fn user_message_for_terminal_failure(
     let classify = |value: &str| match value {
         "absent" | "error" => None,
         "invalid_api_key" | "authentication_error" | "invalid_authentication_error" => Some("auth"),
-        "insufficient_quota" | "quota_exceeded" | "billing_error" => Some("quota"),
+        "insufficient_quota" | "quota_exceeded" | "billing_error" | "usage_limit_reached" => {
+            Some("quota")
+        }
         "rate_limit_exceeded"
         | "rate_limit_error"
         | "server_overloaded"
@@ -1237,6 +1544,7 @@ impl CodexSseDecoder {
             terminal_success: false,
             terminal_failure: None,
             emitted_output: false,
+            saw_content_output: false,
             observed_usage: None,
         }
     }
@@ -1248,6 +1556,14 @@ impl CodexSseDecoder {
         self.emitted_output
             || !self.completed_tools.is_empty()
             || self.active_tools.iter().any(|tool| tool.started)
+    }
+
+    /// True once the model produced any content on this attempt, forwarded
+    /// or not. The account-failover gate uses this (stricter than
+    /// `emitted_any_output`): a request that already cost output on seat A
+    /// is never replayed on seat B.
+    fn model_produced_output(&self) -> bool {
+        self.saw_content_output || self.emitted_any_output()
     }
 
     fn push_line(
@@ -1305,6 +1621,23 @@ impl CodexSseDecoder {
                 | "error"
         ) {
             self.saw_model_event = true;
+        }
+        // Content-bearing event families. Anything the model emitted as
+        // output — text, tool arguments, reasoning, content parts, output
+        // items — counts, even when this decoder ignores the event below.
+        if matches!(
+            event_type,
+            "response.output_text.delta"
+                | "response.output_text.done"
+                | "response.output_item.added"
+                | "response.output_item.done"
+                | "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+        ) || event_type.starts_with("response.reasoning")
+            || event_type.starts_with("response.content_part")
+            || event_type.starts_with("response.refusal")
+        {
+            self.saw_content_output = true;
         }
         match event_type {
             "response.output_text.delta" => {
@@ -1420,6 +1753,13 @@ impl CodexSseDecoder {
                         == format!("{}{RESPONSES_CAPACITY_SUFFIX}", self.provider_label)
                     {
                         "responses_capacity"
+                    } else if super::account_routing::stream_failure_is_quota(
+                        error_kind, error_code,
+                    ) {
+                        // Vetted quota identifiers only: the account's
+                        // allowance is spent. Not retried here; the Codex
+                        // path may fail over once if nothing was produced.
+                        "responses_quota"
                     } else {
                         "responses_failed"
                     },
@@ -4632,6 +4972,736 @@ mod send_retry_tests {
         assert!(err.to_string().starts_with("codex request failed: 503"));
     }
 
+    // ─── G5: account-aware selection + bounded failover ──────────────────────
+
+    use crate::runtime::openai::account_routing::{
+        CodexAccountRouter, CodexQuotaEvidence, PinnedAccount,
+    };
+    use agent_core::auth::{Account, CredentialRef, OAuthProviderId};
+
+    /// JWT-shaped token carrying `account_id` as the ChatGPT account claim.
+    fn fake_codex_token_for(account_id: &str) -> String {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": account_id }
+        });
+        format!("h.{}.s", URL_SAFE_NO_PAD.encode(payload.to_string()))
+    }
+
+    fn pinned(label: &str, account_id: &str, auto: bool) -> PinnedAccount {
+        PinnedAccount {
+            credential: CredentialRef::new(
+                OAuthProviderId::OpenAiCodex,
+                Account::parse(label).unwrap(),
+            ),
+            token: fake_codex_token_for(account_id),
+            auto,
+        }
+    }
+
+    /// Scripted router: `pin` returns `first`; `failover` returns the next
+    /// scripted candidate (or `None`). Records every call.
+    struct ScriptedRouter {
+        first: PinnedAccount,
+        candidates: std::sync::Mutex<std::collections::VecDeque<Option<PinnedAccount>>>,
+        failover_calls: AtomicUsize,
+        reported: std::sync::Mutex<Vec<(String, CodexQuotaEvidence)>>,
+    }
+
+    impl ScriptedRouter {
+        fn new(first: PinnedAccount, candidates: Vec<Option<PinnedAccount>>) -> Self {
+            Self {
+                first,
+                candidates: std::sync::Mutex::new(candidates.into()),
+                failover_calls: AtomicUsize::new(0),
+                reported: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn reports(&self) -> Vec<String> {
+            self.reported
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl CodexAccountRouter for ScriptedRouter {
+        async fn pin(&self, _model: &str) -> Result<PinnedAccount, String> {
+            Ok(self.first.clone())
+        }
+        async fn failover(
+            &self,
+            _model: &str,
+            _failed: &PinnedAccount,
+            _evidence: &CodexQuotaEvidence,
+            _failovers_so_far: u32,
+        ) -> Result<Option<PinnedAccount>, String> {
+            self.failover_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.candidates.lock().unwrap().pop_front().flatten())
+        }
+        async fn report_exhausted(&self, failed: &PinnedAccount, evidence: &CodexQuotaEvidence) {
+            self.reported
+                .lock()
+                .unwrap()
+                .push((failed.credential.storage_key(), *evidence));
+        }
+    }
+
+    /// One observed request: `chatgpt-account-id` header, bearer token, body.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        account: String,
+        bearer: String,
+        body: bytes::Bytes,
+    }
+
+    /// Mock Codex endpoint scripted per request: each entry is
+    /// `(status, headers, body)`; the last entry repeats. Records the
+    /// `chatgpt-account-id` header, the bearer and the body of every request.
+    type Script = Vec<(StatusCode, Vec<(&'static str, &'static str)>, &'static str)>;
+    async fn spawn_scripted_codex(script: Script) -> (String, Arc<std::sync::Mutex<Vec<Seen>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(script);
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post({
+                let seen = Arc::clone(&seen);
+                let counter = Arc::clone(&counter);
+                let script = Arc::clone(&script);
+                move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                    let seen = Arc::clone(&seen);
+                    let counter = Arc::clone(&counter);
+                    let script = Arc::clone(&script);
+                    async move {
+                        let header = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let bearer = header("authorization")
+                            .strip_prefix("Bearer ")
+                            .unwrap_or("")
+                            .to_string();
+                        seen.lock().unwrap().push(Seen {
+                            account: header("chatgpt-account-id"),
+                            bearer,
+                            body,
+                        });
+                        let n = counter.fetch_add(1, Ordering::SeqCst);
+                        let (status, hdrs, body) = &script[n.min(script.len() - 1)];
+                        let mut resp = axum::response::Response::builder().status(*status);
+                        for (k, v) in hdrs {
+                            resp = resp.header(*k, *v);
+                        }
+                        let ct = if status.is_success() {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        };
+                        resp.header("content-type", ct)
+                            .body(axum::body::Body::from(*body))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn run_codex_with_router(
+        base_url: &str,
+        router: &dyn CodexAccountRouter,
+        max_retries: u32,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg = ProviderConfig {
+            base_url: base_url.to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openai-codex".to_string(),
+        };
+        call_codex_stream_with_router(
+            &cfg,
+            &reqwest::Client::new(),
+            router,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            tx,
+            None,
+            None,
+            ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            max_retries,
+            &crate::runtime::trace::TraceContext::disabled(),
+        )
+        .await
+    }
+
+    const QUOTA_429: &str = r#"{"error":{"type":"usage_limit_reached","message":"ECHOED prompt","plan_type":"plus","resets_in_seconds":3600}}"#;
+    const GENERIC_429: &str = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+
+    fn notices(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// Auto policy, exhausted 429 on seat A before any output, seat B fresh:
+    /// exactly one switch, the retry carries B's header (derived from B's
+    /// token), identical body bytes, and the cooldown was reported for A.
+    #[tokio::test]
+    async fn quota_429_fails_over_once_to_distinct_account_with_paired_header() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = run_codex_with_router(&url, &router, 3, &tx).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "hello");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one failed attempt on A, one success on B");
+        assert_eq!(seen[0].account, "acct_A");
+        assert_eq!(seen[1].account, "acct_B", "header must follow the pinned token");
+        // Bearer and header are derived from the SAME credential on every
+        // attempt: A's token with A's id, then B's token with B's id — never
+        // a mixed pair.
+        assert_eq!(seen[0].bearer, fake_codex_token_for("acct_A"));
+        assert_eq!(seen[1].bearer, fake_codex_token_for("acct_B"));
+        assert_ne!(seen[0].bearer, seen[1].bearer);
+        assert_eq!(seen[0].body, seen[1].body, "same request bytes, no rebuild");
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+        let notes = notices(&mut rx);
+        assert!(
+            notes.iter().any(|n| n.contains("'astra1'") && n.contains("'astra2'")),
+            "operator must see the switch: {notes:?}"
+        );
+        assert!(
+            notes.iter().all(|n| !n.contains("acct_") && !n.contains("h.")),
+            "notices carry labels only, never ids/tokens: {notes:?}"
+        );
+    }
+
+    /// Explicitly selected account: never switched, even with an eligible
+    /// alternative. The turn ends with the static quota message and no
+    /// transport retries are burned on a provably exhausted seat.
+    #[tokio::test]
+    async fn quota_429_on_explicit_account_never_fails_over() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", false),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("explicit account must fail, not switch");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert!(!err.to_string().contains("ECHOED"));
+        assert_eq!(seen.lock().unwrap().len(), 1, "no retry on exhausted seat");
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        // The cooldown is still reported so the broker stops advertising A.
+        assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+    }
+
+    /// A generic 429 (no exhaustion evidence) keeps the ordinary transport
+    /// retry on the SAME account — it is not proof of a spent window.
+    #[tokio::test]
+    async fn generic_429_retries_same_account_and_never_switches() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], GENERIC_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|r| r.account == "acct_A"));
+        assert!(seen.iter().all(|r| r.bearer == fake_codex_token_for("acct_A")));
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        assert!(router.reports().is_empty());
+    }
+
+    /// Exhausted-window headers on a 429 are provider-declared evidence too.
+    #[tokio::test]
+    async fn quota_429_by_headers_fails_over() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                vec![
+                    ("x-codex-primary-used-percent", "100"),
+                    ("x-codex-primary-reset-after-seconds", "500"),
+                ],
+                "{}",
+            ),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[1].account, "acct_B");
+        let reported = router.reported.lock().unwrap();
+        assert_eq!(reported[0].1.reset_after_secs, Some(500));
+    }
+
+    /// No eligible seat: one quota failure ends the turn — no loop, no
+    /// second attempt on the exhausted account.
+    #[tokio::test]
+    async fn quota_429_with_no_eligible_candidate_fails_without_looping() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", true), vec![None]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 10, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The router hands back the very account that failed (e.g. a broker
+    /// whose cooldown sink is a no-op): refused, never retried.
+    #[tokio::test]
+    async fn failover_to_same_account_is_refused() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra1", "acct_A", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 10, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Both seats exhausted: exactly one switch, then stop (bounded to
+    /// `MAX_CODEX_ACCOUNT_FAILOVERS`), even with a third candidate scripted.
+    #[tokio::test]
+    async fn all_accounts_exhausted_stops_after_one_failover() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![
+                Some(pinned("astra2", "acct_B", true)),
+                Some(pinned("astra3", "acct_C", true)),
+            ],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 10, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "A then B, never C");
+        assert_eq!(seen[0].account, "acct_A");
+        assert_eq!(seen[1].account, "acct_B");
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            router.reports(),
+            vec![
+                "openai-codex@astra1".to_string(),
+                "openai-codex@astra2".to_string()
+            ],
+            "both exhausted seats reported for cooldown"
+        );
+    }
+
+    /// In-stream quota failure (HTTP 200 + terminal `insufficient_quota`)
+    /// with NO output produced: one failover.
+    #[tokio::test]
+    async fn in_stream_quota_before_output_fails_over() {
+        const QUOTA_SSE: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"insufficient_quota\",\"message\":\"ECHOED\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_SSE),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "hello");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].account, "acct_B");
+        assert_eq!(seen[1].bearer, fake_codex_token_for("acct_B"));
+    }
+
+    /// In-stream quota failure AFTER the model produced content — here only
+    /// a reasoning-summary delta, which this decoder does not even forward —
+    /// is terminal: no replay on another account.
+    #[tokio::test]
+    async fn in_stream_quota_after_any_output_never_replays() {
+        const QUOTA_AFTER_REASONING: &str = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking…\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"quota_exceeded\",\"message\":\"x\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_AFTER_REASONING),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must not replay after output");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        // Still reported: the seat IS exhausted.
+        assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+    }
+
+    /// Text already streamed to the UI, then quota: terminal.
+    #[tokio::test]
+    async fn in_stream_quota_after_text_never_replays() {
+        const QUOTA_AFTER_TEXT: &str = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"usage_limit_reached\",\"message\":\"x\"}\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_AFTER_TEXT),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must not replay after output");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// `usage_not_included` is deterministic for the account: no transport
+    /// retry, no failover, status error surfaced.
+    #[tokio::test]
+    async fn usage_not_included_fails_fast_without_retry_or_failover() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            r#"{"error":{"type":"usage_not_included","message":"no codex here"}}"#,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must fail");
+        assert!(err.to_string().starts_with("codex request failed: 429"), "{err}");
+        assert!(!err.to_string().contains("no codex here"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        assert!(router.reports().is_empty());
+    }
+
+    /// A transient 503 (transport retry on A) followed by a quota 429 on A:
+    /// still pre-output, so one failover to B is allowed; B then needs its
+    /// own transient retry, which the shared budget still covers — a
+    /// failover neither consumes nor resets transport retries.
+    #[tokio::test]
+    async fn transport_retry_then_quota_then_failover_keeps_one_retry_budget() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        let seen = seen.lock().unwrap();
+        let accounts: Vec<&str> = seen.iter().map(|r| r.account.as_str()).collect();
+        assert_eq!(accounts, ["acct_A", "acct_A", "acct_B", "acct_B"]);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Transport budget already spent on A when the quota 429 arrives: the
+    /// failover is still permitted (it is not a transport retry), but B gets
+    /// no further transport retries — bounded on both axes.
+    #[tokio::test]
+    async fn failover_does_not_reset_transport_budget() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 1, &tx)
+            .await
+            .expect_err("B's 503 exceeds the shared budget");
+        assert!(err.to_string().starts_with("codex request failed: 503"), "{err}");
+        let accounts: Vec<String> = seen.lock().unwrap().iter().map(|r| r.account.clone()).collect();
+        assert_eq!(accounts, ["acct_A", "acct_A", "acct_B"]);
+    }
+
+    /// Explicit NAMED account (`openai-codex@astra1`) with an in-stream quota
+    /// failure and an eligible alternative scripted: never rotates.
+    #[tokio::test]
+    async fn explicit_named_account_in_stream_quota_never_rotates() {
+        const QUOTA_SSE: &str = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"insufficient_quota\",\"message\":\"x\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_SSE),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", false),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("explicit named account must not rotate");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        assert!(notices(&mut rx).iter().all(|n| !n.contains("switched")));
+    }
+
+    /// Explicit DEFAULT slot behaves the same as a named one: no rotation.
+    #[tokio::test]
+    async fn explicit_default_account_quota_429_never_rotates() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("default", "acct_D", false),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("explicit default must not rotate");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.reports(), vec!["openai-codex".to_string()]);
+    }
+
+    /// Reasoning-only output as an output ITEM (no text delta, nothing
+    /// forwarded to the UI) followed by a quota failure: terminal.
+    #[tokio::test]
+    async fn in_stream_quota_after_reasoning_item_never_replays() {
+        const REASONING_ITEM_THEN_QUOTA: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"insufficient_quota\",\"message\":\"x\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], REASONING_ITEM_THEN_QUOTA),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("reasoning output already produced");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        // Nothing reached the UI — the gate is stricter than "was forwarded".
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, StreamEvent::Llm(crate::LlmEvent::Text(_))),
+                "no text was forwarded"
+            );
+        }
+    }
+
+    /// A metadata-only prelude (`response.created` / `in_progress`) does not
+    /// count as output: failover stays permitted.
+    #[tokio::test]
+    async fn metadata_only_prelude_does_not_block_failover() {
+        const METADATA_THEN_QUOTA: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"usage_limit_reached\",\"message\":\"x\"}\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], METADATA_THEN_QUOTA),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[1].account, "acct_B");
+    }
+
+    /// A failover candidate whose token carries no ChatGPT account claim
+    /// cannot be paired with a header: the turn fails at the runtime, and
+    /// no request is ever sent with a header borrowed from the failed seat.
+    #[tokio::test]
+    async fn failover_candidate_without_account_claim_never_sends_mixed_headers() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let claimless = PinnedAccount {
+            credential: CredentialRef::new(
+                OAuthProviderId::OpenAiCodex,
+                Account::parse("astra2").unwrap(),
+            ),
+            token: format!(
+                "h.{}.s",
+                URL_SAFE_NO_PAD.encode(serde_json::json!({"sub": "nobody"}).to_string())
+            ),
+            auto: true,
+        };
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", true), vec![Some(claimless)]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("claimless token cannot be paired");
+        assert!(err.to_string().contains("account id"), "{err}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "only A's attempt was sent");
+        assert_eq!(seen[0].account, "acct_A");
+    }
+
+    /// The router itself failing during failover is not a loop: report,
+    /// fail the turn with the quota message.
+    #[tokio::test]
+    async fn router_failover_error_ends_turn() {
+        struct FailingRouter(PinnedAccount);
+        #[async_trait]
+        impl CodexAccountRouter for FailingRouter {
+            async fn pin(&self, _m: &str) -> Result<PinnedAccount, String> {
+                Ok(self.0.clone())
+            }
+            async fn failover(
+                &self,
+                _m: &str,
+                _f: &PinnedAccount,
+                _e: &CodexQuotaEvidence,
+                _n: u32,
+            ) -> Result<Option<PinnedAccount>, String> {
+                Err("broker unreachable".into())
+            }
+            async fn report_exhausted(&self, _f: &PinnedAccount, _e: &CodexQuotaEvidence) {}
+        }
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = FailingRouter(pinned("astra1", "acct_A", true));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// The broker adapter with the default trait surface pins the policy
+    /// account as an explicit selection and reports no candidates: the old
+    /// `TokenOnlyBroker` mock keeps working and a quota 429 simply fails.
+    #[tokio::test]
+    async fn broker_adapter_default_trait_surface_is_explicit_and_fails_closed() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let err = run_codex(&url, 5).await.expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1, "no retry, no failover");
+    }
+
     /// The dispatch seam lifts the generic three-attempt budget to the
     /// persistent posture adopted for Anthropic OAuth overloads (10 retries)
     /// — incident: 2026-07-16 chatgpt.com 503/520/timeout bursts.
@@ -4763,8 +5833,11 @@ mod send_retry_tests {
         let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
 
         let err = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             3,
@@ -4794,8 +5867,11 @@ mod send_retry_tests {
         let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
 
         let err = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             1,

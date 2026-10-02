@@ -216,6 +216,12 @@ where
 }
 
 pub async fn login() -> Result<OAuthCredentials, String> {
+    login_into(Some("xai-auth")).await
+}
+
+/// Login; `Some(key)` persists ONLY into that slot (`xai-auth` or
+/// `xai-auth@<label>`), `None` returns the credential unsaved.
+pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
     let client = Client::new();
     let d = discover(&client).await?;
     let verifier = generate_code_verifier();
@@ -260,7 +266,9 @@ pub async fn login() -> Result<OAuthCredentials, String> {
         true,
     )
     .await?;
-    save_provider_auth("xai-auth", &creds)?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)?;
+    }
     Ok(creds)
 }
 

@@ -62,7 +62,7 @@ fn exact_qualified_identity_and_catalog_authority() {
 
     let catalog = CatalogSnapshot::new([foreground.clone(), model("openai-codex/gpt-5.6-fast")]);
     let policy = DelegationPolicy::baseline(foreground.clone(), catalog.clone(), 2, 4).unwrap();
-    assert_eq!(policy.effective_choices(), &[foreground.clone()]);
+    assert_eq!(policy.effective_choices(), std::slice::from_ref(&foreground));
     assert_eq!(policy.catalog_snapshot_id(), catalog.id());
     assert_eq!(
         policy

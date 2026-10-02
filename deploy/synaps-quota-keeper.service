@@ -1,0 +1,63 @@
+# synaps quota-keeper — per-account quota watcher (systemd USER service example)
+#
+# DISABLED BY DEFAULT. Nothing here is installed or enabled automatically.
+# Read docs/providers/quota-keeper.md before enabling.
+#
+# As shipped this unit is READ-ONLY: it polls usage for every connected
+# account, records reset generations and idle delay, and prints alerts
+# (window idle after reset, banked resets, auth errors). It never performs
+# inference, purchases, redemptions or logins.
+#
+# Install (user service, runs as you, uses your ~/.synaps-cli):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/synaps-quota-keeper.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start synaps-quota-keeper        # one session, read-only
+#   journalctl --user -u synaps-quota-keeper -f
+# Enable at login only after you have watched it in read-only mode:
+#   systemctl --user enable synaps-quota-keeper
+#
+# Opting a Codex account into activation is an explicit, per-account,
+# per-unit decision. Edit ExecStart (drop-in: `systemctl --user edit
+# synaps-quota-keeper`) and append, for exactly the accounts you mean:
+#   --activate openai-codex@astra2 --model gpt-5.4-mini
+# Activation is only allowed on the host that owns auth.json (local
+# credential source); a remote broker source stays poll-only. Run exactly
+# ONE keeper per auth.json — the per-account locks are host-local.
+#
+# Second attempt for a generation that stayed `unverified` is never
+# automatic: run once by hand with `--rearm openai-codex@astra2`.
+
+[Unit]
+Description=synaps quota keeper (read-only unless --activate is configured)
+Documentation=https://github.com/HaseebKhalid1507/SynapsCLI/blob/main/docs/providers/quota-keeper.md
+After=network-online.target
+Wants=network-online.target
+# Never restart-loop into repeated activation attempts: the persisted
+# attempt ledger already refuses a second attempt per generation, but
+# bounding restarts keeps a broken environment quiet.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Read-only default. Add `--activate <openai-codex@label> --model <id>` deliberately.
+# Adjust the binary path (e.g. /usr/local/bin/synaps) to your installation.
+ExecStart=%h/.local/bin/synaps quota-keeper --poll-interval 300
+# SIGTERM -> graceful: the keeper persists state and exits; never kill -9 mid-attempt.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=30
+# Hardening. State lives in %h/.synaps-cli/quota-keeper (dir 0700, files 0600).
+# ProtectSystem/ProtectHome are omitted on purpose: in a per-user manager they
+# imply PrivateUsers= and can break access to ~/.synaps-cli; add them only if
+# you have verified `--once` still works under the sandbox.
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Intentionally NOT enabled by default. `systemctl --user enable` is your explicit step.
+WantedBy=default.target

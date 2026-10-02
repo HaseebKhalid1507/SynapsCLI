@@ -532,7 +532,7 @@ fn activation_rejects_mismatched_grants_without_partial_mutation() {
     let foreign = grant_for(&session("session-other"), &catalog, &tool);
     assert!(matches!(
         set.activate(foreign, &catalog).unwrap_err(),
-        ActivationError::SessionMismatch { .. }
+        ActivationError::SessionMismatch
     ));
     assert_eq!(
         set.activated().count(),
