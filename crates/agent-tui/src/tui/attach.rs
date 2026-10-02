@@ -50,6 +50,55 @@ pub struct AttachOpts {
     pub adopted: bool,
 }
 
+/// Toast id for the routine attach notes ([`attach_notices`]).
+const ATTACH_TOAST_ID: &str = "attach";
+
+/// What [`attach_notices`] needs to know about the attach that just happened.
+struct AttachNoticeInputs<'a> {
+    session_id: &'a SessionId,
+    client_id: u64,
+    mode: AttachMode,
+    /// `Some(notice)` when another client owns input, so this one is read-only.
+    owned_elsewhere: Option<String>,
+    /// `Some(continued)` when a plain `synaps` adopted the daemon.
+    adopted: Option<bool>,
+    /// The daemon's other sessions ([`adopt_banner`]), adopt only.
+    others_banner: Option<String>,
+    config_warnings: &'a [String],
+}
+
+/// Attach notes, split by whether they need the user.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AttachNotices {
+    /// Stays in the transcript: the other-sessions list, config warnings,
+    /// and the attach line when input is owned elsewhere (this client is
+    /// read-only until it takes over).
+    transcript: Vec<String>,
+    /// Routine notes ("adopted the running daemon", "attached to … as
+    /// client #N") for a short toast. Kept out of the transcript so a fresh
+    /// session starts empty and shows the boot logo, like in-process.
+    toast: Vec<String>,
+}
+
+fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
+    let mut out = AttachNotices::default();
+    if let Some(continued) = i.adopted {
+        let how = if continued { "continued session" } else { "fresh session" };
+        out.toast.push(format!("adopted the running daemon ({how})"));
+        out.toast.push("SYNAPS_DAEMON_ADOPT=0 for in-process".to_string());
+        out.transcript.extend(i.others_banner);
+    }
+    for w in i.config_warnings {
+        out.transcript.push(format!("⚠ config: {w}"));
+    }
+    let attached = format!("attached to {} as client #{} ({:?})", i.session_id, i.client_id, i.mode);
+    match i.owned_elsewhere {
+        Some(owned) => out.transcript.push(format!("{attached} — {owned}")),
+        None => out.toast.insert(0, attached),
+    }
+    out
+}
+
 /// One-line inventory of the daemon's other sessions, shown when a plain
 /// `synaps` adopts the daemon (F1): the lid-close user must be able to
 /// *see* their parked task, without being surprise-attached to it.
@@ -328,28 +377,29 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for n in super::run_setup::take_boot_notices() {
         app.push_msg(ChatMessage::System(n));
     }
-    if opts.adopted {
-        let how = if opts.continue_session.is_some() { "continued session" } else { "fresh session" };
-        app.push_msg(ChatMessage::System(format!(
-            "adopted the running daemon ({how}) — SYNAPS_DAEMON_ADOPT=0 or `synaps daemon stop` for in-process"
-        )));
-        if let Some(b) = adopt_banner(&welcome_sessions, &snapshot.meta.id, chrono::Utc::now()) {
-            app.push_msg(ChatMessage::System(b));
-        }
+    let notices = attach_notices(AttachNoticeInputs {
+        session_id: &snapshot.meta.id,
+        client_id: transport.client_id().0,
+        mode: transport.mode(),
+        owned_elsewhere: snapshot.input_owned_elsewhere(transport.client_id()),
+        adopted: opts.adopted.then_some(opts.continue_session.is_some()),
+        others_banner: if opts.adopted {
+            adopt_banner(&welcome_sessions, &snapshot.meta.id, chrono::Utc::now())
+        } else {
+            None
+        },
+        config_warnings: &config.warnings,
+    });
+    for n in notices.transcript {
+        app.push_msg(ChatMessage::System(n));
     }
-    for w in &config.warnings {
-        app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
+    if !notices.toast.is_empty() {
+        app.toasts.upsert(
+            super::toast::Toast::new(ATTACH_TOAST_ID, String::new())
+                .titled("daemon")
+                .lines(notices.toast),
+        );
     }
-    app.push_msg(ChatMessage::System(format!(
-        "attached to {} as client #{} ({:?}){}",
-        snapshot.meta.id,
-        transport.client_id().0,
-        transport.mode(),
-        match snapshot.input_owned_elsewhere(transport.client_id()) {
-            Some(owned) => format!(" — {owned}"),
-            None => String::new(),
-        }
-    )));
     // Mid-turn attach: rebuild the partial turn from the replay ring, then
     // the actor's pending prompts.
     let replay = snapshot.replay.clone();
@@ -396,6 +446,58 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn notice_inputs<'a>(id: &'a SessionId, warnings: &'a [String]) -> AttachNoticeInputs<'a> {
+        AttachNoticeInputs {
+            session_id: id,
+            client_id: 1,
+            mode: AttachMode::Mirror,
+            owned_elsewhere: None,
+            adopted: None,
+            others_banner: None,
+            config_warnings: warnings,
+        }
+    }
+
+    #[test]
+    fn routine_attach_notes_go_to_the_toast_so_the_logo_shows() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        // plain `synaps` adopting the daemon, nothing else going on
+        let n = attach_notices(AttachNoticeInputs { adopted: Some(false), ..notice_inputs(&id, &[]) });
+        assert!(n.transcript.is_empty(), "a fresh session's transcript stays empty: {n:?}");
+        assert_eq!(n.toast[0], "attached to 20261001-000000-ours as client #1 (Mirror)");
+        assert_eq!(n.toast[1], "adopted the running daemon (fresh session)");
+        assert!(n.toast[2].contains("SYNAPS_DAEMON_ADOPT=0"), "{n:?}");
+        // `--continue` says so
+        let n = attach_notices(AttachNoticeInputs { adopted: Some(true), ..notice_inputs(&id, &[]) });
+        assert_eq!(n.toast[1], "adopted the running daemon (continued session)");
+        // explicit `--attach`: only the attach line
+        let n = attach_notices(notice_inputs(&id, &[]));
+        assert_eq!(n, AttachNotices { transcript: vec![], toast: vec![
+            "attached to 20261001-000000-ours as client #1 (Mirror)".to_string(),
+        ] });
+    }
+
+    #[test]
+    fn notes_that_need_the_user_stay_in_the_transcript() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        let warnings = vec!["unknown key `fooo`".to_string()];
+        let n = attach_notices(AttachNoticeInputs {
+            adopted: Some(false),
+            others_banner: Some("2 other sessions in this daemon".to_string()),
+            owned_elsewhere: Some("input is owned by client #3 (tui)".to_string()),
+            ..notice_inputs(&id, &warnings)
+        });
+        assert_eq!(n.transcript, vec![
+            "2 other sessions in this daemon".to_string(),
+            "⚠ config: unknown key `fooo`".to_string(),
+            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui)"
+                .to_string(),
+        ]);
+        // read-only attach: the attach line is in the transcript, not the toast
+        assert!(n.toast.iter().all(|l| !l.starts_with("attached to")), "{n:?}");
+        assert_eq!(n.toast[0], "adopted the running daemon (fresh session)");
+    }
 
     #[test]
     fn not_running_message_says_so_and_how_to_start() {

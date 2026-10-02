@@ -391,7 +391,7 @@ pub(crate) fn tool_accent(tool_name: &str) -> Color {
     }
 
     if tool_name.starts_with("ext__") {
-        return resolve(t.tool_ext, t.event_icon);
+        return resolve(t.tool_ext, t.event_accent("high"));
     }
 
     match tool_name {

@@ -205,7 +205,7 @@ pub(crate) async fn run_setup(
 
     if mcp_server_count > 0 {
         tracing::info!(
-            "{} MCP servers available (use connect_mcp_server to activate)",
+            "{} MCP tools available from configured servers",
             mcp_server_count
         );
     }

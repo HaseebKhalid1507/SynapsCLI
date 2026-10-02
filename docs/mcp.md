@@ -68,10 +68,10 @@ stable across restarts.
 
 Safety properties:
 
-- only the **exact-lease path** writes (a server the operator configured,
-  started for an already gate-authorized call). The legacy server-wide
-  `connect_mcp_server` gateway never writes — it is not exact-tool
-  authorized and must not be a cache-poisoning bridge;
+- only two paths write: the **exact-lease path** (a server the operator
+  configured, started for an already gate-authorized call), and **boot
+  discovery** for a configured server with no fingerprint-matching entry
+  (below);
 - entries pass the same sanitisation as a load (name bounds, object
   schemas, ≤ 64 KiB per schema, ≤ 256 tools per server, descriptions
   clamped);
@@ -94,3 +94,29 @@ one default-path behaviour change of daemon-mode phase 2; it is listed in
 
 Kill-switch: `SYNAPS_MCP_CACHE_WRITEBACK=0` (also `false`/`off`) — never
 write. The cache remains a supported *input*.
+
+## One MCP path in every mode (legacy gateway removed)
+
+MCP tools are always descriptor-backed registry entries executed through
+per-session leases, whatever `progressive_tool_disclosure` says:
+
+- **Progressive on:** they stay dormant until `activate_tools` (or are sent
+  deferred on Anthropic, see `request-lifecycle-progressive-disclosure.md`).
+- **Progressive off:** they are part of every session's core, sent from the
+  first request. The tools list never changes mid-session.
+
+The old `connect_mcp_server` gateway is gone. It registered a server's tools
+mid-session, which rewrote the prompt cache, and in the daemon it shared one
+connection and one tool registry across every session. The daemon's
+"legacy MCP conflict" refusal went with it; `--allow-legacy-mcp` and
+`SYNAPS_DAEMON_ALLOW_LEGACY_MCP` are accepted and ignored.
+
+### Boot discovery for new servers
+
+A configured server with no fingerprint-matching descriptor-cache entry (a new
+server, or a changed command/args/env) is started **once at boot**: initialize,
+`tools/list`, recorded through `record_server_listing` (same lock and
+sanitisation as the lease write-back), then stopped. It is bounded to 20 s per
+server, and a timeout cannot leak a process because children are
+`kill_on_drop`. A failure leaves that server without tools for this run and is
+retried next boot. `SYNAPS_MCP_CACHE_WRITEBACK=0` disables it.

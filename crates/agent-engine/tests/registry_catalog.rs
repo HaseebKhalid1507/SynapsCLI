@@ -3,14 +3,12 @@
 //! extension merge) with truthful runtime-origin provenance and proven
 //! passivity against production-shaped extension/MCP metadata.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agent_engine::extensions::hooks::events::{HookEvent, HookResult};
 use agent_engine::extensions::runtime::process::RegisteredExtensionToolSpec;
 use agent_engine::extensions::runtime::ExtensionHandler;
-use agent_engine::mcp::McpConnectTool;
 use agent_engine::tools::catalog::{
     CapabilitySource, CatalogError, CatalogGeneration, ToolCatalog, ToolId, TrustProvenance,
 };
@@ -319,22 +317,6 @@ fn extension_merge_catalogs_extension_provenance_without_invoking_the_handler() 
     assert_eq!(handler.hook_calls.load(Ordering::SeqCst), 0);
     assert_eq!(handler.tool_calls.load(Ordering::SeqCst), 0);
     assert_eq!(handler.shutdowns.load(Ordering::SeqCst), 0);
-}
-
-// ── MCP gateway is explicitly builtin; no connection at catalog time ────────
-
-#[test]
-fn mcp_gateway_tool_is_explicitly_builtin_and_inert_to_catalog() {
-    let mut registry = ToolRegistry::empty();
-    registry
-        .try_register(Arc::new(McpConnectTool::new(HashMap::new())))
-        .expect("gateway registration succeeds");
-    let record = registry
-        .catalog()
-        .get(&ToolId::builtin("connect_mcp_server"))
-        .expect("gateway cataloged as builtin");
-    assert_eq!(record.source(), &CapabilitySource::Builtin);
-    assert_eq!(record.provenance(), &TrustProvenance::BuiltinRuntime);
 }
 
 // ── Duplicate capability identity across runtime names fails typed ──────────

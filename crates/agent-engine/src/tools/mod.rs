@@ -33,6 +33,7 @@ pub mod catalog;
 pub mod discovery;
 pub mod ledger;
 pub mod output;
+pub mod prompt_catalog;
 mod registry;
 pub mod respond;
 pub mod send_channel;
