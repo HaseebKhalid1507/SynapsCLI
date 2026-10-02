@@ -341,6 +341,19 @@ impl Daemon {
         };
         registry::write_daemon_json(&paths, &info)?;
 
+        // Before any session of this image registers: drop registrations no
+        // running session owns (dead owner pid). After a reload, also every
+        // one naming our own pid: the old image exec'd without ending its
+        // sessions, and the ones still live re-register when they rehydrate
+        // below, under their current (e.g. post-compaction) id. On a fresh
+        // start our pid may already own live registrations (a daemon hosted
+        // in a process that runs other sessions), so it is left alone.
+        let own_pid = reload_state.as_ref().map(|_| info.pid);
+        let swept = crate::events::registry::sweep_stale_registrations(own_pid);
+        if swept > 0 {
+            tracing::info!(swept, "daemon: removed stale session registrations");
+        }
+
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
             reload::rehydrate(&state, rs).await;

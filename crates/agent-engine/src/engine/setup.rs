@@ -29,6 +29,10 @@ pub struct BackgroundTasks {
     #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
     session_socket_path: String,
     session_id: String,
+    /// What this session wrote to the registry. Removal is checked against
+    /// it, so ending this session never deletes a newer registration of the
+    /// same id.
+    registration: crate::events::registry::SessionRegistration,
     /// Hook bus the session's `on_session_start` injection lives on; cleared
     /// at shutdown so a long-lived process does not accumulate stale keys.
     hook_bus: Arc<crate::extensions::hooks::HookBus>,
@@ -48,7 +52,7 @@ impl BackgroundTasks {
             .store(true, std::sync::atomic::Ordering::Release);
         self.socket_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        crate::events::registry::unregister_session(&self.session_id);
+        crate::events::registry::unregister_owned(&self.registration);
         // Cleanup only — fail-soft when no tokio runtime is current.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let hook_bus = Arc::clone(&self.hook_bus);
@@ -68,6 +72,11 @@ impl Drop for BackgroundTasks {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.watcher_task.abort();
         self.socket_task.abort();
+        // A session can end without `shutdown()` (an early return, a panic
+        // unwinding, a frontend that just drops). Its registration and
+        // socket must not outlive it: those leftovers piled up by the
+        // hundreds in `run/`. Idempotent after `shutdown()`.
+        crate::events::registry::unregister_owned(&self.registration);
     }
 }
 
@@ -291,6 +300,13 @@ pub(crate) fn spawn_session_background(
         runtime.event_queue().clone(),
         socket_shutdown.clone(),
     );
+    // Registrations whose owner process is gone (killed, crashed, exited
+    // without cleanup) are dead weight for every `send`/`status` scan.
+    // Starting a session is a cheap, frequent moment to drop them.
+    let pruned = crate::events::registry::sweep_stale_registrations(None);
+    if pruned > 0 {
+        tracing::debug!(pruned, "registry: removed registrations of dead processes");
+    }
     let session_registration = crate::events::registry::SessionRegistration {
         kind: crate::events::registry::REGISTRATION_KIND.to_string(),
         session_id: session.id.clone(),
@@ -320,6 +336,7 @@ pub(crate) fn spawn_session_background(
         socket_task,
         session_socket_path,
         session_id: session.id.clone(),
+        registration: session_registration,
         hook_bus: Arc::clone(runtime.hook_bus()),
         // The appender guard lives on the `EngineHost` now.
         log_guard: None,
@@ -609,6 +626,69 @@ fn resolve_or_create_session(
 mod tests {
     use super::*;
     use agent_core::reasoning::ReasoningLevel;
+
+    /// A session's registry card and socket must not outlive it, even when
+    /// it ends without `shutdown()` (S348: 470 leftovers in `run/`), and
+    /// `shutdown()` followed by drop stays clean.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn session_registration_is_removed_on_drop_without_shutdown() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let runtime = Runtime::new_headless();
+        let dir = crate::events::registry::registry_dir();
+        for explicit_shutdown in [false, true] {
+            let session = Session::new("claude-sonnet-4-5", "low", None);
+            let card = dir.join(format!("{}.json", session.id));
+            let sock = std::path::PathBuf::from(crate::events::registry::socket_path_for_session(
+                &session.id,
+            ));
+            let background = spawn_session_background(&runtime, &session).unwrap();
+            for _ in 0..100 {
+                if sock.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(card.exists() && sock.exists(), "registered and listening");
+            if explicit_shutdown {
+                background.shutdown();
+            }
+            drop(background);
+            assert!(
+                !card.exists(),
+                "card removed (shutdown: {explicit_shutdown})"
+            );
+            assert!(
+                !sock.exists(),
+                "socket removed (shutdown: {explicit_shutdown})"
+            );
+        }
+    }
+
+    /// Starting a session drops registrations whose owner process is gone.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn starting_a_session_prunes_registrations_of_dead_processes() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = crate::events::registry::registry_dir();
+        let dead = crate::events::registry::SessionRegistration {
+            kind: crate::events::registry::REGISTRATION_KIND.to_string(),
+            session_id: "20200101-000000-dead".into(),
+            name: None,
+            socket_path: crate::events::registry::socket_path_for_session("20200101-000000-dead"),
+            pid: 999_999,
+            started_at: chrono::Utc::now(),
+        };
+        crate::events::registry::register_session(&dead).unwrap();
+        std::fs::write(&dead.socket_path, b"").unwrap();
+
+        let runtime = Runtime::new_headless();
+        let session = Session::new("claude-sonnet-4-5", "low", None);
+        let background = spawn_session_background(&runtime, &session).unwrap();
+        assert!(!dir.join("20200101-000000-dead.json").exists());
+        assert!(!std::path::Path::new(&dead.socket_path).exists());
+        background.shutdown();
+    }
 
     async fn saved_session(first: &str) -> Session {
         let mut session = Session::new("claude-sonnet-4-5", "low", None);
