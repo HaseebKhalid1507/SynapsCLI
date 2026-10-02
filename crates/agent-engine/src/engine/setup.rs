@@ -152,7 +152,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     if mcp_server_count > 0 {
         tracing::info!(
-            "{} MCP servers available (use connect_mcp_server to activate)",
+            "{} MCP tools available from configured servers",
             mcp_server_count
         );
     }

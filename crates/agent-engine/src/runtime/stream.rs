@@ -197,6 +197,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.deferred_loading` (Anthropic deferred tool definitions).
+    pub(super) deferred_tool_loading: bool,
     /// `tools.activation_confirm` policy (auto | prompt | deny).
     pub(super) activation_confirm: agent_core::config::ActivationConfirm,
     /// Runtime-scoped tool-session identity the execution gate scopes the
@@ -464,6 +466,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            deferred_tool_loading,
             activation_confirm,
             tool_session_id,
             retained_tool_set,
@@ -644,7 +647,7 @@ impl StreamMethods {
                     event = "turn_budget_exhausted",
                     dimension = dimension.as_str(),
                     elapsed_secs = budget_meter.elapsed().as_secs(),
-                    max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                    max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                     rounds_used = budget_meter.rounds_used(),
                     max_provider_rounds = budget_meter.budget().max_provider_rounds,
                     round_renewals_used = budget_meter.round_renewals_used(),
@@ -704,7 +707,7 @@ impl StreamMethods {
             // the head and start a fresh context segment with renewed time.
             // An un-exercised segment (no provider round yet) still hard-stops.
             time_checkpoint = context_enabled
-                && !budget_meter.budget().max_elapsed.is_zero()
+                && budget_meter.budget().has_time_limit()
                 && budget_meter.wall_clock_exceeded();
             if time_checkpoint && !segment_has_provider_round {
                 finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -723,7 +726,7 @@ impl StreamMethods {
                                         renewals_used = budget_meter.round_renewals_used(),
                                         renewals_remaining = remaining,
                                         elapsed_secs = budget_meter.elapsed().as_secs(),
-                                        max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                                        max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                                         tool_calls_used = budget_meter.tool_calls_used(),
                                         "provider-round checkpoint: renewed, continuing automatically"
                                     );
@@ -738,7 +741,7 @@ impl StreamMethods {
                                 Err(agent_core::BudgetDimension::WallClock)
                                     if context_enabled
                                         && segment_has_provider_round
-                                        && !budget_meter.budget().max_elapsed.is_zero() =>
+                                        && budget_meter.budget().has_time_limit() =>
                                 {
                                     time_checkpoint = true;
                                 }
@@ -750,7 +753,7 @@ impl StreamMethods {
                         }
                     }
                     Err(agent_core::BudgetDimension::WallClock)
-                        if context_enabled && !budget_meter.budget().max_elapsed.is_zero() =>
+                        if context_enabled && budget_meter.budget().has_time_limit() =>
                     {
                         if !segment_has_provider_round {
                             finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -779,7 +782,7 @@ impl StreamMethods {
 
             // Round-top set maintenance: if dynamic registration advanced
             // the catalog generation since the retained set was built (e.g.
-            // `connect_mcp_server` drained after the previous round),
+            // an extension tool registered after the previous round),
             // rebuild it here — explicitly, deterministically, from the
             // currently verified capabilities. Exact activations whose
             // record still matches its pinned digest+provenance are carried
@@ -957,10 +960,19 @@ impl StreamMethods {
                             "session schema projection dropped a pinned member for this round"
                         );
                     }
-                    report.schema
+                    let split = deferred_tool_loading.then(|| {
+                        let referenced =
+                            super::helpers::HelperMethods::referenced_tool_ids(request_messages);
+                        std::sync::Arc::new(
+                            tools_snapshot.deferred_tool_split(&session_set, &referenced),
+                        )
+                    });
+                    (report.schema, split)
                 };
+                let (projection, anthropic_tool_split) = projection;
                 projected_options = super::api::ApiOptions {
                     request_tools_schema: Some(std::sync::Arc::new(projection)),
+                    anthropic_tool_split,
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     ..options.clone()
@@ -1659,7 +1671,7 @@ impl StreamMethods {
                     // retained session-set snapshot, translating inputs into
                     // owned dispatch records under that same guard. Only
                     // after the guard is released are tasks spawned, so no
-                    // registration (`connect_mcp_server`, extension load)
+                    // registration (extension load, a `tool_register_tx` drain)
                     // can change policy between sibling calls, and no lock
                     // is held across tool execution. Denials are typed,
                     // static, metadata-only and happen BEFORE implementation
@@ -3056,6 +3068,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set,
@@ -3961,6 +3974,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set: Default::default(),

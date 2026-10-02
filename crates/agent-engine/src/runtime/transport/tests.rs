@@ -318,6 +318,7 @@ fn adapter_bytes(s: &body_golden::Scenario) -> (Vec<u8>, TranslationReport) {
         s.model,
         &cleaned,
         &s.tools,
+        &[],
         &s.system_prompt,
         s.auth_type,
         s.thinking_budget,

@@ -64,11 +64,6 @@ pub fn autospawn_enabled() -> bool {
 /// One-line reason used by every attach path when the flag is off.
 pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
 
-/// `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` (§4.4).
-pub fn allow_legacy_mcp_env() -> bool {
-    matches!(std::env::var("SYNAPS_DAEMON_ALLOW_LEGACY_MCP").as_deref(), Ok("1") | Ok("true"))
-}
-
 /// Builds a session for `Attach::Create`: `host_factory` (real actor) or
 /// `echo_factory` (tests).
 pub type SessionFactory = Arc<
@@ -113,6 +108,9 @@ pub struct DaemonOpts {
     /// turn (idle, client-less sessions are saved on exit; `--continue`
     /// brings them back). A turn in flight always blocks the exit.
     pub idle_exit: Option<Duration>,
+    /// Deprecated, ignored: legacy MCP was removed (every mode uses
+    /// per-session MCP leases). Still forwarded so an older client can spawn
+    /// a newer daemon.
     pub allow_legacy_mcp: bool,
     /// Test seam: `registry_dir()` replacement.
     pub runtime_dir: Option<PathBuf>,
@@ -275,22 +273,6 @@ pub struct Daemon {
     accept: tokio::task::JoinHandle<()>,
 }
 
-/// Refuse-to-start check (§2.11): legacy `McpTool` connections would be
-/// shared across sessions.
-pub fn legacy_mcp_conflict(host: &EngineHost, allow: bool) -> Option<String> {
-    if allow || allow_legacy_mcp_env() {
-        return None;
-    }
-    let cfg = host.config();
-    if !cfg.progressive_tool_disclosure && host.mcp_server_count() > 0 {
-        return Some(format!(
-            "progressive_tool_disclosure=false with {} MCP server(s) configured: legacy McpTool connections would be shared across sessions. Set progressive_tool_disclosure=true, or pass --allow-legacy-mcp / SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1",
-            host.mcp_server_count()
-        ));
-    }
-    None
-}
-
 impl Daemon {
     /// Reap stale files, take the flock, bind (dir 0700 / sock 0600), write
     /// `daemon.json`, spawn the accept loop, signal the ready fd if any.
@@ -301,9 +283,6 @@ impl Daemon {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        if let Some(msg) = legacy_mcp_conflict(&host, opts.allow_legacy_mcp) {
-            anyhow::bail!("refusing to start: {msg}");
         }
         // C3: after `reload` the new image ADOPTS the inherited flock and
         // skips `reap_stale` (the old image's files are ours).
@@ -709,9 +688,6 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
         anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
     }
     let host = EngineHost::boot_and_install(crate::HostOpts { profile: opts.profile.clone(), no_extensions: false }).await?;
-    if let Some(msg) = legacy_mcp_conflict(&host, opts.allow_legacy_mcp) {
-        anyhow::bail!("refusing to start: {msg} (exit {EXIT_REFUSED})");
-    }
     // Sidecars spawn once per daemon: discover before accepting (bounded 10 s).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let _loader = crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None);

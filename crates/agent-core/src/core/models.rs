@@ -26,6 +26,29 @@ pub fn default_model() -> &'static str {
 ///
 /// Adaptive thinking also auto-enables interleaved thinking — no beta
 /// header required.
+/// Whether an Anthropic model supports tool search, i.e. `defer_loading` tool
+/// definitions expanded by `tool_reference` blocks. Anthropic's compatibility
+/// table lists Haiku 4.5, Sonnet 4.5+, Opus 4.5+ and every 5.x family; Opus 4.1
+/// and earlier (and Sonnet 4 / the 3.x line) do not support it. Unknown future
+/// `claude-*` ids are assumed to support it.
+pub fn model_supports_tool_search(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_prefix("anthropic/").unwrap_or(&m);
+    if !m.starts_with("claude-") {
+        return false;
+    }
+    const UNSUPPORTED: &[&str] = &[
+        "claude-3",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-opus-4-2025",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-2025",
+        "claude-instant",
+    ];
+    !UNSUPPORTED.iter().any(|p| m.starts_with(p))
+}
+
 pub fn model_supports_adaptive_thinking(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     // Only Opus 4.7+ REQUIRES adaptive. Opus 4.6 supports it optionally
@@ -140,6 +163,31 @@ pub fn context_window_for_model(_model: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_search_support_follows_anthropic_compatibility_table() {
+        for m in [
+            "claude-opus-5-5",
+            "anthropic/claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-8",
+        ] {
+            assert!(super::model_supports_tool_search(m), "{m}");
+        }
+        for m in [
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-latest",
+            "gpt-5.6-sol",
+            "groq/llama-3.3-70b-versatile",
+        ] {
+            assert!(!super::model_supports_tool_search(m), "{m}");
+        }
+    }
+
     use super::*;
 
     #[test]

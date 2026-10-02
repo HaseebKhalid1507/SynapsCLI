@@ -141,19 +141,16 @@ impl EngineHost {
         // Discover plugins/skills, build command registry, register load_skill tool.
         let (command_registry, keybind_registry) = crate::skills::register(&tools, &config).await;
 
-        // MCP loading (if configured). Flag-off keeps the legacy connect
-        // gateway; progressive disclosure switches to exact descriptor-backed
-        // dormant tools with no gateway.
-        let mcp_server_count =
-            crate::mcp::setup_lazy_mcp(&tools, config.progressive_tool_disclosure).await;
-        let mcp_runtime = if config.progressive_tool_disclosure {
-            Some(Arc::new(crate::mcp::McpRuntimeManager::new(
-                crate::mcp::lease::config_source_from_disk(),
-                crate::mcp::lease::DEFAULT_IDLE_MAX,
-            )))
-        } else {
-            None
-        };
+        // MCP (if configured): descriptor-backed tools, executed through
+        // per-session leases in every mode. With progressive disclosure they
+        // stay dormant until activated; without it they are part of every
+        // session's core. A configured server with no cached descriptors is
+        // discovered once at boot (bounded).
+        let mcp_server_count = crate::mcp::setup_lazy_mcp(&tools).await;
+        let mcp_runtime = Some(Arc::new(crate::mcp::McpRuntimeManager::new(
+            crate::mcp::lease::config_source_from_disk(),
+            crate::mcp::lease::DEFAULT_IDLE_MAX,
+        )));
 
         let hook_bus = Arc::new(HookBus::new());
         let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
