@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serial_test::serial;
 use support::*;
-use synaps_cli::orchestration::{DelegationTreeBudget, DelegationTreeDenied, OrchestrationRuntime};
+use synaps_cli::orchestration::{DelegationTreeDenied, OrchestrationRuntime};
 use synaps_cli::runtime::budget::{TurnBudget, TurnRole};
 use synaps_cli::runtime::trace::{
     CollectingTraceSink, ExecutionCommitStatus, ExecutionCorrelation, ExecutionPhase, TraceContext,
@@ -898,7 +898,7 @@ fn correlated_events_share_ids_preserve_model_order_and_have_bounded_previews() 
 }
 
 #[test]
-fn delegation_tree_depth_and_fanout_are_bounded_before_dispatch() {
+fn delegation_depth_is_bounded_before_dispatch() {
     let foreground = model("anthropic/foreground");
     let runtime = OrchestrationRuntime::new(agent_core::orchestration::DelegationPolicy::enforced(
         foreground.clone(),
@@ -906,21 +906,15 @@ fn delegation_tree_depth_and_fanout_are_bounded_before_dispatch() {
         4,
         8,
     ))
-    .with_tree_budget(DelegationTreeBudget {
-        max_depth: 1,
-        max_children_per_worker: 1,
-        max_total_descendants: 2,
-    })
+    .with_max_depth(1)
     .unwrap();
     assert_eq!(runtime.reserve_delegation("root-child", None), Ok(1));
     assert_eq!(
         runtime.reserve_delegation("nested", Some("root-child")),
-        Err(DelegationTreeDenied::DepthLimit)
+        Err(DelegationTreeDenied::DepthLimit { max_depth: 1 })
     );
-    assert_eq!(
-        runtime.reserve_delegation("root-sibling", None),
-        Err(DelegationTreeDenied::ChildLimit)
-    );
+    // Fan-out is the policy's concurrency limit, not a tree cap.
+    assert_eq!(runtime.reserve_delegation("root-sibling", None), Ok(1));
 }
 
 #[test]
