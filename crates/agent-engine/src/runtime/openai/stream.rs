@@ -677,6 +677,13 @@ pub(crate) async fn call_codex_stream_inner(
                     .header("chatgpt-account-id", account_id.as_str())
                     .header("originator", "synaps")
                     .header("OpenAI-Beta", "responses=experimental")
+                    // Cache affinity: the ChatGPT backend routes prompt-cache
+                    // lookups by the `session-id` header (Codex CLI sends its
+                    // conversation id as both headers and as
+                    // `prompt_cache_key`). Without it, every request reported
+                    // cached_tokens = 0, even with a byte-identical prefix.
+                    .header("session-id", prompt_cache_key.as_str())
+                    .header("thread-id", prompt_cache_key.as_str())
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .body(body_bytes.clone())
@@ -803,8 +810,10 @@ pub(crate) async fn call_codex_stream_inner(
 
 /// Stable prompt-cache routing key for this conversation.
 ///
-/// The Codex backend routes prefix-cache lookups by `prompt_cache_key`
-/// (upstream codex-rs sends its conversation UUID on every request). Synaps
+/// Sent as `prompt_cache_key` in the body AND as the `session-id` /
+/// `thread-id` headers: the ChatGPT backend derives cache affinity from the
+/// `session-id` header (upstream codex-rs sends its conversation UUID in all
+/// three places). The body key alone yielded zero cache hits. Synaps
 /// doesn't thread a session id down to the transport, so derive a
 /// deterministic key from the stable head of the prompt: the instructions
 /// plus the first input item. Identical heads hash to the same key — which
@@ -4519,6 +4528,78 @@ mod send_retry_tests {
             "the logical request must resend byte-identical content"
         );
         assert_eq!(result["content"][0]["text"], "hello");
+    }
+
+    /// Mock Codex endpoint that records every request's (session-id,
+    /// thread-id, prompt_cache_key). The first `fail_count` POSTs fail 500.
+    async fn spawn_header_recording_codex(
+        fail_count: usize,
+    ) -> (String, Arc<std::sync::Mutex<Vec<(String, String, String)>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post({
+                let seen = Arc::clone(&seen);
+                move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                    let seen = Arc::clone(&seen);
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        let get = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let key = serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|b| b["prompt_cache_key"].as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        seen.lock()
+                            .unwrap()
+                            .push((get("session-id"), get("thread-id"), key));
+                        if counter.fetch_add(1, Ordering::SeqCst) < fail_count {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_string()).into_response()
+                        } else {
+                            (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                CODEX_SSE_SUCCESS.to_string(),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The ChatGPT backend derives prompt-cache affinity from the `session-id`
+    /// header (Codex CLI `responses_session_id`); without it every request
+    /// reported `cached_tokens: 0`. Measured A/B: no header 0/0/0 cached;
+    /// with `session-id`/`thread-id` = prompt_cache_key, 0 then 95%, 95%.
+    #[tokio::test]
+    async fn codex_requests_carry_session_and_thread_id_equal_to_the_cache_key() {
+        let (base_url, seen) = spawn_header_recording_codex(1).await;
+        run_codex(&base_url, 2)
+            .await
+            .expect("one transient 500 then success");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "first attempt + one retry");
+        for (session_id, thread_id, key) in seen.iter() {
+            assert!(
+                key.starts_with("synaps-"),
+                "prompt_cache_key in body: {key:?}"
+            );
+            assert_eq!(session_id, key, "session-id header = prompt_cache_key");
+            assert_eq!(thread_id, key, "thread-id header = prompt_cache_key");
+        }
+        assert_eq!(seen[0], seen[1], "a retry keeps the same cache routing");
     }
 
     #[tokio::test]
