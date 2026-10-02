@@ -879,6 +879,12 @@ pub struct SynapsConfig {
     pub tui_background_opaque: bool,
     /// Whether the prompt shows a glow sweeping across it while a turn streams. Default off.
     pub tui_streaming_glow: bool,
+    /// Run the daemon, bash tool commands and PTY shells each in their own
+    /// systemd scope (Linux, when a systemd user manager is reachable), so the
+    /// out-of-memory killer can stop one runaway command instead of the whole
+    /// terminal scope with the daemon in it. `process_scopes = off` disables;
+    /// env `SYNAPS_PROCESS_SCOPES` overrides. Default on.
+    pub process_scopes: bool,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
@@ -955,6 +961,7 @@ impl Default for SynapsConfig {
             theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
             tui_streaming_glow: false,
+            process_scopes: true,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -1011,6 +1018,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "theme_transition",
     "tui_background_opaque",
     "tui_streaming_glow",
+    "process_scopes",
     "agent_name",
     "identity",
     "disabled_plugins",
@@ -1443,6 +1451,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 "false" | "0" | "off" | "no" => config.tui_streaming_glow = false,
                 _ => config.warnings.push(format!(
                     "tui_streaming_glow = {val} — expected on or off; using off"
+                )),
+            },
+            "process_scopes" => match val {
+                "true" | "1" | "on" | "yes" | "auto" => config.process_scopes = true,
+                "false" | "0" | "off" | "no" => config.process_scopes = false,
+                _ => config.warnings.push(format!(
+                    "process_scopes = {val} — expected auto or off; using auto"
                 )),
             },
             "agent_name" => config.agent_name = Some(val.to_string()),
@@ -1952,6 +1967,19 @@ mod tests {
             "no unknown-key warning: {:?}",
             c.warnings
         );
+    }
+
+    #[test]
+    fn process_scopes_defaults_on_and_parses_auto_and_off() {
+        assert!(super::load_config_from_str("").process_scopes);
+        assert!(super::load_config_from_str("process_scopes = auto\n").process_scopes);
+        let off = super::load_config_from_str("process_scopes = off\n");
+        assert!(!off.process_scopes);
+        assert!(off.warnings.is_empty(), "{:?}", off.warnings);
+        let bad = super::load_config_from_str("process_scopes = sometimes\n");
+        assert!(bad.process_scopes, "an invalid value keeps the default");
+        assert!(bad.warnings.iter().any(|w| w.starts_with("process_scopes")));
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"process_scopes"));
     }
 
     #[test]

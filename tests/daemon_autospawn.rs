@@ -268,6 +268,54 @@ fn first_attach_spawns_second_reuses_stop_ends() {
     assert!(!pid_alive(info.pid), "daemon pid {} still alive after stop", info.pid);
 }
 
+/// With a reachable systemd user manager the auto-spawned daemon gets its own
+/// scope, so killing or closing the terminal that spawned it (or an OOM kill
+/// aimed at a big process in that terminal) no longer takes it down (S348).
+/// `systemd-run --scope` execs in place: the pid in daemon.json is the daemon,
+/// the ready handshake still works and `daemon stop` still ends it.
+#[cfg(target_os = "linux")]
+#[test]
+fn spawned_daemon_runs_in_its_own_scope_when_available() {
+    let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        eprintln!("skip: no XDG_RUNTIME_DIR (no systemd user manager here)");
+        return;
+    };
+    let usable = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !usable {
+        eprintln!("skip: systemd-run --user --scope is not usable here");
+        return;
+    }
+    let env = Env::new();
+    let paths = env.paths();
+    let mut cmd = env.cmd(&["attach", "--create"]);
+    cmd.env("XDG_RUNTIME_DIR", &xdg);
+    let mut a = Client::spawn(cmd);
+    a.wait_stdout("○ ready", 30);
+    let info = registry::read_daemon_json(&paths).expect("daemon.json");
+    assert!(pid_alive(info.pid));
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let daemon = std::fs::read_to_string(format!("/proc/{}/cgroup", info.pid)).unwrap();
+    assert_ne!(daemon.trim(), own.trim(), "the daemon must not share the spawner's cgroup");
+    assert!(daemon.trim().ends_with(".scope") && daemon.contains("/app.slice/"), "{daemon}");
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", info.pid)).unwrap();
+    assert_ne!(comm.trim(), "systemd-run", "systemd-run must have exec'd into the daemon");
+
+    a.detach();
+    let st = env.cmd(&["daemon", "stop"]).stdin(Stdio::null()).output().unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    let t0 = Instant::now();
+    while pid_alive(info.pid) && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!pid_alive(info.pid), "daemon pid {} still alive after stop", info.pid);
+}
+
 #[test]
 fn concurrent_first_clients_spawn_exactly_one_daemon() {
     let env = Env::new();
