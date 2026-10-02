@@ -148,6 +148,67 @@ fn unregister_session_in(session_id: &str, dir: &std::path::Path) {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Remove `reg`'s registration and socket, but only while the file on disk
+/// is still this exact registration (same owner pid, start time and socket).
+///
+/// This is what a session calls when it ends. The check matters because the
+/// same id can be registered again while an older owner is still winding
+/// down (a second actor on one id, a rehydrated session after a reload): the
+/// old owner must not delete the newer registration. Best-effort and
+/// idempotent: a missing or foreign file is left alone.
+pub fn unregister_owned(reg: &SessionRegistration) {
+    unregister_owned_in(reg, &registry_dir());
+}
+
+fn unregister_owned_in(reg: &SessionRegistration, dir: &std::path::Path) {
+    let safe_id = sanitize_session_id(&reg.session_id);
+    let path = dir.join(format!("{}.json", safe_id));
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(on_disk) = serde_json::from_str::<SessionRegistration>(&content) else {
+        return;
+    };
+    if on_disk.kind != REGISTRATION_KIND
+        || on_disk.pid != reg.pid
+        || on_disk.started_at != reg.started_at
+        || on_disk.socket_path != reg.socket_path
+    {
+        tracing::debug!(session = %reg.session_id, "registry: registration was replaced; leaving the newer one");
+        return;
+    }
+    remove_registration_files(dir, &path, &on_disk);
+}
+
+/// Unlink a registration file and its socket. The socket is only removed
+/// when it lies inside the registry dir, so a crafted file can never delete
+/// anything elsewhere.
+fn remove_registration_files(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    reg: &SessionRegistration,
+) {
+    let sock = std::path::Path::new(&reg.socket_path);
+    if sock.starts_with(dir) && sock.extension().is_some_and(|e| e == "sock") {
+        let _ = std::fs::remove_file(sock);
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Remove registrations that no running session can own and return how
+/// many were removed. Always: an owner pid that no longer exists. With
+/// `own_pid` (the daemon, at startup): also registrations naming that pid,
+/// which can only be leftovers. A reload re-execs the same pid without
+/// running any session's shutdown, and the new image has not registered
+/// anything yet when it sweeps.
+pub fn sweep_stale_registrations(own_pid: Option<u32>) -> usize {
+    sweep_stale_registrations_in(&registry_dir(), own_pid)
+}
+
+fn sweep_stale_registrations_in(dir: &std::path::Path, own_pid: Option<u32>) -> usize {
+    scan_registrations(dir, own_pid).1
+}
+
 /// Returns true if a process with `pid` is alive (Unix: `kill(pid, 0)`).
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -183,11 +244,21 @@ pub fn list_active_sessions() -> Vec<SessionRegistration> {
 }
 
 fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
+    scan_registrations(dir, None).0
+}
+
+/// Read every session registration in `dir`, unlink the stale ones (dead
+/// owner pid, or `own_pid` when given) and return `(live, removed)`.
+fn scan_registrations(
+    dir: &std::path::Path,
+    own_pid: Option<u32>,
+) -> (Vec<SessionRegistration>, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
 
     let mut live = Vec::new();
+    let mut removed = 0;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -209,20 +280,15 @@ fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
             }
         };
 
-        if pid_is_alive(reg.pid) {
+        if own_pid != Some(reg.pid) && pid_is_alive(reg.pid) {
             live.push(reg);
         } else {
-            // Dead owner: prune the registration and its socket, but only a
-            // socket inside our dir (a crafted file must not delete elsewhere).
-            let sock = std::path::Path::new(&reg.socket_path);
-            if sock.starts_with(dir) && sock.extension().is_some_and(|e| e == "sock") {
-                let _ = std::fs::remove_file(sock);
-            }
-            let _ = std::fs::remove_file(&path);
+            remove_registration_files(dir, &path, &reg);
+            removed += 1;
         }
     }
 
-    live
+    (live, removed)
 }
 
 /// Resolve a query to a registration. Resolution order:
@@ -463,6 +529,108 @@ mod tests {
 
         // File should also be gone
         assert!(!dir.join("stale-dead-pid.json").exists());
+    }
+
+    /// A registration whose socket lives in `dir`, with a real socket file,
+    /// so removal of both can be observed.
+    fn reg_with_socket(dir: &std::path::Path, id: &str, pid: u32) -> SessionRegistration {
+        let reg = SessionRegistration {
+            kind: REGISTRATION_KIND.to_string(),
+            session_id: id.to_string(),
+            name: None,
+            socket_path: socket_path_in_dir(dir, id),
+            pid,
+            started_at: Utc::now(),
+        };
+        std::fs::write(&reg.socket_path, b"").unwrap();
+        register_session_in(&reg, dir).unwrap();
+        reg
+    }
+
+    #[test]
+    fn unregister_owned_removes_its_own_registration_and_socket() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let reg = reg_with_socket(&dir, "owned", std::process::id());
+        unregister_owned_in(&reg, &dir);
+        assert!(!dir.join("owned.json").exists());
+        assert!(!dir.join("owned.sock").exists());
+        // Idempotent: shutdown() and Drop both call it.
+        unregister_owned_in(&reg, &dir);
+    }
+
+    #[test]
+    fn unregister_owned_leaves_a_newer_registration_of_the_same_id() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let old = reg_with_socket(&dir, "same-id", std::process::id());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer = reg_with_socket(&dir, "same-id", std::process::id());
+        assert_ne!(old.started_at, newer.started_at);
+
+        unregister_owned_in(&old, &dir);
+        assert!(dir.join("same-id.json").exists(), "newer registration kept");
+        assert!(dir.join("same-id.sock").exists(), "newer socket kept");
+        let live = list_active_sessions_in(&dir);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].started_at, newer.started_at);
+    }
+
+    #[test]
+    fn a_renamed_registration_is_still_owned_and_removed() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let reg = reg_with_socket(&dir, "renamed", std::process::id());
+        update_session_name_in("renamed", Some("ambient"), &dir).unwrap();
+        unregister_owned_in(&reg, &dir);
+        assert!(
+            !dir.join("renamed.json").exists(),
+            "a rename keeps ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_sweep_removes_dead_and_own_pid_and_keeps_other_live_owners() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let own = std::process::id();
+        // SAFETY: getppid has no preconditions; the parent (the test runner's
+        // parent shell) is alive and owned by the same user.
+        let other_live = unsafe { libc::getppid() } as u32;
+        reg_with_socket(&dir, "dead-owner", 999_999);
+        reg_with_socket(&dir, "pre-reload", own);
+        reg_with_socket(&dir, "other-process", other_live);
+        std::fs::write(dir.join("daemon.json"), r#"{"pid":999999}"#).unwrap();
+
+        assert_eq!(sweep_stale_registrations_in(&dir, Some(own)), 2);
+        for gone in ["dead-owner", "pre-reload"] {
+            assert!(
+                !dir.join(format!("{gone}.json")).exists(),
+                "{gone} card removed"
+            );
+            assert!(
+                !dir.join(format!("{gone}.sock")).exists(),
+                "{gone} socket removed"
+            );
+        }
+        assert!(dir.join("other-process.json").exists());
+        assert!(dir.join("other-process.sock").exists());
+        assert!(
+            dir.join("daemon.json").exists(),
+            "daemon.json is never a session"
+        );
+    }
+
+    #[test]
+    fn sweep_without_own_pid_keeps_registrations_of_this_process() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        reg_with_socket(&dir, "mine", std::process::id());
+        reg_with_socket(&dir, "dead", 999_999);
+        assert_eq!(sweep_stale_registrations_in(&dir, None), 1);
+        assert!(dir.join("mine.json").exists());
+        assert!(!dir.join("dead.json").exists());
     }
 
     #[test]
