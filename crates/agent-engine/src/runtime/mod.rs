@@ -492,6 +492,11 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// Frozen system-prompt catalog of activatable tools (progressive
+    /// disclosure): rendered once per session on first use, then reused
+    /// byte-for-byte so activations and late registrations never change the
+    /// cached prompt prefix. Outer `None` = not rendered yet.
+    tool_catalog_prompt: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// The `SessionToolSet` retained for `host_tool_session` across stream
     /// turns (exact activations are session-scoped). Minted empty with the
     /// runtime and shared by `Clone`, exactly like `host_tool_session`.
@@ -1032,6 +1037,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
+            tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
             session_id: None,
             cwd: None,
@@ -1107,6 +1113,73 @@ impl Runtime {
     /// - the model identity cannot be canonicalized — fail closed to the
     ///   unmodified base.
     pub async fn effective_system_prompt(&self) -> Option<String> {
+        let base = self.orchestrated_system_prompt().await;
+        // A typed prompt manifest owns the full stack: nothing is appended.
+        if self.effective_prompt.is_some() {
+            return base;
+        }
+        match self.frozen_tool_catalog().await {
+            Some(catalog) => Some(match base {
+                Some(base) if !base.is_empty() => format!("{base}\n\n{catalog}"),
+                _ => catalog,
+            }),
+            None => base,
+        }
+    }
+
+    /// The progressive-disclosure catalog of activatable tools for the
+    /// system prompt, frozen per session (see `tool_catalog_prompt`). `None`
+    /// when progressive disclosure is off, model-initiated activation is
+    /// denied, the runtime cannot activate tools (workers), or nothing
+    /// outside the session core is activatable.
+    pub async fn frozen_tool_catalog(&self) -> Option<String> {
+        if !self.progressive_tool_disclosure
+            || self.activation_confirm == agent_core::config::ActivationConfirm::Deny
+        {
+            return None;
+        }
+        if let Some(frozen) = self
+            .tool_catalog_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return frozen;
+        }
+        let rendered = {
+            let registry = self.tools.read().await;
+            if registry.get("activate_tools").is_none() {
+                None
+            } else {
+                let core_set = continuation::context_tool_set(
+                    self.host_tool_session.clone(),
+                    registry.catalog(),
+                    true,
+                    self.context_management_enabled(),
+                );
+                let core: std::collections::HashSet<String> = core_set
+                    .core_ids()
+                    .map(|id| id.as_str().to_string())
+                    .collect();
+                crate::tools::prompt_catalog::render(
+                    registry.catalog(),
+                    &core,
+                    crate::tools::activation::is_activatable_record,
+                )
+            }
+        };
+        let mut slot = self
+            .tool_catalog_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // First render wins (a concurrent caller may have frozen it already).
+        slot.get_or_insert(rendered).clone()
+    }
+
+    /// The configured base prompt plus the builtin orchestration doctrine
+    /// for the current model (what `effective_system_prompt` returned before
+    /// the tool catalog was appended).
+    async fn orchestrated_system_prompt(&self) -> Option<String> {
         if self.effective_prompt.is_some() {
             return self.system_prompt.clone();
         }
@@ -4231,6 +4304,7 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
@@ -5128,6 +5202,91 @@ mod tests {
 #[cfg(test)]
 mod effective_prompt_tests {
     use super::*;
+
+    // ── progressive-disclosure tool catalog in the system prompt ────────────
+
+    struct LateTool;
+    #[async_trait::async_trait]
+    impl crate::Tool for LateTool {
+        fn name(&self) -> &str {
+            "late_tool"
+        }
+        fn description(&self) -> &str {
+            "Registered after the catalog froze."
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _p: Value, _c: crate::ToolContext) -> crate::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_lists_activatable_tools_outside_the_core() {
+        let mut runtime = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        assert!(
+            runtime.frozen_tool_catalog().await.is_none(),
+            "flag off: no catalog"
+        );
+        runtime.progressive_tool_disclosure = true;
+        let catalog = runtime.frozen_tool_catalog().await.expect("catalog");
+        assert!(catalog.starts_with("## Activatable tools\n"));
+        assert!(
+            catalog.contains("not instructions"),
+            "third-party text is framed as data"
+        );
+        assert!(catalog.contains("- builtin:subagent_start"), "{catalog}");
+        for core in [
+            "builtin:bash",
+            "builtin:read",
+            "builtin:activate_tools",
+            "builtin:search_tools",
+        ] {
+            assert!(
+                !catalog.contains(&format!("- {core}")),
+                "core {core} listed"
+            );
+        }
+        let prompt = runtime.effective_system_prompt().await.unwrap();
+        assert!(prompt.starts_with("BASE."), "base stays first");
+        assert!(prompt.ends_with(&catalog), "catalog appended last");
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_is_frozen_per_session() {
+        let mut runtime = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        runtime.progressive_tool_disclosure = true;
+        let first = runtime.effective_system_prompt().await.unwrap();
+        runtime.tools.write().await.register(Arc::new(LateTool));
+        let clone = runtime.clone();
+        assert_eq!(runtime.effective_system_prompt().await.unwrap(), first);
+        assert_eq!(clone.effective_system_prompt().await.unwrap(), first);
+        assert!(
+            !first.contains("late_tool"),
+            "late registration does not rewrite the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_absent_when_activation_is_denied_or_impossible() {
+        let mut denied = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        denied.progressive_tool_disclosure = true;
+        denied.set_activation_confirm(agent_core::config::ActivationConfirm::Deny);
+        assert!(denied.frozen_tool_catalog().await.is_none());
+        assert_eq!(
+            denied.effective_system_prompt().await.as_deref(),
+            Some("BASE.")
+        );
+
+        let mut worker = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        worker.progressive_tool_disclosure = true;
+        worker.set_tools(crate::ToolRegistry::without_subagent());
+        assert!(
+            worker.frozen_tool_catalog().await.is_none(),
+            "no activate_tools, no catalog"
+        );
+    }
 
     fn headless(model: &str, base: &str) -> Runtime {
         let mut runtime = Runtime::new_headless();
