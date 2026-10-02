@@ -19,6 +19,7 @@
 | `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Deprecated, ignored. Legacy MCP was removed: every mode uses per-session MCP leases, so the daemon no longer refuses to start with `progressive_tool_disclosure=false` and MCP servers configured. (`--allow-legacy-mcp` is likewise accepted and ignored.) |
 | `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` / `--auto-approve-confirms` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
+| `process_scopes = auto \| off` (config key, default `auto`) / `SYNAPS_PROCESS_SCOPES` (env wins) | On Linux with a reachable systemd user manager, the spawned daemon, every bash tool command and every PTY shell start in their **own** transient scope (`systemd-run --user --scope`, ~4 ms per spawn). systemd-oomd kills a whole cgroup at once; without this a runaway tool command shared the cgroup of the terminal that started the daemon, and an OOM kill took the command, the daemon and every session down together (S348). Now only the command's scope is killed, and closing the spawning terminal no longer ends the daemon. Off, unavailable (macOS, containers, no user bus), or a session env without `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`: processes start exactly as before. `daemon reload` re-execs in place and keeps the current cgroup; a daemon moves into its own scope at its next fresh start. Scopes show in `systemctl --user list-units --type=scope` as `synaps daemon` / `synaps tool: bash|shell`. |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
 | `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
@@ -54,7 +55,8 @@ synaps --attach --new
 That is all: no env, no `daemon --detach` first. `synaps daemon status` says
 `not running (auto-starts on first --attach)` until then; `synaps daemon stop` ends it.
 
-`--detach` forks `current_exe daemon --foreground` under `setsid`, stdout → null, stderr → pipe,
+`--detach` forks `current_exe daemon --foreground` under `setsid` (through `systemd-run --user --scope` when
+`process_scopes` applies, which execs in place: same pid), stdout → null, stderr → pipe,
 and waits ≤ 5 s for `R` on an anonymous ready pipe (EOF before `R` = child died → error with its
 stderr tail). Measured on bella: ready in ~75 ms.
 

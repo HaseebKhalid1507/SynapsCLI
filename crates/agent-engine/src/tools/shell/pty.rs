@@ -176,8 +176,24 @@ impl PtyHandle {
         let program = parts
             .first()
             .ok_or_else(|| RuntimeError::Tool("Empty command string".to_string()))?;
+        // Its own systemd scope (Linux, when available), like the bash tool:
+        // a long-lived shell running a memory-hungry build is then the only
+        // thing the OOM killer stops. The env below is merged onto the
+        // inherited one, so the child can always reach the user manager.
+        let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = {
+            let program: std::ffi::OsString = (*program).into();
+            let args = parts
+                .iter()
+                .skip(1)
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            match crate::process_scope::launcher_for_env(None) {
+                Some(launcher) => launcher.wrap("synaps tool: shell", program, args),
+                None => (program, args),
+            }
+        };
         let mut cmd = CommandBuilder::new(program);
-        for arg in parts.iter().skip(1) {
+        for arg in &args {
             cmd.arg(arg);
         }
 
@@ -401,6 +417,60 @@ mod tests {
 
     /// A fast PTY producer with a deliberately stalled consumer is bounded
     /// at the reader-thread handoff, and dropping the handle releases it.
+    /// A PTY shell gets its own systemd scope when the machine supports it
+    /// (S348): a long-lived shell running a memory-hungry build is then the
+    /// only cgroup the OOM killer stops. It still has a working terminal.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn pty_shell_gets_its_own_scope_when_available() {
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let before = pty_output_snapshot();
+        // Typed into an interactive shell, as the tool is used (the spawn
+        // command line is whitespace-split, so no quoted -c script here).
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle
+            .write(b"cat /proc/$$/cgroup; test -t 0 && echo tty=yes; exit\n")
+            .expect("write");
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !String::from_utf8_lossy(&out).contains("tty=yes\r")
+        {
+            out.extend(handle.try_read_output(Duration::from_millis(200)).await);
+        }
+        // Settle the process-global PTY accounting before the next #[serial]
+        // test snapshots it (same release wait as the retention tests).
+        drop(handle);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (pty_output_snapshot().active_readers > before.active_readers
+            || pty_output_snapshot().retained_bytes != before.retained_bytes)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let text = String::from_utf8_lossy(&out).replace('\r', "");
+        assert!(
+            text.contains("tty=yes"),
+            "the shell must still have a terminal: {text}"
+        );
+        // A real terminal prefixes lines with control sequences (bracketed
+        // paste etc.); take the cgroup path wherever it starts on its line.
+        let child = text
+            .lines()
+            .filter(|l| !l.contains("cat /proc/")) // the echoed command line
+            .find_map(|l| l.find("0::/").map(|i| l[i..].trim().to_string()))
+            .unwrap_or_default();
+        assert!(child.starts_with("0::/"), "no cgroup line in: {text:?}");
+        if crate::process_scope::launcher_for_env(None).is_some() {
+            assert_ne!(child, own.trim(), "{text}");
+            assert!(child.ends_with(".scope"), "{child}");
+        } else {
+            assert_eq!(child, own.trim(), "unwrapped fallback");
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn pty_slow_consumer_retention_is_bounded_and_drop_releases_reader() {

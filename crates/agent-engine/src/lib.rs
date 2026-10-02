@@ -7,6 +7,7 @@ pub mod extensions;
 pub mod attachments;
 pub mod daemon;
 pub mod help;
+pub mod process_scope;
 pub mod host;
 pub mod mcp;
 pub mod memory_backend;

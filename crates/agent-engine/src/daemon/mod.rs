@@ -486,20 +486,29 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon").arg("--foreground");
+    let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
     if let Some(p) = &opts.profile {
-        cmd.arg("--profile").arg(p);
+        cmd_args.extend(["--profile".into(), p.into()]);
     }
     if let Some(s) = &opts.socket {
-        cmd.arg("--socket").arg(s);
+        cmd_args.extend(["--socket".into(), s.into()]);
     }
     if let Some(i) = opts.idle_exit {
-        cmd.arg("--idle-exit").arg(i.as_secs().to_string());
+        cmd_args.extend(["--idle-exit".into(), i.as_secs().to_string().into()]);
     }
     if opts.allow_legacy_mcp {
-        cmd.arg("--allow-legacy-mcp");
+        cmd_args.push("--allow-legacy-mcp".into());
     }
+    // Its own systemd scope (Linux, when available): the daemon outlives the
+    // terminal that spawned it, and a memory-hungry process in that terminal
+    // can no longer get the daemon killed with it. `systemd-run --scope`
+    // execs in place, so the pid, the ready fd and the env all carry over.
+    let (program, cmd_args) = match crate::process_scope::launcher_for_env(None) {
+        Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
+        None => (exe.into_os_string(), cmd_args),
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(cmd_args);
     cmd.env("SYNAPS_DAEMON", "1")
         .env(READY_FD_ENV, write_fd.to_string())
         .stdin(std::process::Stdio::null())

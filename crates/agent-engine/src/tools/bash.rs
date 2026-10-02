@@ -220,11 +220,64 @@ impl Tool for BashTool {
     }
 }
 
+/// Kills the command's whole process group unless the command finished on
+/// its own. `child.kill()` stops only the shell: everything the command
+/// started (a test runner's workers, `cmd &` jobs) used to keep running, and
+/// keep using memory, after a timeout or cancel (S348). The command leads its
+/// own group: `setsid` in `pre_exec`, and `systemd-run --scope` execs in
+/// place, so the pid is the group id. Dropped before the `Child`, so the
+/// leader is never reaped (and its pid never reused) before the kill.
+struct KillGroupUnlessFinished {
+    pgid: Option<u32>,
+}
+
+impl KillGroupUnlessFinished {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pgid: pid }
+    }
+
+    /// The command exited by itself: nothing to kill.
+    fn finished(&mut self) {
+        self.pgid = None;
+    }
+
+    /// Kill the group now (the output cap) and disarm.
+    fn kill_now(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            // SAFETY: killpg(2) on our own child's process group.
+            unsafe {
+                libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.pgid = None;
+        }
+    }
+}
+
+impl Drop for KillGroupUnlessFinished {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
+}
+
 /// Which shell backend the shared executor drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellSpec {
     Bash,
     PowerShell,
+}
+
+impl ShellSpec {
+    /// Names the command's systemd scope (`systemctl --user list-units --type=scope`).
+    fn scope_description(self) -> &'static str {
+        match self {
+            ShellSpec::Bash => "synaps tool: bash",
+            ShellSpec::PowerShell => "synaps tool: powershell",
+        }
+    }
 }
 
 /// Shared execution core for bash + powershell: piped stdin/stdout/stderr,
@@ -255,6 +308,14 @@ pub(crate) async fn run_shell_command(
                 vec!["-NoProfile".into(), "-Command".into(), script.into()],
             ),
         };
+        // Its own systemd scope (Linux, when available): a command that eats
+        // all memory is then the only thing the OOM killer stops, not the
+        // daemon and every session sharing its cgroup. See `process_scope`.
+        let (program, args) =
+            match crate::process_scope::launcher_for_env(ctx.capabilities.env.as_deref()) {
+                Some(launcher) => launcher.wrap(spec.scope_description(), program, args),
+                None => (program, args),
+            };
         let mut cmd = tokio::process::Command::new(program);
         if let Some(cwd) = ctx.capabilities.cwd.as_deref() {
             cmd.current_dir(cwd);
@@ -283,6 +344,10 @@ pub(crate) async fn run_shell_command(
         }
 
         let mut child = cmd.spawn().map_err(|e| RuntimeError::Tool(e.to_string()))?;
+        // Armed until the command finishes on its own: a timeout, a cancel,
+        // the output cap or an abandoned password prompt kills the whole
+        // process group, not just the shell.
+        let mut group = KillGroupUnlessFinished::new(child.id());
 
         let stdout = child
             .stdout
@@ -467,6 +532,7 @@ pub(crate) async fn run_shell_command(
                         txd.send(format!("\n\n[output truncated at {}]", max_output));
                     }
                     truncated = true;
+                    group.kill_now();
                     let _ = child.kill().await;
                 }
             }
@@ -474,6 +540,9 @@ pub(crate) async fn run_shell_command(
                 .wait()
                 .await
                 .map_err(|e| RuntimeError::Tool(e.to_string()))?;
+            // Finished on its own: leave anything it deliberately started in
+            // the background (`server &`) running, as before.
+            group.finished();
             // Zeroize redactions (passwords) from memory now that command is done
             for secret in &mut redactions {
                 secret.zeroize();
@@ -551,6 +620,135 @@ fn references_env_name(script: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn own_cgroup() -> String {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    /// The command runs in its own systemd scope when the machine supports
+    /// it, so an out-of-memory kill aimed at it cannot take the daemon's
+    /// cgroup down with it (S348). Without a reachable user manager (CI
+    /// containers), the command must still run, in this process's cgroup.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_command_gets_its_own_scope_when_available() {
+        let out = BashTool
+            .execute(
+                json!({ "command": "cat /proc/self/cgroup; echo pid=$$", "timeout": 30 }),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        let child_cgroup = out.lines().next().unwrap_or_default().trim().to_string();
+        assert!(child_cgroup.starts_with("0::/"), "cgroup v2 line: {out}");
+        if crate::process_scope::launcher_for_env(None).is_some() {
+            assert_ne!(
+                child_cgroup,
+                own_cgroup(),
+                "the command must leave our cgroup"
+            );
+            assert!(child_cgroup.ends_with(".scope"), "{child_cgroup}");
+            assert!(child_cgroup.contains("/app.slice/"), "{child_cgroup}");
+        } else {
+            assert_eq!(child_cgroup, own_cgroup(), "unwrapped fallback");
+        }
+    }
+
+    /// A session environment rebuilt without the user-bus variables cannot
+    /// reach systemd: the command starts unwrapped instead of failing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_command_with_a_rebuilt_env_lacking_the_user_bus_runs_unwrapped() {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.env = Some(vec![(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        )]);
+        let out = BashTool
+            .execute(
+                json!({ "command": "cat /proc/self/cgroup", "timeout": 30 }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.lines().next().unwrap_or_default().trim(), own_cgroup());
+    }
+
+    fn processes_named(name: &str) -> Vec<String> {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", name])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A timed-out command takes everything it started with it, not just the
+    /// shell (S348: a timed-out test run would leave all its workers running).
+    /// Each child is renamed to the marker (`exec -a`), so a survivor is seen.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_timeout_kills_the_whole_process_group() {
+        let marker = format!("synaps-timeout-child-{}", std::process::id());
+        let out = BashTool
+            .execute(
+                json!({
+                    "command": format!("(exec -a {marker} sleep 300) & (exec -a {marker} sleep 300); wait"),
+                    "timeout": 1
+                }),
+                create_tool_context(),
+            )
+            .await;
+        let text = match out {
+            Ok(s) => s,
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("timed out"), "{text}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !processes_named(&marker).is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let left = processes_named(&marker);
+        if !left.is_empty() {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", &marker])
+                .status();
+        }
+        assert!(left.is_empty(), "children survived the timeout: {left:?}");
+    }
+
+    /// A command that exits by itself keeps what it deliberately started in
+    /// the background, as before: only abnormal endings kill the group.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_normal_exit_leaves_a_background_job_running() {
+        let marker = format!("synaps-background-job-{}", std::process::id());
+        let out = BashTool
+            .execute(
+                json!({
+                    "command": format!("(exec -a {marker} sleep 30) >/dev/null 2>&1 & echo started"),
+                    "timeout": 10
+                }),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("started"), "{out}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let alive = processes_named(&marker);
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &marker])
+            .status();
+        assert!(
+            !alive.is_empty(),
+            "a deliberate background job must survive a normal exit"
+        );
+    }
 
     #[tokio::test]
     async fn bash_intermediary_handoff_conserves_bytes_under_large_output() {
