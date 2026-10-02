@@ -20,6 +20,34 @@ pub enum RuntimeError {
     Canceled,
 }
 
+/// Humanized Anthropic 413. Shared with [`RuntimeError::is_request_size_exceeded`]
+/// so the classifier can never drift from the message.
+pub const REQUEST_TOO_LARGE_MESSAGE: &str =
+    "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.";
+
+/// Humanized Anthropic context-window 400. Shared with
+/// [`RuntimeError::is_request_size_exceeded`].
+pub const CONTEXT_WINDOW_EXCEEDED_MESSAGE: &str =
+    "Context window exceeded (HTTP 400). Run /compact to shrink the conversation.";
+
+impl RuntimeError {
+    /// The request itself was too big for the model (context window or
+    /// request size). Resending the same request can never succeed; a
+    /// smaller one can. Matches our own humanized Anthropic messages, plus
+    /// the standard `context_length_exceeded` code in an OpenAI-compatible
+    /// provider's error chain (classification only, never displayed).
+    pub fn is_request_size_exceeded(&self) -> bool {
+        match self {
+            RuntimeError::ApiStatus(msg) => {
+                msg.starts_with(CONTEXT_WINDOW_EXCEEDED_MESSAGE)
+                    || msg.starts_with(REQUEST_TOO_LARGE_MESSAGE)
+                    || msg.contains("context_length_exceeded")
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Translate an Anthropic API error response into a human-actionable message.
 ///
 /// SECURITY (spec §5.1): the response `body` — including any nested
@@ -194,13 +222,13 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
         401 => "Authentication rejected. Run `synaps login` to re-authenticate.".to_string(),
         403 => format!("Access denied (HTTP 403{kind}). Your account may not have access to this model."),
         404 => format!("Model or endpoint not found (HTTP 404{kind}). Check the model name with /model."),
-        413 => "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.".to_string(),
+        413 => REQUEST_TOO_LARGE_MESSAGE.to_string(),
         400 if body_mentions(body, "Consumer Terms") =>
             "Anthropic requires accepting updated Consumer Terms: sign in at claude.ai with this account, accept the terms, then retry.".to_string(),
         400 if body_mentions(body, "extended-cache-ttl") =>
             "Bad request (HTTP 400) — your account may not support 1h cache TTL; set cache_ttl = 5m in config.".to_string(),
         400 if body_mentions(body, "prompt is too long") || body_mentions(body, "max_tokens") || body_mentions(body, "context") =>
-            "Context window exceeded (HTTP 400). Run /compact to shrink the conversation.".to_string(),
+            CONTEXT_WINDOW_EXCEEDED_MESSAGE.to_string(),
         400 => format!("Bad request (HTTP 400{kind}). Provider error details withheld — they can echo request content."),
         500 | 502 | 503 => format!("Anthropic server error (HTTP {status}{kind}). Retries exhausted — usually transient, try again shortly."),
         _ => format!("API error (HTTP {status}{kind}). Provider error details withheld — they can echo request content."),

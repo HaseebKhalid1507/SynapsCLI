@@ -22,6 +22,8 @@ pub struct RuntimeView {
     pub thinking_budget: u32,
     pub context_window: u64,
     pub system_prompt: Option<String>,
+    /// The compaction model setting: an explicit model id, or `auto`
+    /// (follow the session model). Display only; the actor resolves it.
     pub compaction_model: String,
     pub api_retries: u32,
     pub subagent_timeout: u64,
@@ -47,7 +49,7 @@ impl RuntimeView {
             thinking_budget: runtime.thinking_budget(),
             context_window: runtime.context_window(),
             system_prompt: runtime.system_prompt().map(str::to_string),
-            compaction_model: runtime.compaction_model().to_string(),
+            compaction_model: runtime.compaction_model_label().to_string(),
             api_retries: runtime.api_retries(),
             subagent_timeout: runtime.subagent_timeout(),
             max_tool_output: runtime.max_tool_output(),
@@ -77,7 +79,7 @@ pub trait RuntimeRead {
     fn thinking_budget(&self) -> u32;
     fn context_window(&self) -> u64;
     fn system_prompt(&self) -> Option<&str>;
-    fn compaction_model(&self) -> &str;
+    fn compaction_model_label(&self) -> &str;
     fn api_retries(&self) -> u32;
     fn subagent_timeout(&self) -> u64;
     fn max_tool_output(&self) -> usize;
@@ -109,8 +111,8 @@ impl RuntimeRead for crate::Runtime {
     fn system_prompt(&self) -> Option<&str> {
         crate::Runtime::system_prompt(self)
     }
-    fn compaction_model(&self) -> &str {
-        crate::Runtime::compaction_model(self)
+    fn compaction_model_label(&self) -> &str {
+        crate::Runtime::compaction_model_label(self)
     }
     fn api_retries(&self) -> u32 {
         crate::Runtime::api_retries(self)
@@ -154,7 +156,7 @@ impl RuntimeRead for RuntimeView {
     fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
     }
-    fn compaction_model(&self) -> &str {
+    fn compaction_model_label(&self) -> &str {
         &self.compaction_model
     }
     fn api_retries(&self) -> u32 {

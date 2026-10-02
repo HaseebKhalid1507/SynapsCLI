@@ -1269,6 +1269,24 @@ pub fn load_config() -> SynapsConfig {
     config
 }
 
+/// Normalize a `compaction_model` value. `auto` (also `default` or empty,
+/// case-insensitive) is the default and means "the session's own model",
+/// which lets compaction reuse the session's prompt cache; it is stored as
+/// `None`. Anything else names an explicit summarizer model. The single
+/// parser for every entry point (config file, settings UI, runtime setter),
+/// so `auto` can never reach a provider as a literal model id.
+pub fn parse_compaction_model(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("auto")
+        || value.eq_ignore_ascii_case("default")
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
@@ -1304,7 +1322,7 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     }
                 }
             }
-            "compaction_model" => config.compaction_model = Some(val.to_string()),
+            "compaction_model" => config.compaction_model = parse_compaction_model(val),
             "compaction_mode" => match val {
                 "remote" => {
                     config.compaction_mode = crate::core::compaction::CompactionMode::Remote

@@ -564,9 +564,19 @@ pub async fn compact_conversation(
             // instead of a fresh flattened transcript that is all uncached
             // input (S347: a 1.6 MB flattened request drew HTTP 429 on every
             // retry while the session's cached turns kept succeeding).
-            // Only when the summarizer is the session's own model and the
-            // policy withholds nothing: the same provider already received
-            // exactly this history, so nothing new is disclosed.
+            // Only when the summarizer is the session's own model (the auto
+            // default) and the policy withholds nothing: the same provider
+            // already received exactly this history, so nothing new is
+            // disclosed.
+            //
+            // Falls back to the flattened request only when that request can
+            // do better: the aligned path was unavailable (decided locally),
+            // the reply had no text, or the request was too big for the
+            // window (the flattened transcript drops thinking and is smaller;
+            // /compact is the advertised way out of an overflowed session).
+            // Any other failure (rate limit, overload, auth, network) is
+            // returned as is: a second, larger, uncached request would only
+            // fail harder and burn quota doing it.
             let aligned = if rendered.excluded_classes.is_empty()
                 && runtime.compaction_reuses_session_model()
             {
@@ -576,12 +586,13 @@ pub async fn compact_conversation(
                     .compact_call_cache_aligned(api_messages, &instruction)
                     .await
                 {
-                    Ok(text) => Some(text),
-                    Err(err) => {
+                    Ok(summary) => summary,
+                    Err(err) if err.is_request_size_exceeded() => {
                         tracing::warn!(error = %err,
-                            "cache-aligned compaction failed; falling back to the flattened transcript");
+                            "cache-aligned compaction too large for the window; trying the flattened transcript");
                         None
                     }
+                    Err(err) => return Err(err),
                 }
             } else {
                 None

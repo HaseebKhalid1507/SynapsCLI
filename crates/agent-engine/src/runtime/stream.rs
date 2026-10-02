@@ -2258,7 +2258,7 @@ fn base64_image_len(b: &Value) -> usize {
 /// carrying `IMAGE_DROPPED_LABEL`, until the remainder fits. Only touched
 /// messages are cloned (`Arc::make_mut`); `tool_result.content[0]` (the
 /// text summary) is never an image, so the text-first invariant holds.
-fn cap_history_image_bytes(
+pub(super) fn cap_history_image_bytes(
     messages: &[SharedMessage],
     cap: usize,
 ) -> Option<Vec<SharedMessage>> {

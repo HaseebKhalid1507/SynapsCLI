@@ -304,7 +304,8 @@ pub struct Runtime {
     /// Opt-in context windows within a stable logical session (#112).
     /// DARK by default: `ContextManagementMode::Off`.
     pub(crate) continuation: continuation::SharedContinuation,
-    /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
+    /// Model used for compaction. `None` = auto: the session's own model, so
+    /// compaction can resend the session's cached prefix (task #430).
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
     compaction_mode: agent_core::compaction::CompactionMode,
@@ -2004,8 +2005,10 @@ impl Runtime {
             })
     }
 
+    /// Set the compaction model. `auto`/`default`/empty (or `None`) = follow
+    /// the session model; see [`crate::config::parse_compaction_model`].
     pub fn set_compaction_model(&mut self, model: Option<String>) {
-        self.compaction_model = model;
+        self.compaction_model = model.as_deref().and_then(crate::config::parse_compaction_model);
     }
 
     /// Set where compaction summarization runs (spec §9.4).
@@ -2041,14 +2044,23 @@ impl Runtime {
         self.context_window_override = window;
     }
 
-    /// Effective context window for the current model — user override if set,
-    /// otherwise the model's native window from `models::context_window_for_model`.
+    /// The model compaction runs on. Auto (no `compaction_model` configured)
+    /// is the session's own model: the summary request can then resend the
+    /// session's exact prefix and read it from the prompt cache instead of
+    /// paying for the whole history as fresh input.
     pub fn compaction_model(&self) -> &str {
-        self.compaction_model
-            .as_deref()
-            .unwrap_or("claude-sonnet-4-6")
+        self.compaction_model.as_deref().unwrap_or(&self.model)
     }
 
+    /// The compaction model SETTING for display: an explicit model id, or
+    /// `auto` (follow the session model). Settings shows the choice, not
+    /// whichever model auto currently resolves to.
+    pub fn compaction_model_label(&self) -> &str {
+        self.compaction_model.as_deref().unwrap_or("auto")
+    }
+
+    /// Effective context window for the current model — user override if set,
+    /// otherwise the model's native window from `models::context_window_for_model`.
     pub fn context_window(&self) -> u64 {
         self.context_window_override
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
@@ -3512,8 +3524,8 @@ impl Runtime {
     }
 
     /// Whether compaction may reuse this session's prompt cache: the
-    /// summarizer is the session's own model, either because no
-    /// `compaction_model` is configured or because it names the same model.
+    /// summarizer is the session's own model, either because the setting is
+    /// auto (no `compaction_model`) or because it names the same model.
     /// An explicitly different compaction model keeps the flattened path.
     pub fn compaction_reuses_session_model(&self) -> bool {
         let bare = |m: &str| m.strip_prefix("anthropic/").unwrap_or(m).to_string();
@@ -3523,41 +3535,27 @@ impl Runtime {
         }
     }
 
-    /// Cache-aligned compaction: send exactly what a stream round of this
-    /// session sends (model, tools or deferred split, system prompt with the
-    /// session-stable extension context, thinking/effort plan, cache TTL and
-    /// the history) with `instruction` appended as the final user content,
-    /// so the whole history is read from the prompt cache instead of being
-    /// resent as one uncached flattened transcript. Returns the response
-    /// text; a reply without text (e.g. only tool calls) is an error so the
-    /// caller can fall back. Fails closed (error) when the session's tool
-    /// surface cannot be reproduced (progressive mode before any turn).
+    /// Cache-aligned compaction: send exactly what this session's next
+    /// stream round would send (model, tools or deferred split, system
+    /// prompt with the session-stable extension context, thinking/effort
+    /// plan, cache TTL and the history) with `instruction` appended as the
+    /// final user content, so the whole history is read from the prompt
+    /// cache instead of being resent as one uncached flattened transcript.
+    ///
+    /// - `Ok(Some(text))`: the summary.
+    /// - `Ok(None)`: this session cannot take the aligned path; the caller
+    ///   uses the flattened request. Either the prefix cannot be reproduced
+    ///   (progressive tool mode before any turn has run) or the history fails
+    ///   media validation, both decided locally with no request sent and no
+    ///   attempt counted; or the reply carried no text (e.g. tool calls).
+    /// - `Err`: the request failed. The caller decides whether a smaller
+    ///   (flattened) request is worth trying; see `compact_conversation`.
     pub async fn compact_call_cache_aligned(
         &self,
         history: &[crate::SharedMessage],
         instruction: &str,
-    ) -> Result<String> {
-        self.remote_summarization_attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ) -> Result<Option<String>> {
         let model = self.model.clone();
-        self.validate_request_preflight_for(&model, self.codex_request_role())
-            .await?;
-        let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
-        self.refresh_if_needed().await?;
-
-        // System prompt exactly as a stream round builds it.
-        let system_prompt = self.effective_system_prompt().await;
-        let session_injection = match self.session_id.as_deref() {
-            Some(id) => self.hook_bus.session_injection_for(id).await,
-            None => None,
-        };
-        let system_prompt = match session_injection {
-            Some(content) => Some(stream::wrap_extension_context(
-                system_prompt.as_deref().unwrap_or_default(),
-                &content,
-            )),
-            None => system_prompt,
-        };
 
         // Messages: the history, then the instruction as the final user
         // content (merged into a trailing user message to keep alternation).
@@ -3577,6 +3575,70 @@ impl Runtime {
             _ => messages.push(Arc::new(json!({"role": "user", "content": [block]}))),
         }
 
+        // Same request-local steps a stream round applies before the wire
+        // (stream.rs, after `attach_turn_context`): validate the original
+        // media, then degrade the oldest images past the history byte cap.
+        // Skipping the cap would send bytes the session's own rounds never
+        // sent (a cache miss on exactly the image-heavy sessions that grow
+        // huge) and could exceed the request size limit. A history that
+        // fails validation is exactly the stuck session /compact must still
+        // rescue: the flattened transcript carries no media, so hand over.
+        if let Err(reason) = attachments::validate_messages(&model, &messages) {
+            tracing::info!(%reason,
+                "cache-aligned compaction skipped: history fails media validation");
+            return Ok(None);
+        }
+        if let Some(capped) =
+            stream::cap_history_image_bytes(&messages, stream::HISTORY_IMAGE_BYTE_CAP)
+        {
+            messages = capped;
+        }
+
+        // The session's tool surface. In progressive mode it is the retained
+        // set of the last round; before any round there is nothing cached to
+        // reuse, so hand over rather than guess at a prefix.
+        let retained = if self.progressive_tool_disclosure {
+            let retained = self
+                .retained_tool_set
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match retained {
+                Some(retained) => Some(retained),
+                None => {
+                    tracing::info!(
+                        "cache-aligned compaction skipped: no session tool set yet (no turn has run)"
+                    );
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+
+        // Transport seam: counted once the request is going to be built
+        // (same rule as `compact_call`), before preflight and auth refresh.
+        self.remote_summarization_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.validate_request_preflight_for(&model, self.codex_request_role())
+            .await?;
+        let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
+        self.refresh_if_needed().await?;
+
+        // System prompt exactly as a stream round builds it.
+        let system_prompt = self.effective_system_prompt().await;
+        let session_injection = match self.session_id.as_deref() {
+            Some(id) => self.hook_bus.session_injection_for(id).await,
+            None => None,
+        };
+        let system_prompt = match session_injection {
+            Some(content) => Some(stream::wrap_extension_context(
+                system_prompt.as_deref().unwrap_or_default(),
+                &content,
+            )),
+            None => system_prompt,
+        };
+
         let tools_snapshot = self.tools.read().await.clone();
         let mut options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
@@ -3594,17 +3656,7 @@ impl Runtime {
             tool_session_id: Some(self.host_tool_session.clone()),
             ..api::ApiOptions::default()
         };
-        if self.progressive_tool_disclosure {
-            let retained = self
-                .retained_tool_set
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let Some(retained) = retained else {
-                return Err(RuntimeError::Tool(
-                    "cache-aligned compaction: no session tool set yet (no turn has run)".into(),
-                ));
-            };
+        if let Some(retained) = retained {
             let (projection, split) = {
                 let set = retained
                     .read()
@@ -3651,11 +3703,12 @@ impl Runtime {
             })
             .unwrap_or_default();
         if text.trim().is_empty() {
-            return Err(RuntimeError::Tool(
-                "cache-aligned compaction returned no summary text".into(),
-            ));
+            tracing::warn!(
+                "cache-aligned compaction reply carried no summary text; using the flattened request"
+            );
+            return Ok(None);
         }
-        Ok(text)
+        Ok(Some(text))
     }
 
     /// Run a single prompt synchronously (non-streaming). Handles tool execution

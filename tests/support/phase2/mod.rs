@@ -204,6 +204,22 @@ pub enum Script {
         event_delay: Duration,
         body: &'static str,
     },
+    /// Replies answered per arrival order; the last step repeats for any
+    /// further hits. Mixes streaming, non-streaming and error replies in
+    /// one sequence (e.g. a turn, then a compaction that fails, then the
+    /// compaction fallback).
+    Steps(&'static [Step]),
+}
+
+/// One reply in a [`Script::Steps`] sequence.
+#[derive(Clone, Copy, Debug)]
+pub enum Step {
+    /// SSE success with this body.
+    Sse(&'static str),
+    /// Non-streaming Messages JSON success with this body.
+    Json(&'static str),
+    /// This HTTP status with this JSON error body (`retry-after: 0`).
+    Status(u16, &'static str),
 }
 
 fn is_streaming_request(req_body: &[u8]) -> bool {
@@ -230,6 +246,27 @@ fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
             }
         }
         Script::Sse(body) => sse((*body).to_string()),
+        Script::Steps(steps) => {
+            let step = steps
+                .get(hit)
+                .or_else(|| steps.last())
+                .expect("Steps requires at least one step");
+            match *step {
+                Step::Sse(body) => sse(body.to_string()),
+                Step::Json(body) => (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+                    .into_response(),
+                Step::Status(status, body) => (
+                    StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "application/json"), ("retry-after", "0")],
+                    body.to_string(),
+                )
+                    .into_response(),
+            }
+        }
         Script::SeqSse(bodies) => {
             let body = bodies
                 .get(hit)

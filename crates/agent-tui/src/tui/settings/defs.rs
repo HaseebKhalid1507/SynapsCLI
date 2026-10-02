@@ -107,13 +107,9 @@ define_settings! {
 
     "compaction_model", "Compaction model", Model,
         EditorKind::ModelPicker,
-        "Model used for /compact (default: claude-sonnet-4-6).",
+        "Model used for /compact. auto (default): the session's own model, so compaction reads the session's prompt cache.",
         |_app, value| {
-            let model = if value.is_empty() || value == "auto" || value == "default" {
-                None
-            } else {
-                Some(value.to_string())
-            };
+            let model = synaps_cli::config::parse_compaction_model(value);
             SettingApply::Session(SessionSetting::CompactionModel { model })
         };
 

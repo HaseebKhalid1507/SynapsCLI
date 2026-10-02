@@ -363,8 +363,15 @@ pub(crate) fn handle_event(
                             &snap.catalog_overrides,
                             &snap.model_health,
                         );
-                        let mut opts: Vec<String> = Vec::with_capacity(rows.len() + 1);
-                        let mut values: Vec<String> = Vec::with_capacity(rows.len() + 1);
+                        let mut opts: Vec<String> = Vec::with_capacity(rows.len() + 2);
+                        let mut values: Vec<String> = Vec::with_capacity(rows.len() + 2);
+                        // Compaction defaults to auto (the session's own
+                        // model, which reuses its prompt cache); offer it
+                        // first so it is one keypress to get back to.
+                        if def.key == "compaction_model" {
+                            opts.push("Auto — same as session model (uses its cache)".to_string());
+                            values.push("auto".to_string());
+                        }
                         for (display, value) in rows {
                             opts.push(display);
                             values.push(value);

@@ -171,7 +171,7 @@ impl RuntimeSnapshot {
         Self {
             model: runtime.model().to_string(),
             thinking: runtime.thinking_level().to_string(),
-            compaction_model: runtime.compaction_model().to_string(),
+            compaction_model: runtime.compaction_model_label().to_string(),
             context_window: {
                 match config.context_window {
                     Some(200_000) => "200k".to_string(),
