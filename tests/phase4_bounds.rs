@@ -929,6 +929,7 @@ fn role_defaults_are_finite_for_every_autonomous_role() {
         let budget = TurnBudget::for_role(role);
         assert!(budget.max_provider_rounds > 0);
         assert!(budget.max_tool_calls > 0);
-        assert!(budget.max_elapsed < Duration::from_secs(24 * 60 * 60));
+        // Wall clock is opt-in (off by default); rounds and tool calls bound every role.
+        assert_eq!(budget.max_elapsed, None);
     }
 }

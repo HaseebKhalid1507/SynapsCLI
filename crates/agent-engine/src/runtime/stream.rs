@@ -647,7 +647,7 @@ impl StreamMethods {
                     event = "turn_budget_exhausted",
                     dimension = dimension.as_str(),
                     elapsed_secs = budget_meter.elapsed().as_secs(),
-                    max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                    max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                     rounds_used = budget_meter.rounds_used(),
                     max_provider_rounds = budget_meter.budget().max_provider_rounds,
                     round_renewals_used = budget_meter.round_renewals_used(),
@@ -707,7 +707,7 @@ impl StreamMethods {
             // the head and start a fresh context segment with renewed time.
             // An un-exercised segment (no provider round yet) still hard-stops.
             time_checkpoint = context_enabled
-                && !budget_meter.budget().max_elapsed.is_zero()
+                && budget_meter.budget().has_time_limit()
                 && budget_meter.wall_clock_exceeded();
             if time_checkpoint && !segment_has_provider_round {
                 finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -726,7 +726,7 @@ impl StreamMethods {
                                         renewals_used = budget_meter.round_renewals_used(),
                                         renewals_remaining = remaining,
                                         elapsed_secs = budget_meter.elapsed().as_secs(),
-                                        max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                                        max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                                         tool_calls_used = budget_meter.tool_calls_used(),
                                         "provider-round checkpoint: renewed, continuing automatically"
                                     );
@@ -741,7 +741,7 @@ impl StreamMethods {
                                 Err(agent_core::BudgetDimension::WallClock)
                                     if context_enabled
                                         && segment_has_provider_round
-                                        && !budget_meter.budget().max_elapsed.is_zero() =>
+                                        && budget_meter.budget().has_time_limit() =>
                                 {
                                     time_checkpoint = true;
                                 }
@@ -753,7 +753,7 @@ impl StreamMethods {
                         }
                     }
                     Err(agent_core::BudgetDimension::WallClock)
-                        if context_enabled && !budget_meter.budget().max_elapsed.is_zero() =>
+                        if context_enabled && budget_meter.budget().has_time_limit() =>
                     {
                         if !segment_has_provider_round {
                             finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);

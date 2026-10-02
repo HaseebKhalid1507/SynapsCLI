@@ -20,7 +20,11 @@ use agent_core::BudgetDimension;
 pub struct TurnBudget {
     pub max_provider_rounds: u32,
     pub max_tool_calls: u32,
-    pub max_elapsed: Duration,
+    /// Wall-clock limit for one turn. `None` (the default for every role)
+    /// means no limit: a turn that is still making progress is never cut off
+    /// for taking long. Opt in with `turn_budget.<role>.max_elapsed_secs` or
+    /// `/budget time`. Rounds, tool calls and tool-result bytes stay bounded.
+    pub max_elapsed: Option<Duration>,
     pub max_accumulated_tool_result_bytes: usize,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
@@ -52,19 +56,18 @@ impl TurnBudget {
             TurnRole::Foreground => Self {
                 max_provider_rounds: 128,
                 max_tool_calls: 512,
-                max_elapsed: Duration::from_secs(2 * 60 * 60),
+                max_elapsed: None,
                 max_accumulated_tool_result_bytes: 32 * 1024 * 1024,
                 max_context_tokens: None,
                 max_cost_usd: None,
                 // A human is watching and can interrupt; let long agentic
-                // tasks continue through several checkpoints. Each time segment
-                // is bounded by 2h; durable context successors start fresh time.
+                // tasks continue through several checkpoints.
                 max_round_renewals: 8,
             },
             TurnRole::Autonomous => Self {
                 max_provider_rounds: 24,
                 max_tool_calls: 96,
-                max_elapsed: Duration::from_secs(15 * 60),
+                max_elapsed: None,
                 max_accumulated_tool_result_bytes: 8 * 1024 * 1024,
                 max_context_tokens: None,
                 max_cost_usd: None,
@@ -75,7 +78,7 @@ impl TurnBudget {
             TurnRole::Worker => Self {
                 max_provider_rounds: 64,
                 max_tool_calls: 256,
-                max_elapsed: Duration::from_secs(60 * 60),
+                max_elapsed: None,
                 max_accumulated_tool_result_bytes: 16 * 1024 * 1024,
                 max_context_tokens: None,
                 max_cost_usd: None,
@@ -83,6 +86,17 @@ impl TurnBudget {
                 max_round_renewals: 2,
             },
         }
+    }
+
+    /// Whether a wall-clock limit can end (or checkpoint) a turn. A zero
+    /// limit counts as exhausted at once and never as a time checkpoint.
+    pub fn has_time_limit(&self) -> bool {
+        self.max_elapsed.is_some_and(|d| !d.is_zero())
+    }
+
+    /// The wall-clock limit in seconds, for diagnostics (`None` = no limit).
+    pub fn max_elapsed_secs(&self) -> Option<u64> {
+        self.max_elapsed.map(|d| d.as_secs())
     }
 
     /// Role defaults overlaid with the typed config (unset fields keep
@@ -101,7 +115,8 @@ impl TurnBudget {
             budget.max_tool_calls = v;
         }
         if let Some(v) = overrides.max_elapsed_secs {
-            budget.max_elapsed = Duration::from_secs(v);
+            // 0 = no wall-clock limit.
+            budget.max_elapsed = (v > 0).then(|| Duration::from_secs(v));
         }
         if let Some(v) = overrides.max_accumulated_tool_result_bytes {
             budget.max_accumulated_tool_result_bytes = v;
@@ -194,7 +209,9 @@ impl TurnBudgetMeter {
     }
 
     pub(crate) fn wall_clock_exceeded(&self) -> bool {
-        self.started.elapsed() >= self.budget.max_elapsed
+        self.budget
+            .max_elapsed
+            .is_some_and(|max| self.started.elapsed() >= max)
     }
 
     /// A successfully committed durable context successor starts a new time
@@ -250,14 +267,10 @@ impl TurnBudgetMeter {
         let mut error = agent_core::TurnError::budget(dimension);
         if dimension == BudgetDimension::WallClock {
             error.message = format!(
-                "turn budget exhausted (wall_clock): elapsed {}s / limit {}s. \
-                 This is a local per-turn time limit, not a provider error. \
-                 History retained. An authorized auto driver can continue; otherwise send a new prompt for a fresh turn budget. \
-                 For longer turns, use /budget status and /budget time <duration> (e.g. 4h) in the foreground, \
-                 or configure turn_budget.<role>.max_elapsed_secs before restarting the host. \
-                 In context auto, a committed rollover starts a fresh time allowance.",
+                "turn stopped at its {}s time limit (ran {}s). History is kept; send a prompt to continue. \
+                 The limit comes from turn_budget.<role>.max_elapsed_secs or /budget time; /budget time off removes it.",
+                self.budget.max_elapsed_secs().unwrap_or(0),
                 self.elapsed().as_secs(),
-                self.budget.max_elapsed.as_secs(),
             );
         }
         error
@@ -332,7 +345,11 @@ mod tests {
         let worker = TurnBudget::for_role(TurnRole::Worker);
         assert!(auto.max_provider_rounds < worker.max_provider_rounds);
         assert!(worker.max_provider_rounds <= fg.max_provider_rounds);
-        assert!(auto.max_elapsed < worker.max_elapsed);
+        // No role has a wall-clock limit unless one is configured.
+        for budget in [&fg, &auto, &worker] {
+            assert_eq!(budget.max_elapsed, None);
+            assert!(!budget.has_time_limit());
+        }
         assert!(fg.max_context_tokens.is_none());
         assert!(fg.max_cost_usd.is_none());
         // Graceful continuation is most generous for foreground (human
@@ -350,7 +367,7 @@ mod tests {
         cfg.autonomous.max_round_renewals = Some(3);
         let budget = TurnBudget::from_config(TurnRole::Autonomous, &cfg);
         assert_eq!(budget.max_provider_rounds, 2);
-        assert_eq!(budget.max_elapsed, Duration::from_secs(9));
+        assert_eq!(budget.max_elapsed, Some(Duration::from_secs(9)));
         assert_eq!(budget.max_round_renewals, 3);
         assert_eq!(
             budget.max_tool_calls,
@@ -359,8 +376,27 @@ mod tests {
     }
 
     #[test]
-    fn committed_context_segment_resets_only_time() {
+    fn zero_seconds_in_config_means_no_time_limit() {
+        let mut cfg = agent_core::config::TurnBudgetsConfig::default();
+        cfg.foreground.max_elapsed_secs = Some(0);
+        let budget = TurnBudget::from_config(TurnRole::Foreground, &cfg);
+        assert_eq!(budget.max_elapsed, None);
+    }
+
+    #[test]
+    fn a_turn_without_a_time_limit_never_runs_out_of_time() {
         let mut meter = TurnBudgetMeter::new(TurnBudget::for_role(TurnRole::Foreground));
+        meter.started = Instant::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        assert!(!meter.wall_clock_exceeded());
+        assert_eq!(meter.begin_round(), Ok(()));
+    }
+
+    #[test]
+    fn committed_context_segment_resets_only_time() {
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            max_elapsed: Some(Duration::from_secs(7200)),
+            ..TurnBudget::for_role(TurnRole::Foreground)
+        });
         meter.started = Instant::now() - Duration::from_secs(7201);
         meter.charge_tool_calls(3);
         meter.charge_tool_result_bytes(1234).unwrap();
@@ -377,7 +413,10 @@ mod tests {
 
     #[test]
     fn exhaustion_diagnostic_keeps_typed_outcome_and_reports_metadata() {
-        let meter = TurnBudgetMeter::new(TurnBudget::for_role(TurnRole::Foreground));
+        let meter = TurnBudgetMeter::new(TurnBudget {
+            max_elapsed: Some(Duration::from_secs(7200)),
+            ..TurnBudget::for_role(TurnRole::Foreground)
+        });
         let error = meter.exhaustion_error(BudgetDimension::WallClock);
         assert_eq!(
             error.outcome,
@@ -385,13 +424,9 @@ mod tests {
                 dimension: BudgetDimension::WallClock
             }
         );
-        assert!(error.message.contains("elapsed "));
-        assert!(error.message.contains("/ limit 7200s"));
-        assert!(error.message.contains("History retained"));
-        assert!(error.message.contains("/budget time <duration>"));
-        assert!(error
-            .message
-            .contains("committed rollover starts a fresh time allowance"));
+        assert!(error.message.contains("its 7200s time limit (ran "));
+        assert!(error.message.contains("History is kept"));
+        assert!(error.message.contains("/budget time off"));
         // Other dimensions keep the existing diagnostic and exact typed label.
         for dimension in [
             BudgetDimension::ToolCalls,
@@ -419,7 +454,7 @@ mod tests {
         assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
 
         let mut stale = TurnBudgetMeter::new(TurnBudget {
-            max_elapsed: Duration::ZERO,
+            max_elapsed: Some(Duration::ZERO),
             ..TurnBudget::for_role(TurnRole::Foreground)
         });
         // Wall clock outranks the round check.
@@ -454,7 +489,7 @@ mod tests {
         let mut meter = TurnBudgetMeter::new(TurnBudget {
             max_provider_rounds: 1,
             max_round_renewals: 5,
-            max_elapsed: Duration::ZERO,
+            max_elapsed: Some(Duration::ZERO),
             ..TurnBudget::for_role(TurnRole::Foreground)
         });
         // Renewal resets the round counter, but begin_round re-checks the
