@@ -3511,6 +3511,153 @@ impl Runtime {
         .await
     }
 
+    /// Whether compaction may reuse this session's prompt cache: the
+    /// summarizer is the session's own model, either because no
+    /// `compaction_model` is configured or because it names the same model.
+    /// An explicitly different compaction model keeps the flattened path.
+    pub fn compaction_reuses_session_model(&self) -> bool {
+        let bare = |m: &str| m.strip_prefix("anthropic/").unwrap_or(m).to_string();
+        match self.compaction_model.as_deref() {
+            None => true,
+            Some(configured) => bare(configured) == bare(&self.model),
+        }
+    }
+
+    /// Cache-aligned compaction: send exactly what a stream round of this
+    /// session sends (model, tools or deferred split, system prompt with the
+    /// session-stable extension context, thinking/effort plan, cache TTL and
+    /// the history) with `instruction` appended as the final user content,
+    /// so the whole history is read from the prompt cache instead of being
+    /// resent as one uncached flattened transcript. Returns the response
+    /// text; a reply without text (e.g. only tool calls) is an error so the
+    /// caller can fall back. Fails closed (error) when the session's tool
+    /// surface cannot be reproduced (progressive mode before any turn).
+    pub async fn compact_call_cache_aligned(
+        &self,
+        history: &[crate::SharedMessage],
+        instruction: &str,
+    ) -> Result<String> {
+        self.remote_summarization_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let model = self.model.clone();
+        self.validate_request_preflight_for(&model, self.codex_request_role())
+            .await?;
+        let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
+        self.refresh_if_needed().await?;
+
+        // System prompt exactly as a stream round builds it.
+        let system_prompt = self.effective_system_prompt().await;
+        let session_injection = match self.session_id.as_deref() {
+            Some(id) => self.hook_bus.session_injection_for(id).await,
+            None => None,
+        };
+        let system_prompt = match session_injection {
+            Some(content) => Some(stream::wrap_extension_context(
+                system_prompt.as_deref().unwrap_or_default(),
+                &content,
+            )),
+            None => system_prompt,
+        };
+
+        // Messages: the history, then the instruction as the final user
+        // content (merged into a trailing user message to keep alternation).
+        let mut messages: Vec<crate::SharedMessage> = history.to_vec();
+        let block = json!({"type": "text", "text": instruction});
+        match messages.last_mut() {
+            Some(last) if last["role"] == "user" => {
+                let last = Arc::make_mut(last);
+                if let Some(text) = last["content"].as_str().map(str::to_owned) {
+                    last["content"] = json!([{"type": "text", "text": text}]);
+                }
+                match last["content"].as_array_mut() {
+                    Some(blocks) => blocks.push(block),
+                    None => last["content"] = json!([block]),
+                }
+            }
+            _ => messages.push(Arc::new(json!({"role": "user", "content": [block]}))),
+        }
+
+        let tools_snapshot = self.tools.read().await.clone();
+        let mut options = api::ApiOptions {
+            use_1m_context: self.context_window_override == Some(1_000_000),
+            cache_ttl: self.cache_ttl,
+            ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
+            saw_1h_honored: self.saw_1h_honored.clone(),
+            credential_source: self.credential_source.clone(),
+            token_cache: self.token_cache.clone(),
+            anthropic_execution_plan,
+            codex_request_role: self.codex_request_role(),
+            // Base context: an internal request never consumes a user's
+            // one-shot `/trace next` arm (same rule as `compact_call`).
+            trace: self.trace_ctx.clone(),
+            telemetry: self.telemetry_writer.clone(),
+            tool_session_id: Some(self.host_tool_session.clone()),
+            ..api::ApiOptions::default()
+        };
+        if self.progressive_tool_disclosure {
+            let retained = self
+                .retained_tool_set
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let Some(retained) = retained else {
+                return Err(RuntimeError::Tool(
+                    "cache-aligned compaction: no session tool set yet (no turn has run)".into(),
+                ));
+            };
+            let (projection, split) = {
+                let set = retained
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let projection = tools_snapshot.session_tools_schema(&set).schema;
+                let split = self.deferred_tool_loading.then(|| {
+                    let referenced = helpers::HelperMethods::referenced_tool_ids(&messages);
+                    Arc::new(tools_snapshot.deferred_tool_split(&set, &referenced))
+                });
+                (projection, split)
+            };
+            options.request_tools_schema = Some(Arc::new(projection));
+            options.anthropic_tool_split = split;
+            options.session_tool_set = Some(retained);
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = ApiMethods::call_api_stream_inner(
+            &self.auth,
+            &self.client,
+            &model,
+            &tools_snapshot,
+            &system_prompt,
+            self.thinking_budget,
+            self.reasoning_level(),
+            &messages,
+            tx,
+            &tokio_util::sync::CancellationToken::new(),
+            self.api_retries,
+            self.refusal_retries,
+            &options,
+            self.telemetry_level,
+        )
+        .await?;
+        let text: String = response["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b["type"] == "text")
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::Tool(
+                "cache-aligned compaction returned no summary text".into(),
+            ));
+        }
+        Ok(text)
+    }
+
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {

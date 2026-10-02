@@ -9,6 +9,14 @@ pub const COMPACTION_SYSTEM_PROMPT: &str = "You are a context summarization assi
 use super::Runtime;
 use crate::error::Result;
 
+/// Opens the instruction a cache-aligned compaction appends after the real
+/// conversation. The session's own system prompt and tools stay in place
+/// (that is what keeps the prefix cached), so this has to stop the task and
+/// rule out tool calls itself.
+pub const CACHE_ALIGNED_PREAMBLE: &str = "[Context compaction request: this is not a new task.] \
+Stop working on the task. Do not call any tools. Read the whole conversation above and reply \
+with only the summary described below, as plain text.\n\n";
+
 const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -131,6 +139,10 @@ pub struct RenderedCompactionInput {
     /// template when folding into a previous summary) — hashed into the
     /// outcome's prompt-stack digest.
     pub base_prompt: &'static str,
+    /// The instructions alone (template + custom focus + file-operation
+    /// records), without the flattened conversation: what a cache-aligned
+    /// compaction appends after the real history.
+    pub instructions_text: String,
 }
 
 /// Render the summarization request under a disclosure policy. Pure — no
@@ -313,7 +325,8 @@ pub fn render_compaction_input(
 
     let transcript_bytes = conversation_text.len() + file_section.len();
 
-    let mut prompt_text = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
+    let conversation_head = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
+    let mut prompt_text = conversation_head.clone();
     if let Some(instructions) = custom_instructions {
         prompt_text.push_str(&format!(
             "{}\n\nAdditional focus: {}",
@@ -343,12 +356,14 @@ pub fn render_compaction_input(
             .filter(|c| present.contains(c) && !excluded_classes.contains(c))
             .collect();
 
+    let instructions_text = prompt_text[conversation_head.len()..].to_string();
     RenderedCompactionInput {
         prompt_text,
         transcript_bytes,
         included_classes,
         excluded_classes,
         base_prompt,
+        instructions_text,
     }
 }
 
@@ -544,15 +559,54 @@ pub async fn compact_conversation(
             Ok(outcome)
         }
         CompactionMode::Remote => {
-            let user_msg =
-                std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
-            let summary_text = runtime.compact_call(vec![user_msg]).await?;
-            let mut outcome = CompactionOutcome::for_prompt_stack(
-                summary_text,
-                runtime.compaction_model(),
-                rendered.base_prompt,
-                custom_instructions,
-            );
+            // Cache-aligned first: resend the session's own request prefix
+            // (served from the prompt cache) plus one appended instruction,
+            // instead of a fresh flattened transcript that is all uncached
+            // input (S347: a 1.6 MB flattened request drew HTTP 429 on every
+            // retry while the session's cached turns kept succeeding).
+            // Only when the summarizer is the session's own model and the
+            // policy withholds nothing: the same provider already received
+            // exactly this history, so nothing new is disclosed.
+            let aligned = if rendered.excluded_classes.is_empty()
+                && runtime.compaction_reuses_session_model()
+            {
+                let instruction =
+                    format!("{CACHE_ALIGNED_PREAMBLE}{}", rendered.instructions_text);
+                match runtime
+                    .compact_call_cache_aligned(api_messages, &instruction)
+                    .await
+                {
+                    Ok(text) => Some(text),
+                    Err(err) => {
+                        tracing::warn!(error = %err,
+                            "cache-aligned compaction failed; falling back to the flattened transcript");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut outcome = match aligned {
+                Some(summary_text) => {
+                    let mut parts = vec![CACHE_ALIGNED_PREAMBLE, rendered.base_prompt];
+                    if let Some(instructions) = custom_instructions {
+                        parts.push(instructions);
+                    }
+                    CompactionOutcome::new(summary_text, runtime.model(), &parts)
+                }
+                None => {
+                    let user_msg = std::sync::Arc::new(
+                        json!({"role": "user", "content": rendered.prompt_text}),
+                    );
+                    let summary_text = runtime.compact_call(vec![user_msg]).await?;
+                    CompactionOutcome::for_prompt_stack(
+                        summary_text,
+                        runtime.compaction_model(),
+                        rendered.base_prompt,
+                        custom_instructions,
+                    )
+                }
+            };
             outcome.included_classes = rendered.included_classes;
             outcome.excluded_classes = rendered.excluded_classes.clone();
             outcome.redaction_policy = redaction_for(&rendered.excluded_classes);

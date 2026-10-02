@@ -339,7 +339,7 @@ pub(super) fn is_ephemeral_turn_context_block(block: &Value) -> bool {
 /// every turn and used to burn the entire message-history cache from the
 /// system block onward (#297, ~97K tokens rewritten per turn). It rides the
 /// newest user message instead: see [`attach_turn_context`].
-fn wrap_extension_context(base: &str, content: &str) -> String {
+pub(super) fn wrap_extension_context(base: &str, content: &str) -> String {
     format!("{base}\n\n{}", guard_extension_context(content))
 }
 
