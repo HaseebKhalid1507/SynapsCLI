@@ -7,32 +7,48 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
-pub struct DelegationTreeBudget {
-    pub max_depth: u16,
-    pub max_children_per_worker: usize,
-    pub max_total_descendants: usize,
-}
-
+/// Why a delegation was refused before any worker was built. How many
+/// workers may run (and exist unreconciled) is the delegation policy's job
+/// (`subagent.max_concurrent` / `subagent.max_total`); the tree only adds
+/// what the policy cannot see: how deep workers nest.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DelegationTreeDenied {
-    DepthLimit,
-    ChildLimit,
-    DescendantLimit,
+    /// The new worker would sit deeper than `subagent.max_depth`.
+    DepthLimit { max_depth: u16 },
+    /// The handle is already reserved (a retried registration or spawn).
+    DuplicateWorker,
+    /// The parent worker is gone (finished or cancelled with its subtree).
     UnknownParent,
+}
+
+impl std::fmt::Display for DelegationTreeDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DepthLimit { max_depth } => write!(
+                f,
+                "subagent nesting limit reached: workers may nest {max_depth} level(s) deep \
+                 (subagent.max_depth). Do this work directly instead of delegating further."
+            ),
+            Self::DuplicateWorker => write!(f, "this subagent handle is already registered"),
+            Self::UnknownParent => write!(
+                f,
+                "the parent worker of this delegation has already finished or been cancelled"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct DelegationTreeState {
     depth_by_worker: BTreeMap<String, u16>,
     parent_by_worker: BTreeMap<String, String>,
-    child_count: BTreeMap<String, usize>,
     descendants: usize,
 }
 
 /// Session-scoped runtime enforcement shared by every subagent tool path.
 pub struct OrchestrationRuntime {
     inner: Mutex<Inner>,
-    tree_budget: DelegationTreeBudget,
+    max_depth: u16,
     tree: Mutex<DelegationTreeState>,
 }
 struct Inner {
@@ -218,6 +234,16 @@ impl OrchestrationRuntime {
         Ok(CatalogSnapshot::from_entries(entries))
     }
 
+    /// The manifestless baseline sized by the user's `subagent.*` limits.
+    /// Every production install without a prompt-manifest policy uses this.
+    pub fn from_limits(
+        foreground: QualifiedModelId,
+        limits: crate::config::SubagentLimits,
+    ) -> Result<Self, &'static str> {
+        Self::baseline(foreground, limits.max_concurrent, limits.max_total)?
+            .with_max_depth(limits.max_depth)
+    }
+
     /// Secure manifestless baseline: the exact foreground identity is the only
     /// worker choice in a deterministic runtime-controlled catalog.
     pub fn baseline(
@@ -234,43 +260,39 @@ impl OrchestrationRuntime {
     }
 
     pub fn new(policy: DelegationPolicy) -> Self {
-        let max_total_descendants = policy.max_total_workers;
         Self {
             inner: Mutex::new(Inner {
                 registry: WorkerRegistry::new(policy),
                 handles: HashMap::new(),
             }),
-            tree_budget: DelegationTreeBudget {
-                max_depth: 4,
-                max_children_per_worker: 8,
-                max_total_descendants,
-            },
+            max_depth: crate::config::SubagentLimits::default().max_depth,
             tree: Mutex::new(DelegationTreeState::default()),
         }
     }
 
-    pub fn with_tree_budget(mut self, budget: DelegationTreeBudget) -> Result<Self, &'static str> {
-        if budget.max_depth == 0
-            || budget.max_children_per_worker == 0
-            || budget.max_total_descendants == 0
-        {
-            return Err("invalid delegation tree budget");
+    /// How deep workers may nest (`subagent.max_depth`): 1 = only the
+    /// foreground delegates. Zero would forbid all delegation and is refused.
+    pub fn with_max_depth(mut self, max_depth: u16) -> Result<Self, &'static str> {
+        if max_depth == 0 {
+            return Err("invalid subagent nesting depth");
         }
-        self.tree_budget = budget;
+        self.max_depth = max_depth;
         Ok(self)
     }
 
     /// Reserve one tree edge before allocating channels/threads/provider
-    /// runtimes. `parent=None` is a foreground-root child. Every denial is
-    /// fail-closed and leaves the counters unchanged.
+    /// runtimes. `parent=None` is a foreground-root child. Only nesting depth
+    /// is bounded here: fan-out and totals are the delegation policy's
+    /// limits, checked right after in the same spawn path. Every denial is
+    /// fail-closed and leaves the tree unchanged.
     pub fn reserve_delegation(
         &self,
         worker_id: &str,
         parent: Option<&str>,
     ) -> Result<u16, DelegationTreeDenied> {
         let mut tree = self.tree.lock().unwrap();
-        if tree.descendants >= self.tree_budget.max_total_descendants {
-            return Err(DelegationTreeDenied::DescendantLimit);
+        if tree.depth_by_worker.contains_key(worker_id) {
+            return Err(DelegationTreeDenied::DuplicateWorker);
         }
         let depth = match parent {
             None => 1,
@@ -281,22 +303,15 @@ impl OrchestrationRuntime {
                 .ok_or(DelegationTreeDenied::UnknownParent)?
                 .saturating_add(1),
         };
-        if depth > self.tree_budget.max_depth {
-            return Err(DelegationTreeDenied::DepthLimit);
+        if depth > self.max_depth {
+            return Err(DelegationTreeDenied::DepthLimit {
+                max_depth: self.max_depth,
+            });
         }
         let parent_key = parent.unwrap_or("<root>");
-        if tree.child_count.get(parent_key).copied().unwrap_or(0)
-            >= self.tree_budget.max_children_per_worker
-        {
-            return Err(DelegationTreeDenied::ChildLimit);
-        }
-        if tree.depth_by_worker.contains_key(worker_id) {
-            return Err(DelegationTreeDenied::ChildLimit);
-        }
         tree.depth_by_worker.insert(worker_id.to_string(), depth);
         tree.parent_by_worker
             .insert(worker_id.to_string(), parent_key.to_string());
-        *tree.child_count.entry(parent_key.to_string()).or_default() += 1;
         tree.descendants += 1;
         Ok(depth)
     }
@@ -318,12 +333,7 @@ impl OrchestrationRuntime {
             stack.extend(children);
             if tree.depth_by_worker.remove(&current).is_some() {
                 tree.descendants = tree.descendants.saturating_sub(1);
-                if let Some(parent_key) = tree.parent_by_worker.remove(&current) {
-                    if let Some(count) = tree.child_count.get_mut(&parent_key) {
-                        *count = count.saturating_sub(1);
-                    }
-                }
-                tree.child_count.remove(&current);
+                tree.parent_by_worker.remove(&current);
             }
         }
     }
@@ -438,10 +448,14 @@ impl OrchestrationRuntime {
                 network_attempted: false,
                 remediation: match error.typed_code() {
                     agent_core::orchestration::DispatchFailureCode::ConcurrencyLimit =>
-                        "Wait for running workers to finish; collect and reconcile their results. Changing model does not release capacity.",
+                        if inner.registry.policy().recycle_reconciled_workers {
+                            "Wait for running workers to finish; collect and reconcile their results. The limit is subagent.max_concurrent in config. Changing model does not release capacity."
+                        } else {
+                            "Wait for running workers to finish; collect and reconcile their results. The prompt manifest's delegation policy sets this limit. Changing model does not release capacity."
+                        },
                     agent_core::orchestration::DispatchFailureCode::TotalWorkerLimit =>
                         if inner.registry.policy().recycle_reconciled_workers {
-                            "Collect finished workers with reconciled=true to release outstanding-worker capacity. Changing model does not release capacity."
+                            "Collect finished workers with reconciled=true to release outstanding-worker capacity (subagent.max_total in config). Changing model does not release capacity."
                         } else {
                             "The explicit delegation policy cumulative worker budget is exhausted. Changing model or collecting workers does not renew it."
                         },
@@ -909,10 +923,10 @@ mod tests {
         assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
     }
 
-    /// Completion remediation must cite tool-facing `sa_*` handles, never the
-    /// internal policy IDs (`worker-N`) that `WorkerRegistry` allocates.
+    /// The tree bounds nesting depth only. Fan-out is the policy's
+    /// concurrency limit (see `fanout_is_bounded_by_policy_concurrency_not_a_tree_cap`).
     #[test]
-    fn delegation_tree_depth_children_and_total_are_independently_bounded() {
+    fn delegation_tree_bounds_depth_and_rejects_duplicate_handles() {
         let foreground = model("anthropic/foreground");
         let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
             foreground.clone(),
@@ -920,32 +934,53 @@ mod tests {
             8,
             16,
         ))
-        .with_tree_budget(DelegationTreeBudget {
-            max_depth: 2,
-            max_children_per_worker: 2,
-            max_total_descendants: 3,
-        })
+        .with_max_depth(2)
         .unwrap();
 
         assert_eq!(rt.reserve_delegation("a", None), Ok(1));
         assert_eq!(
             rt.reserve_delegation("a", None),
-            Err(DelegationTreeDenied::ChildLimit),
+            Err(DelegationTreeDenied::DuplicateWorker),
             "registration/spawn retry cannot double-reserve one handle"
         );
         assert_eq!(rt.reserve_delegation("b", Some("a")), Ok(2));
         assert_eq!(
             rt.reserve_delegation("too-deep", Some("b")),
-            Err(DelegationTreeDenied::DepthLimit)
+            Err(DelegationTreeDenied::DepthLimit { max_depth: 2 })
         );
-        assert_eq!(rt.reserve_delegation("c", Some("a")), Ok(2));
+        // No per-parent child cap: siblings are limited by the policy only.
+        for i in 0..20 {
+            assert_eq!(
+                rt.reserve_delegation(&format!("sibling-{i}"), Some("a")),
+                Ok(2)
+            );
+        }
+        assert_eq!(rt.delegation_descendants(), 22);
+        rt.release_delegation("a", None);
         assert_eq!(
-            rt.reserve_delegation("too-many", Some("a")),
-            Err(DelegationTreeDenied::DescendantLimit)
+            rt.delegation_descendants(),
+            0,
+            "a parent takes its subtree with it"
         );
-        assert_eq!(rt.delegation_descendants(), 3);
-        rt.release_delegation("c", Some("a"));
-        assert_eq!(rt.delegation_descendants(), 2);
+        assert!(OrchestrationRuntime::new(DelegationPolicy::enforced(
+            model("anthropic/foreground"),
+            [model("anthropic/foreground")],
+            1,
+            1,
+        ))
+        .with_max_depth(0)
+        .is_err());
+    }
+
+    #[test]
+    fn depth_denial_names_the_config_key() {
+        let message = DelegationTreeDenied::DepthLimit { max_depth: 3 }.to_string();
+        assert!(message.contains("3 level"), "{message}");
+        assert!(message.contains("subagent.max_depth"), "{message}");
+        assert!(
+            !message.contains("DepthLimit"),
+            "no Debug names in user text: {message}"
+        );
     }
 
     /// Active reservation count is exact across reserve/release races.
@@ -1049,6 +1084,8 @@ mod tests {
         assert_eq!(rt.delegation_descendants(), 0);
     }
 
+    /// Completion remediation must cite tool-facing `sa_*` handles, never the
+    /// internal policy IDs (`worker-N`) that `WorkerRegistry` allocates.
     #[test]
     fn completion_gate_reports_runtime_handles_not_policy_ids() {
         let rt = OrchestrationRuntime::new(DelegationPolicy::enforced(
@@ -1141,6 +1178,43 @@ mod capacity_recovery_tests {
         assert!(inner.handles.contains_key("new"));
         assert!(inner.handles.contains_key("uncollected"));
         assert_eq!(inner.registry.total_dispatched(), 3);
+    }
+
+    #[test]
+    fn fanout_is_bounded_by_policy_concurrency_not_a_tree_cap() {
+        let limits = crate::config::SubagentLimits {
+            max_concurrent: 16,
+            max_total: 64,
+            max_depth: 4,
+        };
+        let rt = OrchestrationRuntime::from_limits(
+            QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.ultracode_readiness("anthropic/claude-fable-5"),
+            Ok((16, 64))
+        );
+        // Same order as the spawn path: tree reservation, then the policy.
+        for i in 0..16 {
+            let id = format!("sa_{i}");
+            assert_eq!(rt.reserve_delegation(&id, None), Ok(1), "worker {i}");
+            rt.resolve_and_authorize(&id, None).unwrap();
+        }
+        assert_eq!(
+            rt.reserve_delegation("sa_16", None),
+            Ok(1),
+            "the 17th root child is not refused by the tree"
+        );
+        let denial = rt.resolve_and_authorize("sa_16", None).unwrap_err();
+        assert_eq!(denial.code, "concurrency_limit");
+        assert!(
+            denial.remediation.contains("subagent.max_concurrent"),
+            "{}",
+            denial.remediation
+        );
+        assert!(denial.remediation.contains("Changing model does not"));
     }
 
     #[test]
