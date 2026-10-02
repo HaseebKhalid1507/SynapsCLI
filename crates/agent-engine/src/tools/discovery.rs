@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use super::activation::{activate_model_initiated, ActivationAuthority, SharedSessionToolSet};
 use super::catalog::{DiscoveryIndex, DiscoveryQuery, SearchLimits, ToolCatalog, ToolId};
-use super::{Tool, ToolContext, ToolOrigin};
+use super::{Tool, ToolContext, ToolOrigin, ToolOutput};
 use crate::{Result, RuntimeError};
 use agent_core::BoundedText;
 
@@ -304,6 +304,33 @@ impl Tool for ActivateToolsTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        self.activate(params, ctx).await.map(|(summary, _)| summary)
+    }
+
+    /// The text summary first (compaction, previews and non-Anthropic
+    /// providers read it), then one `tool_reference` per activated tool,
+    /// keyed by canonical tool id. On the Anthropic transport with deferred
+    /// loading, the wire layer resolves each id to its wire name and sends
+    /// only the references, which makes the deferred definitions callable
+    /// without changing the cached prompt prefix. Everywhere else the
+    /// references are dropped and the text stands alone.
+    async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let (summary, ids) = self.activate(params, ctx).await?;
+        let mut blocks = Vec::with_capacity(ids.len() + 1);
+        blocks.push(json!({"type": "text", "text": summary}));
+        blocks.extend(
+            ids.iter()
+                .map(|id| json!({"type": "tool_reference", "tool_name": id})),
+        );
+        Ok(ToolOutput::Blocks { blocks, summary })
+    }
+}
+
+impl ActivateToolsTool {
+    /// Authorize and apply one activation batch. Returns the JSON summary
+    /// text and the sorted canonical ids that were requested and are now
+    /// active for the session.
+    async fn activate(&self, params: Value, ctx: ToolContext) -> Result<(String, Vec<String>)> {
         let capability = require_capability(&ctx)?;
         let requested = params["tools"].as_array().ok_or_else(|| {
             RuntimeError::Tool("Missing 'tools' parameter (array of tool id strings)".to_string())
@@ -381,8 +408,10 @@ impl Tool for ActivateToolsTool {
             "count": activated,
             "schema_generation": schema_generation,
         });
-        serde_json::to_string(&body).map_err(|err| {
+        let summary = serde_json::to_string(&body).map_err(|err| {
             RuntimeError::Tool(format!("failed to serialize activation result: {err}"))
-        })
+        })?;
+        let ids = ids.into_iter().map(str::to_string).collect();
+        Ok((summary, ids))
     }
 }

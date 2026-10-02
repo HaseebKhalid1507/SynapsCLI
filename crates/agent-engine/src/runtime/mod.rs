@@ -455,6 +455,9 @@ pub struct Runtime {
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// `tools.deferred_loading`: Anthropic `defer_loading` + `tool_reference`
+    /// for progressive disclosure, so activations keep the cached prefix.
+    deferred_tool_loading: bool,
     /// `tools.activation_confirm` host policy for model-initiated
     /// `activate_tools` (auto | prompt | deny). Default `auto`.
     activation_confirm: agent_core::config::ActivationConfirm,
@@ -1018,6 +1021,7 @@ impl Runtime {
             token_cache: host.token_cache,
             trusted_worker_models: Vec::new(),
             progressive_tool_disclosure: host.progressive_tool_disclosure,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
             mcp_runtime: None,
@@ -2455,6 +2459,7 @@ impl Runtime {
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
+        self.deferred_tool_loading = config.tools_deferred_loading;
         self.activation_confirm = config.tools_activation_confirm;
         tracing::info!(
             mode = config.tools_activation_confirm.as_str(),
@@ -3499,6 +3504,7 @@ impl Runtime {
                     // policy (fresh default-core, zero activations).
                     session_tool_set: None,
                     request_tools_schema: None,
+                    anthropic_tool_split: None,
                     usage_counters: None,
                 },
             )
@@ -4036,6 +4042,7 @@ impl Runtime {
             // the first provider round.
             session_tool_set: None,
             request_tools_schema: None,
+            anthropic_tool_split: None,
             usage_counters: None,
         };
 
@@ -4083,6 +4090,7 @@ impl Runtime {
             delegation_parent: self.delegation_parent.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
@@ -4207,6 +4215,7 @@ impl Clone for Runtime {
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
             mcp_runtime: self.mcp_runtime.clone(),

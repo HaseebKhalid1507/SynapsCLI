@@ -593,6 +593,64 @@ impl ToolRegistry {
     /// (uncataloged) are dropped fail-closed and REPORTED in the returned
     /// [`SessionSchemaProjection::dropped`] list — they would be denied by
     /// the execution gate anyway, so advertising them would be dishonest.
+    /// Anthropic deferred-loading split of one session's tool surface.
+    ///
+    /// `loaded`: the session projection ([`Self::session_tools_schema`]) minus
+    /// activated tools whose `tool_reference` is already in the history. That
+    /// is the session core plus any activation whose reference was lost
+    /// (compaction, reload), so the non-deferred tools-array prefix does not
+    /// change when a tool is activated.
+    ///
+    /// `deferred`: every other activatable tool (trusted source, see
+    /// [`crate::tools::activation::is_activatable_record`]), including
+    /// referenced activations, each carrying `"defer_loading": true`.
+    /// Deferred definitions are not part of the cached prefix, so this set may
+    /// grow or shrink mid-session without a cache rewrite.
+    ///
+    /// `id_to_api`: canonical tool id → wire name for every tool in either
+    /// list, used to resolve history `tool_reference` blocks (which store
+    /// canonical ids) at serialization time.
+    pub fn deferred_tool_split(
+        &self,
+        session: &crate::tools::activation::SessionToolSet,
+        referenced_ids: &HashSet<String>,
+    ) -> DeferredToolSplit {
+        let projection = self.session_tools_schema(session).schema;
+        let projected: HashSet<&str> = projection
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        let mut split = DeferredToolSplit::default();
+        for entry in self.cached_schema.iter() {
+            let Some(api_name) = entry["name"].as_str() else {
+                continue;
+            };
+            let Some(tool) = self.tools.get(self.runtime_name_for_api(api_name)) else {
+                continue;
+            };
+            let id = tool_id_for(tool.as_ref());
+            if projected.contains(api_name) {
+                if session.is_core(&id) || !referenced_ids.contains(id.as_str()) {
+                    split.loaded.push(entry.clone());
+                } else {
+                    split.deferred.push(deferred_entry(entry));
+                }
+            } else if self
+                .catalog
+                .get(&id)
+                .is_some_and(crate::tools::activation::is_activatable_record)
+            {
+                split.deferred.push(deferred_entry(entry));
+            } else {
+                continue;
+            }
+            split
+                .id_to_api
+                .insert(id.as_str().to_string(), api_name.to_string());
+        }
+        split
+    }
+
     pub fn session_tools_schema(
         &self,
         session: &crate::tools::activation::SessionToolSet,
@@ -750,6 +808,26 @@ fn is_recursive_subagent_tool_name(name: &str) -> bool {
             | "memory_context"
     )
 }
+/// Result of [`ToolRegistry::deferred_tool_split`].
+#[derive(Debug, Clone, Default)]
+pub struct DeferredToolSplit {
+    /// Sent normally; the last one carries the tools cache breakpoint.
+    pub loaded: Vec<Value>,
+    /// Sent with `"defer_loading": true`, never with `cache_control`.
+    pub deferred: Vec<Value>,
+    /// Canonical tool id → wire name for every tool in `loaded ∪ deferred`.
+    pub id_to_api: std::collections::HashMap<String, String>,
+}
+
+fn deferred_entry(entry: &Value) -> Value {
+    let mut entry = entry.clone();
+    if let Some(map) = entry.as_object_mut() {
+        map.remove("cache_control");
+        map.insert("defer_loading".to_string(), Value::Bool(true));
+    }
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -893,6 +893,12 @@ pub struct SynapsConfig {
     /// authorizes (locked-down hosts). `server.auto_approve_confirms = true`
     /// still authorizes regardless of this key.
     pub tools_activation_confirm: ActivationConfirm,
+    /// `tools.deferred_loading` (default on). With progressive disclosure on
+    /// the native Anthropic transport, every activatable tool is sent from the
+    /// first request with `defer_loading: true` and `activate_tools` answers
+    /// with `tool_reference` blocks, so an activation never changes the cached
+    /// prompt prefix. `off` restores the per-activation tools-array change.
+    pub tools_deferred_loading: bool,
     /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
     /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
     /// an append-only delta journal with periodic atomic snapshots. See
@@ -954,6 +960,7 @@ impl Default for SynapsConfig {
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
             tools_activation_confirm: ActivationConfirm::default(),
+            tools_deferred_loading: true,
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
@@ -1010,6 +1017,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "disabled_tools",
     "progressive_tool_disclosure",
     "tools.activation_confirm",
+    "tools.deferred_loading",
     "session_persistence",
 ];
 
@@ -1449,6 +1457,13 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
+            "tools.deferred_loading" => match val {
+                "on" | "true" | "1" | "yes" => config.tools_deferred_loading = true,
+                "off" | "false" | "0" | "no" => config.tools_deferred_loading = false,
+                _ => config.warnings.push(format!(
+                    "tools.deferred_loading = {val} — expected on or off; keeping the default (on)"
+                )),
+            },
             "tools.activation_confirm" => match ActivationConfirm::parse(val) {
                 Some(mode) => config.tools_activation_confirm = mode,
                 None => config.warnings.push(format!(
@@ -1842,6 +1857,23 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tools_deferred_loading_defaults_on_and_parses() {
+        assert!(super::load_config_from_str("").tools_deferred_loading);
+        assert!(
+            !super::load_config_from_str("tools.deferred_loading = off\n").tools_deferred_loading
+        );
+        let bad = super::load_config_from_str("tools.deferred_loading = maybe\n");
+        assert!(
+            bad.tools_deferred_loading,
+            "invalid value keeps the default"
+        );
+        assert!(bad
+            .warnings
+            .iter()
+            .any(|w| w.contains("tools.deferred_loading")));
+    }
+
     #[test]
     fn secret_env_value_detects_credential_urls() {
         use super::is_secret_env_value as v;

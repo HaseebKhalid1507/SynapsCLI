@@ -860,6 +860,12 @@ pub struct ApiOptions {
     /// flag-off request bytes exactly. Stream rounds set `Some` only when the
     /// progressive-disclosure flag is enabled.
     pub request_tools_schema: Option<std::sync::Arc<Vec<Value>>>,
+    /// Anthropic deferred-loading split for this request (progressive
+    /// disclosure + `tools.deferred_loading`). `None` keeps the plain tools
+    /// array. Only the native Anthropic transport reads it, and only for a
+    /// model with tool search; every other transport keeps using
+    /// `request_tools_schema`.
+    pub anthropic_tool_split: Option<std::sync::Arc<crate::tools::DeferredToolSplit>>,
     /// Optional shared turn-budget usage counters (Task 23). Updated at the
     /// single authoritative Usage emission per request; the stream loop
     /// reads them for the optional token/cost budget dimensions. `None`
@@ -1145,6 +1151,23 @@ impl ApiMethods {
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        // Deferred tool loading: send the session's loaded tools normally and
+        // every other activatable tool with `defer_loading`, and resolve the
+        // history's `tool_reference` blocks to wire names. Without a split
+        // (or for a model without tool search) references are stripped, so
+        // they never reach a request that cannot accept them.
+        let split = options.anthropic_tool_split.as_deref().filter(|split| {
+            !split.loaded.is_empty()
+                && !split.deferred.is_empty()
+                && crate::core::models::model_supports_tool_search(model)
+        });
+        let (wire_tools, deferred_tools): (&[Value], &[Value]) = match split {
+            Some(split) => (&split.loaded, &split.deferred),
+            None => (&tools_schema, &[]),
+        };
+        HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
+            split.and_then(|split| split.id_to_api.get(id).cloned())
+        });
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Derive the thinking level from the budget for effort mapping.
@@ -1158,7 +1181,8 @@ impl ApiMethods {
         let parts = crate::runtime::transport::anthropic::build_anthropic_request(
             model,
             &cleaned_messages,
-            &tools_schema,
+            wire_tools,
+            deferred_tools,
             system_prompt,
             &auth_type,
             thinking_budget,

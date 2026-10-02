@@ -58,7 +58,9 @@ pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
-pub use registry::{DroppedSessionMember, SessionSchemaProjection, ToolRegistry};
+pub use registry::{
+    DeferredToolSplit, DroppedSessionMember, SessionSchemaProjection, ToolRegistry,
+};
 pub use respond::RespondTool;
 pub use secret_prompt::SecretPromptQueue;
 pub use secret_prompt::{PromptKind, SecretPromptHandle, SecretPromptRequest};

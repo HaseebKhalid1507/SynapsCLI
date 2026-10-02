@@ -56,6 +56,7 @@ impl<'a> RequestBody<'a> {
         model: &'a str,
         messages: &'a [SharedMessage],
         tools_schema: &'a [Value],
+        deferred_tools: &'a [Value],
         system_prompt: &Option<String>,
         auth_type: &str,
         thinking_budget: u32,
@@ -125,7 +126,7 @@ impl<'a> RequestBody<'a> {
             stream: if stream { Some(true) } else { None },
             system: HelperMethods::build_system_blocks(auth_type, system_prompt, ttl),
             thinking,
-            tools: MarkedTools::new(tools_schema, ttl),
+            tools: MarkedTools::with_deferred(tools_schema, deferred_tools, ttl),
         }
     }
 
@@ -150,22 +151,35 @@ impl<'a> RequestBody<'a> {
 pub(super) struct MarkedTools<'a> {
     tools: &'a [Value],
     marked_last: Option<Value>,
+    /// `defer_loading` definitions, serialized after the marked loaded tools
+    /// and never marked (a deferred tool may not carry `cache_control`).
+    /// Empty ⇒ byte-identical to the legacy body.
+    deferred: &'a [Value],
 }
 
 impl<'a> MarkedTools<'a> {
+    #[cfg(test)]
     pub(super) fn new(tools: &'a [Value], ttl: CacheTtl) -> Self {
+        Self::with_deferred(tools, &[], ttl)
+    }
+
+    pub(super) fn with_deferred(tools: &'a [Value], deferred: &'a [Value], ttl: CacheTtl) -> Self {
         let marked_last = tools.last().map(|t| {
             let mut t = t.clone();
             t["cache_control"] = cache_control_value(ttl, MarkerSite::StablePrefix);
             t
         });
-        Self { tools, marked_last }
+        Self {
+            tools,
+            marked_last,
+            deferred,
+        }
     }
 }
 
 impl Serialize for MarkedTools<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.tools.len()))?;
+        let mut seq = serializer.serialize_seq(Some(self.tools.len() + self.deferred.len()))?;
         match &self.marked_last {
             Some(last) => {
                 for tool in &self.tools[..self.tools.len() - 1] {
@@ -178,6 +192,9 @@ impl Serialize for MarkedTools<'_> {
                     seq.serialize_element(tool)?;
                 }
             }
+        }
+        for tool in self.deferred {
+            seq.serialize_element(tool)?;
         }
         seq.end()
     }
@@ -325,6 +342,7 @@ mod anthropic_reasoning_body_tests {
         let body = RequestBody::new(
             model,
             &messages,
+            &[],
             &[],
             &None,
             "api_key",
