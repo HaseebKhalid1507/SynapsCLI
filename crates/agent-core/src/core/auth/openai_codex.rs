@@ -6,7 +6,8 @@ use tokio::sync::oneshot;
 
 use super::{
     generate_code_challenge, generate_code_verifier, generate_state, open_browser,
-    save_provider_auth, start_callback_server, CallbackOutcome, CallbackResult, OAuthCredentials,
+    save_provider_auth, start_callback_server_at, CallbackOutcome, CallbackResult,
+    OAuthCredentials, CALLBACK_HOST,
 };
 
 const PROVIDER: &str = "openai-codex";
@@ -14,6 +15,11 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CALLBACK_PORT: u16 = 1455;
+/// The path OpenAI redirects to (fixed by the registered `REDIRECT_URI`). The
+/// local callback server must listen on exactly this path: the shared default
+/// is `/callback`, which answered the browser redirect with 404 and left the
+/// pasted URL as the only way to finish a login.
+const CALLBACK_PATH: &str = "/auth/callback";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const SCOPE: &str = "openid profile email offline_access";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
@@ -29,7 +35,9 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     let verifier = generate_code_verifier();
     let challenge = generate_code_challenge(&verifier);
     let state = generate_state();
-    let (rx, server_handle) = start_callback_server(state.clone(), CALLBACK_PORT).await?;
+    let (rx, server_handle) =
+        start_callback_server_at(state.clone(), CALLBACK_HOST, CALLBACK_PORT, CALLBACK_PATH)
+            .await?;
     let auth_url = build_auth_url(&challenge, &state)?;
 
     eprintln!("\n\x1b[1mOpening browser to sign in with ChatGPT...\x1b[0m\n");
@@ -240,6 +248,38 @@ pub fn extract_account_id(access_token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_server_listens_where_openai_redirects() {
+        let redirect = url::Url::parse(REDIRECT_URI).unwrap();
+        assert_eq!(redirect.path(), CALLBACK_PATH);
+        assert_eq!(redirect.port(), Some(CALLBACK_PORT));
+    }
+
+    #[tokio::test]
+    async fn browser_redirect_to_auth_callback_completes_the_login() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (rx, handle) =
+            start_callback_server_at("st8".into(), CALLBACK_HOST, port, CALLBACK_PATH)
+                .await
+                .unwrap();
+        let response = reqwest::get(format!(
+            "http://127.0.0.1:{port}{CALLBACK_PATH}?code=c0de&state=st8"
+        ))
+        .await
+        .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+        assert_eq!(
+            rx.await.unwrap(),
+            CallbackOutcome::Authorized(CallbackResult {
+                code: "c0de".into(),
+                state: "st8".into(),
+            })
+        );
+        handle.shutdown().await;
+    }
+
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
