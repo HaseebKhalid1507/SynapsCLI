@@ -630,6 +630,7 @@ impl ToolRegistry {
             };
             let id = tool_id_for(tool.as_ref());
             if projected.contains(api_name) {
+                split.fixed.push(entry.clone());
                 if session.is_core(&id) || !referenced_ids.contains(id.as_str()) {
                     split.loaded.push(entry.clone());
                 } else {
@@ -640,6 +641,7 @@ impl ToolRegistry {
                 .get(&id)
                 .is_some_and(crate::tools::activation::is_activatable_record)
             {
+                split.fixed.push(entry.clone());
                 split.deferred.push(deferred_entry(entry));
             } else {
                 continue;
@@ -815,6 +817,12 @@ pub struct DeferredToolSplit {
     pub loaded: Vec<Value>,
     /// Sent with `"defer_loading": true`, never with `cache_control`.
     pub deferred: Vec<Value>,
+    /// Every tool in `loaded ∪ deferred`, as plain definitions in registry
+    /// order, independent of activation state. The stable tools array for
+    /// transports without deferred loading (OpenAI, Codex, Claude models
+    /// without tool search): activation then only grants permission at the
+    /// execution gate and never changes the request's tools.
+    pub fixed: Vec<Value>,
     /// Canonical tool id → wire name for every tool in `loaded ∪ deferred`.
     pub id_to_api: std::collections::HashMap<String, String>,
 }

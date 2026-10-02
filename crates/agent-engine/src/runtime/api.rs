@@ -873,6 +873,15 @@ pub struct ApiOptions {
     pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
 }
 
+/// Serialized-size cap for the stable (fixed) tools list. Past it a session
+/// with very large MCP servers falls back to the per-session projection and
+/// accepts a cache rewrite per activation rather than a huge request.
+pub(crate) const FIXED_TOOL_LIST_MAX_BYTES: usize = 96 * 1024;
+
+fn fixed_list_within_cap(fixed: &[Value]) -> bool {
+    serde_json::to_vec(fixed).is_ok_and(|bytes| bytes.len() <= FIXED_TOOL_LIST_MAX_BYTES)
+}
+
 /// Validate a provider-assigned request ID from response headers into a
 /// bounded [`trace::TraceId`]. Invalid or hostile values are omitted —
 /// never copied raw into a trace record.
@@ -1038,6 +1047,20 @@ impl ApiMethods {
             .request_tools_schema
             .clone()
             .unwrap_or_else(|| tools.tools_schema());
+        // Stable tool list for every transport without Anthropic deferred
+        // loading: with a split, send all activatable tools from the first
+        // request so an activation never changes the tools array (the front
+        // of every provider's cached prefix). Above the size cap, fall back
+        // to the session projection.
+        let stable_tools: Option<std::sync::Arc<Vec<Value>>> = options
+            .anthropic_tool_split
+            .as_deref()
+            .filter(|split| fixed_list_within_cap(&split.fixed))
+            .map(|split| std::sync::Arc::new(split.fixed.clone()));
+        // OpenAI-compatible and Codex routes, and Claude models without tool
+        // search, use the stable list; the native Anthropic path with tool
+        // search uses the deferred split below instead.
+        let routed_tools_schema = stable_tools.clone().unwrap_or_else(|| tools_schema.clone());
         // Cloud models always dispatch through the typed credential broker.
         // Text-only pre-flight, invocation, cancellation, and Task 10B trace
         // wiring live in `runtime::cloud_invoke` (extracted for testability).
@@ -1076,7 +1099,7 @@ impl ApiMethods {
         if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
             model,
             client,
-            &tools_schema,
+            &routed_tools_schema,
             system_prompt,
             messages,
             &tx,
@@ -1163,7 +1186,7 @@ impl ApiMethods {
         });
         let (wire_tools, deferred_tools): (&[Value], &[Value]) = match split {
             Some(split) => (&split.loaded, &split.deferred),
-            None => (&tools_schema, &[]),
+            None => (&routed_tools_schema, &[]),
         };
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
@@ -1910,6 +1933,19 @@ impl ApiMethods {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_tool_list_cap() {
+        let small = vec![json!({"name": "bash", "input_schema": {}})];
+        assert!(super::fixed_list_within_cap(&small));
+        let big: Vec<Value> = (0..400)
+            .map(|i| json!({"name": format!("t{i}"), "description": "x".repeat(400)}))
+            .collect();
+        assert!(
+            !super::fixed_list_within_cap(&big),
+            "over the cap falls back to the projection"
+        );
+    }
+
     use super::*;
     use crate::runtime::telemetry::TelemetryLevel;
 

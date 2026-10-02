@@ -1363,3 +1363,55 @@ async fn a17_activate_tools_answers_with_text_then_tool_references() {
     mcp.cleanup();
     ext.cleanup();
 }
+
+// ── a18: stable (fixed) tool list for transports without deferred loading ───
+
+#[test]
+fn a18_fixed_tool_list_is_identical_across_activation() {
+    let mcp = mcp_fixture("a18", json!([]));
+    let ext = ext_fixture("a18");
+    let registry = acceptance_registry(&mcp, &ext);
+    let mut set = progressive_set(&registry, &sid("a18"));
+    let none = std::collections::HashSet::new();
+    let before = registry.deferred_tool_split(&set, &none);
+    let names = names_of(&before.fixed);
+    for name in [
+        "bash",
+        "activate_tools",
+        "dormant_00",
+        "ext__srv__echo_tool",
+    ] {
+        assert!(names.contains(name), "{name} missing from the fixed list");
+    }
+    assert!(before
+        .fixed
+        .iter()
+        .all(|t| t.get("defer_loading").is_none()));
+    assert_eq!(
+        names,
+        names_of(&before.loaded)
+            .union(&names_of(&before.deferred))
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        "fixed = loaded ∪ deferred"
+    );
+    activate_exact_for_user(
+        &mut set,
+        registry.catalog(),
+        &ToolId::mcp("srv", "echo_tool"),
+    )
+    .unwrap();
+    for referenced in [
+        std::collections::HashSet::new(),
+        ["mcp.srv:echo_tool".to_string()].into_iter().collect(),
+    ] {
+        let after = registry.deferred_tool_split(&set, &referenced);
+        assert_eq!(
+            serde_json::to_vec(&after.fixed).unwrap(),
+            serde_json::to_vec(&before.fixed).unwrap(),
+            "the fixed list must not change when a tool is activated"
+        );
+    }
+    mcp.cleanup();
+    ext.cleanup();
+}

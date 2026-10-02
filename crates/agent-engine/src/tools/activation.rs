@@ -702,7 +702,10 @@ pub enum ToolAuthorizationError {
     NotCataloged(ToolId),
     /// Known capability, but neither core for this session nor covered by an
     /// exact activation grant (the forged deferred-call case).
-    #[error("Tool call denied: tool is not activated for this session: {0}")]
+    #[error(
+        "Tool call denied: tool is not activated for this session: {0}. \
+         Activate it first: activate_tools with [\"{0}\"]."
+    )]
     NotActivated(ToolId),
     /// The capability's current schema digest differs from the digest the
     /// session pinned at core-build/activation time — a changed tool is

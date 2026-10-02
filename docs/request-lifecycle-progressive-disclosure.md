@@ -81,3 +81,11 @@ With `tools.deferred_loading = on` (the default) on the native Anthropic transpo
 - **Turning it off:** `tools.deferred_loading = off` restores the previous behaviour.
 
 Measured live on the OAuth route: one activation cost about 140 tokens of cache write per expanded definition, and the request after it read the entire previous prefix. A session should keep at least one deferred tool for its lifetime, because going from zero deferred tools to some changes the prefix once (by about 93 tokens).
+
+## Stable tool list on other transports
+
+Anthropic's `defer_loading` is what lets activation leave the cached prefix alone. OpenAI-compatible routes, Codex, and Claude models without tool search have no equivalent, so with `tools.deferred_loading = on` they get a **fixed list** instead: every activatable tool (`DeferredToolSplit::fixed`, in registry order, independent of activation state) from the first request.
+
+- Activation then only grants permission at the execution gate. The tools array never changes, so the provider's prefix cache survives.
+- A call to a listed tool that hasn't been activated is denied with a message telling the model to activate it first.
+- Above 96 KB of tool definitions (very large MCP servers), the request falls back to the per-session projection and accepts a cache rewrite per activation.
