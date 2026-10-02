@@ -7,17 +7,16 @@
 //! second attach reuses (same pid) → `daemon stop` ends it; concurrent
 //! first-clients → exactly ONE daemon (spawn lock); `SYNAPS_DAEMON_AUTOSPAWN=0`
 //! → the no-daemon message, nothing spawned; `SYNAPS_DAEMON=0` → exit 3;
-//! the legacy-MCP refusal → line client exits 3 with the reason, the TUI
-//! falls back in-process (stderr notice, no thin-client ladder — the
-//! on-screen SystemNotice itself needs the tmux harness and is not asserted
-//! here); `daemon status` with nobody running says it auto-starts.
+//! progressive disclosure off with an MCP server configured → the daemon
+//! starts (the legacy-MCP refusal is gone); `daemon status` with nobody
+//! running says it auto-starts.
 
 #![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -57,8 +56,9 @@ impl Env {
         registry::daemon_paths_in(&self.run_dir(), None)
     }
 
-    /// Legacy-MCP refusal setup: `progressive_tool_disclosure=false` + one server.
-    fn legacy_mcp(&self) {
+    /// `progressive_tool_disclosure=false` + one MCP server: the daemon used to
+    /// refuse this (legacy shared `McpTool` connections); it now starts.
+    fn progressive_off_with_mcp(&self) {
         std::fs::write(self.base().join("config"), "progressive_tool_disclosure = false\n").unwrap();
         std::fs::write(
             self.base().join("mcp.json"),
@@ -330,66 +330,25 @@ fn daemon_flag_off_refuses_attach() {
     assert!(!registry::is_alive(&env.paths()));
 }
 
+/// Legacy MCP was removed: with progressive disclosure off and an MCP server
+/// configured, the daemon starts (it used to refuse with exit 3), and the
+/// server's tools go through per-session leases. A server that cannot be
+/// listed (`/bin/cat` speaks no MCP) costs a bounded boot discovery, never a
+/// refusal.
 #[test]
-fn legacy_mcp_refusal_line_client_exits_3() {
+fn progressive_off_with_mcp_server_daemon_starts() {
     let env = Env::new();
-    env.legacy_mcp();
+    env.progressive_off_with_mcp();
     let paths = env.paths();
-    let out = env.cmd(&["attach", "--create"]).stdin(Stdio::null()).output().unwrap();
-    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("daemon unavailable:"), "{err}");
-    assert!(err.contains("progressive_tool_disclosure=false"), "reason is the daemon's one-liner:\n{err}");
-    assert!(!err.contains("starting daemon"), "{err}");
-    wait_alive(&paths, false, 5);
-}
-
-/// `synaps --attach` when the daemon refuses: in-process TUI with the
-/// notice, exit 0, and none of the thin-client ladder stages (no re-exec,
-/// no allocator diet — review H2).
-#[test]
-fn legacy_mcp_refusal_tui_falls_back_in_process() {
-    let env = Env::new();
-    env.legacy_mcp();
-    let ladder = env.home.path().join("ladder.log");
-    let mut child = env
-        .cmd(&["--attach"])
-        .env("SYNAPS_MEM_TRACE", "1")
-        .env("SYNAPS_MEM_TRACE_FILE", &ladder)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            break Some(st);
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let err = reader.join().unwrap();
-    assert!(err.contains("daemon unavailable:") && err.contains("running in-process"), "fallback notice:\n{err}");
-    assert!(err.contains("progressive_tool_disclosure=false"), "{err}");
-    // Exit status is the TUI's own (stdin is /dev/null here, so it may
-    // bail on the terminal); the fallback itself is proven by the notice.
-    let _ = status;
-    let trace = std::fs::read_to_string(&ladder).unwrap_or_default();
-    for stage in ["stage=reexec", "stage=main", "stage=alloc"] {
-        assert!(!trace.contains(stage), "thin-client ladder stage {stage} on the fallback:\n{trace}");
-    }
-    assert!(!registry::is_alive(&env.paths()));
+    let mut a = Client::spawn(env.cmd(&["attach", "--create"]));
+    a.wait_stdout("○ ready", 60);
+    assert!(!a.err.contains("daemon unavailable"), "{}", a.err);
+    assert!(!a.err.contains("progressive_tool_disclosure=false"), "{}", a.err);
+    assert!(registry::is_alive(&paths), "daemon running");
+    a.detach();
+    let st = env.cmd(&["daemon", "stop"]).stdin(Stdio::null()).output().unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    wait_alive(&paths, false, 10);
 }
 
 #[test]

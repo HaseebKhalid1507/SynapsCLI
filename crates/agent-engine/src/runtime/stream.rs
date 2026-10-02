@@ -779,7 +779,7 @@ impl StreamMethods {
 
             // Round-top set maintenance: if dynamic registration advanced
             // the catalog generation since the retained set was built (e.g.
-            // `connect_mcp_server` drained after the previous round),
+            // an extension tool registered after the previous round),
             // rebuild it here — explicitly, deterministically, from the
             // currently verified capabilities. Exact activations whose
             // record still matches its pinned digest+provenance are carried
@@ -1659,7 +1659,7 @@ impl StreamMethods {
                     // retained session-set snapshot, translating inputs into
                     // owned dispatch records under that same guard. Only
                     // after the guard is released are tasks spawned, so no
-                    // registration (`connect_mcp_server`, extension load)
+                    // registration (extension load, a `tool_register_tx` drain)
                     // can change policy between sibling calls, and no lock
                     // is held across tool execution. Denials are typed,
                     // static, metadata-only and happen BEFORE implementation

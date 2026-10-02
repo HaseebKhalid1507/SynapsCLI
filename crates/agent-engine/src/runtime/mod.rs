@@ -2393,7 +2393,7 @@ impl Runtime {
     /// `EngineHost::foreground_runtime`: the host already disabled builtins
     /// on the fresh registry before skills/MCP registered (the old boot
     /// point), and a second pass here would also strip `load_skill`,
-    /// `search_skills`, `connect_mcp_server` and dormant MCP tools — which
+    /// `search_skills` and the descriptor-backed MCP tools — which
     /// the old boot never did.
     pub(crate) fn apply_config_keep_tools(&mut self, config: &crate::config::SynapsConfig) {
         self.apply_config_inner(config, false);
