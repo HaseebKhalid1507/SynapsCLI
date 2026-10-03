@@ -103,6 +103,30 @@ pub fn finalize_subagent(
     started_at: std::time::Instant,
     resumed_from: Option<&str>,
 ) {
+    finalize_subagent_in(
+        state,
+        parent_queue,
+        handle_id,
+        subagent_id,
+        agent_name,
+        started_at,
+        resumed_from,
+        &super::archive::process_dir(),
+    )
+}
+
+/// [`finalize_subagent`] with an explicit resume-archive directory (tests).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_subagent_in(
+    state: &Arc<RwLock<SubagentState>>,
+    parent_queue: Option<&Arc<EventQueue>>,
+    handle_id: &str,
+    subagent_id: u64,
+    agent_name: &str,
+    started_at: std::time::Instant,
+    resumed_from: Option<&str>,
+    archive_dir: &std::path::Path,
+) {
     let (status, preview, cancelled) = {
         // R6: poison-safe — if the thread panicked while holding the write lock,
         // recover the inner value rather than re-panicking outside catch_unwind.
@@ -120,9 +144,20 @@ pub fn finalize_subagent(
         if s.finished_at.is_none() {
             s.finished_at = Some(std::time::Instant::now());
         }
-        let preview: String = s.partial_text.chars().take(300).collect();
+        // The worker's latest word (its result), not the first words of the run.
+        let latest = s.last_response_text().trim();
+        let source = if latest.is_empty() {
+            s.partial_text.trim()
+        } else {
+            latest
+        };
+        let preview: String = source.chars().take(300).collect();
         (s.status.clone(), preview, s.cancel_requested)
     };
+
+    // Archive the full conversation (every terminal status, cancel included) so
+    // subagent_resume and subagent_collect still work after the handle is reaped.
+    super::archive::archive_finished_worker(state, handle_id, archive_dir);
 
     if cancelled {
         tracing::info!("subagent {handle_id}: cancelled by user — suppressing completion wake");

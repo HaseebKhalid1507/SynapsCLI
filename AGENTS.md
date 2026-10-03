@@ -457,7 +457,9 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `max_tool_output` | int | 30000 | Max bytes per tool output |
 | `bash_timeout` | int | 30 | Default bash timeout (seconds) |
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
-| `subagent_timeout` | int | 300 | Default subagent timeout (seconds) |
+| `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
+| `subagent_max_concurrent` | int | 8 | Subagents running at once per session, and children per parent (1..=256) |
+| `subagent_max_total` | int | 64 | Live subagent handles per session (1..=1024; reconciled workers are recycled) |
 | `api_retries` | int | 3 | Max API retries on transient errors |
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
@@ -709,7 +711,7 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `subagent_status` | handle_id | — | Poll reactive subagent state |
 | `subagent_steer` | handle_id, message | — | Inject guidance mid-run |
 | `subagent_collect` | handle_id | — | Collect result (non-blocking poll) |
-| `subagent_resume` | handle_id, instructions | — | Resume finished/timed-out subagent with prior context |
+| `subagent_resume` | handle_id, instructions | archive_path, timeout | Continue a finished/timed-out/failed worker from its own archived conversation |
 | `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
 *Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`.
@@ -723,14 +725,22 @@ subagent_start(agent, task, ...)        → {"handle_id": "sa_1", "status": "run
 subagent_status(handle_id)              → {"status": "running", "partial_output": "..."}
 subagent_steer(handle_id, message)      → {"acknowledged": true}
 subagent_collect(handle_id)             → {"status": "completed", "output": "full result"}
-subagent_resume(handle_id, instructions) → new handle_id; prior conversation prepended as context
+subagent_resume(handle_id, instructions) → new handle_id; the worker continues its archived conversation
 ```
 
 Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
 Use `subagent_resume` on finished/timed-out/failed handles to continue with new instructions — the original handle stays readable.
 
-Implementation: `crates/agent-engine/src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`.
+Every finished worker's full conversation (tool calls and results included) is written to
+`~/.synaps-cli/subagent-history/<process>/<handle>.json` (0600, pruned after 14 days). `subagent_resume`
+replays it with the instructions as the next user turn, so the worker picks up where it stopped, even
+after the handle was collected or reaped; `archive_path` resumes a worker from an earlier or crashed
+session. `subagent_collect` falls back to the archive once a handle is reaped. A timed-out worker is
+cancelled and drained briefly so its last round is kept, and its report leads with its latest progress.
+
+Implementation: `crates/agent-engine/src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`; the reactive
+worker loop is `drive.rs`, the resume archive `archive.rs`.
 
 ---
 

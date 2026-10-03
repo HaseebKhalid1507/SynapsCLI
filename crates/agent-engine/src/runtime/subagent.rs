@@ -110,6 +110,27 @@ pub struct SubagentState {
     pub step: String,
     /// Tool calls started so far (the "tool #N" in `step`).
     pub tools: u32,
+    /// The worker's real message history, from the runtime's last
+    /// `SessionEvent::MessageHistory`. Written to the resume archive by the
+    /// finalizer and then released, so finished handles stay small.
+    pub history: Option<Vec<crate::SharedMessage>>,
+    /// Byte offset in `partial_text` where the latest model response starts.
+    /// Completion previews show that response (the worker's final word), not
+    /// the first words of the whole run.
+    pub last_response_start: usize,
+    /// Identity needed to resume from the archive after the handle is reaped.
+    pub archive_meta: Option<SubagentArchiveMeta>,
+    /// Where the finalizer wrote this worker's resume archive.
+    pub archive_path: Option<std::path::PathBuf>,
+}
+
+/// What `subagent_resume` needs to relaunch a worker when only its archive is left.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SubagentArchiveMeta {
+    pub agent_name: String,
+    pub model: String,
+    pub system_prompt: String,
+    pub timeout_secs: u64,
 }
 
 impl SubagentState {
@@ -124,6 +145,10 @@ impl SubagentState {
             terminal: None,
             step: String::new(),
             tools: 0,
+            history: None,
+            last_response_start: 0,
+            archive_meta: None,
+            archive_path: None,
         }
     }
 
@@ -132,6 +157,18 @@ impl SubagentState {
         self.step.clear();
         self.step.push_str(step);
         self.tools = tools;
+    }
+
+    /// Text of the latest model response (empty if none started yet).
+    pub fn last_response_text(&self) -> &str {
+        let start = self.last_response_start.min(self.partial_text.len());
+        // `last_response_start` is always recorded at a push boundary, but be
+        // defensive about char boundaries after truncation.
+        let mut start = start;
+        while !self.partial_text.is_char_boundary(start) {
+            start -= 1;
+        }
+        &self.partial_text[start..]
     }
 
     /// Persist only typed, allowlisted failure data. Raw provider errors never enter state.
@@ -371,6 +408,7 @@ impl SubagentHandle {
         }
         state.tool_log.clear();
         state.conversation_state.clear();
+        state.history = None;
     }
 
     /// Send a steering message into the running subagent.
@@ -461,6 +499,9 @@ pub struct SubagentRegistry {
     // are cancelled before their thread can start inference.
     spawn_cancellation: Option<crate::CancellationToken>,
     spawn_epoch: u64,
+    /// Resume archives of handles that were reaped. Handle ids come from a
+    /// process-wide counter, so they are never reused. Paths only: tiny.
+    archived: HashMap<String, std::path::PathBuf>,
 }
 
 impl SubagentRegistry {
@@ -469,7 +510,24 @@ impl SubagentRegistry {
             handles: HashMap::new(),
             spawn_cancellation: None,
             spawn_epoch: 0,
+            archived: HashMap::new(),
         }
+    }
+
+    /// Resume archive of `id`, whether its handle is still live or was reaped.
+    pub fn archive_path(&self, id: &str) -> Option<std::path::PathBuf> {
+        if let Some(handle) = self.handles.get(id) {
+            if let Some(path) = handle
+                .state
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .archive_path
+                .clone()
+            {
+                return Some(path);
+            }
+        }
+        self.archived.get(id).cloned()
     }
 
     /// Register a handle and return its id.
@@ -608,6 +666,15 @@ impl SubagentRegistry {
             if retain {
                 self.release_finished_resources(&id);
             } else if let Some(mut handle) = self.handles.remove(&id) {
+                if let Some(path) = handle
+                    .state
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .archive_path
+                    .clone()
+                {
+                    self.archived.insert(id.clone(), path);
+                }
                 if let Some(th) = handle.thread_handle.take() {
                     let _ = th.join();
                 }

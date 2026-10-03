@@ -1,18 +1,21 @@
-//! SubagentResumeTool — restart a finished or timed-out subagent with new instructions.
+//! SubagentResumeTool — continue a finished subagent with new instructions.
 //!
-//! Takes the completed conversation state stored in the prior `SubagentHandle`,
-//! prepends new instructions, and dispatches a fresh subagent via the same flow as
-//! `subagent_start`. The caller gets a new `handle_id` for the continuation run.
+//! The worker's own conversation (from its resume archive, see `archive.rs`) is
+//! replayed as the new run's history, with the instructions as the next user
+//! turn, so it continues where it stopped rather than starting over. That works
+//! for any terminal status and after the handle was collected or reaped; an
+//! `archive_path` resumes a worker of an earlier or crashed session. Without an
+//! archive (legacy), the prior run's text is pasted into a fresh task. The caller
+//! gets a new `handle_id` for the continuation run.
 
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use super::super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
 use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
-use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
+use crate::{AgentEvent, Result, RuntimeError};
 
 pub struct SubagentResumeTool;
 
@@ -21,6 +24,114 @@ fn expired_context_error(handle_id: &str) -> RuntimeError {
         "Subagent '{}' has expired resumable context; call subagent_collect with reconciled=true to reconcile its retained tombstone.",
         handle_id
     ))
+}
+
+/// Identity and opening messages of a resumed run.
+#[derive(Debug)]
+struct PriorRun {
+    agent_name: String,
+    model: String,
+    system_prompt: String,
+    timeout_secs: u64,
+    messages: Vec<crate::SharedMessage>,
+}
+
+fn prior_run(
+    registry: &std::sync::Mutex<crate::runtime::subagent::SubagentRegistry>,
+    prior_handle_id: &str,
+    explicit_archive: Option<std::path::PathBuf>,
+    instructions: &str,
+) -> Result<PriorRun> {
+    // Where the prior context comes from: the worker's archived conversation
+    // (any terminal handle, including collected, reaped and tombstoned ones),
+    // or else the legacy text snapshot on a live handle. An explicit
+    // archive_path belongs to another session, so the registry is skipped.
+    let (live, archive_path, legacy) = if explicit_archive.is_some() {
+        (None, explicit_archive, None)
+    } else {
+        let reg = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let handle = reg.get(&prior_handle_id);
+        if handle.is_some_and(|h| h.status() == SubagentStatus::Running) {
+            return Err(RuntimeError::Tool(format!(
+                "Subagent '{}' is still running. Call subagent_collect first, \
+                     or wait until it finishes.",
+                prior_handle_id
+            )));
+        }
+        let archive_path = reg.archive_path(&prior_handle_id);
+        let live = handle.map(|h| {
+            (
+                h.agent_name.clone(),
+                h.model.clone(),
+                h.system_prompt.clone(),
+                h.timeout_secs,
+            )
+        });
+        let legacy = match handle {
+            Some(_) if archive_path.is_some() => None,
+            Some(h) if h.is_tombstone() => return Err(expired_context_error(&prior_handle_id)),
+            Some(h) => {
+                let state = h.conversation_state();
+                Some(if state.is_empty() {
+                    h.partial_output()
+                } else {
+                    serde_json::to_string(&state).unwrap_or_else(|_| h.partial_output())
+                })
+            }
+            None if archive_path.is_some() => None,
+            None => {
+                return Err(RuntimeError::Tool(format!(
+                    "No subagent found with handle_id '{}'",
+                    prior_handle_id
+                )))
+            }
+        };
+        (live, archive_path, legacy)
+    };
+
+    let archive = match &archive_path {
+        Some(path) => Some(super::archive::read_archive(path).map_err(|e| {
+            RuntimeError::Tool(format!(
+                "Could not read the resume archive of '{}' ({}): {e}",
+                prior_handle_id,
+                path.display()
+            ))
+        })?),
+        None => None,
+    };
+    let (agent_name, model, system_prompt, timeout_secs) = match (live, &archive) {
+        (Some(live), _) => live,
+        (None, Some(a)) => (
+            a.meta.agent_name.clone(),
+            a.meta.model.clone(),
+            a.meta.system_prompt.clone(),
+            a.meta.timeout_secs,
+        ),
+        (None, None) => {
+            return Err(RuntimeError::Tool(format!(
+                "No subagent found with handle_id '{}'",
+                prior_handle_id
+            )))
+        }
+    };
+    let messages: Vec<crate::SharedMessage> = match (archive, legacy) {
+        (Some(a), _) => super::archive::resume_messages(a.history, instructions),
+        // Legacy: no archived conversation, only the prior run's text.
+        (None, Some(prior_context)) => vec![Arc::new(json!({
+            "role": "user",
+            "content": format!(
+                "{instructions}\n\n---\n[Prior conversation context from handle {prior_handle_id}]\n{prior_context}"
+            )
+        }))],
+        (None, None) => unreachable!("either an archive or a legacy snapshot was found"),
+    };
+    Ok(PriorRun {
+        agent_name,
+        model,
+        system_prompt,
+        timeout_secs,
+        messages,
+    })
 }
 
 #[async_trait::async_trait]
@@ -34,11 +145,11 @@ impl Tool for SubagentResumeTool {
     }
 
     fn description(&self) -> &str {
-        "Resume a finished or timed-out reactive subagent with new instructions. \
-         The previous subagent's conversation state is prepended as context so the \
-         new run has full history. Returns a new handle_id — the original handle \
-         remains readable for comparison. Only works on subagents in \
-         finished/timed_out/failed state."
+        "Resume a finished, timed-out, failed or cancelled reactive subagent with new \
+         instructions. The worker continues its own archived conversation (every tool \
+         call and result) with the instructions as the next user turn, so it picks up \
+         where it stopped. Works after the handle was collected or reaped. For a worker \
+         from an earlier or crashed session, pass archive_path. Returns a new handle_id."
     }
 
     fn parameters(&self) -> Value {
@@ -51,8 +162,19 @@ impl Tool for SubagentResumeTool {
                 },
                 "instructions": {
                     "type": "string",
-                    "description": "New task or context to prepend to the resumed subagent. \
-                                    Injected before the prior conversation history."
+                    "description": "What to do next. Sent as the next user turn after the \
+                                    worker's own prior conversation."
+                },
+                "archive_path": {
+                    "type": "string",
+                    "description": "Optional: a resume archive (.json under \
+                                    ~/.synaps-cli/subagent-history/) of a worker from an \
+                                    earlier or crashed session. handle_id is then only a label."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Optional wall-clock limit in seconds for the resumed run \
+                                    (default: the prior run's); 0 = no limit."
                 }
             },
             "required": ["handle_id", "instructions"]
@@ -74,71 +196,46 @@ impl Tool for SubagentResumeTool {
             RuntimeError::Tool("SubagentRegistry not available on this ToolContext".to_string())
         })?;
 
-        // Extract prior state under the lock, release immediately.
-        let (agent_name, model, prior_context, prior_system_prompt, prior_timeout) = {
-            let reg = registry.lock().unwrap();
-            let handle = reg.get(&prior_handle_id).ok_or_else(|| {
-                RuntimeError::Tool(format!(
-                    "No subagent found with handle_id '{}'",
-                    prior_handle_id
-                ))
-            })?;
-
-            if handle.status() == SubagentStatus::Running {
-                return Err(RuntimeError::Tool(format!(
-                    "Subagent '{}' is still running. Call subagent_collect first, \
-                     or wait until it finishes.",
-                    prior_handle_id
-                )));
+        let explicit_archive = match params["archive_path"].as_str() {
+            Some(raw) => {
+                Some(super::archive::checked_archive_path(raw).map_err(RuntimeError::Tool)?)
             }
-            if handle.is_tombstone() {
-                return Err(expired_context_error(&prior_handle_id));
-            }
-
-            let prior = {
-                let state = handle.conversation_state();
-                if state.is_empty() {
-                    handle.partial_output()
-                } else {
-                    serde_json::to_string(&state).unwrap_or_else(|_| handle.partial_output())
-                }
-            };
-
-            (
-                handle.agent_name.clone(),
-                handle.model.clone(),
-                prior,
-                handle.system_prompt.clone(),
-                handle.timeout_secs,
-            )
+            None => None,
         };
+
+        let prior = prior_run(registry, &prior_handle_id, explicit_archive, &instructions)?;
+        let (agent_name, model, system_prompt, initial_messages) = (
+            prior.agent_name,
+            prior.model,
+            prior.system_prompt,
+            prior.messages,
+        );
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(prior.timeout_secs);
 
         // The inherited prior model is still re-authorized as an explicit exact
         // identity; a stale handle cannot bypass current session policy.
-
-        // ── Build resumed task: new instructions → separator → prior context.
-        let resumed_task = format!(
-            "{instructions}\n\n\
-             ---\n\
-             [Prior conversation context from handle {prior_handle_id}]\n\
-             {prior_context}"
-        );
-
-        // Restore the original system prompt and timeout from the prior handle
-        let system_prompt = prior_system_prompt;
-        let timeout_secs = prior_timeout;
         let label = agent_name.clone();
-        let task_preview: String = resumed_task.chars().take(80).collect();
-        let task_full = resumed_task.clone();
+        let task_preview: String = instructions.chars().take(80).collect();
+        let task_full = instructions.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
-        let decision = ctx
+        let orchestration = ctx
             .capabilities
             .orchestration
             .as_ref()
-            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
+            .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?;
+        orchestration
+            .reserve_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref())
+            .map_err(|reason| {
+                RuntimeError::Tool(format!("delegation tree budget denied: {reason:?}"))
+            })?;
+        let decision = orchestration
             .resolve_and_authorize(&handle_id, Some(&model))
-            .map_err(|error| RuntimeError::Tool(error.to_string()))?;
+            .map_err(|error| {
+                orchestration
+                    .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
+                RuntimeError::Tool(error.to_string())
+            })?;
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
@@ -152,6 +249,12 @@ impl Tool for SubagentResumeTool {
         );
 
         let state = Arc::new(RwLock::new(SubagentState::new()));
+        state.write().unwrap().archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: label.clone(),
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            timeout_secs,
+        });
 
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -174,6 +277,7 @@ impl Tool for SubagentResumeTool {
         let parent_queue = ctx.capabilities.event_queue.clone();
         let handle_id_inner = handle_id.clone();
         let prior_handle_for_finalizer = prior_handle_id.clone();
+        let child_parent_id = handle_id.clone();
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         let system_prompt_for_handle = system_prompt.clone();
@@ -196,9 +300,12 @@ impl Tool for SubagentResumeTool {
             reg.register_with_cancellation(handle, ctx.capabilities.launch_cancel.as_ref());
         }
 
-        let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
+        let orchestration_for_worker = Arc::clone(orchestration);
+        let parent_for_worker = ctx.capabilities.delegation_parent.clone();
         if let Err(error) = orchestration.mark_starting(&handle_id) {
             orchestration.rollback(&handle_id);
+            orchestration
+                .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
         // ── Spawn subagent thread ──────────────────────────────────────────────
@@ -206,6 +313,7 @@ impl Tool for SubagentResumeTool {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
             let state_for_finalizer = Arc::clone(&state_t);
             let label_for_finalizer = label_inner.clone();
+            let orchestration_for_runtime = Arc::clone(&orchestration_for_worker);
 
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -225,202 +333,65 @@ impl Tool for SubagentResumeTool {
                 let model_a = model_inner.clone();
                 let tx_events_a = tx_events_inner.clone();
                 let task_for_timeout = task_full_a.clone();
-                let task_for_complete = task_full_a.clone();
-                let task_for_stream = task_full_a;
+                let task_for_complete = task_full_a;
 
-                let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
-                    use futures::StreamExt;
+                let outcome: std::result::Result<SubagentResult, String> =
+                    rt.block_on(async move {
+                        // Host-built worker (shared client/creds/token cache, cached
+                        // registry) or the legacy fresh runtime — see `spawn_runtime`.
+                        let mut runtime = match super::spawn_runtime().await {
+                            Ok(r) => r,
+                            Err(_) => return Err("subagent runtime initialization failed".into()),
+                        };
 
-                    // Host-built worker (shared client/creds/token cache, cached
-                    // registry) or the legacy fresh runtime — see `spawn_runtime`.
-                    let mut runtime = match super::spawn_runtime().await {
-                        Ok(r) => r,
-                        Err(_) => return Err("subagent runtime initialization failed".into()),
-                    };
+                        // Apply subagent spawn policy: worker role, 5m cache TTL, worker
+                        // turn budget. Subagents are short-lived one-shots — paying the 1h
+                        // write premium (~2× input price) on them is unrecoverable waste
+                        // (~$0.23 per 10-spawn fan-out). (#110)
+                        super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
+                        runtime.set_system_prompt(super::compose_system_prompt(
+                            system_prompt,
+                            runtime.memory_backend_is_axel(),
+                        ));
+                        runtime.set_model(model_a.clone());
+                        super::apply_codex_worker_reasoning(
+                            &mut runtime,
+                            codex_parent_plan.as_ref(),
+                        );
+                        runtime
+                            .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
+                        runtime.set_delegation_parent(Some(child_parent_id.clone()));
 
-                    // Apply subagent spawn policy: worker role, 5m cache TTL, worker
-                    // turn budget. Subagents are short-lived one-shots — paying the 1h
-                    // write premium (~2× input price) on them is unrecoverable waste
-                    // (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
-                    runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
-                    runtime.set_model(model_a.clone());
-                    super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
+                        let cancel = crate::CancellationToken::new();
+                        let cancel_inner = cancel.clone();
+                        tokio::spawn(async move {
+                            let _ = shutdown_rx.await;
+                            cancel_inner.cancel();
+                        });
 
-                    let cancel = crate::CancellationToken::new();
-                    let cancel_inner = cancel.clone();
-                    tokio::spawn(async move {
-                        let _ = shutdown_rx.await;
-                        cancel_inner.cancel();
-                    });
+                        let cancel_on_timeout = cancel.clone();
+                        let stream = runtime.run_stream_with_messages(
+                                initial_messages,
+                                cancel,
+                                Some(steer_rx),
+                                None,
+                                false,
+                            )
+                            .await;
 
-                    let mut stream = runtime.run_stream_with_messages(
-                        vec![std::sync::Arc::new(serde_json::json!({"role": "user", "content": task_for_stream}))],
-                        cancel,
-                        Some(steer_rx),
-                        None,
-                        false,
-                    ).await;
-
-                    let mut tool_count = 0u32;
-                    let mut response_baseline = (0usize, 0usize, 0u32);
-                    let mut total_input_tokens = 0u64;
-                    let mut total_output_tokens = 0u64;
-                    let mut total_cache_read = 0u64;
-                    let mut total_cache_creation = 0u64;
-                    // TTL split: None only if no turn ever reported one; otherwise summed.
-                    let mut total_cache_5m: Option<u64> = None;
-                    let mut total_cache_1h: Option<u64> = None;
-
-                    let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
-                    tokio::pin!(timeout_fut);
-
-                    loop {
-                        tokio::select! {
-                            event = stream.next() => {
-                                let Some(event) = event else { break };
-                                match event {
-                                    crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
-                                        state_a.write().unwrap().note_progress("💭 thinking...", tool_count);
-                                        if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
-                                                subagent_id,
-                                                agent_name: label_a.clone(),
-                                                status: "💭 thinking...".to_string(),
-                                            }));
-                                        }
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ResponseStart) => {
-                                        let s = state_a.read().unwrap();
-                                        response_baseline = (s.partial_text.len(), s.tool_log.len(), tool_count);
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ResponseReset) => {
-                                        let mut s = state_a.write().unwrap();
-                                        s.partial_text.truncate(response_baseline.0);
-                                        s.tool_log.truncate(response_baseline.1);
-                                        tool_count = response_baseline.2;
-                                        s.tools = tool_count;
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
-                                        state_a.write().unwrap().partial_text.push_str(&text);
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
-                                        tool_count += 1;
-                                        state_a.write().unwrap().note_progress(&format!("⚙ {} (tool #{})", name, tool_count), tool_count);
-                                        if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
-                                                subagent_id,
-                                                agent_name: label_a.clone(),
-                                                status: format!("⚙ {} (tool #{})", name, tool_count),
-                                            }));
-                                        }
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
-                                        let input_str = input.to_string();
-                                        let input_preview: String = input_str.chars().take(200).collect();
-                                        state_a.write().unwrap().tool_log
-                                            .push(format!("[tool_use]: {} — {}", tool_name, input_preview));
-                                        let detail = match tool_name.as_str() {
-                                            "bash" => {
-                                                let cmd = input["command"].as_str().unwrap_or("");
-                                                let preview: String = cmd.chars().take(60).collect();
-                                                format!("$ {}", preview)
-                                            }
-                                            "read"  => format!("reading {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
-                                            "write" => format!("writing {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
-                                            "edit"  => format!("editing {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
-                                            "grep"  => format!("grep /{}/", input["pattern"].as_str().unwrap_or("?").chars().take(30).collect::<String>()),
-                                            "find"  => format!("find {}", input["pattern"].as_str().unwrap_or("?")),
-                                            "ls"    => format!("ls {}", input["path"].as_str().unwrap_or(".").rsplit('/').next().unwrap_or(".")),
-                                            other   => {
-                                                if other.starts_with("ext__") {
-                                                    other.splitn(3, "__").last().unwrap_or(other).to_string()
-                                                } else {
-                                                    other.to_string()
-                                                }
-                                            }
-                                        };
-                                        state_a.write().unwrap().note_progress(&detail, tool_count);
-                                        if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
-                                                subagent_id,
-                                                agent_name: label_a.clone(),
-                                                status: detail,
-                                            }));
-                                        }
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
-                                        let preview: String = result.chars().take(300).collect();
-                                        state_a.write().unwrap().tool_log
-                                            .push(format!("[tool_result]: {}", preview));
-                                    }
-                                    crate::StreamEvent::Session(SessionEvent::Usage {
-                                        input_tokens, output_tokens,
-                                        cache_read_input_tokens, cache_creation_input_tokens,
-                                        cache_creation_5m, cache_creation_1h,
-                                        model: _,
-                                    }) => {
-                                        total_input_tokens    += input_tokens;
-                                        total_output_tokens   += output_tokens;
-                                        total_cache_read      += cache_read_input_tokens;
-                                        total_cache_creation  += cache_creation_input_tokens;
-                                        crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
-                                        crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
-                                    }
-                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(format!("provider request failed [{}]", e.category_label())),
-                                    crate::StreamEvent::Session(SessionEvent::Done) => break,
-                                    _ => {}
-                                }
-                            }
-                            _ = &mut timeout_fut => {
-                                let (partial, log) = {
-                                    let mut s = state_a.write().unwrap();
-                                    s.status = SubagentStatus::TimedOut;
-                                    s.conversation_state = vec![
-                                        serde_json::json!({"role": "user", "content": task_for_timeout.clone()}),
-                                        serde_json::json!({"role": "assistant", "content": &s.partial_text}),
-                                    ];
-                                    (s.partial_text.clone(), s.tool_log.clone())
-                                };
-                                let mut text = format!("[TIMED OUT after {}s — partial results below]\n\n", timeout_secs);
-                                if !log.is_empty() {
-                                    text.push_str(&log.join("\n"));
-                                    text.push('\n');
-                                }
-                                if !partial.is_empty() {
-                                    text.push_str("\n[partial response]:\n");
-                                    text.push_str(&partial);
-                                }
-                                state_a.write().unwrap_or_else(|p| p.into_inner()).partial_text = text.clone();
-                                return Ok(SubagentResult {
-                                    text,
-                                    model: model_a.clone(),
-                                    input_tokens: total_input_tokens,
-                                    output_tokens: total_output_tokens,
-                                    cache_read: total_cache_read,
-                                    cache_creation: total_cache_creation,
-                                    cache_creation_5m: total_cache_5m,
-                                    cache_creation_1h: total_cache_1h,
-                                    tool_count,
-                                timed_out: true,
-                                });
-                            }
+                        super::drive::WorkerDrive {
+                            state: Arc::clone(&state_a),
+                            tx_events: tx_events_a.clone(),
+                            subagent_id,
+                            label: label_a.clone(),
+                            model: model_a.clone(),
+                            timeout_secs,
+                            cancel: cancel_on_timeout,
+                            task: task_for_timeout,
                         }
-                    }
-
-                    Ok(SubagentResult {
-                        text: state_a.write().unwrap().partial_text.clone(),
-                        model: model_a.clone(),
-                        input_tokens: total_input_tokens,
-                        output_tokens: total_output_tokens,
-                        cache_read: total_cache_read,
-                        cache_creation: total_cache_creation,
-                        cache_creation_5m: total_cache_5m,
-                        cache_creation_1h: total_cache_1h,
-                        tool_count,
-                    timed_out: false,
-                    })
-                });
+                        .run(stream)
+                        .await
+                    });
 
                 match outcome {
                     Ok(sa_result) => {
@@ -486,6 +457,8 @@ impl Tool for SubagentResumeTool {
                 start_time,
                 Some(&prior_handle_for_finalizer),
             );
+            orchestration_for_worker
+                .release_delegation(&handle_id_inner, parent_for_worker.as_deref());
         });
 
         // ── Wire thread handle into the already-registered entry ─────────────
@@ -504,6 +477,8 @@ impl Tool for SubagentResumeTool {
                 let _ = handle.collect().await;
             }
             orchestration.rollback(&handle_id);
+            orchestration
+                .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
 
@@ -523,6 +498,166 @@ mod tests {
     use crate::runtime::subagent::{reap_finished_with_ttl, SubagentRegistry};
     use crate::tools::test_helpers::create_tool_context;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    fn finished_handle(
+        id: &str,
+        status: SubagentStatus,
+        archive_path: Option<std::path::PathBuf>,
+    ) -> SubagentHandle {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        {
+            let mut s = state.write().unwrap();
+            s.status = status;
+            s.partial_text = "prior text".into();
+            s.conversation_state = vec![json!({"role": "assistant", "content": "prior text"})];
+            s.finished_at = Some(std::time::Instant::now());
+            s.archive_path = archive_path;
+        }
+        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let (_result_tx, result_rx) = oneshot::channel();
+        SubagentHandle::new(
+            id.into(),
+            1,
+            "live-label".into(),
+            "task".into(),
+            "anthropic/claude-sonnet-4-6".into(),
+            "live system".into(),
+            30,
+            state,
+            Some(steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
+        )
+    }
+
+    fn archive_in(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "archived-label".into(),
+            model: "anthropic/claude-opus-5-5".into(),
+            system_prompt: "archived system".into(),
+            timeout_secs: 3500,
+        };
+        let history: Vec<crate::SharedMessage> = vec![
+            Arc::new(json!({"role": "user", "content": "build the plate"})),
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "render"}}
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "rendered 300 frames"}
+            ]})),
+        ];
+        super::super::archive::write_archive(dir, id, &meta, "timed_out", "report", &history)
+            .unwrap()
+    }
+
+    fn assert_continues_archive(prior: &PriorRun, instructions: &str) {
+        assert_eq!(
+            prior.messages.len(),
+            3,
+            "archived turns replayed, instructions merged"
+        );
+        assert_eq!(prior.messages[0]["content"], "build the plate");
+        let last = &prior.messages[2]["content"];
+        assert_eq!(last[0]["content"], "rendered 300 frames");
+        assert!(last[1]["text"].as_str().unwrap().ends_with(instructions));
+    }
+
+    #[test]
+    fn reaped_worker_resumes_from_its_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = archive_in(dir.path(), "sa_reaped");
+        let registry = Mutex::new(SubagentRegistry::new());
+        {
+            let mut reg = registry.lock().unwrap();
+            let mut h = finished_handle("sa_reaped", SubagentStatus::TimedOut, Some(path));
+            h.mark_collected();
+            reg.register(h);
+            reg.cleanup_finished_with_ttl(Duration::ZERO);
+            assert!(reg.get("sa_reaped").is_none(), "handle reaped");
+        }
+        let prior = prior_run(&registry, "sa_reaped", None, "render pass 3").unwrap();
+        assert_eq!(prior.agent_name, "archived-label");
+        assert_eq!(prior.model, "anthropic/claude-opus-5-5");
+        assert_eq!(prior.system_prompt, "archived system");
+        assert_eq!(prior.timeout_secs, 3500);
+        assert_continues_archive(&prior, "render pass 3");
+    }
+
+    #[test]
+    fn tombstoned_worker_with_archive_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = archive_in(dir.path(), "sa_tomb");
+        let registry = Mutex::new(SubagentRegistry::new());
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(finished_handle(
+                "sa_tomb",
+                SubagentStatus::Failed("x".into()),
+                Some(path),
+            ));
+            reg.release_finished_resources("sa_tomb");
+            assert!(reg.get("sa_tomb").unwrap().is_tombstone());
+        }
+        let prior = prior_run(&registry, "sa_tomb", None, "continue").unwrap();
+        // A live handle's identity wins over the archive's.
+        assert_eq!(prior.agent_name, "live-label");
+        assert_eq!(prior.timeout_secs, 30);
+        assert_continues_archive(&prior, "continue");
+    }
+
+    #[test]
+    fn running_worker_cannot_be_resumed() {
+        let registry = Mutex::new(SubagentRegistry::new());
+        registry
+            .lock()
+            .unwrap()
+            .register(finished_handle("sa_run", SubagentStatus::Running, None));
+        let err = prior_run(&registry, "sa_run", None, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("still running"), "{err}");
+    }
+
+    #[test]
+    fn explicit_archive_ignores_the_registry() {
+        // An archive from an earlier session can share a handle id with a
+        // worker running now; the registry must not be consulted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = archive_in(dir.path(), "sa_3");
+        let registry = Mutex::new(SubagentRegistry::new());
+        registry
+            .lock()
+            .unwrap()
+            .register(finished_handle("sa_3", SubagentStatus::Running, None));
+        let prior = prior_run(&registry, "sa_3", Some(path), "pick up").unwrap();
+        assert_eq!(prior.agent_name, "archived-label");
+        assert_continues_archive(&prior, "pick up");
+    }
+
+    #[test]
+    fn legacy_handle_without_archive_pastes_prior_text() {
+        let registry = Mutex::new(SubagentRegistry::new());
+        registry.lock().unwrap().register(finished_handle(
+            "sa_old",
+            SubagentStatus::Completed,
+            None,
+        ));
+        let prior = prior_run(&registry, "sa_old", None, "next").unwrap();
+        assert_eq!(prior.messages.len(), 1);
+        let text = prior.messages[0]["content"].as_str().unwrap();
+        assert!(text.starts_with("next") && text.contains("prior text"));
+    }
+
+    #[test]
+    fn unknown_handle_without_archive_is_not_found() {
+        let registry = Mutex::new(SubagentRegistry::new());
+        let err = prior_run(&registry, "sa_none", None, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No subagent found"), "{err}");
+    }
 
     #[tokio::test]
     async fn tombstone_resume_reports_expired_context_without_side_effects() {

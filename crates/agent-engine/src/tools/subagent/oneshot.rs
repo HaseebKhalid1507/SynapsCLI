@@ -59,7 +59,7 @@ impl Tool for SubagentTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 300). Increase for long-running tasks."
+                    "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit."
                 }
             },
             "required": ["task"]
@@ -200,7 +200,12 @@ impl Tool for SubagentTool {
                 let mut total_cache_5m: Option<u64> = None;
                 let mut total_cache_1h: Option<u64> = None;
 
-                let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
+                // 0 = no limit (tokio clamps Duration::MAX to its far-future instant).
+                let timeout_fut = tokio::time::sleep(if timeout_secs == 0 {
+                    Duration::MAX
+                } else {
+                    Duration::from_secs(timeout_secs)
+                });
                 tokio::pin!(timeout_fut);
 
                 loop {
