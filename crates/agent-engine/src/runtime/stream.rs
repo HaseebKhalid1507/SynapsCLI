@@ -1780,6 +1780,17 @@ impl StreamMethods {
                         std::collections::HashMap::new();
                     let mut serial_lane: Option<usize> = None;
                     for (model_order, tool_id, tool_name, prepared, lane) in prepared_calls {
+                        // Happens-after: once a serialized (side-effecting) call is queued,
+                        // every later call in model order joins the serial lane behind it.
+                        // Models routinely emit `[bash: make the file, read: the file]` in
+                        // one response; a concurrent read lane raced the write and failed
+                        // with "No such file". Calls before the first serial call keep
+                        // their own lanes, so independent reads still run in parallel.
+                        let lane = if serial_lane.is_some() {
+                            LaneKind::Serial
+                        } else {
+                            lane
+                        };
                         let index = match lane {
                             LaneKind::Concurrent => {
                                 lanes.push(Vec::new());
@@ -3612,6 +3623,100 @@ mod rich_output_tests {
             results[1]["content"],
             Value::String("plain text result".into())
         );
+    }
+
+    /// Side-effecting stub: sleeps, then flips a shared flag (like `bash` writing a file).
+    struct WriterStub(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Tool for WriterStub {
+        fn name(&self) -> &str {
+            "writer_stub"
+        }
+        fn description(&self) -> &str {
+            "writes after a delay"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        // Default effect: NonIdempotent -> serial lane, like bash.
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("written".to_string())
+        }
+    }
+
+    /// Read-only stub: reports whether the writer's effect is visible yet.
+    struct ProbeStub(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Tool for ProbeStub {
+        fn name(&self) -> &str {
+            "probe_stub"
+        }
+        fn description(&self) -> &str {
+            "reads the flag"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            let seen = self.0.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(if seen { "seen" } else { "missing" }.to_string())
+        }
+    }
+
+    fn results_by_id(d: &Driven) -> std::collections::HashMap<String, Value> {
+        tool_result_message(&d.bodies[1])["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["tool_use_id"].as_str().unwrap().to_string(), r["content"].clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_after_write_in_one_batch_sees_the_write() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_w", "writer_stub"), ("toolu_r", "probe_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let r = results_by_id(&d);
+        assert_eq!(r["toolu_w"], Value::String("written".into()));
+        assert_eq!(
+            r["toolu_r"],
+            Value::String("seen".into()),
+            "a read issued after a side-effecting call must run after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_before_write_in_one_batch_is_not_delayed() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_r", "probe_stub"), ("toolu_w", "writer_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let r = results_by_id(&d);
+        assert_eq!(
+            r["toolu_r"],
+            Value::String("missing".into()),
+            "reads before the first write keep their concurrent lane"
+        );
+        assert_eq!(r["toolu_w"], Value::String("written".into()));
     }
 
     #[tokio::test]

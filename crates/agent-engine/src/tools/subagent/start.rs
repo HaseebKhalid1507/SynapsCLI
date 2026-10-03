@@ -7,12 +7,11 @@
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use super::super::{resolve_agent_prompt, Tool, ToolContext, NEXT_SUBAGENT_ID};
 use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
-use crate::{AgentEvent, LlmEvent, Result, RuntimeError, SessionEvent};
+use crate::{AgentEvent, Result, RuntimeError};
 
 pub struct SubagentStartTool;
 
@@ -81,7 +80,7 @@ impl Tool for SubagentStartTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 300). Increase for long-running tasks."
+                    "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped."
                 }
             },
             "required": ["task"]
@@ -164,6 +163,12 @@ impl Tool for SubagentStartTool {
 
         // ── Shared state ───────────────────────────────────────────────────────
         let state = Arc::new(RwLock::new(SubagentState::new()));
+        state.write().unwrap().archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: label.clone(),
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            timeout_secs,
+        });
 
         // ── Channels ───────────────────────────────────────────────────────────
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
@@ -252,197 +257,65 @@ impl Tool for SubagentStartTool {
                 let task_for_timeout = task_full_a.clone();
                 let task_for_complete = task_full_a;
 
-                let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
-                    use futures::StreamExt;
+                let outcome: std::result::Result<SubagentResult, String> =
+                    rt.block_on(async move {
+                        // Host-built worker (shared client/creds/token cache, cached
+                        // registry) or the legacy fresh runtime — see `spawn_runtime`.
+                        let mut runtime = match super::spawn_runtime().await {
+                            Ok(r) => r,
+                            Err(_) => return Err("subagent runtime initialization failed".into()),
+                        };
 
-                    // Host-built worker (shared client/creds/token cache, cached
-                    // registry) or the legacy fresh runtime — see `spawn_runtime`.
-                    let mut runtime = match super::spawn_runtime().await {
-                        Ok(r) => r,
-                        Err(_) => return Err("subagent runtime initialization failed".into()),
-                    };
+                        // Apply subagent spawn policy: worker role, 5m cache TTL, worker
+                        // turn budget. Subagents are short-lived one-shots — paying the 1h
+                        // write premium (~2× input price) on them is unrecoverable waste
+                        // (~$0.23 per 10-spawn fan-out). (#110)
+                        super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
+                        runtime.set_system_prompt(super::compose_system_prompt(
+                            system_prompt,
+                            runtime.memory_backend_is_axel(),
+                        ));
+                        runtime.set_model(model_a.clone());
+                        super::apply_codex_worker_reasoning(
+                            &mut runtime,
+                            codex_parent_plan.as_ref(),
+                        );
+                        runtime
+                            .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
+                        runtime.set_delegation_parent(Some(child_parent_id.clone()));
 
-                    // Apply subagent spawn policy: worker role, 5m cache TTL, worker
-                    // turn budget. Subagents are short-lived one-shots — paying the 1h
-                    // write premium (~2× input price) on them is unrecoverable waste
-                    // (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
-                    runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
-                    runtime.set_model(model_a.clone());
-                    super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
-                    runtime.install_worker_orchestration(Arc::clone(
-                        &orchestration_for_runtime,
-                    ));
-                    runtime.set_delegation_parent(Some(child_parent_id.clone()));
+                        let cancel = crate::CancellationToken::new();
+                        let cancel_inner = cancel.clone();
+                        tokio::spawn(async move {
+                            let _ = shutdown_rx.await;
+                            cancel_inner.cancel();
+                        });
 
-                    let cancel = crate::CancellationToken::new();
-                    let cancel_inner = cancel.clone();
-                    tokio::spawn(async move {
-                        let _ = shutdown_rx.await;
-                        cancel_inner.cancel();
-                    });
+                        let cancel_on_timeout = cancel.clone();
+                        let stream = runtime.run_stream_with_messages(
+                                vec![std::sync::Arc::new(
+                                    serde_json::json!({"role": "user", "content": task}),
+                                )],
+                                cancel,
+                                Some(steer_rx),
+                                None,
+                                false,
+                            )
+                            .await;
 
-                    let mut stream = runtime.run_stream_with_messages(vec![std::sync::Arc::new(serde_json::json!({"role": "user", "content": task}))], cancel, Some(steer_rx), None, false).await;
-
-                    let mut tool_count = 0u32;
-                    let mut response_baseline = (0usize, 0usize, 0u32);
-                    let mut total_input_tokens = 0u64;
-                    let mut total_output_tokens = 0u64;
-                    let mut total_cache_read = 0u64;
-                    let mut total_cache_creation = 0u64;
-                    // TTL split: None only if no turn ever reported one; otherwise summed.
-                    let mut total_cache_5m: Option<u64> = None;
-                    let mut total_cache_1h: Option<u64> = None;
-
-                    let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
-                    tokio::pin!(timeout_fut);
-
-                    loop {
-                        tokio::select! {
-                            event = stream.next() => {
-                                let Some(event) = event else { break };
-                                match event {
-                                    crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
-                                        state_a.write().unwrap().note_progress("💭 thinking...", tool_count);
-                                        if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
-                                                subagent_id,
-                                                agent_name: label_a.clone(),
-                                                status: "💭 thinking...".to_string(),
-                                            }));
-                                        }
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ResponseStart) => {
-                                        let s = state_a.read().unwrap();
-                                        response_baseline = (s.partial_text.len(), s.tool_log.len(), tool_count);
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ResponseReset) => {
-                                        let mut s = state_a.write().unwrap();
-                                        s.partial_text.truncate(response_baseline.0);
-                                        s.tool_log.truncate(response_baseline.1);
-                                        tool_count = response_baseline.2;
-                                        s.tools = tool_count;
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
-                                        state_a.write().unwrap().partial_text.push_str(&text);
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
-                                        tool_count += 1;
-                                        state_a.write().unwrap().note_progress(&format!("⚙ {} (tool #{})", name, tool_count), tool_count);
-                                        if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
-                                                subagent_id,
-                                                agent_name: label_a.clone(),
-                                                status: format!("⚙ {} (tool #{})", name, tool_count),
-                                            }));
-                                        }
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
-                                        let input_str = input.to_string();
-                                        let input_preview: String = input_str.chars().take(200).collect();
-                                        state_a.write().unwrap().tool_log
-                                            .push(format!("[tool_use]: {} — {}", tool_name, input_preview));
-                                        let detail = match tool_name.as_str() {
-                                            "bash" => {
-                                                let cmd = input["command"].as_str().unwrap_or("");
-                                                let preview: String = cmd.chars().take(60).collect();
-                                                format!("$ {}", preview)
-                                            }
-                                            "read"  => format!("reading {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
-                                            "write" => format!("writing {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
-                                            "edit"  => format!("editing {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
-                                            "grep"  => format!("grep /{}/", input["pattern"].as_str().unwrap_or("?").chars().take(30).collect::<String>()),
-                                            "find"  => format!("find {}", input["pattern"].as_str().unwrap_or("?")),
-                                            "ls"    => format!("ls {}", input["path"].as_str().unwrap_or(".").rsplit('/').next().unwrap_or(".")),
-                                            other   => {
-                                                if other.starts_with("ext__") {
-                                                    other.splitn(3, "__").last().unwrap_or(other).to_string()
-                                                } else {
-                                                    other.to_string()
-                                                }
-                                            }
-                                        };
-                                        state_a.write().unwrap().note_progress(&detail, tool_count);
-                                        if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
-                                                subagent_id,
-                                                agent_name: label_a.clone(),
-                                                status: detail,
-                                            }));
-                                        }
-                                    }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
-                                        let preview: String = result.chars().take(300).collect();
-                                        state_a.write().unwrap().tool_log
-                                            .push(format!("[tool_result]: {}", preview));
-                                    }
-                                    crate::StreamEvent::Session(SessionEvent::Usage {
-                                        input_tokens, output_tokens,
-                                        cache_read_input_tokens, cache_creation_input_tokens,
-                                        cache_creation_5m, cache_creation_1h,
-                                        model: _,
-                                    }) => {
-                                        total_input_tokens    += input_tokens;
-                                        total_output_tokens   += output_tokens;
-                                        total_cache_read      += cache_read_input_tokens;
-                                        total_cache_creation  += cache_creation_input_tokens;
-                                        crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
-                                        crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
-                                    }
-                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(format!("provider request failed [{}]", e.category_label())),
-                                    crate::StreamEvent::Session(SessionEvent::Done) => break,
-                                    _ => {}
-                                }
-                            }
-                            _ = &mut timeout_fut => {
-                                let (partial, log) = {
-                                    let mut s = state_a.write().unwrap();
-                                    s.status = SubagentStatus::TimedOut;
-                                    s.conversation_state = vec![
-                                        serde_json::json!({"role": "user", "content": task_for_timeout.clone()}),
-                                        serde_json::json!({"role": "assistant", "content": &s.partial_text}),
-                                    ];
-                                    (s.partial_text.clone(), s.tool_log.clone())
-                                };
-                                let mut text = format!("[TIMED OUT after {}s — partial results below]\n\n", timeout_secs);
-                                if !log.is_empty() {
-                                    text.push_str(&log.join("\n"));
-                                    text.push('\n');
-                                }
-                                if !partial.is_empty() {
-                                    text.push_str("\n[partial response]:\n");
-                                    text.push_str(&partial);
-                                }
-                                state_a.write().unwrap_or_else(|p| p.into_inner()).partial_text = text.clone();
-                                return Ok(SubagentResult {
-                                    text,
-                                    model: model_a.clone(),
-                                    input_tokens: total_input_tokens,
-                                    output_tokens: total_output_tokens,
-                                    cache_read: total_cache_read,
-                                    cache_creation: total_cache_creation,
-                                    cache_creation_5m: total_cache_5m,
-                                    cache_creation_1h: total_cache_1h,
-                                    tool_count,
-                                timed_out: true,
-                                });
-                            }
+                        super::drive::WorkerDrive {
+                            state: Arc::clone(&state_a),
+                            tx_events: tx_events_a.clone(),
+                            subagent_id,
+                            label: label_a.clone(),
+                            model: model_a.clone(),
+                            timeout_secs,
+                            cancel: cancel_on_timeout,
+                            task: task_for_timeout,
                         }
-                    }
-
-                    Ok(SubagentResult {
-                        text: state_a.write().unwrap().partial_text.clone(),
-                        model: model_a.clone(),
-                        input_tokens: total_input_tokens,
-                        output_tokens: total_output_tokens,
-                        cache_read: total_cache_read,
-                        cache_creation: total_cache_creation,
-                        cache_creation_5m: total_cache_5m,
-                        cache_creation_1h: total_cache_1h,
-                        tool_count,
-                    timed_out: false,
-                    })
-                });
+                        .run(stream)
+                        .await
+                    });
 
                 match outcome {
                     Ok(sa_result) => {

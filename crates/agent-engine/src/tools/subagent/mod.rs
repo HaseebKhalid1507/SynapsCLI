@@ -1,7 +1,9 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
+pub(crate) mod archive;
 pub mod authorize_model;
 pub mod collect;
+mod drive;
 pub(crate) mod finalize;
 pub mod models;
 mod oneshot;
