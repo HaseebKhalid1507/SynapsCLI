@@ -742,7 +742,7 @@ fn provider_model_selections(
 
 fn provider_model_tier(provider_key: &str, model_id: &str) -> &'static str {
     match (provider_key, model_id) {
-        ("openai-codex", "gpt-5.6-sol") => "S+",
+        ("openai-codex", "gpt-6.1-sol" | "gpt-5.6-sol") => "S+",
         ("openai-codex", "gpt-5.6-terra" | "gpt-5.5") => "A",
         ("openai-codex", "gpt-5.6-luna") => "B+",
         _ => "",
