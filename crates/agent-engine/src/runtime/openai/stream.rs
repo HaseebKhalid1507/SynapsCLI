@@ -789,6 +789,15 @@ pub(crate) async fn call_codex_stream_with_router(
     let mut account_id = codex_account_id_for(&pinned)?;
 
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
+    // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH). OpenAI runs
+    // the search server-side; nothing executes locally, so the local tool
+    // guard / command-exec gate are not involved. Off unless configured.
+    let mut tools = tools;
+    if let Some(web_search) =
+        codex_web_search_tool(std::env::var(CODEX_WEB_SEARCH_ENV).ok().as_deref())
+    {
+        tools.push(web_search);
+    }
     // Codex already receives the effective system prompt in `instructions`.
     // Do not also prepend it to `input`: that doubles prompt tokens and repeats
     // context/checkpoint guidance. Pass history to the translator unchanged;
@@ -1186,6 +1195,26 @@ const CODEX_MULTI_AGENT_MODE_OPEN: &str = "<multi_agent_mode>";
 const CODEX_MULTI_AGENT_MODE_CLOSE: &str = "</multi_agent_mode>";
 const CODEX_EXPLICIT_REQUEST_ONLY_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
 const CODEX_PROACTIVE_MULTI_AGENT_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
+
+/// Environment switch for the OpenAI-hosted `web_search` tool on Codex
+/// Responses requests.
+pub(crate) const CODEX_WEB_SEARCH_ENV: &str = "SYNAPS_CODEX_WEB_SEARCH";
+
+/// Map the `SYNAPS_CODEX_WEB_SEARCH` value to the hosted tool spec:
+/// - `live` / `on` / `true` / `1` → `{"type":"web_search"}` (live web access)
+/// - `cached` → `{"type":"web_search","external_web_access":false}`
+/// - anything else (unset, `off`, typos) → no hosted tool.
+///
+/// The hosted tool's `web_search_call` output items are not function calls:
+/// the Responses stream parser already ignores them (only `function_call`
+/// items become tool uses), and the model's answer text carries the cited URLs.
+pub(crate) fn codex_web_search_tool(value: Option<&str>) -> Option<Value> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("live" | "on" | "true" | "1" | "yes") => Some(json!({ "type": "web_search" })),
+        Some("cached") => Some(json!({ "type": "web_search", "external_web_access": false })),
+        _ => None,
+    }
+}
 
 fn codex_multi_agent_mode_item(
     plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
@@ -2321,6 +2350,59 @@ mod codex_decoder_tests {
             })
             .collect();
         assert_eq!(texts, vec!["Hello, ", "world!"]);
+    }
+
+    #[test]
+    fn hosted_web_search_items_are_not_tool_uses() {
+        // OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH) streams
+        // `web_search_call` output items. They run server-side, so the decoder
+        // must not surface them as local tool uses — only the answer text and
+        // real function calls come through.
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#,
+            "",
+            r#"data: {"type":"response.web_search_call.searching","output_index":0,"item_id":"ws_1"}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"ram dass puja chat youtube"}}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"get_asset"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"get_asset","arguments":"{}"}}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","output_index":2,"delta":"Found it."}"#,
+            "",
+            r#"data: {"type":"response.output_text.annotation.added","output_index":2,"annotation":{"type":"url_citation","url":"https://www.youtube.com/watch?v=sH-u96rpYSw"}}"#,
+            "",
+        ];
+        let (decoder, text, events) = drive(&lines);
+        assert_eq!(text, "Found it.");
+        assert_eq!(decoder.completed_tools.len(), 1);
+        assert_eq!(decoder.completed_tools[0].function.name, "get_asset");
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUseStart { .. })))
+            .count();
+        assert_eq!(starts, 1, "web_search_call must not emit a ToolUseStart");
+    }
+
+    #[test]
+    fn web_search_env_value_maps_to_hosted_tool() {
+        use super::codex_web_search_tool;
+        assert_eq!(codex_web_search_tool(None), None);
+        assert_eq!(codex_web_search_tool(Some("")), None);
+        assert_eq!(codex_web_search_tool(Some("off")), None);
+        assert_eq!(codex_web_search_tool(Some("bogus")), None);
+        for on in ["live", "LIVE", " on ", "true", "1", "yes"] {
+            assert_eq!(
+                codex_web_search_tool(Some(on)),
+                Some(serde_json::json!({ "type": "web_search" })),
+                "{on:?}"
+            );
+        }
+        assert_eq!(
+            codex_web_search_tool(Some("cached")),
+            Some(serde_json::json!({ "type": "web_search", "external_web_access": false }))
+        );
     }
 
     #[test]
