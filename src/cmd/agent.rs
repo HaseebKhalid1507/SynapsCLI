@@ -327,7 +327,13 @@ pub async fn run(config_path: String, trigger_context: String) {
         let eq = runtime.event_queue().clone();
         let sd = inbox_shutdown.clone();
         tokio::spawn(async move {
-            synaps_cli::events::watch_inbox(inbox_dir, eq, sd).await;
+            synaps_cli::events::watch_inbox_filtered(
+                inbox_dir,
+                eq,
+                sd,
+                synaps_cli::events::not_watcher_notice,
+            )
+            .await;
         })
     };
     // Setup signal handling for graceful shutdown — catch both SIGINT (Ctrl-C)

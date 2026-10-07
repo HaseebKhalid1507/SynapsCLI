@@ -13,7 +13,7 @@ pub mod socket;
 pub mod types;
 
 pub use format::format_event_for_agent;
-pub use ingest::watch_inbox;
+pub use ingest::{not_watcher_notice, watch_inbox, watch_inbox_filtered, InboxFilter};
 pub use queue::EventQueue;
 pub use registry::*;
 pub use types::{Event, EventChannel, EventContent, EventSender, EventSource, Severity};
