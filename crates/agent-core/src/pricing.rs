@@ -4,20 +4,53 @@
 //! consumer share a single source of truth. Update this file — and only this
 //! file — whenever Anthropic changes its pricing.
 //!
-//! Prices are in USD per million tokens (as of 2026-06).
-//! Source: <https://www.anthropic.com/pricing>
+//! Prices are in USD per million tokens.
+//! Source: <https://platform.claude.com/docs/en/about-claude/pricing>
+//! ("Model pricing" and "Feature-specific pricing → Prompt caching").
 //!
-//! | Model   | Input  | Output |
-//! |---------|--------|--------|
-//! | Fable   | $10.00 | $50.00 |
-//! | Opus    | $5.00  | $25.00 |
-//! | Sonnet  | $3.00  | $15.00 |
-//! | Haiku   | $1.00  | $5.00  |
+//! | Model                         | Input  | Output | Cache read |
+//! |-------------------------------|--------|--------|------------|
+//! | Fable 5.1 / Mythos 5.1        | $10.00 | $50.00 | 0.025×     |
+//! | Fable 5 / Mythos 5            | $10.00 | $50.00 | 0.10×      |
+//! | Opus 5.5                      | $4.00  | $20.00 | 0.05×      |
+//! | Opus 4.5 – 5                  | $5.00  | $25.00 | 0.10×      |
+//! | Opus 4 / 4.1 (and Opus 3)     | $15.00 | $75.00 | 0.10×      |
+//! | Sonnet 5.5                    | $2.00  | $10.00 | 0.05×      |
+//! | Sonnet (other)                | $3.00  | $15.00 | 0.10×      |
+//! | Haiku 5.5 (>100k-token tier)  | $0.50  | $2.50  | 0.10×      |
+//! | Haiku 3.5                     | $0.80  | $4.00  | 0.10×      |
+//! | Haiku (other)                 | $1.00  | $5.00  | 0.10×      |
+//!
+//! Haiku 5.5 is tiered by prompt length; the higher (>100k) tier is used —
+//! the conservative choice for a cost display and for spend caps. Models the
+//! table does not list explicitly (e.g. Sonnet 5, whose list price the page
+//! does not state in full) fall back to the family default above.
 //!
 //! Cache pricing (relative to input price):
-//! - Cache reads:       0.10× input price  (prompt-cache hit)
+//! - Cache reads:       0.10× input price, except where the docs list a
+//!   per-model multiplier (see [`cache_read_multiplier`])
 //! - Cache write (5m):  1.25× input price  (5-minute TTL, the default)
 //! - Cache write (1h):  2.00× input price  (1-hour TTL, opt-in via `cache_ttl`)
+
+/// `true` for Claude Opus 4 / 4.1 (and the retired Opus 3), which the docs
+/// list at $15 / $75 — unlike Opus 4.5 and later ($5 / $25 or less).
+/// IDs: `claude-opus-4-0`, `claude-opus-4-20250514`, `claude-opus-4-1`,
+/// `claude-opus-4-1-20250805`, `claude-opus-4`, `claude-3-opus…`.
+fn is_legacy_opus(m: &str) -> bool {
+    if m.contains("3-opus") || m.contains("opus-3") {
+        return true;
+    }
+    let Some(i) = m.find("opus-4") else {
+        return false;
+    };
+    let rest = &m[i + "opus-4".len()..];
+    rest.is_empty()
+        || rest.starts_with("-0")
+        || rest == "-1"
+        || rest.starts_with("-1-")
+        || rest.starts_with("-2")
+        || rest.starts_with('@')
+}
 
 /// Returns `(input_price_per_mtok, output_price_per_mtok)` for the given model
 /// string. Matching is substring-based so it works with full model IDs like
@@ -30,12 +63,34 @@ fn model_prices(model: &str) -> (f64, f64) {
         // InferX publishes DeepSeek V4 Flash at $0/M input and output.
         // Keep this exact ID before generic DeepSeek entries are ever added.
         "inferx/deepseek-v4-flash" | "deepseek-v4-flash" => (0.0, 0.0),
-        m if m.contains("fable") => (10.0, 50.0),
+        m if m.contains("fable") || m.contains("mythos") => (10.0, 50.0),
+        m if m.contains("opus-5-5") => (4.0, 20.0),
+        m if is_legacy_opus(m) => (15.0, 75.0),
         m if m.contains("opus") => (5.0, 25.0),
+        m if m.contains("sonnet-5-5") => (2.0, 10.0),
         m if m.contains("sonnet") => (3.0, 15.0),
+        m if m.contains("haiku-5-5") => (0.5, 2.5),
+        m if m.contains("haiku-3-5") || m.contains("3-5-haiku") => (0.8, 4.0),
         m if m.contains("haiku") => (1.0, 5.0),
         _ => (3.0, 15.0), // default: Sonnet pricing
     }
+}
+
+/// Cache-read price as a multiple of the input price. The docs list 0.025×
+/// for Fable 5.1 / Mythos 5.1 and 0.05× for Opus 5.5 / Sonnet 5.5; every
+/// other model uses the standard 0.1× (also the conservative default for
+/// models this table does not know).
+pub fn cache_read_multiplier(model: &str) -> f64 {
+    match model {
+        m if m.contains("fable-5-1") || m.contains("mythos-5-1") => 0.025,
+        m if m.contains("opus-5-5") || m.contains("sonnet-5-5") => 0.05,
+        _ => 0.1,
+    }
+}
+
+/// `(input, output)` USD per million tokens for `model` (see the table).
+pub fn prices_per_mtok(model: &str) -> (f64, f64) {
+    model_prices(model)
 }
 
 /// Calculate the USD cost of a single model turn (no cache-write TTL split).
@@ -75,7 +130,8 @@ pub fn calculate_cost(
 /// split made first-class.
 ///
 /// Cache pricing relative to input price:
-/// reads 0.10× | 5m write 1.25× | 1h write 2.0×.
+/// reads [`cache_read_multiplier`] (0.10× by default) | 5m write 1.25× |
+/// 1h write 2.0×.
 pub fn calculate_cost_split(
     model: &str,
     input_tokens: u64,
@@ -86,7 +142,7 @@ pub fn calculate_cost_split(
 ) -> f64 {
     let (input_price, output_price) = model_prices(model);
     (input_tokens as f64 / 1_000_000.0) * input_price
-        + (cache_read as f64 / 1_000_000.0) * input_price * 0.1
+        + (cache_read as f64 / 1_000_000.0) * input_price * cache_read_multiplier(model)
         + (cache_write_5m as f64 / 1_000_000.0) * input_price * 1.25
         + (cache_write_1h as f64 / 1_000_000.0) * input_price * 2.0
         + (output_tokens as f64 / 1_000_000.0) * output_price
@@ -218,5 +274,49 @@ mod tests {
     #[test]
     fn zero_usage_is_zero_cost() {
         assert_eq!(calculate_cost("claude-opus-4-5", 0, 0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn opus_4_and_4_1_are_legacy_priced() {
+        for m in [
+            "claude-opus-4-0",
+            "claude-opus-4-20250514",
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-opus-4",
+            "claude-3-opus-20240229",
+        ] {
+            let cost = calculate_cost(m, 1_000_000, 1_000_000, 0, 0);
+            assert!((cost - 90.0).abs() < 1e-9, "{m}: ${cost}");
+        }
+        for m in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+        ] {
+            let cost = calculate_cost(m, 1_000_000, 1_000_000, 0, 0);
+            assert!((cost - 30.0).abs() < 1e-9, "{m}: ${cost}");
+        }
+    }
+
+    #[test]
+    fn documented_cache_read_multipliers() {
+        // Fable 5.1: $10 × 0.025 = $0.25/MTok; Opus 5.5: $4 × 0.05 = $0.20;
+        // Sonnet 5.5: $2 × 0.05 = $0.10; Opus 4.7: $5 × 0.1 = $0.50.
+        for (m, want) in [
+            ("claude-fable-5-1", 0.25),
+            ("claude-mythos-5-1", 0.25),
+            ("claude-opus-5-5", 0.20),
+            ("claude-sonnet-5-5", 0.10),
+            ("claude-opus-4-7", 0.50),
+            ("claude-fable-5", 1.0),
+            ("gpt-99-turbo", 0.30),
+        ] {
+            let cost = calculate_cost(m, 0, 0, 1_000_000, 0);
+            assert!((cost - want).abs() < 1e-9, "{m}: ${cost} != ${want}");
+        }
     }
 }
