@@ -113,6 +113,9 @@ pub struct ReloadSession {
     /// Non-persisted knobs re-`Set` after create (incl. `/system`).
     #[serde(default)]
     pub settings_replay: Vec<SessionSetting>,
+    /// Per-session `/keepwarm` override (task #444), re-applied after create.
+    #[serde(default)]
+    pub cache_keepwarm: Option<String>,
     pub input_owner_kind: Option<crate::session::ClientKind>,
 }
 
@@ -284,8 +287,15 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
     let journal_id = handle.journal_id();
-    let (config, keep_warm, lifecycle, settings_replay, model) = match rec {
-        Some(r) => (r.config, r.keep_warm, r.lifecycle, r.settings_replay, r.model),
+    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model) = match rec {
+        Some(r) => (
+            r.config,
+            r.keep_warm,
+            r.lifecycle,
+            r.settings_replay,
+            r.cache_keepwarm,
+            r.model,
+        ),
         None => (
             SessionConfig {
                 cwd: meta.cwd.clone(),
@@ -296,6 +306,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             false,
             handle.lifecycle(),
             Vec::new(),
+            None,
             handle.view().model.clone(),
         ),
     };
@@ -314,6 +325,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         keep_warm,
         lifecycle,
         settings_replay,
+        cache_keepwarm,
         input_owner_kind: None,
     }
 }
@@ -615,6 +627,15 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 }
                 if s.keep_warm {
                     let _ = h.send(SessionCommand::KeepWarm { on: true }).await;
+                }
+                if let Some(mode) = &s.cache_keepwarm {
+                    let _ = h
+                        .send(SessionCommand::EngineCommand {
+                            id: u64::MAX,
+                            name: "keepwarm".into(),
+                            arg: mode.clone(),
+                        })
+                        .await;
                 }
                 if matches!(s.lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking) {
                     let _ = h.send(SessionCommand::Park).await;

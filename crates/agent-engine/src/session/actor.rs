@@ -327,7 +327,7 @@ pub struct SessionActor {
     pub(crate) keep_warm: bool,
     /// Opt-in prompt-cache keep-warm pings while idle (task #444). Unrelated
     /// to `keep_warm` above, which only stops the session from parking.
-    pub(crate) cache_keepwarm: super::cache_keepwarm::CacheKeepWarm,
+    pub(crate) cache_keepwarm: super::cache_keepwarm::KeepWarmState,
     /// Armed on last-detach-while-idle / idle-while-detached.
     pub(crate) park_deadline: Option<tokio::time::Instant>,
     /// (P11) Armed when the last client detaches while a pending host prompt is
@@ -618,7 +618,7 @@ impl SessionActor {
             event_queue,
             settings_replay: Vec::new(),
             keep_warm,
-            cache_keepwarm: super::cache_keepwarm::CacheKeepWarm::new(config.cache_keepwarm_hours),
+            cache_keepwarm: super::cache_keepwarm::KeepWarmState::new(config.cache_keepwarm),
             park_deadline: None,
             prompt_abandon_deadline: None,
             stream: None,
@@ -809,7 +809,7 @@ impl SessionActor {
     pub(crate) async fn announce_idle(&mut self) {
         self.flush_saves().await;
         self.emit(SessionEventWire::Idle);
-        self.cache_keepwarm_arm();
+        self.cache_keepwarm_on_idle().await;
     }
 
     /// Wall 1 — actor-owned context-head checkpoint persistence.
@@ -881,6 +881,7 @@ impl SessionActor {
                 self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
             ),
             settings_replay: self.settings_replay.clone(),
+            cache_keepwarm: self.cache_keepwarm.override_mode.map(|m| m.to_string()),
             model: view.model.clone(),
             thinking_level: view.thinking_level.clone(),
         }
@@ -930,6 +931,9 @@ impl SessionActor {
             && !self.conv.api_messages.is_empty()
             && self.conv.queued_message.is_none()
             && !self.keep_warm
+            // An active cache keep-warm period defers parking (its cost is
+            // bounded by the ski-rental ledger); when it ends, `rearm_park`.
+            && !self.cache_keepwarm.active()
             && self.config.persist
             && !self.is_parked()
             && self.driver.is_none()
@@ -1750,7 +1754,7 @@ impl SessionActor {
             && self.driver_pending.is_none()
     }
 
-    fn rearm_park(&mut self) {
+    pub(crate) fn rearm_park(&mut self) {
         if self.is_parked() {
             // Eviction deadline is owned by `park()`; the attach path unparks
             // (which rebuilds the runtime and clears the deadline).
@@ -1842,7 +1846,6 @@ impl SessionActor {
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
         self.park_deadline = None;
-        self.cache_keepwarm_disarm("session parked");
         if self.is_parked() {
             if self.attached.is_empty() {
                 tracing::info!(session = %self.id, "parked past the eviction age — leaving the map (journal kept)");
@@ -2088,7 +2091,7 @@ impl SessionActor {
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
-        self.cache_keepwarm_reset("turn started");
+        self.cache_keepwarm_turn_started();
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
@@ -2703,6 +2706,12 @@ impl SessionActor {
                 .as_deref()
                 .unwrap_or(self.runtime.model())
                 .to_string();
+            self.cache_keepwarm_note_usage(
+                *input_tokens,
+                *output_tokens,
+                *cache_read_input_tokens,
+                *cache_creation_input_tokens,
+            );
             self.conv.add_usage(
                 *input_tokens,
                 *output_tokens,
@@ -2811,9 +2820,6 @@ impl SessionActor {
     // ── stream events (stream_handler.rs handle_stream_event + arm tail) ──
 
     async fn on_stream_event(&mut self, event: StreamEvent) {
-        if matches!(event, StreamEvent::Llm(crate::LlmEvent::ResponseStart)) {
-            self.cache_keepwarm_note_request();
-        }
         // A turn cancelled from outside `cancel_turn` (a driver revocation):
         // its terminal events are not a normal end — the turn is finished as
         // interrupted, never through the post-turn machinery below.
@@ -3085,7 +3091,7 @@ impl SessionActor {
     /// queued (`Steered{delivered:false}`), auto-turns see `busy`.
     pub(crate) async fn compact(&mut self, instructions: Option<String>, source: &str) {
         // Compaction replaces the history: the old cached prefix is dead.
-        self.cache_keepwarm_reset("compaction");
+        self.cache_keepwarm_compaction();
         if Self::compact_inline_env() {
             return self.compact_inline(instructions, source).await;
         }
@@ -3180,6 +3186,7 @@ impl SessionActor {
                             self.conv.total_input_tokens = 0;
                             self.conv.total_output_tokens = 0;
                             self.conv.session_cost = 0.0;
+                            self.conv.keepwarm_cost = 0.0;
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
@@ -3426,6 +3433,9 @@ impl SessionActor {
                 "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
                 "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
                 "cost": self.conv.session_cost,
+                // Included in `cost`; labelled separately (task #444).
+                "keepwarm_cost": self.conv.keepwarm_cost,
+                "keepwarm": self.cache_keepwarm_status_json(None),
                 "messages": self.conv.api_messages.len(),
                 "streaming": self.streaming,
                 "auto_turns": self.consecutive_auto_turns,
@@ -3535,6 +3545,7 @@ impl SessionActor {
         let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
+        self.cache_keepwarm_note_attach(kind);
         let snapshot_meta = client.clone();
         self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
@@ -3582,9 +3593,6 @@ impl SessionActor {
         if self.attached.remove(&client).is_none() {
             return;
         }
-        // The last interactive client leaving stops keep-warm: nobody is
-        // coming back to this cache soon enough to be worth paying for.
-        self.cache_keepwarm_recheck();
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
@@ -3705,10 +3713,6 @@ impl SessionActor {
                 return ControlFlow::Continue(());
             }
         }
-        // Anything the user sends stops keep-warm; the next idle re-arms it.
-        if is_input_command(&cmd) {
-            self.cache_keepwarm_disarm("user input");
-        }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {
             let needs_runtime = !matches!(
@@ -3809,7 +3813,15 @@ impl SessionActor {
                 self.engine_command(id, name, arg).await
             }
             SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
-            SessionCommand::Detach { client } => self.detach(client),
+            SessionCommand::Detach { client } => {
+                self.detach(client);
+                // Nobody left to notice a stale period: confirm the prefix
+                // now rather than at the next ping, so a session whose next
+                // request already changed is free to park.
+                if self.attached.is_empty() && self.cache_keepwarm.active() {
+                    self.cache_keepwarm_recheck().await;
+                }
+            }
             SessionCommand::End { reason } => {
                 // `finish` cancels a running turn for this reason; note it
                 // before the revoke below cancels a driver turn first.
@@ -3875,7 +3887,7 @@ impl SessionActor {
     // ── teardown (tui/mod.rs:352-432 + chat.rs shutdown) ─────────────────
 
     async fn finish(&mut self, reason: EndReason) {
-        self.cache_keepwarm_disarm("session ending");
+        self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::SessionEnding);
         self.lifecycle.store(
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
@@ -4095,7 +4107,7 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.schedule.deadline()) => {
+                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()) => {
                     actor.on_cache_keepwarm_due();
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {

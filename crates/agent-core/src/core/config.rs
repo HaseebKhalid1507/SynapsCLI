@@ -475,10 +475,62 @@ impl AuthConfig {
     }
 }
 
-/// Upper bound for `cache_keepwarm_hours`. Every hour of keep-warm on an
-/// abandoned session costs roughly one cache read of the whole prefix, so the
-/// cap is deliberately short of "forever".
-pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 24;
+/// Upper bound for the `<N>h` form of `cache_keepwarm`. The ski-rental bound
+/// already caps an abandoned session's spend at about one prefix rewrite; the
+/// hour cap is an extra, user-chosen wall on top of it.
+pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
+
+/// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
+/// docs/specs/cache-ttl-spec.md §7.
+///
+/// - `Off` (default): never ping.
+/// - `Auto`: ping while the measured ping spend of the current idle period
+///   stays below the cost of the cache rewrite it prevents (ski-rental rule:
+///   at most 2× the optimal spend, at most ~one rewrite on an abandoned
+///   session).
+/// - `Hours(n)`: the same bound, and additionally stop `n` hours after the
+///   session went idle — whichever comes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheKeepWarm {
+    #[default]
+    Off,
+    Auto,
+    Hours(u32),
+}
+
+impl CacheKeepWarm {
+    /// Parse `off` | `auto` | `<N>h` (case-insensitive; `0h` = off).
+    /// `None` for anything else, including hours above
+    /// [`MAX_CACHE_KEEPWARM_HOURS`].
+    pub fn parse(val: &str) -> Option<CacheKeepWarm> {
+        let v = val.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "off" | "false" | "no" | "0" => return Some(CacheKeepWarm::Off),
+            "auto" | "on" => return Some(CacheKeepWarm::Auto),
+            _ => {}
+        }
+        let digits = v.strip_suffix('h')?;
+        match digits.parse::<u32>().ok()? {
+            0 => Some(CacheKeepWarm::Off),
+            h if h <= MAX_CACHE_KEEPWARM_HOURS => Some(CacheKeepWarm::Hours(h)),
+            _ => None,
+        }
+    }
+
+    pub fn is_off(self) -> bool {
+        self == CacheKeepWarm::Off
+    }
+}
+
+impl std::fmt::Display for CacheKeepWarm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheKeepWarm::Off => f.write_str("off"),
+            CacheKeepWarm::Auto => f.write_str("auto"),
+            CacheKeepWarm::Hours(h) => write!(f, "{h}h"),
+        }
+    }
+}
 
 /// Prompt-cache TTL strategy for Anthropic requests.
 ///
@@ -920,12 +972,10 @@ pub struct SynapsConfig {
     pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
-    /// Opt-in prompt-cache keep-warm (`cache_keepwarm_hours`): how many hours
-    /// after an interactive session goes idle the session actor keeps its
-    /// cached prefix alive with cheap cache-read pings. `0` (default) = off.
-    /// Only honored with `cache_ttl = 1h`; capped at
-    /// [`MAX_CACHE_KEEPWARM_HOURS`]. See docs/specs/cache-ttl-spec.md §7.
-    pub cache_keepwarm_hours: u32,
+    /// Prompt-cache keep-warm while idle (`cache_keepwarm`): `off` (default)
+    /// | `auto` | `<N>h`. See [`CacheKeepWarm`] and
+    /// docs/specs/cache-ttl-spec.md §7.
+    pub cache_keepwarm: CacheKeepWarm,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
@@ -1019,7 +1069,7 @@ impl Default for SynapsConfig {
             telemetry: "off".to_string(),
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
-            cache_keepwarm_hours: 0,
+            cache_keepwarm: CacheKeepWarm::Off,
             max_fps: 60,
             scroll_lines: None,
             theme: None,
@@ -1080,7 +1130,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "telemetry",
     "cache_diagnostics",
     "cache_ttl",
-    "cache_keepwarm_hours",
+    "cache_keepwarm",
     "max_fps",
     "scroll_lines",
     "theme",
@@ -1476,16 +1526,10 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
                 )),
             },
-            "cache_keepwarm_hours" => match val.parse::<u32>() {
-                Ok(h) if h <= MAX_CACHE_KEEPWARM_HOURS => config.cache_keepwarm_hours = h,
-                Ok(_) => {
-                    config.cache_keepwarm_hours = MAX_CACHE_KEEPWARM_HOURS;
-                    config.warnings.push(format!(
-                        "cache_keepwarm_hours = {val} — capped at {MAX_CACHE_KEEPWARM_HOURS}"
-                    ));
-                }
-                Err(_) => config.warnings.push(format!(
-                    "cache_keepwarm_hours = {val} — expected whole hours (0 = off); keep-warm stays off"
+            "cache_keepwarm" => match CacheKeepWarm::parse(val) {
+                Some(mode) => config.cache_keepwarm = mode,
+                None => config.warnings.push(format!(
+                    "cache_keepwarm = {val} — expected off, auto, or 1h–{MAX_CACHE_KEEPWARM_HOURS}h; keep-warm stays off"
                 )),
             },
             "max_fps" => match val.parse::<u32>() {
@@ -2735,28 +2779,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ── cache_keepwarm_hours (task #444) ──
+    // ── cache_keepwarm (task #444) ──
 
     #[test]
     fn test_cache_keepwarm_is_off_by_default() {
-        assert_eq!(SynapsConfig::default().cache_keepwarm_hours, 0);
-        assert_eq!(load_config_from_str("").cache_keepwarm_hours, 0);
+        assert_eq!(SynapsConfig::default().cache_keepwarm, CacheKeepWarm::Off);
+        assert_eq!(load_config_from_str("").cache_keepwarm, CacheKeepWarm::Off);
     }
 
     #[test]
-    fn test_cache_keepwarm_hours_parse_cap_and_garbage() {
-        let c = load_config_from_str("cache_keepwarm_hours = 4\ncache_ttl = 1h\n");
-        assert_eq!(c.cache_keepwarm_hours, 4);
-        assert_eq!(c.cache_ttl, CacheTtl::OneHour);
+    fn test_cache_keepwarm_parse_table() {
+        for (raw, want) in [
+            ("off", Some(CacheKeepWarm::Off)),
+            ("OFF", Some(CacheKeepWarm::Off)),
+            ("0h", Some(CacheKeepWarm::Off)),
+            ("auto", Some(CacheKeepWarm::Auto)),
+            (" Auto ", Some(CacheKeepWarm::Auto)),
+            ("1h", Some(CacheKeepWarm::Hours(1))),
+            ("12H", Some(CacheKeepWarm::Hours(12))),
+            ("48h", Some(CacheKeepWarm::Hours(MAX_CACHE_KEEPWARM_HOURS))),
+            ("49h", None),
+            ("12", None),
+            ("h", None),
+            ("-1h", None),
+            ("lots", None),
+        ] {
+            assert_eq!(CacheKeepWarm::parse(raw), want, "{raw:?}");
+        }
+        for mode in [CacheKeepWarm::Off, CacheKeepWarm::Auto, CacheKeepWarm::Hours(6)] {
+            assert_eq!(CacheKeepWarm::parse(&mode.to_string()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_cache_keepwarm_config_key() {
+        let c = load_config_from_str("cache_keepwarm = auto\ncache_ttl = 5m\n");
+        assert_eq!(c.cache_keepwarm, CacheKeepWarm::Auto);
+        assert_eq!(c.cache_ttl, CacheTtl::FiveMinutes);
         assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
 
-        let c = load_config_from_str("cache_keepwarm_hours = 500\n");
-        assert_eq!(c.cache_keepwarm_hours, MAX_CACHE_KEEPWARM_HOURS);
-        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_hours")));
+        let c = load_config_from_str("cache_keepwarm = 6h\n");
+        assert_eq!(c.cache_keepwarm, CacheKeepWarm::Hours(6));
 
-        let c = load_config_from_str("cache_keepwarm_hours = lots\n");
-        assert_eq!(c.cache_keepwarm_hours, 0, "garbage keeps keep-warm off");
-        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_hours")));
+        let c = load_config_from_str("cache_keepwarm = forever\n");
+        assert_eq!(c.cache_keepwarm, CacheKeepWarm::Off, "garbage keeps keep-warm off");
+        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm")));
     }
 
     // ── cache_ttl parse table (spec §3.1) ──

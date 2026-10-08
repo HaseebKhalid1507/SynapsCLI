@@ -878,21 +878,40 @@ pub struct ApiOptions {
     /// reads them for the optional token/cost budget dimensions. `None`
     /// (default, non-stream callers) records nothing.
     pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// "Last accepted Anthropic request" slot (task #444). Stamped with the
+    /// send time of every attempt that gets a 2xx — the moment the prefix's
+    /// cache entries were written or refreshed. `None` (default) records
+    /// nothing; the foreground turn stream and keep-warm pings set it.
+    pub cache_anchor: Option<std::sync::Arc<super::keepwarm::CacheAnchorCell>>,
     /// Prompt-cache keep-warm ping (task #444). `None` on every real turn,
     /// which keeps turn requests byte-identical to the pre-feature release.
     /// When set (native Anthropic transport only — any other route fails
     /// closed before a request is built): the conversational cache marker is
     /// stamped on the LAST HISTORY message and the trailing ping message
-    /// rides after it unmarked, `max_tokens` is capped, every retry budget is
-    /// zero, and the telemetry record carries `"keepwarm": true`.
+    /// rides after it unmarked, `max_tokens` is cut to the thinking mode's
+    /// minimum, the prefix is fingerprinted (and checked, see
+    /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
+    /// record carries `"keepwarm": true`.
     pub keepwarm: Option<KeepWarmRequest>,
 }
 
-/// Wire knobs for a keep-warm ping (see [`ApiOptions::keepwarm`]).
+/// What a keep-warm request does once its body is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepWarmMode {
+    /// Return `{"keepwarm_prefix": <fingerprint>}`; send nothing.
+    Probe,
+    /// Send only if the built prefix still hashes to `expect`; otherwise
+    /// return `{"keepwarm_prefix": <actual>}` without sending.
+    Send { expect: u64 },
+}
+
+/// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
+#[derive(Debug, Clone)]
 pub struct KeepWarmRequest {
-    /// Hard cap on billed output (thinking + text) for the ping.
-    pub max_tokens: u64,
+    pub mode: KeepWarmMode,
+    /// Last HTTP status the transport saw (0 = none), so the caller can tell
+    /// a 4xx (stop) from a 5xx/429 (bounded retry).
+    pub status: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1231,7 +1250,7 @@ impl ApiMethods {
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
-        match options.keepwarm {
+        match &options.keepwarm {
             // Keep-warm: the marker goes on the last HISTORY message — the
             // durable prefix the next real turn re-sends verbatim — and the
             // trailing ping message (never persisted) rides after it as an
@@ -1268,11 +1287,19 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
-        // `max_tokens` is not part of the prompt-cache key (only tools,
-        // system, messages, thinking config and effort are), so capping it
-        // bounds the ping's output bill without touching the cached prefix.
-        if let Some(keepwarm) = options.keepwarm {
-            body.cap_max_tokens(keepwarm.max_tokens);
+        // Keep-warm: cut the output cap (not part of the cache key), then
+        // fingerprint the prefix exactly as it would go on the wire. A probe —
+        // or a ping whose prefix no longer matches what is cached — returns
+        // here, before any trace, telemetry or network I/O.
+        if let Some(keepwarm) = &options.keepwarm {
+            body.apply_keepwarm_max_tokens();
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            let actual = body
+                .prefix_fingerprint(cleaned_messages.len().saturating_sub(1), beta.as_deref());
+            let send = matches!(keepwarm.mode, KeepWarmMode::Send { expect } if expect == actual);
+            if !send {
+                return Ok(serde_json::json!({ "keepwarm_prefix": actual }));
+            }
         }
         let translation_report = parts.report;
 
@@ -1405,11 +1432,23 @@ impl ApiMethods {
                         return Err(RuntimeError::Canceled);
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
+                    let sent_at = super::keepwarm::CacheAnchor::now();
                     match await_or_cancel(cancel, req.body(body_bytes.clone()).send()).await? {
                         Ok(resp) => {
                             let status = resp.status();
+                            if let Some(keepwarm) = &options.keepwarm {
+                                keepwarm
+                                    .status
+                                    .store(status.as_u16(), std::sync::atomic::Ordering::Relaxed);
+                            }
                             if status.is_success() {
                                 clock.mark_headers();
+                                // Accepted: the prefix's cache entries were
+                                // read or written by a request that started
+                                // no earlier than `sent_at`.
+                                if let Some(anchor) = &options.cache_anchor {
+                                    anchor.stamp(sent_at);
+                                }
                                 response = Some(resp);
                                 break;
                             }

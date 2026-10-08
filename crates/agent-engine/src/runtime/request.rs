@@ -130,11 +130,75 @@ impl<'a> RequestBody<'a> {
         }
     }
 
-    /// Lower `max_tokens` to at most `cap` (prompt-cache keep-warm pings,
-    /// task #444). `max_tokens` is not part of the cache key, so the cached
-    /// prefix is unaffected; real turns never call this.
-    pub(super) fn cap_max_tokens(&mut self, cap: u64) {
-        self.max_tokens = self.max_tokens.min(cap.max(1));
+    /// Output cap for a prompt-cache keep-warm ping (task #444; real turns
+    /// never call this). `max_tokens` is not part of the cache key, so the
+    /// cached prefix is unaffected:
+    /// - thinking off / adaptive: [`KEEPWARM_OUTPUT_TOKENS`] — adaptive
+    ///   thinking has no `max_tokens` floor (the API even accepts 0), so the
+    ///   cap bounds thinking + text together;
+    /// - budgeted thinking (`type: "enabled"`): the API requires
+    ///   `max_tokens > budget_tokens`, and the budget IS part of the cache
+    ///   key, so the ping keeps the budget and gets `budget + 1`. What is
+    ///   billed is the thinking actually produced for a trivial prompt; the
+    ///   session ledger measures it.
+    ///
+    /// Never raises `max_tokens` above what the real turn would send.
+    ///
+    /// [`KEEPWARM_OUTPUT_TOKENS`]: super::keepwarm::KEEPWARM_OUTPUT_TOKENS
+    pub(super) fn apply_keepwarm_max_tokens(&mut self) {
+        let budget = self
+            .thinking
+            .as_ref()
+            .filter(|t| t["type"] == "enabled")
+            .and_then(|t| t["budget_tokens"].as_u64());
+        let cap = match budget {
+            Some(b) => b + super::keepwarm::KEEPWARM_OUTPUT_TOKENS,
+            None => super::keepwarm::KEEPWARM_OUTPUT_TOKENS,
+        };
+        self.max_tokens = self.max_tokens.min(cap);
+    }
+
+    /// FNV-1a 64 over the serialized cache-key prefix of this request:
+    /// model, `output_config` (effort), `system`, `thinking`, `tools` and the
+    /// first `history_len` messages exactly as they go on the wire (cache
+    /// markers included), plus the `anthropic-beta` header (`beta`: 1M
+    /// context and the like select the serving configuration). `max_tokens`
+    /// and `stream` are excluded: neither is rendered into the prompt. Two
+    /// requests with equal fingerprints send byte-identical prefixes through
+    /// the last history breakpoint.
+    pub(super) fn prefix_fingerprint(&self, history_len: usize, beta: Option<&str>) -> u64 {
+        struct Fnv(u64);
+        impl std::io::Write for Fnv {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                for b in buf {
+                    self.0 ^= u64::from(*b);
+                    self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        let sep = |h: &mut Fnv| {
+            let _ = std::io::Write::write_all(h, &[0x1f]);
+        };
+        let _ = serde_json::to_writer(&mut h, self.model);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.output_config);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.system);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.thinking);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.tools);
+        sep(&mut h);
+        let n = history_len.min(self.messages.len());
+        let _ = serde_json::to_writer(&mut h, &self.messages[..n]);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &beta);
+        h.0
     }
 
     /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.

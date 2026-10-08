@@ -562,6 +562,26 @@
     "related": ["/help"]
   },
   {
+    "id": "keepwarm-command",
+    "command": "/keepwarm",
+    "title": "Prompt-cache keep-warm",
+    "summary": "Show or override idle prompt-cache keep-warm for this session: off, auto, or <N>h.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["keepwarm", "keep-warm", "cache", "ttl", "prompt cache", "idle", "cost"],
+    "lines": [
+      "/keepwarm (or /keepwarm status) shows the mode, the active idle period (next ping, spend vs. bound, whether the cached prefix is unchanged) and this session's keep-warm spend.",
+      "/keepwarm auto keeps the prompt cache warm while idle until the pings would cost more than the rewrite they prevent: about 20 pings over ~18h with cache_ttl = 1h, about 12 over ~55 min with 5m or hybrid.",
+      "/keepwarm 6h applies the same bound and also stops 6 hours after the session went idle. /keepwarm off stops it for this session.",
+      "Pings stop by themselves when the next request would differ (/model, /thinking, /system, tool activation, /compact, /clear); read-only commands do not affect them. A new message ends the idle period.",
+      "Keep-warm spend is part of the session cost and labelled separately in the footer and /stats. The default comes from cache_keepwarm in config (off unless set)."
+    ],
+    "related": ["/stats", "/context"]
+  },
+  {
     "id": "budget-command",
     "command": "/budget",
     "title": "Turn time budget",

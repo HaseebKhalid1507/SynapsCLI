@@ -565,6 +565,9 @@ pub struct SessionReloadRecord {
     pub lifecycle: SessionLifecycle,
     #[serde(default)]
     pub settings_replay: Vec<SessionSetting>,
+    /// Per-session `/keepwarm` override (`off`/`auto`/`<N>h`), if any.
+    #[serde(default)]
+    pub cache_keepwarm: Option<String>,
     pub model: String,
     pub thinking_level: String,
 }
@@ -970,6 +973,9 @@ pub struct ConversationSnapshot {
     pub messages_len: usize,
     pub tokens: ConversationTokens,
     pub cost: f64,
+    /// Prompt-cache keep-warm spend, already included in `cost` (task #444).
+    #[serde(default)]
+    pub keepwarm_cost: f64,
     /// Legacy (protocol v3 shape kept): always `None` — an interrupted turn
     /// is recorded in `api_messages` (`engine::interrupt`), never as a recap.
     pub abort_context: Option<String>,

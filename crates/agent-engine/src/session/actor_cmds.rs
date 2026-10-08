@@ -95,6 +95,13 @@ impl SessionActor {
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
+        // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
+        // keep-warm state (task #444).
+        if cmd == "keepwarm" {
+            let value = self.cache_keepwarm_command(&arg).await;
+            self.emit(SessionEventWire::QueryResult { id, value });
+            return;
+        }
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
         if view_changed {

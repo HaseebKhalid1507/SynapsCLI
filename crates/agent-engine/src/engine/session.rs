@@ -90,6 +90,10 @@ pub struct ConversationState {
     pub total_cache_read_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub session_cost: f64,
+    /// Prompt-cache keep-warm spend (task #444), already INCLUDED in
+    /// `session_cost` and shown separately. Live-session only: the total is
+    /// persisted with `session_cost`, this label is not.
+    pub keepwarm_cost: f64,
     /// Message queued to send after current stream completes.
     pub queued_message: Option<String>,
     /// Events buffered during streaming — drained on stream completion.
@@ -108,6 +112,7 @@ impl ConversationState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             session_cost: 0.0,
+            keepwarm_cost: 0.0,
             queued_message: None,
             pending_events: Vec::new(),
         }
@@ -129,6 +134,7 @@ impl ConversationState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             session_cost: session.session_cost,
+            keepwarm_cost: 0.0,
             queued_message: None,
             pending_events: Vec::new(),
             session,
@@ -210,6 +216,7 @@ impl ConversationState {
         self.total_cache_read_tokens = 0;
         self.total_cache_creation_tokens = 0;
         self.session_cost = 0.0;
+        self.keepwarm_cost = 0.0;
         self.queued_message = None;
         self.pending_events.clear();
         self.session = Session::new(
@@ -238,6 +245,7 @@ impl ConversationState {
                 cache_creation: self.total_cache_creation_tokens,
             },
             cost: self.session_cost,
+            keepwarm_cost: self.keepwarm_cost,
             // Wire-compat field (protocol v3); always `None` now.
             abort_context: None,
             queued_message: self.queued_message.clone(),

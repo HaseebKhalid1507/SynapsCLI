@@ -1,11 +1,13 @@
 //! Prompt-cache keep-warm ping (task #444).
 //!
-//! A cache READ refreshes an Anthropic prompt-cache entry's TTL, so re-sending
-//! the session's exact prefix shortly before the 1h TTL lapses keeps a
-//! 300k–1M token prefix warm at 0.1× input price instead of paying a 2×
-//! rewrite when the user comes back. The *scheduling* lives in the session
-//! actor (`session::cache_keepwarm`); this module only builds and sends one
-//! ping.
+//! Anthropic refreshes a cache entry's TTL every time it is read ("hits and
+//! refreshes" are billed at the cache-read rate), and the lifetime counts from
+//! the START of the request that read or wrote it. Re-sending the session's
+//! exact prefix shortly before the TTL lapses keeps a large prefix warm at the
+//! read price instead of paying a full rewrite when the user comes back. The
+//! *policy* (when to ping, when to stop, what it costs) lives in the session
+//! actor (`session::cache_keepwarm`); this module builds, fingerprints and
+//! sends one ping.
 //!
 //! The ping is the request the NEXT real turn would send, minus the parts that
 //! are per-turn by construction, and goes through the SAME request builder
@@ -20,43 +22,90 @@
 //!   conversational marker onto the last history message), so it never enters
 //!   the cached prefix and is never persisted;
 //! - no memory recall, no `before_message` / Inject hooks, no steering, no
-//!   context-pressure message: those only ever touch the request tail and
-//!   would add per-turn bytes;
+//!   context-pressure message: those only ever touch the request tail;
 //! - no `MessageHistory`, no turn, no transcript: events go to a private
 //!   channel and only the `Usage` numbers come back;
-//! - `max_tokens` is capped at [`KEEPWARM_MAX_TOKENS`] (not part of the cache
-//!   key), retries are zero, and the telemetry record says `"keepwarm": true`.
+//! - `max_tokens` is cut to the minimum the thinking mode allows
+//!   (`RequestBody::apply_keepwarm_max_tokens`; not part of the cache key),
+//!   retries are zero, and the telemetry record says `"keepwarm": true`.
 //!
-//! Thinking: the thinking configuration and effort ARE part of the cache key,
-//! so the ping must carry them unchanged. With adaptive thinking (or thinking
-//! off) `max_tokens` is a hard cap on thinking + text, so the ping's output is
-//! bounded by [`KEEPWARM_MAX_TOKENS`]. With legacy budgeted thinking Anthropic
-//! requires `max_tokens > budget_tokens`, so a ping could bill up to the whole
-//! budget (2k–32k output tokens at 5× input price); keep-warm refuses those
-//! configurations instead of silently spending (see
-//! [`Runtime::cache_keepwarm_ineligibility`]).
+//! **Prefix fingerprint.** A ping is only correct while the next real turn's
+//! prefix is byte-identical to what is cached; on a changed prefix it would
+//! WRITE a new entry instead of reading the old one. The builder hashes the
+//! serialized prefix (`RequestBody::prefix_fingerprint`) of every keep-warm
+//! request. [`Runtime::cache_keepwarm_probe`] returns that hash without
+//! sending anything; [`Runtime::cache_keepwarm_ping`] takes the expected hash
+//! and refuses to send — inside the builder, after assembly, right before the
+//! network — when the freshly built prefix differs.
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::api::{ApiMethods, ApiOptions, KeepWarmRequest};
+use super::api::{ApiMethods, ApiOptions, KeepWarmMode, KeepWarmRequest};
 use super::helpers::HelperMethods;
 use super::{Runtime, SessionEvent, StreamEvent};
-use crate::core::config::CacheTtl;
 use crate::{Result, RuntimeError, SharedMessage};
 
-/// Output cap for one ping. Covers thinking + text on adaptive models. At
-/// Opus pricing ($25/MTok output) this is $0.0004 per ping.
-pub const KEEPWARM_MAX_TOKENS: u64 = 16;
+/// Output tokens a ping may produce on top of a thinking budget (or in total
+/// with thinking off / adaptive). One token: the answer is discarded.
+pub const KEEPWARM_OUTPUT_TOKENS: u64 = 1;
 
 /// The trailing user message. Sits after the last cache marker, is never
-/// persisted, and asks for the shortest possible answer so adaptive thinking
-/// has no reason to engage before the output cap cuts it off.
-pub const KEEPWARM_PING_TEXT: &str =
-    "[automated prompt-cache keep-warm ping — not from the user] Reply with only: ok";
+/// persisted, and asks for the shortest possible answer with no reasoning so
+/// budgeted thinking spends as little of its budget as the model allows.
+pub const KEEPWARM_PING_TEXT: &str = "[automated prompt-cache keep-warm ping, not from the user] \
+     This needs no reasoning. Reply with exactly: ok";
+
+/// When this session's runtime last had an Anthropic request accepted
+/// (HTTP 2xx): the moment its cache entries were last written or refreshed.
+/// Taken immediately BEFORE the bytes are handed to the HTTP client, so it is
+/// never later than the provider's own request start (the TTL origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheAnchor {
+    /// Monotonic clock: scheduling.
+    pub mono: tokio::time::Instant,
+    /// Wall clock: the provider's TTL keeps running while this machine
+    /// sleeps; the monotonic clock does not.
+    pub wall: std::time::SystemTime,
+}
+
+impl CacheAnchor {
+    pub fn now() -> Self {
+        Self {
+            mono: tokio::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+}
+
+/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]).
+/// Runtime clones get a FRESH cell (a clone is a different request chain,
+/// like the TTL latches); `share_ttl_latches` shares it.
+#[derive(Debug, Default)]
+pub struct CacheAnchorCell(std::sync::Mutex<Option<CacheAnchor>>);
+
+impl CacheAnchorCell {
+    pub fn stamp(&self, at: CacheAnchor) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.map_or(true, |prev| prev.mono <= at.mono) {
+            *slot = Some(at);
+        }
+    }
+
+    pub fn get(&self) -> Option<CacheAnchor> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// Token usage of one ping, as reported by the provider.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -72,7 +121,7 @@ pub struct KeepWarmUsage {
 }
 
 impl KeepWarmUsage {
-    fn add(&mut self, event: &StreamEvent) {
+    pub(crate) fn add(&mut self, event: &StreamEvent) {
         if let StreamEvent::Session(SessionEvent::Usage {
             input_tokens,
             output_tokens,
@@ -99,7 +148,8 @@ impl KeepWarmUsage {
         }
     }
 
-    /// USD cost of the ping, priced exactly like a turn's usage.
+    /// USD cost of the ping (cache read + any cache write + uncached input +
+    /// output incl. thinking), priced exactly like a turn's usage.
     pub fn cost_usd(&self, fallback_model: &str) -> f64 {
         crate::pricing::calculate_cost_optional_split(
             self.model.as_deref().unwrap_or(fallback_model),
@@ -110,6 +160,58 @@ impl KeepWarmUsage {
             self.cache_write_5m,
             self.cache_write_1h,
         )
+    }
+}
+
+/// What a ping did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PingOutcome {
+    /// Sent; the provider's usage for it.
+    Sent(KeepWarmUsage),
+    /// Not sent: the freshly built prefix no longer matches the expected
+    /// fingerprint (model, thinking, tools, system or history changed).
+    PrefixChanged { expected: u64, actual: u64 },
+}
+
+/// Why a ping failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingFailure {
+    /// Worth a bounded retry: 429/5xx/529, network, in-stream transient.
+    Transient(String),
+    /// Stop: any other 4xx, auth, configuration, ineligible session.
+    Fatal(String),
+    /// Aborted by the actor (a turn started, the session is ending).
+    Canceled,
+}
+
+impl std::fmt::Display for PingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PingFailure::Transient(m) => write!(f, "transient: {m}"),
+            PingFailure::Fatal(m) => write!(f, "{m}"),
+            PingFailure::Canceled => f.write_str("canceled"),
+        }
+    }
+}
+
+/// Classify a ping error. `status` is the last HTTP status the transport saw
+/// (0 = none: network failure before any response).
+pub(crate) fn classify_failure(err: &RuntimeError, status: u16) -> PingFailure {
+    if matches!(err, RuntimeError::Canceled) {
+        return PingFailure::Canceled;
+    }
+    if (400..500).contains(&status) && status != 429 {
+        return PingFailure::Fatal(format!("HTTP {status}"));
+    }
+    match err {
+        RuntimeError::Api(_) | RuntimeError::ApiStatus(_) | RuntimeError::Timeout => {
+            PingFailure::Transient(if status == 0 {
+                "network".to_string()
+            } else {
+                format!("HTTP {status}")
+            })
+        }
+        other => PingFailure::Fatal(other.to_string()),
     }
 }
 
@@ -129,14 +231,15 @@ fn tail_is_markable(last: &Value) -> bool {
 }
 
 /// Whether `history` can be kept warm: it must end with a finished assistant
-/// reply (a turn that errored mid-way leaves nothing worth pinging).
+/// reply (a turn that errored or was interrupted leaves nothing worth pinging).
 pub fn history_ready(history: &[SharedMessage]) -> bool {
     history.last().is_some_and(|m| tail_is_markable(m))
 }
 
 impl Runtime {
-    /// Why this runtime cannot keep its cache warm cheaply, or `None` when it
-    /// can. Checked by the session actor before arming and again by the ping.
+    /// Why this runtime cannot keep its cache warm, or `None` when it can.
+    /// Only the native Anthropic transport carries `cache_control`; every
+    /// TTL (5m, 1h, hybrid) and every thinking mode is supported.
     pub fn cache_keepwarm_ineligibility(&self) -> Option<String> {
         if !super::auth::model_is_anthropic(&self.model) {
             return Some(format!(
@@ -144,51 +247,65 @@ impl Runtime {
                 self.model
             ));
         }
-        match self.cache_ttl {
-            CacheTtl::OneHour => {}
-            CacheTtl::FiveMinutes => {
-                return Some(
-                    "cache_ttl = 5m: a ping every <5 min would cost more than it saves; \
-                     keep-warm needs cache_ttl = 1h"
-                        .into(),
-                )
-            }
-            CacheTtl::Hybrid => {
-                return Some(
-                    "cache_ttl = hybrid: the conversation history is cached with the 5m TTL \
-                     and cannot be kept warm hourly; keep-warm needs cache_ttl = 1h"
-                        .into(),
-                )
-            }
-        }
-        let bare = self.model.strip_prefix("anthropic/").unwrap_or(&self.model);
-        if self.reasoning_level() != agent_core::reasoning::ReasoningLevel::Off
-            && !crate::core::models::model_supports_adaptive_thinking(bare)
-        {
-            let budget = if self.thinking_budget == 0 {
-                crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
-            } else {
-                self.thinking_budget
-            };
-            return Some(format!(
-                "{bare} uses budgeted thinking (budget_tokens = {budget}); the API requires \
-                 max_tokens > budget_tokens and the budget is part of the cache key, so a ping \
-                 could bill up to {budget} output tokens. Keep-warm only runs with thinking \
-                 off or on adaptive-thinking models"
-            ));
-        }
         None
     }
 
+    /// The last accepted Anthropic request of this runtime's request chain.
+    pub fn cache_anchor(&self) -> Option<CacheAnchor> {
+        self.cache_anchor.get()
+    }
+
+    /// Fingerprint of the prefix the next real turn would send for
+    /// `history` (see the module docs). Builds the request through the real
+    /// builder and returns before anything is sent; no network I/O.
+    pub async fn cache_keepwarm_probe(&self, history: &[SharedMessage]) -> Result<u64> {
+        let cancel = CancellationToken::new();
+        let (value, _) = self
+            .keepwarm_request(history, &cancel, KeepWarmMode::Probe, Arc::default())
+            .await?;
+        value["keepwarm_prefix"]
+            .as_u64()
+            .ok_or_else(|| RuntimeError::Session("keep-warm probe produced no fingerprint".into()))
+    }
+
     /// Send ONE keep-warm ping for `history` (the session's durable history,
-    /// unchanged). Never mutates `history`, the runtime's session state, or
-    /// any persisted state; fires no extension hooks; emits nothing to any
-    /// frontend. Returns the provider-reported usage.
+    /// unchanged) if its freshly built prefix still hashes to `expect`.
+    /// Never mutates `history`, the runtime's session state, or any persisted
+    /// state; fires no extension hooks; emits nothing to any frontend.
     pub async fn cache_keepwarm_ping(
         &self,
         history: &[SharedMessage],
+        expect: u64,
         cancel: &CancellationToken,
-    ) -> Result<KeepWarmUsage> {
+    ) -> std::result::Result<PingOutcome, PingFailure> {
+        let status = Arc::new(AtomicU16::new(0));
+        match self
+            .keepwarm_request(
+                history,
+                cancel,
+                KeepWarmMode::Send { expect },
+                Arc::clone(&status),
+            )
+            .await
+        {
+            Ok((value, usage)) => match value.get("keepwarm_prefix").and_then(Value::as_u64) {
+                Some(actual) => Ok(PingOutcome::PrefixChanged {
+                    expected: expect,
+                    actual,
+                }),
+                None => Ok(PingOutcome::Sent(usage)),
+            },
+            Err(e) => Err(classify_failure(&e, status.load(Ordering::Relaxed))),
+        }
+    }
+
+    async fn keepwarm_request(
+        &self,
+        history: &[SharedMessage],
+        cancel: &CancellationToken,
+        mode: KeepWarmMode,
+        status: Arc<AtomicU16>,
+    ) -> Result<(Value, KeepWarmUsage)> {
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
             return Err(RuntimeError::Config(format!(
                 "cache keep-warm skipped: {reason}"
@@ -213,10 +330,13 @@ impl Runtime {
             ));
         }
 
-        // Same preflight as a real turn (run_stream_tracked).
+        // Same preflight as a real turn (run_stream_tracked). A probe sends
+        // nothing, so it never needs a token refresh.
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
-        self.refresh_if_needed().await?;
+        if matches!(mode, KeepWarmMode::Send { .. }) {
+            self.refresh_if_needed().await?;
+        }
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
         let system_prompt = self.effective_system_prompt().await;
@@ -324,9 +444,10 @@ impl Runtime {
             request_tools_schema,
             anthropic_tool_split,
             usage_counters: None,
-            keepwarm: Some(KeepWarmRequest {
-                max_tokens: KEEPWARM_MAX_TOKENS,
-            }),
+            // A successful ping refreshes the cache: it moves the anchor the
+            // next ping is scheduled from.
+            cache_anchor: Some(Arc::clone(&self.cache_anchor)),
+            keepwarm: Some(KeepWarmRequest { mode, status }),
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -351,20 +472,20 @@ impl Runtime {
         while let Ok(event) = rx.try_recv() {
             usage.add(&event);
         }
-        result?;
-        Ok(usage)
+        Ok((result?, usage))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::CacheTtl;
     use crate::extensions::hooks::events::{HookEvent, HookKind, HookResult};
     use crate::extensions::permissions::{Permission, PermissionSet};
     use agent_core::reasoning::ReasoningLevel;
     use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
     use futures::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     const SSE_HI: &str = concat!(
@@ -383,24 +504,43 @@ mod tests {
         "data: {\"type\":\"message_stop\"}\n\n",
     );
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Mock {
         bodies: Arc<Mutex<Vec<String>>>,
+        /// HTTP status served (200 = the SSE body above).
+        status: u16,
     }
 
     async fn spawn_mock() -> (String, Mock) {
-        let mock = Mock::default();
+        spawn_mock_with(200).await
+    }
+
+    async fn spawn_mock_with(status: u16) -> (String, Mock) {
+        let mock = Mock {
+            bodies: Arc::default(),
+            status,
+        };
         let app = Router::new()
             .route(
                 "/v1/messages",
                 post(|State(m): State<Mock>, body: String| async move {
                     m.bodies.lock().unwrap().push(body);
-                    (
-                        StatusCode::OK,
-                        [("content-type", "text/event-stream")],
-                        SSE_HI.to_string(),
-                    )
-                        .into_response()
+                    if m.status == 200 {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            SSE_HI.to_string(),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::from_u16(m.status).unwrap(),
+                            [("content-type", "application/json")],
+                            r#"{"type":"error","error":{"type":"api_error","message":"synthetic"}}"#
+                                .to_string(),
+                        )
+                            .into_response()
+                    }
                 }),
             )
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -479,11 +619,15 @@ mod tests {
         real: Value,
         raw_ping: String,
         history_len: usize,
+        usage: KeepWarmUsage,
         /// `before_message` calls before the ping, after it, after the next turn.
         hook_calls: (usize, usize, usize),
     }
 
-    /// Previous turn → keep-warm ping → the real next turn, on one runtime.
+    /// Previous turn → probe → keep-warm ping → the real next turn, on one
+    /// runtime. Also proves: the probe sends nothing and its fingerprint is
+    /// the one the ping accepts; the ping does not touch history; accepted
+    /// requests move the cache anchor.
     async fn ping_then_next_turn(rt: &Runtime) -> Observed {
         let (url, mock) = spawn_mock().await;
         let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -501,19 +645,44 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(rt.cache_anchor(), None, "no request has run yet");
         // The previous turn: the session is idle afterwards.
         let history = real_turn(rt, vec![user("hello")]).await;
         assert_eq!(history.last().unwrap()["role"], "assistant");
+        let turn_anchor = rt
+            .cache_anchor()
+            .expect("an accepted turn request stamps the anchor");
         let before_ping = calls.load(Ordering::SeqCst);
         let snapshot = history.clone();
 
-        let usage = rt
-            .cache_keepwarm_ping(&history, &CancellationToken::new())
+        let fingerprint = rt.cache_keepwarm_probe(&history).await.expect("probe");
+        assert_eq!(
+            mock.bodies.lock().unwrap().len(),
+            1,
+            "a probe sends nothing"
+        );
+        assert_eq!(
+            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            fingerprint,
+            "the fingerprint is deterministic"
+        );
+
+        let usage = match rt
+            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new())
             .await
-            .expect("ping succeeds");
+            .expect("ping succeeds")
+        {
+            PingOutcome::Sent(usage) => usage,
+            other => panic!("expected a sent ping, got {other:?}"),
+        };
         assert!(
             usage.output_tokens >= 1,
             "usage comes back from the private channel"
+        );
+        let ping_anchor = rt.cache_anchor().expect("anchor");
+        assert!(
+            ping_anchor.mono >= turn_anchor.mono,
+            "the ping moved the anchor"
         );
         let after_ping = calls.load(Ordering::SeqCst);
         assert_eq!(history, snapshot, "the ping must not mutate history");
@@ -531,11 +700,18 @@ mod tests {
             real: serde_json::from_str(&bodies[2]).unwrap(),
             raw_ping: bodies[1].clone(),
             history_len: history.len(),
+            usage,
             hook_calls: (before_ping, after_ping, after_next),
         }
     }
 
-    fn assert_prefix_identical(ping: &Value, real: &Value, n: usize) {
+    fn assert_prefix_identical(
+        ping: &Value,
+        real: &Value,
+        n: usize,
+        history_marker: &Value,
+        ping_max_tokens: u64,
+    ) {
         // Everything the cache key covers besides messages.
         for key in [
             "model",
@@ -559,10 +735,11 @@ mod tests {
         for i in 0..n - 1 {
             assert_eq!(canon(&pm[i]), canon(&rm[i]), "message {i} differs");
         }
-        // The last history message: identical except the ping's marker.
+        // The last history message: identical except the ping's marker,
+        // which carries the history TTL (the governing one).
         let last = &pm[n - 1];
         let marker = &last["content"].as_array().unwrap().last().unwrap()["cache_control"];
-        assert_eq!(*marker, json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(marker, history_marker);
         assert_eq!(
             canon(&strip_cache_control(last.clone())),
             canon(&rm[n - 1]),
@@ -572,29 +749,42 @@ mod tests {
         assert_eq!(marker_count(&pm[n]), 0, "ping message must be unmarked");
         assert_eq!(pm[n]["role"], "user");
         assert_eq!(pm[n]["content"], KEEPWARM_PING_TEXT);
-        // Output is capped; the real turn keeps its own max_tokens.
-        assert_eq!(ping["max_tokens"], json!(KEEPWARM_MAX_TOKENS));
-        assert_ne!(real["max_tokens"], json!(KEEPWARM_MAX_TOKENS));
+        // Output is cut; the real turn keeps its own max_tokens.
+        assert_eq!(ping["max_tokens"], json!(ping_max_tokens));
+        assert!(real["max_tokens"].as_u64().unwrap() > ping_max_tokens);
         assert!(
             marker_count(ping) <= 4,
             "Anthropic allows at most 4 breakpoints"
         );
     }
 
-    /// Adaptive thinking (Opus 4.7): the ping carries the same thinking and
-    /// effort config, its prefix through the last marker matches the real
-    /// next turn, and no hook ran for it.
-    #[tokio::test]
-    #[serial_test::serial(synaps_base_dir)]
-    async fn ping_prefix_matches_next_turn_with_adaptive_thinking() {
-        let _base = crate::test_env::BaseDirGuard::new();
+    fn marker_1h() -> Value {
+        json!({"type": "ephemeral", "ttl": "1h"})
+    }
+
+    fn marker_5m() -> Value {
+        json!({"type": "ephemeral"})
+    }
+
+    fn opus(ttl: CacheTtl) -> Runtime {
         let mut rt = Runtime::new_headless();
         rt.set_model("claude-opus-4-7".to_string());
         assert_eq!(rt.model(), "claude-opus-4-7");
         rt.set_reasoning_level_explicit(ReasoningLevel::High);
-        rt.set_cache_ttl(CacheTtl::OneHour);
+        rt.set_cache_ttl(ttl);
         rt.set_system_prompt("You are a keep-warm test.".into());
         assert_eq!(rt.cache_keepwarm_ineligibility(), None);
+        rt
+    }
+
+    /// Adaptive thinking (Opus 4.7), 1h TTL: same thinking + effort, prefix
+    /// through the last marker matches the real next turn, no hook ran for
+    /// the ping, output capped at one token.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_adaptive_thinking() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let rt = opus(CacheTtl::OneHour);
 
         let o = ping_then_next_turn(&rt).await;
         assert!(
@@ -602,7 +792,7 @@ mod tests {
             "thinking must stay on: {}",
             o.ping
         );
-        assert_prefix_identical(&o.ping, &o.real, o.history_len);
+        assert_prefix_identical(&o.ping, &o.real, o.history_len, &marker_1h(), 1);
 
         // Hooks: live for real turns, never for the ping.
         let (before, after_ping, after_next) = o.hook_calls;
@@ -621,7 +811,33 @@ mod tests {
         assert!(canon(&o.real).contains("PER-TURN-INJECTED-CONTEXT"));
     }
 
-    /// Thinking off on a budgeted-thinking model is eligible and matches too.
+    /// 5m TTL is first-class: same identity, bare ephemeral marker.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_5m_ttl() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let rt = opus(CacheTtl::FiveMinutes);
+        let o = ping_then_next_turn(&rt).await;
+        assert_prefix_identical(&o.ping, &o.real, o.history_len, &marker_5m(), 1);
+    }
+
+    /// Hybrid: the history marker is the 5m one (it governs the interval);
+    /// tools/system keep their 1h markers byte-identically.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_hybrid_ttl() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let rt = opus(CacheTtl::Hybrid);
+        let o = ping_then_next_turn(&rt).await;
+        assert_prefix_identical(&o.ping, &o.real, o.history_len, &marker_5m(), 1);
+        assert!(
+            canon(&o.ping["system"]).contains("\"ttl\":\"1h\""),
+            "hybrid keeps the 1h stable-prefix marker: {}",
+            o.ping["system"]
+        );
+    }
+
+    /// Thinking off on a budgeted-thinking model.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn ping_prefix_matches_next_turn_with_thinking_off() {
@@ -634,60 +850,252 @@ mod tests {
 
         let o = ping_then_next_turn(&rt).await;
         assert!(o.ping.get("thinking").is_none(), "thinking off is omitted");
-        assert_prefix_identical(&o.ping, &o.real, o.history_len);
+        assert_prefix_identical(&o.ping, &o.real, o.history_len, &marker_1h(), 1);
     }
 
-    #[test]
-    fn five_minute_and_hybrid_ttl_are_ineligible() {
-        let mut rt = Runtime::new_headless();
-        rt.set_model("claude-opus-4-7".to_string());
-        assert_eq!(rt.cache_ttl(), CacheTtl::FiveMinutes, "default TTL");
-        let reason = rt.cache_keepwarm_ineligibility().expect("5m is ineligible");
-        assert!(reason.contains("cache_ttl = 5m"), "{reason}");
-        rt.set_cache_ttl(CacheTtl::Hybrid);
-        let reason = rt
-            .cache_keepwarm_ineligibility()
-            .expect("hybrid is ineligible");
-        assert!(reason.contains("hybrid"), "{reason}");
-        rt.set_cache_ttl(CacheTtl::OneHour);
-        assert_eq!(rt.cache_keepwarm_ineligibility(), None);
-    }
-
-    #[test]
-    fn budgeted_thinking_is_ineligible_with_numbers() {
+    /// Budgeted thinking (Sonnet 4.6, `type: enabled`) is SUPPORTED: the
+    /// budget is part of the cache key and stays; `max_tokens` (not part of
+    /// the key) is `budget + 1`, the API's minimum; the ping is costed from
+    /// its measured usage. Under 5m TTL here.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn budgeted_thinking_ping_keeps_budget_and_is_costed() {
+        let _base = crate::test_env::BaseDirGuard::new();
         let mut rt = Runtime::new_headless();
         rt.set_model("claude-sonnet-4-6".to_string());
-        rt.set_cache_ttl(CacheTtl::OneHour);
         rt.set_reasoning_level_explicit(ReasoningLevel::High);
-        let reason = rt
-            .cache_keepwarm_ineligibility()
-            .expect("budgeted thinking cannot be capped");
-        assert!(reason.contains("budget_tokens = 16384"), "{reason}");
+        rt.set_cache_ttl(CacheTtl::FiveMinutes);
+        assert_eq!(
+            rt.cache_keepwarm_ineligibility(),
+            None,
+            "budgeted thinking is eligible"
+        );
+
+        let o = ping_then_next_turn(&rt).await;
+        assert_eq!(o.ping["thinking"]["type"], "enabled", "{}", o.ping);
+        let budget = o.ping["thinking"]["budget_tokens"]
+            .as_u64()
+            .expect("budget");
+        assert_eq!(canon(&o.ping["thinking"]), canon(&o.real["thinking"]));
+        assert_prefix_identical(
+            &o.ping,
+            &o.real,
+            o.history_len,
+            &marker_5m(),
+            budget + KEEPWARM_OUTPUT_TOKENS,
+        );
+        assert!(
+            o.usage.cost_usd("claude-sonnet-4-6") > 0.0,
+            "the ping is costed"
+        );
+    }
+
+    /// A changed prefix is never sent: model, thinking level, system prompt
+    /// and history changes all flip the fingerprint, the ping reports
+    /// `PrefixChanged`, and the provider sees no request.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn changed_prefix_is_refused_before_the_network() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::FiveMinutes);
+        let history = real_turn(&rt, vec![user("hello")]).await;
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap();
+        let sent = mock.bodies.lock().unwrap().len();
+
+        // History grew (e.g. a compaction / /clear / a new turn).
+        let mut longer = history.clone();
+        longer.push(user("more"));
+        longer.push(Arc::new(
+            json!({"role": "assistant", "content": [{"type": "text", "text": "x"}]}),
+        ));
+        let changed = |o: std::result::Result<PingOutcome, PingFailure>| {
+            matches!(o, Ok(PingOutcome::PrefixChanged { .. }))
+        };
+        assert!(changed(
+            rt.cache_keepwarm_ping(&longer, fp, &CancellationToken::new())
+                .await
+        ));
+
+        rt.set_system_prompt("A different system prompt.".into());
+        assert_ne!(rt.cache_keepwarm_probe(&history).await.unwrap(), fp);
+        assert!(changed(
+            rt.cache_keepwarm_ping(&history, fp, &CancellationToken::new())
+                .await
+        ));
+        rt.set_system_prompt("You are a keep-warm test.".into());
+        assert_eq!(
+            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            fp,
+            "restored"
+        );
+
+        rt.set_reasoning_level_explicit(ReasoningLevel::Low);
+        assert_ne!(
+            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            fp,
+            "effort is in the key"
+        );
+        rt.set_reasoning_level_explicit(ReasoningLevel::High);
+
+        rt.set_model("claude-opus-4-6".to_string());
+        assert_eq!(rt.model(), "claude-opus-4-6");
+        assert_ne!(
+            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            fp,
+            "model is in the key"
+        );
+
+        assert_eq!(
+            mock.bodies.lock().unwrap().len(),
+            sent,
+            "no refused ping reached the provider"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn http_4xx_is_fatal_and_5xx_is_transient() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        for (status, fatal) in [(400u16, true), (404, true), (500, false), (429, false)] {
+            let (url, mock) = spawn_mock_with(status).await;
+            let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+            let rt = opus(CacheTtl::FiveMinutes);
+            let fp = rt.cache_keepwarm_probe(&history).await.unwrap();
+            let err = rt
+                .cache_keepwarm_ping(&history, fp, &CancellationToken::new())
+                .await
+                .expect_err("non-2xx fails");
+            assert_eq!(
+                matches!(err, PingFailure::Fatal(_)),
+                fatal,
+                "HTTP {status}: {err:?}"
+            );
+            assert_eq!(
+                mock.bodies.lock().unwrap().len(),
+                1,
+                "HTTP {status}: no retry"
+            );
+            assert_eq!(
+                rt.cache_anchor(),
+                None,
+                "a rejected request refreshes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_classification() {
+        let api = || RuntimeError::ApiStatus("x".into());
+        assert_eq!(
+            classify_failure(&RuntimeError::Canceled, 0),
+            PingFailure::Canceled
+        );
+        assert!(matches!(
+            classify_failure(&api(), 400),
+            PingFailure::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_failure(&api(), 401),
+            PingFailure::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_failure(&api(), 429),
+            PingFailure::Transient(_)
+        ));
+        assert!(matches!(
+            classify_failure(&api(), 529),
+            PingFailure::Transient(_)
+        ));
+        assert!(matches!(
+            classify_failure(&api(), 0),
+            PingFailure::Transient(_)
+        ));
+        // An in-stream error under a 200 is transient.
+        assert!(matches!(
+            classify_failure(&api(), 200),
+            PingFailure::Transient(_)
+        ));
+        assert!(matches!(
+            classify_failure(&RuntimeError::Config("x".into()), 0),
+            PingFailure::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn every_ttl_and_thinking_mode_is_eligible() {
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
+            for (model, level) in [
+                ("claude-opus-4-7", ReasoningLevel::High),
+                ("claude-sonnet-4-6", ReasoningLevel::High),
+                ("claude-sonnet-4-6", ReasoningLevel::Off),
+            ] {
+                let mut rt = Runtime::new_headless();
+                rt.set_model(model.to_string());
+                rt.set_reasoning_level_explicit(level);
+                rt.set_cache_ttl(ttl);
+                assert_eq!(
+                    rt.cache_keepwarm_ineligibility(),
+                    None,
+                    "{model} {level:?} {ttl:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn non_anthropic_models_are_ineligible() {
         let mut rt = Runtime::new_headless();
-        rt.set_cache_ttl(CacheTtl::OneHour);
         rt.set_model("groq/llama-3.3-70b-versatile".to_string());
         if rt.model() == "groq/llama-3.3-70b-versatile" {
             assert!(rt.cache_keepwarm_ineligibility().is_some());
         }
     }
 
-    /// An ineligible ping fails closed before any network I/O.
+    /// An ineligible ping (non-Anthropic model) fails closed, fatally, before
+    /// any network I/O.
     #[tokio::test]
     async fn ineligible_ping_sends_nothing() {
-        let rt = Runtime::new_headless(); // 5m TTL
+        let mut rt = Runtime::new_headless();
+        rt.set_model("groq/llama-3.3-70b-versatile".to_string());
+        if rt.model() != "groq/llama-3.3-70b-versatile" {
+            return;
+        }
         let history = vec![
             user("hello"),
             Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
         ];
         let err = rt
-            .cache_keepwarm_ping(&history, &CancellationToken::new())
+            .cache_keepwarm_ping(&history, 0, &CancellationToken::new())
             .await
-            .expect_err("5m TTL must refuse");
-        assert!(err.to_string().contains("keep-warm skipped"), "{err}");
+            .expect_err("non-Anthropic must refuse");
+        assert!(
+            matches!(err, PingFailure::Fatal(ref m) if m.contains("keep-warm skipped")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_cell_only_moves_forward() {
+        let cell = CacheAnchorCell::default();
+        assert_eq!(cell.get(), None);
+        let a = CacheAnchor::now();
+        let later = CacheAnchor {
+            mono: a.mono + std::time::Duration::from_secs(5),
+            wall: a.wall + std::time::Duration::from_secs(5),
+        };
+        cell.stamp(later);
+        cell.stamp(a);
+        assert_eq!(
+            cell.get(),
+            Some(later),
+            "a late-arriving older stamp never rewinds"
+        );
     }
 
     #[test]
