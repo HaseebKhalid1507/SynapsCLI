@@ -149,6 +149,9 @@ pub(crate) struct App {
     /// Prompt-cache keep-warm spend, already included in `session_cost`
     /// (mirrors `ConversationSnapshot::keepwarm_cost`).
     pub(crate) keepwarm_cost: f64,
+    /// Keep-warm ping tokens, already included in the `total_*` counters
+    /// (mirrors `ConversationSnapshot::keepwarm_tokens`).
+    pub(crate) keepwarm_tokens: agent_engine::session::ConversationTokens,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
     pub(crate) needs_redraw: bool,
@@ -407,6 +410,7 @@ impl App {
             api_call_count: 0,
             session_cost: 0.0,
             keepwarm_cost: 0.0,
+            keepwarm_tokens: Default::default(),
             session,
             agent_name: boot_config
                 .agent_name
@@ -596,6 +600,7 @@ impl App {
         self.total_cache_creation_tokens = conv.tokens.cache_creation;
         self.session_cost = conv.cost;
         self.keepwarm_cost = conv.keepwarm_cost;
+        self.keepwarm_tokens = conv.keepwarm_tokens.clone();
         self.queued_message = conv.queued_message.clone();
         self.pending_events_len = conv.pending_events_len;
         self.consecutive_auto_turns = conv.consecutive_auto_turns;

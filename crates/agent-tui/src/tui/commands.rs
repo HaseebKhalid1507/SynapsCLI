@@ -1331,6 +1331,18 @@ pub(crate) fn build_stats_receipt(
     } else {
         lines.push(format!("    cache write  {:>10}", fmt_tokens(c_write)));
     }
+    // Keep-warm pings are inside the totals above (and the hit rate below);
+    // their share is shown so the numbers add up.
+    let kw = &app.keepwarm_tokens;
+    if kw.cache_read + kw.cache_creation + kw.input + kw.output > 0 {
+        lines.push(format!(
+            "    incl. keep-warm  read {} / write {} / input {} / output {}",
+            fmt_tokens(kw.cache_read),
+            fmt_tokens(kw.cache_creation),
+            fmt_tokens(kw.input),
+            fmt_tokens(kw.output)
+        ));
+    }
 
     lines.push(String::new());
     lines.push(format!(
@@ -2362,10 +2374,22 @@ mod tests {
         let mut app = crate::tui::app::App::new(session);
         app.session_cost = 1.25;
         app.keepwarm_cost = 0.18;
+        app.total_cache_read_tokens = 400_000;
+        app.keepwarm_tokens = agent_engine::session::ConversationTokens {
+            input: 80,
+            output: 2,
+            cache_read: 300_000,
+            cache_creation: 0,
+        };
         let runtime = synaps_cli::Runtime::new_headless();
         let receipt = build_stats_receipt(&app, &runtime);
         assert!(receipt.contains("Cost   $1.2500"), "{receipt}");
         assert!(receipt.contains("incl. cache keep-warm $0.1800"), "{receipt}");
+        assert!(receipt.contains("400.0K"), "the total includes pings: {receipt}");
+        assert!(
+            receipt.contains("incl. keep-warm  read 300.0K / write 0 / input 80 / output 2"),
+            "{receipt}"
+        );
     }
 }
 

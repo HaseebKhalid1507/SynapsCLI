@@ -521,6 +521,7 @@ pub(super) async fn handle_session_event_arm(
             app.total_cache_creation_tokens = 0;
             app.session_cost = 0.0;
             app.keepwarm_cost = 0.0;
+            app.keepwarm_tokens = Default::default();
             app.input_tokens = 0;
             app.output_tokens = 0;
             app.push_msg(ChatMessage::System("new session started".to_string()));

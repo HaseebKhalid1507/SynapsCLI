@@ -318,8 +318,6 @@ use super::markdown::format_tokens;
 use super::theme::THEME;
 use super::view_model::{RenderPatch, ViewInputs};
 
-/// Generate a bash execution trace animation string and its pulsing color.
-/// Returns (trace_string, Color) for use in Span styling.
 /// Footer cost segment: the session total, with the prompt-cache keep-warm
 /// share labelled when there is one (`$1.2345 (kw $0.0800) `).
 pub(crate) fn footer_cost(session_cost: f64, keepwarm_cost: f64) -> String {
@@ -332,6 +330,8 @@ pub(crate) fn footer_cost(session_cost: f64, keepwarm_cost: f64) -> String {
     }
 }
 
+/// Generate a bash execution trace animation string and its pulsing color.
+/// Returns (trace_string, Color) for use in Span styling.
 pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
     const CHARS: [char; 8] = [' ', '░', '▒', '▓', '█', '▓', '▒', '░'];
     const WIDTH: usize = 14;
