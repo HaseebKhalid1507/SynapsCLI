@@ -3198,8 +3198,13 @@ impl SessionActor {
                             self.conv.total_input_tokens = 0;
                             self.conv.total_output_tokens = 0;
                             self.conv.session_cost = 0.0;
+                            // The keep-warm subtotal follows the totals it
+                            // is part of: input/output/cost restart, the
+                            // cache totals (not reset here) keep their
+                            // keep-warm share.
                             self.conv.keepwarm_cost = 0.0;
-                            self.conv.keepwarm_tokens = Default::default();
+                            self.conv.keepwarm_tokens.input = 0;
+                            self.conv.keepwarm_tokens.output = 0;
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));

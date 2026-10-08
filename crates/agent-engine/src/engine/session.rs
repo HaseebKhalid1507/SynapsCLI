@@ -103,6 +103,33 @@ pub struct ConversationState {
     pub pending_events: Vec<String>,
 }
 
+/// The keep-warm token subtotal as persisted in the snapshot
+/// (`Session::keepwarm_tokens`, snapshot-only — never journaled).
+fn persisted_keepwarm_tokens(
+    t: &crate::session::ConversationTokens,
+) -> agent_core::core::session::KeepwarmTokens {
+    agent_core::core::session::KeepwarmTokens {
+        input: t.input,
+        output: t.output,
+        cache_read: t.cache_read,
+        cache_creation: t.cache_creation,
+    }
+}
+
+/// The keep-warm subtotal a resumed conversation starts with: each bucket
+/// clamped under the total it is part of. Input/output totals persist with
+/// the session; the cache totals do not (they restart at 0), so neither do
+/// the keep-warm cache buckets — `/stats` must still add up.
+fn resumed_keepwarm_tokens(session: &Session) -> crate::session::ConversationTokens {
+    let kw = session.keepwarm_tokens;
+    crate::session::ConversationTokens {
+        input: kw.input.min(session.total_input_tokens),
+        output: kw.output.min(session.total_output_tokens),
+        cache_read: 0,
+        cache_creation: 0,
+    }
+}
+
 impl ConversationState {
     /// Create a new conversation with a fresh session.
     pub fn new(session: Session) -> Self {
@@ -138,8 +165,8 @@ impl ConversationState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             session_cost: session.session_cost,
-            keepwarm_cost: session.keepwarm_cost,
-            keepwarm_tokens: Default::default(),
+            keepwarm_cost: session.keepwarm_cost.min(session.session_cost).max(0.0),
+            keepwarm_tokens: resumed_keepwarm_tokens(&session),
             queued_message: None,
             pending_events: Vec::new(),
             session,
@@ -178,6 +205,7 @@ impl ConversationState {
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
         self.session.keepwarm_cost = self.keepwarm_cost;
+        self.session.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
         // Legacy field: an interrupted turn now lives in `api_messages`
         // (`engine::interrupt`); never write a recap back.
         self.session.abort_context = None;
@@ -200,6 +228,7 @@ impl ConversationState {
         candidate.total_output_tokens = self.total_output_tokens;
         candidate.session_cost = self.session_cost;
         candidate.keepwarm_cost = self.keepwarm_cost;
+        candidate.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
         candidate.abort_context = None;
         candidate.updated_at = chrono::Utc::now();
         candidate.auto_title();
