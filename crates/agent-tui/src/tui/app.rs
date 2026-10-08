@@ -146,6 +146,9 @@ pub(crate) struct App {
     pub(crate) last_turn_context_window: u64,
     api_call_count: u32, // private: accounting, used only within app.rs
     pub(crate) session_cost: f64,
+    /// Prompt-cache keep-warm spend, already included in `session_cost`
+    /// (mirrors `ConversationSnapshot::keepwarm_cost`).
+    pub(crate) keepwarm_cost: f64,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
     pub(crate) needs_redraw: bool,
@@ -403,6 +406,7 @@ impl App {
             ),
             api_call_count: 0,
             session_cost: 0.0,
+            keepwarm_cost: 0.0,
             session,
             agent_name: boot_config
                 .agent_name
@@ -591,6 +595,7 @@ impl App {
         self.total_cache_read_tokens = conv.tokens.cache_read;
         self.total_cache_creation_tokens = conv.tokens.cache_creation;
         self.session_cost = conv.cost;
+        self.keepwarm_cost = conv.keepwarm_cost;
         self.queued_message = conv.queued_message.clone();
         self.pending_events_len = conv.pending_events_len;
         self.consecutive_auto_turns = conv.consecutive_auto_turns;
