@@ -466,10 +466,9 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
         handle.send(cmd).await.unwrap();
     }
     // A second client attaching and leaving.
-    let (mut other, _) =
-        LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
-            .await
-            .unwrap();
+    let (other, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
     other
         .send(SessionCommand::Detach {
             client: other.client_id(),

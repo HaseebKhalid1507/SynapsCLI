@@ -1461,7 +1461,7 @@ mod tests {
         assert!((thinking_usd - (300.0 * 15.0 + 40.0 * 3.0) / 1e6).abs() < 1e-12);
         let (pings, ledger, ..) = run(
             cfg_max(CacheKeepWarm::Auto, CacheTtl::FiveMinutes, SONNET, 301),
-            &[u.clone()],
+            std::slice::from_ref(&u),
         );
         assert!((ledger - f64::from(pings) * u.cost_usd(SONNET)).abs() < 1e-9);
     }
