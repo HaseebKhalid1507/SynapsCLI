@@ -475,6 +475,11 @@ impl AuthConfig {
     }
 }
 
+/// Upper bound for `cache_keepwarm_hours`. Every hour of keep-warm on an
+/// abandoned session costs roughly one cache read of the whole prefix, so the
+/// cap is deliberately short of "forever".
+pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 24;
+
 /// Prompt-cache TTL strategy for Anthropic requests.
 ///
 /// Controls the `cache_control` value emitted at every cache marker site:
@@ -915,6 +920,12 @@ pub struct SynapsConfig {
     pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
+    /// Opt-in prompt-cache keep-warm (`cache_keepwarm_hours`): how many hours
+    /// after an interactive session goes idle the session actor keeps its
+    /// cached prefix alive with cheap cache-read pings. `0` (default) = off.
+    /// Only honored with `cache_ttl = 1h`; capped at
+    /// [`MAX_CACHE_KEEPWARM_HOURS`]. See docs/specs/cache-ttl-spec.md §7.
+    pub cache_keepwarm_hours: u32,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
@@ -1008,6 +1019,7 @@ impl Default for SynapsConfig {
             telemetry: "off".to_string(),
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
+            cache_keepwarm_hours: 0,
             max_fps: 60,
             scroll_lines: None,
             theme: None,
@@ -1068,6 +1080,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "telemetry",
     "cache_diagnostics",
     "cache_ttl",
+    "cache_keepwarm_hours",
     "max_fps",
     "scroll_lines",
     "theme",
@@ -1461,6 +1474,18 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 Some(ttl) => config.cache_ttl = ttl,
                 None => config.warnings.push(format!(
                     "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
+                )),
+            },
+            "cache_keepwarm_hours" => match val.parse::<u32>() {
+                Ok(h) if h <= MAX_CACHE_KEEPWARM_HOURS => config.cache_keepwarm_hours = h,
+                Ok(_) => {
+                    config.cache_keepwarm_hours = MAX_CACHE_KEEPWARM_HOURS;
+                    config.warnings.push(format!(
+                        "cache_keepwarm_hours = {val} — capped at {MAX_CACHE_KEEPWARM_HOURS}"
+                    ));
+                }
+                Err(_) => config.warnings.push(format!(
+                    "cache_keepwarm_hours = {val} — expected whole hours (0 = off); keep-warm stays off"
                 )),
             },
             "max_fps" => match val.parse::<u32>() {
@@ -2708,6 +2733,30 @@ mod tests {
             assert_eq!(config.thinking_budget, None);
         });
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── cache_keepwarm_hours (task #444) ──
+
+    #[test]
+    fn test_cache_keepwarm_is_off_by_default() {
+        assert_eq!(SynapsConfig::default().cache_keepwarm_hours, 0);
+        assert_eq!(load_config_from_str("").cache_keepwarm_hours, 0);
+    }
+
+    #[test]
+    fn test_cache_keepwarm_hours_parse_cap_and_garbage() {
+        let c = load_config_from_str("cache_keepwarm_hours = 4\ncache_ttl = 1h\n");
+        assert_eq!(c.cache_keepwarm_hours, 4);
+        assert_eq!(c.cache_ttl, CacheTtl::OneHour);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        let c = load_config_from_str("cache_keepwarm_hours = 500\n");
+        assert_eq!(c.cache_keepwarm_hours, MAX_CACHE_KEEPWARM_HOURS);
+        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_hours")));
+
+        let c = load_config_from_str("cache_keepwarm_hours = lots\n");
+        assert_eq!(c.cache_keepwarm_hours, 0, "garbage keeps keep-warm off");
+        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_hours")));
     }
 
     // ── cache_ttl parse table (spec §3.1) ──
