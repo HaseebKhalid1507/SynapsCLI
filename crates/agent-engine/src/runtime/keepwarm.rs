@@ -187,12 +187,17 @@ pub struct PingReport {
 }
 
 /// Live view of an in-flight ping, shared with the actor so an ABORTED ping
-/// (a turn started, the session ended) can still be booked: `sent` flips
-/// immediately before the body goes to the HTTP client, `usage` accumulates
-/// Usage events as they stream in.
+/// (a turn started, the session ended) can still be booked: `sent` flips once
+/// the request is dispatched (the HTTP client pulls the body over an
+/// established connection, or a response arrives — never for a refused
+/// connection), `connect_failed` when `send()` could not connect, `status`
+/// holds the last HTTP status (0 = none), and `usage` accumulates Usage
+/// events as they stream in.
 #[derive(Debug, Clone, Default)]
 pub struct PingTap {
     pub sent: Arc<std::sync::atomic::AtomicBool>,
+    pub connect_failed: Arc<std::sync::atomic::AtomicBool>,
+    pub status: Arc<AtomicU16>,
     pub usage: Arc<std::sync::Mutex<KeepWarmUsage>>,
 }
 
@@ -207,6 +212,69 @@ impl PingTap {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// What this ping is booked at, by [`ping_booking`], and its cost:
+    /// measured usage, else `worst_usd` once dispatched, else nothing.
+    /// EVERY path that ends a ping (done Ok / Err, abort, task panic) books
+    /// through here.
+    pub fn bill(&self, model: &str, worst_usd: f64) -> PingBill {
+        let usage = self.usage();
+        let booking = ping_booking(
+            usage != KeepWarmUsage::default(),
+            self.was_sent(),
+            self.connect_failed.load(Ordering::Relaxed),
+            self.status.load(Ordering::Relaxed),
+        );
+        let cost_usd = match booking {
+            PingBooking::Measured => usage.cost_usd(model),
+            PingBooking::WorstCase => worst_usd,
+            PingBooking::Nothing => 0.0,
+        };
+        PingBill {
+            booking,
+            usage,
+            cost_usd,
+        }
+    }
+}
+
+/// How a finished or aborted ping is booked (see [`ping_booking`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingBooking {
+    /// The provider reported usage: book exactly that.
+    Measured,
+    /// Dispatched, no usage seen: the provider may bill it — book the
+    /// period's worst case for the ping.
+    WorstCase,
+    /// Never dispatched (refused before the network, or a connect failure
+    /// with no HTTP status): nothing can be billed.
+    Nothing,
+}
+
+/// The one booking rule for a ping, on every path: usage arrived → its real
+/// cost; otherwise dispatched → the worst case, unless the error was a
+/// connect failure with no HTTP status; otherwise $0.
+pub fn ping_booking(
+    usage_arrived: bool,
+    sent: bool,
+    connect_failed: bool,
+    http_status: u16,
+) -> PingBooking {
+    if usage_arrived {
+        PingBooking::Measured
+    } else if sent && !(connect_failed && http_status == 0) {
+        PingBooking::WorstCase
+    } else {
+        PingBooking::Nothing
+    }
+}
+
+/// A ping's booking (see [`PingTap::bill`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PingBill {
+    pub booking: PingBooking,
+    pub usage: KeepWarmUsage,
+    pub cost_usd: f64,
 }
 
 /// What a probe learned about the next ping, without sending anything.
@@ -287,6 +355,29 @@ pub fn history_ready(history: &[SharedMessage]) -> bool {
     history.last().is_some_and(|m| tail_is_markable(m))
 }
 
+/// Conservative token estimate of the part of the history's last message
+/// (the turn's final reply) that the cached prefix will hold: its content
+/// minus thinking blocks, which the API strips when the next request
+/// re-sends the reply (they were billed as output, never cached). Ping 1
+/// may write at most this (plus the last request's uncached input) without
+/// counting as a partial miss.
+pub fn reply_prefix_tokens(history: &[SharedMessage]) -> u64 {
+    let Some(last) = history.last() else {
+        return 0;
+    };
+    let kept = match last["content"].as_array() {
+        Some(blocks) => Value::Array(
+            blocks
+                .iter()
+                .filter(|b| !matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
+                .cloned()
+                .collect(),
+        ),
+        None => last["content"].clone(),
+    };
+    super::context::conservative_token_estimate(&kept.to_string())
+}
+
 impl Runtime {
     /// Why this runtime cannot keep its cache warm, or `None` when it can.
     /// Only the native Anthropic transport carries `cache_control`; every
@@ -326,7 +417,7 @@ impl Runtime {
         let cancel = CancellationToken::new();
         let tap = PingTap::default();
         let (value, _) = self
-            .keepwarm_request(history, &cancel, KeepWarmMode::Probe, Arc::default(), &tap)
+            .keepwarm_request(history, &cancel, KeepWarmMode::Probe, &tap)
             .await;
         let value = value?;
         let fingerprint = value["keepwarm_prefix"].as_u64().ok_or_else(|| {
@@ -353,15 +444,8 @@ impl Runtime {
         cancel: &CancellationToken,
         tap: &PingTap,
     ) -> PingReport {
-        let status = Arc::new(AtomicU16::new(0));
         let (value, notices) = self
-            .keepwarm_request(
-                history,
-                cancel,
-                KeepWarmMode::Send { expect },
-                Arc::clone(&status),
-                tap,
-            )
+            .keepwarm_request(history, cancel, KeepWarmMode::Send { expect }, tap)
             .await;
         let result = match value {
             Ok(value) => match value.get("keepwarm_prefix").and_then(Value::as_u64) {
@@ -371,7 +455,7 @@ impl Runtime {
                 }),
                 None => Ok(PingOutcome::Sent),
             },
-            Err(e) => Err(classify_failure(&e, status.load(Ordering::Relaxed))),
+            Err(e) => Err(classify_failure(&e, tap.status.load(Ordering::Relaxed))),
         };
         PingReport {
             result,
@@ -385,11 +469,10 @@ impl Runtime {
         history: &[SharedMessage],
         cancel: &CancellationToken,
         mode: KeepWarmMode,
-        status: Arc<AtomicU16>,
         tap: &PingTap,
     ) -> (Result<Value>, Vec<String>) {
         match self
-            .keepwarm_request_inner(history, cancel, mode, status, tap)
+            .keepwarm_request_inner(history, cancel, mode, tap)
             .await
         {
             Ok(r) => r,
@@ -404,7 +487,6 @@ impl Runtime {
         history: &[SharedMessage],
         cancel: &CancellationToken,
         mode: KeepWarmMode,
-        status: Arc<AtomicU16>,
         tap: &PingTap,
     ) -> Result<(Result<Value>, Vec<String>)> {
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
@@ -550,8 +632,9 @@ impl Runtime {
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
             keepwarm: Some(KeepWarmRequest {
                 mode,
-                status,
+                status: Arc::clone(&tap.status),
                 sent: Arc::clone(&tap.sent),
+                connect_failed: Arc::clone(&tap.connect_failed),
             }),
         };
 
@@ -613,6 +696,10 @@ impl Runtime {
     /// The pre-request context assessment of `run_stream_internal`, for the
     /// next turn = `history` + an empty user message, WITHOUT committing the
     /// policy's next state. `Some(reason)` on Rollover / HardStop.
+    ///
+    /// Mirrors the real round exactly: it assesses the round's final
+    /// `request_messages` — after the request-local history image cap — via
+    /// the same [`super::stream::pre_request_context_budget`].
     fn keepwarm_context_blocks(
         &self,
         history: &[SharedMessage],
@@ -620,9 +707,12 @@ impl Runtime {
         projected_schema: Option<&[Value]>,
         tools_snapshot: &crate::ToolRegistry,
     ) -> Option<String> {
-        use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget};
+        use agent_core::core::context_policy::{assess_context, ContextAction};
         let mut next: Vec<SharedMessage> = history.to_vec();
         next.push(Arc::new(json!({"role": "user", "content": ""})));
+        let capped =
+            super::stream::cap_history_image_bytes(&next, super::stream::HISTORY_IMAGE_BYTE_CAP);
+        let request_messages: &[SharedMessage] = capped.as_deref().unwrap_or(&next[..]);
         let fallback_schema;
         let schema = match projected_schema {
             Some(s) => s,
@@ -631,36 +721,20 @@ impl Runtime {
                 fallback_schema.as_slice()
             }
         };
-        let context_window = self.context_window();
-        let assessment = super::context::assess(&super::context::ContextBudgetInputs {
-            model: &self.model,
-            provider_window: context_window,
+        let (assessment, budget) = super::stream::pre_request_context_budget(
+            &self.model,
+            self.context_window(),
             system_prompt,
-            tools_schema: schema,
-            messages: &next,
-            skill_contents: &[],
-            memory_contents: &[],
-            thinking_budget_tokens: self.thinking_budget as u64,
-            next_tool_result_bytes: self.max_tool_output as u64,
-            output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
-        });
+            schema,
+            request_messages,
+            self.thinking_budget as u64,
+            self.max_tool_output as u64,
+        );
         let state = self
             .continuation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let decision = assess_context(
-            &state.config,
-            &state.policy,
-            ContextBudget {
-                context_window_tokens: context_window,
-                used_tokens: assessment.used_tokens(),
-                hard_remaining_tokens: context_window.saturating_sub(assessment.used_tokens()),
-                required_next_round_tokens: assessment
-                    .reserves
-                    .total()
-                    .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
-            },
-        );
+        let decision = assess_context(&state.config, &state.policy, budget);
         match decision.action {
             ContextAction::Rollover => Some(format!(
                 "the next turn would roll the context over ({} tokens used)",
@@ -1551,5 +1625,138 @@ mod tests {
         // 500k reads at $0.50/MTok + 16 output at $25/MTok + 20 input at $5/MTok.
         let cost = u.cost_usd("claude-opus-4-7");
         assert!((cost - 0.2505).abs() < 0.001, "{cost}");
+    }
+
+    /// The one booking rule (I-2), as a table.
+    #[test]
+    fn booking_rule_table() {
+        use PingBooking::*;
+        // (usage arrived, sent, connect failed, HTTP status) → booking
+        let table = [
+            ((true, true, false, 200), Measured),
+            ((true, false, false, 0), Measured),
+            ((true, true, false, 529), Measured),
+            ((false, true, false, 200), WorstCase), // aborted mid-stream
+            ((false, true, false, 0), WorstCase),   // read timeout after dispatch
+            ((false, true, false, 500), WorstCase),
+            ((false, true, true, 0), Nothing), // connect failure, no status
+            ((false, true, true, 503), WorstCase), // a status means it got there
+            ((false, false, false, 0), Nothing), // refused before the network
+            ((false, false, true, 0), Nothing),
+        ];
+        for ((usage, sent, connect, status), want) in table {
+            assert_eq!(
+                ping_booking(usage, sent, connect, status),
+                want,
+                "usage={usage} sent={sent} connect_failed={connect} status={status}"
+            );
+        }
+        // And the bill prices each booking.
+        let tap = PingTap::default();
+        assert_eq!(tap.bill("claude-opus-4-7", 0.5).cost_usd, 0.0);
+        tap.sent.store(true, Ordering::Relaxed);
+        let bill = tap.bill("claude-opus-4-7", 0.5);
+        assert_eq!((bill.booking, bill.cost_usd), (WorstCase, 0.5));
+        tap.usage.lock().unwrap().cache_read_tokens = 1_000_000;
+        let bill = tap.bill("claude-opus-4-7", 0.5);
+        assert_eq!(bill.booking, Measured);
+        assert!((bill.cost_usd - 0.5).abs() < 1e-9, "1M reads at $0.50/MTok");
+    }
+
+    fn two_message_history() -> Vec<SharedMessage> {
+        vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ]
+    }
+
+    /// A refused connection never marks the ping sent: it is booked at $0.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_refused_connection_is_never_sent_and_books_nothing() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        }; // dropped: nothing listens there now
+        let _url = crate::test_env::EnvVarGuard::set(
+            "SYNAPS_ANTHROPIC_BASE_URL",
+            &format!("http://{addr}"),
+        );
+        let history = two_message_history();
+        let rt = opus(CacheTtl::OneHour);
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let tap = PingTap::default();
+        let report = rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &tap)
+            .await;
+        assert!(report.result.is_err(), "{report:?}");
+        assert!(!tap.was_sent(), "never dispatched");
+        assert!(tap.connect_failed.load(Ordering::Relaxed));
+        let bill = tap.bill("claude-opus-4-7", 0.75);
+        assert_eq!((bill.booking, bill.cost_usd), (PingBooking::Nothing, 0.0));
+    }
+
+    /// The body went out, the provider never answered (read timeout / the
+    /// actor aborted it): no usage, but it may be billed — worst case.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_dispatched_ping_without_usage_books_the_worst_case() {
+        use tokio::io::AsyncReadExt;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept, swallow the request, never respond.
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            while sock.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        });
+        let _url = crate::test_env::EnvVarGuard::set(
+            "SYNAPS_ANTHROPIC_BASE_URL",
+            &format!("http://{addr}"),
+        );
+        let history = two_message_history();
+        let rt = opus(CacheTtl::OneHour);
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let tap = PingTap::default();
+        let cancel = CancellationToken::new();
+        let ping = {
+            let (rt, history, tap, cancel) =
+                (rt.clone(), history.clone(), tap.clone(), cancel.clone());
+            tokio::spawn(async move { rt.cache_keepwarm_ping(&history, fp, &cancel, &tap).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !tap.was_sent() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the body was pulled over the established connection");
+        cancel.cancel();
+        let report = ping.await.unwrap();
+        assert_eq!(report.result, Err(PingFailure::Canceled));
+        assert!(!tap.connect_failed.load(Ordering::Relaxed));
+        let bill = tap.bill("claude-opus-4-7", 0.75);
+        assert_eq!(
+            (bill.booking, bill.cost_usd),
+            (PingBooking::WorstCase, 0.75)
+        );
+    }
+
+    #[test]
+    fn reply_prefix_tokens_skip_thinking() {
+        let text = "a".repeat(250); // 100 tokens at 2.5 chars/token
+        let with_thinking = vec![Arc::new(json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "x".repeat(50_000), "signature": "s"},
+            {"type": "text", "text": text},
+        ]}))];
+        let plain = vec![Arc::new(json!({"role": "assistant", "content": [
+            {"type": "text", "text": text},
+        ]}))];
+        let t = reply_prefix_tokens(&with_thinking);
+        assert_eq!(t, reply_prefix_tokens(&plain), "thinking is not counted");
+        assert!((100..200).contains(&t), "{t}");
+        assert_eq!(reply_prefix_tokens(&[]), 0);
     }
 }

@@ -279,6 +279,47 @@ fn retain_session_tool_set(
     shared
 }
 
+/// The pre-request context assessment of a stream round over the round's
+/// final `request_messages` (after injection and the history image cap):
+/// the estimate and the budget `assess_context` decides on. Shared with the
+/// keep-warm probe (`runtime::keepwarm`) so the two can never drift.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pre_request_context_budget(
+    model: &str,
+    context_window: u64,
+    system_prompt: Option<&str>,
+    tools_schema: &[Value],
+    request_messages: &[SharedMessage],
+    thinking_budget_tokens: u64,
+    next_tool_result_bytes: u64,
+) -> (
+    super::context::ContextAssessment,
+    agent_core::core::context_policy::ContextBudget,
+) {
+    let assessment = super::context::assess(&super::context::ContextBudgetInputs {
+        model,
+        provider_window: context_window,
+        system_prompt,
+        tools_schema,
+        messages: request_messages,
+        skill_contents: &[],
+        memory_contents: &[],
+        thinking_budget_tokens,
+        next_tool_result_bytes,
+        output_reserve_tokens: HelperMethods::max_tokens_for_model(model),
+    });
+    let budget = agent_core::core::context_policy::ContextBudget {
+        context_window_tokens: context_window,
+        used_tokens: assessment.used_tokens(),
+        hard_remaining_tokens: context_window.saturating_sub(assessment.used_tokens()),
+        required_next_round_tokens: assessment
+            .reserves
+            .total()
+            .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+    };
+    (assessment, budget)
+}
+
 /// The pure half of [`retain_session_tool_set`]: the set a turn starting now
 /// would use, given the retained set (if any). Returns the selected set, the
 /// activations dropped while carrying, and whether the retained set is
@@ -1026,45 +1067,27 @@ impl StreamMethods {
             let mut context_advisory = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
-                use agent_core::core::context_policy::{
-                    assess_context, ContextAction, ContextBudget,
-                };
+                use agent_core::core::context_policy::{assess_context, ContextAction};
                 let fallback_schema = tools_snapshot.tools_schema();
                 let schema = round_options
                     .request_tools_schema
                     .as_deref()
                     .map(|s| s.as_slice())
                     .unwrap_or(&fallback_schema);
-                let assessment = super::context::assess(&super::context::ContextBudgetInputs {
-                    model: &model,
-                    provider_window: context_window,
-                    system_prompt: injected_system.as_deref(),
-                    tools_schema: schema,
-                    messages: request_messages,
-                    skill_contents: &[],
-                    memory_contents: &[],
-                    thinking_budget_tokens: thinking_budget as u64,
-                    next_tool_result_bytes: max_tool_output as u64,
-                    output_reserve_tokens: HelperMethods::max_tokens_for_model(&model),
-                });
+                let (assessment, budget) = pre_request_context_budget(
+                    &model,
+                    context_window,
+                    injected_system.as_deref(),
+                    schema,
+                    request_messages,
+                    thinking_budget as u64,
+                    max_tool_output as u64,
+                );
                 let decision = {
                     let mut s = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let d = assess_context(
-                        &s.config,
-                        &s.policy,
-                        ContextBudget {
-                            context_window_tokens: context_window,
-                            used_tokens: assessment.used_tokens(),
-                            hard_remaining_tokens: context_window
-                                .saturating_sub(assessment.used_tokens()),
-                            required_next_round_tokens: assessment
-                                .reserves
-                                .total()
-                                .saturating_add(ADVISORY_RESERVE_TOKENS),
-                        },
-                    );
+                    let d = assess_context(&s.config, &s.policy, budget);
                     s.policy = d.next_state;
                     d
                 };

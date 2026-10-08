@@ -913,9 +913,34 @@ pub struct KeepWarmRequest {
     /// Last HTTP status the transport saw (0 = none), so the caller can tell
     /// a 4xx (stop) from a 5xx/429 (bounded retry).
     pub status: std::sync::Arc<std::sync::atomic::AtomicU16>,
-    /// Set immediately before the request body is handed to the HTTP client:
-    /// from then on the ping may be billed even if it is aborted.
+    /// Set once the request is actually dispatched: when the HTTP client,
+    /// over an established connection with the head written, pulls the body
+    /// (see [`keepwarm_body`]), or when `send()` returns a response. From then
+    /// on the ping may be billed even if it is aborted. A refused connection
+    /// never sets it.
     pub sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when `send()` failed to connect (no HTTP status, nothing sent).
+    pub connect_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A keep-warm request body that flips `sent` when the HTTP client first
+/// pulls it: hyper only polls a request body once the connection is
+/// established and the request head is written, so a ping that never
+/// connected is never marked sent. `Content-Length` is set explicitly so the
+/// wire framing matches a buffered body's (no chunked encoding).
+fn keepwarm_body(
+    req: reqwest::RequestBuilder,
+    body: bytes::Bytes,
+    sent: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> reqwest::RequestBuilder {
+    let flag = std::sync::Arc::clone(sent);
+    let len = body.len();
+    let stream = futures::stream::once(async move {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok::<bytes::Bytes, std::io::Error>(body)
+    });
+    req.header(reqwest::header::CONTENT_LENGTH, len)
+        .body(reqwest::Body::wrap_stream(stream))
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1440,15 +1465,17 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
-                    if let Some(keepwarm) = &options.keepwarm {
-                        keepwarm
-                            .sent
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    match await_or_cancel(cancel, req.body(body_bytes.clone()).send()).await? {
+                    let req = match &options.keepwarm {
+                        Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
+                        None => req.body(body_bytes.clone()),
+                    };
+                    match await_or_cancel(cancel, req.send()).await? {
                         Ok(resp) => {
                             let status = resp.status();
                             if let Some(keepwarm) = &options.keepwarm {
+                                keepwarm
+                                    .sent
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                                 keepwarm
                                     .status
                                     .store(status.as_u16(), std::sync::atomic::Ordering::Relaxed);
@@ -1621,6 +1648,13 @@ impl ApiMethods {
                             }
                         }
                         Err(e) => {
+                            if let Some(keepwarm) = &options.keepwarm {
+                                if e.is_connect() {
+                                    keepwarm
+                                        .connect_failed
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             non_429_attempts += 1;
                             if non_429_attempts > max_retries {
                                 if let Some(t) = tracer.take() {
