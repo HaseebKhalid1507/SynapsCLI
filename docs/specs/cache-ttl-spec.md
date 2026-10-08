@@ -436,6 +436,96 @@ Telemetry (`UsageRecord`) already carries the split; no change.
 
 ---
 
+## 7. Cache keep-warm (`cache_keepwarm_hours`, task #444)
+
+**Opt-in, off by default.** With `cache_ttl = 1h`, an interactive session that
+goes idle can keep its cached prefix alive with cheap cache-read pings, so
+coming back after lunch (or the next morning) reads the 300k–1M token prefix
+at 0.1× input price instead of rewriting it at 2×.
+
+```
+cache_ttl = 1h
+cache_keepwarm_hours = 4   # 0 = off (default); max 24
+```
+
+### 7.1 What it costs
+
+A ping re-sends the exact prefix and reads it from cache. Per ping, on a
+prefix of `P` tokens at input price `p`:
+
+| item | cost | Opus ($5 in / $25 out), P = 500k |
+|---|---|---|
+| cache read of the prefix | `0.1 × P × p` | $0.25 |
+| trailing ping message (~25 tokens, uncached) | `25 × p` | ~$0.0001 |
+| output (hard cap 16 tokens, thinking included) | `≤ 16 × 5p` | ≤ $0.0004 |
+| first ping only: writes the final assistant reply (`W` tokens) at 1h | `2 × W × p` | $0.02 for W = 2k |
+| **rewrite it replaces** (user returns after expiry) | `2 × P × p` | **$5.00** |
+
+One ping costs ~5% of one rewrite (models with 0.05× / 0.025× cache reads —
+Opus/Sonnet 5.5, Fable/Mythos 5.1 — make it 2.5% / 1.25%). Pings run every
+55 minutes, so a 4 h window costs 4 pings (≈ 0.4 P input-equivalents) and pays
+off if at least one in five idle periods ends with the user coming back inside
+the window. **Abandoned sessions pay for every ping in the window**, which is
+why it is opt-in and capped.
+
+### 7.2 When it runs
+
+- Owner: the session actor (`crates/agent-engine/src/session/cache_keepwarm.rs`).
+  It arms when the actor announces `Idle` after a turn that reached the
+  provider and whose history ends in a finished assistant reply, with an
+  interactive client (TUI or `synaps attach`) attached.
+- First ping at *last request start + 55 min* (the TTL counts from the start
+  of the request that last read/wrote the entry; 5 min margin). Each ping
+  re-schedules *ping start + 55 min* while that is inside
+  *idle start + `cache_keepwarm_hours`*.
+- Stops on: any input command from a client, a turn or compaction starting,
+  the last interactive client detaching, park, session end,
+  `max_session_cost` reached (session cost + ping cost), or any ping error.
+  It re-arms only at the next idle.
+- Never runs for subagents, headless/one-shot sessions, RPC/server clients,
+  armed session drivers, non-Anthropic models, `cache_ttl = 5m` or `hybrid`
+  (the history marker is 5m there), or budgeted thinking (below). The reason
+  is logged once (`cache keep-warm off: …`).
+
+### 7.3 Why the ping hits the cache
+
+The ping is built by `Runtime::cache_keepwarm_ping`
+(`crates/agent-engine/src/runtime/keepwarm.rs`) through the same request
+builder as a turn (`call_api_stream_inner` → `build_anthropic_request`): same
+tools (including the progressive-disclosure projection), system prompt,
+thinking config and effort, model, TTL markers and durable history. The only
+differences are after the cache key's reach:
+
+- the conversational `cache_control` marker sits on the **last history
+  message** instead of the new user message, and the trailing ping message
+  (`[automated prompt-cache keep-warm ping — not from the user] Reply with
+  only: ok`) rides after it unmarked. The next real turn's lookback finds
+  this entry, so it reads through the final assistant reply;
+- `max_tokens = 16` (`max_tokens` is not part of the cache key);
+- no memory recall, `before_message`/Inject hooks, steering or pressure
+  notice (all request-tail, per-turn content), no retries.
+
+The ping never touches history, the session file, the transcript or the
+session's cost counters; its spend is logged per ping and counted against
+`max_session_cost`. Telemetry records for pings carry `"keepwarm": true`.
+
+### 7.4 Thinking
+
+Thinking config (mode, `budget_tokens`) and `output_config.effort` are part of
+the cache key, so the ping must carry them unchanged.
+
+- **Adaptive thinking** (Opus 4.7+, Sonnet 4.7+, 5.x) and **thinking off**:
+  `max_tokens` is a hard cap on thinking + text, so output is ≤ 16 tokens
+  (≤ $0.0004 on Opus). Supported.
+- **Budgeted thinking** (Opus 4.6, Sonnet 4.6/4.5, Haiku 4.5 with thinking
+  on): the API requires `max_tokens > budget_tokens`, and the budget can't
+  change without invalidating the cache, so one ping could bill up to the full
+  budget — 16,384 tokens × $25/MTok = $0.41 on Opus 4.6 at the default level,
+  more than the $0.25 cache read it buys. Keep-warm refuses these
+  configurations rather than spend silently.
+
+---
+
 *Every component here exists because the code demanded it; nothing exists
 because the brief asserted it. The brief was wrong once — see §0. Build from
 this document, not from the brief.*
