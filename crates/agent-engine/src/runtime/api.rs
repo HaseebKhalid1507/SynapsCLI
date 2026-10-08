@@ -898,7 +898,8 @@ pub struct ApiOptions {
 /// What a keep-warm request does once its body is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepWarmMode {
-    /// Return `{"keepwarm_prefix": <fingerprint>}`; send nothing.
+    /// Return `{"keepwarm_prefix": <fingerprint>, "keepwarm_max_tokens": n}`;
+    /// send nothing.
     Probe,
     /// Send only if the built prefix still hashes to `expect`; otherwise
     /// return `{"keepwarm_prefix": <actual>}` without sending.
@@ -912,6 +913,9 @@ pub struct KeepWarmRequest {
     /// Last HTTP status the transport saw (0 = none), so the caller can tell
     /// a 4xx (stop) from a 5xx/429 (bounded retry).
     pub status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    /// Set immediately before the request body is handed to the HTTP client:
+    /// from then on the ping may be billed even if it is aborted.
+    pub sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1298,7 +1302,10 @@ impl ApiMethods {
                 .prefix_fingerprint(cleaned_messages.len().saturating_sub(1), beta.as_deref());
             let send = matches!(keepwarm.mode, KeepWarmMode::Send { expect } if expect == actual);
             if !send {
-                return Ok(serde_json::json!({ "keepwarm_prefix": actual }));
+                return Ok(serde_json::json!({
+                    "keepwarm_prefix": actual,
+                    "keepwarm_max_tokens": body.max_tokens(),
+                }));
             }
         }
         let translation_report = parts.report;
@@ -1433,6 +1440,11 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    if let Some(keepwarm) = &options.keepwarm {
+                        keepwarm
+                            .sent
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     match await_or_cancel(cancel, req.body(body_bytes.clone()).send()).await? {
                         Ok(resp) => {
                             let status = resp.status();

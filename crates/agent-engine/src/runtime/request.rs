@@ -134,8 +134,11 @@ impl<'a> RequestBody<'a> {
     /// never call this). `max_tokens` is not part of the cache key, so the
     /// cached prefix is unaffected:
     /// - thinking off / adaptive: [`KEEPWARM_OUTPUT_TOKENS`] — adaptive
-    ///   thinking has no `max_tokens` floor (the API even accepts 0), so the
-    ///   cap bounds thinking + text together;
+    ///   thinking has no `max_tokens` floor, so the cap bounds thinking +
+    ///   text together. Not the documented `max_tokens: 0` pre-warm: that is
+    ///   rejected with `stream: true`, and whether `stream` is part of the
+    ///   cache key is undocumented, so the ping streams exactly like the
+    ///   real turn it keeps warm (spec §7.1);
     /// - budgeted thinking (`type: "enabled"`): the API requires
     ///   `max_tokens > budget_tokens`, and the budget IS part of the cache
     ///   key, so the ping keeps the budget and gets `budget + 1`. What is
@@ -199,6 +202,11 @@ impl<'a> RequestBody<'a> {
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &beta);
         h.0
+    }
+
+    /// The output cap this body will send (keep-warm worst-case pricing).
+    pub(super) fn max_tokens(&self) -> u64 {
+        self.max_tokens
     }
 
     /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.

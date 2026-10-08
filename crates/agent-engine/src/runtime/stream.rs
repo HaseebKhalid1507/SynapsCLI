@@ -252,12 +252,13 @@ fn retain_session_tool_set(
     let mut slot = retained
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = slot.as_ref() {
+    let fresh = if let Some(existing) = slot.as_ref() {
         let mut set = existing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if set.session() == fresh.session() {
-            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+        let (next, dropped, reused) =
+            select_turn_start_tool_set(Some(&*set), fresh, catalog, progressive);
+        if reused {
             for d in &dropped {
                 tracing::warn!(
                     tool = %d.id,
@@ -269,10 +270,41 @@ fn retain_session_tool_set(
             drop(set);
             return std::sync::Arc::clone(existing);
         }
-    }
+        next
+    } else {
+        fresh
+    };
     let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
     *slot = Some(std::sync::Arc::clone(&shared));
     shared
+}
+
+/// The pure half of [`retain_session_tool_set`]: the set a turn starting now
+/// would use, given the retained set (if any). Returns the selected set, the
+/// activations dropped while carrying, and whether the retained set is
+/// reused (carried into). Never writes anything — the keep-warm ping
+/// (`runtime::keepwarm`) uses it read-only to project exactly the tool
+/// schema the next real turn will send.
+pub(super) fn select_turn_start_tool_set(
+    existing: Option<&crate::tools::activation::SessionToolSet>,
+    fresh: crate::tools::activation::SessionToolSet,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+) -> (
+    crate::tools::activation::SessionToolSet,
+    Vec<crate::tools::activation::DroppedActivation>,
+    bool,
+) {
+    if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        return (fresh, Vec::new(), false);
+    }
+    match existing {
+        Some(set) if set.session() == fresh.session() => {
+            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+            (next, dropped, true)
+        }
+        _ => (fresh, Vec::new(), false),
+    }
 }
 
 fn assistant_text_from_content(content: &[Value]) -> String {

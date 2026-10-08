@@ -166,11 +166,62 @@ impl KeepWarmUsage {
 /// What a ping did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PingOutcome {
-    /// Sent; the provider's usage for it.
-    Sent(KeepWarmUsage),
+    /// Sent and accepted; its usage is in [`PingReport::usage`].
+    Sent,
     /// Not sent: the freshly built prefix no longer matches the expected
     /// fingerprint (model, thinking, tools, system or history changed).
     PrefixChanged { expected: u64, actual: u64 },
+}
+
+/// One ping's result AND whatever the provider billed for it. Usage is
+/// returned on every path — success, transient or fatal error, in-stream
+/// error under a 200 — so the caller books it all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PingReport {
+    pub result: std::result::Result<PingOutcome, PingFailure>,
+    pub usage: KeepWarmUsage,
+    /// Notices the request raised (e.g. the one-per-session silent 1h→5m
+    /// downgrade notice: the ping shares the session's latch, so the actor
+    /// must surface it).
+    pub notices: Vec<String>,
+}
+
+/// Live view of an in-flight ping, shared with the actor so an ABORTED ping
+/// (a turn started, the session ended) can still be booked: `sent` flips
+/// immediately before the body goes to the HTTP client, `usage` accumulates
+/// Usage events as they stream in.
+#[derive(Debug, Clone, Default)]
+pub struct PingTap {
+    pub sent: Arc<std::sync::atomic::AtomicBool>,
+    pub usage: Arc<std::sync::Mutex<KeepWarmUsage>>,
+}
+
+impl PingTap {
+    pub fn was_sent(&self) -> bool {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    pub fn usage(&self) -> KeepWarmUsage {
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// What a probe learned about the next ping, without sending anything.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeepWarmProbe {
+    /// Prefix fingerprint (see the module docs).
+    pub fingerprint: u64,
+    /// The ping's `max_tokens`: the worst-case output it can be billed for
+    /// (1, or `budget + 1` under budgeted thinking).
+    pub max_tokens: u64,
+    /// `Some(reason)` when the next real turn — this history plus an empty
+    /// user message — would roll the context over or hard-stop before its
+    /// first request (the same assessment `run_stream_internal` makes). The
+    /// cached prefix is then not what the next turn sends.
+    pub context_blocks: Option<String>,
 }
 
 /// Why a ping failed.
@@ -255,47 +306,77 @@ impl Runtime {
         self.cache_anchor.get()
     }
 
-    /// Fingerprint of the prefix the next real turn would send for
-    /// `history` (see the module docs). Builds the request through the real
-    /// builder and returns before anything is sent; no network I/O.
-    pub async fn cache_keepwarm_probe(&self, history: &[SharedMessage]) -> Result<u64> {
+    /// The session's silent 1h→5m downgrade latch has fired: the server
+    /// honours only 5m whatever the configured TTL says.
+    pub fn cache_ttl_downgraded(&self) -> bool {
+        self.ttl_downgrade_notified.load(Ordering::Relaxed)
+    }
+
+    /// A request of this session has written a 1h cache entry.
+    pub fn cache_1h_honoured(&self) -> bool {
+        self.saw_1h_honored.load(Ordering::Relaxed)
+    }
+
+    /// Probe the ping the next real turn would justify for `history` (see
+    /// the module docs): its prefix fingerprint, its worst-case output, and
+    /// whether the next turn would roll the context over first. Builds the
+    /// request through the real builder and returns before anything is
+    /// sent; no network I/O.
+    pub async fn cache_keepwarm_probe(&self, history: &[SharedMessage]) -> Result<KeepWarmProbe> {
         let cancel = CancellationToken::new();
+        let tap = PingTap::default();
         let (value, _) = self
-            .keepwarm_request(history, &cancel, KeepWarmMode::Probe, Arc::default())
-            .await?;
-        value["keepwarm_prefix"]
-            .as_u64()
-            .ok_or_else(|| RuntimeError::Session("keep-warm probe produced no fingerprint".into()))
+            .keepwarm_request(history, &cancel, KeepWarmMode::Probe, Arc::default(), &tap)
+            .await;
+        let value = value?;
+        let fingerprint = value["keepwarm_prefix"].as_u64().ok_or_else(|| {
+            RuntimeError::Session("keep-warm probe produced no fingerprint".into())
+        })?;
+        Ok(KeepWarmProbe {
+            fingerprint,
+            max_tokens: value["keepwarm_max_tokens"].as_u64().unwrap_or(0),
+            context_blocks: value["keepwarm_context_blocks"]
+                .as_str()
+                .map(str::to_string),
+        })
     }
 
     /// Send ONE keep-warm ping for `history` (the session's durable history,
     /// unchanged) if its freshly built prefix still hashes to `expect`.
     /// Never mutates `history`, the runtime's session state, or any persisted
     /// state; fires no extension hooks; emits nothing to any frontend.
+    /// `tap` sees the request leave and its usage arrive while it runs.
     pub async fn cache_keepwarm_ping(
         &self,
         history: &[SharedMessage],
         expect: u64,
         cancel: &CancellationToken,
-    ) -> std::result::Result<PingOutcome, PingFailure> {
+        tap: &PingTap,
+    ) -> PingReport {
         let status = Arc::new(AtomicU16::new(0));
-        match self
+        let (value, notices) = self
             .keepwarm_request(
                 history,
                 cancel,
                 KeepWarmMode::Send { expect },
                 Arc::clone(&status),
+                tap,
             )
-            .await
-        {
-            Ok((value, usage)) => match value.get("keepwarm_prefix").and_then(Value::as_u64) {
+            .await;
+        let result = match value {
+            Ok(value) => match value.get("keepwarm_prefix").and_then(Value::as_u64) {
                 Some(actual) => Ok(PingOutcome::PrefixChanged {
                     expected: expect,
                     actual,
                 }),
-                None => Ok(PingOutcome::Sent(usage)),
+                None => Ok(PingOutcome::Sent),
             },
             Err(e) => Err(classify_failure(&e, status.load(Ordering::Relaxed))),
+        };
+        PingReport {
+            result,
+            usage: tap.usage(),
+            notices,
         }
     }
 
@@ -305,7 +386,27 @@ impl Runtime {
         cancel: &CancellationToken,
         mode: KeepWarmMode,
         status: Arc<AtomicU16>,
-    ) -> Result<(Value, KeepWarmUsage)> {
+        tap: &PingTap,
+    ) -> (Result<Value>, Vec<String>) {
+        match self
+            .keepwarm_request_inner(history, cancel, mode, status, tap)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => (Err(e), Vec::new()),
+        }
+    }
+
+    /// `Err` = refused before any request was built (nothing billed);
+    /// `Ok((Err, _))` = the request itself failed (usage, if any, is in `tap`).
+    async fn keepwarm_request_inner(
+        &self,
+        history: &[SharedMessage],
+        cancel: &CancellationToken,
+        mode: KeepWarmMode,
+        status: Arc<AtomicU16>,
+        tap: &PingTap,
+    ) -> Result<(Result<Value>, Vec<String>)> {
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
             return Err(RuntimeError::Config(format!(
                 "cache keep-warm skipped: {reason}"
@@ -391,26 +492,25 @@ impl Runtime {
                 true,
                 context_enabled,
             );
+            // The SAME selection a turn start makes (`retain_session_tool_set`),
+            // through its pure half: nothing is written back.
             let retained = self
                 .retained_tool_set
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let set = match retained {
-                Some(shared) if crate::tools::activation::carry_forward_enabled() => {
-                    let existing = shared
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if existing.session() == fresh.session() {
-                        existing
-                            .carry_activations_into(fresh, tools_snapshot.catalog())
-                            .0
-                    } else {
-                        fresh
-                    }
-                }
-                _ => fresh,
-            };
+            let existing = retained.as_ref().map(|shared| {
+                shared
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            let (set, _, _) = super::stream::select_turn_start_tool_set(
+                existing.as_deref(),
+                fresh,
+                tools_snapshot.catalog(),
+                true,
+            );
+            drop(existing);
             let schema = tools_snapshot.session_tools_schema(&set).schema;
             let split = self.deferred_tool_loading.then(|| {
                 let referenced = HelperMethods::referenced_tool_ids(request_messages);
@@ -425,9 +525,10 @@ impl Runtime {
             memory_backend: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
-            // A fresh latch: a downgrade notice raised by a ping goes nowhere,
-            // so it must not consume the session's one real notice.
-            ttl_downgrade_notified: Default::default(),
+            // The SESSION's latch: a ping that sees the silent 1h→5m
+            // downgrade raises the one notice (the actor surfaces it) and
+            // the actor schedules by the 5m TTL the server honours.
+            ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
             saw_1h_honored: self.saw_1h_honored.clone(),
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
@@ -441,17 +542,21 @@ impl Runtime {
             telemetry: self.telemetry_writer.clone(),
             tool_session_id: Some(self.host_tool_session.clone()),
             session_tool_set: None,
-            request_tools_schema,
+            request_tools_schema: request_tools_schema.clone(),
             anthropic_tool_split,
             usage_counters: None,
             // A successful ping refreshes the cache: it moves the anchor the
             // next ping is scheduled from.
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
-            keepwarm: Some(KeepWarmRequest { mode, status }),
+            keepwarm: Some(KeepWarmRequest {
+                mode,
+                status,
+                sent: Arc::clone(&tap.sent),
+            }),
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let result = ApiMethods::call_api_stream_inner(
+        let call = ApiMethods::call_api_stream_inner(
             &self.auth,
             &self.client,
             &self.model,
@@ -466,13 +571,107 @@ impl Runtime {
             0,
             &options,
             self.telemetry_level,
-        )
-        .await;
-        let mut usage = KeepWarmUsage::default();
+        );
+        tokio::pin!(call);
+        // Drain events WHILE the request runs: usage lands in the tap as it
+        // arrives, so an aborted ping can still be booked.
+        let mut notices = Vec::new();
+        let mut on_event = |event: StreamEvent| {
+            if let StreamEvent::Session(SessionEvent::Notice(n)) = &event {
+                notices.push(n.clone());
+            }
+            tap.usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .add(&event);
+        };
+        let mut result = loop {
+            tokio::select! {
+                r = &mut call => break r,
+                Some(event) = rx.recv() => on_event(event),
+            }
+        };
         while let Ok(event) = rx.try_recv() {
-            usage.add(&event);
+            on_event(event);
         }
-        Ok((result?, usage))
+        // Probe: also run the next turn's pre-request context assessment.
+        if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
+            if context_enabled {
+                if let Some(why) = self.keepwarm_context_blocks(
+                    history,
+                    system_prompt.as_deref(),
+                    request_tools_schema.as_deref().map(|s| s.as_slice()),
+                    &tools_snapshot,
+                ) {
+                    value["keepwarm_context_blocks"] = Value::String(why);
+                }
+            }
+        }
+        Ok((result, notices))
+    }
+
+    /// The pre-request context assessment of `run_stream_internal`, for the
+    /// next turn = `history` + an empty user message, WITHOUT committing the
+    /// policy's next state. `Some(reason)` on Rollover / HardStop.
+    fn keepwarm_context_blocks(
+        &self,
+        history: &[SharedMessage],
+        system_prompt: Option<&str>,
+        projected_schema: Option<&[Value]>,
+        tools_snapshot: &crate::ToolRegistry,
+    ) -> Option<String> {
+        use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget};
+        let mut next: Vec<SharedMessage> = history.to_vec();
+        next.push(Arc::new(json!({"role": "user", "content": ""})));
+        let fallback_schema;
+        let schema = match projected_schema {
+            Some(s) => s,
+            None => {
+                fallback_schema = tools_snapshot.tools_schema();
+                fallback_schema.as_slice()
+            }
+        };
+        let context_window = self.context_window();
+        let assessment = super::context::assess(&super::context::ContextBudgetInputs {
+            model: &self.model,
+            provider_window: context_window,
+            system_prompt,
+            tools_schema: schema,
+            messages: &next,
+            skill_contents: &[],
+            memory_contents: &[],
+            thinking_budget_tokens: self.thinking_budget as u64,
+            next_tool_result_bytes: self.max_tool_output as u64,
+            output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
+        });
+        let state = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let decision = assess_context(
+            &state.config,
+            &state.policy,
+            ContextBudget {
+                context_window_tokens: context_window,
+                used_tokens: assessment.used_tokens(),
+                hard_remaining_tokens: context_window.saturating_sub(assessment.used_tokens()),
+                required_next_round_tokens: assessment
+                    .reserves
+                    .total()
+                    .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+            },
+        );
+        match decision.action {
+            ContextAction::Rollover => Some(format!(
+                "the next turn would roll the context over ({} tokens used)",
+                assessment.used_tokens()
+            )),
+            ContextAction::HardStop => Some(format!(
+                "the next turn would hit the context hard limit ({} tokens used)",
+                assessment.used_tokens()
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -504,21 +703,40 @@ mod tests {
         "data: {\"type\":\"message_stop\"}\n\n",
     );
 
+    /// A 200 stream that reports usage, then fails in-stream (overloaded).
+    const SSE_USAGE_THEN_ERROR: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kw\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-4-7\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":5000}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null,",
+        "\"stop_sequence\":null},\"usage\":{\"input_tokens\":12,\"output_tokens\":1,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":5000}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+        "\"message\":\"synthetic\"}}\n\n",
+    );
+
     #[derive(Clone)]
     struct Mock {
         bodies: Arc<Mutex<Vec<String>>>,
-        /// HTTP status served (200 = the SSE body above).
+        /// HTTP status served (200 = `sse`).
         status: u16,
+        sse: &'static str,
     }
 
     async fn spawn_mock() -> (String, Mock) {
-        spawn_mock_with(200).await
+        spawn_mock_full(200, SSE_HI).await
     }
 
     async fn spawn_mock_with(status: u16) -> (String, Mock) {
+        spawn_mock_full(status, SSE_HI).await
+    }
+
+    async fn spawn_mock_full(status: u16, sse: &'static str) -> (String, Mock) {
         let mock = Mock {
             bodies: Arc::default(),
             status,
+            sse,
         };
         let app = Router::new()
             .route(
@@ -529,7 +747,7 @@ mod tests {
                         (
                             StatusCode::OK,
                             [("content-type", "text/event-stream")],
-                            SSE_HI.to_string(),
+                            m.sse.to_string(),
                         )
                             .into_response()
                     } else {
@@ -655,26 +873,30 @@ mod tests {
         let before_ping = calls.load(Ordering::SeqCst);
         let snapshot = history.clone();
 
-        let fingerprint = rt.cache_keepwarm_probe(&history).await.expect("probe");
+        let fingerprint = rt
+            .cache_keepwarm_probe(&history)
+            .await
+            .expect("probe")
+            .fingerprint;
         assert_eq!(
             mock.bodies.lock().unwrap().len(),
             1,
             "a probe sends nothing"
         );
         assert_eq!(
-            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint,
             fingerprint,
             "the fingerprint is deterministic"
         );
 
-        let usage = match rt
-            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new())
-            .await
-            .expect("ping succeeds")
-        {
-            PingOutcome::Sent(usage) => usage,
-            other => panic!("expected a sent ping, got {other:?}"),
-        };
+        let tap = PingTap::default();
+        let report = rt
+            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
+            .await;
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        assert!(tap.was_sent(), "the tap saw the request leave");
+        assert_eq!(tap.usage(), report.usage, "the tap saw the usage");
+        let usage = report.usage;
         assert!(
             usage.output_tokens >= 1,
             "usage comes back from the private channel"
@@ -901,7 +1123,7 @@ mod tests {
         let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
         let mut rt = opus(CacheTtl::FiveMinutes);
         let history = real_turn(&rt, vec![user("hello")]).await;
-        let fp = rt.cache_keepwarm_probe(&history).await.unwrap();
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
         let sent = mock.bodies.lock().unwrap().len();
 
         // History grew (e.g. a compaction / /clear / a new turn).
@@ -910,30 +1132,32 @@ mod tests {
         longer.push(Arc::new(
             json!({"role": "assistant", "content": [{"type": "text", "text": "x"}]}),
         ));
-        let changed = |o: std::result::Result<PingOutcome, PingFailure>| {
-            matches!(o, Ok(PingOutcome::PrefixChanged { .. }))
-        };
+        let changed = |r: PingReport| matches!(r.result, Ok(PingOutcome::PrefixChanged { .. }));
+        let tap = PingTap::default();
         assert!(changed(
-            rt.cache_keepwarm_ping(&longer, fp, &CancellationToken::new())
+            rt.cache_keepwarm_ping(&longer, fp, &CancellationToken::new(), &tap)
                 .await
         ));
 
         rt.set_system_prompt("A different system prompt.".into());
-        assert_ne!(rt.cache_keepwarm_probe(&history).await.unwrap(), fp);
+        assert_ne!(
+            rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint,
+            fp
+        );
         assert!(changed(
-            rt.cache_keepwarm_ping(&history, fp, &CancellationToken::new())
+            rt.cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &tap)
                 .await
         ));
         rt.set_system_prompt("You are a keep-warm test.".into());
         assert_eq!(
-            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint,
             fp,
             "restored"
         );
 
         rt.set_reasoning_level_explicit(ReasoningLevel::Low);
         assert_ne!(
-            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint,
             fp,
             "effort is in the key"
         );
@@ -942,7 +1166,7 @@ mod tests {
         rt.set_model("claude-opus-4-6".to_string());
         assert_eq!(rt.model(), "claude-opus-4-6");
         assert_ne!(
-            rt.cache_keepwarm_probe(&history).await.unwrap(),
+            rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint,
             fp,
             "model is in the key"
         );
@@ -952,6 +1176,7 @@ mod tests {
             sent,
             "no refused ping reached the provider"
         );
+        assert!(!tap.was_sent(), "a refused ping never leaves");
     }
 
     #[tokio::test]
@@ -966,10 +1191,11 @@ mod tests {
             let (url, mock) = spawn_mock_with(status).await;
             let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
             let rt = opus(CacheTtl::FiveMinutes);
-            let fp = rt.cache_keepwarm_probe(&history).await.unwrap();
+            let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
             let err = rt
-                .cache_keepwarm_ping(&history, fp, &CancellationToken::new())
+                .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
                 .await
+                .result
                 .expect_err("non-2xx fails");
             assert_eq!(
                 matches!(err, PingFailure::Fatal(_)),
@@ -987,6 +1213,199 @@ mod tests {
                 "a rejected request refreshes nothing"
             );
         }
+    }
+
+    /// The prefix-identity proof for one more request shape: the ping and
+    /// the real next turn send identical model/tools/system/thinking/effort
+    /// and history through the marker.
+    async fn assert_identity_1h(rt: &Runtime) -> Observed {
+        let o = ping_then_next_turn(rt).await;
+        assert_prefix_identical(&o.ping, &o.real, o.history_len, &marker_1h(), 1);
+        o
+    }
+
+    /// Progressive tool disclosure: the tool schema is the projection of the
+    /// retained session tool set, selected exactly as a turn start selects
+    /// it (`select_turn_start_tool_set`).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_progressive_disclosure() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.progressive_tool_disclosure = true;
+        assert_identity_1h(&rt).await;
+    }
+
+    /// Deferred tool loading on top of progressive disclosure: the
+    /// loaded/deferred split is part of the identity.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_deferred_tools() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.progressive_tool_disclosure = true;
+        rt.deferred_tool_loading = true;
+        assert_identity_1h(&rt).await;
+    }
+
+    /// Context management on: the guidance is appended to the system prompt
+    /// of both.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_context_management_guidance() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let rt = opus(CacheTtl::OneHour);
+        rt.continuation.lock().unwrap().config.mode =
+            crate::core::config::ContextManagementMode::Auto;
+        let o = assert_identity_1h(&rt).await;
+        assert!(
+            canon(&o.ping["system"]).contains("Work normally."),
+            "guidance present: {}",
+            o.ping["system"]
+        );
+    }
+
+    /// A session-scoped extension injection rides in the system prompt of
+    /// both (unlike the per-turn `before_message` injection, which is tail).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_session_injection() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.set_session_id(Some("kw-session".into()));
+        rt.hook_bus()
+            .set_session_injection_for("kw-session", "SESSION-SCOPED-INJECTION".into())
+            .await;
+        let o = assert_identity_1h(&rt).await;
+        assert!(canon(&o.ping["system"]).contains("SESSION-SCOPED-INJECTION"));
+    }
+
+    /// OAuth: the Claude Code transport identity and the extra system blocks
+    /// are identical on both.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_prefix_matches_next_turn_with_oauth_system_blocks() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
+            auth_token: "oauth-test-token".to_string(),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(crate::epoch_millis() + 3_600_000),
+        }));
+        let o = assert_identity_1h(&rt).await;
+        assert!(
+            canon(&o.ping["system"]).contains("You are Claude Code"),
+            "{}",
+            o.ping["system"]
+        );
+    }
+
+    /// Context rollover ahead: the probe runs the next turn's pre-request
+    /// assessment (history + an empty user message) and reports a Rollover /
+    /// HardStop without committing any policy state.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn probe_reports_a_context_rollover_ahead() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus(CacheTtl::OneHour);
+        rt.continuation.lock().unwrap().config.mode =
+            crate::core::config::ContextManagementMode::Auto;
+        let history = real_turn(&rt, vec![user("hello")]).await;
+        let probe = rt.cache_keepwarm_probe(&history).await.unwrap();
+        assert_eq!(probe.context_blocks, None, "plenty of room");
+        let before = rt.continuation.lock().unwrap().policy;
+        // The next round needs more headroom than the window has left.
+        rt.continuation.lock().unwrap().config.reserve_tokens = 10_000_000;
+        let probe = rt.cache_keepwarm_probe(&history).await.unwrap();
+        assert!(probe.context_blocks.is_some(), "{probe:?}");
+        assert_eq!(
+            rt.continuation.lock().unwrap().policy,
+            before,
+            "the probe never commits policy state"
+        );
+        // Context management off: no assessment, like a real turn.
+        rt.continuation.lock().unwrap().config.mode =
+            crate::core::config::ContextManagementMode::Off;
+        assert_eq!(
+            rt.cache_keepwarm_probe(&history)
+                .await
+                .unwrap()
+                .context_blocks,
+            None
+        );
+    }
+
+    /// The probe reports the ping's real `max_tokens` (worst-case output).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn probe_reports_max_tokens() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        let rt = opus(CacheTtl::OneHour);
+        assert_eq!(
+            rt.cache_keepwarm_probe(&history).await.unwrap().max_tokens,
+            1
+        );
+        let mut rt = Runtime::new_headless();
+        rt.set_model("claude-sonnet-4-6".to_string());
+        rt.set_reasoning_level_explicit(ReasoningLevel::XHigh);
+        let probe = rt.cache_keepwarm_probe(&history).await.unwrap();
+        let budget = u64::from(rt.thinking_budget);
+        assert!(budget >= 16_384, "budgeted thinking at xhigh: {budget}");
+        assert_eq!(
+            probe.max_tokens,
+            budget + KEEPWARM_OUTPUT_TOKENS,
+            "{probe:?}"
+        );
+    }
+
+    /// Usage is returned on EVERY path: a ping that was billed and then
+    /// failed in-stream still reports what it cost (and so does the tap).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_usage_is_returned_on_error() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock_full(200, SSE_USAGE_THEN_ERROR).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        let rt = opus(CacheTtl::OneHour);
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let tap = PingTap::default();
+        let report = rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &tap)
+            .await;
+        assert!(
+            matches!(report.result, Err(PingFailure::Transient(_))),
+            "{report:?}"
+        );
+        assert_eq!(report.usage.cache_read_tokens, 5_000, "{report:?}");
+        assert!(report.usage.cost_usd("claude-opus-4-7") > 0.0);
+        assert_eq!(tap.usage(), report.usage);
+        assert!(tap.was_sent());
+        assert_eq!(mock.bodies.lock().unwrap().len(), 1, "no transport retry");
+    }
+
+    /// The ping shares the session's silent-downgrade latch (not a fresh
+    /// one): a downgrade it observes is the session's one notice.
+    #[test]
+    fn ping_shares_the_session_ttl_latch() {
+        let rt = opus(CacheTtl::OneHour);
+        assert!(!rt.cache_ttl_downgraded());
+        let mut ping_rt = rt.clone();
+        ping_rt.share_ttl_latches(&rt);
+        ping_rt
+            .ttl_downgrade_notified
+            .store(true, Ordering::Relaxed);
+        assert!(rt.cache_ttl_downgraded(), "the latch is shared");
     }
 
     #[test]
@@ -1070,10 +1489,13 @@ mod tests {
             user("hello"),
             Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
         ];
+        let tap = PingTap::default();
         let err = rt
-            .cache_keepwarm_ping(&history, 0, &CancellationToken::new())
+            .cache_keepwarm_ping(&history, 0, &CancellationToken::new(), &tap)
             .await
+            .result
             .expect_err("non-Anthropic must refuse");
+        assert!(!tap.was_sent());
         assert!(
             matches!(err, PingFailure::Fatal(ref m) if m.contains("keep-warm skipped")),
             "{err:?}"
