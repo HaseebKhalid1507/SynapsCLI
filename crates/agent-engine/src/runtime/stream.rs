@@ -2787,6 +2787,41 @@ mod tests {
             "durable prefix must be byte-identical across turns or the cache entry is dead"
         );
     }
+
+    #[test]
+    fn trace_cache_readers_see_the_mid_message_marker_on_an_injected_turn() {
+        // Telemetry regression (#443): the request trace's cache-boundary and
+        // history-tail readers only probed a message's FINAL block for
+        // `cache_control`. On an injected turn the real annotator puts the
+        // marker on block 0 and the ephemeral context after it (the #297
+        // design pinned above), so the trace reported NO message boundary
+        // and counted the whole history as recomputed tail. That made a
+        // healthy request look like a full cache rewrite. The readers must
+        // see the marker exactly where the annotator puts it.
+        use crate::runtime::trace::diagnostics::{history_tail_bytes, message_cache_marker};
+
+        let history = vec![
+            user_msg(json!("q")),
+            assistant_msg("a"),
+            user_msg(json!("let it happen")),
+        ];
+        let mut req = attach_turn_context(&history, &guard_extension_context("ambient memory"));
+        HelperMethods::annotate_cache_breakpoint(&mut req, CacheTtl::OneHour);
+
+        // Shape precondition: the marker really is mid-message.
+        let content = req[2]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content[0].get("cache_control").is_some());
+        assert!(content[1].get("cache_control").is_none());
+
+        let marker = message_cache_marker(&req[2]).expect("trace must see the mid-message marker");
+        assert_eq!(marker["ttl"], "1h");
+        // The boundary is the newest message, so nothing after it is tail.
+        assert!(
+            history_tail_bytes(&req).is_empty(),
+            "an injected turn must not report the whole history as recomputed tail"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
