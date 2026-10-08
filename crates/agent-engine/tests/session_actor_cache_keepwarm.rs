@@ -536,6 +536,18 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
         let st = keepwarm(&mut t, next_id(), "status").await;
         assert_eq!(st["active"], false, "{name} must end the period: {st}");
         assert_eq!(st["last_end"], "prefix changed", "{name}: {st}");
+        if name == "/thinking" && thinking != "off" {
+            // Budgeted thinking on this small mock prefix is (correctly) refused by
+            // the worst-case bound, which would mask the next changer's baseline.
+            // Restore the cheap thinking-off baseline before the next case.
+            t.send(SessionCommand::EngineCommand {
+                id: next_id(),
+                name: "thinking".into(),
+                arg: "off".into(),
+            })
+            .await
+            .unwrap();
+        }
     }
 
     // ── /keepwarm off is honoured per session; auto turns it back on ──
