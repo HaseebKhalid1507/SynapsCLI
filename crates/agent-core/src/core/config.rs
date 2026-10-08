@@ -480,6 +480,15 @@ impl AuthConfig {
 /// hour cap is an extra, user-chosen wall on top of it.
 pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
 
+/// Default for `cache_keepwarm_auto_max_hours`: the longest an `auto` idle
+/// period may run. Without it the ski-rental bound alone lets a 0.05×
+/// cache-read model (Opus 5.5, Sonnet 5.5) ping ~39 times over ~36h and a
+/// 0.025× model (Fable 5.1, Mythos 5.1) ~79 times over ~72h under a 1h TTL,
+/// keeping an abandoned session unparked for days. 24h: a user who steps
+/// away for a working day or overnight still comes back to a warm cache; a
+/// session left over a weekend parks. (Owner decision, task #444.)
+pub const DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS: u32 = 24;
+
 /// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
 /// docs/specs/cache-ttl-spec.md §7.
 ///
@@ -487,7 +496,8 @@ pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
 /// - `Auto`: ping while the measured ping spend of the current idle period
 ///   stays below the cost of the cache rewrite it prevents (ski-rental rule:
 ///   at most 2× the optimal spend, at most ~one rewrite on an abandoned
-///   session).
+///   session), and for at most `cache_keepwarm_auto_max_hours` (default
+///   [`DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS`]) after the session went idle.
 /// - `Hours(n)`: the same bound, and additionally stop `n` hours after the
 ///   session went idle — whichever comes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -976,6 +986,11 @@ pub struct SynapsConfig {
     /// | `auto` | `<N>h`. See [`CacheKeepWarm`] and
     /// docs/specs/cache-ttl-spec.md §7.
     pub cache_keepwarm: CacheKeepWarm,
+    /// Longest an `auto` keep-warm idle period may run, in hours
+    /// (`cache_keepwarm_auto_max_hours`, 1–48, default
+    /// [`DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS`]). An explicit `<N>h` mode
+    /// is its own window and ignores this.
+    pub cache_keepwarm_auto_max_hours: u32,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
@@ -1070,6 +1085,7 @@ impl Default for SynapsConfig {
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
             cache_keepwarm: CacheKeepWarm::Off,
+            cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
             max_fps: 60,
             scroll_lines: None,
             theme: None,
@@ -1131,6 +1147,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "cache_diagnostics",
     "cache_ttl",
     "cache_keepwarm",
+    "cache_keepwarm_auto_max_hours",
     "max_fps",
     "scroll_lines",
     "theme",
@@ -1532,6 +1549,16 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     "cache_keepwarm = {val} — expected off, auto, or 1h–{MAX_CACHE_KEEPWARM_HOURS}h; keep-warm stays off"
                 )),
             },
+            "cache_keepwarm_auto_max_hours" => {
+                match val.trim().trim_end_matches(['h', 'H']).parse::<u32>() {
+                    Ok(h) if (1..=MAX_CACHE_KEEPWARM_HOURS).contains(&h) => {
+                        config.cache_keepwarm_auto_max_hours = h
+                    }
+                    _ => config.warnings.push(format!(
+                        "cache_keepwarm_auto_max_hours = {val} — expected 1–{MAX_CACHE_KEEPWARM_HOURS}; using {DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS}"
+                    )),
+                }
+            }
             "max_fps" => match val.parse::<u32>() {
                 Ok(fps) if (1..=1000).contains(&fps) => config.max_fps = fps,
                 Ok(_) => config.warnings.push(format!(
@@ -2820,6 +2847,22 @@ mod tests {
 
         let c = load_config_from_str("cache_keepwarm = 6h\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Hours(6));
+
+        assert_eq!(c.cache_keepwarm_auto_max_hours, 24, "default auto cap");
+
+        let c = load_config_from_str("cache_keepwarm_auto_max_hours = 8\n");
+        assert_eq!(c.cache_keepwarm_auto_max_hours, 8);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = load_config_from_str("cache_keepwarm_auto_max_hours = 12h\n");
+        assert_eq!(c.cache_keepwarm_auto_max_hours, 12);
+        for bad in ["0", "49", "lots"] {
+            let c = load_config_from_str(&format!("cache_keepwarm_auto_max_hours = {bad}\n"));
+            assert_eq!(c.cache_keepwarm_auto_max_hours, 24, "{bad}");
+            assert!(
+                c.warnings.iter().any(|w| w.contains("auto_max_hours")),
+                "{bad}"
+            );
+        }
 
         let c = load_config_from_str("cache_keepwarm = forever\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Off, "garbage keeps keep-warm off");
