@@ -574,11 +574,11 @@
     "keywords": ["keepwarm", "keep-warm", "cache", "ttl", "prompt cache", "idle", "cost"],
     "lines": [
       "/keepwarm (or /keepwarm status) shows the mode, the active idle period (next ping, spend vs. bound, whether the cached prefix is unchanged) and this session's keep-warm spend.",
-      "/keepwarm auto keeps the prompt cache warm while idle until the pings would cost more than the rewrite they prevent: about 19 pings over ~17h when the server honours cache_ttl = 1h, about 12 over ~55 min with 5m or hybrid (or a 1h setting the server silently downgraded). On an already idle session it starts at once.",
-      "/keepwarm 6h applies the same bound and also stops 6 hours after the session went idle (N = 1–48). /keepwarm off stops it for this session; the choice survives park and daemon reload.",
+      "/keepwarm auto keeps the prompt cache warm while idle until the pings would cost more than the rewrite they prevent, or for at most cache_keepwarm_auto_max_hours (default 24h) after the session went idle. With cache_ttl = 1h honoured by the server: about 19 pings over ~17h on most models (0.1x cache reads); 26 over ~24h on Opus 5.5 / Sonnet 5.5 (0.05x; 39 over ~36h without the cap) and on Fable 5.1 / Mythos 5.1 (0.025x; 79 over ~72h without the cap). With 5m or hybrid (or a 1h setting the server silently downgraded): about 12 pings over ~55 min (0.1x), 24 over ~1.8h (0.05x), 49 over ~3.7h (0.025x). On an already idle session it starts at once; after it stopped at the cost bound, turning it off and on again does not restart it until your next message.",
+      "/keepwarm 6h applies the same bound and stops 6 hours after the session went idle instead of the auto cap (N = 1–48). /keepwarm off stops it for this session; the choice survives park and daemon reload.",
       "Nothing is pinged when nothing is cached (a prompt below the model's cache minimum), when the next turn would roll the context over first, or when one worst-case ping costs more than the rewrite (budgeted thinking on a small prompt).",
       "Pings stop by themselves when the next request would differ (/model, /thinking, /system, tool activation, /compact, /clear); read-only commands do not affect them. A new message ends the idle period.",
-      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; both persist with the session. The default comes from cache_keepwarm in config (off unless set)."
+      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; the labels are saved with the session snapshot. The default comes from cache_keepwarm in config (off unless set)."
     ],
     "related": ["/stats", "/context"]
   },

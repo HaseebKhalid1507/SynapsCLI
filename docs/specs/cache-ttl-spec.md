@@ -444,12 +444,14 @@ the prefix at the cache-read price instead of re-writing it. Works with every
 TTL (`5m`, `1h`, `hybrid`) and every thinking mode, within the guards below.
 
 ```
-cache_keepwarm = auto     # off (default) | auto | <N>h  (N = 1–48)
+cache_keepwarm = auto               # off (default) | auto | <N>h  (N = 1–48)
+cache_keepwarm_auto_max_hours = 24  # auto's longest idle period (1–48, default 24)
 ```
 
 Per session: `/keepwarm [status|off|auto|<N>h]`. `auto` stops by the cost
-bound below; `<N>h` also stops N hours after the session went idle, whichever
-comes first. `auto` / `<N>h` on a session that is already idle starts a period
+bound below or `cache_keepwarm_auto_max_hours` after the session went idle
+(default 24h); `<N>h` stops by the bound or N hours after the session went
+idle, whichever comes first (the auto cap does not apply to it). `auto` / `<N>h` on a session that is already idle starts a period
 at once if it is eligible. The override survives park and daemon reload: it is
 kept on the session handle (`SessionHandle::cache_keepwarm_override`), so even
 a reload whose actor checkpoint did not confirm re-applies it instead of the
@@ -517,8 +519,12 @@ This is the deterministic ski-rental strategy:
 - user never returns → waste ≤ B, i.e. **at most one rewrite**.
 
 `P` and `B` are re-measured from every ping (`cache_read + cache_write`);
-before the first ping `P` is the last request's `read + write + input +
-output`.
+before the first ping `P` is the last request's `read + write + input` plus
+the part of its reply the prefix will hold: `min(output, estimate(reply
+without thinking blocks))` — thinking is billed as output once and stripped
+from the history the next request re-sends, so it is never cached and ping 1
+is not allowed to "write" it (`runtime::keepwarm::reply_prefix_tokens`,
+the conservative token estimator).
 
 Numbers (Anthropic's price table; [pr]), P = 300k, thinking off / adaptive
 (`max_tokens` = 1):
@@ -533,9 +539,33 @@ Numbers (Anthropic's price table; [pr]), P = 300k, thinking off / adaptive
 case makes the 20th not fit, so 19 (`ski_rental_1h_is_nineteen_pure_reads…`).
 A ping that thinks a lot ends the period sooner: 5k thinking tokens on Sonnet
 4.6 ($0.075) cut a 1h period to 10 pings
-(`an_expensive_ping_stops_the_period_early`). Models with 0.05× / 0.025×
-reads allow 2× / 4× more pings — the ledger uses the same per-model pricing as
-the session.
+(`an_expensive_ping_stops_the_period_early`).
+
+Per cache-read multiplier (pure reads, the ledger uses the session's
+per-model pricing; `ping_counts_per_multiplier_and_the_auto_cap`):
+
+| read multiplier (models) | `1h`: bound alone | `1h`: `auto` (24h cap) | `5m` / `hybrid` |
+|---|---|---|---|
+| 0.1× (most models) | 19 pings, ~17.4 h | 19 pings, ~17.4 h | 12 pings, ~54 min |
+| 0.05× (Opus 5.5, Sonnet 5.5) | 39 pings, ~35.75 h | **26 pings, ~23.8 h** | 24 pings, ~1.8 h |
+| 0.025× (Fable 5.1, Mythos 5.1) | 79 pings, ~72.4 h | **26 pings, ~23.8 h** | 49 pings, ~3.7 h |
+
+(`2.0 / m` reads fit a 1h bound, `1.25 / m` a 5m one; the worst case's output
+token makes the last whole one not fit.) The bound alone would keep a
+0.025× session unparked for three days. **`auto` therefore also stops
+`cache_keepwarm_auto_max_hours` (default 24) after the session went idle**:
+someone back after a working day or a night still finds the cache warm, a
+session left over a weekend parks. Owner decision (task #444), configurable;
+an explicit `<N>h` (1–48) is the user's own window and ignores it.
+
+**Cache epochs.** A period's ledger belongs to the cache entry it protects.
+An epoch starts with a real request's usage (a new anchor from a real turn)
+and lasts until the next one, a compaction, or a conversation swap
+(`/clear`, `/resume`). Ending a period and starting another within the same
+epoch — `/keepwarm off` then `auto`, a period ended by a prefix change that
+was undone — **continues** it: same ledger, same ping count (ping 1's write
+allowance is never granted twice), same idle start for the windows. So after
+`BoundReached`, `off` → `auto` pings nothing until the next real turn.
 
 `hybrid`: the bound prices the whole prefix at the 5m rate. The 1h
 tools/system entries usually survive a short lapse, so the true rewrite is
@@ -592,9 +622,12 @@ breakpoint (markers included) and the `anthropic-beta` header; not
 - **Context rollover**: a real turn runs the context-management pre-request
   assessment and may roll the context over (or hard-stop) before its first
   request — then what is cached is not what it sends. The probe runs the same
-  assessment (`context::assess` + `assess_context`, same system prompt, tool
-  projection and reserves) for the history plus an empty next message,
-  without committing the policy state. Rollover or HardStop → no period at
+  assessment through the same function (`stream::pre_request_context_budget`
+  + `assess_context`, same system prompt, tool projection and reserves) over
+  the same messages a real round assesses — the history plus an empty next
+  message **after the request-local history image cap** — without committing
+  the policy state. (A `before_message` hook's per-turn injection is the one
+  input it cannot know in advance.) Rollover or HardStop → no period at
   `Idle`, and an active period ends at its next due ping.
 
 The tool schema comes from the same selection a turn start makes
@@ -625,7 +658,8 @@ variant exhaustively and drives them through the actor.
 | Machine slept past the TTL | Age check at fire time → period ends, no ping. Slept but still in time → the wall-clock deadline fires the ping early enough (§7.3). |
 | Transient error (429, 5xx, 529, network, in-stream) | Usage booked; retry after 5 s, 15 s, 30 s while the retry still lands before the late guard and fits the bound; then end. |
 | Any other 4xx, auth, config | Usage (if any) booked; end, no retry. |
-| Ping aborted in flight (turn, compaction, park, session end) | Booked: its real usage if any arrived, else — once the request left (`PingTap::sent`, set right before the HTTP send) — the period's worst-case estimate for it. |
+| `/clear` or `/resume` while a period is active | The period ends at once (`prefix changed`) before the swap, an in-flight ping is aborted, and its cost is booked to the conversation being left (which the swap saves), never to the new one. |
+| Booking a ping — every path (finished OK, failed, aborted, task panic) | One rule (`runtime::keepwarm::ping_booking`, applied by `PingTap::bill`): usage arrived → its real cost; else, if the request was **dispatched**, the worst case for that ping — unless it failed to connect with no HTTP status; else $0. "Dispatched" (`PingTap::sent`) is set when the HTTP client pulls the request body over an established connection (hyper only polls the body after connecting and writing the head; the body carries an explicit `Content-Length`, so the wire framing is unchanged) or when a response arrives. A refused connection is never dispatched; a read timeout after the body went out is. |
 | Turn, compaction, another ping in flight | Never pinged concurrently. |
 | Driver armed, queued work, pending prompt | End (`Blocked`). |
 | `max_session_cost` | Checked against the worst case (§7.2); all ping spend counts toward it. |
@@ -638,12 +672,16 @@ runtime and conversation, and the ping must be built by that runtime from
 that history. Deferral keeps one idle runtime resident for at most the
 period's length, which the cost bound already caps.
 
-`SYNAPS_CACHE_KEEPWARM_INTERVAL_MS` (replaces the interval) exists only in
-test builds: `session::cache_keepwarm::interval_override` is compiled under
-`#[cfg(any(test, feature = "testing"))]` and is a constant `None` otherwise.
-The integration tests get the `testing` feature through synaps-engine's
-self dev-dependency (`synaps-engine = { path = ".", features = ["testing"] }`),
-like every other test seam in the crate.
+The ping interval test seam is code-only:
+`session::cache_keepwarm::testing::IntervalOverride` (an RAII guard over a
+process-wide override), compiled under `#[cfg(any(test, feature =
+"testing"))]`; `interval_override()` is a constant `None` otherwise. It is
+deliberately **not** an environment variable: `cargo test` feature-unifies
+`agent-engine/testing` into the dev build of the `synaps` binary (the root
+crate's dev-dependency), and an env-driven override would be live in that
+runnable binary. No binary target calls the guard, so no binary input (env,
+config, argv) can reach it. The integration tests get the `testing` feature
+through synaps-engine's self dev-dependency.
 
 ### 7.6 The ping request
 
@@ -670,14 +708,30 @@ written to history, the session file or the transcript.
 ### 7.7 Cost visibility and logs
 
 - Ping spend is added to the session cost (persisted, counted against
-  `max_session_cost`) and labelled: `keepwarm_cost` — persisted with the
-  session (`Session::keepwarm_cost`, journal meta), so it survives
-  resume/reload — → footer `$1.2345 (kw $0.0800)`, `/stats`, the `Status`
-  query (`keepwarm_cost`, `keepwarm`), `/keepwarm status`.
+  `max_session_cost`) and labelled: `keepwarm_cost` → footer `$1.2345 (kw
+  $0.0800)`, `/stats`, the `Status` query (`keepwarm_cost`, `keepwarm`),
+  `/keepwarm status`.
 - Ping tokens are added to the session token totals (input, output, cache
   read, cache write) and shown separately (`keepwarm_tokens`; `/stats`:
   `incl. keep-warm read … / write … / input … / output …`), so the cache
   figures add up.
+- **Persistence: snapshot only.** `Session::keepwarm_cost` and
+  `Session::keepwarm_tokens` are written to the `.json` snapshot and **never
+  to the journal**. The v2 journal's `SessionMeta` is `deny_unknown_fields`
+  in every shipped build: a 0.10.1 reader treats a meta record with a new
+  field as a torn tail, silently truncates the loaded history, and its next
+  save resets the journal to that truncation. The snapshot `Session`
+  tolerates unknown fields, so older builds just ignore the labels. In
+  journal mode the labels are therefore as of the last snapshot — slightly
+  stale until the next one (the session cost and token totals themselves are
+  journaled and always current). On load both labels are clamped under the
+  totals they are part of (`Session::clamp_keepwarm_to_totals`; on resume the
+  cache-token buckets restart at 0 with the cache totals, which are not
+  persisted). `journal_written_by_this_build_parses_with_the_0_10_1_reader`
+  replays this build's journal through a frozen copy of 0.10.1's record types.
+- A compaction successor restarts the keep-warm subtotal exactly like the
+  totals it belongs to: cost, input and output restart at 0; the cache-token
+  buckets are kept, like `total_cache_*`.
 - API log (telemetry) records for pings carry `"keepwarm": true`.
 - One `info` line per ping (age, TTL, read / write / input / output tokens,
   cost, ledger vs bound), one per period start (incl. worst-case ping) and end
@@ -693,7 +747,9 @@ written to history, the session file or the transcript.
   `max_tokens` and a context rollover ahead (without committing policy
   state); usage returned on an in-stream error; the ping shares the session's
   TTL latch; changed prefix refused before the network; 4xx fatal / 5xx &
-  429 transient with no transport retry; anchor only moves forward.
+  429 transient with no transport retry; anchor only moves forward; the
+  booking rule table; a refused connection is never dispatched (books $0);
+  a dispatched ping with no usage books the worst case.
 - `session::cache_keepwarm` (pure, injected clocks): ski-rental counts (1h:
   19, 5m: 12) with measured costs, overhead, first write, expensive thinking;
   the worst-case rule (Sonnet 4.6 xhigh, 5m, P = 20k → no period) and
@@ -702,20 +758,31 @@ written to history, the session file or the transcript.
   (downgrade, evidence, upgrade/downgrade by pings); suspend at minute 10 for
   30 min under 1h → ping before expiry; anchor scheduling; hybrid; late idle;
   sleep past expiry; backoff; failed spend in the ledger; 4xx; `<N>h` vs
-  bound; the interval override is test-only.
+  bound; ping counts per read multiplier and the 24h `auto` cap; cache
+  epochs (a re-enabled period continues an exhausted ledger, ping 1's write
+  allowance is never re-granted); ping 1's allowance excludes thinking; the
+  actor's timer clamps to `WALL_POLL` and is off with no period / a ping in
+  flight; the interval override is set only by code, never by the
+  environment.
 - `daemon::reload`: the `/keepwarm` override survives a reload whose
   checkpoint did not confirm.
 - `tests/session_actor_cache_keepwarm.rs` (real actor): the command matrix;
   pings with cost and tokens surfaced, detach not stopping them, auto-park
   deferred until the bound ends the period (exactly 19 pings); explicit park
-  ends the period; `/keepwarm auto` / `6h` on an idle session starts one at
-  once; a billed ping that failed is booked; an aborted in-flight ping is
-  booked at its worst case. The waits there are generous (60 s) on purpose:
+  ends the period while the zero-grace auto-park stays deferred;
+  `/keepwarm auto` / `6h` on an idle session starts one at once; a billed
+  ping that failed is booked; an aborted in-flight ping is booked at its
+  worst case; after the bound, `off` → `auto` pings nothing until a real
+  turn; `/clear` and `/resume` mid-ping book the ping to the old
+  conversation. The waits there are generous (60 s) on purpose:
   a 300 ms test interval against a 1h TTL means lateness never changes the
   outcome (pings cannot expire; the count is fixed by the ledger, not the
   clock), so nothing asserts timing, only order and arithmetic.
-- `agent_core::pricing`: Opus 4 / 4.1 legacy prices; documented read
-  multipliers.
+- `agent_core::pricing`: Opus 4 / 4.1 legacy prices (incl. `@` / Bedrock
+  IDs); documented read multipliers; Sonnet 5 at $2 / $10; Haiku 5.5's two
+  prompt-length tiers.
+- `agent_core::session_journal`: keep-warm labels snapshot-only, clamped on
+  load, and the journal readable by 0.10.1's `SessionMeta`.
 
 ---
 
