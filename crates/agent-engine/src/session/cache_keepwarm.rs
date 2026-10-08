@@ -47,7 +47,8 @@ use super::actor::SessionActor;
 use super::types::ClientKind;
 use crate::core::config::{CacheKeepWarm, CacheTtl};
 use crate::runtime::keepwarm::{
-    CacheAnchor, KeepWarmProbe, KeepWarmUsage, PingFailure, PingOutcome, PingReport, PingTap,
+    CacheAnchor, KeepWarmProbe, KeepWarmUsage, PingBill, PingFailure, PingOutcome, PingReport,
+    PingTap,
 };
 
 /// No ping may start once the cache is this close to expiry: the request
@@ -107,19 +108,57 @@ pub fn ping_interval(ttl: CacheTtl) -> Duration {
     governing_ttl(ttl) - safety_margin(ttl)
 }
 
-/// Test seam: `SYNAPS_CACHE_KEEPWARM_INTERVAL_MS` replaces the interval.
-/// Compiled only into test builds (`testing` feature); production ignores it.
+/// The ping interval override, in ms (0 = none). Test-only: written solely
+/// by [`testing::IntervalOverride`], which no binary calls.
 #[cfg(any(test, feature = "testing"))]
+static INTERVAL_OVERRIDE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam replacing `ping_interval(honoured TTL)`.
+///
+/// Not an environment variable on purpose: `cargo test` feature-unifies
+/// `agent-engine/testing` into the dev build of the `synaps` binary, so an
+/// env-driven override would be live in a runnable binary. This one is set
+/// only by code ([`testing::IntervalOverride`]), compiled only under
+/// `cfg(test)` / the `testing` feature, and no binary target calls it: no
+/// binary input (env, config, argv) can reach it. In a build without the
+/// feature it is a constant `None`.
 pub fn interval_override() -> Option<Duration> {
-    std::env::var("SYNAPS_CACHE_KEEPWARM_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let ms = INTERVAL_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return Some(Duration::from_millis(ms));
+        }
+    }
+    None
 }
 
-#[cfg(not(any(test, feature = "testing")))]
-pub fn interval_override() -> Option<Duration> {
-    None
+/// Test-only controls (`cfg(test)` / `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// Shortens the keep-warm ping interval for every session in this
+    /// process while alive (tests that use it must be `#[serial]`).
+    #[must_use = "the override is cleared when the guard drops"]
+    pub struct IntervalOverride(());
+
+    impl IntervalOverride {
+        pub fn set(interval: Duration) -> Self {
+            let ms = u64::try_from(interval.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            super::INTERVAL_OVERRIDE_MS.store(ms, Ordering::Relaxed);
+            Self(())
+        }
+    }
+
+    impl Drop for IntervalOverride {
+        fn drop(&mut self) {
+            super::INTERVAL_OVERRIDE_MS.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Evidence about the TTL the server honours for this session.
@@ -307,6 +346,30 @@ pub struct PeriodConfig {
     pub max_tokens: u64,
     /// Replaces `ping_interval(honoured TTL)` (test seam only).
     pub interval_override: Option<Duration>,
+    /// Longest an `auto` period may run, in hours
+    /// (`cache_keepwarm_auto_max_hours`; 0 = no cap). `<N>h` ignores it.
+    pub auto_max_hours: u32,
+    /// Tokens of the last reply that the cached prefix will actually hold
+    /// (thinking stripped on resend, see
+    /// `runtime::keepwarm::reply_prefix_tokens`). `None`: the reply's
+    /// billed `output_tokens`.
+    pub reply_tokens: Option<u64>,
+}
+
+/// What a cache epoch carries from one period to the next. An epoch is the
+/// life of one real request's cache entry: only a new real request (new
+/// usage, new anchor) starts a fresh one. Ending a period (e.g. `/keepwarm
+/// off`) and starting another without a real turn in between CONTINUES the
+/// epoch: same ledger, same idle start, ping 1's write allowance not
+/// re-granted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EpochCarry {
+    pub ledger_usd: f64,
+    pub pings: u32,
+    pub prefix_tokens: u64,
+    pub ping_input: u64,
+    pub idle_since: Instant,
+    pub idle_wall: SystemTime,
 }
 
 /// Timer decision.
@@ -370,6 +433,33 @@ impl Period {
         now: Instant,
         wall: SystemTime,
     ) -> Result<Period, PeriodEnd> {
+        Self::start_in_epoch(
+            id,
+            cfg,
+            fingerprint,
+            last,
+            evidence,
+            anchor,
+            now,
+            wall,
+            None,
+        )
+    }
+
+    /// [`start`](Self::start), continuing `carry` when the cache epoch has
+    /// not changed since an earlier period (see [`EpochCarry`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_in_epoch(
+        id: u64,
+        cfg: PeriodConfig,
+        fingerprint: u64,
+        last: &KeepWarmUsage,
+        evidence: TtlEvidence,
+        anchor: CacheAnchor,
+        now: Instant,
+        wall: SystemTime,
+        carry: Option<&EpochCarry>,
+    ) -> Result<Period, PeriodEnd> {
         let cached = last.cache_read_tokens + last.cache_write_tokens;
         if cached == 0 {
             return Err(PeriodEnd::NothingCached);
@@ -382,8 +472,13 @@ impl Period {
             });
         }
         // The next turn re-sends what is cached plus the last request's
-        // uncached tail and its reply; ping 1 caches those.
-        let first_write = last.input_tokens + last.output_tokens;
+        // uncached tail and its reply; ping 1 caches those. Only what the
+        // prefix will hold counts: output the API strips on resend
+        // (thinking) is billed once and never cached.
+        let reply = cfg
+            .reply_tokens
+            .map_or(last.output_tokens, |r| r.min(last.output_tokens));
+        let first_write = last.input_tokens + reply;
         let prefix_tokens = cached + first_write;
         let mut p = Period {
             id,
@@ -407,6 +502,18 @@ impl Period {
             in_flight: false,
             fired_age: Duration::ZERO,
         };
+        if let Some(c) = carry {
+            // Same epoch: the ledger, the ping count (so ping 1's write
+            // allowance is never re-granted), and the idle start continue.
+            p.ledger_usd = c.ledger_usd;
+            p.pings = c.pings;
+            p.idle_since = c.idle_since;
+            p.idle_wall = c.idle_wall;
+            if c.pings > 0 {
+                p.prefix_tokens = c.prefix_tokens;
+                p.ping_input = c.ping_input;
+            }
+        }
         p.reprice();
         // Due at anchor + interval; a turn that streamed past it is due now.
         let interval = p.interval();
@@ -425,6 +532,18 @@ impl Period {
             return Err(r);
         }
         Ok(p)
+    }
+
+    /// What the next period of this cache epoch continues from.
+    pub fn epoch_carry(&self) -> EpochCarry {
+        EpochCarry {
+            ledger_usd: self.ledger_usd,
+            pings: self.pings,
+            prefix_tokens: self.prefix_tokens,
+            ping_input: self.ping_input,
+            idle_since: self.idle_since,
+            idle_wall: self.idle_wall,
+        }
     }
 
     /// Bound and worst case for the current prefix, TTL and ping count.
@@ -501,16 +620,17 @@ impl Period {
         Some(self.next_at.min(now + wall_left))
     }
 
+    /// `<N>h` window, or `auto`'s `auto_max_hours` cap, from the idle start.
     fn past_window(&self, at: Instant, wall: SystemTime) -> Option<PeriodEnd> {
-        match self.cfg.mode {
-            CacheKeepWarm::Hours(h) => {
-                let window = Duration::from_secs(u64::from(h) * 3600);
-                let walled = wall.duration_since(self.idle_wall).unwrap_or_default();
-                (at.saturating_duration_since(self.idle_since) >= window || walled >= window)
-                    .then_some(PeriodEnd::HoursReached(h))
-            }
-            _ => None,
-        }
+        let h = match self.cfg.mode {
+            CacheKeepWarm::Hours(h) => h,
+            CacheKeepWarm::Auto if self.cfg.auto_max_hours > 0 => self.cfg.auto_max_hours,
+            _ => return None,
+        };
+        let window = Duration::from_secs(u64::from(h) * 3600);
+        let walled = wall.duration_since(self.idle_wall).unwrap_or_default();
+        (at.saturating_duration_since(self.idle_since) >= window || walled >= window)
+            .then_some(PeriodEnd::HoursReached(h))
     }
 
     fn past_bound(&self) -> Option<PeriodEnd> {
@@ -658,6 +778,17 @@ pub(crate) struct PingTask {
     tap: PingTap,
     /// Pricing model at send time (the runtime may be gone when it ends).
     model: String,
+    /// The period's worst case for this ping at send time: what it is
+    /// booked at if it was dispatched but no usage arrived.
+    worst_usd: f64,
+}
+
+impl PingTask {
+    /// The ONE booking rule (`runtime::keepwarm::ping_booking`) applied to
+    /// this ping; every path that ends a ping books through here.
+    fn bill(&self) -> PingBill {
+        self.tap.bill(&self.model, self.worst_usd)
+    }
 }
 
 /// Actor-owned keep-warm state.
@@ -665,6 +796,12 @@ pub(crate) struct PingTask {
 pub(crate) struct KeepWarmState {
     /// `cache_keepwarm` from config at session create.
     configured: CacheKeepWarm,
+    /// `cache_keepwarm_auto_max_hours` from config at session create.
+    auto_max_hours: u32,
+    /// The current cache epoch's carry (see [`EpochCarry`]); `None` until a
+    /// period of this epoch ended. Reset by every real request's usage, a
+    /// compaction and a conversation swap.
+    epoch: Option<EpochCarry>,
     /// `/keepwarm …` for this session (survives park and daemon reload).
     pub(crate) override_mode: Option<CacheKeepWarm>,
     /// Shared with the session handle so a daemon reload that cannot
@@ -688,12 +825,17 @@ pub(crate) struct KeepWarmState {
 pub type OverrideSlot = std::sync::Arc<std::sync::Mutex<Option<CacheKeepWarm>>>;
 
 impl KeepWarmState {
-    pub(crate) fn new(configured: CacheKeepWarm, override_slot: OverrideSlot) -> Self {
+    pub(crate) fn new(
+        configured: CacheKeepWarm,
+        auto_max_hours: u32,
+        override_slot: OverrideSlot,
+    ) -> Self {
         let override_mode = *override_slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self {
             configured,
+            auto_max_hours,
             override_mode,
             override_slot,
             ..Self::default()
@@ -718,11 +860,15 @@ impl KeepWarmState {
 
     /// When the actor's timer should next wake: the ping deadline, but never
     /// later than [`WALL_POLL`] (re-reads the wall clock after a suspend).
+    /// `None` (no timer) with no period or while a ping is in flight.
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        let now = Instant::now();
+        self.deadline_at(Instant::now(), SystemTime::now())
+    }
+
+    fn deadline_at(&self, now: Instant, wall: SystemTime) -> Option<Instant> {
         self.period
             .as_ref()
-            .and_then(|p| p.deadline(now, SystemTime::now()))
+            .and_then(|p| p.deadline(now, wall))
             .map(|d| d.min(now + WALL_POLL))
     }
 }
@@ -780,6 +926,8 @@ impl SessionActor {
     /// latest request's usage decides whether anything is cached at all.
     pub(crate) fn cache_keepwarm_note_usage(&mut self, usage: KeepWarmUsage) {
         self.cache_keepwarm.last_request = Some(usage);
+        // A real request refreshed/rewrote the cache: a new epoch.
+        self.cache_keepwarm.epoch = None;
     }
 
     /// A real turn is starting: the idle period is over, any ping in flight
@@ -796,6 +944,20 @@ impl SessionActor {
         self.cache_keepwarm_end(PeriodEnd::Compaction);
         self.cache_keepwarm.turn_started_at = None;
         self.cache_keepwarm.last_request = None;
+        self.cache_keepwarm.epoch = None;
+    }
+
+    /// `/clear` (`NewSession`) or `/resume` is about to replace the
+    /// conversation. Call it BEFORE the swap: the period ends at once
+    /// (prefix changed), a ping in flight is aborted, and its cost is booked
+    /// to the conversation it was keeping warm — the old one, which the swap
+    /// then saves. Nothing of the old conversation may start a period on
+    /// the new one.
+    pub(crate) fn cache_keepwarm_conversation_replaced(&mut self) {
+        self.cache_keepwarm_end(PeriodEnd::PrefixChanged);
+        self.cache_keepwarm.turn_started_at = None;
+        self.cache_keepwarm.last_request = None;
+        self.cache_keepwarm.epoch = None;
     }
 
     /// An explicit park request: an active period ends ("parked by
@@ -830,35 +992,25 @@ impl SessionActor {
         self.emit_conversation();
     }
 
-    /// Abort the in-flight ping, if any, and book what it may have cost: its
-    /// real usage if any arrived, else — once the request left — the
-    /// period's worst-case estimate for it.
+    /// Abort the in-flight ping, if any, and book what it may have cost
+    /// ([`PingTask::bill`]: real usage, else the worst case once dispatched,
+    /// else nothing).
     fn cache_keepwarm_abort_ping(&mut self) {
         let Some(task) = self.cache_keepwarm.task.take() else {
             return;
         };
         task.cancel.cancel();
         task.handle.abort();
-        let usage = task.tap.usage();
-        let cost = if usage != KeepWarmUsage::default() {
-            usage.cost_usd(&task.model)
-        } else if task.tap.was_sent() {
-            self.cache_keepwarm
-                .period
-                .as_ref()
-                .map_or(0.0, Period::worst_next_usd)
-        } else {
-            0.0
-        };
-        if cost > 0.0 {
+        let bill = task.bill();
+        if bill.cost_usd > 0.0 {
             tracing::info!(
                 session = %self.id,
-                cost_usd = cost,
-                measured = usage != KeepWarmUsage::default(),
+                cost_usd = bill.cost_usd,
+                booking = ?bill.booking,
                 "cache keep-warm ping aborted in flight; booked"
             );
         }
-        self.cache_keepwarm_book(&usage, cost);
+        self.cache_keepwarm_book(&bill.usage, bill.cost_usd);
     }
 
     /// End the active period (and abort any ping) with one final log line.
@@ -877,6 +1029,8 @@ impl SessionActor {
             "cache keep-warm period ended"
         );
         self.cache_keepwarm.last_end = Some(reason.to_string());
+        // A later period of the same cache epoch continues from here.
+        self.cache_keepwarm.epoch = Some(p.epoch_carry());
         // A period defers parking; now the session may park normally.
         self.rearm_park();
     }
@@ -948,6 +1102,10 @@ impl SessionActor {
             model: self.runtime.model().to_string(),
             max_tokens: probe.max_tokens,
             interval_override: interval_override(),
+            auto_max_hours: self.cache_keepwarm.auto_max_hours,
+            reply_tokens: Some(crate::runtime::keepwarm::reply_prefix_tokens(
+                &self.conv.api_messages,
+            )),
         };
         let evidence = TtlEvidence {
             downgraded: self.runtime.cache_ttl_downgraded(),
@@ -958,7 +1116,8 @@ impl SessionActor {
         self.cache_keepwarm.next_period_id += 1;
         let id = self.cache_keepwarm.next_period_id;
         let now = Instant::now();
-        match Period::start(
+        let carry = self.cache_keepwarm.epoch;
+        match Period::start_in_epoch(
             id,
             cfg,
             probe.fingerprint,
@@ -967,6 +1126,7 @@ impl SessionActor {
             anchor,
             now,
             SystemTime::now(),
+            carry.as_ref(),
         ) {
             Ok(p) => {
                 tracing::info!(
@@ -1043,6 +1203,7 @@ impl SessionActor {
             Fire::End(reason) => self.cache_keepwarm_end(reason),
             Fire::Ping => {
                 let expect = p.fingerprint();
+                let worst_usd = p.worst_next_usd();
                 // A detached clone sharing the anchor and the TTL latches:
                 // the actor keeps serving clients while the ping runs; a
                 // turn start aborts it.
@@ -1063,6 +1224,7 @@ impl SessionActor {
                     cancel,
                     tap,
                     model: self.runtime.model().to_string(),
+                    worst_usd,
                 });
             }
         }
@@ -1088,9 +1250,10 @@ impl SessionActor {
                 notices: Vec::new(),
             },
         };
-        // Book on EVERY path: success, failure, retry.
-        let cost = report.usage.cost_usd(&task.model);
-        self.cache_keepwarm_book(&report.usage, cost);
+        // Book on EVERY path (success, failure, panic) by the one rule.
+        let bill = task.bill();
+        let cost = bill.cost_usd;
+        self.cache_keepwarm_book(&bill.usage, cost);
         for notice in &report.notices {
             self.emit(crate::session::SessionEventWire::SystemNotice(
                 notice.clone(),
@@ -1306,6 +1469,8 @@ mod tests {
             model: model.to_string(),
             max_tokens,
             interval_override: None,
+            auto_max_hours: 0,
+            reply_tokens: None,
         }
     }
 
@@ -1873,8 +2038,29 @@ mod tests {
 
     #[test]
     fn the_actor_polls_the_wall_clock_while_a_period_is_active() {
-        assert!(WALL_POLL <= Duration::from_secs(15));
         assert!(WALL_POLL < safety_margin(CacheTtl::FiveMinutes));
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(61_000);
+        let mut kw = KeepWarmState::default();
+        assert_eq!(kw.deadline_at(t0, w0), None, "no period: no timer");
+        // A 1h period: the ping is 55 min away, the timer wakes at WALL_POLL.
+        kw.period = Some(start(
+            cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, OPUS),
+            &last_read(OPUS),
+            t0,
+            w0,
+        ));
+        assert_eq!(kw.deadline_at(t0, w0), Some(t0 + WALL_POLL));
+        // Due sooner than WALL_POLL: the ping deadline itself.
+        let (near, wnear) = (
+            t0 + 55 * MIN - Duration::from_secs(3),
+            w0 + 55 * MIN - Duration::from_secs(3),
+        );
+        assert_eq!(kw.deadline_at(near, wnear), Some(t0 + 55 * MIN));
+        // In flight: no timer (the ping's completion wakes the actor).
+        let p = kw.period.as_mut().unwrap();
+        assert_eq!(p.fire(t0 + 55 * MIN, w0 + 55 * MIN, 0.0, None), Fire::Ping);
+        assert_eq!(kw.deadline_at(t0 + 55 * MIN, w0 + 55 * MIN), None);
     }
 
     // ── robustness ──
@@ -1981,13 +2167,193 @@ mod tests {
         );
     }
 
+    /// The interval override is reachable only from code (the
+    /// `testing::IntervalOverride` guard, compiled under `cfg(test)` / the
+    /// `testing` feature and called by no binary), never from the
+    /// environment — so a dev `synaps` binary built by `cargo test` with the
+    /// feature unified in cannot be told to ping faster.
     #[test]
     #[serial_test::serial(synaps_keepwarm_interval)]
-    fn the_interval_override_is_test_only() {
-        // Compiled only under `cfg(any(test, feature = "testing"))`; the
-        // production build's `interval_override` is a constant `None`.
-        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_CACHE_KEEPWARM_INTERVAL_MS", "250");
-        assert_eq!(interval_override(), Some(Duration::from_millis(250)));
+    fn the_interval_override_is_set_only_by_code_never_by_the_environment() {
+        let _env = crate::test_env::EnvVarGuard::set("SYNAPS_CACHE_KEEPWARM_INTERVAL_MS", "250");
+        assert_eq!(interval_override(), None, "the old env var does nothing");
+        {
+            let _g = testing::IntervalOverride::set(Duration::from_millis(250));
+            assert_eq!(interval_override(), Some(Duration::from_millis(250)));
+        }
+        assert_eq!(interval_override(), None, "cleared with the guard");
+    }
+
+    // ── cache epochs (I-1) ──
+
+    /// BoundReached → `/keepwarm off` → `auto` in the same epoch: the
+    /// ledger continues, so the re-enabled period does not start.
+    #[test]
+    fn a_re_enabled_period_continues_the_exhausted_ledger() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(80_000);
+        let c = || cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, OPUS);
+        let mut p = start(c(), &last_read(OPUS), t0, w0);
+        let read = usage(OPUS, P, 0, 0, 0);
+        let end = loop {
+            let at = p.next_at();
+            let wat = w0 + (at - t0);
+            match p.fire(at, wat, 0.0, None) {
+                Fire::Ping => {}
+                Fire::End(r) => break r,
+                Fire::NotYet => unreachable!(),
+            }
+            p.charge(read.cost_usd(OPUS));
+            if let Err(r) = p.ping_sent(&read, Some(anchor_at(at, wat)), false) {
+                break r;
+            }
+        };
+        assert!(matches!(end, PeriodEnd::BoundReached { .. }), "{end}");
+        let carry = p.epoch_carry();
+        assert_eq!(carry.pings, 19);
+        // Re-enabled right after the last ping (its anchor): still bound.
+        let anchor = p.anchor;
+        let err = Period::start_in_epoch(
+            2,
+            c(),
+            7,
+            &last_read(OPUS),
+            ev_1h(),
+            anchor,
+            anchor.mono,
+            anchor.wall,
+            Some(&carry),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PeriodEnd::BoundReached { .. }), "{err}");
+        // A new epoch (no carry) would have started afresh.
+        assert!(Period::start_in_epoch(
+            3,
+            c(),
+            7,
+            &last_read(OPUS),
+            ev_1h(),
+            anchor,
+            anchor.mono,
+            anchor.wall,
+            None
+        )
+        .is_ok());
+    }
+
+    /// Ping 1's write allowance belongs to the epoch: a period resumed after
+    /// ping 1 never re-grants it, and the ledger carries over.
+    #[test]
+    fn ping_one_write_allowance_is_never_re_granted_in_an_epoch() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(81_000);
+        let c = || cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, OPUS);
+        let last = usage(OPUS, 250_000, 0, 0, 50_000);
+        let mut p = start(c(), &last, t0, w0);
+        let at = p.next_at();
+        let wat = w0 + (at - t0);
+        assert_eq!(p.fire(at, wat, 0.0, None), Fire::Ping);
+        let first = usage(OPUS, 250_000, 50_000, 40, 1);
+        p.charge(first.cost_usd(OPUS));
+        p.ping_sent(&first, Some(anchor_at(at, wat)), false)
+            .unwrap();
+        let carry = p.epoch_carry();
+        // `/keepwarm off` then `auto`: same epoch.
+        let mut q = Period::start_in_epoch(
+            2,
+            c(),
+            7,
+            &last,
+            ev_1h(),
+            anchor_at(at, wat),
+            at,
+            wat,
+            Some(&carry),
+        )
+        .unwrap();
+        assert_eq!(q.pings(), 1);
+        assert!((q.ledger_usd() - first.cost_usd(OPUS)).abs() < 1e-12);
+        let at2 = q.next_at();
+        let wat2 = wat + (at2 - at);
+        assert_eq!(q.fire(at2, wat2, 0.0, None), Fire::Ping);
+        // Writing the reply again is now a partial miss, not ping 1.
+        assert_eq!(
+            q.ping_sent(&usage(OPUS, 250_000, 50_000, 40, 1), None, false),
+            Err(PeriodEnd::PartialMiss {
+                written: 50_000,
+                prefix: P
+            })
+        );
+    }
+
+    // ── auto's maximum period length (M-1) ──
+
+    /// Pure 1h reads per cache-read multiplier: the ski-rental bound alone
+    /// gives 19 (0.1×), 39 (0.05×) and 79 (0.025×) pings; `auto`'s 24h cap
+    /// stops the latter two at 26 (the 27th would be due at 24h45m).
+    #[test]
+    fn ping_counts_per_multiplier_and_the_auto_cap() {
+        for (model, uncapped, capped) in [
+            ("claude-opus-4-7", 19, 19),
+            ("claude-opus-5-5", 39, 26),
+            ("claude-fable-5-1", 79, 26),
+        ] {
+            let mut c = cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, model);
+            let (pings, _, _, reason, elapsed) = run(c.clone(), &[usage(model, P, 0, 0, 0)]);
+            assert_eq!(pings, uncapped, "{model}");
+            assert!(
+                matches!(reason, PeriodEnd::BoundReached { .. }),
+                "{model}: {reason}"
+            );
+            assert_eq!(elapsed, uncapped * 55 * MIN, "{model}");
+            c.auto_max_hours = 24;
+            let (pings, _, _, reason, _) = run(c, &[usage(model, P, 0, 0, 0)]);
+            assert_eq!(pings, capped, "{model}");
+            if capped < uncapped {
+                assert_eq!(reason, PeriodEnd::HoursReached(24), "{model}");
+            }
+        }
+        // 5m: 12 (0.1×), 24 (0.05×), 49 (0.025×) pings, all well under 24h.
+        for (model, want) in [
+            ("claude-opus-4-7", 12),
+            ("claude-opus-5-5", 24),
+            ("claude-fable-5-1", 49),
+        ] {
+            let mut c = cfg(CacheKeepWarm::Auto, CacheTtl::FiveMinutes, model);
+            c.auto_max_hours = 24;
+            let (pings, ..) = run(c, &[usage(model, P, 0, 0, 0)]);
+            assert_eq!(pings, want, "{model} 5m");
+        }
+        // An explicit <N>h window ignores the auto cap.
+        let mut c = cfg(
+            CacheKeepWarm::Hours(48),
+            CacheTtl::OneHour,
+            "claude-fable-5-1",
+        );
+        c.auto_max_hours = 24;
+        let (pings, ..) = run(c, &[usage("claude-fable-5-1", P, 0, 0, 0)]);
+        assert_eq!(pings, 52, "48h window: 52 pings at 55 min");
+    }
+
+    // ── ping 1's write allowance (N-3) ──
+
+    #[test]
+    fn first_write_counts_only_what_the_prefix_will_hold() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(82_000);
+        // The last request read 250k, sent 1k uncached and billed 40k
+        // output — of which the reply text is ~2k; the rest was thinking,
+        // which the API strips on resend.
+        let last = usage(OPUS, 250_000, 0, 1_000, 40_000);
+        let mut c = cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, OPUS);
+        let billed = start(c.clone(), &last, t0, w0);
+        assert_eq!(billed.prefix_tokens(), 291_000, "without the estimate");
+        c.reply_tokens = Some(2_000);
+        let p = start(c.clone(), &last, t0, w0);
+        assert_eq!(p.prefix_tokens(), 253_000);
+        // Never more than was billed.
+        c.reply_tokens = Some(90_000);
+        assert_eq!(start(c, &last, t0, w0).prefix_tokens(), 291_000);
     }
 
     #[test]

@@ -248,6 +248,14 @@ fn classify(cmd: &SessionCommand) -> Effect {
     }
 }
 
+/// The keep-warm test seam: 300 ms between pings for this test (code-only,
+/// never an environment variable — see `cache_keepwarm::interval_override`).
+fn fast_pings() -> agent_engine::session::cache_keepwarm::testing::IntervalOverride {
+    agent_engine::session::cache_keepwarm::testing::IntervalOverride::set(Duration::from_millis(
+        300,
+    ))
+}
+
 fn period_id(st: &serde_json::Value) -> u64 {
     st["period"]["id"].as_u64().expect("an active period")
 }
@@ -655,7 +663,7 @@ async fn pings_are_costed_and_an_active_period_defers_park_until_it_ends() {
         "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
     );
     let _grace = EnvGuard::set("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
-    let _interval = EnvGuard::set("SYNAPS_CACHE_KEEPWARM_INTERVAL_MS", "300");
+    let _interval = fast_pings();
     let (url, bodies) = recording_stub().await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -750,6 +758,9 @@ async fn explicit_park_ends_the_period_then_parks() {
         &h,
         "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
     );
+    // Grace 0: without the keep-warm deferral the session would park the
+    // moment its last client detaches.
+    let _grace = EnvGuard::set("SYNAPS_DAEMON_PARK_GRACE_SECS", "0");
     let (url, bodies) = recording_stub().await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -766,13 +777,24 @@ async fn explicit_park_ends_the_period_then_parks() {
     turn(&mut t, "hello").await;
     let st = keepwarm(&mut t, 500, "status").await;
     assert_eq!(st["active"], true, "{st}");
-    // Detach (the idle auto-park would wait for the period), then park.
+    // Detach: with grace 0 the idle auto-park is due at once, but the
+    // active period defers it — still Live well after the detach.
     t.send(SessionCommand::Detach {
         client: t.client_id(),
     })
     .await
     .unwrap();
+    assert!(
+        !wait_lifecycle(
+            &handle,
+            SessionLifecycle::Parked,
+            Duration::from_millis(750)
+        )
+        .await,
+        "an active period defers the zero-grace auto-park"
+    );
     assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+    // An explicit park is not deferred: it ends the period and parks.
     handle.send(SessionCommand::Park).await.unwrap();
     assert!(
         wait_lifecycle(&handle, SessionLifecycle::Parked, PATIENCE).await,
@@ -828,7 +850,7 @@ async fn a_billed_ping_that_failed_is_still_booked() {
         &h,
         "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
     );
-    let _interval = EnvGuard::set("SYNAPS_CACHE_KEEPWARM_INTERVAL_MS", "300");
+    let _interval = fast_pings();
     let (url, bodies) = recording_stub_with(Pings::UsageThenError).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -867,7 +889,7 @@ async fn an_aborted_in_flight_ping_is_booked() {
         &h,
         "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
     );
-    let _interval = EnvGuard::set("SYNAPS_CACHE_KEEPWARM_INTERVAL_MS", "300");
+    let _interval = fast_pings();
     let (url, bodies) = recording_stub_with(Pings::Hang).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -889,5 +911,191 @@ async fn an_aborted_in_flight_ping_is_booked() {
     let worst = (20_000.0 * 0.3 + 11.0 * 6.0 + 64.0 * 3.0 + 15.0) / 1e6;
     assert!((kw - worst).abs() < 1e-9, "{kw} vs {worst}: {st}");
     assert_eq!(st["keepwarm"]["session_pings"], 0, "{st}");
+    end(&mut t).await;
+}
+
+/// Worst case of ping 1 in these tests: 20k read + the 11-token tail
+/// written at 1h + 64 estimated input + 1 output, on Sonnet 4.5.
+const WORST_PING_1: f64 = (20_000.0 * 0.3 + 11.0 * 6.0 + 64.0 * 3.0 + 15.0) / 1e6;
+
+/// One `SSE_TURN` turn on Sonnet 4.5: 10 input + 1 output + 18k read + 2k
+/// written at 1h.
+const TURN_COST: f64 = (10.0 * 3.0 + 15.0 + 18_000.0 * 0.3 + 2_000.0 * 6.0) / 1e6;
+
+/// I-1: once the ski-rental bound ended the period, `/keepwarm off` then
+/// `auto` in the same cache epoch continues the exhausted ledger: nothing
+/// more is pinged until a real turn starts a new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn re_enabling_after_the_bound_pings_nothing_until_a_real_turn() {
+    let h = Home::new();
+    write_config(
+        &h,
+        "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
+    );
+    let _interval = fast_pings();
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    turn(&mut t, "hello").await;
+    let st = status_until(&mut t, 900, PATIENCE, |st| {
+        st["keepwarm"]["last_end"]
+            .as_str()
+            .is_some_and(|e| e.contains("ski-rental bound"))
+    })
+    .await;
+    assert_eq!(st["keepwarm"]["active"], false, "{st}");
+    let total = pings(&bodies);
+    assert_eq!(total, 19, "{st}");
+
+    let st = keepwarm(&mut t, 1_000, "off").await;
+    assert_eq!(st["active"], false, "{st}");
+    let st = keepwarm(&mut t, 1_001, "auto").await;
+    assert_eq!(st["active"], false, "the epoch's ledger is spent: {st}");
+    assert!(
+        st["last_end"]
+            .as_str()
+            .is_some_and(|e| e.contains("not started: ski-rental bound")),
+        "{st}"
+    );
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), total, "re-enabling pinged nothing");
+
+    // A real turn is a new epoch: a fresh ledger.
+    turn(&mut t, "again").await;
+    let st = keepwarm(&mut t, 1_002, "status").await;
+    assert_eq!(st["active"], true, "{st}");
+    end(&mut t).await;
+}
+
+/// M-2: `/clear` while a ping is in flight ends the period at once, aborts
+/// the ping, and books it to the OLD conversation (saved by the clear).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn clear_mid_ping_books_the_ping_to_the_old_conversation() {
+    let h = Home::new();
+    write_config(
+        &h,
+        "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
+    );
+    let _interval = fast_pings();
+    let (url, bodies) = recording_stub_with(Pings::Hang).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    turn(&mut t, "hello").await;
+    assert!(wait_pings(&bodies, 1, PATIENCE).await);
+    let before = status(&mut t, 1_100).await;
+    assert_eq!(before["keepwarm"]["period"]["in_flight"], true, "{before}");
+    let old_id = before["session"].as_str().unwrap().to_string();
+
+    t.send(SessionCommand::NewSession).await.unwrap();
+    until(&mut t, |e| {
+        matches!(e, agent_engine::session::SessionEventWire::Cleared { .. })
+    })
+    .await;
+    let st = status(&mut t, 1_101).await;
+    assert_ne!(st["session"], old_id.as_str(), "{st}");
+    assert_eq!(st["keepwarm"]["active"], false, "{st}");
+    assert_eq!(st["keepwarm"]["last_end"], "prefix changed", "{st}");
+    assert_eq!(st["keepwarm_cost"].as_f64().unwrap(), 0.0, "{st}");
+    assert_eq!(
+        st["cost"].as_f64().unwrap(),
+        0.0,
+        "not on the new one: {st}"
+    );
+    let old = agent_engine::resolve_session(&old_id).unwrap();
+    assert!(
+        (old.session_cost - TURN_COST - WORST_PING_1).abs() < 1e-9,
+        "booked to the old conversation: {} vs {}",
+        old.session_cost,
+        TURN_COST + WORST_PING_1
+    );
+    end(&mut t).await;
+}
+
+/// M-2: `/resume` while a ping is in flight ends the period at once, aborts
+/// the ping, and books it to the conversation being left — never to the
+/// resumed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resume_mid_ping_books_the_ping_to_the_old_conversation() {
+    let h = Home::new();
+    write_config(
+        &h,
+        "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
+    );
+    let _interval = fast_pings();
+    let (url, bodies) = recording_stub_with(Pings::Hang).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    // A saved session to resume (on disk only: no actor holds its lock).
+    let mut saved = agent_engine::Session::new(MODEL, "off", None);
+    saved.api_messages = vec![
+        Arc::new(serde_json::json!({"role": "user", "content": "other"})),
+        Arc::new(
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]}),
+        ),
+    ];
+    saved.session_cost = 0.125;
+    saved.save().await.unwrap();
+    let other_id = saved.id.clone();
+
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    turn(&mut t, "hello").await;
+    assert!(wait_pings(&bodies, 1, PATIENCE).await);
+    let before = status(&mut t, 1_200).await;
+    assert_eq!(before["keepwarm"]["period"]["in_flight"], true, "{before}");
+    let old_id = before["session"].as_str().unwrap().to_string();
+
+    t.send(SessionCommand::Resume {
+        id: 1_202,
+        query: other_id.clone(),
+    })
+    .await
+    .unwrap();
+    until(&mut t, |e| {
+        matches!(e, agent_engine::session::SessionEventWire::Resumed { .. })
+    })
+    .await;
+    let st = status(&mut t, 1_203).await;
+    assert_eq!(st["session"], other_id.as_str(), "{st}");
+    assert_eq!(st["keepwarm"]["active"], false, "{st}");
+    assert_eq!(st["keepwarm"]["last_end"], "prefix changed", "{st}");
+    assert_eq!(st["keepwarm_cost"].as_f64().unwrap(), 0.0, "{st}");
+    assert_eq!(
+        st["cost"].as_f64().unwrap(),
+        0.125,
+        "the resumed conversation is not charged: {st}"
+    );
+    let old = agent_engine::resolve_session(&old_id).unwrap();
+    assert!(
+        (old.session_cost - TURN_COST - WORST_PING_1).abs() < 1e-9,
+        "booked to the old conversation: {} vs {}",
+        old.session_cost,
+        TURN_COST + WORST_PING_1
+    );
     end(&mut t).await;
 }

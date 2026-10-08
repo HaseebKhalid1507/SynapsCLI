@@ -621,6 +621,7 @@ impl SessionActor {
             keep_warm,
             cache_keepwarm: super::cache_keepwarm::KeepWarmState::new(
                 config.cache_keepwarm,
+                config.cache_keepwarm_auto_max_hours,
                 cache_keepwarm,
             ),
             park_deadline: None,
@@ -3809,6 +3810,9 @@ impl SessionActor {
                 if self.driver.is_some() {
                     self.driver_revoke("session replaced");
                 }
+                // Before `clear` saves the old session: a ping in flight is
+                // aborted and booked to it, not to the new one.
+                self.cache_keepwarm_conversation_replaced();
                 // `clear` saves the old session directly: queued saves of it
                 // must land first, never after.
                 self.persister.flush().await;

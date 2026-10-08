@@ -264,6 +264,9 @@ impl SessionActor {
                 }
             }
         };
+        // Committed to the swap: end keep-warm now, booking any ping in
+        // flight to the conversation being left (saved just below).
+        self.cache_keepwarm_conversation_replaced();
         self.runtime.set_model(session.model.clone());
         // A resumed session owns its saved choice. Preserve that explicit
         // provenance across later model switches.
