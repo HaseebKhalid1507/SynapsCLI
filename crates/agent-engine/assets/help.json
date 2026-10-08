@@ -574,10 +574,11 @@
     "keywords": ["keepwarm", "keep-warm", "cache", "ttl", "prompt cache", "idle", "cost"],
     "lines": [
       "/keepwarm (or /keepwarm status) shows the mode, the active idle period (next ping, spend vs. bound, whether the cached prefix is unchanged) and this session's keep-warm spend.",
-      "/keepwarm auto keeps the prompt cache warm while idle until the pings would cost more than the rewrite they prevent: about 20 pings over ~18h with cache_ttl = 1h, about 12 over ~55 min with 5m or hybrid.",
-      "/keepwarm 6h applies the same bound and also stops 6 hours after the session went idle. /keepwarm off stops it for this session.",
+      "/keepwarm auto keeps the prompt cache warm while idle until the pings would cost more than the rewrite they prevent: about 19 pings over ~17h when the server honours cache_ttl = 1h, about 12 over ~55 min with 5m or hybrid (or a 1h setting the server silently downgraded). On an already idle session it starts at once.",
+      "/keepwarm 6h applies the same bound and also stops 6 hours after the session went idle (N = 1–48). /keepwarm off stops it for this session; the choice survives park and daemon reload.",
+      "Nothing is pinged when nothing is cached (a prompt below the model's cache minimum), when the next turn would roll the context over first, or when one worst-case ping costs more than the rewrite (budgeted thinking on a small prompt).",
       "Pings stop by themselves when the next request would differ (/model, /thinking, /system, tool activation, /compact, /clear); read-only commands do not affect them. A new message ends the idle period.",
-      "Keep-warm spend is part of the session cost and labelled separately in the footer and /stats. The default comes from cache_keepwarm in config (off unless set)."
+      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; both persist with the session. The default comes from cache_keepwarm in config (off unless set)."
     ],
     "related": ["/stats", "/context"]
   },
