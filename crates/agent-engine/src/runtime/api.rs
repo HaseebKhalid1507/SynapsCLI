@@ -878,6 +878,21 @@ pub struct ApiOptions {
     /// reads them for the optional token/cost budget dimensions. `None`
     /// (default, non-stream callers) records nothing.
     pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// Prompt-cache keep-warm ping (task #444). `None` on every real turn,
+    /// which keeps turn requests byte-identical to the pre-feature release.
+    /// When set (native Anthropic transport only — any other route fails
+    /// closed before a request is built): the conversational cache marker is
+    /// stamped on the LAST HISTORY message and the trailing ping message
+    /// rides after it unmarked, `max_tokens` is capped, every retry budget is
+    /// zero, and the telemetry record carries `"keepwarm": true`.
+    pub keepwarm: Option<KeepWarmRequest>,
+}
+
+/// Wire knobs for a keep-warm ping (see [`ApiOptions::keepwarm`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepWarmRequest {
+    /// Hard cap on billed output (thinking + text) for the ping.
+    pub max_tokens: u64,
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1058,6 +1073,13 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
+        // Keep-warm pings exist only for the native Anthropic transport: every
+        // other route would ignore the output cap and the marker placement.
+        if options.keepwarm.is_some() && !super::auth::model_is_anthropic(model) {
+            return Err(RuntimeError::Config(
+                "cache keep-warm ping requires the native Anthropic transport".into(),
+            ));
+        }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
         let wire_messages = super::continuation::wire_messages(messages);
         let messages = wire_messages.as_deref().unwrap_or(messages);
@@ -1209,7 +1231,20 @@ impl ApiMethods {
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
+        match options.keepwarm {
+            // Keep-warm: the marker goes on the last HISTORY message — the
+            // durable prefix the next real turn re-sends verbatim — and the
+            // trailing ping message (never persisted) rides after it as an
+            // uncached tail, exactly like a real turn's newest user message.
+            Some(_) if cleaned_messages.len() >= 2 => {
+                let history_len = cleaned_messages.len() - 1;
+                HelperMethods::annotate_cache_breakpoint(
+                    &mut cleaned_messages[..history_len],
+                    options.cache_ttl,
+                );
+            }
+            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl),
+        }
 
         // Derive the thinking level from the budget for effort mapping.
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
@@ -1232,7 +1267,13 @@ impl ApiMethods {
             options.cache_ttl,
             true,
         );
-        let body = parts.body;
+        let mut body = parts.body;
+        // `max_tokens` is not part of the prompt-cache key (only tools,
+        // system, messages, thinking config and effort are), so capping it
+        // bounds the ping's output bill without touching the cached prefix.
+        if let Some(keepwarm) = options.keepwarm {
+            body.cap_max_tokens(keepwarm.max_tokens);
+        }
         let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
@@ -1438,7 +1479,10 @@ impl ApiMethods {
                                 .unwrap_or_default();
 
                             // Decide whether we've exhausted retries for this error class.
-                            let retry_exhausted = if is_429 {
+                            // A keep-warm ping never retries: any error stops it.
+                            let retry_exhausted = if options.keepwarm.is_some() {
+                                true
+                            } else if is_429 {
                                 attempt >= MAX_429_RETRIES
                             } else {
                                 non_429_attempts >= max_retries
@@ -1757,6 +1801,7 @@ impl ApiMethods {
                         system_bytes,
                         breakpoints,
                     },
+                    keepwarm: options.keepwarm.is_some(),
                 };
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
@@ -1823,7 +1868,10 @@ impl ApiMethods {
                     } else {
                         non_429_attempts
                     };
-                    if retries_used >= retry_budget || cancel.is_cancelled() {
+                    if retries_used >= retry_budget
+                        || cancel.is_cancelled()
+                        || options.keepwarm.is_some()
+                    {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
                         if let Some(t) = tracer.take() {

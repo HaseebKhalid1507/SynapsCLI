@@ -29,6 +29,7 @@ pub mod google_vertex;
 pub(crate) mod helpers;
 mod image_limits;
 mod image_retention;
+pub mod keepwarm;
 pub mod memory_context;
 pub mod memory_history;
 pub mod openai;
@@ -3593,6 +3594,7 @@ impl Runtime {
                     request_tools_schema: None,
                     anthropic_tool_split: None,
                     usage_counters: None,
+                    keepwarm: None,
                 },
             )
             .await?;
@@ -4131,6 +4133,7 @@ impl Runtime {
             request_tools_schema: None,
             anthropic_tool_split: None,
             usage_counters: None,
+            keepwarm: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));

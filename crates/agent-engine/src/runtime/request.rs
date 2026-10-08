@@ -130,6 +130,13 @@ impl<'a> RequestBody<'a> {
         }
     }
 
+    /// Lower `max_tokens` to at most `cap` (prompt-cache keep-warm pings,
+    /// task #444). `max_tokens` is not part of the cache key, so the cached
+    /// prefix is unaffected; real turns never call this.
+    pub(super) fn cap_max_tokens(&mut self, cap: u64) {
+        self.max_tokens = self.max_tokens.min(cap.max(1));
+    }
+
     /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.
     pub(super) fn has_tool_marker(&self) -> bool {
         !self.tools.tools.is_empty()
