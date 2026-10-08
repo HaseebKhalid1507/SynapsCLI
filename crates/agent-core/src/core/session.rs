@@ -17,6 +17,11 @@ pub struct Session {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
+    /// Prompt-cache keep-warm spend (task #444), already INCLUDED in
+    /// `session_cost`; persisted so a resumed/reloaded session still labels
+    /// it. Absent (0) on sessions that never kept warm.
+    #[serde(default, skip_serializing_if = "is_zero_cost")]
+    pub keepwarm_cost: f64,
     /// Persisted listing hint: `api_messages.len()` at save time. Declared
     /// BEFORE `api_messages` so it lands in the header that
     /// `read_session_header` reads without touching the message array.
@@ -120,6 +125,10 @@ pub fn user_content_for_display(content: &serde_json::Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
+fn is_zero_cost(v: &f64) -> bool {
+    *v == 0.0
+}
+
 impl Session {
     pub fn new(model: &str, thinking_level: &str, system_prompt: Option<&str>) -> Self {
         let now = Utc::now();
@@ -140,6 +149,7 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
+            keepwarm_cost: 0.0,
             message_count: 0,
             api_messages: Vec::new(),
             abort_context: None,
@@ -191,6 +201,7 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
+            keepwarm_cost: 0.0,
             message_count: 0,
             api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,

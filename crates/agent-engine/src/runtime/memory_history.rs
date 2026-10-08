@@ -1327,6 +1327,7 @@ mod tests {
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 session_cost: 0.0,
+                keepwarm_cost: 0.0,
                 message_count: 0,
                 api_messages: vec![
                     Arc::new(json!({"role": "user", "content": user})),

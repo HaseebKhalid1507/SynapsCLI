@@ -91,9 +91,12 @@ pub struct ConversationState {
     pub total_cache_creation_tokens: u64,
     pub session_cost: f64,
     /// Prompt-cache keep-warm spend (task #444), already INCLUDED in
-    /// `session_cost` and shown separately. Live-session only: the total is
-    /// persisted with `session_cost`, this label is not.
+    /// `session_cost` and shown separately; persisted with it
+    /// (`Session::keepwarm_cost`).
     pub keepwarm_cost: f64,
+    /// Keep-warm ping tokens, already INCLUDED in the `total_*` counters
+    /// above and shown separately so `/stats` adds up.
+    pub keepwarm_tokens: crate::session::ConversationTokens,
     /// Message queued to send after current stream completes.
     pub queued_message: Option<String>,
     /// Events buffered during streaming — drained on stream completion.
@@ -113,6 +116,7 @@ impl ConversationState {
             total_cache_creation_tokens: 0,
             session_cost: 0.0,
             keepwarm_cost: 0.0,
+            keepwarm_tokens: Default::default(),
             queued_message: None,
             pending_events: Vec::new(),
         }
@@ -134,7 +138,8 @@ impl ConversationState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             session_cost: session.session_cost,
-            keepwarm_cost: 0.0,
+            keepwarm_cost: session.keepwarm_cost,
+            keepwarm_tokens: Default::default(),
             queued_message: None,
             pending_events: Vec::new(),
             session,
@@ -172,6 +177,7 @@ impl ConversationState {
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
+        self.session.keepwarm_cost = self.keepwarm_cost;
         // Legacy field: an interrupted turn now lives in `api_messages`
         // (`engine::interrupt`); never write a recap back.
         self.session.abort_context = None;
@@ -193,6 +199,7 @@ impl ConversationState {
         candidate.total_input_tokens = self.total_input_tokens;
         candidate.total_output_tokens = self.total_output_tokens;
         candidate.session_cost = self.session_cost;
+        candidate.keepwarm_cost = self.keepwarm_cost;
         candidate.abort_context = None;
         candidate.updated_at = chrono::Utc::now();
         candidate.auto_title();
@@ -217,6 +224,7 @@ impl ConversationState {
         self.total_cache_creation_tokens = 0;
         self.session_cost = 0.0;
         self.keepwarm_cost = 0.0;
+        self.keepwarm_tokens = Default::default();
         self.queued_message = None;
         self.pending_events.clear();
         self.session = Session::new(
@@ -246,6 +254,7 @@ impl ConversationState {
             },
             cost: self.session_cost,
             keepwarm_cost: self.keepwarm_cost,
+            keepwarm_tokens: self.keepwarm_tokens.clone(),
             // Wire-compat field (protocol v3); always `None` now.
             abort_context: None,
             queued_message: self.queued_message.clone(),

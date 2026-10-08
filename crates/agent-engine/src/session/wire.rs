@@ -374,6 +374,8 @@ pub struct ConversationDigest {
     pub cost: f64,
     #[serde(default)]
     pub keepwarm_cost: f64,
+    #[serde(default)]
+    pub keepwarm_tokens: ConversationTokens,
     pub abort_context: Option<String>,
     pub queued_message: Option<String>,
     pub pending_events_len: usize,
@@ -408,6 +410,7 @@ impl ConversationDigest {
             tokens: s.tokens.clone(),
             cost: s.cost,
             keepwarm_cost: s.keepwarm_cost,
+            keepwarm_tokens: s.keepwarm_tokens.clone(),
             abort_context: s.abort_context.clone(),
             queued_message: s.queued_message.clone(),
             pending_events_len: s.pending_events_len,
@@ -428,6 +431,7 @@ impl ConversationDigest {
             tokens: self.tokens,
             cost: self.cost,
             keepwarm_cost: self.keepwarm_cost,
+            keepwarm_tokens: self.keepwarm_tokens,
             abort_context: self.abort_context,
             queued_message: self.queued_message,
             pending_events_len: self.pending_events_len,
@@ -941,6 +945,7 @@ mod tests {
             tokens: ConversationTokens { input: 1, output: 2, cache_read: 3, cache_creation: 4 },
             cost: 0.5,
             keepwarm_cost: 0.125,
+            keepwarm_tokens: ConversationTokens { input: 0, output: 0, cache_read: 9, cache_creation: 0 },
             abort_context: Some("ctx".into()),
             queued_message: None,
             pending_events_len: 2,

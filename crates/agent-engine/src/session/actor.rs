@@ -603,6 +603,7 @@ impl SessionActor {
                 journal_id,
                 presence,
                 name,
+                cache_keepwarm,
             },
         ) = SessionHandle::new(meta.clone(), view);
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
@@ -618,7 +619,10 @@ impl SessionActor {
             event_queue,
             settings_replay: Vec::new(),
             keep_warm,
-            cache_keepwarm: super::cache_keepwarm::KeepWarmState::new(config.cache_keepwarm),
+            cache_keepwarm: super::cache_keepwarm::KeepWarmState::new(
+                config.cache_keepwarm,
+                cache_keepwarm,
+            ),
             park_deadline: None,
             prompt_abandon_deadline: None,
             stream: None,
@@ -923,6 +927,14 @@ impl SessionActor {
     /// empty `api_messages`, so no journal ever exists) never parks: it
     /// costs nothing warm and could not be unparked from disk (H2).
     pub(crate) fn can_park(&self) -> bool {
+        // An active cache keep-warm period defers the idle auto-park (its
+        // cost is bounded by the ski-rental ledger); when it ends,
+        // `rearm_park`. An explicit `Park` ends the period first.
+        self.can_park_ignoring_keepwarm() && !self.cache_keepwarm.active()
+    }
+
+    /// `can_park` minus the keep-warm deferral.
+    pub(crate) fn can_park_ignoring_keepwarm(&self) -> bool {
         self.attached.is_empty()
             && !self.streaming
             && self.compact.is_none()
@@ -931,9 +943,6 @@ impl SessionActor {
             && !self.conv.api_messages.is_empty()
             && self.conv.queued_message.is_none()
             && !self.keep_warm
-            // An active cache keep-warm period defers parking (its cost is
-            // bounded by the ski-rental ledger); when it ends, `rearm_park`.
-            && !self.cache_keepwarm.active()
             && self.config.persist
             && !self.is_parked()
             && self.driver.is_none()
@@ -2706,12 +2715,15 @@ impl SessionActor {
                 .as_deref()
                 .unwrap_or(self.runtime.model())
                 .to_string();
-            self.cache_keepwarm_note_usage(
-                *input_tokens,
-                *output_tokens,
-                *cache_read_input_tokens,
-                *cache_creation_input_tokens,
-            );
+            self.cache_keepwarm_note_usage(crate::runtime::keepwarm::KeepWarmUsage {
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+                cache_read_tokens: *cache_read_input_tokens,
+                cache_write_tokens: *cache_creation_input_tokens,
+                cache_write_5m: *cache_creation_5m,
+                cache_write_1h: *cache_creation_1h,
+                model: usage_model.clone(),
+            });
             self.conv.add_usage(
                 *input_tokens,
                 *output_tokens,
@@ -3852,6 +3864,8 @@ impl SessionActor {
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::Park => {
+                // Explicit request: end an active keep-warm period, then park.
+                self.cache_keepwarm_park_requested();
                 if let std::ops::ControlFlow::Break(reason) = self.park().await {
                     return ControlFlow::Break(reason);
                 }
@@ -4108,7 +4122,7 @@ impl SessionTask {
                     actor.on_prompt_abandon_deadline();
                 }
                 _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()) => {
-                    actor.on_cache_keepwarm_due();
+                    actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
                     actor.on_cache_keepwarm_done(res);

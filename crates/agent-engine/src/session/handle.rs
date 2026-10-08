@@ -52,6 +52,10 @@ pub struct SessionHandle {
     /// Session name — `--name` at create / `/cmd saveas` later. Written by
     /// the actor so listings and `--continue <name>` see renames live.
     name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// Per-session `/keepwarm` override (task #444), written by the actor.
+    /// Lives here so a daemon reload whose checkpoint did not confirm still
+    /// carries the user's explicit choice.
+    cache_keepwarm: super::cache_keepwarm::OverrideSlot,
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
@@ -75,6 +79,7 @@ pub struct SessionEndpoints {
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
     pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    pub cache_keepwarm: super::cache_keepwarm::OverrideSlot,
 }
 
 impl SessionHandle {
@@ -88,6 +93,7 @@ impl SessionHandle {
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
+        let cache_keepwarm = super::cache_keepwarm::OverrideSlot::default();
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
@@ -98,6 +104,7 @@ impl SessionHandle {
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
             name: Arc::clone(&name),
+            cache_keepwarm: Arc::clone(&cache_keepwarm),
             placeholder_config: None,
         };
         (
@@ -110,6 +117,7 @@ impl SessionHandle {
                 journal_id,
                 presence,
                 name,
+                cache_keepwarm,
             },
         )
     }
@@ -153,6 +161,14 @@ impl SessionHandle {
     /// Current session name (create `--name` or a later `saveas`).
     pub fn name(&self) -> Option<String> {
         (**self.name.load()).clone()
+    }
+
+    /// The session's `/keepwarm` override (`off`/`auto`/`<N>h`), if any.
+    pub fn cache_keepwarm_override(&self) -> Option<String> {
+        self.cache_keepwarm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|m| m.to_string())
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,

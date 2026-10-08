@@ -349,6 +349,10 @@ enum JournalRecord {
     },
 }
 
+fn is_zero_cost(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// Mirror of [`Session`] WITHOUT `api_messages`, with identical serde
 /// attributes. `deny_unknown_fields` + the `session_meta_stays_in_sync_…`
 /// test make silent drift between the two types impossible.
@@ -367,6 +371,8 @@ struct SessionMeta {
     total_input_tokens: u64,
     total_output_tokens: u64,
     session_cost: f64,
+    #[serde(default, skip_serializing_if = "is_zero_cost")]
+    keepwarm_cost: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +409,7 @@ impl SessionMeta {
             total_input_tokens: s.total_input_tokens,
             total_output_tokens: s.total_output_tokens,
             session_cost: s.session_cost,
+            keepwarm_cost: s.keepwarm_cost,
             message_count: Some(s.api_messages.len()),
             abort_context: s.abort_context.clone(),
             parent_session: s.parent_session.clone(),
@@ -426,6 +433,7 @@ impl SessionMeta {
         s.total_input_tokens = self.total_input_tokens;
         s.total_output_tokens = self.total_output_tokens;
         s.session_cost = self.session_cost;
+        s.keepwarm_cost = self.keepwarm_cost;
         s.abort_context = self.abort_context;
         s.parent_session = self.parent_session;
         s.compacted_into = self.compacted_into;
@@ -711,6 +719,8 @@ struct SessionSnapshotRef<'a> {
     total_input_tokens: u64,
     total_output_tokens: u64,
     session_cost: f64,
+    #[serde(skip_serializing_if = "is_zero_cost")]
+    keepwarm_cost: f64,
     message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: &'a Option<String>,
@@ -746,6 +756,7 @@ impl<'a> SessionSnapshotRef<'a> {
             total_input_tokens: s.total_input_tokens,
             total_output_tokens: s.total_output_tokens,
             session_cost: s.session_cost,
+            keepwarm_cost: s.keepwarm_cost,
             message_count: s.api_messages.len(),
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
@@ -1045,6 +1056,7 @@ mod tests {
         s.abort_context = Some("ctx".into());
         s.parent_session = Some("parent".into());
         s.compacted_into = Some("child".into());
+        s.keepwarm_cost = 0.25;
         let mut value = serde_json::to_value(&s).unwrap();
         value.as_object_mut().unwrap().remove("api_messages");
         let meta: SessionMeta = serde_json::from_value(value)
@@ -1059,6 +1071,7 @@ mod tests {
         a.title = "t".into();
         a.total_input_tokens = 7;
         a.session_cost = 0.5;
+        a.keepwarm_cost = 0.125;
         a.updated_at = chrono::Utc::now();
         let mut b = Session::new("model-b", "low", None);
         b.id = a.id.clone();
@@ -1067,6 +1080,7 @@ mod tests {
         assert_eq!(b.title, "t");
         assert_eq!(b.total_input_tokens, 7);
         assert_eq!(b.session_cost, 0.5);
+        assert_eq!(b.keepwarm_cost, 0.125);
         assert_eq!(b.updated_at, a.updated_at);
     }
 
@@ -1645,6 +1659,25 @@ mod save_cost_bench {
                 );
                 let _ = delete_session_files_in_dir(dir.path(), &s.id);
             }
+        }
+    }
+
+    /// Task #444: keep-warm spend persists through both the snapshot and the
+    /// journal, so a resumed / reloaded session still labels it.
+    #[test]
+    fn keepwarm_cost_survives_save_and_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        for persistence in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages
+                .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": "q"})));
+            s.session_cost = 1.5;
+            s.keepwarm_cost = 0.25;
+            save_session_in_dir(&dir, &s, persistence).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(loaded.keepwarm_cost, 0.25, "{persistence:?}");
+            assert_eq!(loaded.session_cost, 1.5, "{persistence:?}");
         }
     }
 }

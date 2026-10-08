@@ -283,7 +283,7 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 
 /// The session as it IS: the actor's record when the checkpoint confirmed,
 /// else what the handle alone knows (journal, cwd, keep-warm, lifecycle,
-/// current model from the published view).
+/// current model from the published view, the `/keepwarm` override).
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
     let journal_id = handle.journal_id();
@@ -306,7 +306,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             false,
             handle.lifecycle(),
             Vec::new(),
-            None,
+            // Persisted independently of the checkpoint: an explicit
+            // `/keepwarm` choice must survive a reload that timed out.
+            handle.cache_keepwarm_override(),
             handle.view().model.clone(),
         ),
     };
@@ -704,5 +706,22 @@ mod tests {
         assert!(reload_state_path(&p).ends_with("daemon-work.reload.json"), "{:?}", reload_state_path(&p));
         let p = registry::daemon_paths_in(d.path(), None);
         assert!(reload_state_path(&p).ends_with("daemon.reload.json"));
+    }
+
+    /// Task #444: a reload whose checkpoint did not confirm (`rec == None`)
+    /// still carries the explicit `/keepwarm` choice, read from the handle,
+    /// instead of resurrecting the config default.
+    #[test]
+    fn keepwarm_override_survives_an_unconfirmed_checkpoint() {
+        use crate::core::config::CacheKeepWarm;
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("kw-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert_eq!(record(&handle, None).cache_keepwarm, None, "no override yet");
+        // What the actor writes on `/keepwarm off`.
+        *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Off);
+        assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
+        *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
+        assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
     }
 }

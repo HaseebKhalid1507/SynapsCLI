@@ -976,6 +976,9 @@ pub struct ConversationSnapshot {
     /// Prompt-cache keep-warm spend, already included in `cost` (task #444).
     #[serde(default)]
     pub keepwarm_cost: f64,
+    /// Keep-warm ping tokens, already included in `tokens` (task #444).
+    #[serde(default)]
+    pub keepwarm_tokens: ConversationTokens,
     /// Legacy (protocol v3 shape kept): always `None` — an interrupted turn
     /// is recorded in `api_messages` (`engine::interrupt`), never as a recap.
     pub abort_context: Option<String>,
