@@ -246,14 +246,18 @@ pub enum PingBooking {
     /// Dispatched, no usage seen: the provider may bill it — book the
     /// period's worst case for the ping.
     WorstCase,
-    /// Never dispatched (refused before the network, or a connect failure
-    /// with no HTTP status): nothing can be billed.
+    /// Nothing can be billed: never dispatched (refused before the network,
+    /// or a connect failure with no HTTP status), or rejected outright with an
+    /// HTTP error status before any usage was reported — the provider does not
+    /// bill a request it refused (an in-stream error after a 200 arrives with
+    /// `message_start` usage and is `Measured`).
     Nothing,
 }
 
 /// The one booking rule for a ping, on every path: usage arrived → its real
-/// cost; otherwise dispatched → the worst case, unless the error was a
-/// connect failure with no HTTP status; otherwise $0.
+/// cost; otherwise rejected with an HTTP error status (≥ 400) → $0; otherwise
+/// dispatched → the worst case, unless the error was a connect failure with no
+/// HTTP status; otherwise $0.
 pub fn ping_booking(
     usage_arrived: bool,
     sent: bool,
@@ -262,6 +266,8 @@ pub fn ping_booking(
 ) -> PingBooking {
     if usage_arrived {
         PingBooking::Measured
+    } else if http_status >= 400 {
+        PingBooking::Nothing
     } else if sent && !(connect_failed && http_status == 0) {
         PingBooking::WorstCase
     } else {
@@ -1638,9 +1644,11 @@ mod tests {
             ((true, true, false, 529), Measured),
             ((false, true, false, 200), WorstCase), // aborted mid-stream
             ((false, true, false, 0), WorstCase),   // read timeout after dispatch
-            ((false, true, false, 500), WorstCase),
+            ((false, true, false, 500), Nothing),   // rejected by status: not billed
+            ((false, true, false, 429), Nothing),
+            ((false, true, false, 529), Nothing),
             ((false, true, true, 0), Nothing), // connect failure, no status
-            ((false, true, true, 503), WorstCase), // a status means it got there
+            ((false, true, true, 503), Nothing), // an error status, no usage: not billed
             ((false, false, false, 0), Nothing), // refused before the network
             ((false, false, true, 0), Nothing),
         ];

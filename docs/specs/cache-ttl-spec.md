@@ -659,7 +659,7 @@ variant exhaustively and drives them through the actor.
 | Transient error (429, 5xx, 529, network, in-stream) | Usage booked; retry after 5 s, 15 s, 30 s while the retry still lands before the late guard and fits the bound; then end. |
 | Any other 4xx, auth, config | Usage (if any) booked; end, no retry. |
 | `/clear` or `/resume` while a period is active | The period ends at once (`prefix changed`) before the swap, an in-flight ping is aborted, and its cost is booked to the conversation being left (which the swap saves), never to the new one. |
-| Booking a ping — every path (finished OK, failed, aborted, task panic) | One rule (`runtime::keepwarm::ping_booking`, applied by `PingTap::bill`): usage arrived → its real cost; else, if the request was **dispatched**, the worst case for that ping — unless it failed to connect with no HTTP status; else $0. "Dispatched" (`PingTap::sent`) is set when the HTTP client pulls the request body over an established connection (hyper only polls the body after connecting and writing the head; the body carries an explicit `Content-Length`, so the wire framing is unchanged) or when a response arrives. A refused connection is never dispatched; a read timeout after the body went out is. |
+| Booking a ping — every path (finished OK, failed, aborted, task panic) | One rule (`runtime::keepwarm::ping_booking`, applied by `PingTap::bill`): usage arrived → its real cost; else, if the provider **rejected it with an HTTP error status** (≥ 400: 400/404/429/500/529 …) → $0, because a refused request is not billed (an in-stream error after a 200 has already delivered `message_start` usage and is booked as measured); else, if the request was **dispatched**, the worst case for that ping — unless it failed to connect with no HTTP status; else $0. "Dispatched" (`PingTap::sent`) is set when the HTTP client pulls the request body over an established connection (hyper only polls the body after connecting and writing the head; the body carries an explicit `Content-Length`, so the wire framing is unchanged) or when a response arrives. A refused connection is never dispatched; a read timeout after the body went out is. |
 | Turn, compaction, another ping in flight | Never pinged concurrently. |
 | Driver armed, queued work, pending prompt | End (`Blocked`). |
 | `max_session_cost` | Checked against the worst case (§7.2); all ping spend counts toward it. |
@@ -749,7 +749,8 @@ written to history, the session file or the transcript.
   TTL latch; changed prefix refused before the network; 4xx fatal / 5xx &
   429 transient with no transport retry; anchor only moves forward; the
   booking rule table; a refused connection is never dispatched (books $0);
-  a dispatched ping with no usage books the worst case.
+  an HTTP error status with no usage books $0; a dispatched ping with no
+  usage and no error status books the worst case.
 - `session::cache_keepwarm` (pure, injected clocks): ski-rental counts (1h:
   19, 5m: 12) with measured costs, overhead, first write, expensive thinking;
   the worst-case rule (Sonnet 4.6 xhigh, 5m, P = 20k → no period) and
