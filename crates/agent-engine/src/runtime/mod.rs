@@ -29,6 +29,7 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod image_limits;
+mod http_phases;
 mod image_retention;
 pub mod keepwarm;
 pub mod memory_context;
@@ -351,6 +352,7 @@ struct PromptReloadSource {
 
 pub struct Runtime {
     client: Client,
+    anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
     auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
@@ -1048,6 +1050,7 @@ impl Runtime {
 
         let mut runtime = Runtime {
             client: host.client,
+            anthropic_stream_client: Default::default(),
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
                 auth_type,
@@ -3705,6 +3708,7 @@ impl Runtime {
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
+                    anthropic_stream_client: self.anthropic_stream_client.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                     // Consistent with the streaming path: a pending
@@ -4274,6 +4278,7 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            anthropic_stream_client: self.anthropic_stream_client.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
@@ -4391,6 +4396,7 @@ impl Clone for Runtime {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
+            anthropic_stream_client: self.anthropic_stream_client.clone(),
             auth: Arc::clone(&self.auth),
             model: self.model.clone(),
             tools: self.tools.clone(),

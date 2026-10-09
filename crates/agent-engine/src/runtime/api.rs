@@ -3,6 +3,7 @@ use super::sse_types::{AnthropicEvent, ContentBlock, Delta};
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use crate::runtime::telemetry::{self, TelemetryLevel};
 use crate::{Result, RuntimeError, ToolRegistry};
+#[cfg(test)]
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -824,6 +825,8 @@ pub struct ApiOptions {
     /// Set by tests to point at a local mock server without touching env vars.
     #[doc(hidden)]
     pub anthropic_base_url: Option<String>,
+    /// Dedicated lazy pool: upload and body idle deadlines are independent.
+    pub(super) anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
     /// Execution authority produced by Runtime preflight. Transports must not
     /// recreate authority for Max/UltraCode from assumed prerequisites.
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
@@ -1287,6 +1290,8 @@ impl ApiMethods {
             })?;
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
+        let streaming_client = super::http_phases::client(&options.anthropic_stream_client)?;
+
         // Read auth state for this API call
         let (mut auth_header_name, mut auth_header_value, auth_type) =
             await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
@@ -1513,7 +1518,7 @@ impl ApiMethods {
                     }
 
                     // Rebuild request (consumed on send)
-                    let mut req = client
+                    let mut req = streaming_client
                         .post(&anthropic_url)
                         .header(auth_header_name.clone(), auth_header_value.clone())
                         .header("anthropic-version", "2023-06-01")
@@ -1539,7 +1544,15 @@ impl ApiMethods {
                         Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
                         None => req.body(body_bytes.clone()),
                     };
-                    match await_or_cancel(cancel, req.send()).await? {
+                    match await_or_cancel(
+                        cancel,
+                        super::http_phases::send(
+                            req,
+                            super::http_phases::header_deadline(body_bytes.len()),
+                        ),
+                    )
+                    .await?
+                    {
                         Ok(resp) => {
                             let status = resp.status();
                             if let Some(keepwarm) = &options.keepwarm {
@@ -1583,7 +1596,8 @@ impl ApiMethods {
                                         "http_401",
                                     );
                                 }
-                                let _ = await_or_cancel(cancel, resp.text()).await?; // drain body
+                                // Drop the rejected response: no unbounded body drain.
+                                drop(resp);
                                 options.token_cache.invalidate("anthropic");
                                 {
                                     let mut g = await_or_cancel(cancel, auth.write()).await?;
@@ -1638,7 +1652,7 @@ impl ApiMethods {
                             let error_text = await_or_cancel(cancel, async {
                                 let mut stream = resp.bytes_stream();
                                 let mut bytes = Vec::new();
-                                while let Some(Ok(chunk)) = stream.next().await {
+                                while let Some(Ok(chunk)) = super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE).await {
                                     let remaining = QUOTA_PROBE_BODY_CAP - bytes.len();
                                     bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                                     if bytes.len() == QUOTA_PROBE_BODY_CAP {
@@ -1909,11 +1923,10 @@ impl ApiMethods {
                                     let terminal = t.failed_terminal("network");
                                     t.finish(clock, None, None, None, None, terminal);
                                 }
-                                return Err(RuntimeError::ApiStatus(
-                                    crate::core::error::humanize_network_error(&e),
-                                ));
+                                tracing::warn!(error = %e.user_message(), "API network retries exhausted");
+                                return Err(e);
                             }
-                            last_err = e.to_string();
+                            last_err = e.user_message();
                             last_status = None;
                             // No headers on network error — plain exponential back-off.
                             let delay = super::telemetry::network_retry_delay(non_429_attempts);
@@ -1986,6 +1999,7 @@ impl ApiMethods {
             };
 
             let mut stream = response.bytes_stream();
+            let mut transport_error = None;
             tracing::debug!("Stream opened");
 
             if !options.suppress_stream_deltas {
@@ -2012,7 +2026,8 @@ impl ApiMethods {
 
             // Cancellation exits through the normal finalization below: partial
             // content, residual Usage and attempt telemetry must not be dropped.
-            while let Ok(Some(chunk)) = await_or_cancel(cancel, stream.next()).await {
+            while let Ok(Some(chunk)) = await_or_cancel(cancel,
+                super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE)).await {
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -2033,9 +2048,10 @@ impl ApiMethods {
                         emit_residual_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
                             error_type: None,
-                            message: crate::core::error::humanize_network_error(&e),
+                            message: e.user_message(),
                             retryable: true,
                         });
+                        transport_error = Some(e);
                         break;
                     }
                 };
@@ -2224,6 +2240,10 @@ impl ApiMethods {
                                 trace_usage,
                                 terminal,
                             );
+                        }
+                        if let Some(error) = transport_error {
+                            tracing::warn!(error = %error.user_message(), "API stream network retries exhausted");
+                            return Err(error);
                         }
                         return Err(RuntimeError::ApiStatus(msg));
                     }

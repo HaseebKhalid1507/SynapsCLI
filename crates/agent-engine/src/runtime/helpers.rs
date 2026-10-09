@@ -59,7 +59,7 @@ pub(crate) fn turn_error_for(
     };
     let outcome = match err {
         E::Canceled => agent_core::TurnOutcome::Canceled,
-        E::Api(_) => provider("network_error"),
+        E::Api(_) | E::NetworkTimeout(_) => provider("network_error"),
         E::ApiStatus(_) => provider("api_status"),
         E::Auth(_) => provider("auth_error"),
         E::Config(_) => provider("config_error"),
@@ -72,7 +72,7 @@ pub(crate) fn turn_error_for(
         E::Tool(_) => provider("tool_error"),
     };
     agent_core::TurnError {
-        message: err.to_string(),
+        message: err.user_message(),
         outcome,
     }
 }

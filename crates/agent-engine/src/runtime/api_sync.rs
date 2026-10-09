@@ -12,7 +12,6 @@ use crate::{Result, RuntimeError, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Provider-reported usage from a non-streaming response body. Only fields
