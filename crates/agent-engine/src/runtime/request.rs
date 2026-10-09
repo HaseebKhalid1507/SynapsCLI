@@ -285,9 +285,16 @@ impl ApiMethods {
     pub(super) async fn build_auth_header(
         auth: &Arc<RwLock<AuthState>>,
     ) -> (String, String, String) {
-        let (auth_token, auth_type) = {
+        let (name, value, kind, _) = Self::build_auth_snapshot(auth).await;
+        (name, value, kind)
+    }
+
+    pub(super) async fn build_auth_snapshot(
+        auth: &Arc<RwLock<AuthState>>,
+    ) -> (String, String, String, Option<String>) {
+        let (auth_token, auth_type, binding) = {
             let a = auth.read().await;
-            (a.auth_token.clone(), a.auth_type.clone())
+            (a.auth_token.clone(), a.auth_type.clone(), a.bound_credential.clone())
         };
         let (name, value) = if auth_type == "oauth" {
             (
@@ -297,7 +304,7 @@ impl ApiMethods {
         } else {
             ("x-api-key".to_string(), auth_token)
         };
-        (name, value, auth_type)
+        (name, value, auth_type, binding)
     }
 
     /// Build the `anthropic-beta` header value. Returns `None` when no beta

@@ -10,6 +10,26 @@ use tokio::sync::RwLock;
 
 pub(super) struct AuthMethods;
 
+impl AuthMethods {
+    pub(super) async fn recover_local_rejection(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+        binding: Option<&str>,
+        rejected: &str,
+    ) -> Result<()> {
+        let credential = turn_pinned_credential(source, binding)
+            .ok_or_else(|| RuntimeError::Auth("Rejected OAuth token has no bound local account; run `synaps login`.".into()))?;
+        let broker = broker_from_source(source, cache, client.clone());
+        let token = broker.recover_rejected_token(&credential, rejected).await
+            .map_err(|_| RuntimeError::Auth("OAuth recovery failed for the rejected account. Run `synaps login` to re-authenticate.".into()))?;
+        Self::bind_pinned(auth, source, PinnedToken { credential, token }).await;
+        Ok(())
+    }
+}
+
+
 /// True if `model` routes to the Anthropic path (not OpenAI/codex/local). Used
 /// to skip the Anthropic pre-stream refresh for non-Anthropic models — they
 /// resolve their own provider auth (incl. via the broker), so fetching an

@@ -1293,9 +1293,9 @@ impl ApiMethods {
         let streaming_client = super::http_phases::client(&options.anthropic_stream_client)?;
 
         // Read auth state for this API call
-        let (mut auth_header_name, mut auth_header_value, auth_type) =
-            await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
-        // C1: allow a single on-401 token refetch+retry for Remote clients.
+        let (mut auth_header_name, mut auth_header_value, auth_type, mut auth_binding) =
+            await_or_cancel(cancel, Self::build_auth_snapshot(auth)).await?;
+        // One credential recovery per logical request (local OAuth or remote).
         let mut auth_retried = false;
 
         // Fail early with a clear message if no Anthropic credentials
@@ -1575,12 +1575,10 @@ impl ApiMethods {
                                 break;
                             }
 
-                            // C1: a 401 with a Remote source means the broker token
-                            // was rejected (revoked, or rotated at the broker before
-                            // our cache thought it expired). Invalidate, refetch from
-                            // the broker, and retry ONCE with the fresh token.
+                            // Another process may have rotated the shared OAuth
+                            // token. Recover once, staying on the rejected account.
                             if status.as_u16() == 401
-                                && options.credential_source.is_remote()
+                                && (options.credential_source.is_remote() || auth_type == "oauth")
                                 && !auth_retried
                             {
                                 auth_retried = true;
@@ -1598,6 +1596,13 @@ impl ApiMethods {
                                 }
                                 // Drop the rejected response: no unbounded body drain.
                                 drop(resp);
+                                if !options.credential_source.is_remote() {
+                                    let rejected = auth_header_value.strip_prefix("Bearer ").unwrap_or("");
+                                    await_or_cancel(cancel, super::auth::AuthMethods::recover_local_rejection(
+                                        auth, client, &options.credential_source, &options.token_cache,
+                                        auth_binding.as_deref(), rejected,
+                                    )).await??;
+                                } else {
                                 options.token_cache.invalidate("anthropic");
                                 {
                                     let mut g = await_or_cancel(cancel, auth.write()).await?;
@@ -1616,10 +1621,12 @@ impl ApiMethods {
                                     ),
                                 )
                                 .await??;
-                                let (n, v, _t) =
-                                    await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
+                                }
+                                let (n, v, _t, binding) =
+                                    await_or_cancel(cancel, Self::build_auth_snapshot(auth)).await?;
                                 auth_header_name = n;
                                 auth_header_value = v;
+                                auth_binding = binding;
                                 continue;
                             }
 
@@ -1779,10 +1786,11 @@ impl ApiMethods {
                                             ),
                                         )
                                         .await?;
-                                        let (n, v, _t) =
-                                            await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
+                                        let (n, v, _t, binding) =
+                                            await_or_cancel(cancel, Self::build_auth_snapshot(auth)).await?;
                                         auth_header_name = n;
                                         auth_header_value = v;
+                                        auth_binding = binding;
                                         anthropic_failovers += 1;
                                         let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
                                             "⚠ {label} exhausted until {until} — switching to {next_label}"
@@ -4354,7 +4362,7 @@ mod on401_tests {
     // CredentialSource::Local must NOT trigger the C1 refetch path.
     // With max_retries=0 the error surfaces immediately after 1 call.
     #[tokio::test]
-    async fn on401_local_source_does_not_retry() {
+    async fn on401_local_api_key_does_not_retry() {
         // Always 401
         let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
 
@@ -4372,6 +4380,30 @@ mod on401_tests {
             "Local source must never retry on 401, got {} calls",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_local_oauth_adopts_peer_token_and_retries_only_once() {
+        let _config = crate::test_env::BaseDirGuard::new();
+        let credential = crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+        crate::auth::save_provider_auth("anthropic", &crate::auth::OAuthCredentials {
+            auth_type: "oauth".into(), access: "peer-token".into(), refresh: "never-used".into(),
+            expires: crate::epoch_millis() + 3_600_000, account_id: None,
+        }).unwrap();
+        for failures in [1, 999] {
+            let (url, counter) = spawn_mock_anthropic(failures).await;
+            let auth = auth_with_token("rejected-token");
+            {
+                let mut state = auth.write().await;
+                state.auth_type = "oauth".into();
+                state.bound_credential = Some(crate::runtime::auth::anthropic_binding(&CredentialSource::Local, &credential));
+            }
+            let result = drive_call(auth.clone(), make_options(url, CredentialSource::Local, TokenCache::new())).await;
+            assert_eq!(result.is_ok(), failures == 1);
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+            assert_eq!(auth.read().await.auth_token, "peer-token");
+        }
     }
 
     // ─── Request-lifecycle T1: outgoing-request trace is metadata-only ──────

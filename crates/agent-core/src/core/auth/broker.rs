@@ -608,6 +608,13 @@ pub trait CredentialBroker: Send + Sync {
         }
     }
 
+    /// Re-vend the exact credential whose access token was rejected. Local
+    /// brokers force refresh only if storage still holds that rejected token.
+    /// Remote/custom brokers keep their ordinary explicit-slot semantics.
+    async fn recover_rejected_token(&self, cred: &CredentialRef, _rejected: &str) -> Result<AccessToken, BrokerError> {
+        self.access_token_for(cred).await
+    }
+
     /// Policy-resolved pair: the credential the broker selected for
     /// `provider` and its token. Default implementation: the default slot.
     async fn access_token_pinned(
@@ -2767,6 +2774,13 @@ pub(crate) fn oauth_provider_logged_in_at(
 
 #[async_trait]
 impl CredentialBroker for LocalBroker {
+    async fn recover_rejected_token(&self, cred: &CredentialRef, rejected: &str) -> Result<AccessToken, BrokerError> {
+        self.check_slot_exists(cred)?;
+        let creds = super::token::recover_rejected_credential(&self.http, cred, rejected)
+            .await.map_err(BrokerError::Credential)?;
+        Ok(AccessToken { token: creds.access, expires: creds.expires })
+    }
+
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError> {
         Ok(self.access_token_pinned(provider).await?.token)
     }

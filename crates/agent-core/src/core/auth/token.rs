@@ -250,6 +250,25 @@ pub(crate) async fn ensure_fresh_credential_checked_at(
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
 ) -> std::result::Result<OAuthCredentials, String> {
+    ensure_credential_checked_at(client, cred, path, expected_seat, None).await
+}
+
+/// Recovery is broker-owned: no refresh credentials cross into the runtime.
+pub(super) async fn recover_rejected_credential(
+    client: &Client,
+    cred: &CredentialRef,
+    rejected: &str,
+) -> std::result::Result<OAuthCredentials, String> {
+    ensure_credential_checked_at(client, cred, &auth_file_path(), None, Some(rejected)).await
+}
+
+async fn ensure_credential_checked_at(
+    client: &Client,
+    cred: &CredentialRef,
+    path: &Path,
+    expected_seat: Option<&SeatIdentity>,
+    rejected: Option<&str>,
+) -> std::result::Result<OAuthCredentials, String> {
     let key = cred.storage_key();
     let provider = cred.provider;
     let gate_key = format!("{}|{}", path.display(), key);
@@ -282,7 +301,7 @@ pub(crate) async fn ensure_fresh_credential_checked_at(
     let save = |old_refresh: &str, fresh: &OAuthCredentials| {
         save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)
     };
-    ensure_fresh_gated_locked(refresh_gate(&gate_key), Some(lock_path), load, refresh, save).await
+    ensure_gated_locked_policy(refresh_gate(&gate_key), Some(lock_path), load, refresh, save, rejected).await
 }
 
 /// Per-credential cross-process lock file, beside the credential file.
@@ -409,12 +428,30 @@ const MAX_CAS_ROUNDS: usize = 2;
 ///    orphaned credential.
 /// 6. Metadata (`accountId`) is carried over when the provider's refresh
 ///    response omits it.
+#[cfg(test)]
 pub(crate) async fn ensure_fresh_gated_locked<Load, Refresh, RFut, Save>(
     gate: Arc<Mutex<()>>,
     lock_path: Option<PathBuf>,
     load: Load,
     refresh: Refresh,
     save: Save,
+) -> std::result::Result<OAuthCredentials, String>
+where
+    Load: Fn() -> std::result::Result<OAuthCredentials, String>,
+    Refresh: Fn(String) -> RFut,
+    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
+    Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
+{
+    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None).await
+}
+
+async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save>(
+    gate: Arc<Mutex<()>>,
+    lock_path: Option<PathBuf>,
+    load: Load,
+    refresh: Refresh,
+    save: Save,
+    rejected: Option<&str>,
 ) -> std::result::Result<OAuthCredentials, String>
 where
     Load: Fn() -> std::result::Result<OAuthCredentials, String>,
@@ -434,7 +471,13 @@ where
         // Re-read under both locks: a preceding waiter (or another process)
         // may have refreshed and atomically persisted a rotated token.
         let creds = load()?;
-        if !is_token_expired(&creds) {
+        // A peer already rotated/replaced the rejected token: adopt it, do
+        // not force another rotation. Otherwise refresh even if unexpired.
+        let needs_refresh = match rejected {
+            Some(rejected) => creds.access == rejected,
+            None => is_token_expired(&creds),
+        };
+        if !needs_refresh {
             return Ok(creds);
         }
         let old_refresh = creds.refresh.clone();
@@ -1024,5 +1067,62 @@ mod tests {
             refresh_lock_path(path, "openai-codex@astra2")
         );
         let _ = CasOutcome::Saved;
+    }
+}
+
+#[cfg(test)]
+mod rejected_token_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    fn credential(access: &str) -> OAuthCredentials {
+        OAuthCredentials { auth_type: "oauth".into(), access: access.into(), refresh: "r0".into(),
+            expires: crate::epoch_millis() + 3_600_000, account_id: Some("account".into()) }
+    }
+    async fn recover(store: &StdMutex<OAuthCredentials>, gate: Arc<Mutex<()>>, calls: &AtomicUsize,
+        lock: Option<PathBuf>, rejected: &str) -> Result<OAuthCredentials, String> {
+        ensure_gated_locked_policy(gate, lock, || Ok(store.lock().unwrap().clone()),
+            |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(credential("new"))
+            }, |_, fresh| { *store.lock().unwrap() = fresh.clone(); Ok(CasOutcome::Saved) }, Some(rejected)).await
+    }
+    #[tokio::test]
+    async fn changed_token_is_adopted_without_refresh() {
+        let store = StdMutex::new(credential("peer-token"));
+        let calls = AtomicUsize::new(0);
+        let got = recover(&store, Arc::new(Mutex::new(())), &calls, None, "rejected").await.unwrap();
+        assert_eq!(got.access, "peer-token");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn unexpired_rejected_token_rotates_once_for_concurrent_waiters() {
+        let store = StdMutex::new(credential("rejected"));
+        let calls = AtomicUsize::new(0);
+        let gate = Arc::new(Mutex::new(()));
+        let (a,b) = tokio::join!(recover(&store, gate.clone(), &calls, None, "rejected"),
+            recover(&store, gate, &calls, None, "rejected"));
+        assert_eq!(a.unwrap().access, "new"); assert_eq!(b.unwrap().access, "new");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn separate_process_gates_serialize_on_the_refresh_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("refresh.lock");
+        let store = StdMutex::new(credential("rejected"));
+        let calls = AtomicUsize::new(0);
+        let (a,b) = tokio::join!(recover(&store, Arc::new(Mutex::new(())), &calls, Some(lock.clone()), "rejected"),
+            recover(&store, Arc::new(Mutex::new(())), &calls, Some(lock), "rejected"));
+        assert_eq!(a.unwrap().access, "new"); assert_eq!(b.unwrap().access, "new");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn removed_slot_is_not_resurrected_by_forced_refresh() {
+        let result = ensure_gated_locked_policy(Arc::new(Mutex::new(())), None,
+            || Ok(credential("rejected")), |_| async { Ok(credential("new")) },
+            |_,_| Ok(CasOutcome::Removed), Some("rejected")).await;
+        assert!(result.unwrap_err().contains("removed"));
     }
 }
