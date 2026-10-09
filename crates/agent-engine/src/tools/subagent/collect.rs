@@ -98,6 +98,7 @@ impl Tool for SubagentCollectTool {
                 return Ok(json!({
                     "handle_id": handle_id,
                     "status": archive.status,
+                    "error": archive.error,
                     "output": archive.output,
                     "model": archive.meta.model,
                     "collected": true,
@@ -311,6 +312,7 @@ mod tests {
             "sa_gone",
             &meta,
             "timed_out",
+            Some("worker timed out"),
             "[TIMED OUT after 60s] latest progress",
             &[Arc::new(json!({"role": "user", "content": "task"}))],
         )
@@ -357,6 +359,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["status"], "timed_out");
+        assert_eq!(body["error"], "worker timed out");
         assert_eq!(body["output"], "[TIMED OUT after 60s] latest progress");
         assert_eq!(body["archive_path"], json!(path));
     }

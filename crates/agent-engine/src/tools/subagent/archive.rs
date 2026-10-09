@@ -34,6 +34,8 @@ pub struct SubagentArchive {
     pub version: u32,
     pub meta: SubagentArchiveMeta,
     pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
     pub output: String,
     pub history: Vec<Value>,
 }
@@ -45,6 +47,7 @@ struct SubagentArchiveRef<'a> {
     handle_id: &'a str,
     meta: &'a SubagentArchiveMeta,
     status: &'a str,
+    error: Option<&'a str>,
     output: &'a str,
     history: &'a [crate::SharedMessage],
 }
@@ -97,6 +100,7 @@ pub fn write_archive(
     handle_id: &str,
     meta: &SubagentArchiveMeta,
     status: &str,
+    error: Option<&str>,
     output: &str,
     history: &[crate::SharedMessage],
 ) -> std::io::Result<PathBuf> {
@@ -108,6 +112,7 @@ pub fn write_archive(
         handle_id,
         meta,
         status,
+        error,
         output,
         history,
     })
@@ -185,7 +190,7 @@ pub fn archive_finished_worker(
     handle_id: &str,
     dir: &Path,
 ) {
-    let (meta, status, output, history) = {
+    let (meta, status, error, output, history) = {
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
         let Some(meta) = s.archive_meta.clone() else {
             if s.history.is_some() {
@@ -194,31 +199,44 @@ pub fn archive_finished_worker(
             }
             return;
         };
-        let Some(history) = s.history.clone() else {
-            s.archive_error =
-                Some("worker exited without a full history checkpoint; resume unavailable".into());
-            return;
-        };
+        // Startup failures may never emit MessageHistory; still write the
+        // archive so the failure diagnostic survives, but mark it unresumable.
+        let history = s.history.clone();
         (
             meta,
             s.status.as_str().to_string(),
+            s.status.failure_reason().map(str::to_owned),
             s.partial_text.clone(),
             history,
         )
     };
-    let outcome = write_archive(dir, handle_id, &meta, &status, &output, &history);
+    let had_history = history.is_some();
+    let history = history.unwrap_or_default();
+    let outcome = write_archive(
+        dir,
+        handle_id,
+        &meta,
+        &status,
+        error.as_deref(),
+        &output,
+        &history,
+    );
     let mut s = state.write().unwrap_or_else(|p| p.into_inner());
     match outcome {
         Ok(path) => {
             s.archive_path = Some(path);
-            s.archive_error = None;
+            s.archive_error = (!had_history).then(|| {
+                "worker exited without a full history checkpoint; resume unavailable".into()
+            });
             s.history = None;
         }
         Err(e) => {
             tracing::warn!("subagent {handle_id}: could not write resume archive: {e}");
-            s.archive_error = Some(format!(
-                "archive write failed: {e}; full history retained in memory"
-            ));
+            s.archive_error = Some(if had_history {
+                format!("archive write failed: {e}; full history retained in memory")
+            } else {
+                format!("archive write failed: {e}; worker exited without a full history checkpoint")
+            });
         }
     }
 }
@@ -355,7 +373,7 @@ mod tests {
     fn archive_round_trips_and_is_private() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("proc");
-        let path = write_archive(&sub, "sa_7", &meta(), "timed_out", "out", &history()).unwrap();
+        let path = write_archive(&sub, "sa_7", &meta(), "timed_out", Some("worker timed out"), "out", &history()).unwrap();
         let a = read_archive(&path).unwrap();
         assert_eq!(a.meta, meta());
         assert_eq!(a.status, "timed_out");
@@ -518,13 +536,19 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_without_history_writes_nothing() {
+    fn finalizer_without_history_preserves_startup_error() {
         let dir = tempfile::tempdir().unwrap();
         let state = RwLock::new(SubagentState::new());
-        state.write().unwrap().archive_meta = Some(meta());
+        {
+            let mut state = state.write().unwrap();
+            state.archive_meta = Some(meta());
+            state.status = crate::runtime::subagent::SubagentStatus::Failed("startup failed".into());
+        }
         archive_finished_worker(&state, "sa_10", dir.path());
-        assert!(state.read().unwrap().archive_path.is_none());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let path = state.read().unwrap().archive_path.clone().unwrap();
+        let archive = read_archive(&path).unwrap();
+        assert_eq!(archive.error.as_deref(), Some("startup failed"));
+        assert!(archive.history.is_empty());
     }
 
     #[test]
@@ -609,7 +633,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let hist = root.path().join("subagent-history");
         let sub = hist.join("proc");
-        let ok = write_archive(&sub, "sa_1", &meta(), "failed", "", &history()).unwrap();
+        let ok = write_archive(&sub, "sa_1", &meta(), "failed", Some("failed"), "", &history()).unwrap();
         assert_eq!(
             checked_archive_path_in(ok.to_str().unwrap(), &hist).unwrap(),
             ok.canonicalize().unwrap()

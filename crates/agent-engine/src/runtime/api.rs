@@ -4406,6 +4406,30 @@ mod on401_tests {
         }
     }
 
+    #[tokio::test]
+    async fn exhausted_send_and_body_disconnect_are_network_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for partial_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 8192];
+                let _ = socket.read(&mut buf).await;
+                if partial_headers {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\ndata: ").await.unwrap();
+                }
+            });
+            let error = drive_call(auth_with_token("test"), make_options(url, CredentialSource::Local, TokenCache::new())).await.unwrap_err();
+            server.await.unwrap();
+            assert!(matches!(error, crate::RuntimeError::Api(_)), "{error:?}");
+            let human = crate::runtime::helpers::turn_error_for(&error, "test-turn");
+            assert!(human.category_label().contains("network_error"));
+            assert!(!human.message.contains("http://"));
+            assert!(!human.message.is_empty());
+        }
+    }
+
     // ─── Request-lifecycle T1: outgoing-request trace is metadata-only ──────
     // A request body containing a unique sentinel must never surface in
     // tracing output at ANY level (TRACE included); only metadata fields

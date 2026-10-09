@@ -584,7 +584,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": "rendered 300 frames"}
             ]})),
         ];
-        super::super::archive::write_archive(dir, id, &meta, "timed_out", "report", &history)
+        super::super::archive::write_archive(dir, id, &meta, "timed_out", Some("worker timed out"), "report", &history)
             .unwrap()
     }
 
