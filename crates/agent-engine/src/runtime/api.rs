@@ -1916,9 +1916,7 @@ impl ApiMethods {
                             last_err = e.to_string();
                             last_status = None;
                             // No headers on network error — plain exponential back-off.
-                            let delay = Duration::from_millis(
-                                1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                            );
+                            let delay = super::telemetry::network_retry_delay(non_429_attempts);
                             tracing::warn!(
                                 "API retry {}/{} after {:?}: {}",
                                 non_429_attempts,

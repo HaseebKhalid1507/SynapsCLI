@@ -526,3 +526,19 @@ mod retry_delay_tests {
         assert!(from_hdr);
     }
 }
+
+/// Headerless network retry delay. Bounded even for arbitrarily large config
+/// values; matches the streaming error path's 64-second ceiling.
+pub(super) fn network_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.saturating_sub(1).min(6))
+}
+
+#[cfg(test)]
+mod network_backoff_tests {
+    #[test]
+    fn configured_large_retry_counts_never_overflow() {
+        let seconds: Vec<_> = [0, 1, 2, 3, 7, 8, u32::MAX].into_iter()
+            .map(|n| super::network_retry_delay(n).as_secs()).collect();
+        assert_eq!(seconds, [1, 1, 2, 4, 64, 64, 64]);
+    }
+}

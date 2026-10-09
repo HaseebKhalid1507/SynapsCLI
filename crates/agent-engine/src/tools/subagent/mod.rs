@@ -110,6 +110,7 @@ pub(crate) fn apply_subagent_runtime_policy(
     session_allow_all: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
     runtime.inherit_session_allow_all(session_allow_all);
+    runtime.apply_retry_config(config);
 
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
@@ -921,5 +922,26 @@ mod label_tests {
         // A cut that lands on a separator leaves no trailing dash.
         let cut = subagent_label(None, Some(&format!("{} tail", "y".repeat(31))));
         assert_eq!(cut, "y".repeat(31));
+    }
+}
+
+#[cfg(test)]
+mod retry_inheritance_tests {
+    #[test]
+    fn worker_policy_inherits_retry_counts_without_foreground_policy() {
+        for (api, refusal) in [(8, 5), (0, 0), (u32::MAX, 7)] {
+            let mut worker = crate::Runtime::new_headless();
+            let config = crate::SynapsConfig {
+                api_retries: api,
+                refusal_retries: refusal,
+                cache_ttl: crate::config::CacheTtl::OneHour,
+                ..Default::default()
+            };
+            super::apply_subagent_runtime_policy(&mut worker, &config, None, None);
+            assert_eq!(worker.api_retries(), api);
+            assert_eq!(worker.refusal_retries(), refusal);
+            assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes);
+            assert_eq!(worker.codex_request_role(), crate::runtime::openai::catalog::CodexRequestRole::Worker);
+        }
     }
 }

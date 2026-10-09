@@ -366,7 +366,9 @@ impl EngineHost {
         // tools, so a projected schema would silently drop every extension
         // tool.
         host.progressive_tool_disclosure = false;
-        Ok(Runtime::from_parts(RuntimeParts::with_reaper(host)))
+        let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(host));
+        runtime.apply_retry_config(&self.config());
+        Ok(runtime)
     }
 
     /// Cached-or-rebuilt worker registry: `without_subagent_with_extensions`

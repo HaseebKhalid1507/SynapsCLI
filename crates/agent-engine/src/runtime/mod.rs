@@ -2786,6 +2786,17 @@ impl Runtime {
         self.subagent_timeout = v;
     }
 
+    /// Copy only retry policy; worker construction must not re-install brokers
+    /// or acquire foreground capabilities by calling full apply_config.
+    pub(crate) fn apply_retry_config(&mut self, config: &crate::SynapsConfig) {
+        self.api_retries = config.api_retries;
+        self.refusal_retries = config.refusal_retries;
+    }
+
+    pub fn refusal_retries(&self) -> u32 {
+        self.refusal_retries
+    }
+
     pub fn set_api_retries(&mut self, v: u32) {
         self.api_retries = v;
     }
