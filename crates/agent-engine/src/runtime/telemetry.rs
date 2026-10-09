@@ -537,8 +537,10 @@ pub(super) fn network_retry_delay(attempt: u32) -> Duration {
 mod network_backoff_tests {
     #[test]
     fn configured_large_retry_counts_never_overflow() {
-        let seconds: Vec<_> = [0, 1, 2, 3, 7, 8, u32::MAX].into_iter()
-            .map(|n| super::network_retry_delay(n).as_secs()).collect();
+        let seconds: Vec<_> = [0, 1, 2, 3, 7, 8, u32::MAX]
+            .into_iter()
+            .map(|n| super::network_retry_delay(n).as_secs())
+            .collect();
         assert_eq!(seconds, [1, 1, 2, 4, 64, 64, 64]);
     }
 }

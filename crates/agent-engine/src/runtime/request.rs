@@ -294,7 +294,11 @@ impl ApiMethods {
     ) -> (String, String, String, Option<String>) {
         let (auth_token, auth_type, binding) = {
             let a = auth.read().await;
-            (a.auth_token.clone(), a.auth_type.clone(), a.bound_credential.clone())
+            (
+                a.auth_token.clone(),
+                a.auth_type.clone(),
+                a.bound_credential.clone(),
+            )
         };
         let (name, value) = if auth_type == "oauth" {
             (

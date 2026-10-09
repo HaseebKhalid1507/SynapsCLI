@@ -301,7 +301,15 @@ async fn ensure_credential_checked_at(
     let save = |old_refresh: &str, fresh: &OAuthCredentials| {
         save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)
     };
-    ensure_gated_locked_policy(refresh_gate(&gate_key), Some(lock_path), load, refresh, save, rejected).await
+    ensure_gated_locked_policy(
+        refresh_gate(&gate_key),
+        Some(lock_path),
+        load,
+        refresh,
+        save,
+        rejected,
+    )
+    .await
 }
 
 /// Per-credential cross-process lock file, beside the credential file.
@@ -1077,23 +1085,45 @@ mod rejected_token_tests {
     use std::sync::Mutex as StdMutex;
 
     fn credential(access: &str) -> OAuthCredentials {
-        OAuthCredentials { auth_type: "oauth".into(), access: access.into(), refresh: "r0".into(),
-            expires: crate::epoch_millis() + 3_600_000, account_id: Some("account".into()) }
+        OAuthCredentials {
+            auth_type: "oauth".into(),
+            access: access.into(),
+            refresh: "r0".into(),
+            expires: crate::epoch_millis() + 3_600_000,
+            account_id: Some("account".into()),
+        }
     }
-    async fn recover(store: &StdMutex<OAuthCredentials>, gate: Arc<Mutex<()>>, calls: &AtomicUsize,
-        lock: Option<PathBuf>, rejected: &str) -> Result<OAuthCredentials, String> {
-        ensure_gated_locked_policy(gate, lock, || Ok(store.lock().unwrap().clone()),
+    async fn recover(
+        store: &StdMutex<OAuthCredentials>,
+        gate: Arc<Mutex<()>>,
+        calls: &AtomicUsize,
+        lock: Option<PathBuf>,
+        rejected: &str,
+    ) -> Result<OAuthCredentials, String> {
+        ensure_gated_locked_policy(
+            gate,
+            lock,
+            || Ok(store.lock().unwrap().clone()),
             |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 tokio::task::yield_now().await;
                 Ok(credential("new"))
-            }, |_, fresh| { *store.lock().unwrap() = fresh.clone(); Ok(CasOutcome::Saved) }, Some(rejected)).await
+            },
+            |_, fresh| {
+                *store.lock().unwrap() = fresh.clone();
+                Ok(CasOutcome::Saved)
+            },
+            Some(rejected),
+        )
+        .await
     }
     #[tokio::test]
     async fn changed_token_is_adopted_without_refresh() {
         let store = StdMutex::new(credential("peer-token"));
         let calls = AtomicUsize::new(0);
-        let got = recover(&store, Arc::new(Mutex::new(())), &calls, None, "rejected").await.unwrap();
+        let got = recover(&store, Arc::new(Mutex::new(())), &calls, None, "rejected")
+            .await
+            .unwrap();
         assert_eq!(got.access, "peer-token");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -1102,9 +1132,12 @@ mod rejected_token_tests {
         let store = StdMutex::new(credential("rejected"));
         let calls = AtomicUsize::new(0);
         let gate = Arc::new(Mutex::new(()));
-        let (a,b) = tokio::join!(recover(&store, gate.clone(), &calls, None, "rejected"),
-            recover(&store, gate, &calls, None, "rejected"));
-        assert_eq!(a.unwrap().access, "new"); assert_eq!(b.unwrap().access, "new");
+        let (a, b) = tokio::join!(
+            recover(&store, gate.clone(), &calls, None, "rejected"),
+            recover(&store, gate, &calls, None, "rejected")
+        );
+        assert_eq!(a.unwrap().access, "new");
+        assert_eq!(b.unwrap().access, "new");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
@@ -1113,16 +1146,37 @@ mod rejected_token_tests {
         let lock = dir.path().join("refresh.lock");
         let store = StdMutex::new(credential("rejected"));
         let calls = AtomicUsize::new(0);
-        let (a,b) = tokio::join!(recover(&store, Arc::new(Mutex::new(())), &calls, Some(lock.clone()), "rejected"),
-            recover(&store, Arc::new(Mutex::new(())), &calls, Some(lock), "rejected"));
-        assert_eq!(a.unwrap().access, "new"); assert_eq!(b.unwrap().access, "new");
+        let (a, b) = tokio::join!(
+            recover(
+                &store,
+                Arc::new(Mutex::new(())),
+                &calls,
+                Some(lock.clone()),
+                "rejected"
+            ),
+            recover(
+                &store,
+                Arc::new(Mutex::new(())),
+                &calls,
+                Some(lock),
+                "rejected"
+            )
+        );
+        assert_eq!(a.unwrap().access, "new");
+        assert_eq!(b.unwrap().access, "new");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
     async fn removed_slot_is_not_resurrected_by_forced_refresh() {
-        let result = ensure_gated_locked_policy(Arc::new(Mutex::new(())), None,
-            || Ok(credential("rejected")), |_| async { Ok(credential("new")) },
-            |_,_| Ok(CasOutcome::Removed), Some("rejected")).await;
+        let result = ensure_gated_locked_policy(
+            Arc::new(Mutex::new(())),
+            None,
+            || Ok(credential("rejected")),
+            |_| async { Ok(credential("new")) },
+            |_, _| Ok(CasOutcome::Removed),
+            Some("rejected"),
+        )
+        .await;
         assert!(result.unwrap_err().contains("removed"));
     }
 }

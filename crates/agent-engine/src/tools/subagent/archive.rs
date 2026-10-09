@@ -373,7 +373,16 @@ mod tests {
     fn archive_round_trips_and_is_private() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("proc");
-        let path = write_archive(&sub, "sa_7", &meta(), "timed_out", Some("worker timed out"), "out", &history()).unwrap();
+        let path = write_archive(
+            &sub,
+            "sa_7",
+            &meta(),
+            "timed_out",
+            Some("worker timed out"),
+            "out",
+            &history(),
+        )
+        .unwrap();
         let a = read_archive(&path).unwrap();
         assert_eq!(a.meta, meta());
         assert_eq!(a.status, "timed_out");
@@ -542,7 +551,8 @@ mod tests {
         {
             let mut state = state.write().unwrap();
             state.archive_meta = Some(meta());
-            state.status = crate::runtime::subagent::SubagentStatus::Failed("startup failed".into());
+            state.status =
+                crate::runtime::subagent::SubagentStatus::Failed("startup failed".into());
         }
         archive_finished_worker(&state, "sa_10", dir.path());
         let path = state.read().unwrap().archive_path.clone().unwrap();
@@ -633,7 +643,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let hist = root.path().join("subagent-history");
         let sub = hist.join("proc");
-        let ok = write_archive(&sub, "sa_1", &meta(), "failed", Some("failed"), "", &history()).unwrap();
+        let ok = write_archive(
+            &sub,
+            "sa_1",
+            &meta(),
+            "failed",
+            Some("failed"),
+            "",
+            &history(),
+        )
+        .unwrap();
         assert_eq!(
             checked_archive_path_in(ok.to_str().unwrap(), &hist).unwrap(),
             ok.canonicalize().unwrap()

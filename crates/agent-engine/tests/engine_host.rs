@@ -11,7 +11,11 @@ async fn host() -> Arc<EngineHost> {
         let home = std::env::temp_dir().join(format!("synaps-engine-host-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("config"), "api_retries = 8\nrefusal_retries = 5\n").unwrap();
+        std::fs::write(
+            home.join("config"),
+            "api_retries = 8\nrefusal_retries = 5\n",
+        )
+        .unwrap();
         config::set_base_dir_for_tests(home);
         let h = EngineHost::boot(HostOpts {
             profile: None,

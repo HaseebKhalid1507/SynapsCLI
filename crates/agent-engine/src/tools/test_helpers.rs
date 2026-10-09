@@ -1,5 +1,4 @@
 //! Shared test helpers for tool unit tests.
-#![cfg(test)]
 
 use super::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 

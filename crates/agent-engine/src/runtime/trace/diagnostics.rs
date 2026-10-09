@@ -605,7 +605,7 @@ mod tests {
         }));
         let fresh = msg("user", "new");
         let tail = history_tail_bytes(&[cached.clone(), fresh.clone()]);
-        let only_fresh = history_tail_bytes(&[fresh.clone()]);
+        let only_fresh = history_tail_bytes(std::slice::from_ref(&fresh));
         // The tail after the boundary is exactly the fresh message.
         assert_eq!(tail, only_fresh);
         // Without a boundary, the whole history is the tail.

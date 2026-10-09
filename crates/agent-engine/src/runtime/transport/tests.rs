@@ -361,7 +361,7 @@ fn adapter_golden_byte_identity_all_modes() {
             String::from_utf8_lossy(&old),
             String::from_utf8_lossy(&bytes_a),
         );
-        if !(s.identity_sensitive && !default_identity) {
+        if !s.identity_sensitive || default_identity {
             let path = dir.join(format!("{}.json", s.name));
             let fixture = std::fs::read(&path)
                 .unwrap_or_else(|e| panic!("missing fixture {} — {e}", path.display()));

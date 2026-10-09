@@ -1597,33 +1597,43 @@ impl ApiMethods {
                                 // Drop the rejected response: no unbounded body drain.
                                 drop(resp);
                                 if !options.credential_source.is_remote() {
-                                    let rejected = auth_header_value.strip_prefix("Bearer ").unwrap_or("");
-                                    await_or_cancel(cancel, super::auth::AuthMethods::recover_local_rejection(
-                                        auth, client, &options.credential_source, &options.token_cache,
-                                        auth_binding.as_deref(), rejected,
-                                    )).await??;
+                                    let rejected =
+                                        auth_header_value.strip_prefix("Bearer ").unwrap_or("");
+                                    await_or_cancel(
+                                        cancel,
+                                        super::auth::AuthMethods::recover_local_rejection(
+                                            auth,
+                                            client,
+                                            &options.credential_source,
+                                            &options.token_cache,
+                                            auth_binding.as_deref(),
+                                            rejected,
+                                        ),
+                                    )
+                                    .await??;
                                 } else {
-                                options.token_cache.invalidate("anthropic");
-                                {
-                                    let mut g = await_or_cancel(cancel, auth.write()).await?;
-                                    g.auth_token.clear();
-                                    g.token_expires = None;
-                                }
-                                await_or_cancel(
-                                    cancel,
-                                    super::auth::AuthMethods::refresh_if_needed(
-                                        std::sync::Arc::clone(auth),
-                                        client,
-                                        &options.credential_source,
-                                        &options.token_cache,
-                                        Some(model),
-                                        super::auth::RefreshPoint::WithinTurn,
-                                    ),
-                                )
-                                .await??;
+                                    options.token_cache.invalidate("anthropic");
+                                    {
+                                        let mut g = await_or_cancel(cancel, auth.write()).await?;
+                                        g.auth_token.clear();
+                                        g.token_expires = None;
+                                    }
+                                    await_or_cancel(
+                                        cancel,
+                                        super::auth::AuthMethods::refresh_if_needed(
+                                            std::sync::Arc::clone(auth),
+                                            client,
+                                            &options.credential_source,
+                                            &options.token_cache,
+                                            Some(model),
+                                            super::auth::RefreshPoint::WithinTurn,
+                                        ),
+                                    )
+                                    .await??;
                                 }
                                 let (n, v, _t, binding) =
-                                    await_or_cancel(cancel, Self::build_auth_snapshot(auth)).await?;
+                                    await_or_cancel(cancel, Self::build_auth_snapshot(auth))
+                                        .await?;
                                 auth_header_name = n;
                                 auth_header_value = v;
                                 auth_binding = binding;
@@ -1659,7 +1669,12 @@ impl ApiMethods {
                             let error_text = await_or_cancel(cancel, async {
                                 let mut stream = resp.bytes_stream();
                                 let mut bytes = Vec::new();
-                                while let Some(Ok(chunk)) = super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE).await {
+                                while let Some(Ok(chunk)) = super::http_phases::next(
+                                    &mut stream,
+                                    super::http_phases::STREAM_IDLE,
+                                )
+                                .await
+                                {
                                     let remaining = QUOTA_PROBE_BODY_CAP - bytes.len();
                                     bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                                     if bytes.len() == QUOTA_PROBE_BODY_CAP {
@@ -1786,8 +1801,11 @@ impl ApiMethods {
                                             ),
                                         )
                                         .await?;
-                                        let (n, v, _t, binding) =
-                                            await_or_cancel(cancel, Self::build_auth_snapshot(auth)).await?;
+                                        let (n, v, _t, binding) = await_or_cancel(
+                                            cancel,
+                                            Self::build_auth_snapshot(auth),
+                                        )
+                                        .await?;
                                         auth_header_name = n;
                                         auth_header_value = v;
                                         auth_binding = binding;
@@ -2034,8 +2052,12 @@ impl ApiMethods {
 
             // Cancellation exits through the normal finalization below: partial
             // content, residual Usage and attempt telemetry must not be dropped.
-            while let Ok(Some(chunk)) = await_or_cancel(cancel,
-                super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE)).await {
+            while let Ok(Some(chunk)) = await_or_cancel(
+                cancel,
+                super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE),
+            )
+            .await
+            {
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -3424,7 +3446,8 @@ mod tests {
             .stream_error
             .take()
             .expect("error event must be captured");
-        for (text, ctx_name) in [(err.message.as_str(), "stream_error message")] {
+        {
+            let (text, ctx_name) = (err.message.as_str(), "stream_error message");
             assert!(
                 !text.contains(HOSTILE_SENTINEL),
                 "{ctx_name}: sentinel leaked: {text}"
@@ -4386,20 +4409,35 @@ mod on401_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn on401_local_oauth_adopts_peer_token_and_retries_only_once() {
         let _config = crate::test_env::BaseDirGuard::new();
-        let credential = crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
-        crate::auth::save_provider_auth("anthropic", &crate::auth::OAuthCredentials {
-            auth_type: "oauth".into(), access: "peer-token".into(), refresh: "never-used".into(),
-            expires: crate::epoch_millis() + 3_600_000, account_id: None,
-        }).unwrap();
+        let credential =
+            crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+        crate::auth::save_provider_auth(
+            "anthropic",
+            &crate::auth::OAuthCredentials {
+                auth_type: "oauth".into(),
+                access: "peer-token".into(),
+                refresh: "never-used".into(),
+                expires: crate::epoch_millis() + 3_600_000,
+                account_id: None,
+            },
+        )
+        .unwrap();
         for failures in [1, 999] {
             let (url, counter) = spawn_mock_anthropic(failures).await;
             let auth = auth_with_token("rejected-token");
             {
                 let mut state = auth.write().await;
                 state.auth_type = "oauth".into();
-                state.bound_credential = Some(crate::runtime::auth::anthropic_binding(&CredentialSource::Local, &credential));
+                state.bound_credential = Some(crate::runtime::auth::anthropic_binding(
+                    &CredentialSource::Local,
+                    &credential,
+                ));
             }
-            let result = drive_call(auth.clone(), make_options(url, CredentialSource::Local, TokenCache::new())).await;
+            let result = drive_call(
+                auth.clone(),
+                make_options(url, CredentialSource::Local, TokenCache::new()),
+            )
+            .await;
             assert_eq!(result.is_ok(), failures == 1);
             assert_eq!(counter.load(Ordering::SeqCst), 2);
             assert_eq!(auth.read().await.auth_token, "peer-token");
@@ -4420,7 +4458,12 @@ mod on401_tests {
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\ndata: ").await.unwrap();
                 }
             });
-            let error = drive_call(auth_with_token("test"), make_options(url, CredentialSource::Local, TokenCache::new())).await.unwrap_err();
+            let error = drive_call(
+                auth_with_token("test"),
+                make_options(url, CredentialSource::Local, TokenCache::new()),
+            )
+            .await
+            .unwrap_err();
             server.await.unwrap();
             assert!(matches!(error, crate::RuntimeError::Api(_)), "{error:?}");
             let human = crate::runtime::helpers::turn_error_for(&error, "test-turn");

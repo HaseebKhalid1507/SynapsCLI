@@ -1372,9 +1372,11 @@ mod tests {
 
     #[test]
     fn oversize_frame_rejected_both_directions() {
-        assert!(DAEMON_MAX_FRAME_BYTES > RPC_MAX_FRAME_BYTES);
+        const { assert!(DAEMON_MAX_FRAME_BYTES > RPC_MAX_FRAME_BYTES) };
         let big = "x".repeat(DAEMON_MAX_FRAME_BYTES + 1);
-        assert!(decode_line::<ClientFrame>(&big).unwrap_err().contains("64 MiB"));
+        assert!(decode_line::<ClientFrame>(&big)
+            .unwrap_err()
+            .contains("64 MiB"));
         // encode side: a frame that would serialise past the cap is refused
         let f = DaemonFrame::Error { session_id: None, message: big };
         assert!(encode_line(&f).unwrap_err().contains("64 MiB"));

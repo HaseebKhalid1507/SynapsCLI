@@ -1796,7 +1796,7 @@ mod tests {
         };
 
         let action = InputAction::SlashCommand("sidecar".into(), "toggle".into());
-        handle_input_action(action, state).await;
+        let _ = handle_input_action(action, state).await;
 
         let found = app.transcript.messages().iter().any(|m| {
             matches!(

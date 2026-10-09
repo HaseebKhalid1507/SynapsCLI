@@ -19,8 +19,11 @@ impl AuthMethods {
         binding: Option<&str>,
         rejected: &str,
     ) -> Result<()> {
-        let credential = turn_pinned_credential(source, binding)
-            .ok_or_else(|| RuntimeError::Auth("Rejected OAuth token has no bound local account; run `synaps login`.".into()))?;
+        let credential = turn_pinned_credential(source, binding).ok_or_else(|| {
+            RuntimeError::Auth(
+                "Rejected OAuth token has no bound local account; run `synaps login`.".into(),
+            )
+        })?;
         let broker = broker_from_source(source, cache, client.clone());
         let token = broker.recover_rejected_token(&credential, rejected).await
             .map_err(|_| RuntimeError::Auth("OAuth recovery failed for the rejected account. Run `synaps login` to re-authenticate.".into()))?;
@@ -28,7 +31,6 @@ impl AuthMethods {
         Ok(())
     }
 }
-
 
 /// True if `model` routes to the Anthropic path (not OpenAI/codex/local). Used
 /// to skip the Anthropic pre-stream refresh for non-Anthropic models — they

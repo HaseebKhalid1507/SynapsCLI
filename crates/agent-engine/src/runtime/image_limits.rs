@@ -721,25 +721,39 @@ pub(super) fn cap_worker_images(messages: &[SharedMessage]) -> Option<Vec<Shared
     cap_images(messages, WORKER_IMAGE_COUNT, WORKER_IMAGE_BYTES)
 }
 
-fn cap_images(messages: &[SharedMessage], count_cap: usize, byte_cap: usize) -> Option<Vec<SharedMessage>> {
+fn cap_images(
+    messages: &[SharedMessage],
+    count_cap: usize,
+    byte_cap: usize,
+) -> Option<Vec<SharedMessage>> {
     let slots = image_slots(messages);
     let bytes = |slot| {
         let block = block_at(messages, slot);
         if block["source"]["type"] == "base64" {
             block["source"]["data"].as_str().map_or(0, str::len)
-        } else { 0 }
+        } else {
+            0
+        }
     };
     let mut count = slots.len();
     let mut total = slots.iter().map(|&slot| bytes(slot)).sum::<usize>();
-    if count <= count_cap && total <= byte_cap { return None; }
+    if count <= count_cap && total <= byte_cap {
+        return None;
+    }
     let mut out = messages.to_vec();
     for slot in slots {
-        if count <= count_cap && total <= byte_cap { break; }
+        if count <= count_cap && total <= byte_cap {
+            break;
+        }
         total -= bytes(slot);
         count -= 1;
         replace_with_text(&mut out, slot, WORKER_IMAGE_LABEL.to_owned());
     }
-    tracing::info!(remaining_images = count, remaining_bytes = total, "worker image upload budget applied");
+    tracing::info!(
+        remaining_images = count,
+        remaining_bytes = total,
+        "worker image upload budget applied"
+    );
     Some(out)
 }
 
@@ -754,8 +768,10 @@ mod worker_image_tests {
     }
     #[test]
     fn newest_images_survive_both_budgets_without_mutating_history() {
-        let history = vec![message(json!([image("old"), {"type":"tool_result","tool_use_id":"t1",
-            "content":[{"type":"text","text":"summary"},image("middle"),image("new")]}]))];
+        let history = vec![message(
+            json!([image("old"), {"type":"tool_result","tool_use_id":"t1",
+            "content":[{"type":"text","text":"summary"},image("middle"),image("new")]}]),
+        )];
         let original = history[0].clone();
         let out = cap_images(&history, 2, 9).unwrap();
         assert_eq!(out[0]["content"][0]["type"], "text");

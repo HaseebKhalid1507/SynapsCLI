@@ -729,33 +729,6 @@ mod codex_ultra_worker_tests {
 #[cfg(test)]
 mod forum_worker_tests {
     use super::{apply_subagent_runtime_policy, subagent_tools};
-    use crate::tools::Tool;
-    use std::sync::Arc;
-
-    struct ExtensionProbe(&'static str);
-    #[async_trait::async_trait]
-    impl Tool for ExtensionProbe {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn description(&self) -> &str {
-            "registry-only fixture"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-        fn extension_id(&self) -> Option<&str> {
-            Some("forum-test")
-        }
-        async fn execute(
-            &self,
-            _: serde_json::Value,
-            _: crate::ToolContext,
-        ) -> crate::Result<String> {
-            panic!("registry construction must not execute tools")
-        }
-    }
-
     #[test]
     fn common_worker_policy_forks_author_without_mutating_parent() {
         let parent = crate::Runtime::new_headless();
@@ -941,7 +914,10 @@ mod retry_inheritance_tests {
             assert_eq!(worker.api_retries(), api);
             assert_eq!(worker.refusal_retries(), refusal);
             assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes);
-            assert_eq!(worker.codex_request_role(), crate::runtime::openai::catalog::CodexRequestRole::Worker);
+            assert_eq!(
+                worker.codex_request_role(),
+                crate::runtime::openai::catalog::CodexRequestRole::Worker
+            );
         }
     }
 }

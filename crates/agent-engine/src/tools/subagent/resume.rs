@@ -589,8 +589,16 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": "rendered 300 frames"}
             ]})),
         ];
-        super::super::archive::write_archive(dir, id, &meta, "timed_out", Some("worker timed out"), "report", &history)
-            .unwrap()
+        super::super::archive::write_archive(
+            dir,
+            id,
+            &meta,
+            "timed_out",
+            Some("worker timed out"),
+            "report",
+            &history,
+        )
+        .unwrap()
     }
 
     fn assert_continues_archive(prior: &PriorRun, instructions: &str) {
@@ -834,7 +842,13 @@ fn short_timeout_warning(seconds: u64) -> Option<&'static str> {
 mod short_timeout_tests {
     #[test]
     fn only_short_positive_effective_limits_warn() {
-        for (seconds, warns) in [(0,false),(60,true),(299,true),(300,false),(600,false)] {
+        for (seconds, warns) in [
+            (0, false),
+            (60, true),
+            (299, true),
+            (300, false),
+            (600, false),
+        ] {
             assert_eq!(super::short_timeout_warning(seconds).is_some(), warns);
         }
     }

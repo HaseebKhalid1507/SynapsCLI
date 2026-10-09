@@ -35,7 +35,9 @@ pub(super) fn client(slot: &Arc<OnceLock<Client>>) -> Result<&Client> {
 pub(super) async fn send(req: RequestBuilder, deadline: Duration) -> Result<Response> {
     tokio::time::timeout(deadline, req.send())
         .await
-        .map_err(|_| RuntimeError::NetworkTimeout("uploading request / waiting for response headers"))?
+        .map_err(|_| {
+            RuntimeError::NetworkTimeout("uploading request / waiting for response headers")
+        })?
         .map_err(RuntimeError::Api)
 }
 
@@ -46,7 +48,9 @@ where
 {
     match tokio::time::timeout(idle, stream.next()).await {
         Ok(next) => next.map(|chunk| chunk.map_err(RuntimeError::Api)),
-        Err(_) => Some(Err(RuntimeError::NetworkTimeout("waiting for response body bytes"))),
+        Err(_) => Some(Err(RuntimeError::NetworkTimeout(
+            "waiting for response body bytes",
+        ))),
     }
 }
 
@@ -57,13 +61,24 @@ mod tests {
 
     #[test]
     fn upload_allowance_scales_with_wire_bytes() {
-        for (bytes, seconds) in [(0,90),(1,91),(65536,91),(65537,92),(4*1024*1024,154),(12*1024*1024,282)] {
+        for (bytes, seconds) in [
+            (0, 90),
+            (1, 91),
+            (65536, 91),
+            (65537, 92),
+            (4 * 1024 * 1024, 154),
+            (12 * 1024 * 1024, 282),
+        ] {
             assert_eq!(header_deadline(bytes).as_secs(), seconds);
         }
         assert!(header_deadline(usize::MAX).as_secs() >= 90);
     }
 
-    async fn server(header_wait: Duration, chunks: usize, gap: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    async fn server(
+        header_wait: Duration,
+        chunks: usize,
+        gap: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -71,9 +86,17 @@ mod tests {
             let mut buf = [0; 4096];
             let _ = stream.read(&mut buf).await;
             tokio::time::sleep(header_wait).await;
-            if stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").await.is_err() { return; }
+            if stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
             for _ in 0..chunks {
-                if stream.write_all(b"1\r\nx\r\n").await.is_err() { return; }
+                if stream.write_all(b"1\r\nx\r\n").await.is_err() {
+                    return;
+                }
                 tokio::time::sleep(gap).await;
             }
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -86,10 +109,18 @@ mod tests {
         let slot = Arc::new(OnceLock::new());
         let client = client(&slot).unwrap();
         let (url, task) = server(Duration::from_millis(150), 1, Duration::ZERO).await;
-        let response = send(client.post(url).body("body"), Duration::from_secs(2)).await.unwrap();
+        let response = send(client.post(url).body("body"), Duration::from_secs(2))
+            .await
+            .unwrap();
         let mut stream = response.bytes_stream();
-        assert!(next(&mut stream, Duration::from_millis(50)).await.unwrap().is_ok());
-        assert!(matches!(next(&mut stream, Duration::from_millis(50)).await, Some(Err(RuntimeError::NetworkTimeout(_)))));
+        assert!(next(&mut stream, Duration::from_millis(50))
+            .await
+            .unwrap()
+            .is_ok());
+        assert!(matches!(
+            next(&mut stream, Duration::from_millis(50)).await,
+            Some(Err(RuntimeError::NetworkTimeout(_)))
+        ));
         task.abort();
     }
 
@@ -98,12 +129,21 @@ mod tests {
         let slot = Arc::new(OnceLock::new());
         let client = client(&slot).unwrap();
         let (url, task) = server(Duration::from_secs(10), 0, Duration::ZERO).await;
-        assert!(matches!(send(client.get(url), Duration::from_millis(50)).await, Err(RuntimeError::NetworkTimeout(_))));
+        assert!(matches!(
+            send(client.get(url), Duration::from_millis(50)).await,
+            Err(RuntimeError::NetworkTimeout(_))
+        ));
         task.abort();
         let (url, task) = server(Duration::ZERO, 8, Duration::from_millis(50)).await;
-        let mut stream = send(client.get(url), Duration::from_millis(200)).await.unwrap().bytes_stream();
+        let mut stream = send(client.get(url), Duration::from_millis(200))
+            .await
+            .unwrap()
+            .bytes_stream();
         for _ in 0..8 {
-            assert!(next(&mut stream, Duration::from_millis(200)).await.unwrap().is_ok());
+            assert!(next(&mut stream, Duration::from_millis(200))
+                .await
+                .unwrap()
+                .is_ok());
         }
         task.abort();
     }
@@ -115,7 +155,14 @@ mod tests {
         let (url, task) = server(Duration::from_secs(10), 0, Duration::ZERO).await;
         let cancel = crate::CancellationToken::new();
         cancel.cancel();
-        assert!(matches!(super::super::api::await_or_cancel(&cancel, send(client.get(url), Duration::from_secs(10))).await, Err(RuntimeError::Canceled)));
+        assert!(matches!(
+            super::super::api::await_or_cancel(
+                &cancel,
+                send(client.get(url), Duration::from_secs(10))
+            )
+            .await,
+            Err(RuntimeError::Canceled)
+        ));
         task.abort();
     }
 }

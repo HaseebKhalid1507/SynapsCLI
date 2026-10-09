@@ -651,20 +651,21 @@ mod tests {
         // Simple LRO name.
         let broker = FakeBroker::new(vec![ok(r#"{"done":true}"#)]);
         let _ = get_operation(&broker, "operations/op-42").await.unwrap();
-        let seen = broker.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].provider, "google-gemini");
-        assert_eq!(
-            seen[0].method,
-            ProxyMethod::Get,
-            "reference uses GET for getOperation; POST returns 404 from cloudcode-pa"
-        );
-        assert_eq!(seen[0].path, "/v1internal/operations/op-42");
-        assert!(
-            seen[0].body.is_none(),
-            "GET must not carry a body; reference sends none"
-        );
-        drop(seen);
+        {
+            let seen = broker.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].provider, "google-gemini");
+            assert_eq!(
+                seen[0].method,
+                ProxyMethod::Get,
+                "reference uses GET for getOperation; POST returns 404 from cloudcode-pa"
+            );
+            assert_eq!(seen[0].path, "/v1internal/operations/op-42");
+            assert!(
+                seen[0].body.is_none(),
+                "GET must not carry a body; reference sends none"
+            );
+        }
 
         // Nested LRO name — must be preserved verbatim, not stripped.
         let broker = FakeBroker::new(vec![ok(r#"{"done":true}"#)]);

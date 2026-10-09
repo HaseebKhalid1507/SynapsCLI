@@ -124,6 +124,7 @@ pub const MCP_CONFIG_MAX_ENV_VALUE_BYTES: usize = 4096;
 ///   * `${VAR}`           → parent value, or "" when unset
 ///   * `${VAR:-fallback}` → parent value, or `fallback` when unset/empty
 ///   * anything else (incl. a lone `$`, `$VAR`, unterminated `${`) is literal
+///
 /// Only the FIRST expansion level is applied: a parent value containing `${…}`
 /// is copied verbatim (no recursion, so no expansion loops).
 pub fn expand_env_value(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
