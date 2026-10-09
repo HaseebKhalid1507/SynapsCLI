@@ -805,7 +805,7 @@
           "type": "string"
         },
         "timeout": {
-          "description": "Optional wall-clock limit in seconds for the resumed run (default: the prior run's); 0 = no limit.",
+          "description": "Optional wall-clock limit in seconds for the resumed run (default: the prior run's); 0 = no limit. Positive values below 300s emit a warning; prefer at least 600s for API retries.",
           "type": "integer"
         }
       },

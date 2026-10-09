@@ -199,7 +199,7 @@ impl Tool for SubagentResumeTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Optional wall-clock limit in seconds for the resumed run \
-                                    (default: the prior run's); 0 = no limit."
+                                    (default: the prior run's); 0 = no limit. Positive values below 300s emit a warning; prefer at least 600s for API retries."
                 }
             },
             "required": ["handle_id", "instructions"]
@@ -236,6 +236,10 @@ impl Tool for SubagentResumeTool {
             prior.messages,
         );
         let timeout_secs = params["timeout"].as_u64().unwrap_or(prior.timeout_secs);
+        let timeout_warning = short_timeout_warning(timeout_secs);
+        if let Some(warning) = timeout_warning {
+            tracing::warn!(timeout_secs, warning, "short subagent resume timeout");
+        }
 
         // The inherited prior model is still re-authorized as an explicit exact
         // identity; a stale handle cannot bypass current session policy.
@@ -521,6 +525,7 @@ impl Tool for SubagentResumeTool {
         Ok(json!({
             "handle_id":    handle_id,
             "resumed_from": prior_handle_id,
+            "warning": timeout_warning,
             "agent_name":   label,
             "status":       "running"
         })
@@ -815,5 +820,22 @@ mod tests {
         assert!(!error.contains("No subagent found"));
         assert_eq!(registry.lock().unwrap().list_active().len(), count_before);
         assert_eq!(orchestration.completion_gate(), gate_before);
+    }
+}
+
+/// Warn, never silently extend an explicitly requested wall-clock limit.
+fn short_timeout_warning(seconds: u64) -> Option<&'static str> {
+    (seconds > 0 && seconds < 300).then_some(
+        "Resume timeout is below 300s and may expire during upload or API retries; prefer at least 600s (0 disables the limit)."
+    )
+}
+
+#[cfg(test)]
+mod short_timeout_tests {
+    #[test]
+    fn only_short_positive_effective_limits_warn() {
+        for (seconds, warns) in [(0,false),(60,true),(299,true),(300,false),(600,false)] {
+            assert_eq!(super::short_timeout_warning(seconds).is_some(), warns);
+        }
     }
 }
