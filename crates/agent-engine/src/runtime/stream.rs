@@ -1029,6 +1029,18 @@ impl StreamMethods {
             super::attachments::validate_history_for_request(&model, request_messages)
                 .map_err(RuntimeError::Config)?;
 
+            // Workers have a small request-local upload budget. Never trim
+            // durable/resumable history, and validate original media first.
+            let worker_messages;
+            let request_messages = if options.codex_request_role
+                == super::openai::catalog::CodexRequestRole::Worker
+            {
+                worker_messages = super::image_limits::cap_worker_images(request_messages);
+                worker_messages.as_deref().unwrap_or(request_messages)
+            } else {
+                request_messages
+            };
+
             // History image byte cap: the per-turn byte budget resets every
             // turn but base64 images live in history forever. Bound the wire
             // by degrading the OLDEST image blocks to a text label once the
