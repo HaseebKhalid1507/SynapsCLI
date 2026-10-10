@@ -1233,7 +1233,7 @@ impl StreamMethods {
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
             segment_has_provider_round = true;
-            if let Err(dimension) = budget_meter.check_usage(&usage_counters, &model) {
+            if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
                 finish_budget_exceeded!(dimension);
             }
 

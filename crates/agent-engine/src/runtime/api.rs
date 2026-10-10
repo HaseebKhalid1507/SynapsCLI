@@ -267,6 +267,7 @@ impl ParseState {
 /// Immutable per-stream context — not state. `tx` deliberately lives here and
 /// not in `ParseState`: read/write separation is the point.
 struct EventCtx<'t> {
+    model: &'t str,
     tx: &'t mpsc::UnboundedSender<StreamEvent>,
     suppress_stream_deltas: bool,
     telemetry_level: TelemetryLevel,
@@ -569,7 +570,10 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         cache_write_tokens: Some(cache_create),
                     });
                     if let Some(counters) = &ctx.usage_counters {
-                        counters.record(input_t, output_t, cache_read, cache_create);
+                        counters.record_priced(
+                            ctx.model, input_t, output_t, cache_read, cache_create,
+                            cache_create_5m, cache_create_1h,
+                        );
                     }
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
@@ -706,7 +710,10 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
         cache_write_tokens: Some(cache_create),
     });
     if let Some(counters) = &ctx.usage_counters {
-        counters.record(input_t, output_t, cache_read, cache_create);
+        counters.record_priced(
+            ctx.model, input_t, output_t, cache_read, cache_create,
+            state.msg_start_cache_5m, state.msg_start_cache_1h,
+        );
     }
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
@@ -1611,6 +1618,7 @@ impl ApiMethods {
             }
             let mut state = ParseState::new();
             let ctx = EventCtx {
+                model,
                 tx: &tx,
                 suppress_stream_deltas: options.suppress_stream_deltas,
                 telemetry_level,
@@ -1960,6 +1968,7 @@ mod tests {
 
     fn make_ctx(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
+            model: "claude-sonnet-4-5",
             tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
@@ -1991,6 +2000,7 @@ mod tests {
     /// behavior doesn't silently depend on telemetry being enabled.
     fn make_ctx_telemetry_off(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
+            model: "claude-sonnet-4-5",
             tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Off,
@@ -2012,6 +2022,7 @@ mod tests {
         honored: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> EventCtx<'a> {
         EventCtx {
+            model: "claude-sonnet-4-5",
             tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
@@ -2386,6 +2397,84 @@ mod tests {
             drain(&mut rx).is_empty(),
             "residual emission must be a no-op when the delta already emitted"
         );
+    }
+
+    #[test]
+    fn priced_usage_books_final_or_residual_once_with_request_model_and_ttl() {
+        for final_delta in [false, true] {
+            for model in ["claude-opus-4.1", "claude-opus-4.8", "claude-haiku-5.5"] {
+                let (mut state, tx, mut rx) = harness();
+                let counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+                let mut ctx = make_ctx_telemetry_off(&tx);
+                ctx.model = model;
+                ctx.usage_counters = Some(counters.clone());
+                feed(&[PROBED_LIVE_START], &mut state, &ctx);
+                assert_eq!(counters.cost_usd(), 0.0);
+                if final_delta {
+                    feed(&[PROBED_LIVE_DELTA], &mut state, &ctx);
+                }
+                emit_residual_usage(&mut state, &ctx);
+                emit_residual_usage(&mut state, &ctx);
+                let output = if final_delta { 11 } else { 1 };
+                let expected = agent_core::pricing::calculate_cost_split(
+                    model, 3, output, 0, 6, 1097,
+                );
+                assert!((counters.cost_usd() - expected).abs() < 2e-9);
+                assert_eq!(counters.totals(), (3, output, 0, 1103));
+                assert_eq!(counters.latest_context_tokens(), 1106);
+                assert_eq!(drain(&mut rx).iter().filter(|event| matches!(event,
+                    StreamEvent::Session(SessionEvent::Usage { .. }))).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_ttl_final_and_residual_usage_agree_with_display_cost_once() {
+        for final_delta in [false, true] {
+            for (input, aggregate, known5) in [(0, 100_001, 0), (60_000, 40_001, 10_000)] {
+                let (mut state, tx, mut rx) = harness();
+                let counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+                let mut ctx = make_ctx_telemetry_off(&tx);
+                ctx.model = "claude-haiku-5.5";
+                ctx.usage_counters = Some(counters.clone());
+                let start = format!("data: {}", json!({
+                    "type": "message_start", "message": {"id": "msg_partial", "usage": {
+                        "input_tokens": input, "output_tokens": 0,
+                        "cache_creation_input_tokens": aggregate,
+                        "cache_creation": {"ephemeral_5m_input_tokens": known5}
+                    }}
+                }));
+                feed(&[start.as_str()], &mut state, &ctx);
+                assert_eq!(counters.cost_usd(), 0.0);
+                if final_delta {
+                    feed(&[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#], &mut state, &ctx);
+                    assert!(state.usage_emitted, "final delta must book before residual fallback");
+                }
+                emit_residual_usage(&mut state, &ctx);
+                emit_residual_usage(&mut state, &ctx);
+                let expected = if input == 0 { 0.100001 } else { 0.066251 };
+                assert!((counters.cost_usd() - expected).abs() < 2e-9);
+                assert_eq!(counters.totals(), (input, 0, 0, aggregate));
+                let events = drain(&mut rx);
+                let mut usage_count = 0;
+                for event in events {
+                    if let StreamEvent::Session(SessionEvent::Usage {
+                        input_tokens, output_tokens, cache_read_input_tokens,
+                        cache_creation_input_tokens, cache_creation_5m, cache_creation_1h, ..
+                    }) = event {
+                        usage_count += 1;
+                        assert_eq!(cache_creation_5m, Some(known5));
+                        assert_eq!(cache_creation_1h, None);
+                        let display_cost = agent_core::pricing::calculate_cost_optional_split(
+                            ctx.model, input_tokens, output_tokens, cache_read_input_tokens,
+                            cache_creation_input_tokens, cache_creation_5m, cache_creation_1h,
+                        );
+                        assert!((display_cost - expected).abs() < 1e-12);
+                    }
+                }
+                assert_eq!(usage_count, 1);
+            }
+        }
     }
 
     #[test]
@@ -3448,6 +3537,7 @@ mod tests {
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = EventCtx {
+            model: "claude-sonnet-4-5",
             tx: &tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
