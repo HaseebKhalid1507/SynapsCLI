@@ -114,12 +114,14 @@ impl Tool for SubagentCollectTool {
             )));
         };
 
+        super::archive::retry_failed_archive(&handle.state, &handle_id);
         let status = handle.status();
         let output: String = handle.partial_output();
         let elapsed = handle.elapsed_secs();
         let model = handle.model.clone();
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
+        let archive_error = handle.archive_error();
 
         // Mark collected on any terminal read so the reaper knows it's safe to GC.
         let already_collected = handle.is_collected();
@@ -178,6 +180,7 @@ impl Tool for SubagentCollectTool {
         // idempotency to the caller.
         let reconciled_now = params["reconciled"].as_bool().unwrap_or(false);
         let mut body = json!({
+            "archiveError": archive_error,
             "handle_id": handle_id,
             "status":    status.as_str(),
             "output":    output,
@@ -244,6 +247,42 @@ mod tests {
             Some(shutdown_tx),
             Some(result_rx),
         )
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_waits_for_finalization_before_collection() {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let h = make_finished_handle("sa_pending", "still draining");
+        let state = Arc::clone(&h.state);
+        {
+            let mut s = state.write().unwrap();
+            s.finished_at = None;
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "worker".into(),
+                model: "model".into(),
+                system_prompt: "system".into(),
+                timeout_secs: 1,
+            });
+        }
+        registry.lock().unwrap().register(h);
+        let response = SubagentCollectTool
+            .execute(
+                json!({"handle_id":"sa_pending", "reconciled":true}),
+                make_ctx_with_registry(Arc::clone(&registry)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["status"],
+            "running"
+        );
+        let mut reg = registry.lock().unwrap();
+        assert!(!reg.get("sa_pending").unwrap().is_collected());
+        assert_eq!(reg.display_rows()[0].status, SubagentStatus::Running);
+        reg.release_finished_resources("sa_pending");
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+        assert!(reg.get("sa_pending").is_some());
+        assert!(state.read().unwrap().finished_at.is_none());
     }
 
     fn make_ctx_with_registry(registry: Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {

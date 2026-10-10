@@ -168,6 +168,12 @@ impl Tool for SubagentStartTool {
             timeout_secs,
         });
 
+        state.write().unwrap().archive_dir = Some(super::archive::process_dir());
+        let initial_messages = vec![Arc::new(
+            serde_json::json!({"role": "user", "content": task.clone()}),
+        )];
+        state.write().unwrap().history = Some(initial_messages.clone());
+
         // ── Channels ───────────────────────────────────────────────────────────
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -234,6 +240,7 @@ impl Tool for SubagentStartTool {
             let label_for_finalizer = label_inner.clone();
             let orchestration_for_runtime = Arc::clone(&orchestration_for_worker);
 
+            let mut pending_result = None;
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -268,7 +275,11 @@ impl Tool for SubagentStartTool {
                         // turn budget. Subagents are short-lived one-shots — paying the 1h
                         // write premium (~2× input price) on them is unrecoverable waste
                         // (~$0.23 per 10-spawn fan-out). (#110)
-                        super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
+                        super::apply_subagent_runtime_policy(
+                            &mut runtime,
+                            &crate::config::load_config(),
+                            memory_backend.as_ref(),
+                        );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
                             runtime.memory_backend_is_axel(),
@@ -291,15 +302,12 @@ impl Tool for SubagentStartTool {
 
                         let cancel_on_timeout = cancel.clone();
                         let stream = runtime.run_stream_with_messages(
-                                vec![std::sync::Arc::new(
-                                    serde_json::json!({"role": "user", "content": task}),
-                                )],
+                                initial_messages,
                                 cancel,
                                 Some(steer_rx),
                                 None,
                                 false,
-                            )
-                            .await;
+                            ).await;
 
                         super::drive::WorkerDrive {
                             state: Arc::clone(&state_a),
@@ -328,30 +336,10 @@ impl Tool for SubagentStartTool {
                                 ];
                             }
                         }
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let preview: String = sa_result.text.chars().take(120).collect();
-                        if let Some(ref tx) = tx_events_inner {
-                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
-                                subagent_id,
-                                agent_name: label_inner.clone(),
-                                result_preview: preview,
-                                duration_secs: elapsed,
-                            }));
-                        }
-                        let _ = result_tx.send(sa_result);
+                        pending_result = Some(sa_result);
                     }
                     Err(e) => {
-                        state_t.write().unwrap().status = SubagentStatus::Failed(e.clone());
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        if let Some(ref tx) = tx_events_inner {
-                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
-                                subagent_id,
-                                agent_name: label_inner.clone(),
-                                result_preview: format!("ERROR: {}", e),
-                                duration_secs: elapsed,
-                            }));
-                        }
-                        // drop result_tx — collect() will surface the closed channel
+                        state_t.write().unwrap().status = SubagentStatus::Failed(e);
                     }
                 }
             }));
@@ -380,6 +368,25 @@ impl Tool for SubagentStartTool {
                 start_time,
                 None, // start.rs: not a resume
             );
+            // All terminal publications follow the recovery/finalization barrier.
+            if let Some(ref tx) = tx_events_inner {
+                let s = state_for_finalizer
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner());
+                let preview = match s.status.failure_reason() {
+                    Some(reason) => format!("ERROR: {reason}"),
+                    None => s.partial_text.chars().take(120).collect(),
+                };
+                let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
+                    subagent_id,
+                    agent_name: label_for_finalizer.clone(),
+                    result_preview: preview,
+                    duration_secs: start_time.elapsed().as_secs_f64(),
+                }));
+            }
+            if let Some(result) = pending_result {
+                let _ = result_tx.send(result);
+            }
             orchestration_for_worker
                 .release_delegation(&handle_id_inner, parent_for_worker.as_deref());
         });

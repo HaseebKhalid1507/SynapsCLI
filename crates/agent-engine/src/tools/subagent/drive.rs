@@ -145,7 +145,10 @@ impl WorkerDrive {
             }
             StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
                 *tool_count += 1;
-                self.update(format!("⚙ {} (tool #{})", tool_name, tool_count), *tool_count);
+                self.update(
+                    format!("⚙ {} (tool #{})", tool_name, tool_count),
+                    *tool_count,
+                );
             }
             StreamEvent::Llm(LlmEvent::ToolUse {
                 tool_name, input, ..
@@ -488,6 +491,34 @@ mod tests {
         assert_eq!(s.status, SubagentStatus::TimedOut);
         assert_eq!(s.history.as_ref().map(Vec::len), Some(7));
         assert_eq!(s.partial_text, r.text);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_drain_barrier_keeps_managed_worker_publicly_running() {
+        let (d, state, cancel) = drive(5);
+        state.write().unwrap().archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "worker".into(),
+            model: "model".into(),
+            system_prompt: "system".into(),
+            timeout_secs: 5,
+        });
+        let observed = Arc::clone(&state);
+        let stream = futures::stream::once(async move {
+            cancel.cancelled().await;
+            // Timeout already set the raw status, but the history has not arrived.
+            {
+                let s = observed.read().unwrap();
+                assert_eq!(s.status, SubagentStatus::TimedOut);
+                assert_eq!(s.public_status(), SubagentStatus::Running);
+                assert!(s.finished_at.is_none());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            history(7)
+        });
+        d.run(Box::pin(stream)).await.unwrap();
+        let s = state.read().unwrap();
+        assert_eq!(s.public_status(), SubagentStatus::Running);
+        assert_eq!(s.history.as_ref().unwrap().len(), 7);
     }
 
     #[tokio::test(start_paused = true)]

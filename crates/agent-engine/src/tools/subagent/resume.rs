@@ -50,7 +50,7 @@ fn prior_run(
         (None, explicit_archive, None)
     } else {
         let reg = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let handle = reg.get(&prior_handle_id);
+        let handle = reg.get(prior_handle_id);
         if handle.is_some_and(|h| h.status() == SubagentStatus::Running) {
             return Err(RuntimeError::Tool(format!(
                 "Subagent '{}' is still running. Call subagent_collect first, \
@@ -58,7 +58,32 @@ fn prior_run(
                 prior_handle_id
             )));
         }
-        let archive_path = reg.archive_path(&prior_handle_id);
+        if let Some(h) = handle {
+            super::archive::retry_failed_archive(&h.state, prior_handle_id);
+            let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+            if s.archive_error.is_some() || (s.archive_meta.is_some() && s.archive_path.is_none()) {
+                if s.finalization_ready {
+                    if let Some(history) = &s.history {
+                        return Ok(PriorRun {
+                            agent_name: h.agent_name.clone(),
+                            model: h.model.clone(),
+                            system_prompt: h.system_prompt.clone(),
+                            timeout_secs: h.timeout_secs,
+                            messages: super::archive::resume_messages(
+                                history.iter().map(|m| m.as_ref().clone()).collect(),
+                                instructions,
+                            ),
+                        });
+                    }
+                }
+                return Err(RuntimeError::Tool(format!(
+                    "Subagent '{}' has no finalized full history: {}",
+                    prior_handle_id,
+                    s.archive_error.as_deref().unwrap_or("archive pending")
+                )));
+            }
+        }
+        let archive_path = reg.archive_path(prior_handle_id);
         let live = handle.map(|h| {
             (
                 h.agent_name.clone(),
@@ -69,7 +94,7 @@ fn prior_run(
         });
         let legacy = match handle {
             Some(_) if archive_path.is_some() => None,
-            Some(h) if h.is_tombstone() => return Err(expired_context_error(&prior_handle_id)),
+            Some(h) if h.is_tombstone() => return Err(expired_context_error(prior_handle_id)),
             Some(h) => {
                 let state = h.conversation_state();
                 Some(if state.is_empty() {
@@ -256,6 +281,11 @@ impl Tool for SubagentResumeTool {
             timeout_secs,
         });
 
+        state.write().unwrap().archive_dir = Some(super::archive::process_dir());
+
+        // Keep the inherited checkpoint even if runtime startup fails before emitting history.
+        state.write().unwrap().history = Some(initial_messages.clone());
+
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, result_rx) = oneshot::channel::<SubagentResult>();
@@ -315,6 +345,7 @@ impl Tool for SubagentResumeTool {
             let label_for_finalizer = label_inner.clone();
             let orchestration_for_runtime = Arc::clone(&orchestration_for_worker);
 
+            let mut pending_result = None;
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -348,7 +379,11 @@ impl Tool for SubagentResumeTool {
                         // turn budget. Subagents are short-lived one-shots — paying the 1h
                         // write premium (~2× input price) on them is unrecoverable waste
                         // (~$0.23 per 10-spawn fan-out). (#110)
-                        super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
+                        super::apply_subagent_runtime_policy(
+                            &mut runtime,
+                            &crate::config::load_config(),
+                            memory_backend.as_ref(),
+                        );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
                             runtime.memory_backend_is_axel(),
@@ -376,8 +411,7 @@ impl Tool for SubagentResumeTool {
                                 Some(steer_rx),
                                 None,
                                 false,
-                            )
-                            .await;
+                            ).await;
 
                         super::drive::WorkerDrive {
                             state: Arc::clone(&state_a),
@@ -405,29 +439,10 @@ impl Tool for SubagentResumeTool {
                                 ];
                             }
                         }
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let preview: String = sa_result.text.chars().take(120).collect();
-                        if let Some(ref tx) = tx_events_inner {
-                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
-                                subagent_id,
-                                agent_name: label_inner.clone(),
-                                result_preview: preview,
-                                duration_secs: elapsed,
-                            }));
-                        }
-                        let _ = result_tx.send(sa_result);
+                        pending_result = Some(sa_result);
                     }
                     Err(e) => {
-                        state_t.write().unwrap().status = SubagentStatus::Failed(e.clone());
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        if let Some(ref tx) = tx_events_inner {
-                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
-                                subagent_id,
-                                agent_name: label_inner.clone(),
-                                result_preview: format!("ERROR: {}", e),
-                                duration_secs: elapsed,
-                            }));
-                        }
+                        state_t.write().unwrap().status = SubagentStatus::Failed(e);
                     }
                 }
             }));
@@ -457,6 +472,25 @@ impl Tool for SubagentResumeTool {
                 start_time,
                 Some(&prior_handle_for_finalizer),
             );
+            // All terminal publications follow the recovery/finalization barrier.
+            if let Some(ref tx) = tx_events_inner {
+                let s = state_for_finalizer
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner());
+                let preview = match s.status.failure_reason() {
+                    Some(reason) => format!("ERROR: {reason}"),
+                    None => s.partial_text.chars().take(120).collect(),
+                };
+                let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
+                    subagent_id,
+                    agent_name: label_for_finalizer.clone(),
+                    result_preview: preview,
+                    duration_secs: start_time.elapsed().as_secs_f64(),
+                }));
+            }
+            if let Some(result) = pending_result {
+                let _ = result_tx.send(result);
+            }
             orchestration_for_worker
                 .release_delegation(&handle_id_inner, parent_for_worker.as_deref());
         });
@@ -605,6 +639,66 @@ mod tests {
         assert_eq!(prior.agent_name, "live-label");
         assert_eq!(prior.timeout_secs, 30);
         assert_continues_archive(&prior, "continue");
+    }
+
+    #[test]
+    fn review_202_terminal_but_unpublished_worker_must_not_resume_lossily() {
+        let registry = Mutex::new(SubagentRegistry::new());
+        let h = finished_handle("sa_review", SubagentStatus::TimedOut, None);
+        {
+            let mut s = h.state.write().unwrap();
+            // Unlike the intentionally legacy helper, a managed worker has metadata.
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "worker".into(),
+                model: "model".into(),
+                system_prompt: "system".into(),
+                timeout_secs: 1,
+            });
+            s.finished_at = None;
+        }
+        let state = Arc::clone(&h.state);
+        registry.lock().unwrap().register(h);
+        assert!(prior_run(&registry, "sa_review", None, "continue").is_err());
+        registry
+            .lock()
+            .unwrap()
+            .cleanup_finished_with_ttl(Duration::ZERO);
+        assert!(registry.lock().unwrap().get("sa_review").is_some());
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"x").unwrap();
+        let history = vec![
+            Arc::new(json!({"role":"user", "content":"task"})),
+            Arc::new(json!({"role":"assistant", "content":[
+                {"type":"tool_use", "id":"t1", "name":"read", "input":{"path":"x"}}
+            ]})),
+            Arc::new(json!({"role":"user", "content":[
+                {"type":"tool_result", "tool_use_id":"t1", "content":"preserved body"}
+            ]})),
+        ];
+        state.write().unwrap().history = Some(history);
+        super::super::finalize::finalize_subagent_in(
+            &state,
+            None,
+            "sa_review",
+            1,
+            "worker",
+            std::time::Instant::now(),
+            None,
+            &blocked,
+        );
+        // Keep this test hermetic: missing metadata prevents the production-dir retry.
+        state.write().unwrap().archive_meta = None;
+        let prior = prior_run(&registry, "sa_review", None, "continue").unwrap();
+        assert_eq!(prior.messages[2]["content"][0]["content"], "preserved body");
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.get_mut("sa_review").unwrap().mark_collected();
+            reg.release_finished_resources("sa_review");
+            reg.cleanup_finished_with_ttl(Duration::ZERO);
+            assert!(reg.get("sa_review").is_some());
+        }
+        assert!(state.read().unwrap().history.is_some());
     }
 
     #[test]

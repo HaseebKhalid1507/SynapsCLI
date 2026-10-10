@@ -458,8 +458,9 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `bash_timeout` | int | 30 | Default bash timeout (seconds) |
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
 | `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
-| `subagent_max_concurrent` | int | 8 | Subagents running at once per session, and children per parent (1..=256) |
-| `subagent_max_total` | int | 64 | Live subagent handles per session (1..=1024; reconciled workers are recycled) |
+| `subagent.max_concurrent` | int | 16 | Workers running at once across the session's delegation tree |
+| `subagent.max_total` | int | 64 | Dispatched workers not yet reconciled |
+| `subagent.max_depth` | int | 4 | Maximum nesting depth; 1 means foreground-only delegation |
 | `api_retries` | int | 3 | Max API retries on transient errors |
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
@@ -732,12 +733,16 @@ Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
 Use `subagent_resume` on finished/timed-out/failed handles to continue with new instructions — the original handle stays readable.
 
-Every finished worker's full conversation (tool calls and results included) is written to
-`~/.synaps-cli/subagent-history/<process>/<handle>.json` (0600, pruned after 14 days). `subagent_resume`
-replays it with the instructions as the next user turn, so the worker picks up where it stopped, even
-after the handle was collected or reaped; `archive_path` resumes a worker from an earlier or crashed
-session. `subagent_collect` falls back to the archive once a handle is reaped. A timed-out worker is
-cancelled and drained briefly so its last round is kept, and its report leads with its latest progress.
+Finalized worker conversations (tool calls and results included) are archived to
+`~/.synaps-cli/subagent-history/<process>/<handle>.json` (0600). Old process directories
+are pruned on first archive use after 14 days by directory modification time; this is
+not strict per-record retention. `subagent_resume` replays available full history with
+the new instructions as the next user turn, including after collection/reaping when
+an archive was successfully written. An `archive_path` can recover a completed archive
+from an earlier process; an active worker is not continuously crash-checkpointed.
+Finalization/readiness and archive-write failure handling must not silently replace
+known full history with partial text. A timed-out worker is cancelled and drained
+briefly to capture final history; its report leads with its latest progress.
 
 Implementation: `crates/agent-engine/src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`; the reactive
 worker loop is `drive.rs`, the resume archive `archive.rs`.

@@ -51,20 +51,26 @@ struct SubagentArchiveRef<'a> {
 
 /// This process's archive directory (created lazily by [`write_archive`]).
 pub fn process_dir() -> PathBuf {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let root = crate::config::base_dir().join("subagent-history");
+    process_dir_for_base(&crate::config::base_dir())
+}
+
+/// Resolve a base explicitly without mutating process environment (also used by tests).
+pub(super) fn process_dir_for_base(base: &Path) -> PathBuf {
+    static SUFFIX: OnceLock<String> = OnceLock::new();
+    static PRUNED: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let suffix = SUFFIX.get_or_init(|| format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+    let root = base.join("subagent-history");
+    let mut pruned = PRUNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if pruned.insert(root.clone()) {
         prune_older_than(
             &root,
             std::time::Duration::from_secs(KEEP_DAYS * 24 * 60 * 60),
         );
-        root.join(format!(
-            "{}-{}",
-            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-            std::process::id()
-        ))
-    })
-    .clone()
+    }
+    root.join(suffix)
 }
 
 fn prune_older_than(root: &Path, age: std::time::Duration) {
@@ -96,7 +102,7 @@ pub fn write_archive(
 ) -> std::io::Result<PathBuf> {
     create_private_dir(dir)?;
     let path = dir.join(format!("{handle_id}.json"));
-    let tmp = dir.join(format!(".{handle_id}.json.tmp"));
+
     let body = serde_json::to_vec(&SubagentArchiveRef {
         version: ARCHIVE_VERSION,
         handle_id,
@@ -106,8 +112,14 @@ pub fn write_archive(
         history,
     })
     .map_err(std::io::Error::other)?;
-    write_private_file(&tmp, &body)?;
-    std::fs::rename(&tmp, &path)?;
+    // NamedTempFile uses an unpredictable, create_new private file in this directory.
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(&body)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(path)
 }
 
@@ -166,27 +178,8 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-#[cfg(unix)]
-fn write_private_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(body)
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, body)
-}
-
-/// Finalizer hook: move the captured history out of `state` into an archive and
-/// remember its path. History is released from memory either way, so finished
-/// handles stay small. Failures only log: the archive is a recovery aid.
+/// Archive captured history, releasing it only after a successful durable write.
+/// On failure keep the only full copy in state; cleanup must not discard it.
 pub fn archive_finished_worker(
     state: &std::sync::RwLock<SubagentState>,
     handle_id: &str,
@@ -194,10 +187,16 @@ pub fn archive_finished_worker(
 ) {
     let (meta, status, output, history) = {
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
-        let Some(history) = s.history.take() else {
+        let Some(meta) = s.archive_meta.clone() else {
+            if s.history.is_some() {
+                s.archive_error =
+                    Some("missing archive metadata; history retained in memory".into());
+            }
             return;
         };
-        let Some(meta) = s.archive_meta.clone() else {
+        let Some(history) = s.history.clone() else {
+            s.archive_error =
+                Some("worker exited without a full history checkpoint; resume unavailable".into());
             return;
         };
         (
@@ -207,14 +206,41 @@ pub fn archive_finished_worker(
             history,
         )
     };
-    match write_archive(dir, handle_id, &meta, &status, &output, &history) {
+    let outcome = write_archive(dir, handle_id, &meta, &status, &output, &history);
+    let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+    match outcome {
         Ok(path) => {
-            state
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .archive_path = Some(path);
+            s.archive_path = Some(path);
+            s.archive_error = None;
+            s.history = None;
         }
-        Err(e) => tracing::warn!("subagent {handle_id}: could not write resume archive: {e}"),
+        Err(e) => {
+            tracing::warn!("subagent {handle_id}: could not write resume archive: {e}");
+            s.archive_error = Some(format!(
+                "archive write failed: {e}; full history retained in memory"
+            ));
+        }
+    }
+}
+
+/// Explicit terminal collect/resume is also a recovery attempt after disk repair.
+/// Callers hold the registry lock; finalization is already complete, so retries
+/// cannot race the worker's original write or each other.
+pub(super) fn retry_failed_archive(state: &std::sync::RwLock<SubagentState>, handle_id: &str) {
+    let dir = {
+        let s = state.read().unwrap_or_else(|p| p.into_inner());
+        if s.finalization_ready
+            && s.archive_error.is_some()
+            && s.history.is_some()
+            && s.archive_meta.is_some()
+        {
+            s.archive_dir.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(dir) = dir {
+        archive_finished_worker(state, handle_id, &dir);
     }
 }
 
@@ -348,6 +374,130 @@ mod tests {
             !sub.join(".sa_7.json.tmp").exists(),
             "temp file renamed away"
         );
+    }
+
+    #[test]
+    fn launch_roots_and_early_failure_seeds_survive_finalization_and_retry() {
+        let roots = tempfile::tempdir().unwrap();
+        let base_a = roots.path().join("a");
+        let base_b = roots.path().join("b");
+        let dir_a = process_dir_for_base(&base_a);
+        let dir_b = process_dir_for_base(&base_b);
+        assert_ne!(dir_a, dir_b);
+        assert_eq!(dir_a.file_name(), dir_b.file_name());
+        assert_eq!(process_dir_for_base(&base_a), dir_a);
+
+        // Both launch forms, before any runtime emits MessageHistory. The resumed
+        // seed includes actual tool-use/result pairs, not a summary of prior work.
+        for (index, seed) in [
+            vec![Arc::new(
+                json!({"role": "user", "content": "original opening task"}),
+            )],
+            resume_messages(
+                history().iter().map(|m| (**m).clone()).collect(),
+                "continue",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let captured = dir_a.join(index.to_string());
+            std::fs::create_dir_all(&dir_a).unwrap();
+            std::fs::write(&captured, b"block archive directory").unwrap();
+            let state = Arc::new(RwLock::new(SubagentState::new()));
+            {
+                let mut s = state.write().unwrap();
+                s.archive_meta = Some(meta());
+                s.archive_dir = Some(captured.clone());
+                s.history = Some(seed.clone());
+                // Simulate startup failure before the stream exists.
+                s.status = crate::runtime::subagent::SubagentStatus::Failed("init failed".into());
+                assert_eq!(
+                    s.public_status(),
+                    crate::runtime::subagent::SubagentStatus::Running
+                );
+            }
+            // Resolving a later launch under B must not redirect A's finalizer.
+            assert_eq!(process_dir_for_base(&base_b), dir_b);
+            super::super::finalize::finalize_subagent(
+                &state,
+                None,
+                "sa_seed",
+                1,
+                "inline",
+                std::time::Instant::now(),
+                None,
+            );
+            {
+                let s = state.read().unwrap();
+                assert!(s.finalization_ready);
+                assert!(s.archive_error.is_some());
+                assert_eq!(s.history.as_ref().unwrap(), &seed);
+            }
+            std::fs::remove_file(&captured).unwrap();
+            retry_failed_archive(&state, "sa_seed");
+            let s = state.read().unwrap();
+            assert!(s.archive_error.is_none());
+            assert!(s.history.is_none());
+            let path = s.archive_path.as_ref().unwrap();
+            assert!(path.starts_with(&captured));
+            assert_eq!(
+                read_archive(path).unwrap().history,
+                seed.iter().map(|m| (**m).clone()).collect::<Vec<_>>()
+            );
+            assert!(checked_archive_path_in(
+                path.to_str().unwrap(),
+                &base_b.join("subagent-history")
+            )
+            .is_err());
+        }
+        assert!(
+            !dir_b.exists(),
+            "neither finalizer nor retry writes to the later root"
+        );
+    }
+
+    #[test]
+    fn review_202_failed_archive_keeps_recovery_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        let state = RwLock::new(SubagentState::new());
+        {
+            let mut s = state.write().unwrap();
+            s.history = Some(history());
+            s.archive_meta = Some(meta());
+        }
+        archive_finished_worker(&state, "sa_review", &blocked);
+        {
+            let s = state.read().unwrap();
+            assert_eq!(s.history.as_ref().unwrap(), &history());
+            assert!(s.archive_error.is_some());
+            assert!(s.archive_path.is_none());
+        }
+        // Explicit recovery can retry the same stable archive id without losing content.
+        archive_finished_worker(&state, "sa_review", dir.path());
+        let s = state.read().unwrap();
+        assert!(s.archive_error.is_none());
+        assert!(s.history.is_none());
+        assert_eq!(
+            read_archive(s.archive_path.as_ref().unwrap())
+                .unwrap()
+                .history
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn missing_metadata_does_not_take_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = RwLock::new(SubagentState::new());
+        state.write().unwrap().history = Some(history());
+        archive_finished_worker(&state, "sa_missing", dir.path());
+        let s = state.read().unwrap();
+        assert_eq!(s.history.as_ref().unwrap(), &history());
+        assert!(s.archive_error.is_some());
     }
 
     #[test]

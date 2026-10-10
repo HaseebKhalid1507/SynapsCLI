@@ -120,8 +120,14 @@ pub struct SubagentState {
     pub last_response_start: usize,
     /// Identity needed to resume from the archive after the handle is reaped.
     pub archive_meta: Option<SubagentArchiveMeta>,
+    /// Archive destination captured at launch, independent of later config changes.
+    pub archive_dir: Option<std::path::PathBuf>,
     /// Where the finalizer wrote this worker's resume archive.
     pub archive_path: Option<std::path::PathBuf>,
+    /// Managed workers remain publicly running until their recovery outcome is published.
+    pub finalization_started: bool,
+    pub finalization_ready: bool,
+    pub archive_error: Option<String>,
 }
 
 /// What `subagent_resume` needs to relaunch a worker when only its archive is left.
@@ -134,6 +140,18 @@ pub struct SubagentArchiveMeta {
 }
 
 impl SubagentState {
+    pub fn public_status(&self) -> SubagentStatus {
+        if (self.archive_meta.is_some() || self.finalization_started) && !self.finalization_ready {
+            SubagentStatus::Running
+        } else {
+            self.status.clone()
+        }
+    }
+
+    fn recovery_pinned(&self) -> bool {
+        self.history.is_some() && self.archive_path.is_none()
+    }
+
     pub fn new() -> Self {
         Self {
             status: SubagentStatus::Running,
@@ -148,7 +166,11 @@ impl SubagentState {
             history: None,
             last_response_start: 0,
             archive_meta: None,
+            archive_dir: None,
             archive_path: None,
+            finalization_started: false,
+            finalization_ready: false,
+            archive_error: None,
         }
     }
 
@@ -223,7 +245,7 @@ pub struct SubagentHandle {
     pub authorization: Option<AuthorizationDiagnostic>,
 
     // Shared state updated by the subagent thread — one lock for everything.
-    state: Arc<RwLock<SubagentState>>,
+    pub(crate) state: Arc<RwLock<SubagentState>>,
 
     // Channels
     steer_tx: Option<mpsc::UnboundedSender<String>>,
@@ -311,8 +333,7 @@ impl SubagentHandle {
         self.state
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .status
-            .clone()
+            .public_status()
     }
 
     /// Partial output accumulated so far.
@@ -333,7 +354,18 @@ impl SubagentHandle {
             .clone()
     }
 
+    pub fn archive_error(&self) -> Option<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .archive_error
+            .clone()
+    }
+
     pub fn terminal_diagnostic(&self) -> Option<TerminalDiagnostic> {
+        if self.status() == SubagentStatus::Running {
+            return None;
+        }
         if let Some(diagnostic) = self.state.read().unwrap().terminal.clone() {
             return Some(diagnostic);
         }
@@ -392,6 +424,14 @@ impl SubagentHandle {
     /// retaining bounded terminal identity/output for collection and reconciliation.
     fn make_tombstone(&mut self) {
         debug_assert!(self.is_finished());
+        if self
+            .state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .recovery_pinned()
+        {
+            return;
+        }
         self.steer_tx.take();
         self.shutdown_tx.take();
         self.result_rx.take();
@@ -613,7 +653,7 @@ impl SubagentRegistry {
                 SubagentDisplayRow {
                     subagent_id: h.subagent_id,
                     agent_name: h.agent_name.clone(),
-                    status: s.status.clone(),
+                    status: s.public_status(),
                     cancel_requested: s.cancel_requested,
                     elapsed_secs: h.started_at.elapsed().as_secs_f64(),
                     finished_elapsed: s.finished_at.map(|t| t.elapsed()),
@@ -657,6 +697,11 @@ impl SubagentRegistry {
             .iter()
             .filter(|(_, h)| {
                 h.is_finished()
+                    && !h
+                        .state
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .recovery_pinned()
                     && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
                     && (h.is_collected() || h.finished_elapsed().is_some_and(|d| d >= ttl))
             })
