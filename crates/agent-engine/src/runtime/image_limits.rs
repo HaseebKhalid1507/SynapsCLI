@@ -1,5 +1,5 @@
 //! Anthropic-only outgoing image projection. The side rule is independent of
-//! image count; the separate oldest-first 100-image omission is not cache stable.
+//! image count. Original-batch count/byte retirement lives in image_retention.
 use super::attachments::MAX_IMAGE_BYTES;
 use crate::SharedMessage;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -20,8 +20,6 @@ const MAX_PIXELS: u64 = 16_000_000;
 const MAX_ALLOC: u64 = 128 * 1024 * 1024;
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_COUNT: usize = 16;
-const MAX_IMAGES_PER_REQUEST: usize = 100;
-const IMAGE_COUNT_CAP_LABEL: &str = "[image omitted from this request: the conversation holds more than 100 images, so the oldest ones are no longer sent. Re-read the file if you still need it.]";
 const INVALID: &str = "Image projection failed: corrupt or unsupported image; export a static PNG/JPEG at most 2000 pixels per side and reattach it";
 const RESOURCE: &str = "Image projection exceeds resource limits; export a static PNG/JPEG at most 2000 pixels per side and reattach it";
 
@@ -76,19 +74,6 @@ fn block_at(messages: &[SharedMessage], slot: Slot) -> &Value {
         Some(inner) => &outer["content"][inner],
         None => outer,
     }
-}
-
-/// Swap one image block for a text block. Clones only the owning message
-/// (`Arc::make_mut`); a `tool_result`'s leading text summary is never an
-/// image, so the text-first invariant of rich tool output holds.
-fn replace_with_text(messages: &mut [SharedMessage], slot: Slot, text: String) {
-    let message = Arc::make_mut(&mut messages[slot.msg]);
-    let outer = &mut message["content"][slot.block];
-    let target = match slot.inner {
-        Some(inner) => &mut outer["content"][inner],
-        None => outer,
-    };
-    *target = json!({ "type": "text", "text": text });
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -260,17 +245,23 @@ fn project(block: &Value, cache: &Mutex<Cache>) -> Result<Option<Arc<Projection>
     Ok(Some(value))
 }
 
+#[cfg(test)]
 fn enforce(messages: &mut [SharedMessage], cache: &Mutex<Cache>) -> Result<usize, String> {
+    enforce_with_retirement(messages, 0, cache)
+}
+
+fn enforce_with_retirement(
+    messages: &mut [SharedMessage],
+    retired_count: usize,
+    cache: &Mutex<Cache>,
+) -> Result<usize, String> {
     let slots = image_slots(messages);
-    let over_cap = slots.len().saturating_sub(MAX_IMAGES_PER_REQUEST);
     // Reverse order keeps original slot indices valid when adding adjacent text.
-    // Validate/project even count-omitted images: invalid oversized input must
-    // fail independently of count, rather than being hidden by omission.
-    for (index, &slot) in slots.iter().enumerate().rev() {
+    for (occurrence, &slot) in slots.iter().enumerate().rev() {
         let projected = project(block_at(messages, slot), cache)?;
-        if index < over_cap {
-            replace_with_text(messages, slot, IMAGE_COUNT_CAP_LABEL.into());
-        } else if let Some(projected) = projected {
+        // Always project/check the original, including retired occurrences.
+        // Discard retired output rather than letting later images hide errors.
+        if occurrence < retired_count || projected.is_some() {
             let message = Arc::make_mut(&mut messages[slot.msg]);
             let (blocks, index) = match slot.inner {
                 Some(inner) => (
@@ -281,18 +272,26 @@ fn enforce(messages: &mut [SharedMessage], cache: &Mutex<Cache>) -> Result<usize
                 ),
                 None => (message["content"].as_array_mut().unwrap(), slot.block),
             };
+            if occurrence < retired_count {
+                blocks[index] = json!({"type": "text", "text": super::image_retention::OMITTED});
+                continue;
+            }
+            let projected = projected.unwrap();
             blocks[index]["source"]["data"] = Value::String(projected.data.clone());
             blocks[index]["source"]["media_type"] = Value::String(projected.mime.into());
             blocks.insert(index + 1, json!({"type": "text", "text": projected.note}));
         }
     }
-    Ok(over_cap)
+    Ok(retired_count)
 }
 
 /// Acquire before spawn, then MOVE the permit inside blocking work. Cancellation
 /// of the async waiter cannot admit another decoder while this one still runs.
 /// Only projected bytes/metadata survive in the process-wide bounded memo cache.
-pub(super) async fn enforce_image_limits(messages: &mut [SharedMessage]) -> Result<usize, String> {
+pub(super) async fn enforce_image_limits(
+    messages: &mut [SharedMessage],
+    retired_count: usize,
+) -> Result<usize, String> {
     static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     if image_slots(messages).is_empty() {
@@ -306,8 +305,9 @@ pub(super) async fn enforce_image_limits(messages: &mut [SharedMessage]) -> Resu
         .map_err(|_| RESOURCE)?;
     let mut outgoing = messages.to_vec();
     let (outgoing, omitted) = blocking_with_permit(permit, move || {
-        let omitted = enforce(
+        let omitted = enforce_with_retirement(
             &mut outgoing,
+            retired_count,
             CACHE.get_or_init(|| Mutex::new(Cache::default())),
         )?;
         Ok::<_, String>((outgoing, omitted))
@@ -365,7 +365,7 @@ mod tests {
         let mut previous: Vec<SharedMessage> = Vec::new();
         for n in [1, 20, 21, 22] {
             let mut outgoing = original[..n].to_vec();
-            assert_eq!(enforce_image_limits(&mut outgoing).await.unwrap(), 0);
+            assert_eq!(enforce_image_limits(&mut outgoing, 0).await.unwrap(), 0);
             assert_eq!(&outgoing[..previous.len()], previous.as_slice());
             assert_eq!(outgoing[0]["content"][0]["tool_use_id"], "t0");
             assert_eq!(outgoing[0]["content"][0]["is_error"], false);
@@ -508,19 +508,11 @@ mod tests {
     }
 
     #[test]
-    fn oldest_100_101_behavior_remains_explicit() {
+    fn resizing_does_not_independently_evict() {
         let img = fixture(2, 2, false);
-        for n in [100, 101] {
-            let mut out = history(n, &img);
-            assert_eq!(enforce(&mut out, &cache()).unwrap(), n - 100);
-            let first = &out[0]["content"][0]["content"][1];
-            if n == 101 {
-                assert_eq!(first["text"], IMAGE_COUNT_CAP_LABEL);
-            } else {
-                assert_eq!(first, &img);
-            }
-            assert_eq!(out[n - 1]["content"][0]["content"][1], img);
-        }
+        let mut out = history(101, &img);
+        assert_eq!(enforce(&mut out, &cache()).unwrap(), 0);
+        assert_eq!(out[0]["content"][0]["content"][1], img);
     }
 
     #[test]
@@ -553,6 +545,57 @@ mod tests {
         assert!(encode(&image::DynamicImage::new_rgb8(2, 2), true, 1).is_err());
     }
 
+    #[tokio::test]
+    async fn retired_originals_still_fail_projection_at_1_and_101() {
+        let mut png = fixture(2001, 2, false);
+        let mut bytes = STANDARD
+            .decode(png["source"]["data"].as_str().unwrap())
+            .unwrap();
+        bytes.truncate(33);
+        bytes.extend_from_slice(b"\x00\x00\x00\x00IEND\xAE\x42\x60\x82");
+        png["source"]["data"] = STANDARD.encode(bytes).into();
+        let gif = json!({"type":"image", "source":{"type":"base64", "media_type":"image/gif",
+            "data":STANDARD.encode(b"GIF89a\xd1\x07\x02\x00\x00\x00\x00\x3b")}});
+        let small = fixture(2, 2, false);
+        for bad in [gif, png] {
+            for n in [1, 101] {
+                let mut original = history(1, &bad);
+                original.extend(history(n - 1, &small));
+                super::super::attachments::validate_history_for_request(
+                    "anthropic/claude-sonnet-4-6",
+                    &original,
+                )
+                .unwrap();
+                let retired = super::super::image_retention::plan(&original).unwrap();
+                assert_eq!(retired, if n == 101 { 40 } else { 0 });
+                let mut outgoing = original.clone();
+                assert!(enforce_image_limits(&mut outgoing, retired).await.is_err());
+                assert_eq!(outgoing, original); // failed worker never publishes partial output
+                assert_eq!(original[0]["content"][0]["content"][1], bad);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn integrated_retirement_discards_projection_but_preserves_originals() {
+        let large = fixture(2001, 2, false);
+        let original = history(101, &large);
+        let mut outgoing = original.clone();
+        let retired = super::super::image_retention::plan(&original).unwrap();
+        assert_eq!(
+            enforce_image_limits(&mut outgoing, retired).await.unwrap(),
+            40
+        );
+        for message in &outgoing[..40] {
+            let content = message["content"][0]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 2); // no resize note for retired images
+            assert_eq!(content[1]["text"], super::super::image_retention::OMITTED);
+        }
+        assert_eq!(outgoing[40]["content"][0]["content"][1]["type"], "image");
+        assert_eq!(outgoing[40]["content"][0]["content"][2]["type"], "text");
+        assert_eq!(original[0]["content"][0]["content"][1], large);
+    }
+
     #[test]
     fn small_corrupt_pixels_retain_structural_only_validation() {
         let mut img = fixture(2, 2, false);
@@ -573,16 +616,20 @@ mod tests {
     }
 
     #[test]
-    fn both_transports_project_between_wire_refs_and_cache_marker() {
+    fn both_transports_replay_and_validate_before_merging_and_cache_marker() {
         for source in [include_str!("api.rs"), include_str!("api_sync.rs")] {
             let first = source
-                .find("attachments::validate_messages(model, messages)")
+                .find("attachments::validate_history_for_request(model, messages)")
+                .unwrap();
+            let replay = source.find("image_retention::plan(messages)").unwrap();
+            let sanitize = source
+                .find("HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages)")
                 .unwrap();
             let wire = source
                 .find("HelperMethods::wire_tool_references(&mut cleaned_messages")
                 .unwrap();
             let project = source
-                .find("image_limits::enforce_image_limits(&mut cleaned_messages)")
+                .find("image_limits::enforce_image_limits(&mut cleaned_messages, retired_count)")
                 .unwrap();
             let check = source
                 .find("attachments::validate_messages(model, &cleaned_messages)")
@@ -590,7 +637,8 @@ mod tests {
             let marker = source
                 .find("HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages")
                 .unwrap();
-            assert!(first < wire && wire < project && project < check && check < marker);
+            assert!(first < replay && replay < project && project < check);
+            assert!(check < sanitize && sanitize < wire && wire < marker);
         }
     }
     #[tokio::test]

@@ -135,11 +135,12 @@ Under the daemon (`synaps --daemon`), attachment paths are resolved on the
 `load_attachment` on its own filesystem, builds canonical content blocks, and
 ships them as `Vec<serde_json::Value>` inside `SessionCommand::Submit`. The
 daemon's `SessionActor` validates the blocks structurally
-(`validate_attachment`) and against the session's model (`validate_messages`)
+(`validate_attachment`) and against the session's model (`validate_history_for_request`)
 before appending to history. A validation failure emits a `SystemNotice` and
 does not push the message. Per-frame size is bounded by
-`DAEMON_MAX_FRAME_BYTES` (64 MiB); per-history size by
-`HISTORY_IMAGE_BYTE_CAP` (20 MiB). The RPC stdio path (`synaps rpc`) runs
+`DAEMON_MAX_FRAME_BYTES` (64 MiB). Native Anthropic request attachment bytes
+are bounded by the chunked replay policy below; other routes retain their
+existing strict history and broker budgets. The RPC stdio path (`synaps rpc`) runs
 in-process and loads files directly — no daemon filesystem boundary.
 
 For `/trace next content`, binary media is structurally redacted. OpenAI requests
@@ -191,6 +192,60 @@ including after cancellation. A shared SHA256-keyed FIFO memo holds only project
 base64 bytes and explanatory metadata, limited to 16 entries and 16 MiB; cache
 hits and eviction do not alter projection results.
 
-This is **not universal cache stability**: the existing oldest-first omission
-above 100 images still changes historical prefixes, and existing history byte-cap
-behavior is unchanged. Neither count-cap nor byte-cap policy is fixed here.
+### Native Anthropic chunked image retention
+
+Original admission validates canonical shape, role/nesting, exact capabilities,
+per-item limits and the eight-attachment limit **per original user message**.
+Before decoding base64 or collecting occurrence vectors, a bounded serialization
+prepass caps original canonical media at 256 MiB and 4096 image occurrences
+on all routes (in addition to the existing strict provider/broker budgets).
+Only native Anthropic defers its aggregate 20 MiB budget into chronological replay;
+compatible providers and broker proxy budgets retain their existing rules.
+
+Replay uses unchanged original user-message batches (including all nested sibling
+tool results), not image hashes. At each historical batch, either more than 100
+retained images or more than 20 MiB of serialized original attachment blocks
+triggers retirement of an oldest-image prefix. It retires at least 40 older images
+when available, and continues toward 12 MiB total retained attachments, without
+ever retiring images in that batch. Hard bounds must hold; the chunk/low-water
+headroom is best-effort when the protected batch or documents prevent it.
+The 12 MiB target does not trigger premature eviction: a retained total above
+12 MiB but below 20 MiB stays intact unless count overflows. After overflow,
+soft headroom yields to a protected batch above 12 MiB that still fits 20 MiB.
+Documents are never evicted and accumulate chronologically. If documents plus
+the protected batch cannot fit, admission explicitly fails—even if later text
+has been appended. New tool batches reject all media-bearing siblings atomically
+with explicit errors, preserving correlation IDs, order and text-only siblings.
+
+The watermark is recomputed from every original batch on retries and reloads.
+100 small one-image batches become 61 retained images at batch 101, hold the
+same retired prefix through batch 140, then retire the next chunk at 141.
+Identical images count as distinct occurrences. Omissions use a fixed label.
+No session schema, persistent watermark or runtime retention state is introduced.
+Original messages are untouched. Compaction, truncation and edits start a new
+replay window: **global non-resurrection is not guaranteed** across those changes.
+
+Both native API paths plan retirement on pristine original batches, then project/check
+every original image and apply retirement in one blocking pass, followed by strict projected validation,
+then thinking sanitization/adjacent-role merging, tool-reference lowering and
+cache annotation. Strict checks therefore preserve original batch count semantics
+without weakening the eight-attachment admission limit. The continuation wire copy
+only strips message metadata and preserves batch boundaries. Accounting includes
+serialized original attachment blocks (including documents), not the whole HTTP
+request. Generated cache markers are added only to the outgoing copy, after
+accounting; any attachment metadata already present in originals is conservatively
+charged. Resized output is strictly revalidated for expansion; no second eviction
+fallback occurs. The protected raw batch budget is deliberately conservative.
+
+Retired originals still receive all existing structural/header/base64 validation.
+They also receive the same projection checks as retained images: oversized codec,
+animation and pixel-resource errors still reject the request. Retired projected
+output is discarded, never persisted; small images retain structural-only checks. The separate resize memo is not retention
+state: memo eviction cannot change which image occurrences are retired. Chunk
+boundaries deliberately change the outgoing prefix; retries/reload of unchanged
+history reproduce it, not universal prefix stability across all history changes.
+
+Retention coverage includes shared projection regressions and source-order checks
+for both native transports, plus streaming request tests in
+`runtime::stream::rich_output_tests`. No retention-specific sync loopback parity
+test is provided.

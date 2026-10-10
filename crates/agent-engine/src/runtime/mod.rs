@@ -28,6 +28,7 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod image_limits;
+mod image_retention;
 pub mod memory_context;
 pub mod memory_history;
 pub mod openai;
