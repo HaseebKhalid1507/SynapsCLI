@@ -341,6 +341,19 @@ impl Daemon {
         };
         registry::write_daemon_json(&paths, &info)?;
 
+        // Before any session of this image registers: drop registrations no
+        // running session owns (dead owner pid). After a reload, also every
+        // one naming our own pid: the old image exec'd without ending its
+        // sessions, and the ones still live re-register when they rehydrate
+        // below, under their current (e.g. post-compaction) id. On a fresh
+        // start our pid may already own live registrations (a daemon hosted
+        // in a process that runs other sessions), so it is left alone.
+        let own_pid = reload_state.as_ref().map(|_| info.pid);
+        let swept = crate::events::registry::sweep_stale_registrations(own_pid);
+        if swept > 0 {
+            tracing::info!(swept, "daemon: removed stale session registrations");
+        }
+
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
             reload::rehydrate(&state, rs).await;
@@ -367,8 +380,12 @@ impl Daemon {
         lifecycle::shutdown_all(&self.state, force).await;
         self.accept.abort();
         let _ = self.accept.await;
-        for p in [&self.paths.sock, &self.paths.json, &self.paths.pid] {
-            crate::events::socket::cleanup_socket(&p.to_string_lossy());
+        crate::events::socket::cleanup_socket(&self.paths.sock.to_string_lossy());
+        {
+            let lock = self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lock) = lock.as_ref() {
+                registry::cleanup_metadata(&self.paths, lock);
+            }
         }
         tracing::info!("daemon: stopped");
         // Release the flock last.
@@ -654,21 +671,41 @@ const SPAWN_LOCK_WAIT: Duration = SPAWN_READY_TIMEOUT.saturating_add(Duration::f
 /// first client spawns via `setsid` + ready-fd; the daemon holds the flock).
 /// The **spawn lock** (`<stem>.spawn.lock` next to the flock) serialises
 /// concurrent first-clients: the loser blocks on it, then re-probes the
-/// flock and finds the winner's daemon. Never touches the socket on
-/// ECONNREFUSED alone — `reap_stale` + the flock decide.
+/// flock and finds the winner's daemon. Enabled warm attaches also acquire
+/// this lock (extra open/flock overhead, and the lock must be writable).
+/// Never touches the socket on ECONNREFUSED alone — `reap_stale` + the
+/// flock decide. Daemon startup must NOT acquire the spawn lock: its parent
+/// holds it until the child's ready-fd acknowledgement.
 #[cfg(unix)]
 pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
+    ensure_running_with(opts, autospawn_enabled(), spawn_detached, || {})
+}
+
+// Keep the real cleanup/probe/locking path testable without spawning the unit
+// test executable. The hook marks entry to the lock attempt, not readiness.
+#[cfg(unix)]
+fn ensure_running_with(
+    opts: &DaemonOpts,
+    auto: bool,
+    spawn: impl FnOnce(&DaemonOpts) -> anyhow::Result<u32>,
+    before_spawn_lock: impl FnOnce(),
+) -> Result<Ensured, EnsureError> {
     let paths = opts.paths();
-    registry::reap_stale(&paths);
-    if registry::is_alive(&paths) {
-        return Ok(Ensured::Running);
-    }
-    if !autospawn_enabled() {
-        return Err(EnsureError::AutospawnDisabled);
+    if !auto {
+        // Preserve the disabled path: no spawn-lock dependency, even warm.
+        registry::reap_stale(&paths);
+        return if registry::is_alive(&paths) {
+            Ok(Ensured::Running)
+        } else {
+            Err(EnsureError::AutospawnDisabled)
+        };
     }
     let _ = std::fs::create_dir_all(&paths.dir);
+    before_spawn_lock();
     let _guard = registry::SpawnLock::acquire(&paths, SPAWN_LOCK_WAIT)
         .map_err(|e| EnsureError::Spawn(format!("spawn lock {}: {e}", paths.spawn_lock().display())))?;
+    // No enabled caller may reap/probe before this lock: another client's
+    // transient cleanup/probe DaemonLock is not evidence of a ready daemon.
     // Somebody may have spawned while we waited.
     registry::reap_stale(&paths);
     if registry::is_alive(&paths) {
@@ -682,7 +719,7 @@ pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
     if opts.idle_exit.is_none() {
         opts.idle_exit = autospawn_idle_exit();
     }
-    spawn_detached(&opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
+    spawn(&opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
 }
 
 /// `SYNAPS_DAEMON_IDLE_EXIT_SECS` for auto-spawned daemons: default 10 s —
@@ -810,5 +847,134 @@ mod flag_tests {
         assert!(env_is_off(Some("NO")));
         assert!(!env_is_off(Some("1")));
         assert!(!env_is_off(None));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ensure_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    const WAIT: Duration = Duration::from_secs(3);
+    const BLOCKED: Duration = Duration::from_millis(100);
+
+    fn serialization_case(stale_metadata: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DaemonOpts {
+            runtime_dir: Some(dir.path().to_path_buf()),
+            profile: Some("ensure-serialization".into()),
+            // Avoid reading ambient idle-exit configuration in this test.
+            idle_exit: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let paths = opts.paths();
+        let spawn_lock = registry::SpawnLock::acquire(&paths, WAIT).unwrap();
+        let cleanup_lock = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        if stale_metadata {
+            std::fs::write(&paths.json, b"stale metadata").unwrap();
+            std::fs::write(&paths.pid, b"0\n").unwrap();
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let first_opts = opts.clone();
+        let first_count = Arc::clone(&count);
+        let first_ready = Arc::clone(&ready);
+        let first = std::thread::spawn(move || {
+            let result = ensure_running_with(&first_opts, true, |opts| {
+                first_count.fetch_add(1, Ordering::SeqCst);
+                let paths = opts.paths();
+                // The real ensure path must have reaped the old metadata.
+                assert!(!paths.json.exists());
+                assert!(!paths.pid.exists());
+                let lock = DaemonLock::try_acquire(&paths)?.expect("daemon lock free after reap");
+                let pid = std::process::id();
+                registry::write_daemon_json(&paths, &DaemonInfo {
+                    pid,
+                    protocol_version: 1,
+                    daemon_version: "test".into(),
+                    profile: opts.profile.clone(),
+                    started_at: chrono::Utc::now(),
+                    socket: paths.sock.display().to_string(),
+                    exe: None,
+                    generation: 1,
+                })?;
+                // Main retains daemon ownership past both callers' returns.
+                daemon_tx.send(lock).unwrap();
+                ready_rx.recv_timeout(WAIT).unwrap();
+                first_ready.store(true, Ordering::SeqCst);
+                Ok(pid)
+            }, || attempt_tx.send(()).unwrap());
+            done_tx.send(result).unwrap();
+        });
+        // Trace entry to the actual lock attempt before asserting absence.
+        attempt_rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(done_rx.recv_timeout(BLOCKED), Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(paths.json.exists(), stale_metadata);
+        assert_eq!(paths.pid.exists(), stale_metadata);
+        drop(cleanup_lock);
+        drop(spawn_lock);
+        let daemon_lock = daemon_rx.recv_timeout(WAIT).unwrap();
+
+        // A second real ensure caller sees daemon ownership and metadata, but
+        // must still wait for the spawning caller's ready acknowledgement.
+        let (second_attempt_tx, second_attempt_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_count = Arc::clone(&count);
+        let second_ready = Arc::clone(&ready);
+        let second = std::thread::spawn(move || {
+            let result = ensure_running_with(&opts, true, |_| {
+                second_count.fetch_add(1, Ordering::SeqCst);
+                panic!("warm attach must not spawn");
+            }, || second_attempt_tx.send(()).unwrap());
+            second_done_tx.send((result, second_ready.load(Ordering::SeqCst))).unwrap();
+        });
+        second_attempt_rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(second_done_rx.recv_timeout(BLOCKED), Err(mpsc::RecvTimeoutError::Timeout));
+        assert!(!ready.load(Ordering::SeqCst));
+        ready_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(WAIT).unwrap(), Ok(Ensured::Spawned(std::process::id())));
+        assert_eq!(second_done_rx.recv_timeout(WAIT).unwrap(), (Ok(Ensured::Running), true));
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(registry::read_daemon_json(&paths).unwrap().pid, std::process::id());
+        drop(daemon_lock);
+    }
+
+    #[test]
+    fn ensure_serializes_before_probe_with_missing_metadata() {
+        serialization_case(false);
+    }
+
+    #[test]
+    fn ensure_serializes_before_probe_with_stale_metadata() {
+        serialization_case(true);
+    }
+
+    #[test]
+    fn disabled_ensure_keeps_warm_attach_without_spawn_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DaemonOpts {
+            runtime_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let paths = opts.paths();
+        let _spawn_lock = registry::SpawnLock::acquire(&paths, WAIT).unwrap();
+        let daemon_lock = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        let ensure = || ensure_running_with(&opts, false,
+            |_| panic!("disabled must not spawn"),
+            || panic!("disabled must not attempt spawn lock"));
+        assert_eq!(ensure(), Ok(Ensured::Running));
+        drop(daemon_lock);
+        std::fs::write(&paths.json, b"stale").unwrap();
+        std::fs::write(&paths.pid, b"0\n").unwrap();
+        assert_eq!(ensure(), Err(EnsureError::AutospawnDisabled));
+        assert!(!paths.json.exists());
+        assert!(!paths.pid.exists());
     }
 }

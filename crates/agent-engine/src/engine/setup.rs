@@ -24,10 +24,7 @@ pub struct EngineOpts {
 pub struct BackgroundTasks {
     watcher_shutdown: Arc<std::sync::atomic::AtomicBool>,
     watcher_task: tokio::task::JoinHandle<()>,
-    socket_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    socket_task: tokio::task::JoinHandle<()>,
-    #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
-    session_socket_path: String,
+    endpoint: crate::events::registry::SessionEndpoint,
     session_id: String,
     /// Hook bus the session's `on_session_start` injection lives on; cleared
     /// at shutdown so a long-lived process does not accumulate stale keys.
@@ -42,13 +39,18 @@ pub struct BackgroundTasks {
 }
 
 impl BackgroundTasks {
+    pub(crate) fn update_session_name(
+        &self,
+        name: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        self.endpoint.update_name(name)
+    }
+
     /// Signal all tasks to stop and unregister the session.
     pub fn shutdown(&self) {
         self.watcher_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        self.socket_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-        crate::events::registry::unregister_session(&self.session_id);
+        self.endpoint.shutdown();
         // Cleanup only — fail-soft when no tokio runtime is current.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let hook_bus = Arc::clone(&self.hook_bus);
@@ -64,10 +66,8 @@ impl Drop for BackgroundTasks {
     fn drop(&mut self) {
         self.watcher_shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.socket_shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.watcher_task.abort();
-        self.socket_task.abort();
+        self.endpoint.shutdown();
     }
 }
 
@@ -293,42 +293,22 @@ pub(crate) fn spawn_session_background(
         wt.abort();
     };
 
-    // Start per-session Unix socket listener + register in session registry
-    let socket_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let session_socket_path = crate::events::registry::socket_path_for_session(&session.id);
-    let socket_task = crate::events::socket::listen_session_socket(
-        session_socket_path.clone(),
+    let endpoint = match crate::events::registry::SessionEndpoint::start(
+        &session.id,
+        session.name.clone(),
         runtime.event_queue().clone(),
-        socket_shutdown.clone(),
-    );
-    let session_registration = crate::events::registry::SessionRegistration {
-        kind: crate::events::registry::REGISTRATION_KIND.to_string(),
-        session_id: session.id.clone(),
-        name: session.name.clone(),
-        socket_path: session_socket_path.clone(),
-        pid: std::process::id(),
-        started_at: chrono::Utc::now(),
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            abort_tasks(&watcher_shutdown, &watcher_task);
+            return Err(crate::core::error::RuntimeError::Session(e));
+        }
     };
-    if let Err(e) = crate::events::registry::register_session(&session_registration) {
-        abort_tasks(&watcher_shutdown, &watcher_task);
-        socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        socket_task.abort();
-        // Fail loudly: returning Ok with already-aborted handles silently
-        // poisoned downstream — server inherited dead watcher/socket tasks
-        // and a session that wasn't in the registry, so other tools couldn't
-        // see it. Better to fail boot than start in a broken state.
-        return Err(crate::core::error::RuntimeError::Session(format!(
-            "failed to register session {}: {}",
-            session_registration.session_id, e
-        )));
-    }
 
     Ok(BackgroundTasks {
         watcher_shutdown,
         watcher_task,
-        socket_shutdown,
-        socket_task,
-        session_socket_path,
+        endpoint,
         session_id: session.id.clone(),
         hook_bus: Arc::clone(runtime.hook_bus()),
         // The appender guard lives on the `EngineHost` now.
@@ -619,6 +599,69 @@ fn resolve_or_create_session(
 mod tests {
     use super::*;
     use agent_core::reasoning::ReasoningLevel;
+
+    /// A session's registry card and socket must not outlive it, even when
+    /// it ends without `shutdown()` (S348: 470 leftovers in `run/`), and
+    /// `shutdown()` followed by drop stays clean.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn session_registration_is_removed_on_drop_without_shutdown() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let runtime = Runtime::new_headless();
+        let dir = crate::events::registry::registry_dir();
+        for explicit_shutdown in [false, true] {
+            let session = Session::new("claude-sonnet-4-5", "low", None);
+            let card = dir.join(format!("{}.json", session.id));
+            let background = spawn_session_background(&runtime, &session).unwrap();
+            let sock = std::path::PathBuf::from(&background.endpoint.registration.socket_path);
+            for _ in 0..100 {
+                if sock.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(card.exists() && sock.exists(), "registered and listening");
+            if explicit_shutdown {
+                background.shutdown();
+            }
+            drop(background);
+            assert!(
+                !card.exists(),
+                "card removed (shutdown: {explicit_shutdown})"
+            );
+            assert!(
+                !sock.exists(),
+                "socket removed (shutdown: {explicit_shutdown})"
+            );
+        }
+    }
+
+    /// Starting a session drops registrations whose owner process is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn starting_a_session_prunes_registrations_of_dead_processes() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = crate::events::registry::registry_dir();
+        let dead = crate::events::registry::SessionRegistration {
+            kind: crate::events::registry::REGISTRATION_KIND.to_string(),
+            session_id: "20200101-000000-dead".into(),
+            name: None,
+            socket_path: crate::events::registry::socket_path_for_session("20200101-000000-dead"),
+            pid: 999_999,
+            started_at: chrono::Utc::now(),
+        };
+        crate::events::registry::register_session(&dead).unwrap();
+        let _stale = std::os::unix::net::UnixListener::bind(&dead.socket_path).unwrap();
+
+        let runtime = Runtime::new_headless();
+        let session = Session::new("claude-sonnet-4-5", "low", None);
+        let background = spawn_session_background(&runtime, &session).unwrap();
+        assert!(!dir.join("20200101-000000-dead.json").exists());
+        assert!(!std::path::Path::new(&dead.socket_path).exists());
+        background.shutdown();
+    }
 
     async fn saved_session(first: &str) -> Session {
         let mut session = Session::new("claude-sonnet-4-5", "low", None);

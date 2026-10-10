@@ -109,6 +109,39 @@ is printed to stderr so scripts piping stdout are not affected.
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
 | `daemon.pid` | 0600 | pid |
 
+## Per-session event endpoint ownership
+
+Session registry cards still use `<session-id>.json`, but active event sockets use
+short generation-specific `s-<digest>.sock` names (Windows pipes derive their name
+from that path). Clients must read the card's `socket_path`, not construct a path
+from the session ID; `socket_path_for_session` remains a legacy helper. Registration
+JSON remains backward-readable.
+
+Updated writers coordinate bind/publication, rename, sweeping and removal through
+a permanent `.session-registry.lock` in the runtime directory. **Never delete this
+lock file to resolve contention:** replacing its inode defeats advisory locking.
+Acquisition is bounded to 100 ms. Endpoints bind synchronously before publication;
+cleanup uses the captured runtime directory and socket identity, so an old listener
+cannot delete or rename its replacement's generation. Failure to publish rolls
+back only the newly bound endpoint. Ordinary teardown also cleans up on Drop.
+
+On Unix, cleanup still removes its captured socket if the card lock is busy; the
+next successful scan removes a generated-path card whose endpoint is missing, even
+when the PID remains alive. Windows has no filesystem socket, so card cleanup under
+contention remains best-effort until a retry or own-PID reload sweep. Legacy endpoint
+aborts remove only their captured inode. Regular files, symlinks and unrelated card
+or socket paths are not cleanup targets.
+
+The protocol coordinates updated binaries, not older binaries that ignore the lock
+or hostile same-UID filesystem mutation. Enabled daemon auto-start callers also
+serialize cleanup and liveness probing under the spawn lock, held through readiness;
+a cleanup lock held briefly by another first client is not proof of a ready daemon.
+Warm enabled attaches therefore also require acquiring the writable spawn lock.
+Disabled auto-start behavior is unchanged. Generation collisions fail binding without
+replacing the old endpoint. Long runtime-directory prefixes can still exceed Unix
+socket limits; use a short `SYNAPS_RUNTIME_DIR`. Existing journal locks and compaction
+registration-following behavior are outside this change.
+
 ## Per-session journal lock (F10)
 
 Each session with an active `Runtime` holds an exclusive advisory `flock` on

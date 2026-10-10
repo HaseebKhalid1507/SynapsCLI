@@ -43,7 +43,7 @@ pub fn registry_dir() -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    dir
+    std::fs::canonicalize(&dir).unwrap_or(dir)
 }
 
 /// Sanitize a session ID for safe use in filenames and socket paths.
@@ -65,7 +65,9 @@ pub fn sanitize_session_id(raw: &str) -> String {
         .collect::<String>()
 }
 
-/// Returns the Unix domain socket path for a session.
+/// Returns the legacy Unix socket path for a session.
+/// Active endpoint clients must read `SessionRegistration::socket_path`: new
+/// endpoints use bounded generation names, not this pre-publication helper.
 /// Sockets live in the registry dir — `$SYNAPS_RUNTIME_DIR` when set (e.g.
 /// `/run/user/<uid>/synaps`), otherwise `$SYNAPS_BASE_DIR/run` (default
 /// `~/.synaps-cli/run/`) — which is user-owned and mode 0700, avoiding /tmp
@@ -81,27 +83,267 @@ fn socket_path_in_dir(dir: &std::path::Path, session_id: &str) -> String {
         .into_owned()
 }
 
+/// A permanent lock inode: never unlink this file, including during cleanup.
+/// Bounded acquisition keeps Drop and synchronous boot fail-soft under contention.
+pub(crate) fn lock_dir(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(dir.join(".session-registry.lock"))
+        .map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("registry lock is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        // SAFETY: geteuid has no preconditions.
+        if meta.uid() != unsafe { libc::geteuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o777 != 0o600
+        {
+            return Err("unsafe registry lock owner, links or permissions".into());
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        if fs4::fs_std::FileExt::try_lock_exclusive(&file).map_err(|e| e.to_string())? {
+            return Ok(file);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("registry lock busy".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+fn same_owner(a: &SessionRegistration, b: &SessionRegistration) -> bool {
+    a.session_id == b.session_id
+        && a.pid == b.pid
+        && a.started_at == b.started_at
+        && a.socket_path == b.socket_path
+}
+
+fn generated_endpoint_missing(dir: &std::path::Path, reg: &SessionRegistration) -> bool {
+    #[cfg(unix)]
+    {
+        let path = dir.join(generated_basename(reg));
+        std::path::Path::new(&reg.socket_path) == path
+            && std::fs::symlink_metadata(path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, reg);
+        false
+    }
+}
+
+fn generated_basename(reg: &SessionRegistration) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!("{}\0{}\0{}", reg.session_id, reg.pid, reg.started_at);
+    let digest = Sha256::digest(identity.as_bytes());
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("s-{hex}.sock")
+}
+
+fn regular_card(path: &std::path::Path) -> bool {
+    !is_reserved_json(path)
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn valid_card(path: &std::path::Path, reg: &SessionRegistration) -> bool {
+    reg.kind == REGISTRATION_KIND
+        && !is_reserved_json(path)
+        && path.file_name()
+            == Some(std::ffi::OsStr::new(&format!(
+                "{}.json",
+                sanitize_session_id(&reg.session_id)
+            )))
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn remove_socket(dir: &std::path::Path, reg: &SessionRegistration) {
+    let sock = std::path::Path::new(&reg.socket_path);
+    // Exact immediate child only; never follow a claimed subdirectory/symlink.
+    let legacy = format!("{}.sock", sanitize_session_id(&reg.session_id));
+    if (sock == dir.join(generated_basename(reg)) || sock == dir.join(legacy))
+        && sock.parent() == Some(dir)
+    {
+        super::socket::cleanup_socket(&reg.socket_path);
+    }
+}
+
+/// Owns a bound, published generation and its captured runtime directory.
+/// A timestamp/hash collision fails binding without replacing the prior socket.
+/// Unix lock-contention leftovers are repaired on the next successful scan;
+/// Windows card cleanup under contention requires retry or own-PID reload sweep.
+/// No asynchronous task can bind after this guard is dropped.
+pub struct SessionEndpoint {
+    pub registration: SessionRegistration,
+    dir: PathBuf,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+    socket: super::socket::SocketIdentity,
+}
+
+impl SessionEndpoint {
+    pub fn start(
+        id: &str,
+        name: Option<String>,
+        queue: std::sync::Arc<super::queue::EventQueue>,
+    ) -> Result<Self, String> {
+        let dir = std::fs::canonicalize(registry_dir()).map_err(|e| e.to_string())?;
+        Self::start_in(&dir, id, name, queue)
+    }
+
+    fn start_in(
+        dir: &std::path::Path,
+        id: &str,
+        name: Option<String>,
+        queue: std::sync::Arc<super::queue::EventQueue>,
+    ) -> Result<Self, String> {
+        let _lock = lock_dir(dir)?;
+        scan_registrations_locked(dir, None);
+        let mut registration = SessionRegistration {
+            kind: REGISTRATION_KIND.into(),
+            session_id: id.into(),
+            name,
+            socket_path: String::new(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        registration.socket_path = dir
+            .join(generated_basename(&registration))
+            .to_string_lossy()
+            .into_owned();
+        let (listener, socket) = super::socket::bind_session_socket(&registration.socket_path)
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = write_registration(&registration, dir) {
+            socket.remove();
+            return Err(e);
+        }
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = super::socket::serve_session_socket(
+            listener,
+            registration.socket_path.clone(),
+            queue,
+            shutdown.clone(),
+        );
+        Ok(Self {
+            registration,
+            dir: dir.to_path_buf(),
+            shutdown,
+            task,
+            socket,
+        })
+    }
+
+    /// Rename only this published generation in the captured directory.
+    pub fn update_name(&self, name: Option<&str>) -> Result<(), String> {
+        let _lock = lock_dir(&self.dir)?;
+        let path = self.dir.join(format!(
+            "{}.json",
+            sanitize_session_id(&self.registration.session_id)
+        ));
+        if !regular_card(&path) {
+            return Err("session card missing".into());
+        }
+        let mut disk: SessionRegistration =
+            serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if !valid_card(&path, &disk) || !same_owner(&disk, &self.registration) {
+            return Err("session generation replaced".into());
+        }
+        disk.name = name.map(str::to_owned);
+        write_registration(&disk, &self.dir)
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.task.abort();
+        // This unique generation cannot be reused by another successful bind.
+        // Remove only the captured inode even if card cleanup cannot get the lock.
+        self.socket.remove();
+        let Ok(_lock) = lock_dir(&self.dir) else {
+            // Unix scans repair missing generated endpoints, including live-PID
+            // cards. Windows has no filesystem endpoint: card cleanup remains
+            // best effort until explicit shutdown retry / own-PID reload sweep.
+            return;
+        };
+        unregister_owned_locked(&self.registration, &self.dir, false);
+    }
+}
+
+impl Drop for SessionEndpoint {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Write `{session_id}.json` atomically (tmp + rename). Chmod 0600 on Unix.
 pub fn register_session(reg: &SessionRegistration) -> Result<(), String> {
     register_session_in(reg, &registry_dir())
 }
 
 fn register_session_in(reg: &SessionRegistration, dir: &std::path::Path) -> Result<(), String> {
+    let _lock = lock_dir(dir)?;
+    write_registration(reg, dir)
+}
+
+fn write_registration(reg: &SessionRegistration, dir: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
     let safe_id = sanitize_session_id(&reg.session_id);
     let path = dir.join(format!("{}.json", safe_id));
-    let tmp = path.with_extension("tmp");
+    if is_reserved_json(&path) {
+        return Err("reserved session id".into());
+    }
+    // Do not overwrite foreign JSON, symlinks or special files sharing run/.
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return Err("not a regular session card".into());
+            }
+            let old: SessionRegistration =
+                serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            if !valid_card(&path, &old) || old.session_id != reg.session_id {
+                return Err("refusing to replace a foreign session card".into());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let tmp = dir.join(format!(".session-{}.tmp", uuid::Uuid::new_v4().simple()));
 
     let json = serde_json::to_string(reg).map_err(|e| format!("serialize error: {}", e))?;
 
-    std::fs::write(&tmp, &json).map_err(|e| format!("write error: {}", e))?;
-
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename error: {}", e))?;
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e: std::io::Error| e.to_string())?;
 
     Ok(())
 }
@@ -113,49 +355,142 @@ pub fn update_session_name(session_id: &str, name: Option<&str>) -> Result<(), S
     update_session_name_in(session_id, name, &registry_dir())
 }
 
-fn update_session_name_in(session_id: &str, name: Option<&str>, dir: &std::path::Path) -> Result<(), String> {
+fn update_session_name_in(
+    session_id: &str,
+    name: Option<&str>,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    let _lock = lock_dir(dir)?;
     let safe_id = sanitize_session_id(session_id);
     let path = dir.join(format!("{}.json", safe_id));
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    if !regular_card(&path) {
+        return Err("not a regular session card".into());
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut reg: SessionRegistration =
         serde_json::from_str(&content).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    if !valid_card(&path, &reg) {
+        return Err("not a session card".into());
+    }
     reg.name = name.map(str::to_string);
-    register_session_in(&reg, dir)
+    write_registration(&reg, dir)
 }
 
-/// Remove the registration file. Best-effort — never panics.
+/// Operator removal by ID (not owner-scoped). No runtime teardown uses this.
+/// Remove only a valid matching registration. Best-effort — never panics.
 /// Also removes the socket file at `socket_path` if it exists.
 pub fn unregister_session(session_id: &str) {
     unregister_session_in(session_id, &registry_dir());
 }
 
 fn unregister_session_in(session_id: &str, dir: &std::path::Path) {
-    let safe_id = sanitize_session_id(session_id);
-    let path = dir.join(format!("{}.json", safe_id));
-
-    // Load first so we can clean up the socket.
+    let Ok(_lock) = lock_dir(dir) else {
+        return;
+    };
+    let path = dir.join(format!("{}.json", sanitize_session_id(session_id)));
+    if !regular_card(&path) {
+        return;
+    }
     if let Ok(content) = std::fs::read_to_string(&path) {
         if let Ok(reg) = serde_json::from_str::<SessionRegistration>(&content) {
-            let sock = std::path::Path::new(&reg.socket_path);
-            // Only delete if socket_path is inside the registry dir — prevents
-            // a crafted JSON from causing arbitrary file deletion.
-            if sock.starts_with(dir) && sock.extension().is_some_and(|e| e == "sock") {
-                let _ = std::fs::remove_file(sock);
+            if valid_card(&path, &reg) {
+                remove_registration_files(dir, &path, &reg);
             }
         }
     }
+}
 
-    let _ = std::fs::remove_file(&path);
+/// Remove `reg`'s registration and socket, but only while the file on disk
+/// is still this exact registration (same owner pid, start time and socket).
+///
+/// This is what a session calls when it ends. The check matters because the
+/// same id can be registered again while an older owner is still winding
+/// down (a second actor on one id, a rehydrated session after a reload): the
+/// old owner must not delete the newer registration. Best-effort and
+/// idempotent: a missing or foreign file is left alone.
+pub fn unregister_owned(reg: &SessionRegistration) {
+    unregister_owned_in(reg, &registry_dir());
+}
+
+fn unregister_owned_in(reg: &SessionRegistration, dir: &std::path::Path) {
+    let Ok(_lock) = lock_dir(dir) else {
+        return;
+    };
+    unregister_owned_locked(reg, dir, true);
+}
+
+fn unregister_owned_locked(
+    reg: &SessionRegistration,
+    dir: &std::path::Path,
+    remove_claimed_socket: bool,
+) {
+    let safe_id = sanitize_session_id(&reg.session_id);
+    let path = dir.join(format!("{}.json", safe_id));
+    if !regular_card(&path) {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(on_disk) = serde_json::from_str::<SessionRegistration>(&content) else {
+        return;
+    };
+    if !valid_card(&path, &on_disk)
+        || on_disk.session_id != reg.session_id
+        || on_disk.pid != reg.pid
+        || on_disk.started_at != reg.started_at
+        || on_disk.socket_path != reg.socket_path
+    {
+        tracing::debug!(session = %reg.session_id, "registry: registration was replaced; leaving the newer one");
+        return;
+    }
+    if remove_claimed_socket {
+        remove_socket(dir, &on_disk);
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Unlink a registration file and its socket. The socket is only removed
+/// when it lies inside the registry dir, so a crafted file can never delete
+/// anything elsewhere.
+fn remove_registration_files(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    reg: &SessionRegistration,
+) {
+    if !valid_card(path, reg) {
+        return;
+    }
+    remove_socket(dir, reg);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Remove registrations that no running session can own and return how
+/// many were removed. Always: an owner pid that no longer exists. With
+/// `own_pid` (the daemon, at startup): also registrations naming that pid,
+/// which can only be leftovers. A reload re-execs the same pid without
+/// running any session's shutdown, and the new image has not registered
+/// anything yet when it sweeps.
+pub fn sweep_stale_registrations(own_pid: Option<u32>) -> usize {
+    sweep_stale_registrations_in(&registry_dir(), own_pid)
+}
+
+fn sweep_stale_registrations_in(dir: &std::path::Path, own_pid: Option<u32>) -> usize {
+    scan_registrations(dir, own_pid).1
 }
 
 /// Returns true if a process with `pid` is alive (Unix: `kill(pid, 0)`).
 fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // SAFETY: kill with signal 0 never sends a signal; it only checks
         // whether the process exists and we have permission to signal it.
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
@@ -183,15 +518,38 @@ pub fn list_active_sessions() -> Vec<SessionRegistration> {
 }
 
 fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
+    scan_registrations(dir, None).0
+}
+
+/// Read every session registration in `dir`, unlink the stale ones (dead
+/// owner pid, or `own_pid` when given) and return `(live, removed)`.
+fn scan_registrations(
+    dir: &std::path::Path,
+    own_pid: Option<u32>,
+) -> (Vec<SessionRegistration>, usize) {
+    let Ok(_lock) = lock_dir(dir) else {
+        return (Vec::new(), 0);
+    };
+    scan_registrations_locked(dir, own_pid)
+}
+
+fn scan_registrations_locked(
+    dir: &std::path::Path,
+    own_pid: Option<u32>,
+) -> (Vec<SessionRegistration>, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
 
     let mut live = Vec::new();
+    let mut removed = 0;
 
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.extension().is_some_and(|e| e == "json") || is_reserved_json(&path) {
+            continue;
+        }
+        if !regular_card(&path) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -209,20 +567,21 @@ fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
             }
         };
 
-        if pid_is_alive(reg.pid) {
+        if !valid_card(&path, &reg) {
+            continue;
+        }
+        if own_pid != Some(reg.pid)
+            && pid_is_alive(reg.pid)
+            && !generated_endpoint_missing(dir, &reg)
+        {
             live.push(reg);
         } else {
-            // Dead owner: prune the registration and its socket, but only a
-            // socket inside our dir (a crafted file must not delete elsewhere).
-            let sock = std::path::Path::new(&reg.socket_path);
-            if sock.starts_with(dir) && sock.extension().is_some_and(|e| e == "sock") {
-                let _ = std::fs::remove_file(sock);
-            }
-            let _ = std::fs::remove_file(&path);
+            remove_registration_files(dir, &path, &reg);
+            removed += 1;
         }
     }
 
-    live
+    (live, removed)
 }
 
 /// Resolve a query to a registration. Resolution order:
@@ -265,6 +624,188 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn locked_drop_removes_endpoint_and_next_scan_repairs_live_pid_card() {
+        let tmp = tmp_registry();
+        let endpoint = SessionEndpoint::start_in(
+            tmp.path(),
+            "locked",
+            None,
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10)),
+        )
+        .unwrap();
+        let path = endpoint.registration.socket_path.clone();
+        let lock = lock_dir(tmp.path()).unwrap();
+        drop(endpoint);
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(tmp.path().join("locked.json").exists());
+        drop(lock);
+        assert_eq!(sweep_stale_registrations_in(tmp.path(), None), 1);
+        assert!(!tmp.path().join("locked.json").exists());
+    }
+
+    #[tokio::test]
+    async fn owned_rename_refuses_replacement_and_uses_captured_root() {
+        let tmp = tmp_registry();
+        let other = tmp_registry();
+        let queue = std::sync::Arc::new(super::super::queue::EventQueue::new(10));
+        let old = SessionEndpoint::start_in(tmp.path(), "same", None, queue.clone()).unwrap();
+        let new = SessionEndpoint::start_in(tmp.path(), "same", None, queue.clone()).unwrap();
+        let unrelated = SessionEndpoint::start_in(other.path(), "same", None, queue).unwrap();
+        assert!(old.update_name(Some("wrong")).is_err());
+        new.update_name(Some("right")).unwrap();
+        assert_eq!(
+            list_active_sessions_in(tmp.path())[0].name.as_deref(),
+            Some("right")
+        );
+        assert!(list_active_sessions_in(other.path())[0].name.is_none());
+        drop(new);
+        assert!(other.path().join("same.json").exists());
+        drop(unrelated);
+    }
+
+    #[tokio::test]
+    async fn publication_failure_rolls_back_bound_endpoint() {
+        let tmp = tmp_registry();
+        assert!(SessionEndpoint::start_in(
+            tmp.path(),
+            "daemon",
+            None,
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10))
+        )
+        .is_err());
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from(".session-registry.lock")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_survives_old_task_ending_and_immediate_drop() {
+        let tmp = tmp_registry();
+        let queue = std::sync::Arc::new(super::super::queue::EventQueue::new(10));
+        let old = SessionEndpoint::start_in(tmp.path(), "same", None, queue.clone()).unwrap();
+        let old_path = old.registration.socket_path.clone();
+        let new = SessionEndpoint::start_in(tmp.path(), "same", None, queue).unwrap();
+        assert_ne!(old_path, new.registration.socket_path);
+        update_session_name_in("same", Some("renamed"), tmp.path()).unwrap();
+        // No await since either start: neither listener task has been polled.
+        drop(old);
+        assert!(!std::path::Path::new(&old_path).exists());
+        tokio::task::yield_now().await;
+        let _client = tokio::net::UnixStream::connect(&new.registration.socket_path)
+            .await
+            .unwrap();
+        let new_path = new.registration.socket_path.clone();
+        assert_eq!(
+            list_active_sessions_in(tmp.path())[0].name.as_deref(),
+            Some("renamed")
+        );
+        drop(new);
+        assert!(!std::path::Path::new(&new_path).exists());
+        assert!(!tmp.path().join("same.json").exists());
+    }
+
+    #[test]
+    fn lock_is_permanent_and_contention_is_bounded() {
+        let tmp = tmp_registry();
+        let lock = lock_dir(tmp.path()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let dir = tmp.path().to_path_buf();
+        let contender = std::thread::spawn(move || {
+            ready.wait();
+            assert!(lock_dir(&dir).is_err());
+        });
+        barrier.wait();
+        contender.join().unwrap();
+        drop(lock);
+        assert!(tmp.path().join(".session-registry.lock").exists());
+        assert!(lock_dir(tmp.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_sweep_and_registration_are_serialized() {
+        let tmp = tmp_registry();
+        reg_with_socket(tmp.path(), "same", 0);
+        let lock = lock_dir(tmp.path()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let dir = tmp.path().to_path_buf();
+        let sweep = std::thread::spawn(move || {
+            ready.wait();
+            // The other actor holds the publication lock: no stale deletion.
+            assert_eq!(
+                sweep_stale_registrations_in(&dir, Some(std::process::id())),
+                0
+            );
+        });
+        barrier.wait();
+        sweep.join().unwrap();
+        drop(lock);
+        let endpoint = SessionEndpoint::start_in(
+            tmp.path(),
+            "same",
+            None,
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10)),
+        )
+        .unwrap();
+        assert_eq!(sweep_stale_registrations_in(tmp.path(), None), 0);
+        let _client = tokio::net::UnixStream::connect(&endpoint.registration.socket_path)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malicious_socket_claims_leave_user_files_and_other_sockets() {
+        let tmp = tmp_registry();
+        let outside = tmp_registry();
+        let outside_path = outside.path().join("victim.sock");
+        let _outside = std::os::unix::net::UnixListener::bind(&outside_path).unwrap();
+        let unrelated = tmp.path().join("other.sock");
+        let _other = std::os::unix::net::UnixListener::bind(&unrelated).unwrap();
+        let regular = tmp.path().join("victim.sock");
+        std::fs::write(&regular, b"user data").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
+        for path in [
+            outside_path.clone(),
+            unrelated.clone(),
+            regular.clone(),
+            tmp.path().join("link/victim.sock"),
+            tmp.path().join("../victim.sock"),
+        ] {
+            let mut reg = make_reg("victim", None, 0);
+            reg.socket_path = path.to_string_lossy().into_owned();
+            register_session_in(&reg, tmp.path()).unwrap();
+            sweep_stale_registrations_in(tmp.path(), None);
+        }
+        assert!(outside_path.exists());
+        assert!(unrelated.exists());
+        assert_eq!(std::fs::read(regular).unwrap(), b"user data");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn replacement_pipe_is_bound_before_publication() {
+        let tmp = tmp_registry();
+        let queue = std::sync::Arc::new(super::super::queue::EventQueue::new(10));
+        let old = SessionEndpoint::start_in(tmp.path(), "same", None, queue.clone()).unwrap();
+        let new = SessionEndpoint::start_in(tmp.path(), "same", None, queue).unwrap();
+        drop(old);
+        let pipe = super::super::socket::pipe_name_for(&new.registration.socket_path);
+        let _client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(pipe)
+            .unwrap();
+    }
+
     fn tmp_registry() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
@@ -276,7 +817,7 @@ mod tests {
             kind: REGISTRATION_KIND.to_string(),
             session_id: id.to_string(),
             name: name.map(|s| s.to_string()),
-            socket_path: socket_path_for_session(id),
+            socket_path: format!("/unused/{id}.sock"),
             pid,
             started_at: Utc::now(),
         }
@@ -393,8 +934,14 @@ mod tests {
         for _ in 0..2 {
             let found = find_session_registration_in("ambient", &dir).expect("session resolved");
             assert_eq!(found.session_id, "live-0002");
-            assert!(find_session_registration_in("old", &dir).is_some(), "legacy reg counts");
-            let ids: Vec<_> = list_active_sessions_in(&dir).into_iter().map(|r| r.session_id).collect();
+            assert!(
+                find_session_registration_in("old", &dir).is_some(),
+                "legacy reg counts"
+            );
+            let ids: Vec<_> = list_active_sessions_in(&dir)
+                .into_iter()
+                .map(|r| r.session_id)
+                .collect();
             assert!(!ids.contains(&"x".to_string()), "foreign kind not listed");
             assert!(daemon.exists(), "daemon.json must survive");
             assert!(garbage.exists(), "garbage.json must survive");
@@ -418,11 +965,20 @@ mod tests {
         update_session_name_in("rename-0001", Some("ambient"), &dir).unwrap();
         let found = find_session_registration_in("ambient", &dir).expect("resolves by new name");
         assert_eq!(found.session_id, "rename-0001");
-        assert_eq!(found.socket_path, reg.socket_path, "rest of the record kept");
+        assert_eq!(
+            found.socket_path, reg.socket_path,
+            "rest of the record kept"
+        );
 
         update_session_name_in("rename-0001", None, &dir).unwrap();
-        assert!(find_session_registration_in("ambient", &dir).is_none(), "cleared");
-        assert!(update_session_name_in("ghost", Some("x"), &dir).is_err(), "no reg → error");
+        assert!(
+            find_session_registration_in("ambient", &dir).is_none(),
+            "cleared"
+        );
+        assert!(
+            update_session_name_in("ghost", Some("x"), &dir).is_err(),
+            "no reg → error"
+        );
     }
 
     #[test]
@@ -447,6 +1003,7 @@ mod tests {
         unregister_session_in("ghost-session-99", &dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_pid_pruned() {
         let tmp = tmp_registry();
@@ -463,6 +1020,114 @@ mod tests {
 
         // File should also be gone
         assert!(!dir.join("stale-dead-pid.json").exists());
+    }
+
+    /// A registration whose socket lives in `dir`, with a real socket file,
+    /// so removal of both can be observed.
+    #[cfg(unix)]
+    fn reg_with_socket(dir: &std::path::Path, id: &str, pid: u32) -> SessionRegistration {
+        let reg = SessionRegistration {
+            kind: REGISTRATION_KIND.to_string(),
+            session_id: id.to_string(),
+            name: None,
+            socket_path: socket_path_in_dir(dir, id),
+            pid,
+            started_at: Utc::now(),
+        };
+        let _ = std::fs::remove_file(&reg.socket_path);
+        let _socket = std::os::unix::net::UnixListener::bind(&reg.socket_path).unwrap();
+        register_session_in(&reg, dir).unwrap();
+        reg
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregister_owned_removes_its_own_registration_and_socket() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let reg = reg_with_socket(&dir, "owned", std::process::id());
+        unregister_owned_in(&reg, &dir);
+        assert!(!dir.join("owned.json").exists());
+        assert!(!dir.join("owned.sock").exists());
+        // Idempotent: shutdown() and Drop both call it.
+        unregister_owned_in(&reg, &dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregister_owned_leaves_a_newer_registration_of_the_same_id() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let old = reg_with_socket(&dir, "same-id", std::process::id());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer = reg_with_socket(&dir, "same-id", std::process::id());
+        assert_ne!(old.started_at, newer.started_at);
+
+        unregister_owned_in(&old, &dir);
+        assert!(dir.join("same-id.json").exists(), "newer registration kept");
+        assert!(dir.join("same-id.sock").exists(), "newer socket kept");
+        let live = list_active_sessions_in(&dir);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].started_at, newer.started_at);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_renamed_registration_is_still_owned_and_removed() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let reg = reg_with_socket(&dir, "renamed", std::process::id());
+        update_session_name_in("renamed", Some("ambient"), &dir).unwrap();
+        unregister_owned_in(&reg, &dir);
+        assert!(
+            !dir.join("renamed.json").exists(),
+            "a rename keeps ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_sweep_removes_dead_and_own_pid_and_keeps_other_live_owners() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let own = std::process::id();
+        // SAFETY: getppid has no preconditions; the parent (the test runner's
+        // parent shell) is alive and owned by the same user.
+        let other_live = unsafe { libc::getppid() } as u32;
+        reg_with_socket(&dir, "dead-owner", 999_999);
+        reg_with_socket(&dir, "pre-reload", own);
+        reg_with_socket(&dir, "other-process", other_live);
+        std::fs::write(dir.join("daemon.json"), r#"{"pid":999999}"#).unwrap();
+
+        assert_eq!(sweep_stale_registrations_in(&dir, Some(own)), 2);
+        for gone in ["dead-owner", "pre-reload"] {
+            assert!(
+                !dir.join(format!("{gone}.json")).exists(),
+                "{gone} card removed"
+            );
+            assert!(
+                !dir.join(format!("{gone}.sock")).exists(),
+                "{gone} socket removed"
+            );
+        }
+        assert!(dir.join("other-process.json").exists());
+        assert!(dir.join("other-process.sock").exists());
+        assert!(
+            dir.join("daemon.json").exists(),
+            "daemon.json is never a session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_without_own_pid_keeps_registrations_of_this_process() {
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        reg_with_socket(&dir, "mine", std::process::id());
+        reg_with_socket(&dir, "dead", 999_999);
+        assert_eq!(sweep_stale_registrations_in(&dir, None), 1);
+        assert!(dir.join("mine.json").exists());
+        assert!(!dir.join("dead.json").exists());
     }
 
     #[test]
