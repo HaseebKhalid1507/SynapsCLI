@@ -422,6 +422,22 @@ pub enum BlockKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMeta {
     pub kind: BlockKind,
+    /// Size of the block as sent. The unit depends on the message's content
+    /// shape (the Anthropic builder, `trace::anthropic::message_meta`):
+    ///
+    /// - string `content`: one synthetic `text` block whose `byte_len` is the
+    ///   RAW UTF-8 length of the string, with no JSON framing;
+    /// - array `content`: per block, the length of the block's compact JSON
+    ///   serialization, INCLUDING `{"type":"text","text":…}` framing and any
+    ///   `cache_control` marker (a 1h marker adds the 48 bytes of
+    ///   `,"cache_control":{"type":"ephemeral","ttl":"1h"}`).
+    ///
+    /// So the same user text measures differently on the request where it is
+    /// the newest message (coerced to blocks and marked) and on later
+    /// requests (bare string history). For example, `"yo, start steam in bg "`
+    /// is 22 as history and 95 as the marked tail block (47 for the framed
+    /// block plus 48 for the marker). That is not decoration. Compare sizes
+    /// only within one content shape.
     pub byte_len: u64,
 }
 
