@@ -3160,6 +3160,54 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
+        drive_with_model_and_deadline(
+            model,
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    }
+
+    /// Only full-size media stress fixtures opt in: two provider rounds repeat
+    /// original-media validation and JSON transport of MiB-scale histories.
+    /// Allow bounded headroom under parallel CI load without weakening ordinary
+    /// tests' 20-second deadline or shrinking coverage of the 20 MiB boundary.
+    async fn drive_large_media_history(
+        fixture: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        let deadline = std::time::Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        let driven = drive_with_model_and_deadline(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            deadline,
+        )
+        .await;
+        eprintln!(
+            "large-media fixture {fixture}: harness elapsed {:?}, stream deadline {deadline:?}",
+            started.elapsed(),
+        );
+        driven
+    }
+
+    async fn drive_with_model_and_deadline(
+        model: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        deadline: std::time::Duration,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
         let mut registry = ToolRegistry::new();
@@ -3189,12 +3237,19 @@ mod rich_output_tests {
             model,
         );
 
+        let started = std::time::Instant::now();
         let run = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            deadline,
             StreamMethods::run_stream_internal(session, messages),
         )
         .await
-        .expect("stream loop must finish");
+        .unwrap_or_else(|err| {
+            panic!(
+                "stream loop must finish: {err}; deadline {deadline:?}, elapsed {:?}, provider calls {}",
+                started.elapsed(),
+                mock.calls.load(Ordering::SeqCst),
+            )
+        });
         // A fail-closed rejection (e.g. invalid original media) is a valid
         // outcome: the harness records it instead of unwrapping so tests can
         // assert on `bodies.is_empty()` / `rejected`.
@@ -3802,7 +3857,8 @@ mod rich_output_tests {
     async fn valid_history_reaches_provider_unpruned() {
         // 5 × 3.5 MiB = 17.5 MiB < 20 MiB → valid; all 5 must be on the wire.
         let per = 3_670_016usize;
-        let d = drive_with_history(
+        let d = drive_large_media_history(
+            "valid_history_reaches_provider_unpruned",
             image_history(5, per),
             vec![Arc::new(TextTool)],
             &[("toolu_z", "text_stub")],
@@ -3866,7 +3922,8 @@ mod rich_output_tests {
     async fn history_media_limit_replays_chunk_retirement() {
         let history = image_history(7, 3_670_016);
         let original = serde_json::to_string(&history).unwrap();
-        let d = drive_with_history(
+        let d = drive_large_media_history(
+            "history_media_limit_replays_chunk_retirement",
             history.clone(),
             vec![Arc::new(TextTool)],
             &[("toolu_z", "text_stub")],
