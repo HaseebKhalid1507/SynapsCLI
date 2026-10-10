@@ -728,6 +728,21 @@ pub(super) async fn handle_command(
                 }
             }
         }
+        "keepwarm" => {
+            // Prompt-cache keep-warm lives on the actor (task #444):
+            // `EngineCommand{keepwarm}` → status / per-session override.
+            match link.engine_command("keepwarm", arg.trim()).await {
+                Ok(value) => {
+                    let text = value["text"].as_str().unwrap_or("").to_string();
+                    if value["kind"] == "error" {
+                        app.push_msg(ChatMessage::Error(text));
+                    } else {
+                        app.push_msg(ChatMessage::System(text));
+                    }
+                }
+                Err(e) => app.push_msg(ChatMessage::Error(format!("keepwarm failed: {e}"))),
+            }
+        }
         "saveas" => {
             // Naming lives on the actor's session (it owns the journal):
             // `EngineCommand{saveas}` → actor_cmds sets/clears the name and
@@ -1316,6 +1331,18 @@ pub(crate) fn build_stats_receipt(
     } else {
         lines.push(format!("    cache write  {:>10}", fmt_tokens(c_write)));
     }
+    // Keep-warm pings are inside the totals above (and the hit rate below);
+    // their share is shown so the numbers add up.
+    let kw = &app.keepwarm_tokens;
+    if kw.cache_read + kw.cache_creation + kw.input + kw.output > 0 {
+        lines.push(format!(
+            "    incl. keep-warm  read {} / write {} / input {} / output {}",
+            fmt_tokens(kw.cache_read),
+            fmt_tokens(kw.cache_creation),
+            fmt_tokens(kw.input),
+            fmt_tokens(kw.output)
+        ));
+    }
 
     lines.push(String::new());
     lines.push(format!(
@@ -1325,6 +1352,12 @@ pub(crate) fn build_stats_receipt(
     lines.push(String::new());
     lines.push("  Cache savings unavailable: per-request model/tier history not retained".to_string());
     lines.push(format!("  Cost   ${:.4}", session_cost));
+    if app.keepwarm_cost > 0.0 {
+        lines.push(format!(
+            "         incl. cache keep-warm ${:.4}  (/keepwarm status)",
+            app.keepwarm_cost
+        ));
+    }
     lines.push("─────────────────────────────────────────────────".to_string());
     lines.join("\n")
 }
@@ -2330,6 +2363,33 @@ mod tests {
         assert!(!receipt.contains("saved: $"));
         assert!(receipt.contains("5m:"), "missing 5m split");
         assert!(receipt.contains("1h:"), "missing 1h split");
+        assert!(!receipt.contains("keep-warm"), "no keep-warm line without spend");
+    }
+
+    /// Keep-warm spend is labelled inside the session cost (task #444).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stats_receipt_labels_keepwarm_share() {
+        let session = synaps_cli::Session::new("claude-sonnet-4-5", "medium", None);
+        let mut app = crate::tui::app::App::new(session);
+        app.session_cost = 1.25;
+        app.keepwarm_cost = 0.18;
+        app.total_cache_read_tokens = 400_000;
+        app.keepwarm_tokens = agent_engine::session::ConversationTokens {
+            input: 80,
+            output: 2,
+            cache_read: 300_000,
+            cache_creation: 0,
+        };
+        let runtime = synaps_cli::Runtime::new_headless();
+        let receipt = build_stats_receipt(&app, &runtime);
+        assert!(receipt.contains("Cost   $1.2500"), "{receipt}");
+        assert!(receipt.contains("incl. cache keep-warm $0.1800"), "{receipt}");
+        assert!(receipt.contains("400.0K"), "the total includes pings: {receipt}");
+        assert!(
+            receipt.contains("incl. keep-warm  read 300.0K / write 0 / input 80 / output 2"),
+            "{receipt}"
+        );
     }
 }
 

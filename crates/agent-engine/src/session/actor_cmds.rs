@@ -95,6 +95,13 @@ impl SessionActor {
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
+        // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
+        // keep-warm state (task #444).
+        if cmd == "keepwarm" {
+            let value = self.cache_keepwarm_command(&arg).await;
+            self.emit(SessionEventWire::QueryResult { id, value });
+            return;
+        }
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
         if view_changed {
@@ -257,6 +264,9 @@ impl SessionActor {
                 }
             }
         };
+        // Committed to the swap: end keep-warm now, booking any ping in
+        // flight to the conversation being left (saved just below).
+        self.cache_keepwarm_conversation_replaced();
         self.runtime.set_model(session.model.clone());
         // A resumed session owns its saved choice. Preserve that explicit
         // provenance across later model switches.

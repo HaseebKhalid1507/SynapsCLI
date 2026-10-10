@@ -166,6 +166,10 @@ pub struct TelemetryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_diag: Option<CacheDiagRecord>,
     pub context: ContextRecord,
+    /// `true` only on prompt-cache keep-warm pings (task #444) so telemetry
+    /// can separate pings from real turns. Absent on every turn record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub keepwarm: bool,
 }
 
 impl TelemetryRecord {
@@ -341,7 +345,20 @@ mod tests {
         assert!(!json.contains("request_id"));
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
+        assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
         assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
+    }
+
+    #[test]
+    fn keepwarm_record_is_marked() {
+        let record = TelemetryRecord {
+            ts: 1,
+            model: "claude-opus-4-7".to_string(),
+            keepwarm: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"keepwarm\":true"), "{json}");
     }
 
     #[test]

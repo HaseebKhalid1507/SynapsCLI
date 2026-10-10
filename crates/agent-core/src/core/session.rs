@@ -17,6 +17,23 @@ pub struct Session {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
+    /// Prompt-cache keep-warm spend (task #444), already INCLUDED in
+    /// `session_cost`; persisted so a resumed/reloaded session still labels
+    /// it. Absent (0) on sessions that never kept warm.
+    ///
+    /// SNAPSHOT-ONLY: never journaled. The v2 journal's `SessionMeta` is
+    /// `deny_unknown_fields`, so a new field there would make an older build
+    /// (0.10.1) treat every meta record as a torn tail and truncate the
+    /// session; the `.json` snapshot tolerates unknown fields. In journal
+    /// mode the label is therefore as of the last snapshot (slightly stale
+    /// until the next one); load clamps it to `session_cost`.
+    #[serde(default, skip_serializing_if = "is_zero_cost")]
+    pub keepwarm_cost: f64,
+    /// Keep-warm ping tokens, already INCLUDED in the token totals.
+    /// SNAPSHOT-ONLY, like `keepwarm_cost`; clamped on load to the totals
+    /// that survive a reload.
+    #[serde(default, skip_serializing_if = "KeepwarmTokens::is_zero")]
+    pub keepwarm_tokens: KeepwarmTokens,
     /// Persisted listing hint: `api_messages.len()` at save time. Declared
     /// BEFORE `api_messages` so it lands in the header that
     /// `read_session_header` reads without touching the message array.
@@ -120,6 +137,44 @@ pub fn user_content_for_display(content: &serde_json::Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
+fn is_zero_cost(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// Keep-warm token subtotal persisted in the snapshot (see
+/// [`Session::keepwarm_tokens`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepwarmTokens {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_creation: u64,
+}
+
+impl KeepwarmTokens {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Session {
+    /// The keep-warm labels are a subset of the totals; a journal replay can
+    /// leave them (snapshot-only) ahead of totals that were reset since, so
+    /// clamp them back under. Never raises anything.
+    pub fn clamp_keepwarm_to_totals(&mut self) {
+        if !(self.keepwarm_cost.is_finite() && self.keepwarm_cost > 0.0) {
+            self.keepwarm_cost = 0.0;
+        }
+        self.keepwarm_cost = self.keepwarm_cost.min(self.session_cost.max(0.0));
+        self.keepwarm_tokens.input = self.keepwarm_tokens.input.min(self.total_input_tokens);
+        self.keepwarm_tokens.output = self.keepwarm_tokens.output.min(self.total_output_tokens);
+    }
+}
+
 impl Session {
     pub fn new(model: &str, thinking_level: &str, system_prompt: Option<&str>) -> Self {
         let now = Utc::now();
@@ -140,6 +195,8 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
+            keepwarm_cost: 0.0,
+            keepwarm_tokens: KeepwarmTokens::default(),
             message_count: 0,
             api_messages: Vec::new(),
             abort_context: None,
@@ -191,6 +248,8 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
+            keepwarm_cost: 0.0,
+            keepwarm_tokens: KeepwarmTokens::default(),
             message_count: 0,
             api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,

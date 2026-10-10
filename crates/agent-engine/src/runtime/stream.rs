@@ -252,12 +252,13 @@ fn retain_session_tool_set(
     let mut slot = retained
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = slot.as_ref() {
+    let fresh = if let Some(existing) = slot.as_ref() {
         let mut set = existing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if set.session() == fresh.session() {
-            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+        let (next, dropped, reused) =
+            select_turn_start_tool_set(Some(&*set), fresh, catalog, progressive);
+        if reused {
             for d in &dropped {
                 tracing::warn!(
                     tool = %d.id,
@@ -269,10 +270,82 @@ fn retain_session_tool_set(
             drop(set);
             return std::sync::Arc::clone(existing);
         }
-    }
+        next
+    } else {
+        fresh
+    };
     let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
     *slot = Some(std::sync::Arc::clone(&shared));
     shared
+}
+
+/// The pre-request context assessment of a stream round over the round's
+/// final `request_messages` (after injection and the history image cap):
+/// the estimate and the budget `assess_context` decides on. Shared with the
+/// keep-warm probe (`runtime::keepwarm`) so the two can never drift.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pre_request_context_budget(
+    model: &str,
+    context_window: u64,
+    system_prompt: Option<&str>,
+    tools_schema: &[Value],
+    request_messages: &[SharedMessage],
+    thinking_budget_tokens: u64,
+    next_tool_result_bytes: u64,
+) -> (
+    super::context::ContextAssessment,
+    agent_core::core::context_policy::ContextBudget,
+) {
+    let assessment = super::context::assess(&super::context::ContextBudgetInputs {
+        model,
+        provider_window: context_window,
+        system_prompt,
+        tools_schema,
+        messages: request_messages,
+        skill_contents: &[],
+        memory_contents: &[],
+        thinking_budget_tokens,
+        next_tool_result_bytes,
+        output_reserve_tokens: HelperMethods::max_tokens_for_model(model),
+    });
+    let budget = agent_core::core::context_policy::ContextBudget {
+        context_window_tokens: context_window,
+        used_tokens: assessment.used_tokens(),
+        hard_remaining_tokens: context_window.saturating_sub(assessment.used_tokens()),
+        required_next_round_tokens: assessment
+            .reserves
+            .total()
+            .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+    };
+    (assessment, budget)
+}
+
+/// The pure half of [`retain_session_tool_set`]: the set a turn starting now
+/// would use, given the retained set (if any). Returns the selected set, the
+/// activations dropped while carrying, and whether the retained set is
+/// reused (carried into). Never writes anything — the keep-warm ping
+/// (`runtime::keepwarm`) uses it read-only to project exactly the tool
+/// schema the next real turn will send.
+pub(super) fn select_turn_start_tool_set(
+    existing: Option<&crate::tools::activation::SessionToolSet>,
+    fresh: crate::tools::activation::SessionToolSet,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+) -> (
+    crate::tools::activation::SessionToolSet,
+    Vec<crate::tools::activation::DroppedActivation>,
+    bool,
+) {
+    if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        return (fresh, Vec::new(), false);
+    }
+    match existing {
+        Some(set) if set.session() == fresh.session() => {
+            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+            (next, dropped, true)
+        }
+        _ => (fresh, Vec::new(), false),
+    }
 }
 
 fn assistant_text_from_content(content: &[Value]) -> String {
@@ -339,7 +412,7 @@ pub(super) fn is_ephemeral_turn_context_block(block: &Value) -> bool {
 /// every turn and used to burn the entire message-history cache from the
 /// system block onward (#297, ~97K tokens rewritten per turn). It rides the
 /// newest user message instead: see [`attach_turn_context`].
-fn wrap_extension_context(base: &str, content: &str) -> String {
+pub(super) fn wrap_extension_context(base: &str, content: &str) -> String {
     format!("{base}\n\n{}", guard_extension_context(content))
 }
 
@@ -994,45 +1067,27 @@ impl StreamMethods {
             let mut context_advisory = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
-                use agent_core::core::context_policy::{
-                    assess_context, ContextAction, ContextBudget,
-                };
+                use agent_core::core::context_policy::{assess_context, ContextAction};
                 let fallback_schema = tools_snapshot.tools_schema();
                 let schema = round_options
                     .request_tools_schema
                     .as_deref()
                     .map(|s| s.as_slice())
                     .unwrap_or(&fallback_schema);
-                let assessment = super::context::assess(&super::context::ContextBudgetInputs {
-                    model: &model,
-                    provider_window: context_window,
-                    system_prompt: injected_system.as_deref(),
-                    tools_schema: schema,
-                    messages: request_messages,
-                    skill_contents: &[],
-                    memory_contents: &[],
-                    thinking_budget_tokens: thinking_budget as u64,
-                    next_tool_result_bytes: max_tool_output as u64,
-                    output_reserve_tokens: HelperMethods::max_tokens_for_model(&model),
-                });
+                let (assessment, budget) = pre_request_context_budget(
+                    &model,
+                    context_window,
+                    injected_system.as_deref(),
+                    schema,
+                    request_messages,
+                    thinking_budget as u64,
+                    max_tool_output as u64,
+                );
                 let decision = {
                     let mut s = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let d = assess_context(
-                        &s.config,
-                        &s.policy,
-                        ContextBudget {
-                            context_window_tokens: context_window,
-                            used_tokens: assessment.used_tokens(),
-                            hard_remaining_tokens: context_window
-                                .saturating_sub(assessment.used_tokens()),
-                            required_next_round_tokens: assessment
-                                .reserves
-                                .total()
-                                .saturating_add(ADVISORY_RESERVE_TOKENS),
-                        },
-                    );
+                    let d = assess_context(&s.config, &s.policy, budget);
                     s.policy = d.next_state;
                     d
                 };
@@ -2289,7 +2344,7 @@ fn base64_image_len(b: &Value) -> usize {
 /// carrying `IMAGE_DROPPED_LABEL`, until the remainder fits. Only touched
 /// messages are cloned (`Arc::make_mut`); `tool_result.content[0]` (the
 /// text summary) is never an image, so the text-first invariant holds.
-fn cap_history_image_bytes(
+pub(super) fn cap_history_image_bytes(
     messages: &[SharedMessage],
     cap: usize,
 ) -> Option<Vec<SharedMessage>> {

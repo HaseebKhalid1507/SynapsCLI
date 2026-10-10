@@ -67,6 +67,8 @@ pub(crate) struct RenderModel {
     // ── Footer ───────────────────────────────────────────────────────────────
     pub(crate) show_full_output: bool,
     pub(crate) session_cost: f64,
+    /// Keep-warm share of `session_cost` (footer label).
+    pub(crate) keepwarm_cost: f64,
     pub(crate) total_input_tokens: u64,
     pub(crate) total_output_tokens: u64,
     pub(crate) total_cache_read_tokens: u64,

@@ -878,6 +878,69 @@ pub struct ApiOptions {
     /// reads them for the optional token/cost budget dimensions. `None`
     /// (default, non-stream callers) records nothing.
     pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// "Last accepted Anthropic request" slot (task #444). Stamped with the
+    /// send time of every attempt that gets a 2xx — the moment the prefix's
+    /// cache entries were written or refreshed. `None` (default) records
+    /// nothing; the foreground turn stream and keep-warm pings set it.
+    pub cache_anchor: Option<std::sync::Arc<super::keepwarm::CacheAnchorCell>>,
+    /// Prompt-cache keep-warm ping (task #444). `None` on every real turn,
+    /// which keeps turn requests byte-identical to the pre-feature release.
+    /// When set (native Anthropic transport only — any other route fails
+    /// closed before a request is built): the conversational cache marker is
+    /// stamped on the LAST HISTORY message and the trailing ping message
+    /// rides after it unmarked, `max_tokens` is cut to the thinking mode's
+    /// minimum, the prefix is fingerprinted (and checked, see
+    /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
+    /// record carries `"keepwarm": true`.
+    pub keepwarm: Option<KeepWarmRequest>,
+}
+
+/// What a keep-warm request does once its body is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepWarmMode {
+    /// Return `{"keepwarm_prefix": <fingerprint>, "keepwarm_max_tokens": n}`;
+    /// send nothing.
+    Probe,
+    /// Send only if the built prefix still hashes to `expect`; otherwise
+    /// return `{"keepwarm_prefix": <actual>}` without sending.
+    Send { expect: u64 },
+}
+
+/// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
+#[derive(Debug, Clone)]
+pub struct KeepWarmRequest {
+    pub mode: KeepWarmMode,
+    /// Last HTTP status the transport saw (0 = none), so the caller can tell
+    /// a 4xx (stop) from a 5xx/429 (bounded retry).
+    pub status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    /// Set once the request is actually dispatched: when the HTTP client,
+    /// over an established connection with the head written, pulls the body
+    /// (see [`keepwarm_body`]), or when `send()` returns a response. From then
+    /// on the ping may be billed even if it is aborted. A refused connection
+    /// never sets it.
+    pub sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when `send()` failed to connect (no HTTP status, nothing sent).
+    pub connect_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A keep-warm request body that flips `sent` when the HTTP client first
+/// pulls it: hyper only polls a request body once the connection is
+/// established and the request head is written, so a ping that never
+/// connected is never marked sent. `Content-Length` is set explicitly so the
+/// wire framing matches a buffered body's (no chunked encoding).
+fn keepwarm_body(
+    req: reqwest::RequestBuilder,
+    body: bytes::Bytes,
+    sent: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> reqwest::RequestBuilder {
+    let flag = std::sync::Arc::clone(sent);
+    let len = body.len();
+    let stream = futures::stream::once(async move {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok::<bytes::Bytes, std::io::Error>(body)
+    });
+    req.header(reqwest::header::CONTENT_LENGTH, len)
+        .body(reqwest::Body::wrap_stream(stream))
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -1058,6 +1121,13 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
+        // Keep-warm pings exist only for the native Anthropic transport: every
+        // other route would ignore the output cap and the marker placement.
+        if options.keepwarm.is_some() && !super::auth::model_is_anthropic(model) {
+            return Err(RuntimeError::Config(
+                "cache keep-warm ping requires the native Anthropic transport".into(),
+            ));
+        }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
         let wire_messages = super::continuation::wire_messages(messages);
         let messages = wire_messages.as_deref().unwrap_or(messages);
@@ -1209,7 +1279,20 @@ impl ApiMethods {
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
+        match &options.keepwarm {
+            // Keep-warm: the marker goes on the last HISTORY message — the
+            // durable prefix the next real turn re-sends verbatim — and the
+            // trailing ping message (never persisted) rides after it as an
+            // uncached tail, exactly like a real turn's newest user message.
+            Some(_) if cleaned_messages.len() >= 2 => {
+                let history_len = cleaned_messages.len() - 1;
+                HelperMethods::annotate_cache_breakpoint(
+                    &mut cleaned_messages[..history_len],
+                    options.cache_ttl,
+                );
+            }
+            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl),
+        }
 
         // Derive the thinking level from the budget for effort mapping.
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
@@ -1232,7 +1315,24 @@ impl ApiMethods {
             options.cache_ttl,
             true,
         );
-        let body = parts.body;
+        let mut body = parts.body;
+        // Keep-warm: cut the output cap (not part of the cache key), then
+        // fingerprint the prefix exactly as it would go on the wire. A probe —
+        // or a ping whose prefix no longer matches what is cached — returns
+        // here, before any trace, telemetry or network I/O.
+        if let Some(keepwarm) = &options.keepwarm {
+            body.apply_keepwarm_max_tokens();
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            let actual = body
+                .prefix_fingerprint(cleaned_messages.len().saturating_sub(1), beta.as_deref());
+            let send = matches!(keepwarm.mode, KeepWarmMode::Send { expect } if expect == actual);
+            if !send {
+                return Ok(serde_json::json!({
+                    "keepwarm_prefix": actual,
+                    "keepwarm_max_tokens": body.max_tokens(),
+                }));
+            }
+        }
         let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
@@ -1364,11 +1464,30 @@ impl ApiMethods {
                         return Err(RuntimeError::Canceled);
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
-                    match await_or_cancel(cancel, req.body(body_bytes.clone()).send()).await? {
+                    let sent_at = super::keepwarm::CacheAnchor::now();
+                    let req = match &options.keepwarm {
+                        Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
+                        None => req.body(body_bytes.clone()),
+                    };
+                    match await_or_cancel(cancel, req.send()).await? {
                         Ok(resp) => {
                             let status = resp.status();
+                            if let Some(keepwarm) = &options.keepwarm {
+                                keepwarm
+                                    .sent
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                keepwarm
+                                    .status
+                                    .store(status.as_u16(), std::sync::atomic::Ordering::Relaxed);
+                            }
                             if status.is_success() {
                                 clock.mark_headers();
+                                // Accepted: the prefix's cache entries were
+                                // read or written by a request that started
+                                // no earlier than `sent_at`.
+                                if let Some(anchor) = &options.cache_anchor {
+                                    anchor.stamp(sent_at);
+                                }
                                 response = Some(resp);
                                 break;
                             }
@@ -1438,7 +1557,10 @@ impl ApiMethods {
                                 .unwrap_or_default();
 
                             // Decide whether we've exhausted retries for this error class.
-                            let retry_exhausted = if is_429 {
+                            // A keep-warm ping never retries: any error stops it.
+                            let retry_exhausted = if options.keepwarm.is_some() {
+                                true
+                            } else if is_429 {
                                 attempt >= MAX_429_RETRIES
                             } else {
                                 non_429_attempts >= max_retries
@@ -1526,6 +1648,13 @@ impl ApiMethods {
                             }
                         }
                         Err(e) => {
+                            if let Some(keepwarm) = &options.keepwarm {
+                                if e.is_connect() {
+                                    keepwarm
+                                        .connect_failed
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             non_429_attempts += 1;
                             if non_429_attempts > max_retries {
                                 if let Some(t) = tracer.take() {
@@ -1757,6 +1886,7 @@ impl ApiMethods {
                         system_bytes,
                         breakpoints,
                     },
+                    keepwarm: options.keepwarm.is_some(),
                 };
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
@@ -1823,7 +1953,10 @@ impl ApiMethods {
                     } else {
                         non_429_attempts
                     };
-                    if retries_used >= retry_budget || cancel.is_cancelled() {
+                    if retries_used >= retry_budget
+                        || cancel.is_cancelled()
+                        || options.keepwarm.is_some()
+                    {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
                         if let Some(t) = tracer.take() {

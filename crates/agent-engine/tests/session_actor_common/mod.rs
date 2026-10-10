@@ -127,9 +127,7 @@ pub async fn stub_seq(bodies: &'static [&'static str]) -> (String, Arc<AtomicUsi
 }
 
 /// `stub_seq` whose LAST body is served endless (keep-alives forever).
-pub async fn stub_seq_endless_last(
-    bodies: &'static [&'static str],
-) -> (String, Arc<AtomicUsize>) {
+pub async fn stub_seq_endless_last(bodies: &'static [&'static str]) -> (String, Arc<AtomicUsize>) {
     stub_seq_with(bodies, true).await
 }
 
@@ -304,10 +302,12 @@ impl agent_engine::Tool for PromptFixtureTool {
             .capabilities
             .secret_prompt
             .expect("actor passes its SecretPromptHandle to the stream");
-        Ok(match handle.prompt("Secret".into(), "enter secret".into()).await {
-            Some(v) => format!("answered:{}", v.len()),
-            None => "cancelled".to_string(),
-        })
+        Ok(
+            match handle.prompt("Secret".into(), "enter secret".into()).await {
+                Some(v) => format!("answered:{}", v.len()),
+                None => "cancelled".to_string(),
+            },
+        )
     }
 }
 

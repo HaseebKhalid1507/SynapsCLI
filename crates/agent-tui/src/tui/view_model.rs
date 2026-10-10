@@ -64,6 +64,7 @@ pub(crate) struct ViewInputs<'a> {
 
     // ── footer accounting (session totals; per-turn counters stay on App) ──
     pub(crate) session_cost: f64,
+    pub(crate) keepwarm_cost: f64,
     pub(crate) total_input_tokens: u64,
     pub(crate) total_output_tokens: u64,
     pub(crate) total_cache_read_tokens: u64,
@@ -113,6 +114,7 @@ impl<'a> ViewInputs<'a> {
             active_tasks: &app.active_tasks,
             toasts: &app.toasts,
             session_cost: app.session_cost,
+            keepwarm_cost: app.keepwarm_cost,
             total_input_tokens: app.total_input_tokens,
             total_output_tokens: app.total_output_tokens,
             total_cache_read_tokens: app.total_cache_read_tokens,

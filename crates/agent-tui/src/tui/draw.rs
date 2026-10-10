@@ -318,6 +318,18 @@ use super::markdown::format_tokens;
 use super::theme::THEME;
 use super::view_model::{RenderPatch, ViewInputs};
 
+/// Footer cost segment: the session total, with the prompt-cache keep-warm
+/// share labelled when there is one (`$1.2345 (kw $0.0800) `).
+pub(crate) fn footer_cost(session_cost: f64, keepwarm_cost: f64) -> String {
+    if session_cost <= 0.0 {
+        String::new()
+    } else if keepwarm_cost > 0.0 {
+        format!("${session_cost:.4} (kw ${keepwarm_cost:.4}) ")
+    } else {
+        format!("${session_cost:.4} ")
+    }
+}
+
 /// Generate a bash execution trace animation string and its pulsing color.
 /// Returns (trace_string, Color) for use in Span styling.
 pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
@@ -727,6 +739,7 @@ pub(crate) fn build_render_model(
         prompt_fx: inputs.prompt_fx,
         show_full_output: inputs.transcript.show_full_output(),
         session_cost: inputs.session_cost,
+        keepwarm_cost: inputs.keepwarm_cost,
         total_input_tokens: inputs.total_input_tokens,
         total_output_tokens: inputs.total_output_tokens,
         total_cache_read_tokens: inputs.total_cache_read_tokens,
@@ -1429,11 +1442,7 @@ pub(crate) fn render_frame_into(
     // clipped mid-word.
     let theme = THEME.load();
     let dim = theme.chrome_dim();
-    let cost_str = if model.session_cost > 0.0 {
-        format!("${:.4} ", model.session_cost)
-    } else {
-        String::new()
-    };
+    let cost_str = footer_cost(model.session_cost, model.keepwarm_cost);
     let cache_rate = {
         let total_input = model.total_input_tokens
             + model.total_cache_read_tokens
@@ -2198,5 +2207,17 @@ mod boot_fx_tests {
             .as_ref()
             .expect("the render thread owns clearing the effect");
         assert!(fx.done(), "and it is visibly done for that check");
+    }
+}
+
+#[cfg(test)]
+mod footer_cost_tests {
+    use super::footer_cost;
+
+    #[test]
+    fn keepwarm_share_is_labelled_only_when_present() {
+        assert_eq!(footer_cost(0.0, 0.0), "");
+        assert_eq!(footer_cost(1.5, 0.0), "$1.5000 ");
+        assert_eq!(footer_cost(1.5, 0.08), "$1.5000 (kw $0.0800) ");
     }
 }

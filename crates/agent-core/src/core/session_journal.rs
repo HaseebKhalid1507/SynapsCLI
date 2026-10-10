@@ -27,7 +27,7 @@
 //! Normal saves retain the documented non-Unix best effort; durable saves
 //! fail closed there rather than pretend directory fsync is supported.
 
-use crate::core::session::Session;
+use crate::core::session::{KeepwarmTokens, Session};
 use crate::core::stream_types::SharedMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -349,9 +349,24 @@ enum JournalRecord {
     },
 }
 
-/// Mirror of [`Session`] WITHOUT `api_messages`, with identical serde
-/// attributes. `deny_unknown_fields` + the `session_meta_stays_in_sync_…`
-/// test make silent drift between the two types impossible.
+fn is_zero_cost(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// `Session` fields that live ONLY in the `.json` snapshot and are never
+/// journaled. `SessionMeta` is `deny_unknown_fields` in every shipped build
+/// (0.10.1 included): a new field in a meta record makes those builds read
+/// it as a torn tail, truncate the loaded history, and then overwrite the
+/// journal with that truncation on the next save. The snapshot `Session`
+/// tolerates unknown fields, so new metadata goes there instead.
+#[cfg_attr(not(test), allow(dead_code))]
+const SNAPSHOT_ONLY_FIELDS: &[&str] = &["keepwarm_cost", "keepwarm_tokens"];
+
+/// Mirror of [`Session`] WITHOUT `api_messages` and the
+/// [`SNAPSHOT_ONLY_FIELDS`], with identical serde attributes.
+/// `deny_unknown_fields` + the `session_meta_stays_in_sync_…` test make
+/// silent drift between the two types impossible. Do NOT add fields here:
+/// older builds reject them (see [`SNAPSHOT_ONLY_FIELDS`]).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionMeta {
@@ -711,6 +726,10 @@ struct SessionSnapshotRef<'a> {
     total_input_tokens: u64,
     total_output_tokens: u64,
     session_cost: f64,
+    #[serde(skip_serializing_if = "is_zero_cost")]
+    keepwarm_cost: f64,
+    #[serde(skip_serializing_if = "KeepwarmTokens::is_zero")]
+    keepwarm_tokens: KeepwarmTokens,
     message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: &'a Option<String>,
@@ -746,6 +765,8 @@ impl<'a> SessionSnapshotRef<'a> {
             total_input_tokens: s.total_input_tokens,
             total_output_tokens: s.total_output_tokens,
             session_cost: s.session_cost,
+            keepwarm_cost: s.keepwarm_cost,
+            keepwarm_tokens: s.keepwarm_tokens,
             message_count: s.api_messages.len(),
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
@@ -873,6 +894,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
     let binding: SnapshotBinding =
         serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
+    session.clamp_keepwarm_to_totals();
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
@@ -911,6 +933,9 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             Ok(JournalRecord::Open { .. }) | Err(_) => break, // torn tail
         }
     }
+    // Keep-warm labels are snapshot-only (SNAPSHOT_ONLY_FIELDS): keep them
+    // under the journal-replayed totals.
+    session.clamp_keepwarm_to_totals();
     Ok(session)
 }
 
@@ -1045,8 +1070,13 @@ mod tests {
         s.abort_context = Some("ctx".into());
         s.parent_session = Some("parent".into());
         s.compacted_into = Some("child".into());
+        s.keepwarm_cost = 0.25;
+        s.keepwarm_tokens.cache_read = 9;
         let mut value = serde_json::to_value(&s).unwrap();
         value.as_object_mut().unwrap().remove("api_messages");
+        for f in SNAPSHOT_ONLY_FIELDS {
+            value.as_object_mut().unwrap().remove(*f);
+        }
         let meta: SessionMeta = serde_json::from_value(value)
             .expect("Session grew a field SessionMeta does not mirror — extend SessionMeta");
         assert_eq!(meta.id, s.id);
@@ -1646,5 +1676,181 @@ mod save_cost_bench {
                 let _ = delete_session_files_in_dir(dir.path(), &s.id);
             }
         }
+    }
+}
+
+/// Task #444, C-1: keep-warm labels are snapshot-only, and the journal stays
+/// readable by 0.10.1.
+#[cfg(test)]
+mod snapshot_only_fields {
+    use super::*;
+
+    /// Task #444: keep-warm spend persists through the snapshot in both
+    /// modes (journal mode publishes a snapshot on the first save).
+    #[test]
+    fn keepwarm_cost_survives_save_and_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        for persistence in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": "q"}),
+            ));
+            s.session_cost = 1.5;
+            s.total_input_tokens = 100;
+            s.total_output_tokens = 10;
+            s.keepwarm_cost = 0.25;
+            s.keepwarm_tokens = KeepwarmTokens {
+                input: 4,
+                output: 2,
+                cache_read: 900,
+                cache_creation: 0,
+            };
+            save_session_in_dir(&dir, &s, persistence).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(loaded.keepwarm_cost, 0.25, "{persistence:?}");
+            assert_eq!(loaded.keepwarm_tokens, s.keepwarm_tokens, "{persistence:?}");
+            assert_eq!(loaded.session_cost, 1.5, "{persistence:?}");
+        }
+    }
+
+    /// The exact `SessionMeta` field set shipped in 0.10.1 (5c86d2ca), with
+    /// its `deny_unknown_fields`. Kept frozen on purpose: it stands in for
+    /// the older reader, which must keep parsing every meta record this
+    /// build writes (C-1, task #444).
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct SessionMetaV0_10_1 {
+        id: String,
+        title: String,
+        #[serde(default)]
+        name: Option<String>,
+        model: String,
+        thinking_level: String,
+        system_prompt: Option<String>,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        total_input_tokens: u64,
+        total_output_tokens: u64,
+        session_cost: f64,
+        #[serde(default)]
+        message_count: Option<usize>,
+        #[serde(default)]
+        abort_context: Option<String>,
+        #[serde(default)]
+        parent_session: Option<String>,
+        #[serde(default)]
+        compacted_into: Option<String>,
+        #[serde(default)]
+        env: Option<Vec<(String, String)>>,
+        #[serde(default)]
+        env_stripped: Vec<String>,
+        #[serde(default)]
+        prompt_provenance: Option<serde_json::Value>,
+        #[serde(default)]
+        compaction: Option<serde_json::Value>,
+    }
+
+    /// 0.10.1's journal reader, reduced to the part that matters: every
+    /// record must parse (an `Err` there is a torn tail that truncates the
+    /// session and is then rewritten by `full_snapshot_reset`).
+    #[derive(Deserialize)]
+    #[serde(tag = "k")]
+    #[allow(dead_code)]
+    enum JournalRecordV0_10_1 {
+        #[serde(rename = "open")]
+        Open {
+            v: u8,
+            base: usize,
+            #[serde(default)]
+            generation: Option<String>,
+            #[serde(default)]
+            history_hash: Option<String>,
+        },
+        #[serde(rename = "msg")]
+        Msg {
+            v: u8,
+            i: usize,
+            m: serde_json::Value,
+        },
+        #[serde(rename = "meta")]
+        Meta {
+            v: u8,
+            meta: Box<SessionMetaV0_10_1>,
+            #[serde(default)]
+            history_hash: Option<String>,
+        },
+    }
+
+    #[test]
+    fn journal_written_by_this_build_parses_with_the_0_10_1_reader() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", Some("sys"));
+        s.name = Some("n".into());
+        s.parent_session = Some("p".into());
+        s.env = Some(vec![("PATH".into(), "/bin".into())]);
+        s.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "q"}),
+        ));
+        s.session_cost = 1.0;
+        s.total_input_tokens = 50;
+        s.keepwarm_cost = 0.5;
+        s.keepwarm_tokens.input = 5;
+        s.keepwarm_tokens.cache_read = 1_000;
+        // First save publishes the snapshot; the next two append deltas
+        // (messages + meta records carrying every non-zero field).
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        for turn in 0..2 {
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "assistant", "content": format!("a{turn}")}),
+            ));
+            s.session_cost += 0.25;
+            s.keepwarm_cost += 0.125;
+            let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+            assert!(matches!(receipt.mode, SaveMode::Append { .. }));
+        }
+        let raw = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap();
+        let mut metas = 0;
+        for line in raw.lines() {
+            let record: JournalRecordV0_10_1 = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("0.10.1 cannot parse {line}: {e}"));
+            if matches!(record, JournalRecordV0_10_1::Meta { .. }) {
+                metas += 1;
+            }
+            assert!(
+                !line.contains("keepwarm"),
+                "journaled a snapshot-only field: {line}"
+            );
+        }
+        assert_eq!(metas, 2);
+        // And this build still reads back the full history, with the
+        // keep-warm label as of the snapshot (stale until the next one).
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 3);
+        assert_eq!(loaded.session_cost, 1.5);
+        assert_eq!(loaded.keepwarm_cost, 0.5);
+    }
+
+    #[test]
+    fn keepwarm_labels_clamp_under_the_totals_on_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", None);
+        s.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "q"}),
+        ));
+        s.session_cost = 0.25;
+        s.total_input_tokens = 3;
+        s.total_output_tokens = 1;
+        s.keepwarm_cost = 0.75; // e.g. a stale snapshot label
+        s.keepwarm_tokens.input = 10;
+        s.keepwarm_tokens.output = 10;
+        save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.keepwarm_cost, 0.25);
+        assert_eq!(loaded.keepwarm_tokens.input, 3);
+        assert_eq!(loaded.keepwarm_tokens.output, 1);
     }
 }

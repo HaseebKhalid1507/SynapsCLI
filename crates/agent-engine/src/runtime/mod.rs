@@ -29,6 +29,7 @@ pub mod google_vertex;
 pub(crate) mod helpers;
 mod image_limits;
 mod image_retention;
+pub mod keepwarm;
 pub mod memory_context;
 pub mod memory_history;
 pub mod openai;
@@ -429,6 +430,10 @@ pub struct Runtime {
     /// suppresses the downgrade notice on healthy Hybrid turns where the 1h
     /// prefix is already cached. Shared into `ApiOptions` for every request.
     saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When this runtime's foreground request chain last had an Anthropic
+    /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
+    /// shared by `share_ttl_latches`, like the TTL latches above.
+    cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
     /// Last Anthropic message id (`msg_...`) — threaded into the next
     /// request's `diagnostics.previous_message_id` when diagnostics is on.
     /// Reserved for the cache-diagnosis beta wiring (handoff item).
@@ -1023,6 +1028,7 @@ impl Runtime {
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_anchor: Default::default(),
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
             hook_bus: host.hook_bus,
@@ -3444,6 +3450,7 @@ impl Runtime {
     pub fn share_ttl_latches(&mut self, parent: &Runtime) {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
+        self.cache_anchor = parent.cache_anchor.clone();
     }
 
     /// Change the cache TTL strategy mid-session. The next request re-marks
@@ -3593,6 +3600,8 @@ impl Runtime {
                     request_tools_schema: None,
                     anthropic_tool_split: None,
                     usage_counters: None,
+                    cache_anchor: None,
+                    keepwarm: None,
                 },
             )
             .await?;
@@ -4131,6 +4140,10 @@ impl Runtime {
             request_tools_schema: None,
             anthropic_tool_split: None,
             usage_counters: None,
+            // The foreground turn's accepted requests are what keep-warm
+            // schedules from.
+            cache_anchor: Some(self.cache_anchor.clone()),
+            keepwarm: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4291,6 +4304,7 @@ impl Clone for Runtime {
             // honored-state isn't inherited from the parent.
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_anchor: Default::default(),
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
