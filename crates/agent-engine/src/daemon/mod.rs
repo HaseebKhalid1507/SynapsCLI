@@ -380,8 +380,12 @@ impl Daemon {
         lifecycle::shutdown_all(&self.state, force).await;
         self.accept.abort();
         let _ = self.accept.await;
-        for p in [&self.paths.sock, &self.paths.json, &self.paths.pid] {
-            crate::events::socket::cleanup_socket(&p.to_string_lossy());
+        crate::events::socket::cleanup_socket(&self.paths.sock.to_string_lossy());
+        {
+            let lock = self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lock) = lock.as_ref() {
+                registry::cleanup_metadata(&self.paths, lock);
+            }
         }
         tracing::info!("daemon: stopped");
         // Release the flock last.
