@@ -155,3 +155,42 @@ modality table is keyed by **provider-prefixed** ids (`anthropic/claude-sonnet-4
 it at runtime. An unprefixed id with no cached evidence is treated as text-only
 and image attachments are refused with `attachments rejected: Selected model
 lacks exact image input capability metadata`. Profiles normally use prefixed ids.
+
+### Anthropic request-local image sizing
+
+On the native Anthropic streaming and non-streaming paths, images with either
+encoded-raster side over 2000 pixels are resized proportionally from the **first**
+request, regardless of image count. This prevents the former 20-to-21 image
+transition from changing earlier image blocks. Saved originals, tool ingress,
+and non-Anthropic routes are unchanged. Older saved originals can produce a
+one-time different outgoing prefix after upgrading.
+
+Projection uses deterministic Triangle filtering, JPEG quality 85 for JPEG input,
+and RGBA PNG otherwise (preserving alpha). A stable adjacent text block states
+original/sent dimensions: coordinates refer to sent pixels. Resizing uses the
+encoded raster, deliberately does **not** apply EXIF orientation, and removes
+metadata; export an upright static image first if orientation matters. Images
+at or below 2000 pixels per side are sent unchanged. They retain preexisting
+structural/header validation, not full decoding: a small image with corrupt pixel
+data can still pass through for the provider to reject. Oversized GIF/WebP (including
+static files) and animated PNG require static PNG/JPEG export rather than silently
+losing animation.
+
+Original attachment preflight runs first; projected output is revalidated against
+the same budgets. Projection bounds input to 3.5 MiB, 8000 pixels per side and
+16 million pixels for resizing, sets image 0.24's partial 128 MiB library
+allocation guard, and bounds encoded output to 3.5 MiB. This guard is **not a
+hard ceiling on JPEG decoder memory**: it is not propagated to JPEG internal
+allocations, including progressive coefficient buffers. The 16 MP cap and single
+heavy-work slot bound the workload, not total decoder memory to 128 MiB. Nor is
+this a process-memory ceiling: decoded pixels, resize scratch/output, base64 and
+encoder buffers also consume memory. Invalid/unsupported oversized images or budget
+failures return actionable errors before sending, never silently fall back to
+the original. One process-wide blocking worker slot limits heavy decode work,
+including after cancellation. A shared SHA256-keyed FIFO memo holds only projected
+base64 bytes and explanatory metadata, limited to 16 entries and 16 MiB; cache
+hits and eviction do not alter projection results.
+
+This is **not universal cache stability**: the existing oldest-first omission
+above 100 images still changes historical prefixes, and existing history byte-cap
+behavior is unchanged. Neither count-cap nor byte-cap policy is fixed here.

@@ -1191,10 +1191,16 @@ impl ApiMethods {
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
-        // Whole-request image limits (>20 images → each ≤ 2000 px; ≤ 100
-        // images). Outgoing copy only; healthy histories are untouched. Runs
-        // before the cache marker so the marker lands on the final shape.
-        super::image_limits::enforce_image_limits(&mut cleaned_messages);
+        // Stable per-image projection precedes cache markers, only on Anthropic.
+        // Original preflight above remains authoritative; recheck output budgets.
+        await_or_cancel(
+            cancel,
+            super::image_limits::enforce_image_limits(&mut cleaned_messages),
+        )
+        .await?
+        .map_err(RuntimeError::Config)?;
+        super::attachments::validate_messages(model, &cleaned_messages)
+            .map_err(RuntimeError::Config)?;
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Derive the thinking level from the budget for effort mapping.
