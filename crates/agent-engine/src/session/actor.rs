@@ -671,7 +671,7 @@ impl SessionActor {
         let name = self.conv.session.name.clone();
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
-        if let Err(e) = crate::events::registry::update_session_name(self.id.as_str(), name.as_deref()) {
+        if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
         }
     }
