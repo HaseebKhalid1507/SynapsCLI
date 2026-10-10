@@ -2353,7 +2353,7 @@ impl SessionActor {
             let mut proposed = self.conv.api_messages.clone();
             proposed.push(candidate.clone());
             let model = self.runtime.model().to_string();
-            if let Err(e) = crate::runtime::attachments::validate_messages(&model, &proposed) {
+            if let Err(e) = crate::runtime::attachments::validate_history_for_request(&model, &proposed) {
                 // Typed refusal: the submitting client gets its editor text
                 // back (stream_handler restores `last_submitted` on `Refused`)
                 // and keeps its attachment drafts; mirrors see a notice.

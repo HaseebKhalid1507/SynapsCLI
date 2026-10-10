@@ -917,10 +917,9 @@ impl StreamMethods {
             };
 
             // Validate original media before any request-local pruning. A
-            // resumed/oversized history must fail visibly, not lose
-            // attachments first and accidentally pass the check on the reduced
-            // request. (`call_api_stream_inner` re-validates the capped copy.)
-            super::attachments::validate_messages(&model, request_messages)
+            // malformed history must fail visibly. Native admission replays
+            // original batches; only other routes retain the legacy byte cap.
+            super::attachments::validate_history_for_request(&model, request_messages)
                 .map_err(RuntimeError::Config)?;
 
             // History image byte cap: the per-turn byte budget resets every
@@ -930,7 +929,11 @@ impl StreamMethods {
             // injection above — durable history is untouched.
             let capped_messages: Vec<SharedMessage>;
             let request_messages: &[SharedMessage] =
-                match cap_history_image_bytes(request_messages, HISTORY_IMAGE_BYTE_CAP) {
+                match if super::attachments::native_image_retention(&model) {
+                    None
+                } else {
+                    cap_history_image_bytes(request_messages, HISTORY_IMAGE_BYTE_CAP)
+                } {
                     Some(capped) => {
                         capped_messages = capped;
                         &capped_messages
@@ -2115,8 +2118,25 @@ impl StreamMethods {
                 // Add tool results to conversation — always, so the assistant's tool_use
                 // blocks have matching tool_result blocks even on cancellation.
                 let round_result_bytes: usize = tool_results.iter().map(tool_result_bytes).sum();
-                let tool_batch =
-                    super::attachments::bounded_tool_results(&model, &messages, tool_results);
+                let tool_batch = match super::attachments::bounded_tool_results(
+                    &model, &messages, tool_results,
+                ) {
+                    Ok(batch) => batch,
+                    Err((error, completed_results)) => {
+                        // Never lose execution evidence or orphan tool_use IDs
+                        // when preexisting history fails revalidation. No resend.
+                        messages.push(Arc::new(json!({
+                            "role":"user", "content":completed_results
+                        })));
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        if let Some(call_id) = interrupted_side_effect {
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                                agent_core::TurnError::interrupted_after_side_effect(call_id),
+                            )));
+                        }
+                        return Err(RuntimeError::Config(error));
+                    }
+                };
                 messages.push(Arc::new(tool_batch));
 
                 if canceled {
@@ -3777,13 +3797,7 @@ mod rich_output_tests {
         assert_eq!(out[2]["content"][0]["type"], "image");
     }
 
-    /// #112 ordering: `validate_messages` (MAX_HISTORY_ENCODED_BYTES = 20 MiB)
-    /// runs BEFORE `cap_history_image_bytes` (HISTORY_IMAGE_BYTE_CAP = 20 MiB),
-    /// so a history the validator accepts is never lossily pruned — every
-    /// image the user sent reaches the provider intact. The cap is a
-    /// belt-and-braces bound only (unit-tested directly below); an over-limit
-    /// history is an error, not a silent trim
-    /// (`history_media_limit_rejects_before_lossy_pruning`).
+    /// Histories below both retention thresholds remain untouched.
     #[tokio::test]
     async fn valid_history_reaches_provider_unpruned() {
         // 5 × 3.5 MiB = 17.5 MiB < 20 MiB → valid; all 5 must be on the wire.
@@ -3847,9 +3861,9 @@ mod rich_output_tests {
         );
     }
 
-    /// Invalid original histories fail closed BEFORE pruning, with zero sends.
+    /// Native original-byte overflow triggers chunk retirement, not rejection.
     #[tokio::test]
-    async fn history_media_limit_rejects_before_lossy_pruning() {
+    async fn history_media_limit_replays_chunk_retirement() {
         let history = image_history(7, 3_670_016);
         let original = serde_json::to_string(&history).unwrap();
         let d = drive_with_history(
@@ -3859,9 +3873,26 @@ mod rich_output_tests {
             Arc::new(crate::extensions::hooks::HookBus::new()),
         )
         .await;
-        assert!(d.rejected, "invalid original media must stop inference");
-        assert!(d.bodies.is_empty(), "oversized history must never reach the provider");
+        assert!(!d.rejected, "valid native history should retire older images");
+        assert!(!d.bodies.is_empty());
+        let wire = serde_json::to_string(&d.bodies[0]).unwrap();
+        assert!(wire.contains(super::super::image_retention::OMITTED));
         assert_eq!(serde_json::to_string(&history).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn malformed_retired_original_still_rejects_before_sending() {
+        let mut history = image_history(7, 3_670_016);
+        Arc::make_mut(&mut history[2])["content"][0]["content"][1]["source"]["data"] =
+            json!("invalid base64");
+        let d = drive_with_history(
+            history,
+            vec![Arc::new(TextTool)],
+            &[("toolu_z", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        ).await;
+        assert!(d.rejected);
+        assert!(d.bodies.is_empty());
     }
 
     #[test]

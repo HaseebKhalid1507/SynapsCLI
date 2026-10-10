@@ -858,7 +858,7 @@ pub async fn prepare(
     // multimodal work as though it were an account or selection failure.
     let mut proposed_history = history.to_vec();
     proposed_history.push(Arc::new(json!({"role":"user", "content":proposal.prompt})));
-    crate::runtime::attachments::validate_messages(model, &proposed_history)
+    crate::runtime::attachments::validate_history_for_request(model, &proposed_history)
         .map_err(PrepareError::Blocked)?;
     validate_model_capability(model, level).map_err(PrepareError::Selection)?;
     let mut candidate = runtime.clone();
@@ -907,7 +907,7 @@ pub fn validate_prepared(
     validate_model_capability(&proposal.selection.model, level)?;
     let mut messages = history.to_vec();
     messages.push(Arc::new(json!({"role":"user", "content":proposal.prompt})));
-    crate::runtime::attachments::validate_messages(&proposal.selection.model, &messages)
+    crate::runtime::attachments::validate_history_for_request(&proposal.selection.model, &messages)
 }
 
 /// Mutation validation is deliberately permissive for arbitrary OpenAI-compatible

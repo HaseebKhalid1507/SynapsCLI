@@ -1051,7 +1051,7 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
-        super::attachments::validate_messages(model, messages).map_err(RuntimeError::Config)?;
+        super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
         let wire_messages = super::continuation::wire_messages(messages);
         let messages = wire_messages.as_deref().unwrap_or(messages);
         // One provider-neutral schema source for every transport. The opt-in
@@ -1171,9 +1171,7 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() on &[SharedMessage] is N refcount bumps,
         // not a deep copy; sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        // Strip empty/invalid thinking blocks before they hit the API. See
-        // `sanitize_thinking_blocks` for the failure mode this guards against.
-        HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
         // Deferred tool loading: send the session's loaded tools normally and
         // every other activatable tool with `defer_loading`, and resolve the
         // history's `tool_reference` blocks to wire names. Without a split
@@ -1188,19 +1186,22 @@ impl ApiMethods {
             Some(split) => (&split.loaded, &split.deferred),
             None => (&tools_schema, &[]),
         };
-        HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
-            split.and_then(|split| split.id_to_api.get(id).cloned())
-        });
         // Stable per-image projection precedes cache markers, only on Anthropic.
         // Original preflight above remains authoritative; recheck output budgets.
         await_or_cancel(
             cancel,
-            super::image_limits::enforce_image_limits(&mut cleaned_messages),
+            super::image_limits::enforce_image_limits(&mut cleaned_messages, retired_count),
         )
         .await?
         .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // Strict checks retain original per-source batch boundaries: sanitizing
+        // first could merge valid adjacent user batches past eight attachments.
+        HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
+            split.and_then(|split| split.id_to_api.get(id).cloned())
+        });
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Derive the thinking level from the budget for effort mapping.
