@@ -264,7 +264,7 @@ The tool's `parameters()` JSON schema is what the model sees. Be precise — bad
 The old "5-site sync" pain point was solved by the `define_settings!` macro. Now it's 2–3 sites:
 
 1. **`crates/agent-tui/src/tui/settings/defs.rs`** — add an entry to the `define_settings!` invocation: key, label, category, `EditorKind` (`Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`), help text, and the apply closure (`|runtime, app, value| { ... }`). The macro generates both `ALL_SETTINGS` (schema) and `apply_setting_dispatch()` — they cannot drift.
-2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default.
+2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default. List the key in `KNOWN_CONFIG_KEYS` (or `FAMILY_CONFIG_KEYS` for `shell.*`/`memory.*`/… family keys); the coverage test in `settings/defs.rs` then fails until the key has a settings row or an `EXCLUDED_CONFIG_KEYS` entry with a reason.
 3. **`crates/agent-engine/src/skills/mod.rs::BUILTIN_COMMANDS`** — only if it also gets a slash command (e.g. `/foo`); then handle it in `tui/commands.rs::handle_command()` too.
 
 `apply_setting()` itself lives in `crates/agent-tui/src/tui/helpers.rs` and delegates to the generated dispatch — you should rarely need to touch it. Step 2 is the un-tested one: forget the `load_config()` branch and the setting silently won't persist across restarts.

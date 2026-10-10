@@ -347,9 +347,19 @@ pub(crate) fn handle_event(
                     EditorKind::Text { numeric } => {
                         state.row_error = None;
                         state.edit_mode = Some(ActiveEditor::Text {
-                            buffer: current_value_for(def, snap),
+                            buffer: text_editor_seed(def, snap),
                             setting_key: def.key,
                             numeric,
+                            error: None,
+                        });
+                    }
+                    // Preset cycler that also takes a typed value (`6h`).
+                    EditorKind::Cycler(_) if super::defs::TYPED_CYCLERS.contains(&def.key) => {
+                        state.row_error = None;
+                        state.edit_mode = Some(ActiveEditor::Text {
+                            buffer: text_editor_seed(def, snap),
+                            setting_key: def.key,
+                            numeric: false,
                             error: None,
                         });
                     }
@@ -633,7 +643,19 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
             };
             if on { "on".to_string() } else { "off".to_string() }
         }
-        _ => String::new(),
+        // Config-file-backed rows (cache_ttl, memory.backend, …).
+        other => super::draw::config_row_display(other).unwrap_or_default(),
+    }
+}
+
+/// Initial text-editor buffer for a row: its current value, except that an
+/// unset placeholder ("(none)" / "(default)") starts empty.
+fn text_editor_seed(def: &super::schema::SettingDef, snap: &RuntimeSnapshot) -> String {
+    let current = current_value_for(def, snap);
+    if current == super::draw::NONE_DISPLAY || current == super::draw::DEFAULT_DISPLAY {
+        String::new()
+    } else {
+        current
     }
 }
 

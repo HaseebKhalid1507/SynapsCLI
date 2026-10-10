@@ -696,39 +696,42 @@ pub fn parse_auto_turn_cap(val: &str) -> Option<u32> {
     }
 }
 
-/// Parse `events.*` configuration keys.
-fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
+/// Parse `events.*` configuration keys. `Err` carries the diagnostic the
+/// caller prints (stderr, unchanged); the value side effects are the same
+/// either way (an unrecognised `auto_turn` still fails safe to `false`).
+fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) -> Result<(), String> {
     if key == "events.auto_turn" {
         let normalised = val.trim().to_lowercase();
-        cfg.auto_turn = match normalised.as_str() {
+        match normalised.as_str() {
             // Explicit true values.
-            "true" | "1" | "yes" | "on" => true,
+            "true" | "1" | "yes" | "on" => cfg.auto_turn = true,
             // Explicit false values.
-            "false" | "0" | "no" | "off" => false,
+            "false" | "0" | "no" | "off" => cfg.auto_turn = false,
             // Unrecognised: fail safe to false and warn so the user knows.
             other => {
-                eprintln!(
+                cfg.auto_turn = false;
+                return Err(format!(
                     "warning: config: unrecognised value for events.auto_turn = {:?}; \
                      expected true/false/yes/no/on/off/1/0 — defaulting to false",
                     other
-                );
-                false
+                ));
             }
-        };
+        }
     } else if key == "events.auto_turn_cap" {
         match parse_auto_turn_cap(val) {
             Some(cap) => cfg.auto_turn_cap = cap,
             None => {
-                eprintln!(
+                return Err(format!(
                     "warning: config: unrecognised value for events.auto_turn_cap = {:?}; \
                      expected a non-negative integer or unlimited/inf/infinite (0 = unlimited) \
                      — keeping default {}",
                     val.trim(),
                     DEFAULT_AUTO_TURN_CAP
-                );
+                ));
             }
         }
     } // unknown events.* keys ignored
+    Ok(())
 }
 
 /// Typed per-role turn-budget overrides (Task 23, spec §8.1). Every field
@@ -760,29 +763,38 @@ pub struct TurnBudgetsConfig {
 }
 
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing).
-fn parse_turn_budget_config_key(budgets: &mut TurnBudgetsConfig, key: &str, val: &str) {
+/// the default (parity with shell.* parsing). `Err` carries the diagnostic
+/// the caller prints.
+fn parse_turn_budget_config_key(
+    budgets: &mut TurnBudgetsConfig,
+    key: &str,
+    val: &str,
+) -> Result<(), String> {
     let Some(rest) = key.strip_prefix("turn_budget.") else {
-        return;
+        return Ok(());
     };
     let Some((role, field)) = rest.split_once('.') else {
-        eprintln!("Warning: invalid turn_budget key '{key}' (expected turn_budget.<role>.<field>)");
-        return;
+        return Err(format!(
+            "Warning: invalid turn_budget key '{key}' (expected turn_budget.<role>.<field>)"
+        ));
     };
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
         "autonomous" => &mut budgets.autonomous,
         "worker" => &mut budgets.worker,
         other => {
-            eprintln!("Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|worker)");
-            return;
+            return Err(format!(
+                "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|worker)"
+            ));
         }
     };
     macro_rules! set {
         ($slot:expr, $ty:ty) => {
             match val.parse::<$ty>() {
                 Ok(parsed) => $slot = Some(parsed),
-                Err(_) => eprintln!("Warning: invalid value for {key}: '{val}', using default"),
+                Err(_) => {
+                    return Err(format!("Warning: invalid value for {key}: '{val}', using default"))
+                }
             }
         };
     }
@@ -796,8 +808,9 @@ fn parse_turn_budget_config_key(budgets: &mut TurnBudgetsConfig, key: &str, val:
         "max_context_tokens" => set!(overrides.max_context_tokens, u64),
         "max_cost_usd" => set!(overrides.max_cost_usd, f64),
         "max_round_renewals" => set!(overrides.max_round_renewals, u32),
-        other => eprintln!("Warning: unknown turn_budget field '{other}'"),
+        other => return Err(format!("Warning: unknown turn_budget field '{other}'")),
     }
+    Ok(())
 }
 
 /// Continuous-memory settings surface (Task A2, spec §12). Every field is
@@ -872,38 +885,46 @@ const KNOWN_MEMORY_MODES: &[&str] = &[
 
 /// Parse `memory.<field>` keys (Task A2, spec §12). Invalid values warn and
 /// keep the default (parity with turn_budget.* parsing) — never fail open.
-fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) {
+/// `Err` carries the diagnostic the caller prints.
+fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) -> Result<(), String> {
     let Some(field) = key.strip_prefix("memory.") else {
-        return;
+        return Ok(());
     };
     /// Strict boolean: recognised forms parse; anything else warns and
     /// keeps the current (default) value.
-    fn parse_bool(slot: &mut bool, key: &str, val: &str) {
+    fn parse_bool(slot: &mut bool, key: &str, val: &str) -> Result<(), String> {
         match val {
             "true" | "1" | "yes" | "on" => *slot = true,
             "false" | "0" | "no" | "off" => *slot = false,
-            other => eprintln!(
-                "Warning: invalid value for {key}: '{other}', expected true/false — using default"
-            ),
+            other => {
+                return Err(format!(
+                    "Warning: invalid value for {key}: '{other}', expected true/false — using default"
+                ))
+            }
         }
+        Ok(())
     }
     /// Closed string-enum: value must be in `allowed`, else warn and keep
     /// the current (default) value.
-    fn parse_enum(slot: &mut String, key: &str, val: &str, allowed: &[&str]) {
+    fn parse_enum(slot: &mut String, key: &str, val: &str, allowed: &[&str]) -> Result<(), String> {
         if allowed.contains(&val) {
             *slot = val.to_string();
+            Ok(())
         } else {
-            eprintln!(
+            Err(format!(
                 "Warning: invalid value for {key}: '{val}', expected one of {} — using default",
                 allowed.join("|")
-            );
+            ))
         }
     }
     macro_rules! set_num {
         ($slot:expr, $ty:ty) => {
             match val.parse::<$ty>() {
-                Ok(parsed) => $slot = parsed,
-                Err(_) => eprintln!("Warning: invalid value for {key}: '{val}', using default"),
+                Ok(parsed) => {
+                    $slot = parsed;
+                    Ok(())
+                }
+                Err(_) => Err(format!("Warning: invalid value for {key}: '{val}', using default")),
             }
         };
     }
@@ -924,7 +945,7 @@ fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) {
         "auto_consolidate" => parse_enum(&mut memory.auto_consolidate, key, val, &["off", "on"]),
         "local_embeddings" => parse_enum(&mut memory.local_embeddings, key, val, &["off", "on"]),
         "gliner" => parse_enum(&mut memory.gliner, key, val, &["off", "on"]),
-        other => eprintln!("Warning: unknown memory field '{other}'"),
+        other => Err(format!("Warning: unknown memory field '{other}'")),
     }
 }
 
@@ -1119,10 +1140,14 @@ impl Default for SynapsConfig {
 }
 
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
-const KNOWN_CONFIG_KEYS: &[&str] = &[
+/// Public so the /settings coverage test can require a settings row (or an
+/// explicit exclusion) for every key here.
+pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "model",
     "thinking",
     "compaction_model",
+    "compaction_mode",
+    "compaction_exclude",
     "context_window",
     "context_management.mode",
     "context_management.pressure_tokens",
@@ -1165,6 +1190,82 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "tools.activation_confirm",
     "tools.deferred_loading",
     "session_persistence",
+    "sidecar_toggle_key",
+];
+
+/// Every key accepted by the namespaced family parsers that is NOT in
+/// [`KNOWN_CONFIG_KEYS`] (`shell.*`, `events.*`, `turn_budget.*`,
+/// `memory.*`, `server.*`, `bridge.*`, `auth.*`). Open-ended families whose
+/// suffix is user-chosen are listed as `prefix.*`. Keep this in sync when a
+/// parser learns a key: the /settings coverage test requires each entry to
+/// have a settings row or an explicit exclusion.
+pub const FAMILY_CONFIG_KEYS: &[&str] = &[
+    // parse_shell_config_key
+    "shell.max_sessions",
+    "shell.idle_timeout",
+    "shell.readiness_timeout_ms",
+    "shell.max_readiness_timeout_ms",
+    "shell.default_rows",
+    "shell.default_cols",
+    "shell.readiness_strategy",
+    "shell.max_output",
+    // parse_events_config_key
+    "events.auto_turn",
+    "events.auto_turn_cap",
+    // parse_turn_budget_config_key: turn_budget.<role>.<field>
+    "turn_budget.foreground.max_provider_rounds",
+    "turn_budget.foreground.max_tool_calls",
+    "turn_budget.foreground.max_elapsed_secs",
+    "turn_budget.foreground.max_accumulated_tool_result_bytes",
+    "turn_budget.foreground.max_context_tokens",
+    "turn_budget.foreground.max_cost_usd",
+    "turn_budget.foreground.max_round_renewals",
+    "turn_budget.autonomous.max_provider_rounds",
+    "turn_budget.autonomous.max_tool_calls",
+    "turn_budget.autonomous.max_elapsed_secs",
+    "turn_budget.autonomous.max_accumulated_tool_result_bytes",
+    "turn_budget.autonomous.max_context_tokens",
+    "turn_budget.autonomous.max_cost_usd",
+    "turn_budget.autonomous.max_round_renewals",
+    "turn_budget.worker.max_provider_rounds",
+    "turn_budget.worker.max_tool_calls",
+    "turn_budget.worker.max_elapsed_secs",
+    "turn_budget.worker.max_accumulated_tool_result_bytes",
+    "turn_budget.worker.max_context_tokens",
+    "turn_budget.worker.max_cost_usd",
+    "turn_budget.worker.max_round_renewals",
+    // memory backend (top-level arms of apply_config_content)
+    "memory.backend",
+    "memory.user_scope",
+    "memory.axel.executable",
+    "memory.axel.brain",
+    // parse_memory_config_key
+    "memory.default_mode",
+    "memory.default_mode_confirmed",
+    "memory.recall_max_records",
+    "memory.recall_max_tokens",
+    "memory.recall_timeout_ms",
+    "memory.capture_tools",
+    "memory.capture_assistant",
+    "memory.capture_user",
+    "memory.auto_consolidate",
+    "memory.local_embeddings",
+    "memory.gliner",
+    // parse_server_config_key
+    "server.allowed_origins",
+    "server.token",
+    "server.auto_approve_confirms",
+    "server.max_message_size",
+    // parse_bridge_config_key
+    "bridge.uds_path",
+    "bridge.heartbeat_mirror",
+    "bridge.heartbeat_timeout_ms",
+    // parse_auth_config_key
+    "auth.remote_endpoint",
+    "auth.machine_token",
+    // open-ended families
+    "provider.*",
+    "keybind.*",
 ];
 
 /// Simple Levenshtein distance for did-you-mean suggestions.
@@ -1207,65 +1308,29 @@ fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> 
     write_config_value_locked(key, &values.join(", "))
 }
 
-/// Parse shell.* configuration keys and update the ShellConfig.
-fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) {
+/// Parse shell.* configuration keys and update the ShellConfig. `Err`
+/// carries the diagnostic the caller prints.
+fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) -> Result<(), String> {
+    let invalid = || format!("Warning: invalid value for {key}: '{val}', using default");
     match key {
         "shell.max_sessions" => {
-            if let Ok(sessions) = val.parse::<usize>() {
-                shell_config.max_sessions = sessions;
-            } else {
-                eprintln!(
-                    "Warning: invalid value for shell.max_sessions: '{}', using default",
-                    val
-                );
-            }
+            shell_config.max_sessions = val.parse::<usize>().map_err(|_| invalid())?;
         }
         "shell.idle_timeout" => {
-            if let Ok(timeout) = val.parse::<u64>() {
-                shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
-            } else {
-                eprintln!(
-                    "Warning: invalid value for shell.idle_timeout: '{}', using default",
-                    val
-                );
-            }
+            let timeout = val.parse::<u64>().map_err(|_| invalid())?;
+            shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
         }
         "shell.readiness_timeout_ms" => {
-            if let Ok(timeout) = val.parse::<u64>() {
-                shell_config.readiness_timeout_ms = timeout;
-            } else {
-                eprintln!(
-                    "Warning: invalid value for shell.readiness_timeout_ms: '{}', using default",
-                    val
-                );
-            }
+            shell_config.readiness_timeout_ms = val.parse::<u64>().map_err(|_| invalid())?;
         }
         "shell.max_readiness_timeout_ms" => {
-            if let Ok(timeout) = val.parse::<u64>() {
-                shell_config.max_readiness_timeout_ms = timeout;
-            } else {
-                eprintln!("Warning: invalid value for shell.max_readiness_timeout_ms: '{}', using default", val);
-            }
+            shell_config.max_readiness_timeout_ms = val.parse::<u64>().map_err(|_| invalid())?;
         }
         "shell.default_rows" => {
-            if let Ok(rows) = val.parse::<u16>() {
-                shell_config.default_rows = rows;
-            } else {
-                eprintln!(
-                    "Warning: invalid value for shell.default_rows: '{}', using default",
-                    val
-                );
-            }
+            shell_config.default_rows = val.parse::<u16>().map_err(|_| invalid())?;
         }
         "shell.default_cols" => {
-            if let Ok(cols) = val.parse::<u16>() {
-                shell_config.default_cols = cols;
-            } else {
-                eprintln!(
-                    "Warning: invalid value for shell.default_cols: '{}', using default",
-                    val
-                );
-            }
+            shell_config.default_cols = val.parse::<u16>().map_err(|_| invalid())?;
         }
         "shell.readiness_strategy" => {
             let val_lower = val.to_lowercase();
@@ -1273,28 +1338,17 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
                 "timeout" | "prompt" | "hybrid" => {
                     shell_config.readiness_strategy = val.to_string();
                 }
-                _ => {
-                    eprintln!(
-                        "Warning: invalid value for shell.readiness_strategy: '{}', using default",
-                        val
-                    );
-                }
+                _ => return Err(invalid()),
             }
         }
         "shell.max_output" => {
-            if let Ok(max_output) = val.parse::<usize>() {
-                shell_config.max_output = max_output;
-            } else {
-                eprintln!(
-                    "Warning: invalid value for shell.max_output: '{}', using default",
-                    val
-                );
-            }
+            shell_config.max_output = val.parse::<usize>().map_err(|_| invalid())?;
         }
         _ => {
             // Unknown shell.* keys are preserved (not rejected)
         }
     }
+    Ok(())
 }
 
 /// Parse server.* configuration keys and update the ServerConfig.
@@ -1389,6 +1443,46 @@ pub fn load_config_from_str(content: &str) -> SynapsConfig {
     config
 }
 
+/// Every problem the parser reports for `content`: the `warnings` surfaced
+/// at startup plus the stderr-only diagnostics of the `shell.*`, `events.*`,
+/// `turn_budget.*` and `memory.*` families. Pure — prints nothing and
+/// touches no process state.
+pub fn config_content_problems(content: &str) -> Vec<String> {
+    let mut config = SynapsConfig::default();
+    let mut problems = Vec::new();
+    apply_config_content_with(&mut config, content, &mut |diagnostic: String| problems.push(diagnostic));
+    problems.extend(config.warnings);
+    problems
+}
+
+/// Check a `key = value` edit before it is written (the /settings modal).
+///
+/// Runs the real parser over the config file as it would look after
+/// [`write_config_value`] and returns `Err` with the parser's own messages
+/// for any problem the edit introduces — invalid values, and cross-key
+/// rules such as `context_management` threshold ordering, `subagent`
+/// concurrency vs total, or `memory.default_mode` without operator consent.
+/// Problems already present before the edit are not blamed on it.
+pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
+    if key.contains(['=', '\n', '\r'])
+        || value.contains(['\n', '\r'])
+    {
+        return Err("value must be a single line".to_string());
+    }
+    // The file the edit lands in (profile-aware, like `write_config_value`),
+    // computed without `resolve_write_path`'s directory creation.
+    let target = get_active_config_dir().join("config");
+    let existing = std::fs::read_to_string(&target).unwrap_or_default();
+    let before = config_content_problems(&existing);
+    let after = config_content_problems(&replace_config_line(&existing, key, value));
+    let introduced: Vec<String> = after.into_iter().filter(|p| !before.contains(p)).collect();
+    if introduced.is_empty() {
+        Ok(())
+    } else {
+        Err(introduced.join("; "))
+    }
+}
+
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -1418,6 +1512,19 @@ pub fn load_config() -> SynapsConfig {
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
+    // The shell/events/turn_budget/memory families report to stderr (not
+    // `config.warnings`) — unchanged behaviour.
+    apply_config_content_with(config, content, &mut |diagnostic: String| eprintln!("{diagnostic}"));
+}
+
+/// [`apply_config_content`] with the stderr-only family diagnostics routed
+/// to `family_diagnostic` instead, so [`config_content_problems`] can see
+/// every value the parser rejects.
+fn apply_config_content_with(
+    config: &mut SynapsConfig,
+    content: &str,
+    family_diagnostic: &mut dyn FnMut(String),
+) {
     let mut invalid_context_management = false;
     let mut invalid_memory_backend = false;
     for line in content.lines() {
@@ -1482,6 +1589,9 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 }
                 config.compaction_exclude = classes;
             }
+            // `auto` = model default (what /settings and `/context auto`
+            // write): clears any override, no warning.
+            "context_window" if val.eq_ignore_ascii_case("auto") => config.context_window = None,
             "context_window" => {
                 let parsed = match val {
                     "200k" | "200K" => Some(200_000),
@@ -1490,7 +1600,7 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 };
                 if parsed.is_none() {
                     config.warnings.push(format!(
-                        "context_window = {val} — expected 200k, 1m, or a token count; ignored"
+                        "context_window = {val} — expected 200k, 1m, auto, or a token count; ignored"
                     ));
                 }
                 config.context_window = parsed;
@@ -1612,6 +1722,10 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     "process_scopes = {val} — expected auto or off; using auto"
                 )),
             },
+            // Read directly by the keybind registry (`read_config_value`);
+            // recognised here so the /settings row never trips the
+            // unknown-key warning.
+            "sidecar_toggle_key" => {}
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
@@ -1692,7 +1806,9 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
             _ => {
                 // Handle namespaced keys
                 if key.starts_with("shell.") {
-                    parse_shell_config_key(&mut config.shell, key, val);
+                    if let Err(diagnostic) = parse_shell_config_key(&mut config.shell, key, val) {
+                        family_diagnostic(diagnostic);
+                    }
                 } else if key.starts_with("server.") {
                     parse_server_config_key(&mut config.server, key, val);
                 } else if key.starts_with("bridge.") {
@@ -1700,11 +1816,21 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
                 } else if key.starts_with("events.") {
-                    parse_events_config_key(&mut config.events, key, val);
+                    if let Err(diagnostic) = parse_events_config_key(&mut config.events, key, val)
+                    {
+                        family_diagnostic(diagnostic);
+                    }
                 } else if key.starts_with("turn_budget.") {
-                    parse_turn_budget_config_key(&mut config.turn_budgets, key, val);
+                    if let Err(diagnostic) =
+                        parse_turn_budget_config_key(&mut config.turn_budgets, key, val)
+                    {
+                        family_diagnostic(diagnostic);
+                    }
                 } else if key.starts_with("memory.") {
-                    parse_memory_config_key(&mut config.memory, key, val);
+                    if let Err(diagnostic) = parse_memory_config_key(&mut config.memory, key, val)
+                    {
+                        family_diagnostic(diagnostic);
+                    }
                 } else if key.starts_with("startup.") {
                     if let Err(reason) =
                         parse_startup_config_key(&mut config.startup, key, val)
@@ -1883,7 +2009,24 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
 fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let out = replace_config_line(&existing, key, value);
 
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, out)?;
+    // Config may contain API keys — restrict to owner-only
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// `existing` with the first `key = …` line replaced by `key = value` (or
+/// the pair appended), comments and unknown keys preserved — exactly what
+/// [`write_config_value`] writes.
+fn replace_config_line(existing: &str, key: &str, value: &str) -> String {
     let key_trimmed = key.trim();
     let replacement = format!("{} = {}", key_trimmed, value);
 
@@ -1916,17 +2059,7 @@ fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
     if !out.ends_with('\n') {
         out.push('\n');
     }
-
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, out)?;
-    // Config may contain API keys — restrict to owner-only
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    out
 }
 
 /// Add a favorite model id (`provider/model`) to config, preserving sort/dedup.
@@ -3806,5 +3939,147 @@ api_retries = 5
         ] {
             assert_ne!(cfg.thinking_level, Some(other));
         }
+    }
+
+    // ── /settings coverage support ────────────────────────────────────────
+
+    /// `context_window = auto` is what the /settings cycler and `/context
+    /// auto` write: it means "model default" (no override) and must not warn.
+    #[test]
+    fn context_window_auto_is_model_default_without_warning() {
+        for spelling in ["auto", "AUTO", "Auto"] {
+            let cfg = load_config_from_str(&format!("context_window = {spelling}\n"));
+            assert_eq!(cfg.context_window, None, "{spelling}");
+            assert!(cfg.warnings.is_empty(), "{spelling}: {:?}", cfg.warnings);
+        }
+        // `auto` after an explicit window clears it.
+        let cfg = load_config_from_str("context_window = 1m\ncontext_window = auto\n");
+        assert_eq!(cfg.context_window, None);
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        // Existing spellings are unchanged; garbage still warns.
+        assert_eq!(
+            load_config_from_str("context_window = 200k\n").context_window,
+            Some(200_000)
+        );
+        let bad = load_config_from_str("context_window = huge\n");
+        assert_eq!(bad.context_window, None);
+        assert!(bad.warnings.iter().any(|w| w.contains("context_window")));
+    }
+
+    /// The /settings sidecar row writes `sidecar_toggle_key`; it is read by
+    /// the keybind registry and must not trip the unknown-key warning.
+    #[test]
+    fn sidecar_toggle_key_is_a_known_key() {
+        let cfg = load_config_from_str("sidecar_toggle_key = F2\n");
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        assert!(KNOWN_CONFIG_KEYS.contains(&"sidecar_toggle_key"));
+        assert!(KNOWN_CONFIG_KEYS.contains(&"compaction_mode"));
+        assert!(KNOWN_CONFIG_KEYS.contains(&"compaction_exclude"));
+    }
+
+    /// `config_content_problems` sees the stderr-only family diagnostics
+    /// (shell/events/turn_budget/memory) as well as `warnings`, and nothing
+    /// for valid values.
+    #[test]
+    fn config_content_problems_covers_family_diagnostics() {
+        for bad in [
+            "shell.max_sessions = lots",
+            "shell.readiness_strategy = eventually",
+            "events.auto_turn = maybe",
+            "events.auto_turn_cap = many",
+            "turn_budget.worker.max_cost_usd = cheap",
+            "turn_budget.nobody.max_tool_calls = 3",
+            "memory.capture_tools = everything",
+            "memory.recall_max_records = -1",
+            "memory.user_scope = yes",
+            "cache_ttl = forever",
+        ] {
+            let problems = config_content_problems(bad);
+            assert!(!problems.is_empty(), "{bad} should be reported");
+        }
+        for good in [
+            "shell.max_sessions = 8",
+            "shell.readiness_strategy = prompt",
+            "events.auto_turn = off",
+            "events.auto_turn_cap = unlimited",
+            "turn_budget.worker.max_cost_usd = 2.5",
+            "memory.capture_tools = off",
+            "memory.recall_max_records = 4",
+            "memory.user_scope = true",
+            "cache_ttl = hybrid",
+        ] {
+            let problems = config_content_problems(good);
+            assert!(problems.is_empty(), "{good}: {problems:?}");
+        }
+        // The family values still land exactly as before.
+        let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
+        assert_eq!(cfg.shell.max_sessions, 8);
+        assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    /// Every listed family key is accepted by its parser for some value
+    /// (catches a typo in `FAMILY_CONFIG_KEYS`).
+    #[test]
+    fn family_config_keys_are_real_parser_keys() {
+        let sample = |key: &str| -> &'static str {
+            match key {
+                "shell.readiness_strategy" => "hybrid",
+                "memory.backend" => "legacy",
+                "memory.user_scope" | "memory.default_mode_confirmed" => "true",
+                "memory.default_mode" => "off",
+                "memory.capture_tools" => "summary_only",
+                "memory.capture_assistant" | "memory.capture_user" => "on",
+                "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
+                "memory.axel.executable" | "memory.axel.brain" => "/opt/axel",
+                "events.auto_turn" => "on",
+                "server.allowed_origins" | "server.token" => "x",
+                "server.auto_approve_confirms" | "bridge.heartbeat_mirror" => "false",
+                "bridge.uds_path" => "/tmp/x.sock",
+                "auth.remote_endpoint" | "auth.machine_token" => "x",
+                _ => "7",
+            }
+        };
+        for key in FAMILY_CONFIG_KEYS.iter().filter(|k| !k.ends_with(".*")) {
+            assert!(!KNOWN_CONFIG_KEYS.contains(key), "{key} is listed twice");
+            let content = format!("{key} = {}\n", sample(key));
+            let problems = config_content_problems(&content);
+            assert!(problems.is_empty(), "{key}: {problems:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn validate_config_edit_uses_the_real_parser_and_whole_file() {
+        let home = make_test_home("validate-edit");
+        let cfg = home.join(".synaps-cli/config");
+        with_home(&home, || {
+            // Single-key value checks.
+            assert!(validate_config_edit("cache_ttl", "1h").is_ok());
+            assert!(validate_config_edit("cache_ttl", "2h").is_err());
+            assert!(validate_config_edit("shell.max_output", "big").is_err());
+            assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());
+            assert!(validate_config_edit("memory.axel.brain", "/abs/brain.r8").is_ok());
+            assert!(validate_config_edit("model", "a\nb").is_err());
+
+            // Cross-key rules see the rest of the file.
+            std::fs::write(&cfg, "context_management.rollover_tokens = 100000\n").unwrap();
+            assert!(validate_config_edit("context_management.pressure_tokens", "90000").is_ok());
+            assert!(validate_config_edit("context_management.pressure_tokens", "150000").is_err());
+            std::fs::write(&cfg, "subagent.max_total = 8\n").unwrap();
+            assert!(validate_config_edit("subagent.max_concurrent", "8").is_ok());
+            assert!(validate_config_edit("subagent.max_concurrent", "9").is_err());
+            std::fs::write(&cfg, "").unwrap();
+            assert!(validate_config_edit("memory.default_mode", "recall_once").is_err());
+            assert!(validate_config_edit("memory.default_mode", "off").is_ok());
+            std::fs::write(&cfg, "memory.default_mode_confirmed = true\n").unwrap();
+            assert!(validate_config_edit("memory.default_mode", "recall_once").is_ok());
+
+            // A problem already in the file is not blamed on an unrelated edit.
+            std::fs::write(&cfg, "cache_ttl = forever\n").unwrap();
+            assert!(validate_config_edit("max_fps", "120").is_ok());
+            // Validation never writes.
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "cache_ttl = forever\n");
+        });
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

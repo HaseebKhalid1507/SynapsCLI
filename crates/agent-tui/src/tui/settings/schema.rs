@@ -9,8 +9,11 @@ pub(crate) enum Category {
     Model,
     Providers,
     Agent,
+    Context,
+    Budgets,
     ToolLimits,
     Appearance,
+    Memory,
     Plugins,
     Sidecar,
     Startup,
@@ -23,8 +26,11 @@ impl Category {
             Category::Model => "Model",
             Category::Providers => "Providers",
             Category::Agent => "Agent",
+            Category::Context => "Context & Cache",
+            Category::Budgets => "Turn Budgets",
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
+            Category::Memory => "Memory",
             Category::Plugins => "Plugins",
             Category::Sidecar => "Sidecar",
             Category::Startup => "Startup",
@@ -33,12 +39,15 @@ impl Category {
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 9] = [
+pub(crate) const CATEGORIES: [Category; 12] = [
     Category::Model,
     Category::Providers,
     Category::Agent,
+    Category::Context,
+    Category::Budgets,
     Category::ToolLimits,
     Category::Appearance,
+    Category::Memory,
     Category::Plugins,
     Category::Sidecar,
     Category::Startup,
@@ -102,6 +111,23 @@ mod tests {
     }
 
     #[test]
+    fn new_categories_are_present_and_populated() {
+        for cat in [
+            Category::Context,
+            Category::Budgets,
+            Category::Memory,
+        ] {
+            assert!(CATEGORIES.contains(&cat), "{cat:?} missing from CATEGORIES");
+            assert!(
+                ALL_SETTINGS.iter().any(|d| d.category == cat),
+                "{cat:?} has no settings"
+            );
+        }
+        assert_eq!(Category::Context.label(), "Context & Cache");
+        assert_eq!(Category::Budgets.label(), "Turn Budgets");
+    }
+
+    #[test]
     fn plugins_category_is_present() {
         assert!(CATEGORIES.contains(&Category::Plugins));
     }
@@ -160,7 +186,8 @@ mod tests {
     #[test]
     fn visible_categories_returns_all_when_no_claims() {
         let v = visible_categories(&[]);
-        assert_eq!(v.len(), 9);
+        assert_eq!(v.len(), CATEGORIES.len());
+        assert_eq!(v.len(), 12);
         assert!(v.contains(&Category::Sidecar));
     }
 
@@ -168,7 +195,8 @@ mod tests {
     fn visible_categories_hides_sidecar_when_claim_has_settings_category() {
         let claim = mk_claim("sample-sidecar", "capture", Some("capture"));
         let v = visible_categories(&[claim]);
-        assert_eq!(v.len(), 8);
+        assert_eq!(v.len(), CATEGORIES.len() - 1);
+        assert_eq!(v.len(), 11);
         assert!(!v.contains(&Category::Sidecar));
         assert_eq!(v[0], Category::Model);
         assert_eq!(*v.last().unwrap(), Category::Daemon);
@@ -178,7 +206,7 @@ mod tests {
     fn visible_categories_keeps_sidecar_when_claim_has_no_settings_category() {
         let claim = mk_claim("p", "ocr", None);
         let v = visible_categories(&[claim]);
-        assert_eq!(v.len(), 9);
+        assert_eq!(v.len(), 12);
         assert!(v.contains(&Category::Sidecar));
     }
 }
