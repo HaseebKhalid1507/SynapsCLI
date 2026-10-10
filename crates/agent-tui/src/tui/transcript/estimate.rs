@@ -386,18 +386,17 @@ mod tests {
     // Calling the estimator over 1,000 off-screen fenced messages must leave
     // HIGHLIGHT_CALLS == 0.
     //
-    // SYNTAX_SET_TOUCHED is a process-global latch (fires once per process);
-    // in a shared-process test run another test may have pre-warmed syntect.
-    // We assert highlight_call_count() only; the integration test
-    // `tests/mem_transcript.rs` asserts SYNTAX_SET_TOUCHED independently in
-    // an isolated process.
+    // Hermetic (#285): the highlight probe is thread-local and this test
+    // measures a before/after delta on its own thread, so concurrent tests
+    // that highlight code can't perturb it. `serial(highlight)` groups it
+    // with the other probe readers (belt-and-braces; see highlight.rs).
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
-    #[ignore = "reads process-global HIGHLIGHT_CALLS counter; run isolated with --ignored --test-threads=1 (see task #285)"]
+    #[serial_test::serial(highlight)]
     fn estimator_over_1000_fenced_messages_zero_highlight_calls() {
         use super::super::super::highlight;
 
-        highlight::highlight_reset_counters();
+        let before = highlight::highlight_call_count();
 
         const N: usize = 1_000;
         for i in 0..N {
@@ -416,7 +415,7 @@ mod tests {
             assert!(h >= MIN_MSG_HEIGHT, "msg {i}: estimate must be nonzero");
         }
 
-        let calls = highlight::highlight_call_count();
+        let calls = highlight::highlight_call_count() - before;
         assert_eq!(
             calls, 0,
             "estimator over {N} fenced messages must never call the highlight module \

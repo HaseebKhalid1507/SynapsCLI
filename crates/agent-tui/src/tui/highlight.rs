@@ -125,7 +125,7 @@ fn syntax_set() -> Arc<Loaded> {
         return Arc::clone(loaded);
     }
     #[cfg(any(test, feature = "testing"))]
-    SYNTAX_SET_TOUCHED.store(true, Ordering::Relaxed);
+    SYNTAX_SET_TOUCHED.with(|t| t.set(true));
     let t0 = Instant::now();
     let loaded = Arc::new(Loaded {
         set: load_syntax_set(),
@@ -197,52 +197,61 @@ pub(crate) fn is_loaded() -> bool {
 
 // ── Test-only highlight instrumentation (Slice 0 / T241) ─────────────────────
 //
-// Two counters:
-//   HIGHLIGHT_CALLS   — bumped once per syntect highlight_line() call-site entry
+// Two probes:
+//   HIGHLIGHT_CALLS   — bumped once per syntect highlight session entry
 //                       (each of highlight_code_block / highlight_tool_code /
-//                        highlight_read_output touching SYNTAX_SET increments this)
-//   SYNTAX_SET_TOUCHED — latched true the first time SYNTAX_SET is force-initialized
-//                        (i.e. the LazyLock closure runs). Loading syntect defaults
-//                        is the single largest first-touch memory cost (~10–20 MB);
-//                        off-screen code fences must NOT trigger it on the first frame
-//                        after Slice 3 lands.
+//                        highlight_read_output increments this)
+//   SYNTAX_SET_TOUCHED — latched true when a syntect load (first touch or
+//                        reload after eviction) runs. Loading syntect is the
+//                        single largest first-touch memory cost (~10–20 MB);
+//                        off-screen code fences must NOT trigger it.
 //
-// All three items compile to zero bytes and zero cycles in production.
+// Hermeticity (#285): both probes are THREAD-LOCAL, not process-global.
+// libtest runs every `#[test]` on its own thread, so a test only ever sees
+// highlight work done on its own thread — any other test highlighting code
+// fences concurrently (markdown/render tests do so constantly) can no longer
+// bump or reset this test's counter. The measured paths
+// (`estimate_message_height`, `TranscriptStore::visible_window`,
+// `TestHarness::render`) all highlight synchronously on the calling thread.
+// Consequence: highlight work done on ANOTHER thread is invisible to the
+// probe — a measurement must drive rendering on the test thread itself
+// (the positive control `highlight_probe_is_thread_local` pins this).
+//
+// All of this compiles to nothing in production.
 // Reset via `highlight_reset_counters()`; read via the `highlight_*` accessors.
 #[cfg(any(test, feature = "testing"))]
-pub(crate) static HIGHLIGHT_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static HIGHLIGHT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SYNTAX_SET_TOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-#[cfg(any(test, feature = "testing"))]
-pub(crate) static SYNTAX_SET_TOUCHED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Reset both counters to zero — call before a measurement frame.
-/// Also clears `SYNTAX_SET_TOUCHED` (which is a latch, not a rate counter,
-/// so it only makes sense to clear between isolated test runs).
+/// Reset both probes to zero for the CALLING THREAD — call before a
+/// measurement frame. Also clears `SYNTAX_SET_TOUCHED` (a latch, not a rate
+/// counter). Never affects other threads/tests.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn highlight_reset_counters() {
-    HIGHLIGHT_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
-    SYNTAX_SET_TOUCHED.store(false, std::sync::atomic::Ordering::Relaxed);
+    HIGHLIGHT_CALLS.with(|c| c.set(0));
+    SYNTAX_SET_TOUCHED.with(|t| t.set(false));
 }
 
-/// Read `HIGHLIGHT_CALLS`.
+/// Read `HIGHLIGHT_CALLS` for the calling thread (sessions since the last
+/// reset on this thread). Prefer measuring a delta (read before/after).
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn highlight_call_count() -> usize {
-    HIGHLIGHT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    HIGHLIGHT_CALLS.with(|c| c.get())
 }
 
-/// Read `SYNTAX_SET_TOUCHED`.
+/// Read `SYNTAX_SET_TOUCHED` for the calling thread.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn syntax_set_was_touched() -> bool {
-    SYNTAX_SET_TOUCHED.load(std::sync::atomic::Ordering::Relaxed)
+    SYNTAX_SET_TOUCHED.with(|t| t.get())
 }
 
 /// Internal helper: bump HIGHLIGHT_CALLS once per syntect highlight session entry.
 #[cfg(any(test, feature = "testing"))]
 #[inline(always)]
 fn note_highlight_call() {
-    HIGHLIGHT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    HIGHLIGHT_CALLS.with(|c| c.set(c.get() + 1));
 }
 #[cfg(not(any(test, feature = "testing")))]
 #[inline(always)]
@@ -695,6 +704,34 @@ mod tests {
             after_more as i64 - base as i64,
             after_evict as i64 - after_more as i64,
             after_reload as i64 - after_evict as i64,
+        );
+    }
+
+    /// #285 positive control: the highlight probe counts this thread's own
+    /// highlight sessions exactly, and work on another thread (i.e. another
+    /// concurrently running test) never leaks into it. If this fails, every
+    /// "zero highlight calls" ratchet could pass vacuously or flake.
+    #[test]
+    #[serial_test::serial(highlight)]
+    fn highlight_probe_is_thread_local() {
+        let before = highlight_call_count();
+        let _ = highlight_code_block("fn main() {}\n", "rust", "");
+        assert_eq!(highlight_call_count() - before, 1, "own call must count");
+
+        let mid = highlight_call_count();
+        std::thread::spawn(|| {
+            highlight_reset_counters();
+            for _ in 0..3 {
+                let _ = highlight_code_block("let x = 1;\n", "rust", "");
+            }
+            assert_eq!(highlight_call_count(), 3);
+        })
+        .join()
+        .expect("helper thread");
+        assert_eq!(
+            highlight_call_count(),
+            mid,
+            "another thread's highlight calls/reset must not touch this thread's probe"
         );
     }
 

@@ -3170,15 +3170,17 @@ mod source_text_tests {
 //
 // T1/T2 use the per-store render probe — parallel-safe, ACTIVE in CI (they
 // never touch syntect: the promoted window is plain text).
-// The mixed-store cold test and T3 read the PROCESS-GLOBAL highlight
-// counters, so they stay `#[ignore]` and must run isolated:
-//
-//   cargo test -p synaps-tui --lib -- --ignored slice3 --test-threads=1
+// T3 and the two slow `baseline_*` tests read the highlight probe. Since #285
+// that probe is THREAD-LOCAL (see highlight.rs), so readers are hermetic
+// under the normal parallel runner; they also share
+// `#[serial_test::serial(highlight)]` and measure deltas. T3 is ACTIVE; the
+// `baseline_*` tests stay `#[ignore]` only because they are slow (load
+// syntect):  cargo test -p synaps-tui --lib -- --ignored slice3
 //
 // Counter semantics (recap):
 //   probe_render_count()  — render_message_lines calls since last probe_reset()
-//   highlight_call_count() — syntect highlight_line sessions since last reset
-//   syntax_set_was_touched() — whether SYNTAX_SET LazyLock init fired since reset
+//   highlight_call_count() — syntect highlight sessions on THIS thread since reset
+//   syntax_set_was_touched() — whether THIS thread triggered a syntect load since reset
 #[cfg(test)]
 mod slice3_lazy_ratchets {
     use super::super::highlight;
@@ -3254,6 +3256,7 @@ mod slice3_lazy_ratchets {
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
     #[ignore = "slow: halo reaches fenced tail msgs → loads syntect; run with --ignored"]
+    #[serial_test::serial(highlight)]
     fn baseline_slice0_cold_missing_renders_all_messages() {
         // Name kept from Slice 0 for history/grep; the assertion is now the
         // Slice-3 I-RENDER ratchet (renders ≤ RENDER_BOUND, not == TOTAL).
@@ -3371,11 +3374,10 @@ mod slice3_lazy_ratchets {
     // trigger syntect; now: fences strictly OUTSIDE viewport+halo trigger
     // ZERO highlight calls — I-HILITE). The fences sit at the FRONT of the
     // transcript (indices 0..N_CODE) so the tail window + halo never reaches
-    // them. Reads the process-global highlight counters → stays `#[ignore]`;
-    // run isolated:  cargo test -p synaps-tui --lib -- --ignored slice3 --test-threads=1
+    // them. Reads the (thread-local, #285) highlight probe as a delta → hermetic.
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
-    #[ignore = "reads process-global highlight counters; run isolated with --ignored --test-threads=1"]
+    #[serial_test::serial(highlight)]
     fn slice3_t3_offscreen_code_fence_zero_highlight_calls() {
         const N_CODE: usize = 200; // fences at the FRONT — far outside the halo
         const N_PLAIN: usize = 800;
@@ -3405,13 +3407,14 @@ mod slice3_lazy_ratchets {
         }
 
         store.probe_reset();
-        highlight::highlight_reset_counters();
+        highlight::highlight_reset_counters(); // thread-local: clears the latch
+        let hl_before = highlight::highlight_call_count();
 
         let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
         let _vw = store.visible_window(area, &test_ctx());
 
         let renders = store.probe_render_count();
-        let hl_calls = highlight::highlight_call_count();
+        let hl_calls = highlight::highlight_call_count() - hl_before;
         let ss_touched = highlight::syntax_set_was_touched();
 
         eprintln!(
@@ -3429,13 +3432,13 @@ mod slice3_lazy_ratchets {
             renders <= RENDER_BOUND,
             "I-RENDER holds here too: rendered {renders} > {RENDER_BOUND}"
         );
-        // SYNTAX_SET_TOUCHED is a process-global latch reset by
-        // highlight_reset_counters(); reliable only when this test runs
-        // isolated (--test-threads=1), which the #[ignore] note mandates.
+        // SYNTAX_SET_TOUCHED is a thread-local latch (#285): it flips only if
+        // THIS test's frame triggered a syntect load, regardless of what other
+        // concurrently running tests do to the shared cache.
         assert!(
             !ss_touched,
             "I-HILITE: SYNTAX_SET must not initialize when no fence is in \
-             the viewport + halo (run isolated — see #[ignore] note)"
+             the viewport + halo"
         );
     }
 
@@ -3446,6 +3449,7 @@ mod slice3_lazy_ratchets {
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
     #[ignore = "slow: loads syntect defaults; run explicitly with --ignored"]
+    #[serial_test::serial(highlight)]
     fn baseline_slice0_warm_cache_second_frame_zero_renders() {
         let mut store = make_synthetic_store(100, 20);
 
@@ -3457,12 +3461,12 @@ mod slice3_lazy_ratchets {
 
         // Reset after cold frame, measure the second.
         store.probe_reset();
-        highlight::highlight_reset_counters();
+        let hl_before = highlight::highlight_call_count();
 
         let _vw2 = store.visible_window(area, &ctx);
 
         let renders = store.probe_render_count();
-        let hl_calls = highlight::highlight_call_count();
+        let hl_calls = highlight::highlight_call_count() - hl_before;
 
         eprintln!(
             "[baseline_slice0_warm_cache_second_frame_zero_renders]\n  \

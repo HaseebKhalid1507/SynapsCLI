@@ -555,7 +555,10 @@ mod tests {
     /// after_tool_call handler returns Replace — this is the seam that lets an
     /// extension compress/redact tool output before it enters history.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn after_tool_call_replace_substitutes_recorded_output() {
+        // #186: Replace writes the intercept audit — isolate the base dir.
+        let base = crate::test_env::BaseDirGuard::new();
         let bus = std::sync::Arc::new(HookBus::new());
         let handler = TestHandler::new(
             "compressor",
@@ -585,6 +588,11 @@ mod tests {
         .await;
 
         assert_eq!(recorded, "COMPRESSED", "Replace output must reach history");
+        let audit = std::fs::read_to_string(
+            crate::extensions::audit::intercept_file_path_for(base.path()),
+        )
+        .expect("intercept audit must land in the isolated base dir");
+        assert!(audit.contains("\"plugin_id\":\"compressor\""));
     }
 
     /// With no transform handler, the original output is preserved unchanged.
@@ -609,7 +617,10 @@ mod tests {
     /// Replace, later handlers are never reached (mirrors block/modify
     /// chain-stop). Proves the "first transform wins" comment in emit().
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn replace_stops_chain_for_after_tool_call() {
+        // #186: Replace writes the intercept audit — isolate the base dir.
+        let _base = crate::test_env::BaseDirGuard::new();
         let bus = HookBus::new();
         let first = TestHandler::new(
             "first",
@@ -1162,7 +1173,10 @@ mod tests {
     /// FINAL emit_after_tool_call return is ≤ max_tool_output (+marker overhead).
     /// Proves compress-then-truncate ordering at the new site.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn final_output_truncated_to_max_tool_output_after_hook() {
+        // #186: Replace writes the intercept audit — isolate the base dir.
+        let _base = crate::test_env::BaseDirGuard::new();
         let bus = std::sync::Arc::new(HookBus::new());
         let big: String = "x".repeat(100_000);
         let handler = TestHandler::new("bloater", HookResult::Replace { output: big });
@@ -1222,7 +1236,10 @@ mod tests {
     /// Test D: emit_after_tool_call unit-level — Continue and Replace branches
     /// both truncate to max_tool_output, and truncation is char-boundary safe.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn emit_after_tool_call_truncates_char_boundary_safe() {
+        // #186: Replace writes the intercept audit — isolate the base dir.
+        let _base = crate::test_env::BaseDirGuard::new();
         // Continue path with multibyte content.
         let bus = std::sync::Arc::new(HookBus::new());
         let multibyte: String = "héllo🌟".repeat(5_000);
