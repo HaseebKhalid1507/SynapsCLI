@@ -133,7 +133,11 @@ aborts remove only their captured inode. Regular files, symlinks and unrelated c
 or socket paths are not cleanup targets.
 
 The protocol coordinates updated binaries, not older binaries that ignore the lock
-or hostile same-UID filesystem mutation. Generation collisions fail binding without
+or hostile same-UID filesystem mutation. Enabled daemon auto-start callers also
+serialize cleanup and liveness probing under the spawn lock, held through readiness;
+a cleanup lock held briefly by another first client is not proof of a ready daemon.
+Warm enabled attaches therefore also require acquiring the writable spawn lock.
+Disabled auto-start behavior is unchanged. Generation collisions fail binding without
 replacing the old endpoint. Long runtime-directory prefixes can still exceed Unix
 socket limits; use a short `SYNAPS_RUNTIME_DIR`. Existing journal locks and compaction
 registration-following behavior are outside this change.
