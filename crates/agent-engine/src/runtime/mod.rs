@@ -451,6 +451,10 @@ pub struct Runtime {
     /// These seed the session policy and are replayed when a manifestless
     /// foreground model change replaces that policy snapshot.
     trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
+    /// Subagent fan-out limits (`subagent.*`) used whenever this runtime
+    /// installs a manifestless delegation policy (boot, new session, model
+    /// change). Changing them affects the next install, not running workers.
+    subagent_limits: crate::config::SubagentLimits,
     /// True when this stream should expose only its session projection rather
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
@@ -1025,6 +1029,7 @@ impl Runtime {
             credential_source: host.credential_source,
             token_cache: host.token_cache,
             trusted_worker_models: Vec::new(),
+            subagent_limits: crate::config::SubagentLimits::default(),
             progressive_tool_disclosure: host.progressive_tool_disclosure,
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
@@ -1368,6 +1373,11 @@ impl Runtime {
         self.orchestration = Some(runtime);
     }
 
+    /// The `subagent.*` limits this runtime sizes delegation policies with.
+    pub fn subagent_limits(&self) -> crate::config::SubagentLimits {
+        self.subagent_limits
+    }
+
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
     }
@@ -1442,8 +1452,9 @@ impl Runtime {
         {
             let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
                 .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
-            let replacement = crate::orchestration::OrchestrationRuntime::baseline(
-                foreground, 8, 64,
+            let replacement = crate::orchestration::OrchestrationRuntime::from_limits(
+                foreground,
+                self.subagent_limits,
             )
             .map_err(|_| "model change blocked: trusted worker catalog unavailable".to_string())?;
             for trusted in &self.trusted_worker_models {
@@ -2558,6 +2569,7 @@ impl Runtime {
             .collect();
         self.trusted_worker_models.sort();
         self.trusted_worker_models.dedup();
+        self.subagent_limits = config.subagent;
         if let Some(orchestration) = &self.orchestration {
             for model in &self.trusted_worker_models {
                 if let Err(error) = orchestration.grant_worker_model(model.as_str()) {
@@ -4287,6 +4299,7 @@ impl Clone for Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
+            subagent_limits: self.subagent_limits,
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
@@ -4858,6 +4871,50 @@ mod tests {
         orchestration
             .resolve_and_authorize("sa_after_switch", Some("anthropic/claude-opus-4-6"))
             .expect("configured worker trust must survive policy replacement");
+    }
+
+    #[test]
+    fn configured_subagent_limits_size_the_policy_rebuilt_on_model_change() {
+        let mut runtime = Runtime::new_headless();
+        assert_eq!(
+            runtime.subagent_limits(),
+            crate::config::SubagentLimits::default(),
+            "defaults before any config"
+        );
+        runtime.apply_config(&crate::config::SynapsConfig {
+            subagent: crate::config::SubagentLimits {
+                max_concurrent: 24,
+                max_total: 96,
+                max_depth: 2,
+            },
+            ..Default::default()
+        });
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::from_limits(
+                foreground,
+                runtime.subagent_limits(),
+            )
+            .unwrap(),
+        ));
+        runtime
+            .try_set_model("xai-auth/grok-4.5-latest".to_owned())
+            .unwrap();
+
+        let orchestration = runtime.orchestration().unwrap();
+        assert_eq!(orchestration.foreground_model(), "xai-auth/grok-4.5-latest");
+        assert_eq!(
+            orchestration.ultracode_readiness("xai-auth/grok-4.5-latest"),
+            Ok((24, 96)),
+            "the replacement policy uses the configured limits, not a hardcoded 8/64"
+        );
+        assert_eq!(orchestration.reserve_delegation("a", None), Ok(1));
+        assert_eq!(orchestration.reserve_delegation("b", Some("a")), Ok(2));
+        assert_eq!(
+            orchestration.reserve_delegation("c", Some("b")),
+            Err(crate::orchestration::DelegationTreeDenied::DepthLimit { max_depth: 2 })
+        );
     }
 
     #[test]

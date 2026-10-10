@@ -304,6 +304,56 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Subagent fan-out limits (`subagent.*` keys). They apply to the whole
+/// delegation tree of one session: workers started by workers count against
+/// the same limits as workers started by the foreground. A prompt manifest
+/// with an explicit delegation policy sets its own concurrency and total
+/// limits; `max_depth` applies either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentLimits {
+    /// Workers running at the same time. Default: 16.
+    pub max_concurrent: usize,
+    /// Workers dispatched and not yet collected with `reconciled=true`
+    /// (running, finished, or collected without reconciling). Default: 64.
+    pub max_total: usize,
+    /// How deep workers may nest: 1 = only the foreground delegates,
+    /// 2 = its workers may delegate once more, and so on. Default: 4.
+    pub max_depth: u16,
+}
+
+impl Default for SubagentLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 16,
+            max_total: 64,
+            max_depth: 4,
+        }
+    }
+}
+
+/// Parse `subagent.*` keys. Unknown keys and invalid values return an error
+/// (caller warns and keeps the default).
+fn parse_subagent_config_key(
+    config: &mut SubagentLimits,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    let positive = || match value.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("expected a whole number of at least 1"),
+    };
+    match key {
+        "subagent.max_concurrent" => config.max_concurrent = positive()?,
+        "subagent.max_total" => config.max_total = positive()?,
+        "subagent.max_depth" => {
+            config.max_depth =
+                u16::try_from(positive()?).map_err(|_| "expected a whole number from 1 to 65535")?
+        }
+        _ => return Err("unknown subagent key"),
+    }
+    Ok(())
+}
+
 /// Parse `startup.*` keys. Unknown keys return an error (caller warns).
 fn parse_startup_config_key(
     config: &mut StartupConfig,
@@ -847,6 +897,8 @@ pub struct SynapsConfig {
     pub startup: StartupConfig,
     /// Daemon lifetime knobs (`daemon.*`); env vars still win.
     pub daemon: DaemonConfig,
+    /// Subagent fan-out limits (`subagent.*`).
+    pub subagent: SubagentLimits,
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
@@ -937,6 +989,7 @@ impl Default for SynapsConfig {
             context_management: ContextManagementConfig::default(),
             startup: StartupConfig::default(),
             daemon: DaemonConfig::default(),
+            subagent: SubagentLimits::default(),
             compaction_model: None,
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
@@ -1000,6 +1053,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_timeout",
     "bash_max_timeout",
     "subagent_timeout",
+    "subagent.max_concurrent",
+    "subagent.max_total",
+    "subagent.max_depth",
     "api_retries",
     "refusal_retries",
     "telemetry",
@@ -1550,6 +1606,12 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
                     {
                         config.warnings.push(format!("{key} — {reason}"));
                     }
+                } else if key.starts_with("subagent.") {
+                    if let Err(reason) =
+                        parse_subagent_config_key(&mut config.subagent, key, val)
+                    {
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
                 } else if key.starts_with("context_management.") {
                     if let Err(reason) = parse_context_management_config_key(
                         &mut config.context_management, key, val,
@@ -1595,6 +1657,16 @@ fn apply_config_content(config: &mut SynapsConfig, content: &str) {
         config
             .warnings
             .push(format!("context_management — {reason}"));
+    }
+    // The delegation policy refuses concurrent > total, which would take
+    // subagents away entirely. Keep the stricter number for both. Checked
+    // after the loop so key order never matters.
+    if config.subagent.max_concurrent > config.subagent.max_total {
+        config.warnings.push(format!(
+            "subagent.max_concurrent ({}) is above subagent.max_total ({}); using {} for both",
+            config.subagent.max_concurrent, config.subagent.max_total, config.subagent.max_total
+        ));
+        config.subagent.max_concurrent = config.subagent.max_total;
     }
     if invalid_context_management {
         config.context_management = ContextManagementConfig::default();
@@ -1952,6 +2024,87 @@ mod tests {
             "no unknown-key warning: {:?}",
             c.warnings
         );
+    }
+
+    #[test]
+    fn subagent_limits_default_to_16_64_4() {
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent, super::SubagentLimits::default());
+        assert_eq!(c.subagent.max_concurrent, 16);
+        assert_eq!(c.subagent.max_total, 64);
+        assert_eq!(c.subagent.max_depth, 4);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+    }
+
+    #[test]
+    fn subagent_limits_parse_and_are_known_keys() {
+        let c = super::load_config_from_str(concat!(
+            "subagent.max_concurrent = 24\n",
+            "subagent.max_total = 100\n",
+            "subagent.max_depth = 2\n",
+            "subagent_timeout = 600\n",
+        ));
+        assert_eq!(c.subagent.max_concurrent, 24);
+        assert_eq!(c.subagent.max_total, 100);
+        assert_eq!(c.subagent.max_depth, 2);
+        assert_eq!(c.subagent_timeout, 600, "the old flat key is unaffected");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        for k in [
+            "subagent.max_concurrent",
+            "subagent.max_total",
+            "subagent.max_depth",
+        ] {
+            assert!(
+                super::KNOWN_CONFIG_KEYS.contains(&k),
+                "{k} not in KNOWN_CONFIG_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_limits_reject_zero_and_junk_and_keep_defaults() {
+        let c = super::load_config_from_str(concat!(
+            "subagent.max_concurrent = 0\n",
+            "subagent.max_total = lots\n",
+            "subagent.max_depth = 70000\n",
+            "subagent.max_children = 4\n",
+        ));
+        assert_eq!(c.subagent, super::SubagentLimits::default());
+        for key in [
+            "subagent.max_concurrent",
+            "subagent.max_total",
+            "subagent.max_depth",
+            "subagent.max_children",
+        ] {
+            assert!(
+                c.warnings.iter().any(|w| w.starts_with(key)),
+                "expected a warning for {key}: {:?}",
+                c.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_concurrency_above_total_uses_the_stricter_number() {
+        // Either key order: the check runs after the whole file is parsed.
+        for text in [
+            "subagent.max_total = 10\nsubagent.max_concurrent = 32\n",
+            "subagent.max_concurrent = 32\nsubagent.max_total = 10\n",
+        ] {
+            let c = super::load_config_from_str(text);
+            assert_eq!(c.subagent.max_concurrent, 10);
+            assert_eq!(c.subagent.max_total, 10);
+            assert!(
+                c.warnings
+                    .iter()
+                    .any(|w| w.contains("subagent.max_concurrent (32)")),
+                "{:?}",
+                c.warnings
+            );
+        }
+        // Lowering only the total below the default concurrency also clamps.
+        let c = super::load_config_from_str("subagent.max_total = 5\n");
+        assert_eq!(c.subagent.max_concurrent, 5);
     }
 
     #[test]

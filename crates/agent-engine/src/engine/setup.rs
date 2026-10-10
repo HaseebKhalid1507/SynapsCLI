@@ -217,13 +217,20 @@ pub(crate) fn resolve_session_and_prompt(
             .map_err(|e| crate::RuntimeError::Config(format!("invalid prompt manifest: {e}")))?;
         let delegation_policy_digest = delegation_policy.as_ref().map(|policy| policy.digest());
         if let Some(policy) = delegation_policy {
+            // The manifest's policy owns concurrency and totals; nesting
+            // depth is not part of a manifest, so the user's limit applies.
             runtime.install_orchestration(Arc::new(
-                crate::orchestration::OrchestrationRuntime::new(policy),
+                crate::orchestration::OrchestrationRuntime::new(policy)
+                    .with_max_depth(runtime.subagent_limits().max_depth)
+                    .map_err(|error| crate::RuntimeError::Config(error.into()))?,
             ));
         } else {
             runtime.install_orchestration(Arc::new(
-                crate::orchestration::OrchestrationRuntime::baseline(model.clone(), 8, 64)
-                    .map_err(|error| crate::RuntimeError::Config(error.into()))?,
+                crate::orchestration::OrchestrationRuntime::from_limits(
+                    model.clone(),
+                    runtime.subagent_limits(),
+                )
+                .map_err(|error| crate::RuntimeError::Config(error.into()))?,
             ));
         }
         let user = system
@@ -250,8 +257,11 @@ pub(crate) fn resolve_session_and_prompt(
         let foreground = crate::orchestration::canonical_foreground_identity(runtime.model())
             .map_err(|e| crate::RuntimeError::Config(format!("invalid foreground model: {e}")))?;
         runtime.install_orchestration(Arc::new(
-            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64)
-                .map_err(|error| crate::RuntimeError::Config(error.into()))?,
+            crate::orchestration::OrchestrationRuntime::from_limits(
+                foreground,
+                runtime.subagent_limits(),
+            )
+            .map_err(|error| crate::RuntimeError::Config(error.into()))?,
         ));
         runtime.set_system_prompt(legacy_prompt);
     }

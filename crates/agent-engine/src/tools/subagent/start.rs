@@ -134,9 +134,7 @@ impl Tool for SubagentStartTool {
             .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?;
         orchestration
             .reserve_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref())
-            .map_err(|reason| {
-                RuntimeError::Tool(format!("delegation tree budget denied: {reason:?}"))
-            })?;
+            .map_err(|reason| RuntimeError::Tool(format!("delegation denied: {reason}")))?;
         let decision = orchestration
             .resolve_and_authorize(&handle_id, requested_model)
             .map_err(|error| {
