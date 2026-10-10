@@ -20,6 +20,102 @@ pub(crate) enum SettingApply {
     Local(Result<(), String>),
 }
 
+/// Cycler rows whose Enter also opens a free-text editor, for values the
+/// parser accepts beyond the preset list (e.g. `cache_keepwarm = 6h`).
+pub(crate) const TYPED_CYCLERS: &[&str] = &["cache_keepwarm"];
+
+/// Config keys the parser accepts that deliberately have NO /settings row,
+/// with the reason. Every key in `config::KNOWN_CONFIG_KEYS` and
+/// `config::FAMILY_CONFIG_KEYS` must be a row in `ALL_SETTINGS` or listed
+/// here (enforced by `every_config_key_has_a_row_or_an_exclusion`), so a
+/// new config key cannot silently skip the settings UI. Keep this tight.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
+    // Dead config: parsed by `load_config` but read by nothing (the shell
+    // tool is built from `ShellConfig::default()`; no runtime consumer of
+    // the continuous-memory policy fields). No row until a PR wires the key
+    // up — that PR must move it back to a row in `define_settings!`.
+    ("shell.default_cols", NOT_READ_YET),
+    ("shell.default_rows", NOT_READ_YET),
+    ("shell.idle_timeout", NOT_READ_YET),
+    ("shell.max_output", NOT_READ_YET),
+    ("shell.max_sessions", NOT_READ_YET),
+    ("shell.readiness_strategy", NOT_READ_YET),
+    ("shell.readiness_timeout_ms", NOT_READ_YET),
+    ("shell.max_readiness_timeout_ms", NOT_READ_YET),
+    ("memory.default_mode", NOT_READ_YET),
+    ("memory.capture_user", NOT_READ_YET),
+    ("memory.capture_assistant", NOT_READ_YET),
+    ("memory.capture_tools", NOT_READ_YET),
+    ("memory.recall_max_records", NOT_READ_YET),
+    ("memory.recall_max_tokens", NOT_READ_YET),
+    ("memory.recall_timeout_ms", NOT_READ_YET),
+    ("memory.auto_consolidate", NOT_READ_YET),
+    ("memory.local_embeddings", NOT_READ_YET),
+    ("memory.gliner", NOT_READ_YET),
+    ("server.token", "secret: never echoed in a TUI"),
+    ("auth.machine_token", "secret: never echoed in a TUI"),
+    ("auth.remote_endpoint", "credential-broker wiring set by deployment, not a preference"),
+    ("server.allowed_origins", "WebSocket server mode only"),
+    ("server.auto_approve_confirms", "security-sensitive WebSocket server-mode policy"),
+    ("server.max_message_size", "WebSocket server mode only"),
+    ("bridge.uds_path", "internal sidecar plumbing"),
+    ("bridge.heartbeat_mirror", "internal sidecar plumbing"),
+    ("bridge.heartbeat_timeout_ms", "internal sidecar plumbing"),
+    ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
+    ("favorite_models", "owned by the model picker (/models favorites)"),
+    ("disabled_plugins", "owned by the Plugins tab"),
+    ("provider.*", "owned by the Providers tab (API keys)"),
+    ("keybind.*", "keybind family (keybind registry), not a single setting"),
+];
+
+/// Reason for dead-config exclusions (see `EXCLUDED_CONFIG_KEYS`).
+#[cfg_attr(not(test), allow(dead_code))]
+const NOT_READ_YET: &str =
+    "parsed but not read by the runtime yet (no-op); wiring it up must restore its settings row";
+
+/// Config-only rows: validate with the real config parser over the whole
+/// file as it would look after the write, so /settings can never persist a
+/// value `load_config` rejects (including cross-key rules). `Err` carries
+/// the parser's own message and the caller skips the write.
+fn config_edit(key: &str, value: &str) -> SettingApply {
+    SettingApply::Local(synaps_cli::config::validate_config_edit(key, value))
+}
+
+/// `on` / `off` only (what the cycler emits), then the parser check.
+fn on_off(key: &str, value: &str) -> SettingApply {
+    match value {
+        "on" | "off" => config_edit(key, value),
+        _ => SettingApply::Local(Err("expected on or off".to_string())),
+    }
+}
+
+/// A non-negative whole number, then the parser check (ranges, widths).
+fn whole_number(key: &str, value: &str) -> SettingApply {
+    match value.trim().parse::<u64>() {
+        Ok(_) => config_edit(key, value),
+        Err(_) => SettingApply::Local(Err("expected a whole number".to_string())),
+    }
+}
+
+/// Free text that must not be blank (the parser would store it verbatim).
+fn non_empty_text(key: &str, value: &str) -> SettingApply {
+    if value.trim().is_empty() {
+        SettingApply::Local(Err("must not be empty".to_string()))
+    } else {
+        config_edit(key, value)
+    }
+}
+
+/// A finite, non-negative dollar amount. Stricter than the parser, which
+/// also takes `inf`/`NaN`/negatives as an f64.
+fn budget_usd(key: &str, value: &str) -> SettingApply {
+    match value.trim().parse::<f64>() {
+        Ok(usd) if usd.is_finite() && usd >= 0.0 => config_edit(key, value),
+        _ => SettingApply::Local(Err("expected a dollar amount, e.g. 2.50".to_string())),
+    }
+}
+
 macro_rules! define_settings {
     ($(
         $key:literal, $label:expr, $category:ident, $editor:expr, $help:expr,
@@ -245,6 +341,274 @@ define_settings! {
             Ok(_) => SettingApply::Local(Ok(())),
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
         };
+
+    // ── Context & cache ──────────────────────────────────────────────────
+    // Config-only rows below validate through the real config parser
+    // (`config_edit`), so /settings can never write a value `load_config`
+    // rejects; `Local(Err)` skips the write.
+
+    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["5m", "1h", "hybrid"]),
+        "Prompt-cache lifetime for Anthropic requests: 5m (default), 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Takes effect next launch.",
+        |_app, value| config_edit("cache_ttl", value);
+
+    "cache_diagnostics", "Cache diagnostics", Context, EditorKind::Cycler(&["on", "off"]),
+        "Opt into the cache-diagnosis beta (reports why a prompt-cache read missed). Takes effect next launch.",
+        |_app, value| on_off("cache_diagnostics", value);
+
+    "cache_keepwarm", "Cache keep-warm", Context,
+        EditorKind::Cycler(&["off", "auto", "1h", "2h", "4h", "8h", "12h", "24h", "48h"]),
+        "Keep the prompt cache warm while idle: off, auto (stops once pings would cost more than the rewrite they prevent), or stop after <N>h (1–48). ←/→ cycles presets; Enter types any <N>h. New sessions after next launch; /keepwarm changes the current session.",
+        |_app, value| config_edit("cache_keepwarm", value);
+
+    "cache_keepwarm_auto_max_hours", "Keep-warm auto max (h)", Context,
+        EditorKind::Text { numeric: true },
+        "Longest an auto keep-warm idle period may run, in hours (1–48, default 24). Takes effect next launch.",
+        |_app, value| whole_number("cache_keepwarm_auto_max_hours", value);
+
+    "context_management.mode", "Context management", Context,
+        EditorKind::Cycler(&["off", "auto"]),
+        "Automatic context management: auto plans a wrap-up and hands over to a fresh context before the window fills; off disables it (default). Takes effect next launch.",
+        |_app, value| config_edit("context_management.mode", value);
+
+    "context_management.pressure_tokens", "Pressure threshold", Context,
+        EditorKind::Text { numeric: false },
+        "Token count where context pressure starts (auto = window-aware default: 140k on 200k, 250k on 1m). Must stay below the rollover threshold. Takes effect next launch.",
+        |_app, value| config_edit("context_management.pressure_tokens", value);
+
+    "context_management.rollover_tokens", "Rollover threshold", Context,
+        EditorKind::Text { numeric: false },
+        "Token count where a context rollover becomes due (auto = window-aware default: 180k on 200k, 400k on 1m). Takes effect next launch.",
+        |_app, value| config_edit("context_management.rollover_tokens", value);
+
+    "context_management.reserve_tokens", "Reserve tokens", Context,
+        EditorKind::Text { numeric: true },
+        "Minimum free tokens kept before any model round (1–1000000, default 16000). Takes effect next launch.",
+        |_app, value| whole_number("context_management.reserve_tokens", value);
+
+    "context_management.finish_rounds", "Finish rounds", Context,
+        EditorKind::Text { numeric: true },
+        "Extra plan/wrap-up rounds allowed after a rollover becomes due (0–8, default 2; 0 = none). Takes effect next launch.",
+        |_app, value| whole_number("context_management.finish_rounds", value);
+
+    "compaction_mode", "Compaction mode", Context, EditorKind::Cycler(&["remote", "local"]),
+        "Where /compact summarises: remote (the configured provider, default) or local (no network request is built). Takes effect next launch.",
+        |_app, value| config_edit("compaction_mode", value);
+
+    "compaction_exclude", "Compaction exclude", Context,
+        EditorKind::Text { numeric: false },
+        "Content kept out of remote compaction, comma-separated: user_text, assistant_text, thinking, tool_calls, tool_results, file_paths, event_data. Empty = none. Takes effect next launch.",
+        |_app, value| config_edit("compaction_exclude", value);
+
+    "refusal_retries", "Refusal retries", Context, EditorKind::Text { numeric: true },
+        "Retries when the model stops with a refusal (default 2). Takes effect next launch.",
+        |_app, value| match value.trim().parse::<u32>() {
+            Ok(_) => config_edit("refusal_retries", value),
+            Err(_) => SettingApply::Local(Err("expected a whole number".to_string())),
+        };
+
+    "telemetry", "Telemetry", Context, EditorKind::Cycler(&["off", "basic", "full"]),
+        "Per-request API log in ~/.cache/synaps/api-log.jsonl (stays on this machine): off (default), basic (timing, usage, cost) or full (adds rate-limit headers and cache diagnostics). Takes effect next launch.",
+        |_app, value| match value {
+            "off" | "basic" | "full" => config_edit("telemetry", value),
+            _ => SettingApply::Local(Err("expected off, basic or full".to_string())),
+        };
+
+    // ── Agent ────────────────────────────────────────────────────────────
+
+    "subagent.max_concurrent", "Subagents at once", Agent, EditorKind::Text { numeric: true },
+        "Workers running at the same time across the whole delegation tree (at least 1, default 16; never above the total). Takes effect next launch.",
+        |_app, value| whole_number("subagent.max_concurrent", value);
+
+    "subagent.max_total", "Subagents in total", Agent, EditorKind::Text { numeric: true },
+        "Workers dispatched and not yet reconciled across the delegation tree (at least 1, default 64). Takes effect next launch.",
+        |_app, value| whole_number("subagent.max_total", value);
+
+    "subagent.max_depth", "Subagent depth", Agent, EditorKind::Text { numeric: true },
+        "How deep workers may nest: 1 = only the foreground delegates (1–65535, default 4). Takes effect next launch.",
+        |_app, value| whole_number("subagent.max_depth", value);
+
+    "session_persistence", "Session persistence", Agent, EditorKind::Cycler(&["json", "journal"]),
+        "How sessions are saved: json (full rewrite, default) or journal (append-only deltas with periodic snapshots). Applies from the next session save.",
+        |_app, value| config_edit("session_persistence", value);
+
+    "agent_name", "Agent name", Agent, EditorKind::Text { numeric: false },
+        "Name the agent goes by. Takes effect next launch.",
+        |_app, value| non_empty_text("agent_name", value);
+
+    "identity", "Identity", Agent, EditorKind::Text { numeric: false },
+        "Identity preamble at the top of the system prompt (default: the SynapsCLI identity). Remove the line from the config to restore the default. Takes effect next launch.",
+        |_app, value| non_empty_text("identity", value);
+
+    "events.auto_turn", "Auto turns", Agent, EditorKind::Cycler(&["on", "off"]),
+        "Start a model turn automatically when runtime events arrive while idle (server, RPC and daemon sessions). Takes effect next launch.",
+        |_app, value| on_off("events.auto_turn", value);
+
+    "events.auto_turn_cap", "Auto-turn cap", Agent, EditorKind::Text { numeric: true },
+        "Consecutive automatic turns before the session waits for real input (default 5; 0 = unlimited). Takes effect next launch.",
+        |_app, value| whole_number("events.auto_turn_cap", value);
+
+    // ── Turn budgets ─────────────────────────────────────────────────────
+
+    "turn_budget.foreground.max_cost_usd", "Foreground cost (USD)", Budgets,
+        EditorKind::Text { numeric: false },
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| budget_usd("turn_budget.foreground.max_cost_usd", value);
+
+    "turn_budget.foreground.max_elapsed_secs", "Foreground time (s)", Budgets,
+        EditorKind::Text { numeric: true },
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.foreground.max_elapsed_secs", value);
+
+    "turn_budget.foreground.max_tool_calls", "Foreground tool calls", Budgets,
+        EditorKind::Text { numeric: true },
+        "Tool calls allowed in one turn — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.foreground.max_tool_calls", value);
+
+    "turn_budget.foreground.max_provider_rounds", "Foreground rounds", Budgets,
+        EditorKind::Text { numeric: true },
+        "Model round-trips allowed in one turn before the allowance runs out — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.foreground.max_provider_rounds", value);
+
+    "turn_budget.foreground.max_round_renewals", "Foreground renewals", Budgets,
+        EditorKind::Text { numeric: true },
+        "Automatic renewals of the round allowance after it runs out mid-turn; 0 = hard stop at the first exhaustion — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.foreground.max_round_renewals", value);
+
+    "turn_budget.foreground.max_context_tokens", "Foreground ctx tokens", Budgets,
+        EditorKind::Text { numeric: true },
+        "Context tokens one turn may use — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.foreground.max_context_tokens", value);
+
+    "turn_budget.foreground.max_accumulated_tool_result_bytes", "Foreground tool bytes", Budgets,
+        EditorKind::Text { numeric: true },
+        "Total bytes of tool results one turn may accumulate — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.foreground.max_accumulated_tool_result_bytes", value);
+
+    "turn_budget.autonomous.max_cost_usd", "Autonomous cost (USD)", Budgets,
+        EditorKind::Text { numeric: false },
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| budget_usd("turn_budget.autonomous.max_cost_usd", value);
+
+    "turn_budget.autonomous.max_elapsed_secs", "Autonomous time (s)", Budgets,
+        EditorKind::Text { numeric: true },
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.autonomous.max_elapsed_secs", value);
+
+    "turn_budget.autonomous.max_tool_calls", "Autonomous tool calls", Budgets,
+        EditorKind::Text { numeric: true },
+        "Tool calls allowed in one turn — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.autonomous.max_tool_calls", value);
+
+    "turn_budget.autonomous.max_provider_rounds", "Autonomous rounds", Budgets,
+        EditorKind::Text { numeric: true },
+        "Model round-trips allowed in one turn before the allowance runs out — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.autonomous.max_provider_rounds", value);
+
+    "turn_budget.autonomous.max_round_renewals", "Autonomous renewals", Budgets,
+        EditorKind::Text { numeric: true },
+        "Automatic renewals of the round allowance after it runs out mid-turn; 0 = hard stop at the first exhaustion — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.autonomous.max_round_renewals", value);
+
+    "turn_budget.autonomous.max_context_tokens", "Autonomous ctx tokens", Budgets,
+        EditorKind::Text { numeric: true },
+        "Context tokens one turn may use — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.autonomous.max_context_tokens", value);
+
+    "turn_budget.autonomous.max_accumulated_tool_result_bytes", "Autonomous tool bytes", Budgets,
+        EditorKind::Text { numeric: true },
+        "Total bytes of tool results one turn may accumulate — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.autonomous.max_accumulated_tool_result_bytes", value);
+
+    "turn_budget.worker.max_cost_usd", "Worker cost (USD)", Budgets,
+        EditorKind::Text { numeric: false },
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| budget_usd("turn_budget.worker.max_cost_usd", value);
+
+    "turn_budget.worker.max_elapsed_secs", "Worker time (s)", Budgets,
+        EditorKind::Text { numeric: true },
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.worker.max_elapsed_secs", value);
+
+    "turn_budget.worker.max_tool_calls", "Worker tool calls", Budgets,
+        EditorKind::Text { numeric: true },
+        "Tool calls allowed in one turn — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.worker.max_tool_calls", value);
+
+    "turn_budget.worker.max_provider_rounds", "Worker rounds", Budgets,
+        EditorKind::Text { numeric: true },
+        "Model round-trips allowed in one turn before the allowance runs out — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.worker.max_provider_rounds", value);
+
+    "turn_budget.worker.max_round_renewals", "Worker renewals", Budgets,
+        EditorKind::Text { numeric: true },
+        "Automatic renewals of the round allowance after it runs out mid-turn; 0 = hard stop at the first exhaustion — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.worker.max_round_renewals", value);
+
+    "turn_budget.worker.max_context_tokens", "Worker ctx tokens", Budgets,
+        EditorKind::Text { numeric: true },
+        "Context tokens one turn may use — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.worker.max_context_tokens", value);
+
+    "turn_budget.worker.max_accumulated_tool_result_bytes", "Worker tool bytes", Budgets,
+        EditorKind::Text { numeric: true },
+        "Total bytes of tool results one turn may accumulate — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.worker.max_accumulated_tool_result_bytes", value);
+    // ── Tool limits ──────────────────────────────────────────────────────
+
+    "progressive_tool_disclosure", "Progressive tools", ToolLimits,
+        EditorKind::Cycler(&["on", "off"]),
+        "Start each session with a small core tool set and activate the rest on demand (off = send every tool schema, default). Takes effect next launch.",
+        |_app, value| on_off("progressive_tool_disclosure", value);
+
+    "tools.deferred_loading", "Deferred tool loading", ToolLimits,
+        EditorKind::Cycler(&["on", "off"]),
+        "With progressive tools on the native Anthropic transport: send activatable tools up front as deferred so an activation never changes the cached prompt (default on). Takes effect next launch.",
+        |_app, value| on_off("tools.deferred_loading", value);
+
+    "tools.activation_confirm", "Tool activation", ToolLimits,
+        EditorKind::Cycler(&["auto", "prompt", "deny"]),
+        "When the model asks to activate tools: auto allows (default), prompt asks you, deny refuses. Takes effect next launch.",
+        |_app, value| config_edit("tools.activation_confirm", value);
+
+    "process_scopes", "Process scopes", ToolLimits, EditorKind::Cycler(&["auto", "off"]),
+        "Run the daemon, bash commands and shells in their own systemd scopes so the OOM killer stops one runaway command, not the terminal (Linux; default auto). Applies to commands started afterwards; the daemon's own scope changes next launch. Env SYNAPS_PROCESS_SCOPES overrides.",
+        |_app, value| config_edit("process_scopes", value);
+
+    "disabled_tools", "Disabled tools", ToolLimits, EditorKind::Text { numeric: false },
+        "Built-in tools never offered to the model, comma-separated runtime names (e.g. bash, ls). Empty = none. Takes effect next launch.",
+        |_app, value| config_edit("disabled_tools", value);
+
+    "disabled_skills", "Disabled skills", ToolLimits, EditorKind::Text { numeric: false },
+        "Skills never loaded, comma-separated names. Empty = none. Takes effect next launch.",
+        |_app, value| config_edit("disabled_skills", value);
+
+    // ── Appearance ───────────────────────────────────────────────────────
+
+    "max_fps", "Max FPS", Appearance, EditorKind::Text { numeric: true },
+        "Redraw cap while streaming, in frames per second (1–1000, default 60). Input always redraws immediately. Takes effect next launch.",
+        |_app, value| whole_number("max_fps", value);
+
+    "scroll_lines", "Scroll lines", Appearance, EditorKind::Text { numeric: true },
+        "Lines scrolled per mouse-wheel event (1–20, default 3). Takes effect next launch.",
+        |_app, value| whole_number("scroll_lines", value);
+
+    // ── Memory ───────────────────────────────────────────────────────────
+
+    "memory.backend", "Memory backend", Memory, EditorKind::Cycler(&["legacy", "axel"]),
+        "Note storage: legacy (default) or axel (needs the Axel executable below). Selecting a backend never enables capture or recall. Restart required.",
+        |_app, value| config_edit("memory.backend", value);
+
+    "memory.user_scope", "User-wide notes", Memory, EditorKind::Cycler(&["true", "false"]),
+        "Allow user-wide notes in addition to project notes (default false). Never grants capture or history consent. Restart required.",
+        |_app, value| config_edit("memory.user_scope", value);
+
+    "memory.axel.executable", "Axel executable", Memory, EditorKind::Text { numeric: false },
+        "Absolute path to the Axel memory service executable (never looked up on PATH). Restart required.",
+        |_app, value| config_edit("memory.axel.executable", value);
+
+    "memory.axel.brain", "Axel brain", Memory, EditorKind::Text { numeric: false },
+        "Absolute path to a shared Axel brain file (unset = the private per-user default). Restart required.",
+        |_app, value| config_edit("memory.axel.brain", value);
 }
 
 #[cfg(test)]
@@ -428,5 +792,273 @@ mod tests {
             apply_setting_dispatch("unknown_key_xyz", "val", &mut app),
             SettingApply::Local(Ok(()))
         ));
+    }
+
+    // ── Settings coverage (every config key editable or excluded) ─────────
+
+    /// Points SYNAPS_BASE_DIR at a temp dir holding `config` for the test's
+    /// lifetime; restores the previous value on drop. Hold
+    /// `CONFIG_ENV_TEST_LOCK` while it lives.
+    struct TempConfig {
+        dir: tempfile::TempDir,
+        old: Option<String>,
+    }
+
+    impl TempConfig {
+        fn new(content: &str) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("config"), content).expect("write config");
+            let old = std::env::var("SYNAPS_BASE_DIR").ok();
+            synaps_cli::config::set_base_dir_for_tests(dir.path().to_path_buf());
+            Self { dir, old }
+        }
+
+        fn write(&self, content: &str) {
+            std::fs::write(self.dir.path().join("config"), content).expect("write config");
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+                None => std::env::remove_var("SYNAPS_BASE_DIR"),
+            }
+        }
+    }
+
+    fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drift guard: every option a Cycler row can write is accepted by
+    /// `load_config` with no warning (and no stderr-only family diagnostic).
+    /// Catches cyclers like the old `context_window = auto`, which the parser
+    /// ignored with a warning.
+    #[test]
+    fn every_cycler_option_is_accepted_by_load_config() {
+        let _lock = config_lock();
+        let temp = TempConfig::new("");
+        let mut bad = Vec::new();
+        for def in ALL_SETTINGS {
+            let EditorKind::Cycler(options) = def.editor else {
+                continue;
+            };
+            for option in options.iter() {
+                let content = format!("{} = {option}\n", def.key);
+                temp.write(&content);
+                let config = synaps_cli::config::load_config();
+                if !config.warnings.is_empty() {
+                    bad.push(format!("{} = {option}: {:?}", def.key, config.warnings));
+                }
+                let problems = synaps_cli::config::config_content_problems(&content);
+                if !problems.is_empty() {
+                    bad.push(format!("{} = {option}: {problems:?}", def.key));
+                }
+            }
+        }
+        drop(temp);
+        assert!(bad.is_empty(), "cycler options the parser rejects: {bad:#?}");
+    }
+
+    /// Coverage guard: every key the config parser accepts — the top-level
+    /// `KNOWN_CONFIG_KEYS` and the explicit family list
+    /// `FAMILY_CONFIG_KEYS` — has a /settings row or an `EXCLUDED_CONFIG_KEYS`
+    /// entry. A new config key without either fails here.
+    #[test]
+    fn every_config_key_has_a_row_or_an_exclusion() {
+        let rows: Vec<&str> = ALL_SETTINGS.iter().map(|d| d.key).collect();
+        let excluded: Vec<&str> = EXCLUDED_CONFIG_KEYS.iter().map(|(k, _)| *k).collect();
+        let parser_keys: Vec<&str> = synaps_cli::config::KNOWN_CONFIG_KEYS
+            .iter()
+            .chain(synaps_cli::config::FAMILY_CONFIG_KEYS.iter())
+            .copied()
+            .collect();
+        let missing: Vec<&str> = parser_keys
+            .iter()
+            .copied()
+            .filter(|k| !rows.contains(k) && !excluded.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "config keys with neither a /settings row nor an EXCLUDED_CONFIG_KEYS entry: {missing:?}"
+        );
+        // EXCLUDED stays tight: only real parser keys, never also a row, and
+        // every exclusion says why.
+        for (key, reason) in EXCLUDED_CONFIG_KEYS {
+            assert!(parser_keys.contains(key), "excluded key {key} is not a parser key");
+            assert!(!rows.contains(key), "{key} is both a row and excluded");
+            assert!(!reason.trim().is_empty(), "{key} needs a reason");
+        }
+        // And the UI never writes a key the parser does not know.
+        for def in ALL_SETTINGS {
+            if matches!(def.editor, EditorKind::Display) {
+                continue;
+            }
+            assert!(
+                parser_keys.contains(&def.key),
+                "settings row {} is not a config parser key",
+                def.key
+            );
+        }
+    }
+
+    /// Every row shows a real current value: snapshot-backed rows are the
+    /// original fixed set; every other row is config-backed and resolves in
+    /// `config_row_display` (never the "?" fallback), and with an empty
+    /// config the value shown is one the parser accepts.
+    #[test]
+    fn every_config_backed_row_displays_a_parseable_default() {
+        use super::super::draw::{config_row_display, DEFAULT_DISPLAY, NONE_DISPLAY};
+        const SNAPSHOT_ROWS: &[&str] = &[
+            "model",
+            "thinking",
+            "reasoning_type",
+            "context_window",
+            "compaction_model",
+            "api_retries",
+            "subagent_timeout",
+            "max_tool_output",
+            "bash_timeout",
+            "bash_max_timeout",
+            "theme",
+            "tui_background_opaque",
+            "tui_streaming_glow",
+            "theme_transition",
+            "sidecar_toggle_key",
+            "startup.quick_start",
+            "startup.extensions_ready_timeout_secs",
+            "daemon.idle_exit_secs",
+            "daemon.prompt_abandon_secs",
+            "daemon.parked_evict_secs",
+        ];
+        let _lock = config_lock();
+        let temp = TempConfig::new("");
+        let mut bad = Vec::new();
+        for def in ALL_SETTINGS {
+            if SNAPSHOT_ROWS.contains(&def.key) {
+                continue;
+            }
+            let Some(shown) = config_row_display(def.key) else {
+                bad.push(format!("{}: no current-value display", def.key));
+                continue;
+            };
+            if let EditorKind::Cycler(options) = def.editor {
+                if !options.contains(&shown.as_str()) {
+                    bad.push(format!("{}: default {shown:?} not in {options:?}", def.key));
+                }
+            }
+            if shown == NONE_DISPLAY || shown == DEFAULT_DISPLAY {
+                continue;
+            }
+            let problems =
+                synaps_cli::config::config_content_problems(&format!("{} = {shown}\n", def.key));
+            if !problems.is_empty() {
+                bad.push(format!("{} = {shown}: {problems:?}", def.key));
+            }
+        }
+        drop(temp);
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// The display follows the configured value (normalised spellings).
+    #[test]
+    fn config_row_display_reads_the_configured_value() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        let temp = TempConfig::new(concat!(
+            "cache_ttl = 60m\n",
+            "cache_keepwarm = 6H\n",
+            "compaction_mode = local_only\n",
+            "process_scopes = no\n",
+            "disabled_tools = bash,  ls\n",
+            "turn_budget.worker.max_cost_usd = 2.5\n",
+        ));
+        assert_eq!(config_row_display("cache_ttl").as_deref(), Some("1h"));
+        assert_eq!(config_row_display("cache_keepwarm").as_deref(), Some("6h"));
+        assert_eq!(config_row_display("compaction_mode").as_deref(), Some("local"));
+        assert_eq!(config_row_display("process_scopes").as_deref(), Some("off"));
+        assert_eq!(config_row_display("disabled_tools").as_deref(), Some("bash, ls"));
+        assert_eq!(
+            config_row_display("turn_budget.worker.max_cost_usd").as_deref(),
+            Some("2.5")
+        );
+        drop(temp);
+    }
+
+    #[test]
+    fn typed_cyclers_are_cycler_rows() {
+        for key in TYPED_CYCLERS {
+            let def = ALL_SETTINGS
+                .iter()
+                .find(|d| d.key == *key)
+                .unwrap_or_else(|| panic!("{key} must be a settings row"));
+            assert!(matches!(def.editor, EditorKind::Cycler(_)), "{key} must be a Cycler");
+        }
+    }
+
+    fn is_ok(apply: SettingApply) -> bool {
+        matches!(apply, SettingApply::Local(Ok(())))
+    }
+
+    fn is_err(apply: SettingApply) -> bool {
+        matches!(apply, SettingApply::Local(Err(_)))
+    }
+
+    /// Config-only rows validate through the real parser: invalid input is
+    /// `Local(Err)` (no write), valid input `Local(Ok)` (caller writes).
+    #[test]
+    fn config_row_validators_accept_valid_and_reject_invalid() {
+        let _lock = config_lock();
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+
+            assert!(is_ok(d("cache_ttl", "hybrid")));
+            assert!(is_err(d("cache_ttl", "2h")));
+            assert!(is_ok(d("cache_keepwarm", "6h")));
+            assert!(is_err(d("cache_keepwarm", "49h")));
+            assert!(is_ok(d("cache_keepwarm_auto_max_hours", "48")));
+            assert!(is_err(d("cache_keepwarm_auto_max_hours", "49")));
+            assert!(is_ok(d("context_management.pressure_tokens", "auto")));
+            assert!(is_ok(d("context_management.pressure_tokens", "120000")));
+            assert!(is_err(d("context_management.pressure_tokens", "lots")));
+            assert!(is_err(d("context_management.finish_rounds", "9")));
+            assert!(is_ok(d("compaction_exclude", "thinking, tool_results")));
+            assert!(is_err(d("compaction_exclude", "thinking, secrets")));
+            assert!(is_ok(d("refusal_retries", "4")));
+            assert!(is_err(d("refusal_retries", "-1")));
+            assert!(is_err(d("telemetry", "loud")));
+            assert!(is_ok(d("subagent.max_depth", "3")));
+            assert!(is_err(d("subagent.max_depth", "0")));
+            assert!(is_err(d("subagent.max_depth", "70000")));
+            assert!(is_err(d("identity", "   ")));
+            assert!(is_ok(d("events.auto_turn_cap", "0")));
+            assert!(is_ok(d("turn_budget.worker.max_cost_usd", "2.50")));
+            assert!(is_err(d("turn_budget.worker.max_cost_usd", "-1")));
+            assert!(is_err(d("turn_budget.worker.max_cost_usd", "NaN")));
+            assert!(is_err(d("turn_budget.foreground.max_tool_calls", "many")));
+            assert!(is_ok(d("max_fps", "144")));
+            assert!(is_err(d("max_fps", "0")));
+            assert!(is_err(d("scroll_lines", "21")));
+            assert!(is_ok(d("memory.axel.brain", "/srv/axel/brain.r8")));
+            assert!(is_err(d("memory.axel.brain", "brain.r8")));
+            assert!(is_err(d("memory.user_scope", "yes")));
+            assert!(is_err(d("memory.backend", "sqlite")));
+        }
+
+        // Cross-key rules see the rest of the file.
+        temp.write("subagent.max_total = 4\n");
+        assert!(is_err(apply_setting_dispatch("subagent.max_concurrent", "5", &mut app)));
+        assert!(is_ok(apply_setting_dispatch("subagent.max_concurrent", "4", &mut app)));
+        // Validation never writes.
+        assert_eq!(
+            synaps_cli::config::read_config_value("subagent.max_concurrent"),
+            None
+        );
+        drop(temp);
     }
 }
