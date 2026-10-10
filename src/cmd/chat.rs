@@ -957,6 +957,7 @@ mod actor {
         let host = EngineHost::boot_and_install(HostOpts {
             profile,
             no_extensions,
+            mcp_discovery: agent_engine::McpDiscovery::Inline,
         })
         .await?;
         // Extension discovery completes BEFORE the session exists, so

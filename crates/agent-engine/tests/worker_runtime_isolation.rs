@@ -43,6 +43,7 @@ async fn host_with_disclosure_on() -> Arc<EngineHost> {
         let h = EngineHost::boot(HostOpts {
             profile: None,
             no_extensions: true,
+            mcp_discovery: agent_engine::McpDiscovery::Inline,
         })
         .await
         .expect("host boot");

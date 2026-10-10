@@ -15,6 +15,7 @@ async fn host() -> Arc<EngineHost> {
         let h = EngineHost::boot(HostOpts {
             profile: None,
             no_extensions: true,
+            mcp_discovery: agent_engine::McpDiscovery::Inline,
         })
         .await
         .expect("host boot");
@@ -38,6 +39,7 @@ async fn boot_twice_returns_same_host() {
     let other = EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .unwrap();
@@ -52,6 +54,7 @@ async fn boot_twice_returns_same_host() {
     let again = EngineHost::boot_and_install(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .unwrap();
@@ -177,6 +180,7 @@ async fn extensions_ready_returns_when_loader_panics() {
     let h = EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .unwrap();

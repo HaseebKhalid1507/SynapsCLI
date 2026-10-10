@@ -21,6 +21,7 @@ async fn host() -> Arc<EngineHost> {
     let h = EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .expect("host boots");

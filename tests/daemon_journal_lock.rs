@@ -36,7 +36,7 @@ async fn in_process_continue_of_live_daemon_session_refused() {
 
     // ── 1. Start daemon with one session ──
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true })
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline })
             .await
             .expect("host boot");
     let d = Daemon::start(

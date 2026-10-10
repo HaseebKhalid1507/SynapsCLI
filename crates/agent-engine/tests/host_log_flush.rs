@@ -14,6 +14,7 @@ async fn line_logged_before_flush_reaches_the_file() {
     let h = EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .expect("host boot");

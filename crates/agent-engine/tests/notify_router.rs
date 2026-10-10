@@ -67,6 +67,7 @@ async fn notification_router_reaches_every_session() {
     let host = EngineHost::boot_and_install(HostOpts {
         profile: None,
         no_extensions: false,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .expect("host boot");

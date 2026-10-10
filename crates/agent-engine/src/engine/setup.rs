@@ -118,6 +118,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let host = EngineHost::boot_and_install(HostOpts {
         profile: opts.profile.clone(),
         no_extensions: opts.no_extensions,
+        mcp_discovery: crate::McpDiscovery::Inline,
     })
     .await?;
     // `apply_config` is applied inside `foreground_runtime()` — before

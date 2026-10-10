@@ -402,6 +402,56 @@ fn progressive_off_with_mcp_server_daemon_starts() {
     wait_alive(&paths, false, 10);
 }
 
+/// Release blocker: a hung MCP server with no cached descriptors used to be
+/// discovered inside host boot (20 s), past the spawner's ready bound, so
+/// every auto-start failed. The daemon now boots on cached descriptors only
+/// and discovers in the background after it is accepting: the spawn must
+/// succeed and the client reach ready well within `SPAWN_READY_TIMEOUT`,
+/// and the hung server is still tried (in the background).
+#[test]
+fn hung_mcp_server_does_not_delay_daemon_ready() {
+    let env = Env::new();
+    let spy = env.home.path().join("hung-spy.log");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/agent-engine/tests/fixtures/mcp_fixture_server.py");
+    let mcp = serde_json::json!({"mcpServers": {"stuck": {
+        "command": "python3",
+        "args": [fixture.display().to_string()],
+        "env": {
+            "MCP_FIXTURE_SPY": spy.display().to_string(),
+            "MCP_FIXTURE_MODE": "hang"
+        }
+    }}});
+    std::fs::write(env.base().join("mcp.json"), mcp.to_string()).unwrap();
+    let paths = env.paths();
+
+    let t0 = Instant::now();
+    let mut a = Client::spawn(env.cmd(&["attach", "--create"]));
+    a.wait_stdout("○ ready", 60);
+    let elapsed = t0.elapsed();
+    assert!(a.err.contains("starting daemon (pid "), "the spawn succeeded:\n{}", a.err);
+    assert!(!a.err.contains("daemon unavailable"), "{}", a.err);
+    assert!(
+        elapsed < agent_engine::daemon::SPAWN_READY_TIMEOUT,
+        "ready after {elapsed:?}; MCP discovery must not gate daemon readiness"
+    );
+    assert!(registry::is_alive(&paths), "daemon running");
+
+    // Discovery still happens, after ready, in the background.
+    let t1 = Instant::now();
+    while !std::fs::read_to_string(&spy).unwrap_or_default().contains("spawn") {
+        assert!(
+            t1.elapsed() < Duration::from_secs(30),
+            "background MCP discovery never started the hung server"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    a.detach();
+    env.stop();
+    wait_alive(&paths, false, 10);
+}
+
 #[test]
 fn status_without_daemon_says_auto_start() {
     let env = Env::new();

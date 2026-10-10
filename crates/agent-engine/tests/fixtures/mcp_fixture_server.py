@@ -7,7 +7,12 @@ assumptions, no sockets, no network. Behavior is driven by env:
   MCP_FIXTURE_SPY        append-only event log file (spawn/request/notify/eof)
   MCP_FIXTURE_TOOLS_JSON path to a JSON array of tools to advertise
   MCP_FIXTURE_MODE       ok (default) | huge (oversized init line) |
-                         error (hostile provider error message on init)
+                         error (hostile provider error message on init) |
+                         hang (log spawn and requests, never reply; exit on
+                         stdin EOF)
+  MCP_FIXTURE_MODE_FILE  optional file whose stripped content overrides
+                         MCP_FIXTURE_MODE (switch behaviour without changing
+                         the launch config fingerprint)
 """
 import json
 import os
@@ -29,11 +34,30 @@ def reply(obj):
 
 log("spawn")
 mode = os.environ.get("MCP_FIXTURE_MODE", "ok")
+mode_file = os.environ.get("MCP_FIXTURE_MODE_FILE")
+if mode_file and os.path.exists(mode_file):
+    with open(mode_file) as f:
+        mode = f.read().strip() or mode
 tools = []
 tools_path = os.environ.get("MCP_FIXTURE_TOOLS_JSON")
 if tools_path and os.path.exists(tools_path):
     with open(tools_path) as f:
         tools = json.load(f)
+
+if mode == "hang":
+    # A hung server: reads (and logs) requests, never replies, and exits only
+    # when its stdin closes (the client dropped/killed it).
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        log("hang:" + str(msg.get("method", "")))
+    log("eof")
+    sys.exit(0)
 
 for line in sys.stdin:
     line = line.strip()

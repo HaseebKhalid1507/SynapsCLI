@@ -48,7 +48,7 @@ async fn two_sessions_one_daemon_isolated() {
     let (url, hits, bodies) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true }).await.expect("host boot");
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline }).await.expect("host boot");
     let d = Daemon::start(host.clone(), DaemonOpts { runtime_dir: Some(guard.base_dir().join("run")), ..Default::default() })
         .await
         .expect("daemon start");
@@ -172,7 +172,7 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
     let (url, _hits, _bodies) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true }).await.expect("host boot");
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline }).await.expect("host boot");
     let d = Daemon::start(host.clone(), DaemonOpts { runtime_dir: Some(guard.base_dir().join("run")), ..Default::default() })
         .await
         .expect("daemon start");

@@ -114,9 +114,35 @@ connection and one tool registry across every session. The daemon's
 ### Boot discovery for new servers
 
 A configured server with no fingerprint-matching descriptor-cache entry (a new
-server, or a changed command/args/env) is started **once at boot**: initialize,
+server, or a changed command/args/env) is started **once**: initialize,
 `tools/list`, recorded through `record_server_listing` (same lock and
-sanitisation as the lease write-back), then stopped. It is bounded to 20 s per
-server, and a timeout cannot leak a process because children are
-`kill_on_drop`. A failure leaves that server without tools for this run and is
-retried next boot. `SYNAPS_MCP_CACHE_WRITEBACK=0` disables it.
+sanitisation as the lease write-back), then stopped. Missing servers are
+discovered **in parallel** (at most 8 at once), each bounded to 20 s, so the
+worst case is about one timeout, not 20 s per server. A timeout cannot leak a
+process because children are `kill_on_drop`. `SYNAPS_MCP_CACHE_WRITEBACK=0`
+disables discovery (and the failure records below).
+
+**Failures are negative-cached.** A discovery that errors or times out is
+recorded in the same cache file (`discovery_failures`, keyed by server name:
+config fingerprint, last attempt time, attempt count) through the same locked,
+sanitising write path (`record_discovery_failure`). The server then
+contributes no tools and is **not started again** until its backoff expires:
+1 h after the first failure, doubling per consecutive failure, capped at
+24 h. Boot logs `MCP discovery for '<name>' failed recently; retrying after
+<time>` when it skips one. Editing the server's command/args/env (a new
+fingerprint) retries immediately; a successful listing removes the entry. The
+field is optional and omitted when empty, so the cache format version is
+unchanged and older binaries ignore it.
+
+**Where discovery runs.** In-process modes (TUI without daemon, `chat`,
+`agent`, `server`) discover during boot (`McpDiscovery::Inline`). The daemon
+boots with **cached descriptors only** (`McpDiscovery::Background`): it
+signals ready without waiting for any MCP server, and discovers uncached
+servers in a background task once it is accepting. When that task finishes,
+only the newly discovered servers' tools are added to the shared registry
+(one atomic batch; a rejected batch is logged and adds nothing). With
+progressive disclosure on they are dormant (searchable/activatable). With it
+**off** they are core tools: every live session sends them from its next
+request, which costs one prompt-cache rewrite per live session, once — the
+same effect as an extension registering late. Sessions started after the
+daemon restarts get them from the cache at boot.
