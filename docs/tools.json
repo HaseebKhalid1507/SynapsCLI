@@ -685,7 +685,7 @@
           "type": "string"
         },
         "timeout": {
-          "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
+          "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit.",
           "type": "integer"
         },
         "write_policy": {
@@ -788,17 +788,25 @@
     }
   },
   {
-    "description": "Resume a finished or timed-out reactive subagent with new instructions. The previous subagent's conversation state is prepended as context so the new run has full history. Returns a new handle_id — the original handle remains readable for comparison. Only works on subagents in finished/timed_out/failed state.",
+    "description": "Resume a finished, timed-out, failed or cancelled reactive subagent with new instructions. The worker continues its own archived conversation (every tool call and result) with the instructions as the next user turn, so it picks up where it stopped. Works after the handle was collected or reaped. For a worker from an earlier or crashed session, pass archive_path. Returns a new handle_id.",
     "name": "subagent_resume",
     "parameters": {
       "properties": {
+        "archive_path": {
+          "description": "Optional: a resume archive (.json under ~/.synaps-cli/subagent-history/) of a worker from an earlier or crashed session. handle_id is then only a label.",
+          "type": "string"
+        },
         "handle_id": {
           "description": "Handle ID of the completed subagent to resume (e.g. \"sa_3\").",
           "type": "string"
         },
         "instructions": {
-          "description": "New task or context to prepend to the resumed subagent. Injected before the prior conversation history.",
+          "description": "What to do next. Sent as the next user turn after the worker's own prior conversation.",
           "type": "string"
+        },
+        "timeout": {
+          "description": "Optional wall-clock limit in seconds for the resumed run (default: the prior run's); 0 = no limit.",
+          "type": "integer"
         }
       },
       "required": [
@@ -846,7 +854,7 @@
           "type": "string"
         },
         "timeout": {
-          "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
+          "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped.",
           "type": "integer"
         },
         "write_policy": {

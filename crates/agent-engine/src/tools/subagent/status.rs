@@ -72,6 +72,7 @@ impl Tool for SubagentStatusTool {
         let model = handle.model.clone();
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
+        let archive_error = handle.archive_error();
         let _ = handle;
         drop(reg);
 
@@ -99,6 +100,7 @@ impl Tool for SubagentStatusTool {
             "model":          model,
             "terminal_cause": terminal,
             "authorization":   authorization,
+            "archiveError": archive_error,
             "output_length":  output_length
         });
         if let Some(reason) = status.failure_reason() {

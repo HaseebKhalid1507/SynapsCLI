@@ -103,11 +103,68 @@ pub fn finalize_subagent(
     started_at: std::time::Instant,
     resumed_from: Option<&str>,
 ) {
+    let dir = state
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .archive_dir
+        .clone();
+    finalize_subagent_impl(
+        state,
+        parent_queue,
+        handle_id,
+        subagent_id,
+        agent_name,
+        started_at,
+        resumed_from,
+        dir.as_deref(),
+    )
+}
+
+/// [`finalize_subagent`] with an explicit resume-archive directory (tests).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_subagent_in(
+    state: &Arc<RwLock<SubagentState>>,
+    parent_queue: Option<&Arc<EventQueue>>,
+    handle_id: &str,
+    subagent_id: u64,
+    agent_name: &str,
+    started_at: std::time::Instant,
+    resumed_from: Option<&str>,
+    archive_dir: &std::path::Path,
+) {
+    finalize_subagent_impl(
+        state,
+        parent_queue,
+        handle_id,
+        subagent_id,
+        agent_name,
+        started_at,
+        resumed_from,
+        Some(archive_dir),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_subagent_impl(
+    state: &Arc<RwLock<SubagentState>>,
+    parent_queue: Option<&Arc<EventQueue>>,
+    handle_id: &str,
+    subagent_id: u64,
+    agent_name: &str,
+    started_at: std::time::Instant,
+    resumed_from: Option<&str>,
+    archive_dir: Option<&std::path::Path>,
+) {
     let (status, preview, cancelled) = {
         // R6: poison-safe — if the thread panicked while holding the write lock,
         // recover the inner value rather than re-panicking outside catch_unwind.
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
 
+        if s.finalization_started {
+            return;
+        }
+        s.finalization_started = true;
         if s.cancel_requested {
             // Honest label: user abort ≠ error, ≠ completion.
             s.status = SubagentStatus::Cancelled;
@@ -117,12 +174,33 @@ pub fn finalize_subagent(
             // so the parent is never told a lie.
             s.status = SubagentStatus::Failed("thread exited without terminal status".into());
         }
-        if s.finished_at.is_none() {
-            s.finished_at = Some(std::time::Instant::now());
-        }
-        let preview: String = s.partial_text.chars().take(300).collect();
+        // The worker's latest word (its result), not the first words of the run.
+        let latest = s.last_response_text().trim();
+        let source = if latest.is_empty() {
+            s.partial_text.trim()
+        } else {
+            latest
+        };
+        let preview: String = source.chars().take(300).collect();
         (s.status.clone(), preview, s.cancel_requested)
     };
+
+    // Archive the full conversation (every terminal status, cancel included) so
+    // subagent_resume and subagent_collect still work after the handle is reaped.
+    if let Some(dir) = archive_dir {
+        super::archive::archive_finished_worker(state, handle_id, dir);
+    } else {
+        let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+        if s.history.is_some() || s.archive_meta.is_some() {
+            s.archive_error =
+                Some("missing launch archive directory; history retained in memory".into());
+        }
+    }
+    {
+        let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+        s.finished_at = Some(std::time::Instant::now());
+        s.finalization_ready = true;
+    }
 
     if cancelled {
         tracing::info!("subagent {handle_id}: cancelled by user — suppressing completion wake");
@@ -169,6 +247,84 @@ mod tests {
             inner.partial_text = text.to_string();
         }
         s
+    }
+
+    #[test]
+    fn completion_is_published_only_with_recovery_outcome_and_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state(SubagentStatus::Completed, "done");
+        {
+            let mut s = state.write().unwrap();
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "worker".into(),
+                model: "model".into(),
+                system_prompt: "system".into(),
+                timeout_secs: 1,
+            });
+            s.history = Some(vec![Arc::new(
+                serde_json::json!({"role":"user", "content":"task"}),
+            )]);
+            assert_eq!(s.public_status(), SubagentStatus::Running);
+        }
+        let queue = Arc::new(EventQueue::new(100));
+        let started = std::time::Instant::now();
+        finalize_subagent_in(
+            &state,
+            Some(&queue),
+            "sa_order",
+            1,
+            "worker",
+            started,
+            None,
+            dir.path(),
+        );
+        {
+            let s = state.read().unwrap();
+            assert!(s.finalization_ready);
+            assert!(s.finished_at.is_some());
+            assert!(super::super::archive::read_archive(s.archive_path.as_ref().unwrap()).is_ok());
+            assert_eq!(s.public_status(), SubagentStatus::Completed);
+        }
+        let count = queue.len();
+        assert_eq!(count, 1);
+        state.write().unwrap().cancel_requested = true;
+        finalize_subagent_in(
+            &state,
+            Some(&queue),
+            "sa_order",
+            1,
+            "worker",
+            started,
+            None,
+            dir.path(),
+        );
+        assert_eq!(queue.len(), count);
+        assert_eq!(state.read().unwrap().status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn cancelled_finalizer_is_ready_without_duplicate_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state(SubagentStatus::Running, "cancelled");
+        state.write().unwrap().cancel_requested = true;
+        let queue = Arc::new(EventQueue::new(100));
+        for _ in 0..2 {
+            finalize_subagent_in(
+                &state,
+                Some(&queue),
+                "sa_cancel",
+                1,
+                "worker",
+                std::time::Instant::now(),
+                None,
+                dir.path(),
+            );
+        }
+        assert!(queue.is_empty());
+        let s = state.read().unwrap();
+        assert!(s.finalization_ready);
+        assert!(s.finished_at.is_some());
+        assert_eq!(s.public_status(), SubagentStatus::Cancelled);
     }
 
     // U6: completion event schema
