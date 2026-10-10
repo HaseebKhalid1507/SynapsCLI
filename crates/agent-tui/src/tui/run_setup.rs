@@ -142,6 +142,7 @@ pub(crate) async fn run_setup(
     let host = EngineHost::boot_and_install(HostOpts {
         profile,
         no_extensions,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await?;
     let handle = host

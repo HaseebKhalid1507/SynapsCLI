@@ -37,8 +37,25 @@ pub const EXIT_VERSION: i32 = 2;
 pub const EXIT_DAEMON_LOST: i32 = 4;
 /// Env var carrying the write end of the ready pipe to a spawned daemon.
 pub const READY_FD_ENV: &str = "SYNAPS_DAEMON_READY_FD";
-/// How long `spawn_detached` waits for the child's ready byte.
-pub const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound `run_foreground` waits for extension discovery before it
+/// starts accepting and signals ready (sidecars spawn once per daemon, and
+/// early sessions must see extension tools/hooks).
+pub const EXTENSION_DISCOVERY_WAIT: Duration = Duration::from_secs(10);
+/// Headroom for the rest of the daemon's pre-ready work (host boot with
+/// cached MCP descriptors only, bind, registry files) and a loaded machine.
+const SPAWN_READY_MARGIN: Duration = Duration::from_secs(5);
+/// How long `spawn_detached` waits for the child's ready byte. Strictly
+/// greater than the daemon's bounded pre-ready work: the extension wait plus
+/// a margin. MCP discovery never counts here — the daemon runs it in the
+/// background after it is accepting ([`crate::McpDiscovery::Background`]).
+pub const SPAWN_READY_TIMEOUT: Duration =
+    Duration::from_secs(EXTENSION_DISCOVERY_WAIT.as_secs() + SPAWN_READY_MARGIN.as_secs());
+// The spawner must outwait the daemon's bounded pre-ready work, or one slow
+// extension walk makes every auto-start fail (killed before `R`).
+const _: () = assert!(
+    SPAWN_READY_TIMEOUT.as_secs() > EXTENSION_DISCOVERY_WAIT.as_secs(),
+    "SPAWN_READY_TIMEOUT must exceed EXTENSION_DISCOVERY_WAIT"
+);
 
 /// `SYNAPS_DAEMON` feature flag: ON unless set to `0`/`false`/`off`/`no`.
 /// `SYNAPS_DAEMON=1` is accepted (no-op, kept for older scripts).
@@ -488,7 +505,8 @@ pub fn signal_ready() {
 }
 
 /// Parent side: `current_exe daemon --foreground …` in its own session
-/// (`setsid`), stdout → null, stderr → pipe; waits ≤ 5 s for `R` on the
+/// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
+/// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
 /// ready pipe. EOF before `R` = child died → error with its stderr tail.
 #[cfg(unix)]
 pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
@@ -751,14 +769,23 @@ fn autospawn_idle_exit_from(v: Option<&str>, cfg_secs: u64) -> Option<Duration> 
 pub const AUTOSPAWN_IDLE_EXIT: Duration = Duration::from_secs(10);
 
 
-/// `synaps daemon --foreground` body: gate → boot host → extension discovery
-/// once → start → wait for SIGTERM/SIGINT/Shutdown frame/idle.
+/// `synaps daemon --foreground` body: gate → boot host (cached MCP
+/// descriptors only) → extension discovery once → start → background MCP
+/// discovery → wait for SIGTERM/SIGINT/Shutdown frame/idle.
 pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if !enabled() {
         anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
     }
-    let host = EngineHost::boot_and_install(crate::HostOpts { profile: opts.profile.clone(), no_extensions: false }).await?;
-    // Sidecars spawn once per daemon: discover before accepting (bounded 10 s).
+    // Background MCP discovery: a hung/dead MCP server must never delay the
+    // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
+    let host = EngineHost::boot_and_install(crate::HostOpts {
+        profile: opts.profile.clone(),
+        no_extensions: false,
+        mcp_discovery: crate::McpDiscovery::Background,
+    })
+    .await?;
+    // Sidecars spawn once per daemon: discover before accepting (bounded by
+    // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let _loader = crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None);
     let wait = async {
@@ -769,8 +796,11 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
-        tracing::warn!("daemon: extension discovery still running after 10 s; accepting anyway");
+    if tokio::time::timeout(EXTENSION_DISCOVERY_WAIT, wait).await.is_err() {
+        tracing::warn!(
+            wait = ?EXTENSION_DISCOVERY_WAIT,
+            "daemon: extension discovery still running; accepting anyway"
+        );
     }
     // C3 router: widget.* frames from every sidecar fan out to every live
     // session (daemon-global widgets today — frames carry no session id).
@@ -780,7 +810,13 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if opts.factory.is_none() {
         opts.factory = Some(host_factory(&host));
     }
+    let mcp_host = Arc::clone(&host);
     let daemon = Daemon::start(host, opts).await?;
+    // Accepting and ready: now discover uncached MCP servers. New servers'
+    // tools join the shared registry when it finishes (see
+    // `EngineHost::spawn_background_mcp_discovery` for live-session effects).
+    let _mcp_discovery = mcp_host.spawn_background_mcp_discovery();
+    drop(mcp_host);
     let state = Arc::clone(&daemon.state);
     tokio::spawn(async move {
         #[cfg(unix)]

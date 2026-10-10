@@ -19,7 +19,7 @@ use serial_test::serial;
 
 async fn start(runtime_dir: &std::path::Path) -> Daemon {
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true }).await.expect("host boot");
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline }).await.expect("host boot");
     Daemon::start(host, DaemonOpts { runtime_dir: Some(runtime_dir.to_path_buf()), ..Default::default() })
         .await
         .expect("daemon start")

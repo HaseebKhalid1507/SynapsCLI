@@ -70,6 +70,7 @@ async fn attach_to_parked_session_replays_conversation() {
     let host: Arc<EngineHost> = EngineHost::boot_and_install(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .expect("host boot");
