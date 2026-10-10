@@ -299,6 +299,14 @@ impl SessionManager {
         tx_delta: Option<&crate::tools::output::DeltaSender>,
         max_output: usize,
     ) -> Result<(String, String, String)> {
+        self.create_session_cancellable(opts, tx_delta, max_output, None).await
+    }
+
+    pub(crate) async fn create_session_cancellable(
+        &self, opts: SessionOpts,
+        tx_delta: Option<&crate::tools::output::DeltaSender>, max_output: usize,
+        cancel: Option<&crate::CancellationToken>,
+    ) -> Result<(String, String, String)> {
         // --- Check session limit ---
         {
             let sessions = self
@@ -338,12 +346,26 @@ impl SessionManager {
             .unwrap_or(self.config.idle_timeout);
 
         // --- Spawn PTY ---
-        let mut pty = PtyHandle::spawn(
-            &command,
-            opts.working_directory.as_deref(),
-            opts.env,
-            rows,
-            cols,
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(RuntimeError::Tool("Shell canceled before launch".into()));
+        }
+        let probe_cwd = opts.working_directory.clone();
+        let probe_env = opts.env;
+        // The worker prepares only the probe; it never spawns a PTY command.
+        let probe = tokio::task::spawn_blocking(move ||
+            PtyHandle::prepare_scope(probe_cwd.as_deref(), &probe_env));
+        let prepared = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(RuntimeError::Tool("Shell canceled before launch".into())),
+                result = probe => result,
+            }
+        } else { probe.await }.map_err(|e| RuntimeError::Tool(e.to_string()))?;
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(RuntimeError::Tool("Shell canceled before launch".into()));
+        }
+        let mut pty = PtyHandle::spawn_prepared(
+            &command, opts.working_directory.as_deref(), rows, cols, prepared,
         )?;
 
         // --- Build readiness detector (with per-session overrides) ---
@@ -640,6 +662,17 @@ mod tests {
             readiness_timeout_ms: None,
             idle_timeout: None,
         }
+    }
+
+    #[tokio::test]
+    async fn canceled_creation_never_spawns_or_registers_a_shell() {
+        let mgr = default_manager();
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let error = mgr.create_session_cancellable(opts_for("echo should-not-run"), None,
+            256 * 1024, Some(&token)).await.unwrap_err().to_string();
+        assert!(error.contains("canceled before launch"), "{error}");
+        assert!(mgr.sessions.lock().unwrap().is_empty());
     }
 
     // 1. Create session with `echo hello` → output contains "hello"

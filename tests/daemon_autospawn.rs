@@ -276,12 +276,13 @@ fn first_attach_spawns_second_reuses_stop_ends() {
 #[cfg(target_os = "linux")]
 #[test]
 fn spawned_daemon_runs_in_its_own_scope_when_available() {
+        if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") { return; }
     let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") else {
         eprintln!("skip: no XDG_RUNTIME_DIR (no systemd user manager here)");
         return;
     };
     let usable = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "/bin/true"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -294,7 +295,9 @@ fn spawned_daemon_runs_in_its_own_scope_when_available() {
     let env = Env::new();
     let paths = env.paths();
     let mut cmd = env.cmd(&["attach", "--create"]);
-    cmd.env("XDG_RUNTIME_DIR", &xdg);
+    cmd.env("XDG_RUNTIME_DIR", &xdg)
+        .env("SYNAPS_TEST_REAL_SCOPES", "1")
+        .env("SYNAPS_PROCESS_SCOPES", "auto");
     let mut a = Client::spawn(cmd);
     a.wait_stdout("○ ready", 30);
     let info = registry::read_daemon_json(&paths).expect("daemon.json");

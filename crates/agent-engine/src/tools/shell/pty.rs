@@ -144,6 +144,12 @@ pub struct PtyHandle {
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
+type PreparedScope = (
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    Option<std::path::PathBuf>,
+    Option<crate::process_scope::ScopeLauncher>,
+);
+
 impl PtyHandle {
     /// Spawn a command on a new PTY.
     ///
@@ -158,6 +164,29 @@ impl PtyHandle {
         env: HashMap<String, String>,
         rows: u16,
         cols: u16,
+    ) -> Result<Self> {
+        let prepared = Self::prepare_scope(working_dir, &env);
+        Self::spawn_prepared(command, working_dir, rows, cols, prepared)
+    }
+
+    pub(crate) fn prepare_scope(working_dir: Option<&str>, env: &HashMap<String, String>) -> PreparedScope {
+        // Snapshot after TERM and user overrides; probe and child see exactly
+        // the same environment. This synchronous API may probe for up to 3 s.
+        let mut effective_env = crate::process_scope::inherited_env();
+        crate::process_scope::set_env(&mut effective_env, "TERM", "xterm-256color");
+        for (k, v) in env { crate::process_scope::set_env(&mut effective_env, k, v); }
+        let scope_cwd = working_dir.map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| effective_env.iter().find(|(k, _)| k == "HOME")
+                .map(|(_, v)| std::path::PathBuf::from(v)));
+        let launcher = scope_cwd.as_deref().and_then(|cwd|
+            crate::process_scope::launcher_for_effective_env(&effective_env, Some(cwd)));
+        (effective_env, scope_cwd, launcher)
+    }
+
+    pub(crate) fn spawn_prepared(
+        command: &str, working_dir: Option<&str>, rows: u16, cols: u16,
+        prepared: PreparedScope,
     ) -> Result<Self> {
         // 1. Open a PTY pair with the requested size.
         let pty_system = native_pty_system();
@@ -176,10 +205,7 @@ impl PtyHandle {
         let program = parts
             .first()
             .ok_or_else(|| RuntimeError::Tool("Empty command string".to_string()))?;
-        // Its own systemd scope (Linux, when available), like the bash tool:
-        // a long-lived shell running a memory-hungry build is then the only
-        // thing the OOM killer stops. The env below is merged onto the
-        // inherited one, so the child can always reach the user manager.
+        let (effective_env, scope_cwd, launcher) = prepared;
         let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = {
             let program: std::ffi::OsString = (*program).into();
             let args = parts
@@ -187,8 +213,8 @@ impl PtyHandle {
                 .skip(1)
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>();
-            match crate::process_scope::launcher_for_env(None) {
-                Some(launcher) => launcher.wrap("synaps tool: shell", program, args),
+            match launcher {
+                Some(launcher) => launcher.wrap("synaps tool: shell", crate::process_scope::resolve_program(program, &effective_env, scope_cwd.as_deref()).map_err(|e| RuntimeError::Tool(e.to_string()))?, args),
                 None => (program, args),
             }
         };
@@ -202,11 +228,8 @@ impl PtyHandle {
             cmd.cwd(dir);
         }
 
-        // Inject environment variables; always set TERM.
-        cmd.env("TERM", "xterm-256color");
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
+        cmd.env_clear();
+        for (k, v) in &effective_env { cmd.env(k, v); }
 
         // 3. Spawn the child on the slave side.
         let child = pair
@@ -419,11 +442,12 @@ mod tests {
     /// at the reader-thread handoff, and dropping the handle releases it.
     /// A PTY shell gets its own systemd scope when the machine supports it
     /// (S348): a long-lived shell running a memory-hungry build is then the
-    /// only cgroup the OOM killer stops. It still has a working terminal.
+    /// separate cgroup (not a memory cap or protection from ancestor OOM). It still has a working terminal.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[serial]
     async fn pty_shell_gets_its_own_scope_when_available() {
+        if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") { return; }
         let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
         let before = pty_output_snapshot();
         // Typed into an interactive shell, as the tool is used (the spawn

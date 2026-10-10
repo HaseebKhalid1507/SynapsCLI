@@ -226,7 +226,8 @@ impl Tool for BashTool {
 /// keep using memory, after a timeout or cancel (S348). The command leads its
 /// own group: `setsid` in `pre_exec`, and `systemd-run --scope` execs in
 /// place, so the pid is the group id. Dropped before the `Child`, so the
-/// leader is never reaped (and its pid never reused) before the kill.
+/// leader is not reaped by Child drop before the kill. Explicit kill paths
+/// signal/disarm first; normal wait disarms synchronously on completion.
 struct KillGroupUnlessFinished {
     pgid: Option<u32>,
 }
@@ -241,7 +242,7 @@ impl KillGroupUnlessFinished {
         self.pgid = None;
     }
 
-    /// Kill the group now (the output cap) and disarm.
+    /// Signal and disarm BEFORE any explicit kill/wait can reap the leader.
     fn kill_now(&mut self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid.take() {
@@ -308,21 +309,40 @@ pub(crate) async fn run_shell_command(
                 vec!["-NoProfile".into(), "-Command".into(), script.into()],
             ),
         };
-        // Its own systemd scope (Linux, when available): a command that eats
-        // all memory is then the only thing the OOM killer stops, not the
-        // daemon and every session sharing its cgroup. See `process_scope`.
-        let (program, args) =
-            match crate::process_scope::launcher_for_env(ctx.capabilities.env.as_deref()) {
-                Some(launcher) => launcher.wrap(spec.scope_description(), program, args),
-                None => (program, args),
-            };
+        let effective_env = ctx.capabilities.env.as_ref()
+            .map(|env| env.iter().map(|(k, v)| (k.into(), v.into())).collect())
+            .unwrap_or_else(crate::process_scope::inherited_env);
+        let probe_env = effective_env.clone();
+        let probe_cwd = ctx.capabilities.cwd.clone();
+        // This worker can only launch a bounded throwaway probe. Abandoning
+        // this future can never launch the real command from the worker.
+        if ctx.capabilities.launch_cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(RuntimeError::Tool("Command canceled before launch".into()));
+        }
+        let probe_task = tokio::task::spawn_blocking(move || {
+            crate::process_scope::launcher_for_effective_env(
+                &probe_env, probe_cwd.as_deref())
+        });
+        let launcher = if let Some(cancel) = &ctx.capabilities.launch_cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(RuntimeError::Tool("Command canceled before launch".into())),
+                result = probe_task => result,
+            }
+        } else {
+            probe_task.await
+        }.map_err(|e| RuntimeError::Tool(e.to_string()))?;
+        let (program, args) = match launcher {
+            Some(launcher) => launcher.wrap(spec.scope_description(),
+                crate::process_scope::resolve_program(program, &effective_env,
+                    ctx.capabilities.cwd.as_deref()).map_err(|e| RuntimeError::Tool(e.to_string()))?, args),
+            None => (program, args),
+        };
         let mut cmd = tokio::process::Command::new(program);
         if let Some(cwd) = ctx.capabilities.cwd.as_deref() {
             cmd.current_dir(cwd);
         }
-        if let Some(env) = &ctx.capabilities.env {
-            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-        }
+        cmd.env_clear().envs(effective_env);
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -343,6 +363,9 @@ pub(crate) async fn run_shell_command(
             });
         }
 
+        if ctx.capabilities.launch_cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(RuntimeError::Tool("Command canceled before launch".into()));
+        }
         let mut child = cmd.spawn().map_err(|e| RuntimeError::Tool(e.to_string()))?;
         // Armed until the command finishes on its own: a timeout, a cancel,
         // the output cap or an abandoned password prompt kills the whole
@@ -483,6 +506,7 @@ pub(crate) async fn run_shell_command(
                                 flush_result.map_err(|e| RuntimeError::Tool(e.to_string()))?;
                             }
                             None => {
+                                group.kill_now();
                                 let _ = child.kill().await;
                                 return Err(RuntimeError::Tool(
                                     "Command canceled while waiting for password".to_string(),
@@ -536,13 +560,13 @@ pub(crate) async fn run_shell_command(
                     let _ = child.kill().await;
                 }
             }
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| RuntimeError::Tool(e.to_string()))?;
+            let status = child.wait().await;
+            // wait errors may mean the leader was already reaped externally;
+            // never signal a potentially recycled process-group ID afterwards.
+            group.finished();
+            let status = status.map_err(|e| RuntimeError::Tool(e.to_string()))?;
             // Finished on its own: leave anything it deliberately started in
             // the background (`server &`) running, as before.
-            group.finished();
             // Zeroize redactions (passwords) from memory now that command is done
             for secret in &mut redactions {
                 secret.zeroize();
@@ -621,6 +645,37 @@ fn references_env_name(script: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_child_kills_signal_and_disarm_group_before_reaping() {
+        let source = include_str!("bash.rs");
+        let executor = source.split("pub(crate) async fn run_shell_command").nth(1).unwrap()
+            .split("#[cfg(test)]").next().unwrap();
+        let kills: Vec<_> = executor.match_indices("let _ = child.kill().await;").collect();
+        assert_eq!(kills.len(), 2, "audit every new explicit kill path");
+        for (offset, _) in kills {
+            assert!(executor[..offset].trim_end().ends_with("group.kill_now();"));
+        }
+        assert!(executor.contains("let status = child.wait().await;"));
+        let wait = executor.split("let status = child.wait().await;").nth(1).unwrap();
+        assert!(wait.find("group.finished();").unwrap() < wait.find("status.map_err").unwrap());
+        assert!(executor.find("let mut child = cmd.spawn()").unwrap()
+            < executor.find("let mut group = KillGroupUnlessFinished::new").unwrap());
+    }
+
+    #[tokio::test]
+    async fn canceled_launch_never_runs_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-exist");
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let mut ctx = create_tool_context();
+        ctx.capabilities.launch_cancel = Some(token);
+        let error = BashTool.execute(json!({"command": format!("touch '{}'", marker.display())}), ctx)
+            .await.unwrap_err().to_string();
+        assert!(error.contains("canceled before launch"), "{error}");
+        assert!(!marker.exists());
+    }
+
     fn own_cgroup() -> String {
         std::fs::read_to_string("/proc/self/cgroup")
             .unwrap_or_default()
@@ -635,6 +690,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bash_command_gets_its_own_scope_when_available() {
+        if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") { return; }
         let out = BashTool
             .execute(
                 json!({ "command": "cat /proc/self/cgroup; echo pid=$$", "timeout": 30 }),

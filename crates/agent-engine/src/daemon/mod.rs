@@ -479,12 +479,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()?;
-    let mut fds = [0i32; 2];
-    // SAFETY: plain pipe(2) on a valid 2-slot array.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+
 
     let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
     if let Some(p) = &opts.profile {
@@ -499,18 +494,33 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     if opts.allow_legacy_mcp {
         cmd_args.push("--allow-legacy-mcp".into());
     }
-    // Its own systemd scope (Linux, when available): the daemon outlives the
-    // terminal that spawned it, and a memory-hungry process in that terminal
-    // can no longer get the daemon killed with it. `systemd-run --scope`
-    // execs in place, so the pid, the ready fd and the env all carry over.
-    let (program, cmd_args) = match crate::process_scope::launcher_for_env(None) {
+    // Scope wrapping execs in place: PID, ready FD and stdio remain intact.
+    // Separate scopes do not protect against ancestor/global OOM.
+    let mut effective_env = crate::process_scope::inherited_env();
+    crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
+    effective_env.retain(|(k, _)| k != READY_FD_ENV);
+    let (program, cmd_args) = match crate::process_scope::launcher_for_effective_env(&effective_env, None) {
         Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
         None => (exe.into_os_string(), cmd_args),
     };
+    let mut fds = [0i32; 2];
+    // SAFETY: plain pipe(2) on a valid 2-slot array.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    // Probe has finished before readiness capabilities exist.
+    for fd in [read_fd, write_fd] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(read_fd); libc::close(write_fd); }
+            return Err(error.into());
+        }
+    }
+    crate::process_scope::set_env(&mut effective_env, READY_FD_ENV, write_fd.to_string());
     let mut cmd = std::process::Command::new(program);
     cmd.args(cmd_args);
-    cmd.env("SYNAPS_DAEMON", "1")
-        .env(READY_FD_ENV, write_fd.to_string())
+    cmd.env_clear().envs(effective_env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -527,7 +537,13 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            unsafe { libc::close(read_fd); libc::close(write_fd); }
+            return Err(error.into());
+        }
+    };
     // SAFETY: parent no longer needs the write end; closing it makes EOF mean "child died".
     unsafe { libc::close(write_fd) };
     let pid = child.id();
@@ -571,16 +587,24 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
         drop(child);
         return Ok(pid);
     }
-    let mut tail = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut tail);
-    }
-    // EOF before `R`: the child is gone (or dying) — collect its status. A
-    // still-running child that just never signalled is killed.
+    // Stop/reap before reading stderr; descendants may retain its write end.
     let status = child.try_wait().ok().flatten().or_else(|| {
         let _ = child.kill();
         child.wait().ok()
     });
+    let mut tail = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        use std::os::fd::AsRawFd;
+        let fd = err.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0 {
+            // Bounded bytes and nonblocking reads, even if a descendant holds
+            // the pipe open or keeps writing after the wrapper exits.
+            let mut bytes = Vec::new();
+            let _ = err.by_ref().take(64 * 1024).read_to_end(&mut bytes);
+            tail = String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
     let reason = tail
         .lines()
         .map(str::trim)
