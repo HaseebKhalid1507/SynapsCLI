@@ -189,10 +189,13 @@ impl ApiMethods {
         // The sync transport sends the full registry and never defers, so any
         // `tool_reference` in the history is stripped (it would be a 400).
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|_| None);
-        // Whole-request image limits (>20 images → each ≤ 2000 px; ≤ 100
-        // images). Outgoing copy only; healthy histories are untouched. Runs
-        // before the cache marker so the marker lands on the final shape.
-        super::image_limits::enforce_image_limits(&mut cleaned_messages);
+        // Stable per-image projection precedes cache markers, only on Anthropic.
+        // Original preflight above remains authoritative; recheck output budgets.
+        super::image_limits::enforce_image_limits(&mut cleaned_messages)
+            .await
+            .map_err(RuntimeError::Config)?;
+        super::attachments::validate_messages(model, &cleaned_messages)
+            .map_err(RuntimeError::Config)?;
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old

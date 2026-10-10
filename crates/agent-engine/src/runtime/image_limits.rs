@@ -1,52 +1,29 @@
-//! Request-local enforcement of Anthropic's whole-request image limits.
-//!
-//! The Messages API rejects (HTTP 400) a request that carries MORE THAN 20
-//! images if any one of them has a side over 2000 px ("many-image requests"),
-//! and it caps a request at 100 images. Both limits depend on the whole
-//! request, not on any single image. So a history that was valid one round
-//! turns invalid the moment one more image arrives. Because the history is
-//! re-sent every round, every later request in that session fails the same
-//! way. The read tool's per-image guard (8000 px) and attachment preflight
-//! cannot see this: each image is fine on its own.
-//!
-//! [`enforce_image_limits`] runs on the outgoing copy of the history, right
-//! after `sanitize_thinking_blocks`, on the Anthropic transports only. The
-//! durable session history is never rewritten (same contract as the stream
-//! loop's `cap_history_image_bytes`).
-//!
-//! Prompt-cache behaviour:
-//! - A request with 20 or fewer images is returned untouched (no clone, no
-//!   decode). Every healthy session is byte-identical to before.
-//! - The dimension rule depends only on each image's own bytes, and a session
-//!   that has crossed 20 images stays across (history only grows). So the
-//!   same blocks are replaced on every round and the cached prefix is stable
-//!   after the single miss at the round that crosses the threshold.
-//! - The 100-image cap drops the OLDEST images first. That one is a sliding
-//!   window (each new image past 100 moves it), which is acceptable that deep
-//!   into a session.
-
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::{json, Value};
-use std::sync::Arc;
-
+//! Anthropic-only outgoing image projection. The side rule is independent of
+//! image count; the separate oldest-first 100-image omission is not cache stable.
+use super::attachments::MAX_IMAGE_BYTES;
 use crate::SharedMessage;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use image::{io::Reader, GenericImageView, ImageEncoder, ImageFormat};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::VecDeque,
+    io::{Cursor, Write},
+    sync::{Arc, Mutex, OnceLock},
+};
 
-/// More images than this in one request turns on the per-image side limit.
-pub(crate) const MANY_IMAGE_THRESHOLD: usize = 20;
-/// Per-side pixel limit for every image once the threshold is exceeded.
-pub(crate) const MANY_IMAGE_MAX_SIDE_PX: u32 = 2000;
-/// Hard cap on images in a single request. Conservative: keeping the newest
-/// 100 never produces an invalid request, at worst it drops very old images.
-pub(crate) const MAX_IMAGES_PER_REQUEST: usize = 100;
-
-/// Label for images removed by the per-request image count cap.
-pub(crate) const IMAGE_COUNT_CAP_LABEL: &str = "[image omitted from this request: the conversation holds more than 100 images, so the oldest ones are no longer sent. Re-read the file if you still need it.]";
-
-/// Base64 chars decoded first when reading dimensions. PNG/GIF/WebP headers
-/// sit in the first 30 bytes; a JPEG's SOF can sit behind a large EXIF
-/// segment, so a miss falls back to decoding the whole payload. Multiple of
-/// 4, so the prefix is a complete run of base64 quads.
-const DIMENSION_PREFIX_CHARS: usize = 64 * 1024;
+const MAX_SIDE: u32 = 2000;
+const MAX_PIXELS: u64 = 16_000_000;
+// image 0.24 partial library guard, NOT a total JPEG decoder memory ceiling:
+// limits are not propagated to JPEG internals (e.g. progressive buffers).
+// The 16 MP cap and one worker bound workload, not decoder memory to 128 MiB.
+const MAX_ALLOC: u64 = 128 * 1024 * 1024;
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_COUNT: usize = 16;
+const MAX_IMAGES_PER_REQUEST: usize = 100;
+const IMAGE_COUNT_CAP_LABEL: &str = "[image omitted from this request: the conversation holds more than 100 images, so the oldest ones are no longer sent. Re-read the file if you still need it.]";
+const INVALID: &str = "Image projection failed: corrupt or unsupported image; export a static PNG/JPEG at most 2000 pixels per side and reattach it";
+const RESOURCE: &str = "Image projection exceeds resource limits; export a static PNG/JPEG at most 2000 pixels per side and reattach it";
 
 /// Where an image block sits: `content[block]` of message `msg`, or
 /// `content[block].content[inner]` for media nested in a `tool_result`.
@@ -114,372 +91,573 @@ fn replace_with_text(messages: &mut [SharedMessage], slot: Slot, text: String) {
     *target = json!({ "type": "text", "text": text });
 }
 
-/// Pixel size of a base64 image, read from its header. `None` when the
-/// source is not base64 or the header cannot be parsed.
-fn image_size(block: &Value) -> Option<(u32, u32)> {
+#[derive(Clone, Debug, PartialEq)]
+struct Projection {
+    data: String,
+    mime: &'static str,
+    note: String,
+}
+
+#[derive(Default)]
+struct Cache {
+    entries: VecDeque<([u8; 32], Arc<Projection>)>,
+    bytes: usize,
+}
+impl Cache {
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<Projection>> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+    fn insert(&mut self, key: [u8; 32], value: Arc<Projection>) {
+        let size = value.data.len() + value.note.len();
+        if size > CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= CACHE_COUNT || self.bytes + size > CACHE_BYTES {
+            if let Some((_, old)) = self.entries.pop_front() {
+                self.bytes -= old.data.len() + old.note.len();
+            }
+        }
+        self.bytes += size;
+        self.entries.push_back((key, value));
+    }
+}
+
+/// A Write-only encoder sink: fail before extending past the raw image budget.
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl Write for BoundedOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(RESOURCE));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode(image: &image::DynamicImage, jpeg: bool, limit: usize) -> Result<Vec<u8>, String> {
+    let mut out = BoundedOutput {
+        bytes: Vec::new(),
+        limit,
+    };
+    if jpeg {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode_image(image)
+            .map_err(|_| RESOURCE)?;
+    } else {
+        let rgba = image.to_rgba8();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ColorType::Rgba8,
+            )
+            .map_err(|_| RESOURCE)?;
+    }
+    Ok(out.bytes)
+}
+
+// Walk PNG chunks (not arbitrary compressed bytes) to reject APNG when resizing.
+fn animated_png(bytes: &[u8]) -> bool {
+    let mut pos = 8usize;
+    while let Some(header) = bytes.get(pos..pos.saturating_add(8)) {
+        if &header[4..8] == b"acTL" {
+            return true;
+        }
+        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let Some(next) = pos.checked_add(12).and_then(|n| n.checked_add(len)) else {
+            break;
+        };
+        pos = next;
+    }
+    false
+}
+
+fn project(block: &Value, cache: &Mutex<Cache>) -> Result<Option<Arc<Projection>>, String> {
     let source = &block["source"];
+    let data = source["data"].as_str().ok_or(INVALID)?;
+    let mime = source["media_type"].as_str().ok_or(INVALID)?;
     if source["type"] != "base64" {
-        return None;
+        return Err(INVALID.into());
     }
-    let data = source["data"].as_str()?;
-    let mime = source["media_type"].as_str()?;
-    let size_of = |encoded: &str| {
-        STANDARD
-            .decode(encoded)
-            .ok()
-            .and_then(|bytes| crate::tools::read::image_dimensions(mime, &bytes))
+    if data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+        return Err(RESOURCE.into());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"synaps-anthropic-image-v1:2000:triangle:jpeg85:rgba-png:raster-orientation\0");
+    hash.update(mime.as_bytes());
+    hash.update([0]);
+    hash.update(data.as_bytes());
+    let key: [u8; 32] = hash.finalize().into();
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(Some(hit));
+    }
+    let bytes = STANDARD.decode(data).map_err(|_| INVALID)?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(RESOURCE.into());
+    }
+    let format = match mime {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::WebP,
+        _ => return Err(INVALID.into()),
     };
-    // `get` (not indexing): a non-ASCII payload must not panic on a char
-    // boundary; it is corrupt anyway and simply falls through to `None`.
-    let prefix = data.get(..DIMENSION_PREFIX_CHARS.min(data.len()))?;
-    size_of(prefix).or_else(|| {
-        if prefix.len() < data.len() {
-            size_of(data)
-        } else {
-            None
-        }
-    })
+    // Cheap bounded header inspection BEFORE constructing any decoder.
+    let (w, h) = crate::tools::read::image_dimensions(mime, &bytes).ok_or(INVALID)?;
+    if w == 0 || h == 0 || w.max(h) > 8000 {
+        return Err(RESOURCE.into());
+    }
+    // Preserve preexisting structural validation for small originals; do not
+    // decode their pixels, even if corrupt data may later be rejected upstream.
+    if w.max(h) <= MAX_SIDE {
+        return Ok(None);
+    }
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(RESOURCE.into());
+    }
+    // Conservative for GIF/WebP: require a static PNG/JPEG export rather than
+    // silently flattening animation. Small originals remain byte-identical.
+    if matches!(format, ImageFormat::Gif | ImageFormat::WebP)
+        || (format == ImageFormat::Png && animated_png(&bytes))
+    {
+        return Err("Image projection requires a static PNG/JPEG export for oversized GIF/WebP or animated PNG; reattach an export at most 2000 pixels per side".into());
+    }
+    let mut reader = Reader::with_format(Cursor::new(&bytes), format);
+    let mut limits = image::io::Limits::default();
+    limits.max_image_width = Some(8000);
+    limits.max_image_height = Some(8000);
+    limits.max_alloc = Some(MAX_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|_| INVALID)?;
+    if decoded.dimensions() != (w, h) {
+        return Err(INVALID.into());
+    }
+    let longest = u64::from(w.max(h));
+    let sent_w = (u64::from(w) * u64::from(MAX_SIDE) / longest).max(1) as u32;
+    let sent_h = (u64::from(h) * u64::from(MAX_SIDE) / longest).max(1) as u32;
+    let resized = decoded.resize_exact(sent_w, sent_h, image::imageops::FilterType::Triangle);
+    let jpeg = format == ImageFormat::Jpeg;
+    let encoded = encode(&resized, jpeg, MAX_IMAGE_BYTES)?;
+    let value = Arc::new(Projection {
+        data: STANDARD.encode(encoded),
+        mime: if jpeg { "image/jpeg" } else { "image/png" },
+        note: format!("[Image resized for this request: original {w}x{h} pixels; sent {sent_w}x{sent_h} pixels. Coordinates refer to sent pixels. Encoded raster orientation is used; EXIF orientation is not applied.]"),
+    });
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, value.clone());
+    Ok(Some(value))
 }
 
-fn oversized_label(size: Option<(u32, u32)>) -> String {
-    let what = match size {
-        Some((w, h)) => format!("{w}x{h} px"),
-        None => "size could not be read".to_string(),
-    };
-    format!(
-        "[image omitted from this request ({what}): the conversation holds more than \
-         {MANY_IMAGE_THRESHOLD} images, and then Anthropic accepts only images up to \
-         {MANY_IMAGE_MAX_SIDE_PX} px per side. If you still need it, downscale a copy \
-         (e.g. `convert IN -resize 1568x1568\\> OUT`) and read that.]"
-    )
-}
-
-/// Bring the outgoing history within Anthropic's whole-request image limits.
-/// Returns the number of image blocks replaced (0 = nothing touched, no
-/// allocation, every `Arc` unchanged).
-pub(super) fn enforce_image_limits(messages: &mut [SharedMessage]) -> usize {
+fn enforce(messages: &mut [SharedMessage], cache: &Mutex<Cache>) -> Result<usize, String> {
     let slots = image_slots(messages);
-    if slots.len() <= MANY_IMAGE_THRESHOLD {
-        return 0;
-    }
-
-    // 1. Count cap: drop the oldest images beyond the newest 100.
     let over_cap = slots.len().saturating_sub(MAX_IMAGES_PER_REQUEST);
-    for &slot in &slots[..over_cap] {
-        replace_with_text(messages, slot, IMAGE_COUNT_CAP_LABEL.to_string());
-    }
-
-    // 2. Side limit: what remains is still more than 20 images (min(n, 100)),
-    //    so every image must be at most 2000 px per side. An image whose size
-    //    cannot be read is treated as oversized: sending it would risk the
-    //    same 400 on every later round.
-    let mut oversized = 0usize;
-    for &slot in &slots[over_cap..] {
-        let size = image_size(block_at(messages, slot));
-        let fits = size.is_some_and(|(w, h)| w.max(h) <= MANY_IMAGE_MAX_SIDE_PX);
-        if !fits {
-            replace_with_text(messages, slot, oversized_label(size));
-            oversized += 1;
+    // Reverse order keeps original slot indices valid when adding adjacent text.
+    // Validate/project even count-omitted images: invalid oversized input must
+    // fail independently of count, rather than being hidden by omission.
+    for (index, &slot) in slots.iter().enumerate().rev() {
+        let projected = project(block_at(messages, slot), cache)?;
+        if index < over_cap {
+            replace_with_text(messages, slot, IMAGE_COUNT_CAP_LABEL.into());
+        } else if let Some(projected) = projected {
+            let message = Arc::make_mut(&mut messages[slot.msg]);
+            let (blocks, index) = match slot.inner {
+                Some(inner) => (
+                    message["content"][slot.block]["content"]
+                        .as_array_mut()
+                        .unwrap(),
+                    inner,
+                ),
+                None => (message["content"].as_array_mut().unwrap(), slot.block),
+            };
+            blocks[index]["source"]["data"] = Value::String(projected.data.clone());
+            blocks[index]["source"]["media_type"] = Value::String(projected.mime.into());
+            blocks.insert(index + 1, json!({"type": "text", "text": projected.note}));
         }
     }
+    Ok(over_cap)
+}
 
-    let replaced = over_cap + oversized;
-    if replaced > 0 {
-        tracing::info!(
-            images = slots.len(),
-            over_count_cap = over_cap,
-            oversized,
-            "request image limits: image blocks replaced with text labels in the outgoing copy"
-        );
+/// Acquire before spawn, then MOVE the permit inside blocking work. Cancellation
+/// of the async waiter cannot admit another decoder while this one still runs.
+/// Only projected bytes/metadata survive in the process-wide bounded memo cache.
+pub(super) async fn enforce_image_limits(messages: &mut [SharedMessage]) -> Result<usize, String> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    if image_slots(messages).is_empty() {
+        return Ok(0);
     }
-    replaced
+    let permit = GATE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| RESOURCE)?;
+    let mut outgoing = messages.to_vec();
+    let (outgoing, omitted) = blocking_with_permit(permit, move || {
+        let omitted = enforce(
+            &mut outgoing,
+            CACHE.get_or_init(|| Mutex::new(Cache::default())),
+        )?;
+        Ok::<_, String>((outgoing, omitted))
+    })
+    .await?;
+    messages.clone_from_slice(&outgoing);
+    Ok(omitted)
+}
+
+async fn blocking_with_permit<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| "Image projection worker failed; export a smaller static image".to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Minimal PNG header: signature + IHDR length/type + width + height.
-    fn png(w: u32, h: u32) -> String {
-        let mut b = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        b.extend_from_slice(&13u32.to_be_bytes());
-        b.extend_from_slice(b"IHDR");
-        b.extend_from_slice(&w.to_be_bytes());
-        b.extend_from_slice(&h.to_be_bytes());
-        b.extend_from_slice(&[8, 6, 0, 0, 0]);
-        STANDARD.encode(b)
+    fn fixture(w: u32, h: u32, jpeg: bool) -> Value {
+        let raster = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            w,
+            h,
+            image::Rgba([60, 120, 180, 128]),
+        ));
+        json!({"type": "image", "source": {"type": "base64",
+            "media_type": if jpeg { "image/jpeg" } else { "image/png" },
+            "data": STANDARD.encode(encode(&raster, jpeg, MAX_IMAGE_BYTES).unwrap())}})
+    }
+    fn history(n: usize, img: &Value) -> Vec<SharedMessage> {
+        (0..n)
+            .map(|i| {
+                Arc::new(json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": format!("t{i}"), "is_error": false,
+                     "content": [{"type": "text", "text": "original summary"}, img]}
+                ]}))
+            })
+            .collect()
+    }
+    fn cache() -> Mutex<Cache> {
+        Mutex::new(Cache::default())
     }
 
-    /// JPEG whose SOF0 sits behind an APP1 segment larger than the decode
-    /// prefix, so the size is only readable from the full payload.
-    fn jpeg_with_big_exif(w: u16, h: u16) -> String {
-        let mut b = vec![0xFF, 0xD8];
-        let app1_len: u16 = 60_000; // > 48 KiB decoded prefix
-        b.extend_from_slice(&[0xFF, 0xE1]);
-        b.extend_from_slice(&app1_len.to_be_bytes());
-        b.resize(b.len() + app1_len as usize - 2, 0);
-        b.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
-        b.extend_from_slice(&h.to_be_bytes());
-        b.extend_from_slice(&w.to_be_bytes());
-        b.extend_from_slice(&[0x03; 12]);
-        b.extend_from_slice(&[0xFF, 0xD9]);
-        STANDARD.encode(b)
-    }
-
-    fn image(mime: &str, data: String) -> Value {
-        json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}})
-    }
-
-    fn png_image(w: u32, h: u32) -> Value {
-        image("image/png", png(w, h))
-    }
-
-    /// A read-tool style result: text summary first, then the image.
-    fn tool_result(id: &str, img: Value) -> Value {
-        json!({"type": "tool_result", "tool_use_id": id,
-               "content": [{"type": "text", "text": "Image: shot.png"}, img]})
-    }
-
-    fn user(content: Vec<Value>) -> SharedMessage {
-        Arc::new(json!({"role": "user", "content": content}))
-    }
-
-    fn assistant() -> SharedMessage {
-        Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}))
-    }
-
-    /// `n` user messages, each one tool_result image, alternating with
-    /// assistant turns. `size(i)` gives image i's dimensions.
-    fn history(n: usize, size: impl Fn(usize) -> (u32, u32)) -> Vec<SharedMessage> {
-        let mut out = Vec::new();
-        for i in 0..n {
-            let (w, h) = size(i);
-            out.push(user(vec![tool_result(&format!("t{i}"), png_image(w, h))]));
-            out.push(assistant());
-        }
-        out
-    }
-
-    fn remaining_images(messages: &[SharedMessage]) -> usize {
-        image_slots(messages).len()
-    }
-
-    #[test]
-    fn twenty_images_untouched_even_when_oversized() {
-        let original = history(20, |_| (2400, 1771));
-        let mut out = original.clone();
-        assert_eq!(enforce_image_limits(&mut out), 0);
-        for (a, b) in original.iter().zip(&out) {
-            assert!(Arc::ptr_eq(a, b), "healthy path must not clone");
-        }
-    }
-
-    #[test]
-    fn twenty_first_image_drops_only_oversized_ones() {
-        // The S344 session shape: 21 images, a handful of 2400 px screenshots.
-        let big = [5usize, 9, 12];
-        let original = history(21, |i| {
-            if big.contains(&i) {
-                (2400, 1771)
-            } else {
-                (1200, 760)
-            }
-        });
-        let mut out = original.clone();
-        assert_eq!(enforce_image_limits(&mut out), big.len());
-        assert_eq!(remaining_images(&out), 21 - big.len());
-
-        for (idx, (a, b)) in original.iter().zip(&out).enumerate() {
-            let image_no = idx / 2;
-            let touched = idx % 2 == 0 && big.contains(&image_no);
-            assert_eq!(!Arc::ptr_eq(a, b), touched, "message {idx}");
-        }
-        let replaced = &out[10]["content"][0]["content"];
-        assert_eq!(replaced[0]["type"], "text", "text summary stays first");
-        assert_eq!(replaced[1]["type"], "text");
-        let label = replaced[1]["text"].as_str().unwrap();
-        assert!(label.contains("2400x1771 px"), "{label}");
-        assert!(label.contains("2000 px"), "{label}");
-    }
-
-    /// The image sizes of the real session that hit the 400 (in order). The
-    /// 21st image pushed it past 20 while five 2400 px screenshots were in
-    /// history, so every later request failed until /compact.
-    #[test]
-    fn real_session_shape_is_brought_within_limits() {
-        const SIZES: [(u32, u32); 21] = [
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1200, 760),
-            (1600, 1518),
-            (1200, 760),
-            (2000, 1518),
-            (1200, 760),
-            (1200, 760),
-            (2400, 1771),
-            (2400, 1771),
-            (2400, 1210),
-            (2400, 927),
-            (2400, 990),
-            (1200, 760),
-            (1200, 760),
-        ];
-        let mut out = history(SIZES.len(), |i| SIZES[i]);
-        assert_eq!(enforce_image_limits(&mut out), 5);
-        let kept = image_slots(&out);
-        assert_eq!(kept.len(), 16);
-        for slot in kept {
-            let (w, h) = image_size(block_at(&out, slot)).expect("readable");
-            assert!(w.max(h) <= MANY_IMAGE_MAX_SIDE_PX, "{w}x{h} still sent");
-        }
-        // One image fewer (the last one was never read) needs no change.
-        let mut before = history(SIZES.len() - 1, |i| SIZES[i]);
-        assert_eq!(enforce_image_limits(&mut before), 0);
-    }
-
-    #[test]
-    fn exactly_2000_px_is_kept() {
-        let mut out = history(25, |_| (2000, 2000));
-        assert_eq!(enforce_image_limits(&mut out), 0);
-        assert_eq!(remaining_images(&out), 25);
-    }
-
-    #[test]
-    fn top_level_user_images_are_covered() {
-        let mut out = history(20, |_| (800, 600));
-        out.push(user(vec![
-            json!({"type": "text", "text": "look"}),
-            png_image(3000, 100),
-        ]));
-        assert_eq!(enforce_image_limits(&mut out), 1);
-        let last = out.last().unwrap();
-        assert_eq!(last["content"][1]["type"], "text");
-        assert!(last["content"][1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("3000x100 px"));
-    }
-
-    #[test]
-    fn unreadable_size_is_treated_as_oversized_past_threshold() {
-        let mut out = history(20, |_| (800, 600));
-        out.push(user(vec![image(
-            "image/png",
-            STANDARD.encode(b"not a png"),
-        )]));
-        assert_eq!(enforce_image_limits(&mut out), 1);
-        let text = out.last().unwrap()["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("size could not be read"), "{text}");
-    }
-
-    #[test]
-    fn jpeg_size_found_past_decode_prefix() {
-        let small = image("image/jpeg", jpeg_with_big_exif(1600, 900));
-        let large = image("image/jpeg", jpeg_with_big_exif(2400, 900));
-        assert!(small["source"]["data"].as_str().unwrap().len() > DIMENSION_PREFIX_CHARS);
-        assert_eq!(image_size(&small), Some((1600, 900)));
-        assert_eq!(image_size(&large), Some((2400, 900)));
-
-        let mut out = history(19, |_| (800, 600));
-        out.push(user(vec![small]));
-        out.push(assistant());
-        out.push(user(vec![large]));
-        assert_eq!(enforce_image_limits(&mut out), 1);
-        assert_eq!(remaining_images(&out), 20);
-    }
-
-    #[test]
-    fn count_cap_boundary_preserves_newest_images_and_history() {
-        for count in [100usize, 101] {
-            let original = history(count, |_| (2000, 2000));
-            let saved = serde_json::to_vec(&original).unwrap();
-            let mut out = original.clone();
-            assert_eq!(enforce_image_limits(&mut out), count - 100);
-            assert_eq!(remaining_images(&out), 100);
-            assert_eq!(serde_json::to_vec(&original).unwrap(), saved);
-            for (index, (before, after)) in original.iter().zip(&out).enumerate() {
-                if count == 101 && index == 0 {
-                    assert!(!Arc::ptr_eq(before, after));
-                    assert_eq!(after["content"][0]["tool_use_id"], "t0");
-                    assert_eq!(
-                        after["content"][0]["content"][0],
-                        before["content"][0]["content"][0]
-                    );
-                    assert_eq!(
-                        after["content"][0]["content"][1]["text"],
-                        IMAGE_COUNT_CAP_LABEL
-                    );
-                } else {
-                    assert!(Arc::ptr_eq(before, after), "message {index}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn dimension_boundary_preserves_durable_history() {
-        for count in [20usize, 21] {
-            let original = history(count, |i| if i == 0 { (2001, 2000) } else { (2000, 2000) });
-            let saved = serde_json::to_vec(&original).unwrap();
-            let mut out = original.clone();
-            assert_eq!(enforce_image_limits(&mut out), count - 20);
-            assert_eq!(remaining_images(&out), 20);
-            assert_eq!(serde_json::to_vec(&original).unwrap(), saved);
-            assert_eq!(remaining_images(&original), count);
+    #[tokio::test]
+    async fn prefix_is_identical_at_1_20_21_22_and_original_arcs_survive() {
+        let img = fixture(2001, 4, false);
+        let original = history(22, &img);
+        let saved = original.clone();
+        let mut previous: Vec<SharedMessage> = Vec::new();
+        for n in [1, 20, 21, 22] {
+            let mut outgoing = original[..n].to_vec();
+            assert_eq!(enforce_image_limits(&mut outgoing).await.unwrap(), 0);
+            assert_eq!(&outgoing[..previous.len()], previous.as_slice());
+            assert_eq!(outgoing[0]["content"][0]["tool_use_id"], "t0");
+            assert_eq!(outgoing[0]["content"][0]["is_error"], false);
             assert_eq!(
-                original[0]["content"][0]["content"][1],
-                png_image(2001, 2000)
+                outgoing[0]["content"][0]["content"][0]["text"],
+                "original summary"
+            );
+            for (a, b) in original.iter().zip(&saved) {
+                assert!(Arc::ptr_eq(a, b));
+            }
+            assert_eq!(original[0]["content"][0]["content"][1], img);
+            previous = outgoing;
+        }
+    }
+
+    #[test]
+    fn boundary_top_level_nested_and_alpha() {
+        let c = cache();
+        let small = fixture(2000, 2, false);
+        let large = fixture(2001, 2, false);
+        let mut messages = vec![Arc::new(json!({"role": "user", "content": [small, large,
+            {"type": "tool_result", "tool_use_id": "nested", "content": [large]}]}))];
+        let original = messages.clone();
+        enforce(&mut messages, &c).unwrap();
+        assert_eq!(messages[0]["content"][0], original[0]["content"][0]);
+        assert_eq!(messages[0]["content"][2]["type"], "text");
+        assert_eq!(messages[0]["content"][3]["tool_use_id"], "nested");
+        assert_eq!(
+            messages[0]["content"][1],
+            messages[0]["content"][3]["content"][0]
+        );
+        let bytes = STANDARD
+            .decode(
+                messages[0]["content"][1]["source"]["data"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let raster = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(raster.dimensions(), (2000, 1));
+        assert_eq!(raster.to_rgba8().get_pixel(0, 0)[3], 128);
+        let again = messages.clone();
+        enforce(&mut messages, &c).unwrap();
+        assert_eq!(messages, again); // no duplicate explanatory text
+        let mut unchanged = history(1, &small);
+        let saved = unchanged.clone();
+        enforce(&mut unchanged, &c).unwrap();
+        assert!(Arc::ptr_eq(&saved[0], &unchanged[0]));
+    }
+
+    #[test]
+    fn jpeg_real_exif_6_8_preserves_encoded_raster() {
+        let mut img = fixture(2001, 3, true);
+        let baseline = project(&img, &cache()).unwrap().unwrap();
+        let bytes = STANDARD
+            .decode(img["source"]["data"].as_str().unwrap())
+            .unwrap();
+        for orientation in [6u8, 8] {
+            // Valid Exif/TIFF little-endian IFD0: Orientation SHORT, count 1.
+            let mut exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+            exif.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0, 0]);
+            // Also exercise header scanning beyond the old short prefix.
+            exif.resize(59_998, 0);
+            let mut with_exif = bytes[..2].to_vec();
+            with_exif.extend_from_slice(&[0xff, 0xe1]);
+            with_exif.extend_from_slice(&60_000u16.to_be_bytes());
+            with_exif.extend_from_slice(&exif);
+            with_exif.extend_from_slice(&bytes[2..]);
+            img["source"]["data"] = STANDARD.encode(with_exif).into();
+            let projected = project(&img, &cache()).unwrap().unwrap();
+            // Both tags would swap axes if honored. Output must instead be
+            // byte-identical to the untagged raster, with metadata stripped.
+            assert_eq!(projected, baseline);
+            let decoded =
+                image::load_from_memory(&STANDARD.decode(&projected.data).unwrap()).unwrap();
+            assert_eq!(decoded.dimensions(), (2000, 2));
+            assert!(projected.note.contains("EXIF orientation is not applied"));
+        }
+    }
+
+    #[test]
+    fn mixed_multiple_images_and_nested_results_keep_indices() {
+        let small = fixture(2, 2, false);
+        let wide = fixture(2001, 3, false);
+        let tall = fixture(3, 2001, false);
+        let text = json!({"type": "text", "text": "keep"});
+        let mut messages = vec![Arc::new(json!({"role": "user", "content": [
+            wide, text,
+            {"type": "tool_result", "tool_use_id": "a", "content": [text, tall, small, wide, text]},
+            tall,
+            {"type": "tool_result", "tool_use_id": "b", "is_error": false, "content": [wide, text, tall]},
+            small, wide
+        ]}))];
+        let originals = messages.clone();
+        let c = cache();
+        let projected_block = |img: &Value| {
+            let p = project(img, &c).unwrap().unwrap();
+            let mut block = img.clone();
+            block["source"]["data"] = p.data.clone().into();
+            (block, json!({"type": "text", "text": p.note}))
+        };
+        let (w, wn) = projected_block(&wide);
+        let (t, tn) = projected_block(&tall);
+        enforce(&mut messages, &c).unwrap();
+        assert_eq!(
+            *messages[0],
+            json!({"role": "user", "content": [
+                w, wn, text,
+                {"type": "tool_result", "tool_use_id": "a", "content": [text, t, tn, small, w, wn, text]},
+                t, tn,
+                {"type": "tool_result", "tool_use_id": "b", "is_error": false, "content": [w, wn, text, t, tn]},
+                small, w, wn
+            ]})
+        );
+        assert_eq!(originals[0]["content"][0], wide);
+    }
+
+    #[test]
+    fn cache_hit_eviction_and_byte_count_bounds_are_deterministic() {
+        let c = cache();
+        let img = fixture(2001, 2, false);
+        let first = project(&img, &c).unwrap().unwrap();
+        let hit = project(&img, &c).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        for i in 0..CACHE_COUNT + 1 {
+            c.lock().unwrap().insert(
+                [i as u8; 32],
+                Arc::new(Projection {
+                    data: "x".repeat(CACHE_BYTES / 4),
+                    mime: "image/png",
+                    note: "note".into(),
+                }),
             );
         }
+        assert!(c.lock().unwrap().entries.len() <= CACHE_COUNT);
+        assert!(c.lock().unwrap().bytes <= CACHE_BYTES);
+        let miss = project(&img, &c).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &miss));
+        assert_eq!(first, miss);
     }
 
     #[test]
-    fn count_cap_drops_oldest_beyond_100() {
-        let mut out = history(105, |_| (800, 600));
-        assert_eq!(enforce_image_limits(&mut out), 5);
-        assert_eq!(remaining_images(&out), MAX_IMAGES_PER_REQUEST);
-        for i in 0..5 {
-            let block = &out[i * 2]["content"][0]["content"][1];
-            assert_eq!(block["text"], IMAGE_COUNT_CAP_LABEL, "image {i}");
+    fn oldest_100_101_behavior_remains_explicit() {
+        let img = fixture(2, 2, false);
+        for n in [100, 101] {
+            let mut out = history(n, &img);
+            assert_eq!(enforce(&mut out, &cache()).unwrap(), n - 100);
+            let first = &out[0]["content"][0]["content"][1];
+            if n == 101 {
+                assert_eq!(first["text"], IMAGE_COUNT_CAP_LABEL);
+            } else {
+                assert_eq!(first, &img);
+            }
+            assert_eq!(out[n - 1]["content"][0]["content"][1], img);
         }
-        assert_eq!(out[10]["content"][0]["content"][1]["type"], "image");
     }
 
     #[test]
-    fn output_is_stable_round_to_round() {
-        // Same history in, same bytes out: the cached prefix survives.
-        let base = history(30, |i| if i % 4 == 0 { (2400, 900) } else { (900, 600) });
-        let mut first = base.clone();
-        let mut second = base.clone();
-        enforce_image_limits(&mut first);
-        enforce_image_limits(&mut second);
-        assert_eq!(
-            serde_json::to_string(&first).unwrap(),
-            serde_json::to_string(&second).unwrap()
-        );
-        // And a later round (one more turn appended) keeps the earlier prefix.
-        let mut later = base.clone();
-        later.push(user(vec![tool_result("t30", png_image(900, 600))]));
-        enforce_image_limits(&mut later);
-        assert_eq!(
-            serde_json::to_string(&first).unwrap(),
-            serde_json::to_string(&later[..first.len()]).unwrap()
-        );
+    fn malformed_resource_animation_and_encoder_limits() {
+        let mut img = fixture(2001, 2, false);
+        img["source"]["data"] = "!!!!".into();
+        assert!(project(&img, &cache()).is_err());
+        img["source"]["data"] = "A".repeat(MAX_IMAGE_BYTES.div_ceil(3) * 4 + 1).into();
+        assert_eq!(project(&img, &cache()).unwrap_err(), RESOURCE);
+        // Malformed oversized headers must error, never count-dependent omission.
+        let valid = fixture(2001, 2, false);
+        let mut bytes = STANDARD
+            .decode(valid["source"]["data"].as_str().unwrap())
+            .unwrap();
+        bytes.truncate(33);
+        img["source"]["data"] = STANDARD.encode(&bytes).into();
+        for n in [1, 21, 101] {
+            assert!(enforce(&mut history(n, &img), &cache()).is_err());
+        }
+        bytes[16..20].copy_from_slice(&8000u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&8000u32.to_be_bytes());
+        img["source"]["data"] = STANDARD.encode(&bytes).into();
+        assert_eq!(project(&img, &cache()).unwrap_err(), RESOURCE);
+        let gif = json!({"type": "image", "source": {"type": "base64", "media_type": "image/gif",
+            "data": STANDARD.encode(b"GIF89a\xd1\x07\x02\x00\x00\x00\x00")}});
+        assert!(project(&gif, &cache())
+            .unwrap_err()
+            .contains("static PNG/JPEG"));
+        assert!(encode(&image::DynamicImage::new_rgba8(2, 2), false, 1).is_err());
+        assert!(encode(&image::DynamicImage::new_rgb8(2, 2), true, 1).is_err());
     }
 
     #[test]
-    fn non_image_content_is_ignored() {
-        let mut out = vec![
-            Arc::new(json!({"role": "user", "content": "plain string content"})),
-            assistant(),
-        ];
-        out.extend(history(25, |_| (800, 600)));
-        assert_eq!(enforce_image_limits(&mut out), 0);
+    fn small_corrupt_pixels_retain_structural_only_validation() {
+        let mut img = fixture(2, 2, false);
+        let mut bytes = STANDARD
+            .decode(img["source"]["data"].as_str().unwrap())
+            .unwrap();
+        // Keep structural header/trailer checks valid, but omit all IDAT pixels.
+        bytes.truncate(33);
+        bytes.extend_from_slice(b"\x00\x00\x00\x00IEND\xAE\x42\x60\x82");
+        assert!(image::load_from_memory(&bytes).is_err());
+        img["source"]["data"] = STANDARD.encode(bytes).into();
+        let mut messages = history(1, &img);
+        let original = messages.clone();
+        super::super::attachments::validate_messages("anthropic/claude-sonnet-4-6", &messages)
+            .unwrap();
+        enforce(&mut messages, &cache()).unwrap();
+        assert!(Arc::ptr_eq(&messages[0], &original[0]));
+    }
+
+    #[test]
+    fn both_transports_project_between_wire_refs_and_cache_marker() {
+        for source in [include_str!("api.rs"), include_str!("api_sync.rs")] {
+            let first = source
+                .find("attachments::validate_messages(model, messages)")
+                .unwrap();
+            let wire = source
+                .find("HelperMethods::wire_tool_references(&mut cleaned_messages")
+                .unwrap();
+            let project = source
+                .find("image_limits::enforce_image_limits(&mut cleaned_messages)")
+                .unwrap();
+            let check = source
+                .find("attachments::validate_messages(model, &cleaned_messages)")
+                .unwrap();
+            let marker = source
+                .find("HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages")
+                .unwrap();
+            assert!(first < wire && wire < project && project < check && check < marker);
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_waiter_keeps_blocking_permit_until_work_finishes() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(blocking_with_permit(permit, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(gate.clone().try_acquire_owned().is_err());
+        release_tx.send(()).unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_token_cancel_drops_worker_waiter_but_keeps_permit() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().acquire_owned().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let token = cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            super::super::api::await_or_cancel(
+                &token,
+                blocking_with_permit(permit, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }),
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await;
+        let held = gate.clone().try_acquire_owned().is_err();
+        // Release even if an assertion fails, so the blocking pool can shut down.
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Err(crate::RuntimeError::Canceled)
+        ));
+        assert!(held);
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn projected_output_passes_original_attachment_preflight() {
+        let mut messages = history(1, &fixture(2001, 4, false));
+        super::super::attachments::validate_messages("anthropic/claude-sonnet-4-6", &messages)
+            .unwrap();
+        enforce(&mut messages, &cache()).unwrap();
+        super::super::attachments::validate_messages("anthropic/claude-sonnet-4-6", &messages)
+            .unwrap();
     }
 }
