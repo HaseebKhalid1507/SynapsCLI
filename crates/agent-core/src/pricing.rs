@@ -22,13 +22,21 @@
 //! | Haiku 5.5, prompt ≤ 100k      | $0.10  | $0.50  | 0.10×      |
 //! | Haiku 5.5, prompt > 100k      | $0.50  | $2.50  | 0.10×      |
 //! | Haiku 3.5                     | $0.80  | $4.00  | 0.10×      |
+//! | Haiku 3 (historical)          | $0.25  | $1.25  | fallback* |
 //! | Haiku (other)                 | $1.00  | $5.00  | 0.10×      |
 //!
-//! **Sonnet 5.** The page leaves the Sonnet 5 base input/output cells blank,
-//! but every other cell of that row pins it at $2 / $10: the prompt-caching
-//! columns read $2.50 (5m write = 1.25 × $2), $4 (1h write = 2 × $2) and
-//! $0.20 (read = 0.1 × $2), and the Batch row reads $1 / $5 (the documented
-//! 50% batch discount on $2 / $10). $3 / $15 fits none of them.
+//! Historical Opus 3 / Haiku 3 input and output rates:
+//! <https://www.anthropic.com/news/claude-3-family> (verified 2026-10-10).
+//! *Legacy cache rates use the standard multiplier fallback; historical cache
+//! support and prices were not verified from that launch source.
+//!
+//! **Sonnet 5.** The official model overview explicitly lists $2 input / $10
+//! output per million tokens (verified 2026-10-10):
+//! <https://platform.claude.com/docs/en/models/sonnet-5/overview>.
+//! These are standard global direct-API estimates, not complete invoices:
+//! fast-mode/residency multipliers and server-tool charges are not modeled.
+//! Unknown-model fallbacks and routed/cloud/subscription model IDs are estimates,
+//! not verified provider invoice rates or net charges after credits/discounts.
 //!
 //! **Haiku 5.5** is priced by prompt length ("Long context pricing"): a prompt
 //! of over 100,000 tokens pays the higher row. The prompt is everything the
@@ -46,51 +54,46 @@
 /// pricing").
 const HAIKU_5_5_TIER_TOKENS: u64 = 100_000;
 
-/// `true` for Claude Opus 4 / 4.1 (and the retired Opus 3), which the docs
-/// list at $15 / $75 — unlike Opus 4.5 and later ($5 / $25 or less).
-/// IDs: `claude-opus-4-0`, `claude-opus-4-20250514`, `claude-opus-4-1`,
-/// `claude-opus-4-1-20250805`, `claude-opus-4`, Vertex's
-/// `claude-opus-4-1@20250805` / `claude-opus-4@20250514`, Bedrock's
-/// `anthropic.claude-opus-4-1-20250805-v1:0`, `claude-3-opus…`.
-///
-/// After `opus-4` comes either nothing / a non-`-` separator (`@`, `:`), or
-/// `-` and a digit run: the run `0` or `1` is the 4.0 / 4.1 minor version, an
-/// 8-digit run is the 4.0 snapshot date; any other run (`5`, `6`, …) is a
-/// later, cheaper Opus.
-fn is_legacy_opus(m: &str) -> bool {
-    if m.contains("3-opus") || m.contains("opus-3") {
-        return true;
+/// Match a complete version, accepting dotted and hyphenated minor versions.
+/// Only documented ID suffix shapes are stripped: snapshot dates, Vertex dates,
+/// and Bedrock revisions. Similar-looking version prefixes are not aliases.
+fn is_version(model: &str, version: &str) -> bool {
+    fn suffix_ok(rest: &str) -> bool {
+        if matches!(rest, "" | "-latest" | ":0" | "-v1:0") {
+            return true;
+        }
+        let Some(date) = rest.strip_prefix('-').or_else(|| rest.strip_prefix('@')) else {
+            return false;
+        };
+        date.len() >= 8
+            && date.as_bytes()[..8].iter().all(u8::is_ascii_digit)
+            && matches!(&date[8..], "" | "-v1:0")
     }
-    let Some(i) = m.find("opus-4") else {
-        return false;
-    };
-    let rest = &m[i + "opus-4".len()..];
-    let Some(after_dash) = rest.strip_prefix('-') else {
-        // "", "@20250514", ":0" — plain Opus 4.
-        return !rest.starts_with(|c: char| c.is_ascii_digit());
-    };
-    let run_len = after_dash
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_dash.len());
-    let run = &after_dash[..run_len];
-    run == "0" || run == "1" || run.len() == 8
+    let dotted = version.rsplit_once('-').and_then(|(prefix, minor)| {
+        (prefix.ends_with(|c: char| c.is_ascii_digit())
+            && minor.bytes().all(|c| c.is_ascii_digit()))
+        .then(|| format!("{prefix}.{minor}"))
+    });
+    let matched = [Some(version), dotted.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|v| {
+            model.match_indices(v).any(|(i, _)| {
+                (i == 0 || matches!(model.as_bytes()[i - 1], b'-' | b'/' | b'.'))
+                    && suffix_ok(&model[i + v.len()..])
+            })
+        });
+    matched
 }
 
-/// `true` for Claude Sonnet 5 itself (`claude-sonnet-5`,
-/// `claude-sonnet-5-20260101`, `claude-sonnet-5@…`), not for a later
-/// `sonnet-5-N` minor version the table does not list.
+fn is_legacy_opus(m: &str) -> bool {
+    ["3-opus", "opus-3", "opus-4", "opus-4-0", "opus-4-1"]
+        .iter()
+        .any(|v| is_version(m, v))
+}
+
 fn is_sonnet_5(m: &str) -> bool {
-    let Some(i) = m.find("sonnet-5") else {
-        return false;
-    };
-    let rest = &m[i + "sonnet-5".len()..];
-    let Some(after_dash) = rest.strip_prefix('-') else {
-        return !rest.starts_with(|c: char| c.is_ascii_digit());
-    };
-    let run_len = after_dash
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_dash.len());
-    run_len == 8 || run_len == 0
+    is_version(m, "sonnet-5")
 }
 
 /// Returns `(input_price_per_mtok, output_price_per_mtok)` for the given model
@@ -107,21 +110,27 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
         // Keep this exact ID before generic DeepSeek entries are ever added.
         "inferx/deepseek-v4-flash" | "deepseek-v4-flash" => (0.0, 0.0),
         m if m.contains("fable") || m.contains("mythos") => (10.0, 50.0),
-        m if m.contains("opus-5-5") => (4.0, 20.0),
+        m if is_version(m, "opus-5-5") => (4.0, 20.0),
         m if is_legacy_opus(m) => (15.0, 75.0),
         m if m.contains("opus") => (5.0, 25.0),
-        m if m.contains("sonnet-5-5") => (2.0, 10.0),
-        // Sonnet 5: derived from the cache and batch cells (module docs).
+        m if is_version(m, "sonnet-5-5") => (2.0, 10.0),
+        // Sonnet 5: explicit base rates in the model overview (module docs).
         m if is_sonnet_5(m) => (2.0, 10.0),
         m if m.contains("sonnet") => (3.0, 15.0),
-        m if m.contains("haiku-5-5") => {
+        m if is_version(m, "haiku-5-5") => {
             if prompt_tokens > HAIKU_5_5_TIER_TOKENS {
                 (0.5, 2.5)
             } else {
                 (0.1, 0.5)
             }
         }
-        m if m.contains("haiku-3-5") || m.contains("3-5-haiku") => (0.8, 4.0),
+        m if is_version(m, "haiku-3-5")
+            || is_version(m, "3-5-haiku")
+            || is_version(m, "3.5-haiku") =>
+        {
+            (0.8, 4.0)
+        }
+        m if is_version(m, "3-haiku") || is_version(m, "haiku-3") => (0.25, 1.25),
         m if m.contains("haiku") => (1.0, 5.0),
         _ => (3.0, 15.0), // default: Sonnet pricing
     }
@@ -135,8 +144,8 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
 /// models this table does not know).
 pub fn cache_read_multiplier(model: &str) -> f64 {
     match model {
-        m if m.contains("fable-5-1") || m.contains("mythos-5-1") => 0.025,
-        m if m.contains("opus-5-5") || m.contains("sonnet-5-5") => 0.05,
+        m if is_version(m, "fable-5-1") || is_version(m, "mythos-5-1") => 0.025,
+        m if is_version(m, "opus-5-5") || is_version(m, "sonnet-5-5") => 0.05,
         _ => 0.1,
     }
 }
@@ -203,8 +212,12 @@ pub fn calculate_cost_split(
 
 /// Split-aware cost for callers holding an aggregate plus an *optional* TTL
 /// split (the shape of `SessionEvent::Usage`). When either split bucket is
-/// present the split rates apply; when both are `None`, the aggregate is
-/// billed at the 5m rate — fail-cheap, never fail-expensive.
+/// present, preserve its known count and assign any aggregate remainder to
+/// the conservative 1h rate. This is an estimate, not an inferred TTL. A split
+/// sum exceeding the aggregate is malformed metadata: retain the larger split
+/// sum rather than dropping known writes or lowering the request's price tier.
+/// Arithmetic saturates. When both are `None`, TTL is explicitly unknown and
+/// the existing aggregate-at-5m estimate is retained (potentially underbilling).
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_cost_optional_split(
     model: &str,
@@ -223,20 +236,155 @@ pub fn calculate_cost_optional_split(
             cache_read,
             cache_creation,
         ),
-        (c5, c1) => calculate_cost_split(
-            model,
-            input_tokens,
-            output_tokens,
-            cache_read,
-            c5.unwrap_or(0),
-            c1.unwrap_or(0),
-        ),
+        (c5, c1) => {
+            let c5 = c5.unwrap_or(0);
+            let c1 = c1.unwrap_or(0);
+            let remainder = cache_creation.saturating_sub(c5.saturating_add(c1));
+            calculate_cost_split(
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read,
+                c5,
+                c1.saturating_add(remainder),
+            )
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_split_preserves_aggregate_known_ttls_and_request_tier() {
+        // (input, aggregate, reported 5m, reported 1h, billed 5m, billed 1h)
+        let cases = [
+            (0, 100_001, Some(0), None, 0, 100_001),
+            (0, 100_001, None, Some(0), 0, 100_001),
+            (60_000, 40_000, Some(10_000), None, 10_000, 30_000),
+            (60_000, 40_001, Some(10_000), None, 10_000, 30_001),
+            (60_000, 40_001, None, Some(10_000), 0, 40_001),
+            (60_000, 40_001, Some(10_000), Some(10_000), 10_000, 30_001),
+            (60_000, 1, Some(20_000), Some(20_001), 20_000, 20_001),
+            (60_000, 1, Some(40_001), None, 40_001, 0),
+            (60_000, 40_001, Some(40_001), None, 40_001, 0),
+            (60_000, 40_001, None, Some(40_001), 0, 40_001),
+            (60_000, 40_001, Some(10_000), Some(30_001), 10_000, 30_001),
+            (0, u64::MAX, Some(1), None, 1, u64::MAX - 1),
+            (0, 1, Some(u64::MAX), Some(u64::MAX), u64::MAX, u64::MAX),
+        ];
+        for (input, aggregate, c5, c1, billed5, billed1) in cases {
+            let actual = calculate_cost_optional_split(
+                "claude-haiku-5.5",
+                input,
+                1_000,
+                0,
+                aggregate,
+                c5,
+                c1,
+            );
+            assert_eq!(
+                actual,
+                calculate_cost_split("claude-haiku-5.5", input, 1_000, 0, billed5, billed1,),
+                "input={input}, aggregate={aggregate}, split={c5:?}/{c1:?}"
+            );
+            assert!(actual.is_finite() && actual > 0.0);
+        }
+        // No TTL evidence: intentionally retain the historical 5m estimate.
+        assert_eq!(
+            calculate_cost_optional_split("claude-haiku-5.5", 60_000, 1_000, 0, 40_001, None, None,),
+            calculate_cost("claude-haiku-5.5", 60_000, 1_000, 0, 40_001)
+        );
+    }
+
+    #[test]
+    fn historical_haiku_3_is_bounded_and_not_haiku_3_5() {
+        for model in [
+            "claude-3-haiku",
+            "claude-3-haiku-20240307",
+            "haiku-3",
+            "claude-haiku-3@20240307",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+        ] {
+            assert_eq!(calculate_cost(model, 1_000_000, 0, 0, 0), 0.25, "{model}");
+            assert_eq!(calculate_cost(model, 0, 1_000_000, 0, 0), 1.25, "{model}");
+        }
+        for model in [
+            "claude-3-5-haiku",
+            "claude-3.5-haiku",
+            "haiku-3-5",
+            "haiku-3.5",
+        ] {
+            assert_eq!(
+                calculate_cost(model, 1_000_000, 1_000_000, 0, 0),
+                4.8,
+                "{model}"
+            );
+        }
+        for model in [
+            "haiku-30",
+            "haiku-3garbage",
+            "3-haikuish",
+            "not3-haiku",
+            "claude-3-haiku-20240307oops",
+        ] {
+            assert_eq!(
+                calculate_cost(model, 1_000_000, 1_000_000, 0, 0),
+                6.0,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_aliases_preserve_prices_and_cache_rates() {
+        for model in [
+            "github-copilot/claude-opus-4.8",
+            "claude-opus-4.7",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+        ] {
+            assert_eq!(calculate_cost(model, 1_000_000, 1_000_000, 0, 0), 30.0);
+        }
+        for model in [
+            "claude-opus-4.1",
+            "claude-opus-4-1",
+            "claude-opus-4-20250514",
+            "claude-opus-4.1@20250805",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "claude-3-opus-20240229",
+        ] {
+            assert_eq!(calculate_cost(model, 1_000_000, 1_000_000, 0, 0), 90.0);
+        }
+        for (dotted, dashed) in [
+            ("opus-5.5", "opus-5-5"),
+            ("sonnet-5.5", "sonnet-5-5"),
+            ("haiku-5.5", "haiku-5-5"),
+            ("fable-5.1", "fable-5-1"),
+            ("mythos-5.1", "mythos-5-1"),
+            ("haiku-3.5", "haiku-3-5"),
+        ] {
+            assert_eq!(
+                calculate_cost_split(dotted, 60_000, 1_000, 20_000, 5_000, 10_000),
+                calculate_cost_split(dashed, 60_000, 1_000, 20_000, 5_000, 10_000)
+            );
+            assert_eq!(cache_read_multiplier(dotted), cache_read_multiplier(dashed));
+        }
+        for model in [
+            "opus-4garbage",
+            "opus-4.10",
+            "opus-4-1oops",
+            "opus-4-12345678oops",
+            "opus-30",
+            "notopus-4",
+            "3-opusish",
+        ] {
+            assert!(!is_legacy_opus(model), "{model}");
+        }
+        assert_eq!(cache_read_multiplier("opus-5-50"), 0.1);
+        assert_eq!(cache_read_multiplier("fable-5.10"), 0.1);
+    }
 
     #[test]
     fn fable_pricing() {

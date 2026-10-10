@@ -139,6 +139,9 @@ impl TurnBudget {
 /// the optional token/cost dimensions. Metadata only.
 #[derive(Debug, Default)]
 pub struct UsageCounters {
+    /// Sum of individually priced requests, rounded UP to nanodollars.
+    /// Saturation is fail-closed for any finite configured budget.
+    cost_nanodollars: std::sync::atomic::AtomicU64,
     input_tokens: std::sync::atomic::AtomicU64,
     output_tokens: std::sync::atomic::AtomicU64,
     cache_read_tokens: std::sync::atomic::AtomicU64,
@@ -149,18 +152,62 @@ pub struct UsageCounters {
 }
 
 impl UsageCounters {
-    pub fn record(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
+    /// Book exactly one request, using its model and optional cache TTL split.
+    /// Unknown models retain the pricing table's nonzero Sonnet fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_priced(
+        &self,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cache_write_5m: Option<u64>,
+        cache_write_1h: Option<u64>,
+    ) {
         use std::sync::atomic::Ordering;
-        self.input_tokens.fetch_add(input, Ordering::Relaxed);
-        self.output_tokens.fetch_add(output, Ordering::Relaxed);
-        self.cache_read_tokens
-            .fetch_add(cache_read, Ordering::Relaxed);
-        self.cache_write_tokens
-            .fetch_add(cache_write, Ordering::Relaxed);
+        let cost = agent_core::pricing::calculate_cost_optional_split(
+            model,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_5m,
+            cache_write_1h,
+        );
+        let units = cost * 1_000_000_000.0;
+        let units = if !units.is_finite() || units < 0.0 {
+            u64::MAX
+        } else {
+            units.ceil() as u64
+        };
+        Self::saturating_add(&self.cost_nanodollars, units);
+        Self::saturating_add(&self.input_tokens, input);
+        Self::saturating_add(&self.output_tokens, output);
+        Self::saturating_add(&self.cache_read_tokens, cache_read);
+        Self::saturating_add(&self.cache_write_tokens, cache_write);
         self.latest_context_tokens.store(
             input.saturating_add(cache_read).saturating_add(cache_write),
             Ordering::Relaxed,
         );
+    }
+
+    fn saturating_add(counter: &std::sync::atomic::AtomicU64, value: u64) {
+        use std::sync::atomic::Ordering;
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            Some(old.saturating_add(value))
+        });
+    }
+
+    pub fn cost_usd(&self) -> f64 {
+        let units = self
+            .cost_nanodollars
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if units == u64::MAX {
+            f64::MAX
+        } else {
+            units as f64 / 1_000_000_000.0
+        }
     }
 
     pub fn latest_context_tokens(&self) -> u64 {
@@ -314,19 +361,16 @@ impl TurnBudgetMeter {
     }
 
     /// Optional dimensions, consulted after each provider round from the
-    /// shared usage counters. `model` feeds the pricing table for the
-    /// cost estimate; both checks are no-ops when unconfigured.
-    pub fn check_usage(&self, usage: &UsageCounters, model: &str) -> Result<(), BudgetDimension> {
+    /// shared usage counters. Costs are summed per request, never repriced
+    /// from token totals; both checks are no-ops when unconfigured.
+    pub fn check_usage(&self, usage: &UsageCounters) -> Result<(), BudgetDimension> {
         if let Some(max_context) = self.budget.max_context_tokens {
             if usage.latest_context_tokens() > max_context {
                 return Err(BudgetDimension::InputTokens);
             }
         }
         if let Some(max_cost) = self.budget.max_cost_usd {
-            let (input, output, cache_read, cache_write) = usage.totals();
-            let cost =
-                agent_core::pricing::calculate_cost(model, input, output, cache_read, cache_write);
-            if cost > max_cost {
+            if usage.cost_usd() > max_cost {
                 return Err(BudgetDimension::CostUsd);
             }
         }
@@ -337,6 +381,106 @@ impl TurnBudgetMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_ttl_metadata_cannot_drop_cost_or_lower_tier() {
+        for (input, aggregate, c5, c1, expected) in [
+            (0, 100_001, Some(0), None, 0.100001),
+            (0, 100_001, None, Some(0), 0.100001),
+            (60_000, 40_000, Some(10_000), None, 0.01325),
+            (60_000, 40_001, Some(10_000), None, 0.066251),
+            (60_000, 40_001, None, Some(10_000), 0.070001),
+            (60_000, 40_001, Some(10_000), Some(10_000), 0.066251),
+            (60_000, 1, Some(20_000), Some(20_001), 0.062501),
+            (60_000, 1, Some(40_001), None, 0.055000625),
+            (60_000, 40_001, Some(40_001), None, 0.055000625),
+            (60_000, 40_001, None, Some(40_001), 0.070001),
+            (60_000, 40_001, Some(10_000), Some(30_001), 0.066251),
+            (60_000, 40_001, None, None, 0.055000625),
+        ] {
+            let usage = UsageCounters::default();
+            usage.record_priced("claude-haiku-5.5", input, 0, 0, aggregate, c5, c1);
+            assert!(
+                (usage.cost_usd() - expected).abs() < 2e-9,
+                "input={input}, aggregate={aggregate}, split={c5:?}/{c1:?}"
+            );
+            let mut budget = TurnBudget::for_role(TurnRole::Foreground);
+            budget.max_cost_usd = Some(expected / 2.0);
+            assert_eq!(
+                TurnBudgetMeter::new(budget).check_usage(&usage),
+                Err(BudgetDimension::CostUsd)
+            );
+        }
+        for (aggregate, c5, c1) in [
+            (u64::MAX, Some(1), None),
+            (1, Some(u64::MAX), Some(u64::MAX)),
+        ] {
+            let usage = UsageCounters::default();
+            usage.record_priced("claude-haiku-5.5", 0, 0, 0, aggregate, c5, c1);
+            assert_eq!(usage.cost_usd(), f64::MAX);
+        }
+    }
+
+    #[test]
+    fn costs_are_per_request_not_cumulative_tiers_or_current_model() {
+        let usage = UsageCounters::default();
+        for _ in 0..2 {
+            usage.record_priced("claude-haiku-5.5", 60_000, 1_000, 0, 0, None, None);
+        }
+        assert!((usage.cost_usd() - 0.013).abs() < 3e-9);
+        let mut budget = TurnBudget::for_role(TurnRole::Foreground);
+        budget.max_cost_usd = Some(0.03);
+        let meter = TurnBudgetMeter::new(budget);
+        assert_eq!(meter.check_usage(&usage), Ok(()));
+        usage.record_priced("claude-haiku-5-5", 100_001, 1_000, 0, 0, None, None);
+        assert!((usage.cost_usd() - 0.0655005).abs() < 4e-9);
+        assert_eq!(meter.check_usage(&usage), Err(BudgetDimension::CostUsd));
+        usage.record_priced("claude-opus-4.1", 1_000_000, 1_000_000, 0, 0, None, None);
+        usage.record_priced("claude-opus-4.8", 1_000_000, 1_000_000, 0, 0, None, None);
+        assert!((usage.cost_usd() - 120.0655005).abs() < 6e-9);
+        assert_eq!(usage.latest_context_tokens(), 1_000_000);
+    }
+
+    #[test]
+    fn request_tier_includes_reads_and_both_write_ttls() {
+        for extra in [0, 1] {
+            let usage = UsageCounters::default();
+            usage.record_priced(
+                "claude-haiku-5-5",
+                60_000,
+                1_000,
+                20_000 + extra,
+                20_000,
+                Some(5_000),
+                Some(15_000),
+            );
+            let expected = (0.006 + 0.0002 + 0.000625 + 0.003 + 0.0005 + extra as f64 * 0.00000001)
+                * if extra == 0 { 1.0 } else { 5.0 };
+            assert!((usage.cost_usd() - expected).abs() < 2e-9);
+            assert_eq!(usage.latest_context_tokens(), 100_000 + extra);
+        }
+    }
+
+    #[test]
+    fn unknown_models_and_saturation_cannot_silently_zero_cost() {
+        let usage = UsageCounters::default();
+        usage.record_priced("unknown-model", 1_000_000, 0, 0, 0, None, None);
+        assert!((usage.cost_usd() - 3.0).abs() < 2e-9);
+        for _ in 0..2 {
+            usage.record_priced(
+                "claude-opus-4.1",
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                None,
+                None,
+            );
+        }
+        assert_eq!(usage.totals(), (u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+        assert_eq!(usage.cost_usd(), f64::MAX);
+        assert_eq!(usage.latest_context_tokens(), u64::MAX);
+    }
 
     #[test]
     fn role_defaults_are_ordered_and_typed() {
@@ -533,27 +677,24 @@ mod tests {
     #[test]
     fn usage_counters_drive_optional_dimensions() {
         let usage = UsageCounters::default();
-        usage.record(100, 50, 10, 5);
+        usage.record_priced("claude-sonnet-4-5", 100, 50, 10, 5, None, None);
         assert_eq!(usage.latest_context_tokens(), 115);
 
         let meter = TurnBudgetMeter::new(TurnBudget {
             max_context_tokens: Some(100),
             ..TurnBudget::for_role(TurnRole::Foreground)
         });
-        assert_eq!(
-            meter.check_usage(&usage, "claude-sonnet-4-5"),
-            Err(BudgetDimension::InputTokens)
-        );
+        assert_eq!(meter.check_usage(&usage), Err(BudgetDimension::InputTokens));
 
         let cost_meter = TurnBudgetMeter::new(TurnBudget {
             max_cost_usd: Some(0.0),
             ..TurnBudget::for_role(TurnRole::Foreground)
         });
         assert_eq!(
-            cost_meter.check_usage(&usage, "claude-sonnet-4-5"),
+            cost_meter.check_usage(&usage),
             Err(BudgetDimension::CostUsd)
         );
         let unlimited = TurnBudgetMeter::new(TurnBudget::for_role(TurnRole::Foreground));
-        assert!(unlimited.check_usage(&usage, "claude-sonnet-4-5").is_ok());
+        assert!(unlimited.check_usage(&usage).is_ok());
     }
 }
