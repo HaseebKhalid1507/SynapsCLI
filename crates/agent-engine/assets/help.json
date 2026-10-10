@@ -578,7 +578,7 @@
       "/keepwarm 6h applies the same bound and stops 6 hours after the session went idle instead of the auto cap (N = 1–48). /keepwarm off stops it for this session; the choice survives park and daemon reload.",
       "Nothing is pinged when nothing is cached (a prompt below the model's cache minimum), when the next turn would roll the context over first, or when one worst-case ping costs more than the rewrite (budgeted thinking on a small prompt).",
       "Pings stop by themselves when the next request would differ (/model, /thinking, /system, tool activation, /compact, /clear); read-only commands do not affect them. A new message ends the idle period.",
-      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; the labels are saved with the session snapshot. The default comes from cache_keepwarm in config (off unless set)."
+      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; each ping's spend is saved as soon as it is booked (the labels with the session snapshot). The default comes from cache_keepwarm in config (off unless set)."
     ],
     "related": ["/stats", "/context"]
   },

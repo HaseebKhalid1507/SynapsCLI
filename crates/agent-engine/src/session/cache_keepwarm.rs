@@ -30,6 +30,13 @@
 //!   tail and reply) + uncached input + `max_tokens` of output. Under
 //!   budgeted thinking `max_tokens` is `budget + 1`, so such pings only run
 //!   for prefixes large enough that one worst-case ping fits the bound.
+//! - **the cap exposure**: `max_session_cost` is a hard cap, so admission
+//!   prices what a dispatched ping can actually bill — the larger of that
+//!   read-path worst case and a full miss (the whole prefix written at the
+//!   1h price if the request carries 1h markers, else the honoured TTL's,
+//!   plus the same uncached input and `max_tokens` of output). The
+//!   ski-rental bound stays on the read path: a miss *is* the rewrite and
+//!   ends the period when it happens.
 //!
 //! The period ends on the first of: bound, `<N>h` window, prefix change,
 //! context rollover ahead, a ping that cached nothing / missed / rewrote a
@@ -271,7 +278,8 @@ pub enum PeriodEnd {
     Rejected(String),
     /// Transient errors outlasted the backoff (or the TTL).
     TransientExhausted(String),
-    /// `max_session_cost` reached (or the next worst-case ping would).
+    /// `max_session_cost` reached (or the next ping would cross it if it
+    /// missed the cache and rewrote the whole prefix).
     CostCap {
         cap: f64,
     },
@@ -306,7 +314,7 @@ impl std::fmt::Display for PeriodEnd {
                 bound_usd,
             } => write!(
                 f,
-                "worst-case ping ${worst_usd:.4} exceeds the ${bound_usd:.4} rewrite it would save"
+                "worst-case cache-hit ping ${worst_usd:.4} exceeds the ${bound_usd:.4} rewrite it would save"
             ),
             PeriodEnd::HoursReached(h) => write!(f, "{h}h window reached"),
             PeriodEnd::Expired { age_secs } => write!(
@@ -397,7 +405,12 @@ pub struct Period {
     first_write: u64,
     bound_usd: f64,
     ledger_usd: f64,
+    /// Read-path worst case of the next ping (cache hit, `max_tokens` of
+    /// output): the ski-rental basis.
     worst_next_usd: f64,
+    /// What the next ping can bill if dispatched, a full cache miss
+    /// included: the `max_session_cost` admission basis.
+    exposure_next_usd: f64,
     /// Measured uncached input of the last ping.
     ping_input: u64,
     pings: u32,
@@ -494,6 +507,7 @@ impl Period {
             bound_usd: 0.0,
             ledger_usd: 0.0,
             worst_next_usd: 0.0,
+            exposure_next_usd: 0.0,
             ping_input: PING_INPUT_ESTIMATE,
             pings: 0,
             retries: 0,
@@ -546,7 +560,8 @@ impl Period {
         }
     }
 
-    /// Bound and worst case for the current prefix, TTL and ping count.
+    /// Bound, read-path worst case and cap exposure for the current prefix,
+    /// TTL and ping count.
     fn reprice(&mut self) {
         let model = self.cfg.model.as_str();
         self.bound_usd = rewrite_cost_usd(model, self.ttl, self.prefix_tokens);
@@ -559,6 +574,24 @@ impl Period {
             self.ping_input,
             self.cfg.max_tokens,
         );
+        // A miss rewrites the whole prefix. The ping carries the configured
+        // markers, so under `1h` / `hybrid` that write can be billed at the
+        // 1h price even while the honoured TTL is 5m: take the dearer one.
+        let miss = |ttl| {
+            request_cost_usd(
+                model,
+                ttl,
+                0,
+                self.prefix_tokens,
+                self.ping_input,
+                self.cfg.max_tokens,
+            )
+        };
+        let mut miss_usd = miss(self.ttl);
+        if matches!(self.cfg.ttl, CacheTtl::OneHour | CacheTtl::Hybrid) {
+            miss_usd = miss_usd.max(miss(CacheTtl::OneHour));
+        }
+        self.exposure_next_usd = self.worst_next_usd.max(miss_usd);
     }
 
     fn interval(&self) -> Duration {
@@ -579,10 +612,17 @@ impl Period {
     pub fn bound_usd(&self) -> f64 {
         self.bound_usd
     }
-    /// Worst-case cost of the next ping (what the bound/cap checks use, and
-    /// what an aborted in-flight ping is booked at).
+    /// Read-path worst case of the next ping (cache hit, `max_tokens` of
+    /// output): what the ski-rental bound checks use, and what an aborted
+    /// in-flight ping is booked at.
     pub fn worst_next_usd(&self) -> f64 {
         self.worst_next_usd
+    }
+    /// Most the next ping can bill once dispatched, a full cache miss
+    /// included (≥ [`worst_next_usd`](Self::worst_next_usd)): what the
+    /// `max_session_cost` admission check uses.
+    pub fn exposure_next_usd(&self) -> f64 {
+        self.exposure_next_usd
     }
     pub fn prefix_tokens(&self) -> u64 {
         self.prefix_tokens
@@ -663,7 +703,8 @@ impl Period {
             return Fire::End(r);
         }
         if let Some(cap) = max_session_cost.filter(|c| c.is_finite()) {
-            if session_cost + self.worst_next_usd >= cap {
+            // A hard cap: admit only what fits even if the ping misses.
+            if session_cost + self.exposure_next_usd >= cap {
                 return Fire::End(PeriodEnd::CostCap { cap });
             }
         }
@@ -970,7 +1011,8 @@ impl SessionActor {
 
     /// Book keep-warm spend: session cost (so `max_session_cost` sees it),
     /// the labelled keep-warm cost, token totals (shown separately), and the
-    /// active period's ledger.
+    /// active period's ledger — then queue a session save so the charge is
+    /// durable without waiting for Save/Park/End.
     fn cache_keepwarm_book(&mut self, usage: &KeepWarmUsage, cost: f64) {
         if (cost <= 0.0 && *usage == KeepWarmUsage::default()) || !self.conv.is_live() {
             return;
@@ -990,6 +1032,12 @@ impl SessionActor {
             p.charge(cost);
         }
         self.emit_conversation();
+        // Settled spend must survive a crash during idle (otherwise the
+        // charge is lost and `max_session_cost` headroom restored). The
+        // ordinary session save, queued on the persister: never blocks the
+        // actor. The keep-warm labels stay snapshot-only (never journaled);
+        // in journal mode the journaled session cost carries the charge.
+        self.request_save();
     }
 
     /// Abort the in-flight ping, if any, and book what it may have cost
@@ -1137,7 +1185,7 @@ impl SessionActor {
                     first_ping_in_secs = p.next_at().saturating_duration_since(now).as_secs(),
                     prefix_tokens = p.prefix_tokens(),
                     bound_usd = p.bound_usd(),
-                    worst_ping_usd = p.worst_next_usd(),
+                    worst_ping_usd = p.exposure_next_usd(),
                     "cache keep-warm period started"
                 );
                 self.cache_keepwarm.period = Some(p);
@@ -1368,7 +1416,7 @@ impl SessionActor {
                 "pings": p.pings(),
                 "ledger_usd": p.ledger_usd(),
                 "bound_usd": p.bound_usd(),
-                "worst_ping_usd": p.worst_next_usd(),
+                "worst_ping_usd": p.exposure_next_usd(),
                 "prefix_tokens": p.prefix_tokens(),
                 "next_ping_in_secs": next.unwrap_or(0),
                 "in_flight": p.in_flight(),
@@ -1547,6 +1595,71 @@ mod tests {
 
     // ── ski-rental bound, both TTLs, measured costs, worst case ──
 
+    /// Review #205: a dispatched ping can miss and rewrite the whole prefix
+    /// at the honoured TTL. The hard cap must admit only what fits even then.
+    #[test]
+    fn review_205_possible_cache_miss_must_fit_admission_cap() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut p = start(
+            cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, OPUS),
+            &last_read(OPUS),
+            t0,
+            w0,
+        );
+        let at = p.next_at();
+        let wall = w0 + at.saturating_duration_since(t0);
+        let cap = 0.30;
+        let decision = p.fire(at, wall, 0.0, Some(cap));
+        let miss = KeepWarmUsage {
+            cache_write_tokens: P,
+            cache_write_1h: Some(P),
+            ..KeepWarmUsage::default()
+        };
+        println!(
+            "REVIEW estimated_worst={} possible_write={} cap={cap} decision={decision:?}",
+            p.worst_next_usd,
+            miss.cost_usd(OPUS)
+        );
+        if matches!(decision, Fire::Ping) {
+            assert!(
+                miss.cost_usd(OPUS) <= cap,
+                "admitted request can exceed its session cost cap on a cache miss"
+            );
+        }
+    }
+
+    /// The miss-priced admission must not kill the feature: a cap with room
+    /// for a full miss still pings, and the ski-rental bound stays on the
+    /// read path.
+    #[test]
+    fn a_cap_with_room_for_a_cache_miss_still_pings() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut p = start(
+            cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, OPUS),
+            &last_read(OPUS),
+            t0,
+            w0,
+        );
+        // Full miss at 1h: 300k × $10/MTok = $3.00, + 64 input + 1 output.
+        let exposure = p.exposure_next_usd();
+        let miss = usage(OPUS, 0, P, PING_INPUT_ESTIMATE, 1);
+        let miss = KeepWarmUsage {
+            cache_write_1h: Some(P),
+            ..miss
+        };
+        assert!((exposure - miss.cost_usd(OPUS)).abs() < 1e-9, "{exposure}");
+        assert!(p.worst_next_usd() < p.bound_usd(), "bound basis is the read");
+        let at = p.next_at();
+        let wall = w0 + at.saturating_duration_since(t0);
+        assert_eq!(
+            p.fire(at, wall, 0.0, Some(3.0)),
+            Fire::End(PeriodEnd::CostCap { cap: 3.0 })
+        );
+        assert_eq!(p.fire(at, wall, 0.0, Some(3.01)), Fire::Ping);
+    }
+
     #[test]
     fn ski_rental_1h_is_nineteen_pure_reads_over_about_17h() {
         // A pure read of a 300k prefix: $0.15 on Opus; rewrite at 1h = $3.00.
@@ -1691,7 +1804,14 @@ mod tests {
             p.fire(at, wat, 4.70, Some(5.0)),
             Fire::End(PeriodEnd::CostCap { cap: 5.0 })
         );
-        assert_eq!(p.fire(at, wat, 4.50, Some(5.0)), Fire::Ping);
+        // $4.50 spent: the read-path worst case ($0.40) would fit, but a miss
+        // rewriting the prefix at 1h ($3.00) + the thinking ($0.25) would not.
+        assert_eq!(
+            p.fire(at, wat, 4.50, Some(5.0)),
+            Fire::End(PeriodEnd::CostCap { cap: 5.0 })
+        );
+        // $1.70 spent: even a full miss (~$3.2503) stays under the cap.
+        assert_eq!(p.fire(at, wat, 1.70, Some(5.0)), Fire::Ping);
     }
 
     // ── "nothing cached" guards ──

@@ -501,10 +501,21 @@ Rule: send a ping only while `ledger + worst(next ping) ≤ B`.
   cache) + uncached input (measured; 64 tokens before the first ping) +
   **`max_tokens` × output price**. `max_tokens` is the ping's real cap,
   reported by the probe (1, or `budget + 1`).
-- The same worst case is what `max_session_cost` is checked against: a ping is
-  not sent if `session cost + worst ≥ cap`.
+- `max_session_cost` is a hard cap, so it is checked against what a
+  dispatched ping can actually bill, a **miss** included: `exposure(next
+  ping) = max(worst(next ping), full write of P + the same uncached input +
+  max_tokens × output price)`. The full write is priced at the honoured TTL,
+  or at the 1h price whenever the configured TTL is `1h` or `hybrid` (the
+  ping carries 1h markers even while 5m is honoured), whichever is dearer. A
+  ping is not sent if `session cost + exposure ≥ cap`. Only this admission
+  check is miss-priced; the ski-rental rule above stays on `worst` (a miss
+  *is* the rewrite — pricing every ping as one would leave no room for even
+  a single ping under `B`). With P = 300k on Opus 4.7 under 1h a ping is read
+  at $0.15 but admitted only with ≈ $3.0003 of cap headroom
+  (`review_205_possible_cache_miss_must_fit_admission_cap`,
+  `a_cap_with_room_for_a_cache_miss_still_pings`).
 - If one worst-case ping does not fit `B` at all, **no period starts**
-  (`worst-case ping … exceeds the … rewrite`). In practice budgeted thinking
+  (`worst-case cache-hit ping … exceeds the … rewrite`). In practice budgeted thinking
   then only keeps large prefixes warm: Sonnet 4.6 at `xhigh` (32,769 ×
   $15/MTok = $0.49) under 5m with P = 20k (`B` = $0.075) never pings; under 1h
   with P = 300k (`B` = $1.80) it does.
@@ -662,7 +673,7 @@ variant exhaustively and drives them through the actor.
 | Booking a ping — every path (finished OK, failed, aborted, task panic) | One rule (`runtime::keepwarm::ping_booking`, applied by `PingTap::bill`): usage arrived → its real cost; else, if the provider **rejected it with an HTTP error status** (≥ 400: 400/404/429/500/529 …) → $0, because a refused request is not billed (an in-stream error after a 200 has already delivered `message_start` usage and is booked as measured); else, if the request was **dispatched**, the worst case for that ping — unless it failed to connect with no HTTP status; else $0. "Dispatched" (`PingTap::sent`) is set when the HTTP client pulls the request body over an established connection (hyper only polls the body after connecting and writing the head; the body carries an explicit `Content-Length`, so the wire framing is unchanged) or when a response arrives. A refused connection is never dispatched; a read timeout after the body went out is. |
 | Turn, compaction, another ping in flight | Never pinged concurrently. |
 | Driver armed, queued work, pending prompt | End (`Blocked`). |
-| `max_session_cost` | Checked against the worst case (§7.2); all ping spend counts toward it. |
+| `max_session_cost` | Checked against the ping's exposure, a full cache miss included (§7.2); all ping spend counts toward it. |
 | Session detached | Keep-warm continues (cost bounded by §7.2). The idle **auto-park** is deferred while a period is active (`can_park`); when it ends, `rearm_park` and the session parks after the normal grace. |
 | Explicit `Park` (host / reload) while a period is active | The period ends (`parked by request`), then the session parks. |
 | Script/RPC-only session | No period: requires a TUI or `synaps attach` client to have attached once. |
@@ -724,7 +735,16 @@ written to history, the session file or the transcript.
   tolerates unknown fields, so older builds just ignore the labels. In
   journal mode the labels are therefore as of the last snapshot — slightly
   stale until the next one (the session cost and token totals themselves are
-  journaled and always current). On load both labels are clamped under the
+  journaled and always current).
+- **Persisted when settled.** Every booking of a ping (finished, failed,
+  aborted, task panic — any path that books usage or a charge) queues an
+  ordinary session save on the actor's persister (`request_save`; never
+  blocks the actor), so a crash while idle neither loses the spend nor
+  restores `max_session_cost` headroom
+  (`review_205_completed_ping_accounting_is_persisted_without_manual_save`).
+  There is no reservation: a crash between a ping's dispatch and its
+  settlement can still lose **that one in-flight ping's** charge, at most its
+  exposure (§7.2). On load both labels are clamped under the
   totals they are part of (`Session::clamp_keepwarm_to_totals`; on resume the
   cache-token buckets restart at 0 with the cache totals, which are not
   persisted). `journal_written_by_this_build_parses_with_the_0_10_1_reader`
@@ -734,7 +754,8 @@ written to history, the session file or the transcript.
   buckets are kept, like `total_cache_*`.
 - API log (telemetry) records for pings carry `"keepwarm": true`.
 - One `info` line per ping (age, TTL, read / write / input / output tokens,
-  cost, ledger vs bound), one per period start (incl. worst-case ping) and end
+  cost, ledger vs bound), one per period start (incl. `worst_ping_usd`, the
+  miss-inclusive exposure) and end
   (reason, pings, ledger, bound), one per booked aborted ping, and a `warn`
   line when a ping did not refresh the cache.
 
@@ -754,7 +775,8 @@ written to history, the session file or the transcript.
 - `session::cache_keepwarm` (pure, injected clocks): ski-rental counts (1h:
   19, 5m: 12) with measured costs, overhead, first write, expensive thinking;
   the worst-case rule (Sonnet 4.6 xhigh, 5m, P = 20k → no period) and
-  `max_session_cost` against it; nothing cached (small prompt), uncached
+  `max_session_cost` against the miss-inclusive exposure (a cap with room
+  for a full miss still pings); nothing cached (small prompt), uncached
   share, cache miss, partial miss, ping 1's expected write; honoured TTL
   (downgrade, evidence, upgrade/downgrade by pings); suspend at minute 10 for
   30 min under 1h → ping before expiry; anchor scheduling; hybrid; late idle;
@@ -775,7 +797,8 @@ written to history, the session file or the transcript.
   ping that failed is booked; an aborted in-flight ping is booked at its
   worst case; after the bound, `off` → `auto` pings nothing until a real
   turn; `/clear` and `/resume` mid-ping book the ping to the old
-  conversation. The waits there are generous (60 s) on purpose:
+  conversation; a settled ping's charge is on disk with no manual save.
+  The waits there are generous (60 s) on purpose:
   a 300 ms test interval against a 1h TTL means lateness never changes the
   outcome (pings cannot expire; the count is fixed by the ledger, not the
   clock), so nothing asserts timing, only order and arithmetic.

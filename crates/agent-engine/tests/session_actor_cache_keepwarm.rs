@@ -1099,3 +1099,43 @@ async fn resume_mid_ping_books_the_ping_to_the_old_conversation() {
     );
     end(&mut t).await;
 }
+
+/// Review #205: a settled ping's charge reaches disk on its own. Without it a
+/// crash while idle loses the spend and restores `max_session_cost`
+/// headroom.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn review_205_completed_ping_accounting_is_persisted_without_manual_save() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (url, _bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    turn(&mut t, "hello").await;
+    let st = status_until(&mut t, 6000, PATIENCE, |s| {
+        s["keepwarm_cost"].as_f64().unwrap_or(0.0) > 0.0
+    })
+    .await;
+    assert!(st["keepwarm_cost"].as_f64().unwrap() > 0.0);
+    // No manual Save/Park/End or further real turn before reading durable state.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let disk = agent_core::session::Session::load(st["session"].as_str().unwrap()).unwrap();
+    let disk_kw = disk.keepwarm_cost;
+    let disk_cost = disk.session_cost;
+    end(&mut t).await;
+    assert!(
+        disk_kw > 0.0,
+        "completed ping missing on disk: kw={disk_kw}, total={disk_cost}; in-memory={st}"
+    );
+}
