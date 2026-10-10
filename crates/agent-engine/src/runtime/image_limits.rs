@@ -395,6 +395,51 @@ mod tests {
     }
 
     #[test]
+    fn count_cap_boundary_preserves_newest_images_and_history() {
+        for count in [100usize, 101] {
+            let original = history(count, |_| (2000, 2000));
+            let saved = serde_json::to_vec(&original).unwrap();
+            let mut out = original.clone();
+            assert_eq!(enforce_image_limits(&mut out), count - 100);
+            assert_eq!(remaining_images(&out), 100);
+            assert_eq!(serde_json::to_vec(&original).unwrap(), saved);
+            for (index, (before, after)) in original.iter().zip(&out).enumerate() {
+                if count == 101 && index == 0 {
+                    assert!(!Arc::ptr_eq(before, after));
+                    assert_eq!(after["content"][0]["tool_use_id"], "t0");
+                    assert_eq!(
+                        after["content"][0]["content"][0],
+                        before["content"][0]["content"][0]
+                    );
+                    assert_eq!(
+                        after["content"][0]["content"][1]["text"],
+                        IMAGE_COUNT_CAP_LABEL
+                    );
+                } else {
+                    assert!(Arc::ptr_eq(before, after), "message {index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dimension_boundary_preserves_durable_history() {
+        for count in [20usize, 21] {
+            let original = history(count, |i| if i == 0 { (2001, 2000) } else { (2000, 2000) });
+            let saved = serde_json::to_vec(&original).unwrap();
+            let mut out = original.clone();
+            assert_eq!(enforce_image_limits(&mut out), count - 20);
+            assert_eq!(remaining_images(&out), 20);
+            assert_eq!(serde_json::to_vec(&original).unwrap(), saved);
+            assert_eq!(remaining_images(&original), count);
+            assert_eq!(
+                original[0]["content"][0]["content"][1],
+                png_image(2001, 2000)
+            );
+        }
+    }
+
+    #[test]
     fn count_cap_drops_oldest_beyond_100() {
         let mut out = history(105, |_| (800, 600));
         assert_eq!(enforce_image_limits(&mut out), 5);
