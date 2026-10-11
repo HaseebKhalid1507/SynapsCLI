@@ -148,6 +148,8 @@ pub fn record_tool_output_replace(
     observed_len: usize,
     replacement_len: usize,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    assert_test_base_dir_isolated("record_tool_output_replace");
     record_tool_output_replace_to(
         &crate::config::base_dir(),
         plugin_id,
@@ -156,6 +158,21 @@ pub fn record_tool_output_replace(
         observed_len,
         replacement_len,
     )
+}
+
+/// Test-build tripwire (#186): a unit test that reaches an ambient-path audit
+/// writer without `crate::test_env::BaseDirGuard` would append to the
+/// developer's REAL `~/.synaps-cli/extensions/…` (this happened: `first`,
+/// `mb-replacer`, … entries in a real intercept.jsonl). Fail loudly instead,
+/// before anything is written. Compiled out of non-test builds.
+#[cfg(test)]
+fn assert_test_base_dir_isolated(writer: &str) {
+    assert!(
+        std::env::var_os("SYNAPS_BASE_DIR").is_some(),
+        "{writer} called from a test without an isolated base dir — it would write \
+         under the real ~/.synaps-cli. Hold `crate::test_env::BaseDirGuard` and mark \
+         the test `#[serial_test::serial(synaps_base_dir)]`."
+    );
 }
 
 pub(crate) fn record_tool_output_replace_to(
@@ -374,6 +391,18 @@ mod tests {
             !raw.contains("tool_output"),
             "audit line must not carry content"
         );
+    }
+
+    /// #186 tripwire: an un-isolated test write is rejected before touching
+    /// the filesystem (so it can never land in the real home).
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    #[should_panic(expected = "without an isolated base dir")]
+    fn record_tool_output_replace_rejects_unisolated_test_write() {
+        // Guard restores the caller's SYNAPS_BASE_DIR on unwind.
+        let _restore = crate::test_env::BaseDirGuard::new();
+        std::env::remove_var("SYNAPS_BASE_DIR");
+        let _ = record_tool_output_replace("tripwire", "after_tool_call", None, 1, 1);
     }
 
     #[test]

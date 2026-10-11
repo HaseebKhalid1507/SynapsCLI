@@ -647,6 +647,8 @@ impl TestHarness {
 
     /// Zero the highlight counters (`HIGHLIGHT_CALLS` + `SYNTAX_SET_TOUCHED`).
     /// Call before the frame under measurement to get a clean read.
+    /// The probes are thread-local (#285): they only see highlight work done
+    /// on the calling thread, which is where `render()` draws.
     pub fn reset_highlight_probe(&self) {
         super::highlight::highlight_reset_counters();
     }
@@ -1001,7 +1003,8 @@ pub mod termcaps {
 /// Store probe access (render_count, cum_height_writes, reset_perf_probe) is
 /// available directly on [`TestHarness`].
 ///
-/// Only available under `feature = "testing"`.
+/// Only available under `feature = "testing"`. The highlight probes are
+/// thread-local (#285): reads/resets only see the calling thread's work.
 pub mod probe {
     /// Reset both highlight counters (`HIGHLIGHT_CALLS`, `SYNTAX_SET_TOUCHED`).
     /// Call before the frame under measurement.

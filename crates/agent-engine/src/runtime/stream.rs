@@ -3745,7 +3745,10 @@ mod rich_output_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn rich_output_and_hook_replace() {
+        // #186: Replace writes the intercept audit — isolate the base dir.
+        let _base = crate::test_env::BaseDirGuard::new();
         let bus = Arc::new(crate::extensions::hooks::HookBus::new());
         let mut perms = PermissionSet::new();
         perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
