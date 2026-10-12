@@ -2,6 +2,118 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.2] — 2026-10-12
+
+Long turns are no longer cut off after two hours, sessions with many images
+keep working, and subagents keep their work through timeouts. Legacy MCP is
+gone: MCP tools work the same way with progressive disclosure on or off.
+
+### Fixed
+
+- **Long turns were stopped at a fixed time limit** (2 h foreground, 1 h
+  worker, 15 min autonomous), even while making progress. Turns now have no
+  time limit unless you set one; see Upgrade notes. (#191)
+- **Sessions with more than 20 images failed every request** with HTTP 400
+  until `/compact`. Native Anthropic requests now send a copy of any
+  PNG/JPEG over 2000 px per side scaled down to 2000 px, from the first
+  request; the saved original is unchanged. Past 100 images or 20 MiB of
+  attachments, the oldest images are replaced by a label in chunks of at
+  least 40, so the prompt cache is not rebuilt every turn. (#188, #206, #207)
+- **Subagents lost their work on timeout, failure or reaping**, and
+  `subagent_resume` started over. Each finished worker's conversation is now
+  saved under `~/.synaps-cli/subagent-history/` (kept 14 days), and
+  `subagent_resume` continues it, also for reaped handles or, with
+  `archive_path`, from an earlier session. (#202)
+- A `read` after a `bash` in the same batch raced it and failed with "No
+  such file or directory". Calls after a side-effecting tool now wait for
+  it. (#202)
+- A long daemon turn could die at context rollover with "rollover requires
+  admitted builtin history retrieval tools". (#213)
+- **Codex requests never hit the ChatGPT prompt cache.** They now send the
+  `session-id`/`thread-id` headers the backend uses. (#197)
+- ChatGPT `synaps login` got a 404 on the browser redirect; it now
+  completes from the browser. (#196)
+- A bash command that timed out, was canceled or hit the output cap left
+  its child processes running; the whole process group is now killed.
+  (#201)
+- Dead session cards and sockets piled up in `~/.synaps-cli/run/`. Sessions
+  now remove their own, and dead owners' files are pruned at session and
+  daemon start. (#200)
+- Cost estimates were wrong for several models (e.g. Opus 4/4.1 at a third
+  of the price). Prices and cache-read multipliers now follow Anthropic's
+  pricing page. Displayed costs and `max_session_cost` change. (#204)
+- `synaps` attached to the daemon shows the boot logo again. (#189)
+- `context_window = auto` was ignored and fell back to 200k; it now means
+  the model's default. (#210)
+
+### Added
+
+- **Prompt-cache keep-warm.** `cache_keepwarm = off | auto | <N>h`, or
+  `/keepwarm` per session. While a session is idle it re-reads the cached
+  prefix before it expires, only while that costs less than the rewrite it
+  prevents. `auto` stops after `cache_keepwarm_auto_max_hours` (default 24).
+  Spend shows in the footer (`kw $…`) and `/stats`. (#205)
+- **New MCP servers are discovered at boot**, so their tools appear without
+  a hand-seeded cache. The daemon does this after it is ready; a failing
+  server is retried after 1 h, backing off to 24 h.
+  `SYNAPS_MCP_CACHE_WRITEBACK=0` turns it off. (#195, #209)
+- In progressive mode the system prompt lists the tools the model can
+  activate. (#193)
+- `/settings` covers every user-facing config key, checked by the config
+  parser before it is written. (#210)
+
+### Changed
+
+- **Activating a tool no longer rewrites the Anthropic prompt cache.** Tools
+  are sent deferred and activated by reference, so the tools list stays the
+  same. `tools.deferred_loading = off` turns this off. OpenAI, Codex and
+  models without tool search are unchanged. (#192)
+- Up to 16 subagents run at once (was 8). Limit errors name the config key
+  to raise, instead of `ChildLimit`. A subagent `timeout` of `0` now means
+  no limit. (#199, #202)
+- `/stats` no longer shows a dollar figure for cache savings. (#204)
+- Clients wait up to 15 s (was 5 s) for an auto-started daemon. (#209)
+- TUI: event cards take the theme's colours; ocean's user messages have a
+  visible background. (#189)
+
+### Upgrade notes
+
+- **Legacy MCP is removed.** The model-facing `connect_mcp_server` tool is
+  gone. MCP tools are always descriptor-backed: with progressive disclosure
+  they stay dormant until activated; without it they are in the core set
+  from the first request. `--allow-legacy-mcp` and
+  `SYNAPS_DAEMON_ALLOW_LEGACY_MCP` are accepted and ignored. (#195)
+- **`synaps-engine` crate users:** `McpConnectTool`, `McpTool`,
+  `allow_legacy_mcp_env` and `legacy_mcp_conflict` are removed from the
+  public API, `HostOpts` has a new `mcp_discovery` field, and
+  `TurnBudget::max_elapsed` is now an `Option`. A caret dependency on 0.10
+  picks this up; pin `=0.10.1` to keep the old API. (#191, #195, #209)
+- **Turns have no wall-clock limit by default.** Set one with
+  `turn_budget.<role>.max_elapsed_secs`, or `/budget time 4h` in a session
+  (`/budget time off` clears it). Rounds, tool calls and tool-result bytes
+  still bound every turn. (#191)
+- **systemd scopes:** on Linux with a systemd user manager, the daemon and
+  each bash/powershell command and PTY shell get their own scope, so an OOM
+  kill of a runaway command no longer takes the daemon down too. Opt out
+  with `process_scopes = off` or `SYNAPS_PROCESS_SCOPES=off`. Without a user
+  manager (macOS, containers) processes start as before. The daemon moves
+  into its scope at its next fresh start, not on reload. (#201)
+- **Keep-warm costs money when on.** It is off by default, Anthropic-only,
+  and runs only for sessions a TUI or attach client has opened. (#205)
+- Subagent limits: `subagent.max_concurrent` (16), `subagent.max_total`
+  (64), `subagent.max_depth` (4). (#199)
+- Sessions saved by 0.10.2 still open in 0.10.1: keep-warm totals live only
+  in the snapshot, never in the journal. (#205)
+- The daemon protocol is unchanged (v3). Run `synaps daemon reload` with no
+  turn running to move a 0.10.1 daemon to the new binary; clients
+  reconnect on their own. Clients left open from 0.10.1 keep working;
+  restart them for the new TUI features.
+
+### Internal
+
+- Request-trace telemetry sees mid-message cache markers. (#203)
+- Axel memory sidecar: `openssl` 0.10.73 → 0.10.81. (#211)
+
 ## [0.10.1] — 2026-09-30
 
 Interrupting a turn no longer makes the model refuse your next message,
