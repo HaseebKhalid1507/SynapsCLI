@@ -1187,6 +1187,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
+    // Legacy flat spellings of `subagent.max_concurrent` / `subagent.max_total`.
+    "subagent_max_concurrent",
+    "subagent_max_total",
     "api_retries",
     "refusal_retries",
     "telemetry",
@@ -1664,6 +1667,15 @@ fn apply_config_content_with(
             "subagent_timeout" => {
                 if let Ok(timeout) = val.parse::<u64>() {
                     config.subagent_timeout = timeout;
+                }
+            }
+            // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
+            "subagent_max_concurrent" | "subagent_max_total" => {
+                let dotted = key.replacen("subagent_", "subagent.", 1);
+                if let Err(reason) =
+                    parse_subagent_config_key(&mut config.subagent, &dotted, val)
+                {
+                    config.warnings.push(format!("{key} — {reason}"));
                 }
             }
             "api_retries" => {
@@ -2348,6 +2360,20 @@ mod tests {
                 "{k} not in KNOWN_CONFIG_KEYS"
             );
         }
+    }
+
+    #[test]
+    fn legacy_flat_subagent_limit_keys_alias_the_dotted_keys() {
+        let c = super::load_config_from_str(concat!(
+            "subagent_max_concurrent = 256\n",
+            "subagent_max_total = 1024\n",
+        ));
+        assert_eq!(c.subagent.max_concurrent, 256);
+        assert_eq!(c.subagent.max_total, 1024);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_max_concurrent = 0\n");
+        assert_eq!(c.subagent, super::SubagentLimits::default());
+        assert!(c.warnings.iter().any(|w| w.starts_with("subagent_max_concurrent")));
     }
 
     #[test]
