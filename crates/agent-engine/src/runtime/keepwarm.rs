@@ -621,6 +621,7 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            anthropic_stream_client: self.anthropic_stream_client.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             // The base context: a ping must never consume `/trace next`.
@@ -1372,6 +1373,7 @@ mod tests {
             auth_type: "oauth".to_string(),
             refresh_token: None,
             token_expires: Some(crate::epoch_millis() + 3_600_000),
+            bound_credential: None,
         }));
         let o = assert_identity_1h(&rt).await;
         assert!(

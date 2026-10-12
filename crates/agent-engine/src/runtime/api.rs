@@ -1937,7 +1937,7 @@ impl ApiMethods {
                         }
                         Err(e) => {
                             if let Some(keepwarm) = &options.keepwarm {
-                                if e.is_connect() {
+                                if matches!(&e, RuntimeError::Api(error) if error.is_connect()) {
                                     keepwarm
                                         .connect_failed
                                         .store(true, std::sync::atomic::Ordering::Relaxed);

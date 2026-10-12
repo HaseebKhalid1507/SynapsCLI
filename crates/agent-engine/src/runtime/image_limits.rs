@@ -68,6 +68,16 @@ fn image_slots(messages: &[SharedMessage]) -> Vec<Slot> {
     slots
 }
 
+fn replace_with_text(messages: &mut [SharedMessage], slot: Slot, text: String) {
+    let message = Arc::make_mut(&mut messages[slot.msg]);
+    let outer = &mut message["content"][slot.block];
+    let target = match slot.inner {
+        Some(inner) => &mut outer["content"][inner],
+        None => outer,
+    };
+    *target = json!({ "type": "text", "text": text });
+}
+
 fn block_at(messages: &[SharedMessage], slot: Slot) -> &Value {
     let outer = &messages[slot.msg]["content"][slot.block];
     match slot.inner {
