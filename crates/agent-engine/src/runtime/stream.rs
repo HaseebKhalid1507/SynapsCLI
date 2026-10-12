@@ -348,6 +348,39 @@ pub(super) fn select_turn_start_tool_set(
     }
 }
 
+/// Round-top rebuild of a STALE retained set — the catalog generation
+/// advanced mid-turn (in the daemon, e.g. another session registering or
+/// disabling a tool on the shared registry). The core is re-derived exactly
+/// as turn start derives it, through [`super::continuation::context_tool_set`],
+/// so an opted-in context-management session keeps `context_checkpoint`,
+/// `memory_search` and `memory_fetch`; valid exact activations are then
+/// carried into it. `SYNAPS_TOOLSET_CARRY_FORWARD=0` returns the fresh set
+/// with nothing carried.
+///
+/// Deriving the core from the bare progressive core here instead
+/// (`SessionToolSet::rebuilt_for_catalog`) silently stripped the three
+/// context tools for the rest of the turn, so the next rollover tripped its
+/// "requires admitted builtin history retrieval tools" gate and the turn
+/// died with a config error.
+pub(super) fn rebuild_stale_tool_set(
+    set: &crate::tools::activation::SessionToolSet,
+    session: crate::tools::activation::SessionId,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+    context_enabled: bool,
+) -> (
+    crate::tools::activation::SessionToolSet,
+    Vec<crate::tools::activation::DroppedActivation>,
+) {
+    let fresh =
+        super::continuation::context_tool_set(session, catalog, progressive, context_enabled);
+    if crate::tools::activation::carry_forward_enabled() {
+        set.carry_activations_into(fresh, catalog)
+    } else {
+        (fresh, Vec::new())
+    }
+}
+
 fn assistant_text_from_content(content: &[Value]) -> String {
     content
         .iter()
@@ -872,25 +905,21 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        if crate::tools::activation::carry_forward_enabled() {
-                            let (next, dropped) = set
-                                .rebuilt_for_catalog(registry.catalog(), progressive_tool_disclosure);
-                            for d in &dropped {
-                                tracing::warn!(
-                                    tool = %d.id,
-                                    reason = ?d.reason,
-                                    "activation dropped at round-top rebuild"
-                                );
-                            }
-                            *set = next;
-                        } else {
-                            *set = super::continuation::context_tool_set(
-                                tool_session_id.clone(),
-                                registry.catalog(),
-                                progressive_tool_disclosure,
-                                context_enabled,
+                        let (next, dropped) = rebuild_stale_tool_set(
+                            &set,
+                            tool_session_id.clone(),
+                            registry.catalog(),
+                            progressive_tool_disclosure,
+                            context_enabled,
+                        );
+                        for d in &dropped {
+                            tracing::warn!(
+                                tool = %d.id,
+                                reason = ?d.reason,
+                                "activation dropped at round-top rebuild"
                             );
                         }
+                        *set = next;
                     }
                 }
                 (registry.clone(), registry.catalog().clone())

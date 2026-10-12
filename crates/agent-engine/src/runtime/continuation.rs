@@ -1393,7 +1393,8 @@ mod lifecycle_tests {
         for name in ["context_checkpoint", "memory_search", "memory_fetch"] {
             assert!(ExecutionGate::authorize_wire_call(&registry, &initial, name).is_ok());
         }
-        // Same rebuild path used after a catalog generation change.
+        // Same core derivation the stale-set rebuild uses
+        // (`stream::rebuild_stale_tool_set`, regression-tested below).
         registry.disable(&["write".into()]);
         let rebuilt = context_tool_set(session.clone(), registry.catalog(), true, true);
         assert!(ExecutionGate::authorize_wire_call(&registry, &rebuilt, "memory_fetch").is_ok());
@@ -1403,5 +1404,83 @@ mod lifecycle_tests {
         assert!(ExecutionGate::authorize_wire_call(&registry, &disabled, "memory_fetch").is_err());
         let off = context_tool_set(session, registry.catalog(), true, false);
         assert!(!off.is_core(&ToolId::builtin("memory_search")));
+    }
+
+    /// Regression (2026-10-12, `rollover requires admitted builtin history
+    /// retrieval tools`): a sibling daemon session's turn re-registers
+    /// `context_checkpoint` on the shared registry, advancing the catalog
+    /// generation mid-turn. The round-top rebuild of the now-stale set must
+    /// keep the three context tools AND carry exact activations. The old
+    /// rebuild (`rebuilt_for_catalog`, bare progressive core) dropped the
+    /// context tools for the rest of the turn, so the next rollover failed.
+    #[test]
+    fn round_top_rebuild_after_generation_bump_keeps_context_tools() {
+        use crate::tools::catalog::SessionActivationGrant;
+        let session = crate::tools::activation::SessionId::parse("continuation-round-top").unwrap();
+        let checkpoint = || {
+            Arc::new(crate::tools::context_checkpoint::ContextCheckpointTool(
+                Arc::new(Mutex::new(Default::default())),
+            ))
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(checkpoint());
+        let mut initial = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let deferred = ToolId::builtin("shell_start");
+        assert!(
+            !initial.is_core(&deferred),
+            "fixture needs a deferred builtin"
+        );
+        let rec = registry
+            .catalog()
+            .get(&deferred)
+            .expect("shell_start registered");
+        let grant = SessionActivationGrant::new(
+            session.as_str(),
+            deferred.clone(),
+            registry.catalog().generation(),
+            rec.schema_digest().clone(),
+        )
+        .unwrap();
+        initial.activate(grant, registry.catalog()).unwrap();
+
+        // A sibling session's turn start: identical re-registration, new generation.
+        registry.register(checkpoint());
+        assert!(initial.is_stale(registry.catalog()));
+
+        // Pre-fix path, kept as the control: the bare progressive core loses them.
+        let (old, _) = initial.rebuilt_for_catalog(registry.catalog(), true);
+        assert!(ExecutionGate::authorize_wire_call(&registry, &old, "memory_fetch").is_err());
+
+        let (rebuilt, dropped) = crate::runtime::stream::rebuild_stale_tool_set(
+            &initial,
+            session.clone(),
+            registry.catalog(),
+            true,
+            true,
+        );
+        assert!(dropped.is_empty(), "nothing drifted: {dropped:?}");
+        assert!(!rebuilt.is_stale(registry.catalog()));
+        for name in [
+            "context_checkpoint",
+            "memory_search",
+            "memory_fetch",
+            "shell_start",
+        ] {
+            assert!(
+                ExecutionGate::authorize_wire_call(&registry, &rebuilt, name).is_ok(),
+                "{name} must survive the round-top rebuild"
+            );
+        }
+
+        // Context management off: rebuild stays the minimal core, nothing invented.
+        let (off, _) = crate::runtime::stream::rebuild_stale_tool_set(
+            &initial,
+            session,
+            registry.catalog(),
+            true,
+            false,
+        );
+        assert!(!off.is_core(&ToolId::builtin("memory_search")));
+        assert!(ExecutionGate::authorize_wire_call(&registry, &off, "shell_start").is_ok());
     }
 }
