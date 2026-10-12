@@ -197,6 +197,11 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
         413 => "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.".to_string(),
         400 if body_mentions(body, "Consumer Terms") =>
             "Anthropic requires accepting updated Consumer Terms: sign in at claude.ai with this account, accept the terms, then retry.".to_string(),
+        // Anthropic's whole-request image rule: past 20 images in one request,
+        // every image must be at most 2000 px per side. The runtime trims the
+        // outgoing copy (runtime::image_limits); this names it if it ever slips.
+        400 if body_mentions(body, "many-image") =>
+            "Too many large images (HTTP 400): once a request holds more than 20 images, Anthropic accepts only images up to 2000 px per side. Run /compact to drop old images from the conversation.".to_string(),
         400 if body_mentions(body, "extended-cache-ttl") =>
             "Bad request (HTTP 400) — your account may not support 1h cache TTL; set cache_ttl = 5m in config.".to_string(),
         400 if body_mentions(body, "prompt is too long") || body_mentions(body, "max_tokens") || body_mentions(body, "context") =>
@@ -453,6 +458,21 @@ mod tests {
             r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#,
         );
         assert!(msg.contains("/compact"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_400_many_image_names_the_limit() {
+        let msg = humanize_api_error(
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.433.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"}}"#,
+        );
+        assert!(msg.contains("20 images"), "got: {msg}");
+        assert!(msg.contains("2000 px"), "got: {msg}");
+        assert!(msg.contains("/compact"), "got: {msg}");
+        assert!(
+            !msg.contains("messages.433"),
+            "untrusted detail leaked: {msg}"
+        );
     }
 
     #[test]

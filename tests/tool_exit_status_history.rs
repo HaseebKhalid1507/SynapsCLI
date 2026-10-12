@@ -62,7 +62,7 @@ async fn streamed_then_failed_tool_reports_exit_status_and_notice_to_model() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true })
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline })
             .await
             .expect("host boot");
     let handle = host

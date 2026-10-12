@@ -187,20 +187,34 @@ pub fn is_alive(paths: &DaemonPaths) -> bool {
     }
 }
 
+/// Remove only the daemon's two metadata files, while its lock is held.
+/// These paths come from DaemonPaths, never from a session card or a suffix scan.
+/// Refuse symlinks and special files (including directories and sockets).
+pub(super) fn cleanup_metadata(paths: &DaemonPaths, _lock: &DaemonLock) -> bool {
+    let mut removed = false;
+    for path in [&paths.json, &paths.pid] {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "daemon: metadata cleanup failed"),
+            }
+        }
+    }
+    removed
+}
+
 /// Unlink `sock`/`json`/`pid` if — and only if — no daemon holds the lock.
 /// Returns `true` when something stale was removed.
 pub fn reap_stale(paths: &DaemonPaths) -> bool {
-    if is_alive(paths) {
+    // Retain the probe's lock through deletion: metadata cleanup requires ownership.
+    let Ok(Some(lock)) = DaemonLock::try_acquire(paths) else {
         return false;
-    }
-    let mut reaped = false;
-    for p in [&paths.sock, &paths.json, &paths.pid] {
-        if p.exists() {
-            crate::events::socket::cleanup_socket(&p.to_string_lossy());
-            reaped |= !p.exists();
-        }
-    }
-    reaped
+    };
+    let had_socket = paths.sock.exists();
+    crate::events::socket::cleanup_socket(&paths.sock.to_string_lossy());
+    let reaped_socket = had_socket && !paths.sock.exists();
+    cleanup_metadata(paths, &lock) || reaped_socket
 }
 
 #[cfg(test)]
@@ -236,9 +250,59 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cleanup_is_exact_and_requires_the_held_lock() {
+        let (d, p) = paths();
+        let other = daemon_paths_in(d.path(), Some("other"));
+        for path in [&p.json, &p.pid, &other.json, &other.pid] {
+            std::fs::write(path, b"metadata").unwrap();
+        }
+        let unrelated = d.path().join("session.json");
+        let unrelated_pid = d.path().join("session.pid");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        std::fs::write(&unrelated_pid, b"keep").unwrap();
+        // A regular file at the socket path must not be removed either.
+        std::fs::write(&p.sock, b"not a socket").unwrap();
+        let lock = DaemonLock::try_acquire(&p).unwrap().unwrap();
+        assert!(cleanup_metadata(&p, &lock));
+        assert!(!p.json.exists() && !p.pid.exists());
+        assert!(is_alive(&p), "cleanup must not release or unlink the lock");
+        assert!(!cleanup_metadata(&p, &lock), "idempotent");
+        drop(lock);
+        assert!(!reap_stale(&p), "regular socket impostor is preserved");
+        for path in [&p.sock, &p.lock, &other.json, &other.pid, &unrelated, &unrelated_pid] {
+            assert!(path.exists(), "preserve {}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_cleanup_preserves_symlinks_and_special_files() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let (d, p) = paths();
+        let target = d.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        symlink(&target, &p.json).unwrap();
+        symlink(d.path().join("missing"), &p.pid).unwrap();
+        let lock = DaemonLock::try_acquire(&p).unwrap().unwrap();
+        assert!(!cleanup_metadata(&p, &lock));
+        drop(lock);
+        assert!(!reap_stale(&p));
+        for path in [&p.json, &p.pid] {
+            assert!(std::fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::create_dir(&p.json).unwrap();
+        let _listener = UnixListener::bind(&p.pid).unwrap();
+        assert!(!reap_stale(&p));
+        assert!(p.json.is_dir() && p.pid.exists());
+    }
+
+    #[test]
     fn stale_files_reaped_only_without_holder() {
         let (_d, p) = paths();
-        std::fs::write(&p.sock, b"").unwrap();
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(&p.sock).unwrap();
         let info = DaemonInfo {
             pid: 4_000_000,
             protocol_version: 1,
@@ -258,7 +322,9 @@ mod tests {
         }
         let guard = DaemonLock::try_acquire(&p).unwrap().unwrap();
         assert!(!reap_stale(&p), "live holder: nothing reaped");
+        #[cfg(unix)]
         assert!(p.sock.exists());
+        assert!(p.json.exists() && p.pid.exists());
         drop(guard);
         assert!(reap_stale(&p));
         assert!(!p.sock.exists() && !p.json.exists() && !p.pid.exists());

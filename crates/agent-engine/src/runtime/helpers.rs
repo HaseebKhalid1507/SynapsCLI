@@ -104,6 +104,106 @@ impl HelperMethods {
         injected
     }
 
+    /// Canonical tool ids named by `tool_reference` blocks anywhere in the
+    /// history's tool results (written by `activate_tools`).
+    pub(crate) fn referenced_tool_ids(
+        messages: &[SharedMessage],
+    ) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        for msg in messages {
+            let Some(blocks) = msg["content"].as_array() else {
+                continue;
+            };
+            for block in blocks {
+                if block["type"] != "tool_result" {
+                    continue;
+                }
+                let Some(inner) = block["content"].as_array() else {
+                    continue;
+                };
+                for item in inner {
+                    if item["type"] == "tool_reference" {
+                        if let Some(name) = item["tool_name"].as_str() {
+                            ids.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Put history `tool_reference` blocks into the only shape the Anthropic
+    /// wire accepts, deterministically (same history + same tools ⇒ same
+    /// bytes, so the message prefix stays cacheable):
+    ///
+    /// - a `tool_result` holding references may contain ONLY references (a
+    ///   text block alongside them is a 400), so the text is dropped;
+    /// - every reference must name a tool in this request's `tools` array (an
+    ///   unknown name is a 400), so each stored canonical id is resolved
+    ///   through `resolve`; unresolvable references are dropped;
+    /// - with no resolvable reference left (deferred loading off, a provider
+    ///   or model without tool search, a tool since removed), the result keeps
+    ///   its non-reference blocks only.
+    ///
+    /// Only messages that actually carry references are cloned.
+    pub(crate) fn wire_tool_references(
+        messages: &mut [SharedMessage],
+        resolve: &dyn Fn(&str) -> Option<String>,
+    ) {
+        for msg in messages.iter_mut() {
+            let has_reference = msg["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|b| {
+                    b["type"] == "tool_result"
+                        && b["content"].as_array().is_some_and(|inner| {
+                            inner.iter().any(|i| i["type"] == "tool_reference")
+                        })
+                })
+            });
+            if !has_reference {
+                continue;
+            }
+            let msg = Arc::make_mut(msg);
+            let Some(blocks) = msg["content"].as_array_mut() else {
+                continue;
+            };
+            for block in blocks.iter_mut() {
+                if block["type"] != "tool_result" {
+                    continue;
+                }
+                let Some(inner) = block["content"].as_array() else {
+                    continue;
+                };
+                if !inner.iter().any(|i| i["type"] == "tool_reference") {
+                    continue;
+                }
+                let mut seen = std::collections::HashSet::new();
+                let refs: Vec<Value> = inner
+                    .iter()
+                    .filter(|i| i["type"] == "tool_reference")
+                    .filter_map(|i| i["tool_name"].as_str().and_then(resolve))
+                    .filter(|name| seen.insert(name.clone()))
+                    .map(|name| json!({"type": "tool_reference", "tool_name": name}))
+                    .collect();
+                let replacement = if refs.is_empty() {
+                    let rest: Vec<Value> = inner
+                        .iter()
+                        .filter(|i| i["type"] != "tool_reference")
+                        .cloned()
+                        .collect();
+                    if rest.is_empty() {
+                        json!("ok")
+                    } else {
+                        Value::Array(rest)
+                    }
+                } else {
+                    Value::Array(refs)
+                };
+                block["content"] = replacement;
+            }
+        }
+    }
+
     /// Strip invalid thinking blocks from assistant messages before sending to the API.
     ///
     /// Anthropic rejects any `{"type": "thinking", ...}` block whose `thinking` field
@@ -406,6 +506,113 @@ impl HelperMethods {
 
 #[cfg(test)]
 mod tests {
+
+    // ── deferred tool loading: history tool_reference → Anthropic wire ──────
+
+    fn activation_result(ids: &[&str]) -> SharedMessage {
+        let mut inner = vec![json!({"type": "text", "text": "{\"activated\":1}"})];
+        inner.extend(
+            ids.iter()
+                .map(|id| json!({"type": "tool_reference", "tool_name": id})),
+        );
+        Arc::new(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a", "content": inner}
+        ]}))
+    }
+
+    #[test]
+    fn wire_references_resolve_to_wire_names_and_drop_text() {
+        let mut msgs = vec![activation_result(&["mcp.srv:echo", "builtin:gone"])];
+        let resolve = |id: &str| (id == "mcp.srv:echo").then(|| "ext__srv__echo".to_string());
+        HelperMethods::wire_tool_references(&mut msgs, &resolve);
+        assert_eq!(
+            msgs[0]["content"][0]["content"],
+            json!([{"type": "tool_reference", "tool_name": "ext__srv__echo"}]),
+            "references only (text alongside is a 400); unresolvable dropped"
+        );
+    }
+
+    #[test]
+    fn wire_references_fall_back_to_text_when_nothing_resolves() {
+        let mut msgs = vec![activation_result(&["mcp.srv:echo"])];
+        HelperMethods::wire_tool_references(&mut msgs, &|_| None);
+        assert_eq!(
+            msgs[0]["content"][0]["content"],
+            json!([{"type": "text", "text": "{\"activated\":1}"}])
+        );
+    }
+
+    #[test]
+    fn wire_references_are_deterministic_and_leave_other_messages_shared() {
+        let plain: SharedMessage = Arc::new(json!({"role": "user", "content": "hi"}));
+        let resolve = |id: &str| Some(format!("w_{id}"));
+        let mut a = vec![Arc::clone(&plain), activation_result(&["x", "x", "y"])];
+        let mut b = a.clone();
+        HelperMethods::wire_tool_references(&mut a, &resolve);
+        HelperMethods::wire_tool_references(&mut b, &resolve);
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap()
+        );
+        assert!(
+            Arc::ptr_eq(&a[0], &plain),
+            "messages without references are not cloned"
+        );
+        assert_eq!(
+            a[1]["content"][0]["content"].as_array().unwrap().len(),
+            2,
+            "deduplicated"
+        );
+    }
+
+    #[test]
+    fn referenced_tool_ids_reads_only_tool_result_references() {
+        let msgs = vec![
+            activation_result(&["mcp.srv:echo"]),
+            Arc::new(
+                json!({"role": "user", "content": [{"type": "tool_reference", "tool_name": "not_in_a_result"}]}),
+            ),
+        ];
+        let ids = HelperMethods::referenced_tool_ids(&msgs);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("mcp.srv:echo"));
+    }
+
+    #[test]
+    fn marked_tools_put_deferred_after_the_marked_last_loaded_tool() {
+        let loaded = vec![json!({"name": "bash"}), json!({"name": "activate_tools"})];
+        let deferred = vec![json!({"name": "ext__srv__echo", "defer_loading": true})];
+        let v = serde_json::to_value(crate::runtime::request::MarkedTools::with_deferred(
+            &loaded,
+            &deferred,
+            CacheTtl::OneHour,
+        ))
+        .unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 3);
+        assert!(v[0].get("cache_control").is_none());
+        assert_eq!(
+            v[1]["cache_control"]["ttl"], "1h",
+            "marker on the last LOADED tool"
+        );
+        assert!(
+            v[2].get("cache_control").is_none(),
+            "a deferred tool may not carry cache_control"
+        );
+        assert_eq!(v[2]["defer_loading"], true);
+        let legacy = serde_json::to_vec(&crate::runtime::request::MarkedTools::new(
+            &loaded,
+            CacheTtl::OneHour,
+        ))
+        .unwrap();
+        let empty = serde_json::to_vec(&crate::runtime::request::MarkedTools::with_deferred(
+            &loaded,
+            &[],
+            CacheTtl::OneHour,
+        ))
+        .unwrap();
+        assert_eq!(legacy, empty, "no deferred tools ⇒ byte-identical body");
+    }
+
     use super::*;
     use crate::core::config::CacheTtl;
     use serde_json::json;

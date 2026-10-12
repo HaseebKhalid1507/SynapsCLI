@@ -1113,13 +1113,14 @@ impl TranscriptStore {
                 text,
             } => {
                 let theme = THEME.load();
-                let (icon, sev_color) = match severity.as_str() {
-                    "critical" => ("🔴", theme.event_critical),
-                    "high" => ("🟠", theme.event_icon),
-                    "medium" => ("🟡", theme.event_icon),
-                    "low" => ("🔵", theme.event_source),
-                    _ => ("📨", theme.event_icon),
+                // A one-cell glyph in the palette's colour (colour emoji
+                // ignore the theme and are two cells wide).
+                let icon = match severity.as_str() {
+                    "critical" => "✖",
+                    "low" => "◇",
+                    _ => "◆",
                 };
+                let sev_color = theme.event_accent(severity);
                 // Theme surface (was a fixed slate), with the severity
                 // colour as a heavy bar down the card's left edge.
                 let event_bg = theme.raised_surface(1.18);
@@ -1144,7 +1145,7 @@ impl TranscriptStore {
                     Span::styled(
                         format!("[{}]", source),
                         Style::default()
-                            .fg(theme.event_source)
+                            .fg(theme.event_label())
                             .bg(event_bg)
                             .add_modifier(Modifier::BOLD),
                     ),
@@ -1152,7 +1153,7 @@ impl TranscriptStore {
                     Span::styled(ts_str, Style::default().fg(theme.muted).bg(event_bg)),
                 ]));
                 // Content
-                let text_style = Style::default().fg(theme.event_text).bg(event_bg);
+                let text_style = Style::default().fg(theme.event_body()).bg(event_bg);
                 for (src_line, line_off, line) in source_lines(text) {
                     let prefix_len = m.len() + 2;
                     for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
@@ -1224,6 +1225,52 @@ mod meta_tests {
 
     fn flatten(line: &ratatui::text::Line<'static>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Event cards use a one-cell glyph in the theme's accent (no colour
+    /// emoji), the bar takes the same accent, and the header row fills the
+    /// card width exactly (a two-cell emoji used to push the timestamp out).
+    #[test]
+    fn event_card_is_themed_and_aligned() {
+        use unicode_width::UnicodeWidthStr;
+        let theme = crate::tui::theme::THEME.load();
+        for (severity, glyph) in [("high", "◆"), ("critical", "✖"), ("low", "◇")] {
+            let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
+            store.push_msg(ChatMessage::Event {
+                source: "subagent".into(),
+                severity: severity.into(),
+                text: "Subagent 'spike' finished".into(),
+            });
+            let entry = store.render_message_lines(0, 60, &ctx());
+            let rows: Vec<String> = entry.lines().iter().map(flatten).collect();
+            let header = rows
+                .iter()
+                .position(|r| r.contains("[subagent]"))
+                .expect("header row");
+            assert!(rows[header].contains(glyph), "{severity}: {:?}", rows[header]);
+            for r in &rows {
+                assert!(
+                    !r.chars().any(|c| ('\u{1F300}'..='\u{1FAFF}').contains(&c)),
+                    "no colour emoji: {r:?}"
+                );
+            }
+            let accent = theme.event_accent(severity);
+            let header_line = &entry.lines()[header];
+            assert!(
+                header_line.spans.iter().any(|s| s.content.contains(glyph) && s.style.fg == Some(accent)),
+                "{severity}: glyph in the accent colour"
+            );
+            assert!(
+                header_line.spans.iter().any(|s| s.style.fg == Some(accent) || s.style.bg == Some(accent)),
+                "{severity}: bar in the accent colour"
+            );
+            let widths: Vec<usize> = rows
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| UnicodeWidthStr::width(r.as_str()))
+                .collect();
+            assert!(widths.windows(2).all(|w| w[0] == w[1]), "{severity}: rows {widths:?}");
+        }
     }
 
     /// P10 slice (a) plumbing invariants: every rendered row is classified

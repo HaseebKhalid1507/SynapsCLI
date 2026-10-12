@@ -30,8 +30,9 @@ pub(crate) struct StartArgs {
     /// Exit after SECS with zero clients and zero sessions.
     #[arg(long, value_name = "SECS")]
     pub idle_exit: Option<u64>,
-    /// Allow legacy (non-progressive) MCP with servers configured.
-    #[arg(long)]
+    /// Deprecated, ignored: legacy MCP was removed. Accepted so older
+    /// clients can still spawn this daemon.
+    #[arg(long, hide = true)]
     pub allow_legacy_mcp: bool,
     /// Print `{"binary_version","protocol_version"}` and exit 0 (the reload
     /// version gate probes the NEW binary with this).

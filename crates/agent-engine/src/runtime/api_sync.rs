@@ -96,7 +96,7 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
-        super::attachments::validate_messages(model, messages).map_err(RuntimeError::Config)?;
+        super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
         let wire_messages = super::continuation::wire_messages(messages);
         let messages = wire_messages.as_deref().unwrap_or(messages);
         // Route through OpenAI-compat provider if model resolves to one.
@@ -183,9 +183,20 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() is N refcount bumps, not a deep copy;
         // sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        // Strip empty/invalid thinking blocks before they hit the API. See
-        // `sanitize_thinking_blocks` for the failure mode this guards against.
+        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        // Stable per-image projection precedes cache markers, only on Anthropic.
+        // Original preflight above remains authoritative; recheck output budgets.
+        super::image_limits::enforce_image_limits(&mut cleaned_messages, retired_count)
+            .await
+            .map_err(RuntimeError::Config)?;
+        super::attachments::validate_messages(model, &cleaned_messages)
+            .map_err(RuntimeError::Config)?;
+        // Strict checks retain original per-source batch boundaries: sanitizing
+        // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+        // The sync transport sends the full registry and never defers, so any
+        // `tool_reference` in the history is stripped (it would be a 400).
+        HelperMethods::wire_tool_references(&mut cleaned_messages, &|_| None);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old
@@ -196,6 +207,7 @@ impl ApiMethods {
             model,
             &cleaned_messages,
             &tools_schema,
+            &[],
             system_prompt,
             &auth_type,
             thinking_budget,
@@ -394,6 +406,7 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
                                         t.failed_terminal(&format!("http_{}", status.as_u16()));
@@ -407,13 +420,12 @@ impl ApiMethods {
                                     );
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                                return Err(RuntimeError::Tool(
-                                    crate::core::error::humanize_api_error_with_reset(
-                                        status.as_u16(),
-                                        &error_text,
-                                        hint,
-                                    ),
-                                ));
+                                return Err(RuntimeError::Tool(super::api::terminal_http_error(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                    log_rid.as_ref(),
+                                )));
                             }
 
                             last_reset_hint = reset_hint.clone();
@@ -798,6 +810,7 @@ impl ApiMethods {
                             };
 
                             if !is_retryable || retry_exhausted {
+                                let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
                                         t.failed_terminal(&format!("http_{}", status.as_u16()));
@@ -811,13 +824,12 @@ impl ApiMethods {
                                     );
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                                return Err(RuntimeError::Tool(
-                                    crate::core::error::humanize_api_error_with_reset(
-                                        status.as_u16(),
-                                        &error_text,
-                                        hint,
-                                    ),
-                                ));
+                                return Err(RuntimeError::Tool(super::api::terminal_http_error(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                    log_rid.as_ref(),
+                                )));
                             }
 
                             last_reset_hint = reset_hint;

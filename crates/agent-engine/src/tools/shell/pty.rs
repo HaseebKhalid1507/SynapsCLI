@@ -144,6 +144,12 @@ pub struct PtyHandle {
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
+type PreparedScope = (
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    Option<std::path::PathBuf>,
+    Option<crate::process_scope::ScopeLauncher>,
+);
+
 impl PtyHandle {
     /// Spawn a command on a new PTY.
     ///
@@ -158,6 +164,29 @@ impl PtyHandle {
         env: HashMap<String, String>,
         rows: u16,
         cols: u16,
+    ) -> Result<Self> {
+        let prepared = Self::prepare_scope(working_dir, &env);
+        Self::spawn_prepared(command, working_dir, rows, cols, prepared)
+    }
+
+    pub(crate) fn prepare_scope(working_dir: Option<&str>, env: &HashMap<String, String>) -> PreparedScope {
+        // Snapshot after TERM and user overrides; probe and child see exactly
+        // the same environment. This synchronous API may probe for up to 3 s.
+        let mut effective_env = crate::process_scope::inherited_env();
+        crate::process_scope::set_env(&mut effective_env, "TERM", "xterm-256color");
+        for (k, v) in env { crate::process_scope::set_env(&mut effective_env, k, v); }
+        let scope_cwd = working_dir.map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| effective_env.iter().find(|(k, _)| k == "HOME")
+                .map(|(_, v)| std::path::PathBuf::from(v)));
+        let launcher = scope_cwd.as_deref().and_then(|cwd|
+            crate::process_scope::launcher_for_effective_env(&effective_env, Some(cwd)));
+        (effective_env, scope_cwd, launcher)
+    }
+
+    pub(crate) fn spawn_prepared(
+        command: &str, working_dir: Option<&str>, rows: u16, cols: u16,
+        prepared: PreparedScope,
     ) -> Result<Self> {
         // 1. Open a PTY pair with the requested size.
         let pty_system = native_pty_system();
@@ -176,8 +205,21 @@ impl PtyHandle {
         let program = parts
             .first()
             .ok_or_else(|| RuntimeError::Tool("Empty command string".to_string()))?;
+        let (effective_env, scope_cwd, launcher) = prepared;
+        let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = {
+            let program: std::ffi::OsString = (*program).into();
+            let args = parts
+                .iter()
+                .skip(1)
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            match launcher {
+                Some(launcher) => launcher.wrap("synaps tool: shell", crate::process_scope::resolve_program(program, &effective_env, scope_cwd.as_deref()).map_err(|e| RuntimeError::Tool(e.to_string()))?, args),
+                None => (program, args),
+            }
+        };
         let mut cmd = CommandBuilder::new(program);
-        for arg in parts.iter().skip(1) {
+        for arg in &args {
             cmd.arg(arg);
         }
 
@@ -186,11 +228,8 @@ impl PtyHandle {
             cmd.cwd(dir);
         }
 
-        // Inject environment variables; always set TERM.
-        cmd.env("TERM", "xterm-256color");
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
+        cmd.env_clear();
+        for (k, v) in &effective_env { cmd.env(k, v); }
 
         // 3. Spawn the child on the slave side.
         let child = pair
@@ -401,6 +440,61 @@ mod tests {
 
     /// A fast PTY producer with a deliberately stalled consumer is bounded
     /// at the reader-thread handoff, and dropping the handle releases it.
+    /// A PTY shell gets its own systemd scope when the machine supports it
+    /// (S348): a long-lived shell running a memory-hungry build is then the
+    /// separate cgroup (not a memory cap or protection from ancestor OOM). It still has a working terminal.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn pty_shell_gets_its_own_scope_when_available() {
+        if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") { return; }
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let before = pty_output_snapshot();
+        // Typed into an interactive shell, as the tool is used (the spawn
+        // command line is whitespace-split, so no quoted -c script here).
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle
+            .write(b"cat /proc/$$/cgroup; test -t 0 && echo tty=yes; exit\n")
+            .expect("write");
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !String::from_utf8_lossy(&out).contains("tty=yes\r")
+        {
+            out.extend(handle.try_read_output(Duration::from_millis(200)).await);
+        }
+        // Settle the process-global PTY accounting before the next #[serial]
+        // test snapshots it (same release wait as the retention tests).
+        drop(handle);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (pty_output_snapshot().active_readers > before.active_readers
+            || pty_output_snapshot().retained_bytes != before.retained_bytes)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let text = String::from_utf8_lossy(&out).replace('\r', "");
+        assert!(
+            text.contains("tty=yes"),
+            "the shell must still have a terminal: {text}"
+        );
+        // A real terminal prefixes lines with control sequences (bracketed
+        // paste etc.); take the cgroup path wherever it starts on its line.
+        let child = text
+            .lines()
+            .filter(|l| !l.contains("cat /proc/")) // the echoed command line
+            .find_map(|l| l.find("0::/").map(|i| l[i..].trim().to_string()))
+            .unwrap_or_default();
+        assert!(child.starts_with("0::/"), "no cgroup line in: {text:?}");
+        if crate::process_scope::launcher_for_env(None).is_some() {
+            assert_ne!(child, own.trim(), "{text}");
+            assert!(child.ends_with(".scope"), "{child}");
+        } else {
+            assert_eq!(child, own.trim(), "unwrapped fallback");
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn pty_slow_consumer_retention_is_bounded_and_drop_releases_reader() {

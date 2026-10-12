@@ -668,6 +668,153 @@ fn u64_config_display(key: &str, default: u64) -> String {
         .to_string()
 }
 
+/// Shown for an unset list-valued key (`disabled_tools`, …). A text editor
+/// opened on it starts empty, never with this placeholder.
+pub(crate) const NONE_DISPLAY: &str = "(none)";
+/// Shown for an unset key whose default lives elsewhere (role budgets,
+/// identity, Axel paths). A text editor opened on it starts empty.
+pub(crate) const DEFAULT_DISPLAY: &str = "(default)";
+
+/// Trimmed, non-empty raw config value.
+fn raw_config(key: &str) -> Option<String> {
+    synaps_cli::config::read_config_value(key)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Read a u64 config key that must fall in `range`, defaulting otherwise.
+fn ranged_config_display(key: &str, range: std::ops::RangeInclusive<u64>, default: u64) -> String {
+    raw_config(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| range.contains(n))
+        .unwrap_or(default)
+        .to_string()
+}
+
+/// Comma list as the parser reads it, re-joined; [`NONE_DISPLAY`] if empty.
+fn list_config_display(key: &str) -> String {
+    let items: Vec<String> = raw_config(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        NONE_DISPLAY.to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Raw value if `ok` accepts it, else `fallback`.
+fn checked_config_display(key: &str, ok: impl Fn(&str) -> bool, fallback: &str) -> String {
+    raw_config(key)
+        .filter(|v| ok(v))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Current configured value for the config-file-backed rows that have no
+/// runtime snapshot field, normalised to the spelling the row's cycler
+/// options use (same accepted spellings as the parser; unset/invalid →
+/// the parser's default). `None` for keys not handled here.
+pub(crate) fn config_row_display(key: &str) -> Option<String> {
+    use synaps_cli::config as cfg;
+    let v = match key {
+        // Context & cache
+        "cache_ttl" => match raw_config(key).and_then(|v| cfg::CacheTtl::parse(&v)) {
+            Some(cfg::CacheTtl::OneHour) => "1h".to_string(),
+            Some(cfg::CacheTtl::Hybrid) => "hybrid".to_string(),
+            Some(cfg::CacheTtl::FiveMinutes) | None => "5m".to_string(),
+        },
+        "cache_diagnostics" => bool_config_display(key, false),
+        "cache_keepwarm" => raw_config(key)
+            .and_then(|v| cfg::CacheKeepWarm::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
+        "cache_keepwarm_auto_max_hours" => raw_config(key)
+            .and_then(|v| v.trim_end_matches(['h', 'H']).parse::<u32>().ok())
+            .filter(|h| (1..=cfg::MAX_CACHE_KEEPWARM_HOURS).contains(h))
+            .unwrap_or(cfg::DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS)
+            .to_string(),
+        "context_management.mode" => raw_config(key)
+            .and_then(|v| cfg::ContextManagementMode::parse(&v))
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
+        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+            match raw_config(key).and_then(|v| v.parse::<u64>().ok()) {
+                Some(n) => n.to_string(),
+                None => "auto".to_string(),
+            }
+        }
+        "context_management.reserve_tokens" => {
+            ranged_config_display(key, 1..=cfg::ContextManagementConfig::MAX_RESERVE_TOKENS, 16_000)
+        }
+        "context_management.finish_rounds" => ranged_config_display(
+            key,
+            0..=u64::from(cfg::ContextManagementConfig::MAX_FINISH_ROUNDS),
+            2,
+        ),
+        "compaction_mode" => match raw_config(key).as_deref() {
+            Some("local" | "local_only" | "local-only") => "local".to_string(),
+            _ => "remote".to_string(),
+        },
+        "compaction_exclude" => list_config_display(key),
+        "refusal_retries" => ranged_config_display(key, 0..=u64::from(u32::MAX), 2),
+        "telemetry" => synaps_cli::runtime::telemetry::TelemetryLevel::from_str_key(
+            &raw_config(key).unwrap_or_default(),
+        )
+        .as_str()
+        .to_string(),
+        // Agent
+        "subagent.max_concurrent" => ranged_config_display(key, 1..=u64::MAX, 16),
+        "subagent.max_total" => ranged_config_display(key, 1..=u64::MAX, 64),
+        "subagent.max_depth" => ranged_config_display(key, 1..=u64::from(u16::MAX), 4),
+        "session_persistence" => checked_config_display(key, |v| v == "journal", "json"),
+        "agent_name" | "identity" => raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string()),
+        "events.auto_turn" => bool_config_display(key, true),
+        "events.auto_turn_cap" => raw_config(key)
+            .and_then(|v| cfg::parse_auto_turn_cap(&v))
+            .unwrap_or(cfg::DEFAULT_AUTO_TURN_CAP)
+            .to_string(),
+        // Turn budgets: the raw value when the parser accepts it.
+        k if k.starts_with("turn_budget.") => {
+            let ok = |v: &str| {
+                if k.ends_with(".max_cost_usd") {
+                    v.parse::<f64>().is_ok()
+                } else {
+                    v.parse::<u64>().is_ok()
+                }
+            };
+            checked_config_display(key, ok, DEFAULT_DISPLAY)
+        }
+        // Tool limits
+        "progressive_tool_disclosure" => bool_config_display(key, false),
+        "tools.deferred_loading" => bool_config_display(key, true),
+        "tools.activation_confirm" => raw_config(key)
+            .and_then(|v| cfg::ActivationConfirm::parse(&v))
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
+        "process_scopes" => match raw_config(key).as_deref() {
+            Some("false" | "0" | "off" | "no") => "off".to_string(),
+            _ => "auto".to_string(),
+        },
+        "disabled_tools" | "disabled_skills" => list_config_display(key),
+        // Appearance
+        "max_fps" => ranged_config_display(key, 1..=1000, 60),
+        "scroll_lines" => ranged_config_display(key, 1..=20, 3),
+        // Memory
+        "memory.backend" => checked_config_display(key, |v| v == "axel", "legacy"),
+        "memory.user_scope" => checked_config_display(key, |v| v == "true", "false"),
+        "memory.axel.executable" | "memory.axel.brain" => {
+            raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string())
+        }
+        _ => return None,
+    };
+    Some(v)
+}
+
 pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> String {
     match def.key {
         "model" => snap.model.clone(),
@@ -704,7 +851,7 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
         "daemon.idle_exit_secs" => u64_config_display("daemon.idle_exit_secs", 10),
         "daemon.prompt_abandon_secs" => u64_config_display("daemon.prompt_abandon_secs", 3600),
         "daemon.parked_evict_secs" => u64_config_display("daemon.parked_evict_secs", 3600),
-        _ => "?".into(),
+        other => config_row_display(other).unwrap_or_else(|| "?".into()),
     }
 }
 

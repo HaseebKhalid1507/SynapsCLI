@@ -20,6 +20,7 @@ async fn disabled_tools_hits_builtins_only_and_never_skill_tools() {
     let h = EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .expect("host boot");

@@ -82,6 +82,7 @@ async fn host() -> Arc<EngineHost> {
     EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .expect("host boot")
@@ -312,7 +313,8 @@ fn fixed_event(i: usize) -> synaps_cli::events::types::Event {
 /// Inject an event through the session's real UDS (the `synaps send` path).
 async fn inject(session_id: &str, ev: &synaps_cli::events::types::Event) {
     use tokio::io::AsyncWriteExt;
-    let path = synaps_cli::events::registry::socket_path_for_session(session_id);
+    let path = synaps_cli::events::registry::find_session_registration(session_id)
+        .expect("published session endpoint").socket_path;
     let mut s = tokio::net::UnixStream::connect(&path).await.expect("session socket");
     s.write_all(serde_json::to_string(ev).unwrap().as_bytes()).await.unwrap();
     s.shutdown().await.unwrap();

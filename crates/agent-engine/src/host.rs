@@ -41,7 +41,16 @@ pub struct HostOpts {
     /// Echoed to callers (`EngineBoot::no_extensions`) — extension discovery
     /// is gated by the renderer after boot, not by the host. Not read here.
     pub no_extensions: bool,
+    /// When MCP servers without cached descriptors are discovered.
+    /// [`McpDiscovery::Inline`] (in-process modes) discovers them during
+    /// `boot()`; [`McpDiscovery::Background`] (the daemon) boots with cached
+    /// descriptors only and leaves discovery to
+    /// [`EngineHost::spawn_background_mcp_discovery`], so a hung MCP server
+    /// can never hold up readiness.
+    pub mcp_discovery: McpDiscovery,
 }
+
+pub use crate::mcp::McpDiscovery;
 
 pub struct EngineHost {
     parts: HostParts,
@@ -79,6 +88,9 @@ pub struct EngineHost {
     /// acquisition still waits instead of racing the walk.
     extensions_ready: tokio::sync::watch::Sender<bool>,
     extensions_loading: std::sync::atomic::AtomicBool,
+    /// MCP discovery deferred by [`McpDiscovery::Background`]; taken (once)
+    /// by [`Self::spawn_background_mcp_discovery`].
+    pending_mcp_discovery: std::sync::Mutex<Option<crate::mcp::PendingMcpDiscovery>>,
 }
 
 /// (E-P2) Returned by [`EngineHost::claim_driver`] when another live session
@@ -141,19 +153,20 @@ impl EngineHost {
         // Discover plugins/skills, build command registry, register load_skill tool.
         let (command_registry, keybind_registry) = crate::skills::register(&tools, &config).await;
 
-        // MCP loading (if configured). Flag-off keeps the legacy connect
-        // gateway; progressive disclosure switches to exact descriptor-backed
-        // dormant tools with no gateway.
-        let mcp_server_count =
-            crate::mcp::setup_lazy_mcp(&tools, config.progressive_tool_disclosure).await;
-        let mcp_runtime = if config.progressive_tool_disclosure {
-            Some(Arc::new(crate::mcp::McpRuntimeManager::new(
-                crate::mcp::lease::config_source_from_disk(),
-                crate::mcp::lease::DEFAULT_IDLE_MAX,
-            )))
-        } else {
-            None
+        // MCP (if configured): descriptor-backed tools, executed through
+        // per-session leases in every mode. With progressive disclosure they
+        // stay dormant until activated; without it they are part of every
+        // session's core. A configured server with no cached descriptors is
+        // discovered once (parallel, bounded, negative-cached): here for
+        // `Inline`, later in a background task for `Background` (daemon).
+        let (mcp_server_count, pending_mcp_discovery) = match opts.mcp_discovery {
+            McpDiscovery::Inline => (crate::mcp::setup_lazy_mcp(&tools).await, None),
+            McpDiscovery::Background => crate::mcp::setup_cached_mcp(&tools).await,
         };
+        let mcp_runtime = Some(Arc::new(crate::mcp::McpRuntimeManager::new(
+            crate::mcp::lease::config_source_from_disk(),
+            crate::mcp::lease::DEFAULT_IDLE_MAX,
+        )));
 
         let hook_bus = Arc::new(HookBus::new());
         let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
@@ -198,7 +211,34 @@ impl EngineHost {
             driver_grants: std::sync::Mutex::new(std::collections::HashMap::new()),
             extensions_ready: tokio::sync::watch::channel(false).0,
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
+            pending_mcp_discovery: std::sync::Mutex::new(pending_mcp_discovery),
         }))
+    }
+
+    /// [`McpDiscovery::Background`]: start the deferred MCP discovery in a
+    /// background task (at most once per host; `None` when nothing is
+    /// pending — `Inline` boot, every server cached, or already spawned).
+    /// The daemon calls this after it is accepting. On completion ONLY the
+    /// newly discovered servers' dormant tools are added to the shared
+    /// registry, as one atomic `try_register_batch` (a rejected batch is
+    /// logged and fails closed). Like late extension registration this
+    /// mutates the shared catalog while sessions may be live: with
+    /// progressive disclosure on the tools are dormant (searchable,
+    /// activatable); with it off they are core tools that every live session
+    /// sends from its NEXT request — one prompt-cache rewrite per live
+    /// session, once. The task resolves to the number of tools registered.
+    pub fn spawn_background_mcp_discovery(&self) -> Option<tokio::task::JoinHandle<usize>> {
+        let pending = self
+            .pending_mcp_discovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        let tools = Arc::clone(&self.parts.tools);
+        tracing::info!(
+            servers = ?pending.server_names(),
+            "MCP: discovering uncached servers in the background"
+        );
+        Some(tokio::spawn(async move { pending.run(&tools).await }))
     }
 
     /// Idempotent, atomic install of the process host. Exactly one host ever

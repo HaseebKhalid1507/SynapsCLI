@@ -38,21 +38,117 @@ pub fn pipe_name_for(socket_path: &str) -> String {
 /// attacks from other users are not possible. Still refuse symlinks
 /// as defense-in-depth.
 pub fn cleanup_socket(socket_path: &str) {
-    let path = std::path::Path::new(socket_path);
     #[cfg(unix)]
     {
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                tracing::warn!("socket: refusing to remove symlink at {}", socket_path);
-                return;
+        use std::os::unix::fs::FileTypeExt;
+        let path = std::path::Path::new(socket_path);
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = socket_path;
+}
+
+/// Captured at bind, never inferred later from an untrusted card.
+pub(crate) struct SocketIdentity {
+    #[cfg(unix)]
+    path: String,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+impl SocketIdentity {
+    pub(crate) fn remove(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            if std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|m| m.file_type().is_socket() && (m.dev(), m.ino()) == self.inode)
+            {
+                let _ = std::fs::remove_file(&self.path);
             }
         }
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!("socket: failed to remove {}: {}", socket_path, e),
+}
+
+#[cfg(unix)]
+pub(crate) type SessionListener = UnixListener;
+#[cfg(windows)]
+pub(crate) type SessionListener = tokio::net::windows::named_pipe::NamedPipeServer;
+
+pub(crate) fn bind_session_socket(
+    path: &str,
+) -> std::io::Result<(SessionListener, SocketIdentity)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Never unlink before binding: an existing endpoint belongs to someone else.
+        let listener = UnixListener::bind(path)?;
+        let meta = std::fs::symlink_metadata(path)?;
+        let identity = SocketIdentity {
+            path: path.into(),
+            inode: (meta.dev(), meta.ino()),
+        };
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            identity.remove();
+            return Err(e);
+        }
+        Ok((listener, identity))
     }
+    #[cfg(windows)]
+    {
+        let server = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(pipe_name_for(path))?;
+        Ok((server, SocketIdentity {}))
+    }
+}
+
+/// Compatibility listener API. Binding is synchronous and refuses occupied paths.
+/// Registry users should use SessionEndpoint for atomic bind + publication.
+pub fn listen_session_socket(
+    path: String,
+    queue: Arc<EventQueue>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    match bind_session_socket(&path) {
+        Ok((listener, identity)) => serve_session_socket_inner(
+            listener,
+            path,
+            queue,
+            shutdown,
+            Some(LegacyCleanup(identity)),
+        ),
+        Err(e) => {
+            tracing::error!("socket: bind failed: {}", e);
+            tokio::spawn(async {})
+        }
+    }
+}
+
+struct LegacyCleanup(SocketIdentity);
+impl Drop for LegacyCleanup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // Prefer coordination, but never strand a closed legacy socket
+            // solely because another registry operation owns the lock. The
+            // captured inode check preserves any replacement already bound.
+            let _lock = std::path::Path::new(&self.0.path)
+                .parent()
+                .and_then(|dir| super::registry::lock_dir(dir).ok());
+            self.0.remove();
+        }
+    }
+}
+
+pub(crate) fn serve_session_socket(
+    listener: SessionListener,
+    path: String,
+    queue: Arc<EventQueue>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    serve_session_socket_inner(listener, path, queue, shutdown, None)
 }
 
 /// Bind a Unix socket at `socket_path`, accept connections, parse incoming
@@ -61,34 +157,15 @@ pub fn cleanup_socket(socket_path: &str) {
 /// Protocol: client connects → sends full JSON event → closes connection.
 /// One event per connection. Max payload 256KB.
 #[cfg(unix)]
-pub fn listen_session_socket(
+fn serve_session_socket_inner(
+    listener: SessionListener,
     socket_path: String,
     queue: Arc<EventQueue>,
     shutdown: Arc<AtomicBool>,
+    cleanup: Option<LegacyCleanup>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Remove stale socket from a previous crash
-        cleanup_socket(&socket_path);
-
-        let listener = match UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("socket: failed to bind {}: {}", socket_path, e);
-                return;
-            }
-        };
-
-        // Lock down the socket — session traffic only
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&socket_path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&socket_path, perms);
-            }
-        }
-
+        let _cleanup = cleanup;
         tracing::info!("socket: listening on {}", socket_path);
 
         loop {
@@ -121,8 +198,7 @@ pub fn listen_session_socket(
             }
         }
 
-        cleanup_socket(&socket_path);
-        tracing::info!("socket: shut down, removed {}", socket_path);
+        tracing::info!("socket: shut down {}", socket_path);
     })
 }
 
@@ -130,25 +206,17 @@ pub fn listen_session_socket(
 /// semantics as the Unix listener. The `socket_path` is never created on
 /// disk — it only seeds the pipe name via `pipe_name_for`.
 #[cfg(windows)]
-pub fn listen_session_socket(
+fn serve_session_socket_inner(
+    mut server: SessionListener,
     socket_path: String,
     queue: Arc<EventQueue>,
     shutdown: Arc<AtomicBool>,
+    cleanup: Option<LegacyCleanup>,
 ) -> tokio::task::JoinHandle<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
     tokio::spawn(async move {
+        let _cleanup = cleanup;
         let pipe_name = pipe_name_for(&socket_path);
-        let mut server = match ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&pipe_name)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("socket: failed to create pipe {}: {}", pipe_name, e);
-                return;
-            }
-        };
-
         tracing::info!("socket: listening on {}", pipe_name);
 
         loop {
@@ -253,13 +321,6 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
-    fn tmp_socket_path() -> String {
-        format!(
-            "/tmp/test-session-socket-{}.sock",
-            uuid::Uuid::new_v4().simple()
-        )
-    }
-
     async fn wait_for_socket(path: &str) {
         for _ in 0..50 {
             if std::path::Path::new(path).exists() {
@@ -271,8 +332,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_abort_before_first_poll_closes_listener_and_cleans_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
+        let handle = listen_session_socket(
+            path.clone(),
+            Arc::new(EventQueue::new(10)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(std::path::Path::new(&path).exists());
+        handle.abort();
+        let _ = handle.await;
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(UnixStream::connect(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_abort_cleans_inode_even_while_registry_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("contended.sock")
+            .to_string_lossy()
+            .into_owned();
+        let handle = listen_session_socket(
+            path.clone(),
+            Arc::new(EventQueue::new(10)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let lock = crate::events::registry::lock_dir(tmp.path()).unwrap();
+        handle.abort();
+        let _ = handle.await;
+        assert!(!std::path::Path::new(&path).exists());
+        // The old listener no longer accepts, and its pathname is reusable.
+        let rebound = tokio::net::UnixListener::bind(&path).unwrap();
+        drop(rebound);
+        cleanup_socket(&path);
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn legacy_old_listener_exit_keeps_replacement_inode_connectable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
+        let queue = Arc::new(EventQueue::new(10));
+        let handle = listen_session_socket(
+            path.clone(),
+            queue.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        std::fs::remove_file(&path).unwrap();
+        let replacement =
+            listen_session_socket(path.clone(), queue, Arc::new(AtomicBool::new(false)));
+        handle.abort();
+        let _ = handle.await;
+        let _client = UnixStream::connect(&path).await.unwrap();
+        replacement.abort();
+        let _ = replacement.await;
+    }
+
+    #[tokio::test]
     async fn delivers_event_to_queue() {
-        let path = tmp_socket_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
         let queue = Arc::new(EventQueue::new(10));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -304,7 +438,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_payload() {
-        let path = tmp_socket_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
         let queue = Arc::new(EventQueue::new(10));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -327,7 +466,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_json_does_not_crash() {
-        let path = tmp_socket_path();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
         let queue = Arc::new(EventQueue::new(10));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -362,8 +506,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_socket_removed_on_startup() {
-        let path = tmp_socket_path();
+    async fn regular_file_is_not_removed_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
         // Plant a stale file
         std::fs::write(&path, b"stale").unwrap();
         assert!(std::path::Path::new(&path).exists());
@@ -371,11 +520,13 @@ mod tests {
         let queue = Arc::new(EventQueue::new(10));
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Should not panic — bind replaces the stale file
+        // Refuse to replace a regular user file.
         let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
         wait_for_socket(&path).await;
 
         shutdown.store(true, Ordering::Release);
         handle.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+        std::fs::remove_file(path).unwrap();
     }
 }

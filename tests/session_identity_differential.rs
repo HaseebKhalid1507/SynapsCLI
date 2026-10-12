@@ -157,7 +157,7 @@ async fn session_env_differential_in_process_vs_daemon() {
     std::env::set_var(DAEMON_LEAK_VAR, "leaked!");
 
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true })
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline })
             .await
             .expect("host boot");
     let d = Daemon::start(
@@ -213,7 +213,7 @@ async fn session_env_differential_in_process_vs_daemon() {
 
     // ── (b) in-process session with the same env ────────────────────────
     let host2: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true })
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline })
             .await
             .expect("host boot 2");
 
@@ -319,7 +319,7 @@ async fn attach_existing_does_not_change_env() {
     let env = synthetic_env();
 
     let host: Arc<EngineHost> =
-        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true })
+        EngineHost::boot_and_install(HostOpts { profile: None, no_extensions: true, mcp_discovery: agent_engine::McpDiscovery::Inline })
             .await
             .expect("host boot");
     let d = Daemon::start(

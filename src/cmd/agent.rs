@@ -286,7 +286,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     let hb_path = heartbeat_path.clone();
     let hb_running = Arc::new(AtomicBool::new(true));
     let hb_flag = hb_running.clone();
-    tokio::spawn(async move {
+    let heartbeat_task = tokio::spawn(async move {
         while hb_flag.load(Ordering::Acquire) {
             let ts = chrono::Utc::now().timestamp().to_string();
             // Atomic heartbeat write
@@ -304,14 +304,22 @@ pub async fn run(config_path: String, trigger_context: String) {
         chrono::Utc::now().format("%Y%m%d-%H%M%S"),
         std::process::id()
     );
-    let socket_shutdown = Arc::new(AtomicBool::new(false));
-    let agent_socket_path =
-        synaps_cli::events::registry::socket_path_for_session(&agent_session_id);
-    let socket_task = synaps_cli::events::socket::listen_session_socket(
-        agent_socket_path.clone(),
+    let endpoint = match synaps_cli::events::registry::SessionEndpoint::start(
+        &agent_session_id,
+        Some(agent_name.clone()),
         runtime.event_queue().clone(),
-        socket_shutdown.clone(),
-    );
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            hb_running.store(false, Ordering::Release);
+            heartbeat_task.abort();
+            log(
+                agent_name,
+                &format!("failed to start session endpoint: {e}"),
+            );
+            return;
+        }
+    };
     // Also start inbox watcher for file-drop fallback
     let inbox_shutdown = Arc::new(AtomicBool::new(false));
     let inbox_task = {
@@ -322,21 +330,6 @@ pub async fn run(config_path: String, trigger_context: String) {
             synaps_cli::events::watch_inbox(inbox_dir, eq, sd).await;
         })
     };
-    let agent_registration = synaps_cli::events::registry::SessionRegistration {
-        kind: synaps_cli::events::registry::REGISTRATION_KIND.to_string(),
-        session_id: agent_session_id.clone(),
-        name: Some(agent_name.clone()),
-        socket_path: agent_socket_path.clone(),
-        pid: std::process::id(),
-        started_at: chrono::Utc::now(),
-    };
-    if let Err(e) = synaps_cli::events::registry::register_session(&agent_registration) {
-        log(
-            agent_name,
-            &format!("WARNING: failed to register session: {}", e),
-        );
-    }
-
     // Setup signal handling for graceful shutdown — catch both SIGINT (Ctrl-C)
     // and SIGTERM (supervisor/systemd stop) so a headless agent is not ignored
     // when its parent process sends SIGTERM.
@@ -695,12 +688,9 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Stop heartbeat
     hb_running.store(false, Ordering::Release);
 
-    // Stop event socket + inbox — signal then await cooperative shutdown
-    // (socket task removes the socket file on exit; aborting races that).
-    socket_shutdown.store(true, Ordering::Release);
+    endpoint.shutdown();
     inbox_shutdown.store(true, Ordering::Release);
-    let _ = tokio::join!(socket_task, inbox_task);
-    synaps_cli::events::registry::unregister_session(&agent_session_id);
+    let _ = inbox_task.await;
 
     // If we still don't have a handoff, write a minimal one
     if !watcher_exit_called {

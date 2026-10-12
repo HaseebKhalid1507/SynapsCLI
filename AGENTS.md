@@ -264,7 +264,7 @@ The tool's `parameters()` JSON schema is what the model sees. Be precise — bad
 The old "5-site sync" pain point was solved by the `define_settings!` macro. Now it's 2–3 sites:
 
 1. **`crates/agent-tui/src/tui/settings/defs.rs`** — add an entry to the `define_settings!` invocation: key, label, category, `EditorKind` (`Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`), help text, and the apply closure (`|runtime, app, value| { ... }`). The macro generates both `ALL_SETTINGS` (schema) and `apply_setting_dispatch()` — they cannot drift.
-2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default.
+2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default. List the key in `KNOWN_CONFIG_KEYS` (or `FAMILY_CONFIG_KEYS` for `shell.*`/`memory.*`/… family keys); the coverage test in `settings/defs.rs` then fails until the key has a settings row or an `EXCLUDED_CONFIG_KEYS` entry with a reason.
 3. **`crates/agent-engine/src/skills/mod.rs::BUILTIN_COMMANDS`** — only if it also gets a slash command (e.g. `/foo`); then handle it in `tui/commands.rs::handle_command()` too.
 
 `apply_setting()` itself lives in `crates/agent-tui/src/tui/helpers.rs` and delegates to the generated dispatch — you should rarely need to touch it. Step 2 is the un-tested one: forget the `load_config()` branch and the setting silently won't persist across restarts.
@@ -457,7 +457,10 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `max_tool_output` | int | 30000 | Max bytes per tool output |
 | `bash_timeout` | int | 30 | Default bash timeout (seconds) |
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
-| `subagent_timeout` | int | 300 | Default subagent timeout (seconds) |
+| `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
+| `subagent.max_concurrent` | int | 16 | Workers running at once across the session's delegation tree |
+| `subagent.max_total` | int | 64 | Dispatched workers not yet reconciled |
+| `subagent.max_depth` | int | 4 | Maximum nesting depth; 1 means foreground-only delegation |
 | `api_retries` | int | 3 | Max API retries on transient errors |
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
@@ -709,7 +712,7 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `subagent_status` | handle_id | — | Poll reactive subagent state |
 | `subagent_steer` | handle_id, message | — | Inject guidance mid-run |
 | `subagent_collect` | handle_id | — | Collect result (non-blocking poll) |
-| `subagent_resume` | handle_id, instructions | — | Resume finished/timed-out subagent with prior context |
+| `subagent_resume` | handle_id, instructions | archive_path, timeout | Continue a finished/timed-out/failed worker from its own archived conversation |
 | `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
 *Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`.
@@ -723,14 +726,26 @@ subagent_start(agent, task, ...)        → {"handle_id": "sa_1", "status": "run
 subagent_status(handle_id)              → {"status": "running", "partial_output": "..."}
 subagent_steer(handle_id, message)      → {"acknowledged": true}
 subagent_collect(handle_id)             → {"status": "completed", "output": "full result"}
-subagent_resume(handle_id, instructions) → new handle_id; prior conversation prepended as context
+subagent_resume(handle_id, instructions) → new handle_id; the worker continues its archived conversation
 ```
 
 Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
 Use `subagent_resume` on finished/timed-out/failed handles to continue with new instructions — the original handle stays readable.
 
-Implementation: `crates/agent-engine/src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`.
+Finalized worker conversations (tool calls and results included) are archived to
+`~/.synaps-cli/subagent-history/<process>/<handle>.json` (0600). Old process directories
+are pruned on first archive use after 14 days by directory modification time; this is
+not strict per-record retention. `subagent_resume` replays available full history with
+the new instructions as the next user turn, including after collection/reaping when
+an archive was successfully written. An `archive_path` can recover a completed archive
+from an earlier process; an active worker is not continuously crash-checkpointed.
+Finalization/readiness and archive-write failure handling must not silently replace
+known full history with partial text. A timed-out worker is cancelled and drained
+briefly to capture final history; its report leads with its latest progress.
+
+Implementation: `crates/agent-engine/src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`; the reactive
+worker loop is `drive.rs`, the resume archive `archive.rs`.
 
 ---
 

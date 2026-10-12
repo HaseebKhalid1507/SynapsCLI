@@ -1201,3 +1201,165 @@ async fn a14_consent_policy_hooks_gate_model_activation() {
     mcp.cleanup();
     ext.cleanup();
 }
+
+// ── a15–a17: Anthropic deferred tool loading (cache-stable activation) ──────
+//
+// With `defer_loading`, the loaded (non-deferred) tools are the cached
+// prefix. Activation must never change them; activatable tools ride along as
+// deferred definitions, and `activate_tools` answers with `tool_reference`
+// blocks that make them callable inline.
+
+fn names_of(schemas: &[Value]) -> BTreeSet<String> {
+    schemas
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(String::from))
+        .collect()
+}
+
+#[test]
+fn a15_deferred_split_keeps_loaded_tools_stable_across_activation() {
+    let mcp = mcp_fixture("a15", json!([]));
+    let ext = ext_fixture("a15");
+    let registry = acceptance_registry(&mcp, &ext);
+    let mut set = progressive_set(&registry, &sid("a15"));
+    let none = std::collections::HashSet::new();
+
+    let before = registry.deferred_tool_split(&set, &none);
+    let core: BTreeSet<String> = ["bash", "read", "search_tools", "activate_tools"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(names_of(&before.loaded), core, "loaded = exactly the core");
+    let deferred = names_of(&before.deferred);
+    for name in ["dormant_00", "ext__srv__echo_tool"] {
+        assert!(
+            deferred.contains(name),
+            "{name} must be advertised deferred"
+        );
+    }
+    assert!(before
+        .deferred
+        .iter()
+        .all(|t| t["defer_loading"] == true && t.get("cache_control").is_none()));
+    assert!(before
+        .loaded
+        .iter()
+        .all(|t| t.get("defer_loading").is_none()));
+    assert_eq!(
+        before
+            .id_to_api
+            .get("mcp.srv:echo_tool")
+            .map(String::as_str),
+        Some("ext__srv__echo_tool")
+    );
+
+    activate_exact_for_user(
+        &mut set,
+        registry.catalog(),
+        &ToolId::mcp("srv", "echo_tool"),
+    )
+    .unwrap();
+    // Referenced in history (activate_tools emitted the reference): the
+    // loaded prefix is byte-identical to before the activation.
+    let referenced: std::collections::HashSet<String> =
+        ["mcp.srv:echo_tool".to_string()].into_iter().collect();
+    let after = registry.deferred_tool_split(&set, &referenced);
+    assert_eq!(
+        serde_json::to_vec(&after.loaded).unwrap(),
+        serde_json::to_vec(&before.loaded).unwrap(),
+        "activation must not change the loaded (cached) tools"
+    );
+    assert!(names_of(&after.deferred).contains("ext__srv__echo_tool"));
+
+    // Reference lost (compaction / reload): the activation is loaded again,
+    // so the tool stays callable without its inline expansion.
+    let lost = registry.deferred_tool_split(&set, &none);
+    assert!(names_of(&lost.loaded).contains("ext__srv__echo_tool"));
+    assert!(!names_of(&lost.deferred).contains("ext__srv__echo_tool"));
+    assert!(mcp.events().is_empty(), "splitting must not spawn");
+    mcp.cleanup();
+    ext.cleanup();
+}
+
+#[test]
+fn a16_untrusted_tools_are_never_advertised_deferred() {
+    struct Unverified;
+    #[async_trait::async_trait]
+    impl Tool for Unverified {
+        fn name(&self) -> &str {
+            "unverified_tool"
+        }
+        fn origin(&self) -> synaps_cli::tools::ToolOrigin {
+            synaps_cli::tools::ToolOrigin::Unknown
+        }
+        fn description(&self) -> &str {
+            "no provenance"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        async fn execute(&self, _p: Value, _c: ToolContext) -> synaps_cli::error::Result<String> {
+            unreachable!()
+        }
+    }
+    let mcp = mcp_fixture("a16", json!([]));
+    let ext = ext_fixture("a16");
+    let mut registry = acceptance_registry(&mcp, &ext);
+    registry.register(Arc::new(Unverified));
+    let set = progressive_set(&registry, &sid("a16"));
+    let split = registry.deferred_tool_split(&set, &std::collections::HashSet::new());
+    let all: BTreeSet<String> = names_of(&split.loaded)
+        .union(&names_of(&split.deferred))
+        .cloned()
+        .collect();
+    assert!(
+        !all.contains("unverified_tool"),
+        "untrusted tool advertised"
+    );
+    mcp.cleanup();
+    ext.cleanup();
+}
+
+#[tokio::test]
+async fn a17_activate_tools_answers_with_text_then_tool_references() {
+    let mcp = mcp_fixture("a17", json!([]));
+    let ext = ext_fixture("a17");
+    let registry = acceptance_registry(&mcp, &ext);
+    let set = Arc::new(std::sync::RwLock::new(progressive_set(
+        &registry,
+        &sid("a17"),
+    )));
+    let cap = ActivationCapability::new(
+        registry.catalog().clone(),
+        Arc::clone(&set),
+        ActivationAuthority::ModelConfirmed,
+    );
+    let out = ActivateToolsTool
+        .execute_rich(
+            json!({"tools": ["mcp.srv:echo_tool", "builtin:dormant_00"]}),
+            ctx_full(Some(cap), None, None, None),
+        )
+        .await
+        .expect("activation succeeds");
+    let (summary, blocks) = out.into_parts();
+    let blocks = blocks.expect("rich output");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], summary.as_str(), "text-first invariant");
+    let refs: Vec<&str> = blocks[1..]
+        .iter()
+        .map(|b| {
+            assert_eq!(b["type"], "tool_reference");
+            b["tool_name"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        refs,
+        vec!["builtin:dormant_00", "mcp.srv:echo_tool"],
+        "canonical ids, sorted"
+    );
+    assert!(
+        ExecutionGate::authorize_wire_call(&registry, &set.read().unwrap(), "dormant_00").is_ok()
+    );
+    mcp.cleanup();
+    ext.cleanup();
+}

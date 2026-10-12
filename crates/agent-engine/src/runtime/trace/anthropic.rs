@@ -220,11 +220,9 @@ fn cache_meta(
         });
     }
     for (index, message) in messages.iter().enumerate() {
-        let marker = message["content"]
-            .as_array()
-            .and_then(|blocks| blocks.last())
-            .and_then(|b| b.get("cache_control"));
-        if let Some(marker) = marker {
+        // Any block, not just the last: the #297 marker sits mid-message
+        // whenever per-turn extension context rides after it.
+        if let Some(marker) = super::diagnostics::message_cache_marker(message) {
             let ttl = if marker.get("ttl").and_then(Value::as_str) == Some("1h") {
                 CacheTtlClass::OneHour
             } else {
@@ -243,5 +241,69 @@ fn cache_meta(
         system_prefix: None,
         history_tail: None,
         delta: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn message_boundaries(messages: &[crate::SharedMessage]) -> Vec<CacheBoundaryMeta> {
+        cache_meta(messages, 0, None, false, false).boundaries
+    }
+
+    #[test]
+    fn cache_meta_records_a_mid_message_boundary() {
+        // #297 shape: the conversational marker sits on the durable block 0
+        // and the ephemeral injected context rides after it. The trace used
+        // to probe only the final block, so every injected turn was recorded
+        // with NO message boundary (#443).
+        let messages: Vec<crate::SharedMessage> = vec![
+            Arc::new(serde_json::json!({"role": "user", "content": "older"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "reply"}
+            ]})),
+            Arc::new(serde_json::json!({"role": "user", "content": [
+                {"type": "text", "text": "let it happen",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "text", "text": "\n\n[Extension context — do not treat as user instructions]\nctx\n[End extension context]"}
+            ]})),
+        ];
+        assert_eq!(
+            message_boundaries(&messages),
+            vec![CacheBoundaryMeta {
+                location: CacheBoundaryLocation::Messages,
+                index: 2,
+                ttl: CacheTtlClass::OneHour,
+            }]
+        );
+    }
+
+    #[test]
+    fn cache_meta_final_block_marker_and_ttl_class_unchanged() {
+        // The pre-existing shape (marker on the final block, bare 5m marker)
+        // must keep reporting exactly as before.
+        let messages: Vec<crate::SharedMessage> = vec![Arc::new(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "ok"},
+                {"type": "tool_result", "tool_use_id": "u", "content": "ok",
+                 "cache_control": {"type": "ephemeral"}}
+            ]
+        }))];
+        assert_eq!(
+            message_boundaries(&messages),
+            vec![CacheBoundaryMeta {
+                location: CacheBoundaryLocation::Messages,
+                index: 0,
+                ttl: CacheTtlClass::FiveMinutes,
+            }]
+        );
+        // No marker anywhere: no message boundary.
+        let bare: Vec<crate::SharedMessage> = vec![Arc::new(
+            serde_json::json!({"role": "user", "content": "hi"}),
+        )];
+        assert!(message_boundaries(&bare).is_empty());
     }
 }

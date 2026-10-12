@@ -267,6 +267,7 @@ impl ParseState {
 /// Immutable per-stream context — not state. `tx` deliberately lives here and
 /// not in `ParseState`: read/write separation is the point.
 struct EventCtx<'t> {
+    model: &'t str,
     tx: &'t mpsc::UnboundedSender<StreamEvent>,
     suppress_stream_deltas: bool,
     telemetry_level: TelemetryLevel,
@@ -569,7 +570,10 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         cache_write_tokens: Some(cache_create),
                     });
                     if let Some(counters) = &ctx.usage_counters {
-                        counters.record(input_t, output_t, cache_read, cache_create);
+                        counters.record_priced(
+                            ctx.model, input_t, output_t, cache_read, cache_create,
+                            cache_create_5m, cache_create_1h,
+                        );
                     }
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
@@ -706,7 +710,10 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
         cache_write_tokens: Some(cache_create),
     });
     if let Some(counters) = &ctx.usage_counters {
-        counters.record(input_t, output_t, cache_read, cache_create);
+        counters.record_priced(
+            ctx.model, input_t, output_t, cache_read, cache_create,
+            state.msg_start_cache_5m, state.msg_start_cache_1h,
+        );
     }
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
@@ -860,11 +867,80 @@ pub struct ApiOptions {
     /// flag-off request bytes exactly. Stream rounds set `Some` only when the
     /// progressive-disclosure flag is enabled.
     pub request_tools_schema: Option<std::sync::Arc<Vec<Value>>>,
+    /// Anthropic deferred-loading split for this request (progressive
+    /// disclosure + `tools.deferred_loading`). `None` keeps the plain tools
+    /// array. Only the native Anthropic transport reads it, and only for a
+    /// model with tool search; every other transport keeps using
+    /// `request_tools_schema`.
+    pub anthropic_tool_split: Option<std::sync::Arc<crate::tools::DeferredToolSplit>>,
     /// Optional shared turn-budget usage counters (Task 23). Updated at the
     /// single authoritative Usage emission per request; the stream loop
     /// reads them for the optional token/cost budget dimensions. `None`
     /// (default, non-stream callers) records nothing.
     pub usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// "Last accepted Anthropic request" slot (task #444). Stamped with the
+    /// send time of every attempt that gets a 2xx — the moment the prefix's
+    /// cache entries were written or refreshed. `None` (default) records
+    /// nothing; the foreground turn stream and keep-warm pings set it.
+    pub cache_anchor: Option<std::sync::Arc<super::keepwarm::CacheAnchorCell>>,
+    /// Prompt-cache keep-warm ping (task #444). `None` on every real turn,
+    /// which keeps turn requests byte-identical to the pre-feature release.
+    /// When set (native Anthropic transport only — any other route fails
+    /// closed before a request is built): the conversational cache marker is
+    /// stamped on the LAST HISTORY message and the trailing ping message
+    /// rides after it unmarked, `max_tokens` is cut to the thinking mode's
+    /// minimum, the prefix is fingerprinted (and checked, see
+    /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
+    /// record carries `"keepwarm": true`.
+    pub keepwarm: Option<KeepWarmRequest>,
+}
+
+/// What a keep-warm request does once its body is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepWarmMode {
+    /// Return `{"keepwarm_prefix": <fingerprint>, "keepwarm_max_tokens": n}`;
+    /// send nothing.
+    Probe,
+    /// Send only if the built prefix still hashes to `expect`; otherwise
+    /// return `{"keepwarm_prefix": <actual>}` without sending.
+    Send { expect: u64 },
+}
+
+/// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
+#[derive(Debug, Clone)]
+pub struct KeepWarmRequest {
+    pub mode: KeepWarmMode,
+    /// Last HTTP status the transport saw (0 = none), so the caller can tell
+    /// a 4xx (stop) from a 5xx/429 (bounded retry).
+    pub status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    /// Set once the request is actually dispatched: when the HTTP client,
+    /// over an established connection with the head written, pulls the body
+    /// (see [`keepwarm_body`]), or when `send()` returns a response. From then
+    /// on the ping may be billed even if it is aborted. A refused connection
+    /// never sets it.
+    pub sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when `send()` failed to connect (no HTTP status, nothing sent).
+    pub connect_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A keep-warm request body that flips `sent` when the HTTP client first
+/// pulls it: hyper only polls a request body once the connection is
+/// established and the request head is written, so a ping that never
+/// connected is never marked sent. `Content-Length` is set explicitly so the
+/// wire framing matches a buffered body's (no chunked encoding).
+fn keepwarm_body(
+    req: reqwest::RequestBuilder,
+    body: bytes::Bytes,
+    sent: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> reqwest::RequestBuilder {
+    let flag = std::sync::Arc::clone(sent);
+    let len = body.len();
+    let stream = futures::stream::once(async move {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok::<bytes::Bytes, std::io::Error>(body)
+    });
+    req.header(reqwest::header::CONTENT_LENGTH, len)
+        .body(reqwest::Body::wrap_stream(stream))
 }
 
 /// Validate a provider-assigned request ID from response headers into a
@@ -875,6 +951,29 @@ pub(super) fn provider_request_id_from_headers(
 ) -> Option<crate::runtime::trace::TraceId> {
     crate::runtime::telemetry::request_id_from_headers(headers)
         .and_then(|s| crate::runtime::trace::TraceId::new(s).ok())
+}
+
+/// Humanize a terminal (not retried) HTTP failure AND log it. Without the log
+/// line the only record of a 400 is the TUI banner, so a session that fails
+/// every request leaves nothing in `synaps.log` to diagnose from.
+///
+/// SECURITY (spec §5.1): `body` is untrusted and can echo the request. Only
+/// the numeric status, the provider request id (validated `TraceId`) and OUR
+/// humanized text, built from vetted static strings, are logged. Never the body.
+pub(super) fn terminal_http_error(
+    status: u16,
+    body: &str,
+    reset_hint: Option<&str>,
+    request_id: Option<&crate::runtime::trace::TraceId>,
+) -> String {
+    let message = crate::core::error::humanize_api_error_with_reset(status, body, reset_hint);
+    tracing::warn!(
+        status,
+        request_id = request_id.map_or("-", |id| id.as_str()),
+        error = %message,
+        "API request failed (not retried)"
+    );
+    message
 }
 
 /// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
@@ -1022,7 +1121,14 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
-        super::attachments::validate_messages(model, messages).map_err(RuntimeError::Config)?;
+        // Keep-warm pings exist only for the native Anthropic transport: every
+        // other route would ignore the output cap and the marker placement.
+        if options.keepwarm.is_some() && !super::auth::model_is_anthropic(model) {
+            return Err(RuntimeError::Config(
+                "cache keep-warm ping requires the native Anthropic transport".into(),
+            ));
+        }
+        super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
         let wire_messages = super::continuation::wire_messages(messages);
         let messages = wire_messages.as_deref().unwrap_or(messages);
         // One provider-neutral schema source for every transport. The opt-in
@@ -1142,10 +1248,51 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() on &[SharedMessage] is N refcount bumps,
         // not a deep copy; sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        // Strip empty/invalid thinking blocks before they hit the API. See
-        // `sanitize_thinking_blocks` for the failure mode this guards against.
+        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        // Deferred tool loading: send the session's loaded tools normally and
+        // every other activatable tool with `defer_loading`, and resolve the
+        // history's `tool_reference` blocks to wire names. Without a split
+        // (or for a model without tool search) references are stripped, so
+        // they never reach a request that cannot accept them.
+        let split = options.anthropic_tool_split.as_deref().filter(|split| {
+            !split.loaded.is_empty()
+                && !split.deferred.is_empty()
+                && crate::core::models::model_supports_tool_search(model)
+        });
+        let (wire_tools, deferred_tools): (&[Value], &[Value]) = match split {
+            Some(split) => (&split.loaded, &split.deferred),
+            None => (&tools_schema, &[]),
+        };
+        // Stable per-image projection precedes cache markers, only on Anthropic.
+        // Original preflight above remains authoritative; recheck output budgets.
+        await_or_cancel(
+            cancel,
+            super::image_limits::enforce_image_limits(&mut cleaned_messages, retired_count),
+        )
+        .await?
+        .map_err(RuntimeError::Config)?;
+        super::attachments::validate_messages(model, &cleaned_messages)
+            .map_err(RuntimeError::Config)?;
+        // Strict checks retain original per-source batch boundaries: sanitizing
+        // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
+        HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
+            split.and_then(|split| split.id_to_api.get(id).cloned())
+        });
+        match &options.keepwarm {
+            // Keep-warm: the marker goes on the last HISTORY message — the
+            // durable prefix the next real turn re-sends verbatim — and the
+            // trailing ping message (never persisted) rides after it as an
+            // uncached tail, exactly like a real turn's newest user message.
+            Some(_) if cleaned_messages.len() >= 2 => {
+                let history_len = cleaned_messages.len() - 1;
+                HelperMethods::annotate_cache_breakpoint(
+                    &mut cleaned_messages[..history_len],
+                    options.cache_ttl,
+                );
+            }
+            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl),
+        }
 
         // Derive the thinking level from the budget for effort mapping.
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
@@ -1158,7 +1305,8 @@ impl ApiMethods {
         let parts = crate::runtime::transport::anthropic::build_anthropic_request(
             model,
             &cleaned_messages,
-            &tools_schema,
+            wire_tools,
+            deferred_tools,
             system_prompt,
             &auth_type,
             thinking_budget,
@@ -1167,7 +1315,24 @@ impl ApiMethods {
             options.cache_ttl,
             true,
         );
-        let body = parts.body;
+        let mut body = parts.body;
+        // Keep-warm: cut the output cap (not part of the cache key), then
+        // fingerprint the prefix exactly as it would go on the wire. A probe —
+        // or a ping whose prefix no longer matches what is cached — returns
+        // here, before any trace, telemetry or network I/O.
+        if let Some(keepwarm) = &options.keepwarm {
+            body.apply_keepwarm_max_tokens();
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            let actual = body
+                .prefix_fingerprint(cleaned_messages.len().saturating_sub(1), beta.as_deref());
+            let send = matches!(keepwarm.mode, KeepWarmMode::Send { expect } if expect == actual);
+            if !send {
+                return Ok(serde_json::json!({
+                    "keepwarm_prefix": actual,
+                    "keepwarm_max_tokens": body.max_tokens(),
+                }));
+            }
+        }
         let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
@@ -1299,11 +1464,30 @@ impl ApiMethods {
                         return Err(RuntimeError::Canceled);
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
-                    match await_or_cancel(cancel, req.body(body_bytes.clone()).send()).await? {
+                    let sent_at = super::keepwarm::CacheAnchor::now();
+                    let req = match &options.keepwarm {
+                        Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
+                        None => req.body(body_bytes.clone()),
+                    };
+                    match await_or_cancel(cancel, req.send()).await? {
                         Ok(resp) => {
                             let status = resp.status();
+                            if let Some(keepwarm) = &options.keepwarm {
+                                keepwarm
+                                    .sent
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                keepwarm
+                                    .status
+                                    .store(status.as_u16(), std::sync::atomic::Ordering::Relaxed);
+                            }
                             if status.is_success() {
                                 clock.mark_headers();
+                                // Accepted: the prefix's cache entries were
+                                // read or written by a request that started
+                                // no earlier than `sent_at`.
+                                if let Some(anchor) = &options.cache_anchor {
+                                    anchor.stamp(sent_at);
+                                }
                                 response = Some(resp);
                                 break;
                             }
@@ -1373,13 +1557,17 @@ impl ApiMethods {
                                 .unwrap_or_default();
 
                             // Decide whether we've exhausted retries for this error class.
-                            let retry_exhausted = if is_429 {
+                            // A keep-warm ping never retries: any error stops it.
+                            let retry_exhausted = if options.keepwarm.is_some() {
+                                true
+                            } else if is_429 {
                                 attempt >= MAX_429_RETRIES
                             } else {
                                 non_429_attempts >= max_retries
                             };
 
                             if !is_retryable || retry_exhausted {
+                                let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
                                         t.failed_terminal(&format!("http_{}", status.as_u16()));
@@ -1393,13 +1581,12 @@ impl ApiMethods {
                                     );
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
-                                return Err(RuntimeError::ApiStatus(
-                                    crate::core::error::humanize_api_error_with_reset(
-                                        status.as_u16(),
-                                        &error_text,
-                                        hint,
-                                    ),
-                                ));
+                                return Err(RuntimeError::ApiStatus(terminal_http_error(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                    log_rid.as_ref(),
+                                )));
                             }
 
                             last_status = Some(status.as_u16());
@@ -1461,6 +1648,13 @@ impl ApiMethods {
                             }
                         }
                         Err(e) => {
+                            if let Some(keepwarm) = &options.keepwarm {
+                                if e.is_connect() {
+                                    keepwarm
+                                        .connect_failed
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             non_429_attempts += 1;
                             if non_429_attempts > max_retries {
                                 if let Some(t) = tracer.take() {
@@ -1553,6 +1747,7 @@ impl ApiMethods {
             }
             let mut state = ParseState::new();
             let ctx = EventCtx {
+                model,
                 tx: &tx,
                 suppress_stream_deltas: options.suppress_stream_deltas,
                 telemetry_level,
@@ -1691,6 +1886,7 @@ impl ApiMethods {
                         system_bytes,
                         breakpoints,
                     },
+                    keepwarm: options.keepwarm.is_some(),
                 };
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
@@ -1757,7 +1953,10 @@ impl ApiMethods {
                     } else {
                         non_429_attempts
                     };
-                    if retries_used >= retry_budget || cancel.is_cancelled() {
+                    if retries_used >= retry_budget
+                        || cancel.is_cancelled()
+                        || options.keepwarm.is_some()
+                    {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
                         if let Some(t) = tracer.take() {
@@ -1902,6 +2101,7 @@ mod tests {
 
     fn make_ctx(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
+            model: "claude-sonnet-4-5",
             tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
@@ -1933,6 +2133,7 @@ mod tests {
     /// behavior doesn't silently depend on telemetry being enabled.
     fn make_ctx_telemetry_off(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
         EventCtx {
+            model: "claude-sonnet-4-5",
             tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Off,
@@ -1954,6 +2155,7 @@ mod tests {
         honored: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> EventCtx<'a> {
         EventCtx {
+            model: "claude-sonnet-4-5",
             tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,
@@ -2328,6 +2530,84 @@ mod tests {
             drain(&mut rx).is_empty(),
             "residual emission must be a no-op when the delta already emitted"
         );
+    }
+
+    #[test]
+    fn priced_usage_books_final_or_residual_once_with_request_model_and_ttl() {
+        for final_delta in [false, true] {
+            for model in ["claude-opus-4.1", "claude-opus-4.8", "claude-haiku-5.5"] {
+                let (mut state, tx, mut rx) = harness();
+                let counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+                let mut ctx = make_ctx_telemetry_off(&tx);
+                ctx.model = model;
+                ctx.usage_counters = Some(counters.clone());
+                feed(&[PROBED_LIVE_START], &mut state, &ctx);
+                assert_eq!(counters.cost_usd(), 0.0);
+                if final_delta {
+                    feed(&[PROBED_LIVE_DELTA], &mut state, &ctx);
+                }
+                emit_residual_usage(&mut state, &ctx);
+                emit_residual_usage(&mut state, &ctx);
+                let output = if final_delta { 11 } else { 1 };
+                let expected = agent_core::pricing::calculate_cost_split(
+                    model, 3, output, 0, 6, 1097,
+                );
+                assert!((counters.cost_usd() - expected).abs() < 2e-9);
+                assert_eq!(counters.totals(), (3, output, 0, 1103));
+                assert_eq!(counters.latest_context_tokens(), 1106);
+                assert_eq!(drain(&mut rx).iter().filter(|event| matches!(event,
+                    StreamEvent::Session(SessionEvent::Usage { .. }))).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_ttl_final_and_residual_usage_agree_with_display_cost_once() {
+        for final_delta in [false, true] {
+            for (input, aggregate, known5) in [(0, 100_001, 0), (60_000, 40_001, 10_000)] {
+                let (mut state, tx, mut rx) = harness();
+                let counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+                let mut ctx = make_ctx_telemetry_off(&tx);
+                ctx.model = "claude-haiku-5.5";
+                ctx.usage_counters = Some(counters.clone());
+                let start = format!("data: {}", json!({
+                    "type": "message_start", "message": {"id": "msg_partial", "usage": {
+                        "input_tokens": input, "output_tokens": 0,
+                        "cache_creation_input_tokens": aggregate,
+                        "cache_creation": {"ephemeral_5m_input_tokens": known5}
+                    }}
+                }));
+                feed(&[start.as_str()], &mut state, &ctx);
+                assert_eq!(counters.cost_usd(), 0.0);
+                if final_delta {
+                    feed(&[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#], &mut state, &ctx);
+                    assert!(state.usage_emitted, "final delta must book before residual fallback");
+                }
+                emit_residual_usage(&mut state, &ctx);
+                emit_residual_usage(&mut state, &ctx);
+                let expected = if input == 0 { 0.100001 } else { 0.066251 };
+                assert!((counters.cost_usd() - expected).abs() < 2e-9);
+                assert_eq!(counters.totals(), (input, 0, 0, aggregate));
+                let events = drain(&mut rx);
+                let mut usage_count = 0;
+                for event in events {
+                    if let StreamEvent::Session(SessionEvent::Usage {
+                        input_tokens, output_tokens, cache_read_input_tokens,
+                        cache_creation_input_tokens, cache_creation_5m, cache_creation_1h, ..
+                    }) = event {
+                        usage_count += 1;
+                        assert_eq!(cache_creation_5m, Some(known5));
+                        assert_eq!(cache_creation_1h, None);
+                        let display_cost = agent_core::pricing::calculate_cost_optional_split(
+                            ctx.model, input_tokens, output_tokens, cache_read_input_tokens,
+                            cache_creation_input_tokens, cache_creation_5m, cache_creation_1h,
+                        );
+                        assert!((display_cost - expected).abs() < 1e-12);
+                    }
+                }
+                assert_eq!(usage_count, 1);
+            }
+        }
     }
 
     #[test]
@@ -3390,6 +3670,7 @@ mod tests {
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = EventCtx {
+            model: "claude-sonnet-4-5",
             tx: &tx,
             suppress_stream_deltas: false,
             telemetry_level: TelemetryLevel::Full,

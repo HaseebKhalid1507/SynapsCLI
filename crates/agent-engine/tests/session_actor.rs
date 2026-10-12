@@ -133,6 +133,7 @@ async fn host() -> Arc<EngineHost> {
     EngineHost::boot(HostOpts {
         profile: None,
         no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
     })
     .await
     .unwrap()

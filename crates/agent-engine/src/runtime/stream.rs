@@ -197,6 +197,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.deferred_loading` (Anthropic deferred tool definitions).
+    pub(super) deferred_tool_loading: bool,
     /// `tools.activation_confirm` policy (auto | prompt | deny).
     pub(super) activation_confirm: agent_core::config::ActivationConfirm,
     /// Runtime-scoped tool-session identity the execution gate scopes the
@@ -250,12 +252,13 @@ fn retain_session_tool_set(
     let mut slot = retained
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = slot.as_ref() {
+    let fresh = if let Some(existing) = slot.as_ref() {
         let mut set = existing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if set.session() == fresh.session() {
-            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+        let (next, dropped, reused) =
+            select_turn_start_tool_set(Some(&*set), fresh, catalog, progressive);
+        if reused {
             for d in &dropped {
                 tracing::warn!(
                     tool = %d.id,
@@ -267,10 +270,115 @@ fn retain_session_tool_set(
             drop(set);
             return std::sync::Arc::clone(existing);
         }
-    }
+        next
+    } else {
+        fresh
+    };
     let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
     *slot = Some(std::sync::Arc::clone(&shared));
     shared
+}
+
+/// The pre-request context assessment of a stream round over the round's
+/// final `request_messages` (after injection and the history image cap):
+/// the estimate and the budget `assess_context` decides on. Shared with the
+/// keep-warm probe (`runtime::keepwarm`) so the two can never drift.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pre_request_context_budget(
+    model: &str,
+    context_window: u64,
+    system_prompt: Option<&str>,
+    tools_schema: &[Value],
+    request_messages: &[SharedMessage],
+    thinking_budget_tokens: u64,
+    next_tool_result_bytes: u64,
+) -> (
+    super::context::ContextAssessment,
+    agent_core::core::context_policy::ContextBudget,
+) {
+    let assessment = super::context::assess(&super::context::ContextBudgetInputs {
+        model,
+        provider_window: context_window,
+        system_prompt,
+        tools_schema,
+        messages: request_messages,
+        skill_contents: &[],
+        memory_contents: &[],
+        thinking_budget_tokens,
+        next_tool_result_bytes,
+        output_reserve_tokens: HelperMethods::max_tokens_for_model(model),
+    });
+    let budget = agent_core::core::context_policy::ContextBudget {
+        context_window_tokens: context_window,
+        used_tokens: assessment.used_tokens(),
+        hard_remaining_tokens: context_window.saturating_sub(assessment.used_tokens()),
+        required_next_round_tokens: assessment
+            .reserves
+            .total()
+            .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+    };
+    (assessment, budget)
+}
+
+/// The pure half of [`retain_session_tool_set`]: the set a turn starting now
+/// would use, given the retained set (if any). Returns the selected set, the
+/// activations dropped while carrying, and whether the retained set is
+/// reused (carried into). Never writes anything — the keep-warm ping
+/// (`runtime::keepwarm`) uses it read-only to project exactly the tool
+/// schema the next real turn will send.
+pub(super) fn select_turn_start_tool_set(
+    existing: Option<&crate::tools::activation::SessionToolSet>,
+    fresh: crate::tools::activation::SessionToolSet,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+) -> (
+    crate::tools::activation::SessionToolSet,
+    Vec<crate::tools::activation::DroppedActivation>,
+    bool,
+) {
+    if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        return (fresh, Vec::new(), false);
+    }
+    match existing {
+        Some(set) if set.session() == fresh.session() => {
+            let (next, dropped) = set.carry_activations_into(fresh, catalog);
+            (next, dropped, true)
+        }
+        _ => (fresh, Vec::new(), false),
+    }
+}
+
+/// Round-top rebuild of a STALE retained set — the catalog generation
+/// advanced mid-turn (in the daemon, e.g. another session registering or
+/// disabling a tool on the shared registry). The core is re-derived exactly
+/// as turn start derives it, through [`super::continuation::context_tool_set`],
+/// so an opted-in context-management session keeps `context_checkpoint`,
+/// `memory_search` and `memory_fetch`; valid exact activations are then
+/// carried into it. `SYNAPS_TOOLSET_CARRY_FORWARD=0` returns the fresh set
+/// with nothing carried.
+///
+/// Deriving the core from the bare progressive core here instead
+/// (`SessionToolSet::rebuilt_for_catalog`) silently stripped the three
+/// context tools for the rest of the turn, so the next rollover tripped its
+/// "requires admitted builtin history retrieval tools" gate and the turn
+/// died with a config error.
+pub(super) fn rebuild_stale_tool_set(
+    set: &crate::tools::activation::SessionToolSet,
+    session: crate::tools::activation::SessionId,
+    catalog: &crate::tools::catalog::ToolCatalog,
+    progressive: bool,
+    context_enabled: bool,
+) -> (
+    crate::tools::activation::SessionToolSet,
+    Vec<crate::tools::activation::DroppedActivation>,
+) {
+    let fresh =
+        super::continuation::context_tool_set(session, catalog, progressive, context_enabled);
+    if crate::tools::activation::carry_forward_enabled() {
+        set.carry_activations_into(fresh, catalog)
+    } else {
+        (fresh, Vec::new())
+    }
 }
 
 fn assistant_text_from_content(content: &[Value]) -> String {
@@ -337,7 +445,7 @@ pub(super) fn is_ephemeral_turn_context_block(block: &Value) -> bool {
 /// every turn and used to burn the entire message-history cache from the
 /// system block onward (#297, ~97K tokens rewritten per turn). It rides the
 /// newest user message instead: see [`attach_turn_context`].
-fn wrap_extension_context(base: &str, content: &str) -> String {
+pub(super) fn wrap_extension_context(base: &str, content: &str) -> String {
     format!("{base}\n\n{}", guard_extension_context(content))
 }
 
@@ -464,6 +572,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            deferred_tool_loading,
             activation_confirm,
             tool_session_id,
             retained_tool_set,
@@ -644,7 +753,7 @@ impl StreamMethods {
                     event = "turn_budget_exhausted",
                     dimension = dimension.as_str(),
                     elapsed_secs = budget_meter.elapsed().as_secs(),
-                    max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                    max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                     rounds_used = budget_meter.rounds_used(),
                     max_provider_rounds = budget_meter.budget().max_provider_rounds,
                     round_renewals_used = budget_meter.round_renewals_used(),
@@ -704,7 +813,7 @@ impl StreamMethods {
             // the head and start a fresh context segment with renewed time.
             // An un-exercised segment (no provider round yet) still hard-stops.
             time_checkpoint = context_enabled
-                && !budget_meter.budget().max_elapsed.is_zero()
+                && budget_meter.budget().has_time_limit()
                 && budget_meter.wall_clock_exceeded();
             if time_checkpoint && !segment_has_provider_round {
                 finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -723,7 +832,7 @@ impl StreamMethods {
                                         renewals_used = budget_meter.round_renewals_used(),
                                         renewals_remaining = remaining,
                                         elapsed_secs = budget_meter.elapsed().as_secs(),
-                                        max_elapsed_secs = budget_meter.budget().max_elapsed.as_secs(),
+                                        max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                                         tool_calls_used = budget_meter.tool_calls_used(),
                                         "provider-round checkpoint: renewed, continuing automatically"
                                     );
@@ -738,7 +847,7 @@ impl StreamMethods {
                                 Err(agent_core::BudgetDimension::WallClock)
                                     if context_enabled
                                         && segment_has_provider_round
-                                        && !budget_meter.budget().max_elapsed.is_zero() =>
+                                        && budget_meter.budget().has_time_limit() =>
                                 {
                                     time_checkpoint = true;
                                 }
@@ -750,7 +859,7 @@ impl StreamMethods {
                         }
                     }
                     Err(agent_core::BudgetDimension::WallClock)
-                        if context_enabled && !budget_meter.budget().max_elapsed.is_zero() =>
+                        if context_enabled && budget_meter.budget().has_time_limit() =>
                     {
                         if !segment_has_provider_round {
                             finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -779,7 +888,7 @@ impl StreamMethods {
 
             // Round-top set maintenance: if dynamic registration advanced
             // the catalog generation since the retained set was built (e.g.
-            // `connect_mcp_server` drained after the previous round),
+            // an extension tool registered after the previous round),
             // rebuild it here — explicitly, deterministically, from the
             // currently verified capabilities. Exact activations whose
             // record still matches its pinned digest+provenance are carried
@@ -796,25 +905,21 @@ impl StreamMethods {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if set.is_stale(registry.catalog()) {
-                        if crate::tools::activation::carry_forward_enabled() {
-                            let (next, dropped) = set
-                                .rebuilt_for_catalog(registry.catalog(), progressive_tool_disclosure);
-                            for d in &dropped {
-                                tracing::warn!(
-                                    tool = %d.id,
-                                    reason = ?d.reason,
-                                    "activation dropped at round-top rebuild"
-                                );
-                            }
-                            *set = next;
-                        } else {
-                            *set = super::continuation::context_tool_set(
-                                tool_session_id.clone(),
-                                registry.catalog(),
-                                progressive_tool_disclosure,
-                                context_enabled,
+                        let (next, dropped) = rebuild_stale_tool_set(
+                            &set,
+                            tool_session_id.clone(),
+                            registry.catalog(),
+                            progressive_tool_disclosure,
+                            context_enabled,
+                        );
+                        for d in &dropped {
+                            tracing::warn!(
+                                tool = %d.id,
+                                reason = ?d.reason,
+                                "activation dropped at round-top rebuild"
                             );
                         }
+                        *set = next;
                     }
                 }
                 (registry.clone(), registry.catalog().clone())
@@ -914,10 +1019,9 @@ impl StreamMethods {
             };
 
             // Validate original media before any request-local pruning. A
-            // resumed/oversized history must fail visibly, not lose
-            // attachments first and accidentally pass the check on the reduced
-            // request. (`call_api_stream_inner` re-validates the capped copy.)
-            super::attachments::validate_messages(&model, request_messages)
+            // malformed history must fail visibly. Native admission replays
+            // original batches; only other routes retain the legacy byte cap.
+            super::attachments::validate_history_for_request(&model, request_messages)
                 .map_err(RuntimeError::Config)?;
 
             // History image byte cap: the per-turn byte budget resets every
@@ -927,7 +1031,11 @@ impl StreamMethods {
             // injection above — durable history is untouched.
             let capped_messages: Vec<SharedMessage>;
             let request_messages: &[SharedMessage] =
-                match cap_history_image_bytes(request_messages, HISTORY_IMAGE_BYTE_CAP) {
+                match if super::attachments::native_image_retention(&model) {
+                    None
+                } else {
+                    cap_history_image_bytes(request_messages, HISTORY_IMAGE_BYTE_CAP)
+                } {
                     Some(capped) => {
                         capped_messages = capped;
                         &capped_messages
@@ -957,10 +1065,19 @@ impl StreamMethods {
                             "session schema projection dropped a pinned member for this round"
                         );
                     }
-                    report.schema
+                    let split = deferred_tool_loading.then(|| {
+                        let referenced =
+                            super::helpers::HelperMethods::referenced_tool_ids(request_messages);
+                        std::sync::Arc::new(
+                            tools_snapshot.deferred_tool_split(&session_set, &referenced),
+                        )
+                    });
+                    (report.schema, split)
                 };
+                let (projection, anthropic_tool_split) = projection;
                 projected_options = super::api::ApiOptions {
                     request_tools_schema: Some(std::sync::Arc::new(projection)),
+                    anthropic_tool_split,
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     ..options.clone()
@@ -979,45 +1096,27 @@ impl StreamMethods {
             let mut context_advisory = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
-                use agent_core::core::context_policy::{
-                    assess_context, ContextAction, ContextBudget,
-                };
+                use agent_core::core::context_policy::{assess_context, ContextAction};
                 let fallback_schema = tools_snapshot.tools_schema();
                 let schema = round_options
                     .request_tools_schema
                     .as_deref()
                     .map(|s| s.as_slice())
                     .unwrap_or(&fallback_schema);
-                let assessment = super::context::assess(&super::context::ContextBudgetInputs {
-                    model: &model,
-                    provider_window: context_window,
-                    system_prompt: injected_system.as_deref(),
-                    tools_schema: schema,
-                    messages: request_messages,
-                    skill_contents: &[],
-                    memory_contents: &[],
-                    thinking_budget_tokens: thinking_budget as u64,
-                    next_tool_result_bytes: max_tool_output as u64,
-                    output_reserve_tokens: HelperMethods::max_tokens_for_model(&model),
-                });
+                let (assessment, budget) = pre_request_context_budget(
+                    &model,
+                    context_window,
+                    injected_system.as_deref(),
+                    schema,
+                    request_messages,
+                    thinking_budget as u64,
+                    max_tool_output as u64,
+                );
                 let decision = {
                     let mut s = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let d = assess_context(
-                        &s.config,
-                        &s.policy,
-                        ContextBudget {
-                            context_window_tokens: context_window,
-                            used_tokens: assessment.used_tokens(),
-                            hard_remaining_tokens: context_window
-                                .saturating_sub(assessment.used_tokens()),
-                            required_next_round_tokens: assessment
-                                .reserves
-                                .total()
-                                .saturating_add(ADVISORY_RESERVE_TOKENS),
-                        },
-                    );
+                    let d = assess_context(&s.config, &s.policy, budget);
                     s.policy = d.next_state;
                     d
                 };
@@ -1218,7 +1317,7 @@ impl StreamMethods {
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
             segment_has_provider_round = true;
-            if let Err(dimension) = budget_meter.check_usage(&usage_counters, &model) {
+            if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
                 finish_budget_exceeded!(dimension);
             }
 
@@ -1659,7 +1758,7 @@ impl StreamMethods {
                     // retained session-set snapshot, translating inputs into
                     // owned dispatch records under that same guard. Only
                     // after the guard is released are tasks spawned, so no
-                    // registration (`connect_mcp_server`, extension load)
+                    // registration (extension load, a `tool_register_tx` drain)
                     // can change policy between sibling calls, and no lock
                     // is held across tool execution. Denials are typed,
                     // static, metadata-only and happen BEFORE implementation
@@ -1768,6 +1867,17 @@ impl StreamMethods {
                         std::collections::HashMap::new();
                     let mut serial_lane: Option<usize> = None;
                     for (model_order, tool_id, tool_name, prepared, lane) in prepared_calls {
+                        // Happens-after: once a serialized (side-effecting) call is queued,
+                        // every later call in model order joins the serial lane behind it.
+                        // Models routinely emit `[bash: make the file, read: the file]` in
+                        // one response; a concurrent read lane raced the write and failed
+                        // with "No such file". Calls before the first serial call keep
+                        // their own lanes, so independent reads still run in parallel.
+                        let lane = if serial_lane.is_some() {
+                            LaneKind::Serial
+                        } else {
+                            lane
+                        };
                         let index = match lane {
                             LaneKind::Concurrent => {
                                 lanes.push(Vec::new());
@@ -2103,8 +2213,25 @@ impl StreamMethods {
                 // Add tool results to conversation — always, so the assistant's tool_use
                 // blocks have matching tool_result blocks even on cancellation.
                 let round_result_bytes: usize = tool_results.iter().map(tool_result_bytes).sum();
-                let tool_batch =
-                    super::attachments::bounded_tool_results(&model, &messages, tool_results);
+                let tool_batch = match super::attachments::bounded_tool_results(
+                    &model, &messages, tool_results,
+                ) {
+                    Ok(batch) => batch,
+                    Err((error, completed_results)) => {
+                        // Never lose execution evidence or orphan tool_use IDs
+                        // when preexisting history fails revalidation. No resend.
+                        messages.push(Arc::new(json!({
+                            "role":"user", "content":completed_results
+                        })));
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        if let Some(call_id) = interrupted_side_effect {
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                                agent_core::TurnError::interrupted_after_side_effect(call_id),
+                            )));
+                        }
+                        return Err(RuntimeError::Config(error));
+                    }
+                };
                 messages.push(Arc::new(tool_batch));
 
                 if canceled {
@@ -2246,7 +2373,7 @@ fn base64_image_len(b: &Value) -> usize {
 /// carrying `IMAGE_DROPPED_LABEL`, until the remainder fits. Only touched
 /// messages are cloned (`Arc::make_mut`); `tool_result.content[0]` (the
 /// text summary) is never an image, so the text-first invariant holds.
-fn cap_history_image_bytes(
+pub(super) fn cap_history_image_bytes(
     messages: &[SharedMessage],
     cap: usize,
 ) -> Option<Vec<SharedMessage>> {
@@ -2775,6 +2902,41 @@ mod tests {
             "durable prefix must be byte-identical across turns or the cache entry is dead"
         );
     }
+
+    #[test]
+    fn trace_cache_readers_see_the_mid_message_marker_on_an_injected_turn() {
+        // Telemetry regression (#443): the request trace's cache-boundary and
+        // history-tail readers only probed a message's FINAL block for
+        // `cache_control`. On an injected turn the real annotator puts the
+        // marker on block 0 and the ephemeral context after it (the #297
+        // design pinned above), so the trace reported NO message boundary
+        // and counted the whole history as recomputed tail. That made a
+        // healthy request look like a full cache rewrite. The readers must
+        // see the marker exactly where the annotator puts it.
+        use crate::runtime::trace::diagnostics::{history_tail_bytes, message_cache_marker};
+
+        let history = vec![
+            user_msg(json!("q")),
+            assistant_msg("a"),
+            user_msg(json!("let it happen")),
+        ];
+        let mut req = attach_turn_context(&history, &guard_extension_context("ambient memory"));
+        HelperMethods::annotate_cache_breakpoint(&mut req, CacheTtl::OneHour);
+
+        // Shape precondition: the marker really is mid-message.
+        let content = req[2]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content[0].get("cache_control").is_some());
+        assert!(content[1].get("cache_control").is_none());
+
+        let marker = message_cache_marker(&req[2]).expect("trace must see the mid-message marker");
+        assert_eq!(marker["ttl"], "1h");
+        // The boundary is the newest message, so nothing after it is tail.
+        assert!(
+            history_tail_bytes(&req).is_empty(),
+            "an injected turn must not report the whole history as recomputed tail"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3056,6 +3218,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set,
@@ -3092,6 +3255,54 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
+        drive_with_model_and_deadline(
+            model,
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    }
+
+    /// Only full-size media stress fixtures opt in: two provider rounds repeat
+    /// original-media validation and JSON transport of MiB-scale histories.
+    /// Allow bounded headroom under parallel CI load without weakening ordinary
+    /// tests' 20-second deadline or shrinking coverage of the 20 MiB boundary.
+    async fn drive_large_media_history(
+        fixture: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+    ) -> Driven {
+        let deadline = std::time::Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        let driven = drive_with_model_and_deadline(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            deadline,
+        )
+        .await;
+        eprintln!(
+            "large-media fixture {fixture}: harness elapsed {:?}, stream deadline {deadline:?}",
+            started.elapsed(),
+        );
+        driven
+    }
+
+    async fn drive_with_model_and_deadline(
+        model: &str,
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        deadline: std::time::Duration,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
         let mut registry = ToolRegistry::new();
@@ -3121,12 +3332,19 @@ mod rich_output_tests {
             model,
         );
 
+        let started = std::time::Instant::now();
         let run = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            deadline,
             StreamMethods::run_stream_internal(session, messages),
         )
         .await
-        .expect("stream loop must finish");
+        .unwrap_or_else(|err| {
+            panic!(
+                "stream loop must finish: {err}; deadline {deadline:?}, elapsed {:?}, provider calls {}",
+                started.elapsed(),
+                mock.calls.load(Ordering::SeqCst),
+            )
+        });
         // A fail-closed rejection (e.g. invalid original media) is a valid
         // outcome: the harness records it instead of unwrapping so tests can
         // assert on `bodies.is_empty()` / `rejected`.
@@ -3556,7 +3774,10 @@ mod rich_output_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn rich_output_and_hook_replace() {
+        // #186: Replace writes the intercept audit — isolate the base dir.
+        let _base = crate::test_env::BaseDirGuard::new();
         let bus = Arc::new(crate::extensions::hooks::HookBus::new());
         let mut perms = PermissionSet::new();
         perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
@@ -3599,6 +3820,100 @@ mod rich_output_tests {
             results[1]["content"],
             Value::String("plain text result".into())
         );
+    }
+
+    /// Side-effecting stub: sleeps, then flips a shared flag (like `bash` writing a file).
+    struct WriterStub(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Tool for WriterStub {
+        fn name(&self) -> &str {
+            "writer_stub"
+        }
+        fn description(&self) -> &str {
+            "writes after a delay"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        // Default effect: NonIdempotent -> serial lane, like bash.
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("written".to_string())
+        }
+    }
+
+    /// Read-only stub: reports whether the writer's effect is visible yet.
+    struct ProbeStub(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Tool for ProbeStub {
+        fn name(&self) -> &str {
+            "probe_stub"
+        }
+        fn description(&self) -> &str {
+            "reads the flag"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            let seen = self.0.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(if seen { "seen" } else { "missing" }.to_string())
+        }
+    }
+
+    fn results_by_id(d: &Driven) -> std::collections::HashMap<String, Value> {
+        tool_result_message(&d.bodies[1])["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["tool_use_id"].as_str().unwrap().to_string(), r["content"].clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_after_write_in_one_batch_sees_the_write() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_w", "writer_stub"), ("toolu_r", "probe_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let r = results_by_id(&d);
+        assert_eq!(r["toolu_w"], Value::String("written".into()));
+        assert_eq!(
+            r["toolu_r"],
+            Value::String("seen".into()),
+            "a read issued after a side-effecting call must run after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_before_write_in_one_batch_is_not_delayed() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_r", "probe_stub"), ("toolu_w", "writer_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        let r = results_by_id(&d);
+        assert_eq!(
+            r["toolu_r"],
+            Value::String("missing".into()),
+            "reads before the first write keep their concurrent lane"
+        );
+        assert_eq!(r["toolu_w"], Value::String("written".into()));
     }
 
     #[tokio::test]
@@ -3729,18 +4044,13 @@ mod rich_output_tests {
         assert_eq!(out[2]["content"][0]["type"], "image");
     }
 
-    /// #112 ordering: `validate_messages` (MAX_HISTORY_ENCODED_BYTES = 20 MiB)
-    /// runs BEFORE `cap_history_image_bytes` (HISTORY_IMAGE_BYTE_CAP = 20 MiB),
-    /// so a history the validator accepts is never lossily pruned — every
-    /// image the user sent reaches the provider intact. The cap is a
-    /// belt-and-braces bound only (unit-tested directly below); an over-limit
-    /// history is an error, not a silent trim
-    /// (`history_media_limit_rejects_before_lossy_pruning`).
+    /// Histories below both retention thresholds remain untouched.
     #[tokio::test]
     async fn valid_history_reaches_provider_unpruned() {
         // 5 × 3.5 MiB = 17.5 MiB < 20 MiB → valid; all 5 must be on the wire.
         let per = 3_670_016usize;
-        let d = drive_with_history(
+        let d = drive_large_media_history(
+            "valid_history_reaches_provider_unpruned",
             image_history(5, per),
             vec![Arc::new(TextTool)],
             &[("toolu_z", "text_stub")],
@@ -3799,21 +4109,39 @@ mod rich_output_tests {
         );
     }
 
-    /// Invalid original histories fail closed BEFORE pruning, with zero sends.
+    /// Native original-byte overflow triggers chunk retirement, not rejection.
     #[tokio::test]
-    async fn history_media_limit_rejects_before_lossy_pruning() {
+    async fn history_media_limit_replays_chunk_retirement() {
         let history = image_history(7, 3_670_016);
         let original = serde_json::to_string(&history).unwrap();
-        let d = drive_with_history(
+        let d = drive_large_media_history(
+            "history_media_limit_replays_chunk_retirement",
             history.clone(),
             vec![Arc::new(TextTool)],
             &[("toolu_z", "text_stub")],
             Arc::new(crate::extensions::hooks::HookBus::new()),
         )
         .await;
-        assert!(d.rejected, "invalid original media must stop inference");
-        assert!(d.bodies.is_empty(), "oversized history must never reach the provider");
+        assert!(!d.rejected, "valid native history should retire older images");
+        assert!(!d.bodies.is_empty());
+        let wire = serde_json::to_string(&d.bodies[0]).unwrap();
+        assert!(wire.contains(super::super::image_retention::OMITTED));
         assert_eq!(serde_json::to_string(&history).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn malformed_retired_original_still_rejects_before_sending() {
+        let mut history = image_history(7, 3_670_016);
+        Arc::make_mut(&mut history[2])["content"][0]["content"][1]["source"]["data"] =
+            json!("invalid base64");
+        let d = drive_with_history(
+            history,
+            vec![Arc::new(TextTool)],
+            &[("toolu_z", "text_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        ).await;
+        assert!(d.rejected);
+        assert!(d.bodies.is_empty());
     }
 
     #[test]
@@ -3961,6 +4289,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set: Default::default(),

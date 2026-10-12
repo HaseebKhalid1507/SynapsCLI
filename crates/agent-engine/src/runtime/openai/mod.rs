@@ -259,7 +259,7 @@ pub(crate) async fn try_route_with_memory_backend(
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
-    if let Err(error) = super::attachments::validate_messages(model, messages) {
+    if let Err(error) = super::attachments::validate_history_for_request(model, messages) {
         return Some(Err(error.into()));
     }
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {

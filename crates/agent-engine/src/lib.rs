@@ -7,6 +7,7 @@ pub mod extensions;
 pub mod attachments;
 pub mod daemon;
 pub mod help;
+pub mod process_scope;
 pub mod host;
 pub mod mcp;
 pub mod memory_backend;
@@ -34,7 +35,7 @@ pub use agent_core::SharedMessage;
 pub use agent_core::{next_turn_correlation_id, BudgetDimension, TurnError, TurnOutcome};
 pub use config::{load_config, resolve_system_prompt, SynapsConfig};
 pub use error::{Result, RuntimeError};
-pub use host::{EngineHost, HostOpts, HostParts};
+pub use host::{EngineHost, HostOpts, HostParts, McpDiscovery};
 pub use runtime::{AgentEvent, LlmEvent, Runtime, SessionEvent, StreamEvent};
 pub use session::{
     ClientTransport, Envelope, LocalTransport, SessionCommand, SessionConfig, SessionEventWire,

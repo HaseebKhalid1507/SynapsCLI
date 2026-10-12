@@ -47,10 +47,6 @@ impl Theme {
             subagent_status: Color::Rgb(122, 162, 247),
             subagent_done: Color::Rgb(158, 206, 106),
             subagent_time: Color::Rgb(86, 95, 137),
-            event_icon: Color::Rgb(255, 180, 50),
-            event_source: Color::Rgb(120, 180, 255),
-            event_text: Color::Rgb(200, 200, 210),
-            event_critical: Color::Rgb(255, 80, 80),
             // Tool cards take this palette's colours (Theme::tool_*_background)
             // instead of inheriting the default theme's slate panels.
             tool_input_bg: Color::Reset,

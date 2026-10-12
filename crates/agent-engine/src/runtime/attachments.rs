@@ -47,7 +47,37 @@ const UNSUPPORTED_TRANSPORT: &str =
 ///
 /// Text-only histories remain unaffected, even on unsupported transports.
 pub fn validate_messages(model: &str, messages: &[crate::SharedMessage]) -> Result<(), String> {
+    validate_history(model, messages, MAX_HISTORY_ENCODED_BYTES)
+}
+
+/// Exact native route only; compatible providers and broker routes stay strict.
+pub(crate) fn native_image_retention(model: &str) -> bool {
+    if crate::extensions::providers::ProviderRegistry::parse_model_id(model).is_some()
+        || crate::auth::cloud::split_model_route(model).1.is_some()
+    {
+        return false;
+    }
+    // Local routing may read endpoint configuration: never resolve it here.
+    if model.contains('/') && !model.starts_with("anthropic/") { return false; }
+    openai::resolve_route(model).is_some_and(|route| {
+        route.provider == "anthropic" && route.wire == WireProtocol::AnthropicMessages
+            && route.auth != AuthPolicy::BrokerProxy
+    })
+}
+
+/// Original admission is separate from strict projected-wire validation. Native
+/// Anthropic defers only the aggregate budget to synchronous original replay.
+pub fn validate_history_for_request(model: &str, messages: &[crate::SharedMessage]) -> Result<(), String> {
+    super::image_retention::resource_prepass(messages)?;
+    if !native_image_retention(model) { return validate_messages(model, messages); }
+    validate_history(model, messages, super::image_retention::MAX_ORIGINAL_BYTES)?;
+    super::image_retention::plan(messages)?;
+    Ok(())
+}
+
+fn validate_history(model: &str, messages: &[crate::SharedMessage], limit: usize) -> Result<(), String> {
     let mut validator = Validator::new(model);
+    validator.history_limit = limit;
     for message in messages {
         let mut count = 0;
         if let Some(blocks) = message.get("content").and_then(Value::as_array) {
@@ -77,18 +107,35 @@ pub fn validate_tool_blocks(model: &str, blocks: &[Value]) -> Result<(), String>
 }
 
 /// Assemble a sibling tool batch without admitting newly over-budget media.
-/// Strip only rich results introduced by this batch, newest first, preserving
-/// every correlation ID/order and returning explicit tool errors. Previously
-/// committed history is never rewritten. Its validity is checked before tools.
+/// Native media-bearing siblings are rejected atomically; other routes retain
+/// their existing newest-first policy. IDs, order and text-only results survive.
+/// Invalid preexisting history propagates instead of becoming a tool error.
 pub(crate) fn bounded_tool_results(
     model: &str,
     history: &[crate::SharedMessage],
     mut results: Vec<Value>,
-) -> Value {
+) -> Result<Value, (String, Vec<Value>)> {
+    if let Err(error) = validate_history_for_request(model, history) {
+        // Return ownership: the caller must record completed tool evidence even
+        // when old history became invalid while the tools were executing.
+        return Err((error, results));
+    }
     let mut candidate = history.to_vec();
     candidate.push(std::sync::Arc::new(
         serde_json::json!({"role":"user","content":results}),
     ));
+    if native_image_retention(model) {
+        if let Err(error) = validate_history_for_request(model, &candidate) {
+            // Reject every media-bearing sibling atomically, never a subset.
+            for result in &mut results {
+                if result.get("content").is_some_and(contains_media) {
+                    result["content"] = Value::String(format!("Attachment not sent: {error}"));
+                    result["is_error"] = Value::Bool(true);
+                }
+            }
+        }
+        return Ok(serde_json::json!({"role":"user","content":results}));
+    }
     for index in (0..results.len()).rev() {
         let Err(error) = validate_messages(model, &candidate) else {
             break;
@@ -100,7 +147,7 @@ pub(crate) fn bounded_tool_results(
                 std::sync::Arc::new(serde_json::json!({"role":"user","content":results}));
         }
     }
-    serde_json::json!({"role":"user","content":results})
+    Ok(serde_json::json!({"role":"user","content":results}))
 }
 
 struct Transport {
@@ -255,6 +302,7 @@ struct Validator<'a> {
     model: &'a str,
     transport: Option<Transport>,
     encoded_bytes: usize,
+    history_limit: usize,
     attachments: usize,
 }
 
@@ -264,6 +312,7 @@ impl<'a> Validator<'a> {
             model,
             transport: None,
             encoded_bytes: 0,
+            history_limit: MAX_HISTORY_ENCODED_BYTES,
             attachments: 0,
         }
     }
@@ -333,7 +382,7 @@ impl<'a> Validator<'a> {
             .as_ref()
             .expect("transport resolved")
             .permits(kind)?;
-        let remaining = MAX_HISTORY_ENCODED_BYTES.saturating_sub(self.encoded_bytes);
+        let remaining = self.history_limit.saturating_sub(self.encoded_bytes);
         self.encoded_bytes += serialized_size(block, remaining).ok_or(HISTORY_LIMIT)?;
         self.attachments += 1;
         Ok(())
@@ -518,7 +567,7 @@ fn contains_media(content: &Value) -> bool {
 }
 
 /// Count JSON bytes, including escaping, without allocating a payload copy.
-fn serialized_size<T: Serialize + ?Sized>(value: &T, limit: usize) -> Option<usize> {
+pub(super) fn serialized_size<T: Serialize + ?Sized>(value: &T, limit: usize) -> Option<usize> {
     struct Counter {
         bytes: usize,
         limit: usize,
@@ -590,19 +639,75 @@ mod tests {
     }
 
     #[test]
-    fn combined_tool_batch_rejects_only_overflowing_media_and_preserves_ids() {
+    fn combined_tool_batch_rejects_media_atomically_and_preserves_ids() {
         let results: Vec<_> = (0..9).map(|i| json!({"type":"tool_result", "tool_use_id":format!("tool_{i}"), "content":[image()]})).collect();
-        let bounded = bounded_tool_results(NATIVE, &[], results);
+        let bounded = bounded_tool_results(NATIVE, &[], results).unwrap();
         assert!(validate_messages(NATIVE, &[Arc::new(bounded.clone())]).is_ok());
         for i in 0..9 {
             assert_eq!(bounded["content"][i]["tool_use_id"], format!("tool_{i}"));
         }
-        assert!(bounded["content"][7]["content"].is_array());
+        assert_eq!(bounded["content"][7]["is_error"], true);
         assert_eq!(bounded["content"][8]["is_error"], true);
         assert!(bounded["content"][8]["content"]
             .as_str()
             .unwrap()
             .starts_with("Attachment not sent:"));
+    }
+
+    #[test]
+    fn original_admission_preserves_adjacent_batch_limits_before_sanitize() {
+        let original = vec![message(vec![image(); 8]), message(vec![image(); 8])];
+        validate_history_for_request(NATIVE, &original).unwrap();
+        let mut outgoing = original.clone();
+        super::super::image_retention::apply(&mut outgoing).unwrap();
+        validate_messages(NATIVE, &outgoing).unwrap();
+        super::super::helpers::HelperMethods::sanitize_thinking_blocks(&mut outgoing);
+        assert_eq!(outgoing.len(), 1);
+        assert!(validate_messages(NATIVE, &outgoing).is_err());
+        assert_eq!(original.len(), 2);
+    }
+
+    #[test]
+    fn invalid_retired_original_and_resource_cap_fail_admission() {
+        let mut history = vec![message(vec![image()]); 101];
+        let mut malformed = image();
+        malformed["source"]["data"] = json!("not base64");
+        history[0] = message(vec![malformed]);
+        assert!(validate_history_for_request(NATIVE, &history).is_err());
+        assert!(validate_history_for_request(NATIVE, &vec![message(vec![image()]); 4097])
+            .unwrap_err().contains("4096"));
+        let evidence = vec![json!({
+            "type":"tool_result","tool_use_id":"text","content":"unchanged"
+        })];
+        let (_, returned) = bounded_tool_results(NATIVE, &history, evidence.clone()).unwrap_err();
+        assert_eq!(returned, evidence);
+    }
+
+    #[test]
+    fn atomic_rejection_preserves_text_siblings() {
+        let mut results = vec![json!({"type":"tool_result","tool_use_id":"text","content":"ok"})];
+        results.extend((0..9).map(|i| json!({
+            "type":"tool_result","tool_use_id":format!("image-{i}"),"content":[image()]
+        })));
+        let bounded = bounded_tool_results(NATIVE, &[], results.clone()).unwrap();
+        assert_eq!(bounded["content"][0], results[0]);
+        for i in 1..10 {
+            assert_eq!(bounded["content"][i]["tool_use_id"], results[i]["tool_use_id"]);
+            assert_eq!(bounded["content"][i]["is_error"], true);
+        }
+    }
+
+    #[test]
+    fn native_route_is_exact_and_other_admission_stays_strict() {
+        assert!(native_image_retention(NATIVE));
+        assert!(native_image_retention("claude-sonnet-4-6"));
+        for model in ["local/test", "openrouter/anthropic/claude-sonnet-4-6",
+            "github-copilot/claude-sonnet-4.6", "bedrock/claude-sonnet-4-6",
+            "plugin:provider:model", "anthropic/not-claude"] {
+            assert!(!native_image_retention(model), "{model}");
+            let history = vec![message(vec![image()])];
+            assert_eq!(validate_history_for_request(model, &history), validate_messages(model, &history));
+        }
     }
 
     #[test]
@@ -668,7 +773,7 @@ mod tests {
                 model,
                 &[],
                 vec![json!({"type":"tool_result","tool_use_id":"toolu_read","content":[image()]})],
-            );
+            ).unwrap();
             assert!(bounded["content"][0]["content"].is_array(), "{model}");
             assert!(bounded["content"][0].get("is_error").is_none(), "{model}");
         }

@@ -7,17 +7,16 @@
 //! second attach reuses (same pid) → `daemon stop` ends it; concurrent
 //! first-clients → exactly ONE daemon (spawn lock); `SYNAPS_DAEMON_AUTOSPAWN=0`
 //! → the no-daemon message, nothing spawned; `SYNAPS_DAEMON=0` → exit 3;
-//! the legacy-MCP refusal → line client exits 3 with the reason, the TUI
-//! falls back in-process (stderr notice, no thin-client ladder — the
-//! on-screen SystemNotice itself needs the tmux harness and is not asserted
-//! here); `daemon status` with nobody running says it auto-starts.
+//! progressive disclosure off with an MCP server configured → the daemon
+//! starts (the legacy-MCP refusal is gone); `daemon status` with nobody
+//! running says it auto-starts.
 
 #![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -57,8 +56,9 @@ impl Env {
         registry::daemon_paths_in(&self.run_dir(), None)
     }
 
-    /// Legacy-MCP refusal setup: `progressive_tool_disclosure=false` + one server.
-    fn legacy_mcp(&self) {
+    /// `progressive_tool_disclosure=false` + one MCP server: the daemon used to
+    /// refuse this (legacy shared `McpTool` connections); it now starts.
+    fn progressive_off_with_mcp(&self) {
         std::fs::write(self.base().join("config"), "progressive_tool_disclosure = false\n").unwrap();
         std::fs::write(
             self.base().join("mcp.json"),
@@ -268,6 +268,57 @@ fn first_attach_spawns_second_reuses_stop_ends() {
     assert!(!pid_alive(info.pid), "daemon pid {} still alive after stop", info.pid);
 }
 
+/// With a reachable systemd user manager the auto-spawned daemon gets its own
+/// scope, so killing or closing the terminal that spawned it (or an OOM kill
+/// aimed at a big process in that terminal) no longer takes it down (S348).
+/// `systemd-run --scope` execs in place: the pid in daemon.json is the daemon,
+/// the ready handshake still works and `daemon stop` still ends it.
+#[cfg(target_os = "linux")]
+#[test]
+fn spawned_daemon_runs_in_its_own_scope_when_available() {
+        if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") { return; }
+    let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        eprintln!("skip: no XDG_RUNTIME_DIR (no systemd user manager here)");
+        return;
+    };
+    let usable = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "/bin/true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !usable {
+        eprintln!("skip: systemd-run --user --scope is not usable here");
+        return;
+    }
+    let env = Env::new();
+    let paths = env.paths();
+    let mut cmd = env.cmd(&["attach", "--create"]);
+    cmd.env("XDG_RUNTIME_DIR", &xdg)
+        .env("SYNAPS_TEST_REAL_SCOPES", "1")
+        .env("SYNAPS_PROCESS_SCOPES", "auto");
+    let mut a = Client::spawn(cmd);
+    a.wait_stdout("○ ready", 30);
+    let info = registry::read_daemon_json(&paths).expect("daemon.json");
+    assert!(pid_alive(info.pid));
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let daemon = std::fs::read_to_string(format!("/proc/{}/cgroup", info.pid)).unwrap();
+    assert_ne!(daemon.trim(), own.trim(), "the daemon must not share the spawner's cgroup");
+    assert!(daemon.trim().ends_with(".scope") && daemon.contains("/app.slice/"), "{daemon}");
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", info.pid)).unwrap();
+    assert_ne!(comm.trim(), "systemd-run", "systemd-run must have exec'd into the daemon");
+
+    a.detach();
+    let st = env.cmd(&["daemon", "stop"]).stdin(Stdio::null()).output().unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    let t0 = Instant::now();
+    while pid_alive(info.pid) && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!pid_alive(info.pid), "daemon pid {} still alive after stop", info.pid);
+}
+
 #[test]
 fn concurrent_first_clients_spawn_exactly_one_daemon() {
     let env = Env::new();
@@ -330,66 +381,75 @@ fn daemon_flag_off_refuses_attach() {
     assert!(!registry::is_alive(&env.paths()));
 }
 
+/// Legacy MCP was removed: with progressive disclosure off and an MCP server
+/// configured, the daemon starts (it used to refuse with exit 3), and the
+/// server's tools go through per-session leases. A server that cannot be
+/// listed (`/bin/cat` speaks no MCP) costs a bounded boot discovery, never a
+/// refusal.
 #[test]
-fn legacy_mcp_refusal_line_client_exits_3() {
+fn progressive_off_with_mcp_server_daemon_starts() {
     let env = Env::new();
-    env.legacy_mcp();
+    env.progressive_off_with_mcp();
     let paths = env.paths();
-    let out = env.cmd(&["attach", "--create"]).stdin(Stdio::null()).output().unwrap();
-    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("daemon unavailable:"), "{err}");
-    assert!(err.contains("progressive_tool_disclosure=false"), "reason is the daemon's one-liner:\n{err}");
-    assert!(!err.contains("starting daemon"), "{err}");
-    wait_alive(&paths, false, 5);
+    let mut a = Client::spawn(env.cmd(&["attach", "--create"]));
+    a.wait_stdout("○ ready", 60);
+    assert!(!a.err.contains("daemon unavailable"), "{}", a.err);
+    assert!(!a.err.contains("progressive_tool_disclosure=false"), "{}", a.err);
+    assert!(registry::is_alive(&paths), "daemon running");
+    a.detach();
+    let st = env.cmd(&["daemon", "stop"]).stdin(Stdio::null()).output().unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    wait_alive(&paths, false, 10);
 }
 
-/// `synaps --attach` when the daemon refuses: in-process TUI with the
-/// notice, exit 0, and none of the thin-client ladder stages (no re-exec,
-/// no allocator diet — review H2).
+/// Release blocker: a hung MCP server with no cached descriptors used to be
+/// discovered inside host boot (20 s), past the spawner's ready bound, so
+/// every auto-start failed. The daemon now boots on cached descriptors only
+/// and discovers in the background after it is accepting: the spawn must
+/// succeed and the client reach ready well within `SPAWN_READY_TIMEOUT`,
+/// and the hung server is still tried (in the background).
 #[test]
-fn legacy_mcp_refusal_tui_falls_back_in_process() {
+fn hung_mcp_server_does_not_delay_daemon_ready() {
     let env = Env::new();
-    env.legacy_mcp();
-    let ladder = env.home.path().join("ladder.log");
-    let mut child = env
-        .cmd(&["--attach"])
-        .env("SYNAPS_MEM_TRACE", "1")
-        .env("SYNAPS_MEM_TRACE_FILE", &ladder)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            break Some(st);
+    let spy = env.home.path().join("hung-spy.log");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/agent-engine/tests/fixtures/mcp_fixture_server.py");
+    let mcp = serde_json::json!({"mcpServers": {"stuck": {
+        "command": "python3",
+        "args": [fixture.display().to_string()],
+        "env": {
+            "MCP_FIXTURE_SPY": spy.display().to_string(),
+            "MCP_FIXTURE_MODE": "hang"
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let err = reader.join().unwrap();
-    assert!(err.contains("daemon unavailable:") && err.contains("running in-process"), "fallback notice:\n{err}");
-    assert!(err.contains("progressive_tool_disclosure=false"), "{err}");
-    // Exit status is the TUI's own (stdin is /dev/null here, so it may
-    // bail on the terminal); the fallback itself is proven by the notice.
-    let _ = status;
-    let trace = std::fs::read_to_string(&ladder).unwrap_or_default();
-    for stage in ["stage=reexec", "stage=main", "stage=alloc"] {
-        assert!(!trace.contains(stage), "thin-client ladder stage {stage} on the fallback:\n{trace}");
+    }}});
+    std::fs::write(env.base().join("mcp.json"), mcp.to_string()).unwrap();
+    let paths = env.paths();
+
+    let t0 = Instant::now();
+    let mut a = Client::spawn(env.cmd(&["attach", "--create"]));
+    a.wait_stdout("○ ready", 60);
+    let elapsed = t0.elapsed();
+    assert!(a.err.contains("starting daemon (pid "), "the spawn succeeded:\n{}", a.err);
+    assert!(!a.err.contains("daemon unavailable"), "{}", a.err);
+    assert!(
+        elapsed < agent_engine::daemon::SPAWN_READY_TIMEOUT,
+        "ready after {elapsed:?}; MCP discovery must not gate daemon readiness"
+    );
+    assert!(registry::is_alive(&paths), "daemon running");
+
+    // Discovery still happens, after ready, in the background.
+    let t1 = Instant::now();
+    while !std::fs::read_to_string(&spy).unwrap_or_default().contains("spawn") {
+        assert!(
+            t1.elapsed() < Duration::from_secs(30),
+            "background MCP discovery never started the hung server"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!registry::is_alive(&env.paths()));
+
+    a.detach();
+    env.stop();
+    wait_alive(&paths, false, 10);
 }
 
 #[test]

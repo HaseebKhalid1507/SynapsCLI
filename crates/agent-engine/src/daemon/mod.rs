@@ -37,8 +37,25 @@ pub const EXIT_VERSION: i32 = 2;
 pub const EXIT_DAEMON_LOST: i32 = 4;
 /// Env var carrying the write end of the ready pipe to a spawned daemon.
 pub const READY_FD_ENV: &str = "SYNAPS_DAEMON_READY_FD";
-/// How long `spawn_detached` waits for the child's ready byte.
-pub const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound `run_foreground` waits for extension discovery before it
+/// starts accepting and signals ready (sidecars spawn once per daemon, and
+/// early sessions must see extension tools/hooks).
+pub const EXTENSION_DISCOVERY_WAIT: Duration = Duration::from_secs(10);
+/// Headroom for the rest of the daemon's pre-ready work (host boot with
+/// cached MCP descriptors only, bind, registry files) and a loaded machine.
+const SPAWN_READY_MARGIN: Duration = Duration::from_secs(5);
+/// How long `spawn_detached` waits for the child's ready byte. Strictly
+/// greater than the daemon's bounded pre-ready work: the extension wait plus
+/// a margin. MCP discovery never counts here — the daemon runs it in the
+/// background after it is accepting ([`crate::McpDiscovery::Background`]).
+pub const SPAWN_READY_TIMEOUT: Duration =
+    Duration::from_secs(EXTENSION_DISCOVERY_WAIT.as_secs() + SPAWN_READY_MARGIN.as_secs());
+// The spawner must outwait the daemon's bounded pre-ready work, or one slow
+// extension walk makes every auto-start fail (killed before `R`).
+const _: () = assert!(
+    SPAWN_READY_TIMEOUT.as_secs() > EXTENSION_DISCOVERY_WAIT.as_secs(),
+    "SPAWN_READY_TIMEOUT must exceed EXTENSION_DISCOVERY_WAIT"
+);
 
 /// `SYNAPS_DAEMON` feature flag: ON unless set to `0`/`false`/`off`/`no`.
 /// `SYNAPS_DAEMON=1` is accepted (no-op, kept for older scripts).
@@ -63,11 +80,6 @@ pub fn autospawn_enabled() -> bool {
 
 /// One-line reason used by every attach path when the flag is off.
 pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
-
-/// `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` (§4.4).
-pub fn allow_legacy_mcp_env() -> bool {
-    matches!(std::env::var("SYNAPS_DAEMON_ALLOW_LEGACY_MCP").as_deref(), Ok("1") | Ok("true"))
-}
 
 /// Builds a session for `Attach::Create`: `host_factory` (real actor) or
 /// `echo_factory` (tests).
@@ -113,6 +125,9 @@ pub struct DaemonOpts {
     /// turn (idle, client-less sessions are saved on exit; `--continue`
     /// brings them back). A turn in flight always blocks the exit.
     pub idle_exit: Option<Duration>,
+    /// Deprecated, ignored: legacy MCP was removed (every mode uses
+    /// per-session MCP leases). Still forwarded so an older client can spawn
+    /// a newer daemon.
     pub allow_legacy_mcp: bool,
     /// Test seam: `registry_dir()` replacement.
     pub runtime_dir: Option<PathBuf>,
@@ -275,22 +290,6 @@ pub struct Daemon {
     accept: tokio::task::JoinHandle<()>,
 }
 
-/// Refuse-to-start check (§2.11): legacy `McpTool` connections would be
-/// shared across sessions.
-pub fn legacy_mcp_conflict(host: &EngineHost, allow: bool) -> Option<String> {
-    if allow || allow_legacy_mcp_env() {
-        return None;
-    }
-    let cfg = host.config();
-    if !cfg.progressive_tool_disclosure && host.mcp_server_count() > 0 {
-        return Some(format!(
-            "progressive_tool_disclosure=false with {} MCP server(s) configured: legacy McpTool connections would be shared across sessions. Set progressive_tool_disclosure=true, or pass --allow-legacy-mcp / SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1",
-            host.mcp_server_count()
-        ));
-    }
-    None
-}
-
 impl Daemon {
     /// Reap stale files, take the flock, bind (dir 0700 / sock 0600), write
     /// `daemon.json`, spawn the accept loop, signal the ready fd if any.
@@ -301,9 +300,6 @@ impl Daemon {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        if let Some(msg) = legacy_mcp_conflict(&host, opts.allow_legacy_mcp) {
-            anyhow::bail!("refusing to start: {msg}");
         }
         // C3: after `reload` the new image ADOPTS the inherited flock and
         // skips `reap_stale` (the old image's files are ours).
@@ -362,6 +358,19 @@ impl Daemon {
         };
         registry::write_daemon_json(&paths, &info)?;
 
+        // Before any session of this image registers: drop registrations no
+        // running session owns (dead owner pid). After a reload, also every
+        // one naming our own pid: the old image exec'd without ending its
+        // sessions, and the ones still live re-register when they rehydrate
+        // below, under their current (e.g. post-compaction) id. On a fresh
+        // start our pid may already own live registrations (a daemon hosted
+        // in a process that runs other sessions), so it is left alone.
+        let own_pid = reload_state.as_ref().map(|_| info.pid);
+        let swept = crate::events::registry::sweep_stale_registrations(own_pid);
+        if swept > 0 {
+            tracing::info!(swept, "daemon: removed stale session registrations");
+        }
+
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
             reload::rehydrate(&state, rs).await;
@@ -388,8 +397,12 @@ impl Daemon {
         lifecycle::shutdown_all(&self.state, force).await;
         self.accept.abort();
         let _ = self.accept.await;
-        for p in [&self.paths.sock, &self.paths.json, &self.paths.pid] {
-            crate::events::socket::cleanup_socket(&p.to_string_lossy());
+        crate::events::socket::cleanup_socket(&self.paths.sock.to_string_lossy());
+        {
+            let lock = self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lock) = lock.as_ref() {
+                registry::cleanup_metadata(&self.paths, lock);
+            }
         }
         tracing::info!("daemon: stopped");
         // Release the flock last.
@@ -492,7 +505,8 @@ pub fn signal_ready() {
 }
 
 /// Parent side: `current_exe daemon --foreground …` in its own session
-/// (`setsid`), stdout → null, stderr → pipe; waits ≤ 5 s for `R` on the
+/// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
+/// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
 /// ready pipe. EOF before `R` = child died → error with its stderr tail.
 #[cfg(unix)]
 pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
@@ -500,29 +514,48 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()?;
+
+
+    let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
+    if let Some(p) = &opts.profile {
+        cmd_args.extend(["--profile".into(), p.into()]);
+    }
+    if let Some(s) = &opts.socket {
+        cmd_args.extend(["--socket".into(), s.into()]);
+    }
+    if let Some(i) = opts.idle_exit {
+        cmd_args.extend(["--idle-exit".into(), i.as_secs().to_string().into()]);
+    }
+    if opts.allow_legacy_mcp {
+        cmd_args.push("--allow-legacy-mcp".into());
+    }
+    // Scope wrapping execs in place: PID, ready FD and stdio remain intact.
+    // Separate scopes do not protect against ancestor/global OOM.
+    let mut effective_env = crate::process_scope::inherited_env();
+    crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
+    effective_env.retain(|(k, _)| k != READY_FD_ENV);
+    let (program, cmd_args) = match crate::process_scope::launcher_for_effective_env(&effective_env, None) {
+        Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
+        None => (exe.into_os_string(), cmd_args),
+    };
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
-
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon").arg("--foreground");
-    if let Some(p) = &opts.profile {
-        cmd.arg("--profile").arg(p);
+    // Probe has finished before readiness capabilities exist.
+    for fd in [read_fd, write_fd] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(read_fd); libc::close(write_fd); }
+            return Err(error.into());
+        }
     }
-    if let Some(s) = &opts.socket {
-        cmd.arg("--socket").arg(s);
-    }
-    if let Some(i) = opts.idle_exit {
-        cmd.arg("--idle-exit").arg(i.as_secs().to_string());
-    }
-    if opts.allow_legacy_mcp {
-        cmd.arg("--allow-legacy-mcp");
-    }
-    cmd.env("SYNAPS_DAEMON", "1")
-        .env(READY_FD_ENV, write_fd.to_string())
+    crate::process_scope::set_env(&mut effective_env, READY_FD_ENV, write_fd.to_string());
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(cmd_args);
+    cmd.env_clear().envs(effective_env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -539,7 +572,13 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            unsafe { libc::close(read_fd); libc::close(write_fd); }
+            return Err(error.into());
+        }
+    };
     // SAFETY: parent no longer needs the write end; closing it makes EOF mean "child died".
     unsafe { libc::close(write_fd) };
     let pid = child.id();
@@ -583,16 +622,24 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
         drop(child);
         return Ok(pid);
     }
-    let mut tail = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut tail);
-    }
-    // EOF before `R`: the child is gone (or dying) — collect its status. A
-    // still-running child that just never signalled is killed.
+    // Stop/reap before reading stderr; descendants may retain its write end.
     let status = child.try_wait().ok().flatten().or_else(|| {
         let _ = child.kill();
         child.wait().ok()
     });
+    let mut tail = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        use std::os::fd::AsRawFd;
+        let fd = err.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0 {
+            // Bounded bytes and nonblocking reads, even if a descendant holds
+            // the pipe open or keeps writing after the wrapper exits.
+            let mut bytes = Vec::new();
+            let _ = err.by_ref().take(64 * 1024).read_to_end(&mut bytes);
+            tail = String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
     let reason = tail
         .lines()
         .map(str::trim)
@@ -642,21 +689,41 @@ const SPAWN_LOCK_WAIT: Duration = SPAWN_READY_TIMEOUT.saturating_add(Duration::f
 /// first client spawns via `setsid` + ready-fd; the daemon holds the flock).
 /// The **spawn lock** (`<stem>.spawn.lock` next to the flock) serialises
 /// concurrent first-clients: the loser blocks on it, then re-probes the
-/// flock and finds the winner's daemon. Never touches the socket on
-/// ECONNREFUSED alone — `reap_stale` + the flock decide.
+/// flock and finds the winner's daemon. Enabled warm attaches also acquire
+/// this lock (extra open/flock overhead, and the lock must be writable).
+/// Never touches the socket on ECONNREFUSED alone — `reap_stale` + the
+/// flock decide. Daemon startup must NOT acquire the spawn lock: its parent
+/// holds it until the child's ready-fd acknowledgement.
 #[cfg(unix)]
 pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
+    ensure_running_with(opts, autospawn_enabled(), spawn_detached, || {})
+}
+
+// Keep the real cleanup/probe/locking path testable without spawning the unit
+// test executable. The hook marks entry to the lock attempt, not readiness.
+#[cfg(unix)]
+fn ensure_running_with(
+    opts: &DaemonOpts,
+    auto: bool,
+    spawn: impl FnOnce(&DaemonOpts) -> anyhow::Result<u32>,
+    before_spawn_lock: impl FnOnce(),
+) -> Result<Ensured, EnsureError> {
     let paths = opts.paths();
-    registry::reap_stale(&paths);
-    if registry::is_alive(&paths) {
-        return Ok(Ensured::Running);
-    }
-    if !autospawn_enabled() {
-        return Err(EnsureError::AutospawnDisabled);
+    if !auto {
+        // Preserve the disabled path: no spawn-lock dependency, even warm.
+        registry::reap_stale(&paths);
+        return if registry::is_alive(&paths) {
+            Ok(Ensured::Running)
+        } else {
+            Err(EnsureError::AutospawnDisabled)
+        };
     }
     let _ = std::fs::create_dir_all(&paths.dir);
+    before_spawn_lock();
     let _guard = registry::SpawnLock::acquire(&paths, SPAWN_LOCK_WAIT)
         .map_err(|e| EnsureError::Spawn(format!("spawn lock {}: {e}", paths.spawn_lock().display())))?;
+    // No enabled caller may reap/probe before this lock: another client's
+    // transient cleanup/probe DaemonLock is not evidence of a ready daemon.
     // Somebody may have spawned while we waited.
     registry::reap_stale(&paths);
     if registry::is_alive(&paths) {
@@ -670,7 +737,7 @@ pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
     if opts.idle_exit.is_none() {
         opts.idle_exit = autospawn_idle_exit();
     }
-    spawn_detached(&opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
+    spawn(&opts).map(Ensured::Spawned).map_err(|e| EnsureError::Spawn(e.to_string()))
 }
 
 /// `SYNAPS_DAEMON_IDLE_EXIT_SECS` for auto-spawned daemons: default 10 s —
@@ -702,17 +769,23 @@ fn autospawn_idle_exit_from(v: Option<&str>, cfg_secs: u64) -> Option<Duration> 
 pub const AUTOSPAWN_IDLE_EXIT: Duration = Duration::from_secs(10);
 
 
-/// `synaps daemon --foreground` body: gate → boot host → extension discovery
-/// once → start → wait for SIGTERM/SIGINT/Shutdown frame/idle.
+/// `synaps daemon --foreground` body: gate → boot host (cached MCP
+/// descriptors only) → extension discovery once → start → background MCP
+/// discovery → wait for SIGTERM/SIGINT/Shutdown frame/idle.
 pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if !enabled() {
         anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
     }
-    let host = EngineHost::boot_and_install(crate::HostOpts { profile: opts.profile.clone(), no_extensions: false }).await?;
-    if let Some(msg) = legacy_mcp_conflict(&host, opts.allow_legacy_mcp) {
-        anyhow::bail!("refusing to start: {msg} (exit {EXIT_REFUSED})");
-    }
-    // Sidecars spawn once per daemon: discover before accepting (bounded 10 s).
+    // Background MCP discovery: a hung/dead MCP server must never delay the
+    // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
+    let host = EngineHost::boot_and_install(crate::HostOpts {
+        profile: opts.profile.clone(),
+        no_extensions: false,
+        mcp_discovery: crate::McpDiscovery::Background,
+    })
+    .await?;
+    // Sidecars spawn once per daemon: discover before accepting (bounded by
+    // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let _loader = crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None);
     let wait = async {
@@ -723,8 +796,11 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
-        tracing::warn!("daemon: extension discovery still running after 10 s; accepting anyway");
+    if tokio::time::timeout(EXTENSION_DISCOVERY_WAIT, wait).await.is_err() {
+        tracing::warn!(
+            wait = ?EXTENSION_DISCOVERY_WAIT,
+            "daemon: extension discovery still running; accepting anyway"
+        );
     }
     // C3 router: widget.* frames from every sidecar fan out to every live
     // session (daemon-global widgets today — frames carry no session id).
@@ -734,7 +810,13 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if opts.factory.is_none() {
         opts.factory = Some(host_factory(&host));
     }
+    let mcp_host = Arc::clone(&host);
     let daemon = Daemon::start(host, opts).await?;
+    // Accepting and ready: now discover uncached MCP servers. New servers'
+    // tools join the shared registry when it finishes (see
+    // `EngineHost::spawn_background_mcp_discovery` for live-session effects).
+    let _mcp_discovery = mcp_host.spawn_background_mcp_discovery();
+    drop(mcp_host);
     let state = Arc::clone(&daemon.state);
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -801,5 +883,134 @@ mod flag_tests {
         assert!(env_is_off(Some("NO")));
         assert!(!env_is_off(Some("1")));
         assert!(!env_is_off(None));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ensure_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    const WAIT: Duration = Duration::from_secs(3);
+    const BLOCKED: Duration = Duration::from_millis(100);
+
+    fn serialization_case(stale_metadata: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DaemonOpts {
+            runtime_dir: Some(dir.path().to_path_buf()),
+            profile: Some("ensure-serialization".into()),
+            // Avoid reading ambient idle-exit configuration in this test.
+            idle_exit: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let paths = opts.paths();
+        let spawn_lock = registry::SpawnLock::acquire(&paths, WAIT).unwrap();
+        let cleanup_lock = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        if stale_metadata {
+            std::fs::write(&paths.json, b"stale metadata").unwrap();
+            std::fs::write(&paths.pid, b"0\n").unwrap();
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let first_opts = opts.clone();
+        let first_count = Arc::clone(&count);
+        let first_ready = Arc::clone(&ready);
+        let first = std::thread::spawn(move || {
+            let result = ensure_running_with(&first_opts, true, |opts| {
+                first_count.fetch_add(1, Ordering::SeqCst);
+                let paths = opts.paths();
+                // The real ensure path must have reaped the old metadata.
+                assert!(!paths.json.exists());
+                assert!(!paths.pid.exists());
+                let lock = DaemonLock::try_acquire(&paths)?.expect("daemon lock free after reap");
+                let pid = std::process::id();
+                registry::write_daemon_json(&paths, &DaemonInfo {
+                    pid,
+                    protocol_version: 1,
+                    daemon_version: "test".into(),
+                    profile: opts.profile.clone(),
+                    started_at: chrono::Utc::now(),
+                    socket: paths.sock.display().to_string(),
+                    exe: None,
+                    generation: 1,
+                })?;
+                // Main retains daemon ownership past both callers' returns.
+                daemon_tx.send(lock).unwrap();
+                ready_rx.recv_timeout(WAIT).unwrap();
+                first_ready.store(true, Ordering::SeqCst);
+                Ok(pid)
+            }, || attempt_tx.send(()).unwrap());
+            done_tx.send(result).unwrap();
+        });
+        // Trace entry to the actual lock attempt before asserting absence.
+        attempt_rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(done_rx.recv_timeout(BLOCKED), Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(paths.json.exists(), stale_metadata);
+        assert_eq!(paths.pid.exists(), stale_metadata);
+        drop(cleanup_lock);
+        drop(spawn_lock);
+        let daemon_lock = daemon_rx.recv_timeout(WAIT).unwrap();
+
+        // A second real ensure caller sees daemon ownership and metadata, but
+        // must still wait for the spawning caller's ready acknowledgement.
+        let (second_attempt_tx, second_attempt_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_count = Arc::clone(&count);
+        let second_ready = Arc::clone(&ready);
+        let second = std::thread::spawn(move || {
+            let result = ensure_running_with(&opts, true, |_| {
+                second_count.fetch_add(1, Ordering::SeqCst);
+                panic!("warm attach must not spawn");
+            }, || second_attempt_tx.send(()).unwrap());
+            second_done_tx.send((result, second_ready.load(Ordering::SeqCst))).unwrap();
+        });
+        second_attempt_rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(second_done_rx.recv_timeout(BLOCKED), Err(mpsc::RecvTimeoutError::Timeout));
+        assert!(!ready.load(Ordering::SeqCst));
+        ready_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(WAIT).unwrap(), Ok(Ensured::Spawned(std::process::id())));
+        assert_eq!(second_done_rx.recv_timeout(WAIT).unwrap(), (Ok(Ensured::Running), true));
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(registry::read_daemon_json(&paths).unwrap().pid, std::process::id());
+        drop(daemon_lock);
+    }
+
+    #[test]
+    fn ensure_serializes_before_probe_with_missing_metadata() {
+        serialization_case(false);
+    }
+
+    #[test]
+    fn ensure_serializes_before_probe_with_stale_metadata() {
+        serialization_case(true);
+    }
+
+    #[test]
+    fn disabled_ensure_keeps_warm_attach_without_spawn_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DaemonOpts {
+            runtime_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let paths = opts.paths();
+        let _spawn_lock = registry::SpawnLock::acquire(&paths, WAIT).unwrap();
+        let daemon_lock = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        let ensure = || ensure_running_with(&opts, false,
+            |_| panic!("disabled must not spawn"),
+            || panic!("disabled must not attempt spawn lock"));
+        assert_eq!(ensure(), Ok(Ensured::Running));
+        drop(daemon_lock);
+        std::fs::write(&paths.json, b"stale").unwrap();
+        std::fs::write(&paths.pid, b"0\n").unwrap();
+        assert_eq!(ensure(), Err(EnsureError::AutospawnDisabled));
+        assert!(!paths.json.exists());
+        assert!(!paths.pid.exists());
     }
 }

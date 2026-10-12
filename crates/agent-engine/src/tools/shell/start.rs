@@ -100,10 +100,11 @@ impl Tool for ShellStartTool {
         };
 
         let (session_id, output, status) = mgr
-            .create_session(
+            .create_session_cancellable(
                 opts,
                 ctx.channels.tx_delta.as_ref(),
                 ctx.limits.max_tool_buffer,
+                ctx.capabilities.launch_cancel.as_ref(),
             )
             .await?;
 

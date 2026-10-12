@@ -963,6 +963,14 @@ fn grant_covers_execution(
 /// extension permissions were revoked after cataloging still passes this
 /// check until the catalog entry is removed/rebuilt. Live
 /// permission/revocation integration is Task 20.
+/// Whether `activate_tools` could ever grant this record: the same source
+/// trust check activation applies (verified provenance that matches its
+/// declared source). Used to decide which dormant tools are advertised as
+/// deferred definitions; it never authorizes anything by itself.
+pub(crate) fn is_activatable_record(record: &CapabilityRecord) -> bool {
+    check_source_trust(record).is_ok()
+}
+
 fn check_source_trust(record: &CapabilityRecord) -> Result<(), ToolAuthorizationError> {
     let deny_untrusted = || ToolAuthorizationError::UntrustedSource(record.id().clone());
     let deny_mismatch = || ToolAuthorizationError::SourceProvenanceMismatch(record.id().clone());

@@ -300,17 +300,19 @@ pub fn context_command(
 /// history mutation, or changes to an already-running stream's budget snapshot.
 /// This is a frontend slash command, never a model-callable budget renewal.
 pub fn budget_command(arg: &str, runtime: &mut crate::Runtime) -> CommandResult {
-    const USAGE: &str = "usage: /budget [status] | /budget time <duration> (positive whole seconds/minutes/hours, e.g. 30m or 4h; maximum 24h)";
+    const USAGE: &str = "usage: /budget [status] | /budget time <duration> (positive whole seconds/minutes/hours, e.g. 30m or 4h; maximum 24h) | /budget time off";
     let words: Vec<_> = arg.split_whitespace().collect();
     match words.as_slice() {
         [] | ["status"] => {
             let budget = runtime.turn_budget();
             CommandResult::Output(format!(
                 "Turn budget (configured for future turns, not live usage):\n\
-                 wall-clock: {}s; provider rounds: {} (+{} bounded renewals); tool calls: {}; tool-result bytes: {}\n\
+                 wall-clock: {}; provider rounds: {} (+{} bounded renewals); tool calls: {}; tool-result bytes: {}\n\
                  context tokens: {}; cost USD: {}\n\
-                 Committed context rollovers reset only elapsed time; other limits remain cumulative. /budget time 4h changes only the next-turn time allowance in this runtime; it is not saved to config or session storage.",
-                budget.max_elapsed.as_secs(),
+                 Committed context rollovers reset only elapsed time; other limits remain cumulative. /budget time 4h (or off) changes only the next-turn time allowance in this runtime; it is not saved to config or session storage.",
+                budget
+                    .max_elapsed_secs()
+                    .map_or_else(|| "off".into(), |s| format!("{s}s")),
                 budget.max_provider_rounds,
                 budget.max_round_renewals,
                 budget.max_tool_calls,
@@ -319,12 +321,20 @@ pub fn budget_command(arg: &str, runtime: &mut crate::Runtime) -> CommandResult 
                 budget.max_cost_usd.map_or_else(|| "unset".into(), |v| v.to_string()),
             ))
         }
+        ["time", "off"] => {
+            let mut budget = runtime.turn_budget().clone();
+            budget.max_elapsed = None;
+            runtime.set_turn_budget(budget);
+            CommandResult::Output(
+                "Turn wall-clock limit removed for future turns in this runtime only (not saved). Running turns, worker budgets and all other limits are unchanged.".into(),
+            )
+        }
         ["time", duration] => {
             let Some(seconds) = parse_turn_duration(duration) else {
                 return CommandResult::Error(USAGE.into());
             };
             let mut budget = runtime.turn_budget().clone();
-            budget.max_elapsed = std::time::Duration::from_secs(seconds);
+            budget.max_elapsed = Some(std::time::Duration::from_secs(seconds));
             runtime.set_turn_budget(budget);
             CommandResult::Output(format!(
                 "Turn wall-clock limit set to {seconds}s for future turns in this runtime only (not saved). Running turns, worker budgets and all other limits are unchanged. Send a prompt to continue retained history; this command does not start a turn."
@@ -1019,7 +1029,7 @@ mod tests {
             else {
                 panic!("{arg}");
             };
-            assert!(text.contains("wall-clock: 7200s"));
+            assert!(text.contains("wall-clock: off;"));
             assert!(text.contains("not live usage"));
             assert!(text.contains("tool calls: 512"));
             assert_eq!(runtime.turn_budget(), &original);
@@ -1030,6 +1040,7 @@ mod tests {
             "time 25h",
             "time 1h trailing",
             "status 4h",
+            "time off now",
             "off",
             "reset",
         ] {
@@ -1049,7 +1060,7 @@ mod tests {
         use crate::runtime::budget::{TurnBudget, TurnBudgetMeter, TurnRole};
         let mut runtime = crate::Runtime::new_headless();
         let original = TurnBudget {
-            max_elapsed: std::time::Duration::ZERO,
+            max_elapsed: Some(std::time::Duration::ZERO),
             max_tool_calls: 11,
             max_context_tokens: Some(456),
             max_cost_usd: Some(0.75),
@@ -1066,7 +1077,7 @@ mod tests {
         assert!(text.contains("14400s"));
         assert!(text.contains("not saved"));
         let mut expected = original.clone();
-        expected.max_elapsed = std::time::Duration::from_secs(14400);
+        expected.max_elapsed = Some(std::time::Duration::from_secs(14400));
         assert_eq!(runtime.turn_budget(), &expected);
         assert_eq!(other_runtime.turn_budget(), &original);
         assert_eq!(
@@ -1076,23 +1087,22 @@ mod tests {
         assert!(TurnBudgetMeter::new(runtime.turn_budget().clone())
             .begin_round()
             .is_ok());
+        let Some(CommandResult::Output(text)) =
+            handle_engine_command("budget", "time off", &mut runtime)
+        else {
+            panic!("expected output");
+        };
+        assert!(text.contains("removed"));
+        expected.max_elapsed = None;
+        assert_eq!(runtime.turn_budget(), &expected);
+        // No role has a time limit by default.
         assert_eq!(
-            crate::Runtime::new_headless()
-                .turn_budget()
-                .max_elapsed
-                .as_secs(),
-            7200
+            crate::Runtime::new_headless().turn_budget().max_elapsed,
+            None
         );
-        assert_eq!(
-            TurnBudget::for_role(TurnRole::Worker).max_elapsed.as_secs(),
-            3600
-        );
-        assert_eq!(
-            TurnBudget::for_role(TurnRole::Autonomous)
-                .max_elapsed
-                .as_secs(),
-            900
-        );
+        for role in [TurnRole::Foreground, TurnRole::Worker, TurnRole::Autonomous] {
+            assert_eq!(TurnBudget::for_role(role).max_elapsed, None);
+        }
         assert!(crate::skills::BUILTIN_COMMANDS.contains(&"budget"));
     }
 

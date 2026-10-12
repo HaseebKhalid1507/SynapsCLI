@@ -51,6 +51,7 @@ sha2               = "0.10"
 hmac               = "0.12"
 rand               = "0.9"
 base64             = "0.22"
+image              = { version = "=0.24.9", default-features = false, features = ["png", "jpeg"] }
 
 # URL handling
 url                = "2"

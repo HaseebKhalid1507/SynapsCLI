@@ -11,14 +11,15 @@
 | Env | Effect |
 |---|---|
 | `SYNAPS_DAEMON=0` (also `false`/`off`/`no`) | Disable daemon features: `synaps daemon` and `synaps attach` exit 3 with `daemon disabled by SYNAPS_DAEMON=0`; `--attach` prints `--attach ignored: …` and runs the normal in-process TUI. Unset or `1` = on (`=1` is a no-op kept for older scripts). |
-| `SYNAPS_DAEMON_AUTOSPAWN=0` | Disable auto-spawn only: an attach with no live daemon exits 3 with `no daemon running — start it with \`synaps daemon --detach\``. Default: the first client spawns the daemon (`current_exe daemon --foreground`, same profile, inherits env), waits ≤ 5 s on the ready-fd, prints `starting daemon (pid N) — synaps daemon stop to end it` on stderr, then attaches. A **spawn lock** (`daemon.spawn.lock`) serialises concurrent first-clients: the loser waits, re-probes the flock, attaches to the winner's daemon. If the spawned daemon refuses/dies inside the 5 s (e.g. the legacy-MCP refusal, exit 3) `--attach` falls back to the in-process TUI with a `daemon unavailable: <reason> — running in-process` notice (exit 0); `synaps attach` prints the reason and exits 3. |
+| `SYNAPS_DAEMON_AUTOSPAWN=0` | Disable auto-spawn only: an attach with no live daemon exits 3 with `no daemon running — start it with \`synaps daemon --detach\``. Default: the first client spawns the daemon (`current_exe daemon --foreground`, same profile, inherits env), waits ≤ 15 s (`SPAWN_READY_TIMEOUT`: the daemon's ≤ 10 s extension-discovery wait plus margin) on the ready-fd, prints `starting daemon (pid N) — synaps daemon stop to end it` on stderr, then attaches. A **spawn lock** (`daemon.spawn.lock`) serialises concurrent first-clients: the loser waits, re-probes the flock, attaches to the winner's daemon. If the spawned daemon refuses/dies before it is ready (e.g. the legacy-MCP refusal, exit 3) `--attach` falls back to the in-process TUI with a `daemon unavailable: <reason> — running in-process` notice (exit 0); `synaps attach` prints the reason and exits 3. |
 | `SYNAPS_DAEMON_IDLE_EXIT_SECS` | Auto-spawned daemons (from plain `synaps` or `--attach`) exit on their own after this long with **zero clients and no turn running** — default **10 s** (the clock starts at the last disconnect; parked/idle sessions do not hold it); `0`/`never` keeps them up. Parked sessions are journaled and `--continue` brings them back; nothing is lost, only the warm extensions. A daemon started by hand (`synaps daemon`) uses its own `--idle-exit`. |
 | `SYNAPS_DAEMON_IDLE_END_GRACE_SECS` | A **zero-turn** session with no clients ends after this long (F18) — default **5 s**. It has nothing to keep warm, so it does not wait the full park grace. |
 | `SYNAPS_DAEMON_PARKED_EVICT_SECS` | A **parked** session stays in the daemon's map (so `--attach <ID>`/the adopt banner find it) for this long, then is evicted (`Ended(Evicted)`). Default **1 h**; `never` keeps rows forever. Nothing is lost — the journal stays and `--continue <ID>` rebuilds it, exactly as after a daemon restart. A zero-turn session never parks: it ends (`Idle`) at the park deadline (F18). |
 | `SYNAPS_DAEMON_ADOPT=0` | Disable **adopt**: by default a plain `synaps` (no subcommand, no `--attach`; only `--system`/`-s`, `--continue`, `--prompt-manifest`, `--profile` allowed) runs as the thin socket client with `--attach --new` semantics (fresh session; `--continue` still continues) against the daemon for that profile — **spawning it first if none is running**, exactly like `--attach` (jcode model). A failed spawn, or `SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon, falls back to the ordinary in-process boot with a notice. `SYNAPS_DAEMON_ADOPT=0`, or any other flag (`--no-extensions`, `--help`, attach modifiers) → in-process, untouched. |
-| `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Allow start with `progressive_tool_disclosure=false` **and** MCP servers configured (legacy `McpTool` connections would be shared across sessions). Same as `--allow-legacy-mcp`. |
+| `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Deprecated, ignored. Legacy MCP was removed: every mode uses per-session MCP leases, so the daemon no longer refuses to start with `progressive_tool_disclosure=false` and MCP servers configured. (`--allow-legacy-mcp` is likewise accepted and ignored.) |
 | `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` / `--auto-approve-confirms` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
+| `process_scopes = auto \| off` (config key, default `auto`) / `SYNAPS_PROCESS_SCOPES` (env wins) | On Linux with a reachable systemd user manager, the spawned daemon, every bash tool command and every PTY shell start in their **own** transient scope (`systemd-run --user --scope`). systemd-oomd kills a whole cgroup at once; without this a runaway tool command shared the cgroup of the terminal that started the daemon, and an OOM kill took the command, the daemon and every session down together (S348). Separate scopes reduce shared-cgroup OOM exposure; they are not memory caps. Ancestor-cgroup or global kernel OOM can still kill the daemon and other sessions. Windows isolation is not implemented. Off, unavailable (macOS, containers, no user bus), or a session env without `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`: processes launch directly. Each launch probes with its effective environment and working directory (a three-second polling deadline after spawn, plus best-effort cleanup; offloaded for async bash and PTY startup). The probe never dispatches the requested command, but exact-environment execution is not a side-effect-free sandbox. Kernel-stalled spawn/reaping is not covered by an absolute wall-clock guarantee. A failed probe selects direct launch. Availability can race after a successful probe: any subsequent wrapper failure surfaces as an error, never an automatic direct retry, because the command may already have started. `daemon reload` re-execs in place and keeps the current cgroup; a daemon moves into its own scope at its next fresh start. Scopes show in `systemctl --user list-units --type=scope` as `synaps daemon` / `synaps tool: bash|shell`. |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
 | `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
@@ -35,7 +36,7 @@
 ## CLI
 
 ```
-synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--allow-legacy-mcp] [--profile P]
+synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--profile P]
 synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering)
 synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s)
 synaps daemon sessions [--json]
@@ -54,9 +55,17 @@ synaps --attach --new
 That is all: no env, no `daemon --detach` first. `synaps daemon status` says
 `not running (auto-starts on first --attach)` until then; `synaps daemon stop` ends it.
 
-`--detach` forks `current_exe daemon --foreground` under `setsid`, stdout → null, stderr → pipe,
-and waits ≤ 5 s for `R` on an anonymous ready pipe (EOF before `R` = child died → error with its
-stderr tail). Measured on bella: ready in ~75 ms.
+`--detach` forks `current_exe daemon --foreground` under `setsid` (through `systemd-run --user --scope` when
+`process_scopes` applies, which execs in place: same pid), stdout → null, stderr → pipe,
+and waits ≤ 15 s (`SPAWN_READY_TIMEOUT`, strictly above the daemon's 10 s extension-discovery wait; MCP discovery runs after ready) for `R` on an anonymous ready pipe (EOF before `R` = child died → error with its
+stderr tail). Measured on bella: ready in ~75 ms. The readiness pipe is allocated
+only after scope probing, and failure diagnostics are nonblocking and byte-bounded.
+A kernel-stalled kill/reap is not subject to an absolute five-second return guarantee.
+
+Test-support builds (`testing`) suppress real scope probing by default, including
+ordinary bash/PTY tests. Synthetic launcher tests do not use the host manager.
+Real systemd smoke tests require explicit `SYNAPS_TEST_REAL_SCOPES=1`; this does not
+override an operator's `SYNAPS_PROCESS_SCOPES=off`.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
@@ -99,6 +108,39 @@ is printed to stderr so scripts piping stdout are not affected.
 | `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
 | `daemon.pid` | 0600 | pid |
+
+## Per-session event endpoint ownership
+
+Session registry cards still use `<session-id>.json`, but active event sockets use
+short generation-specific `s-<digest>.sock` names (Windows pipes derive their name
+from that path). Clients must read the card's `socket_path`, not construct a path
+from the session ID; `socket_path_for_session` remains a legacy helper. Registration
+JSON remains backward-readable.
+
+Updated writers coordinate bind/publication, rename, sweeping and removal through
+a permanent `.session-registry.lock` in the runtime directory. **Never delete this
+lock file to resolve contention:** replacing its inode defeats advisory locking.
+Acquisition is bounded to 100 ms. Endpoints bind synchronously before publication;
+cleanup uses the captured runtime directory and socket identity, so an old listener
+cannot delete or rename its replacement's generation. Failure to publish rolls
+back only the newly bound endpoint. Ordinary teardown also cleans up on Drop.
+
+On Unix, cleanup still removes its captured socket if the card lock is busy; the
+next successful scan removes a generated-path card whose endpoint is missing, even
+when the PID remains alive. Windows has no filesystem socket, so card cleanup under
+contention remains best-effort until a retry or own-PID reload sweep. Legacy endpoint
+aborts remove only their captured inode. Regular files, symlinks and unrelated card
+or socket paths are not cleanup targets.
+
+The protocol coordinates updated binaries, not older binaries that ignore the lock
+or hostile same-UID filesystem mutation. Enabled daemon auto-start callers also
+serialize cleanup and liveness probing under the spawn lock, held through readiness;
+a cleanup lock held briefly by another first client is not proof of a ready daemon.
+Warm enabled attaches therefore also require acquiring the writable spawn lock.
+Disabled auto-start behavior is unchanged. Generation collisions fail binding without
+replacing the old endpoint. Long runtime-directory prefixes can still exceed Unix
+socket limits; use a short `SYNAPS_RUNTIME_DIR`. Existing journal locks and compaction
+registration-following behavior are outside this change.
 
 ## Per-session journal lock (F10)
 
@@ -281,7 +323,7 @@ C: bye | socket close = Detach (turn keeps running)
   successor, is refused with the reason named, instead of running a second writer on the same
   history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
   lock. Deleting a session (and retention) removes its draft.
-- Refuse-to-start (exit 3): flag unset; legacy MCP conflict (above); another daemon holds the lock.
+- Refuse-to-start (exit 3): flag unset; another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
   and could not reconnect within M s — session <id>; resume with synaps --attach <id> / --continue <id>`.

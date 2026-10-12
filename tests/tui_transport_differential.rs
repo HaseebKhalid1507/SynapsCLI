@@ -366,18 +366,19 @@ impl Drop for Pane {
 
 /// Socket-pane normalisation on top of [`normalise`] — the documented L≡S
 /// drops (phase 4 §7.4 G9):
-/// 1. the attach banner (`attached to <id> as client #N (Mirror)`), a
-///    System card that exists only on S;
+/// 1. the attach note (`attached to <id> as client #N (Mirror)`), a
+///    toast that exists only on S (a System card when input is owned
+///    elsewhere);
 /// 2. blank rows — the banner card shifts the top-anchored transcript by
 ///    its rows while the input box/footer stay bottom-anchored, so the
 ///    empty region between them differs in height. Content rows, their
 ///    order and the chrome (header, box, footer) are all compared.
-/// 3. the boot logo (L's transcript is empty before the first turn; S's
-///    never is — it holds the banner) and the in-process extension-loader
+/// 3. the boot logo (both transcripts start empty, but the attach toast
+///    can cover part of S's logo) and the in-process extension-loader
 ///    toast (`Extensions / ✓ Loaded N extension`): the attach client has no
 ///    extension host — the daemon loads them (documented phase-3 limitation).
 fn normalise_socket(frame: &str) -> String {
-    let attached = regex::Regex::new(r"^\s*attached to <id> as client #\d+ \([A-Za-z]+\).*$").unwrap();
+    let attached = regex::Regex::new(r"attached to <id> as client #\d+ \([A-Za-z]+\)").unwrap();
     let toast_box = regex::Regex::new(r"^\s+[╭╰]─+[╮╯]\s*$").unwrap();
     let toast_in_rule = regex::Regex::new(r"^─+╭─+╮─+$").unwrap();
     let rule: String = "─".repeat(COLS as usize);
@@ -390,6 +391,7 @@ fn normalise_socket(frame: &str) -> String {
                 && !l.contains('█')
                 && !l.contains("neural interface ready")
                 && !l.contains("│Extensions")
+                && !l.contains("│daemon")
                 && !l.contains("Loaded 1 extension")
                 && !toast_box.is_match(l)
         })

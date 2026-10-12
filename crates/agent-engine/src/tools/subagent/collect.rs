@@ -63,8 +63,13 @@ impl Tool for SubagentCollectTool {
         })?;
 
         let mut reg = registry.lock().unwrap();
+        let archive_path = reg.archive_path(&handle_id);
         let Some(handle) = reg.get_mut(&handle_id) else {
             drop(reg);
+            // A reaped handle's result survives in its resume archive.
+            let archived = archive_path
+                .as_ref()
+                .and_then(|path| super::archive::read_archive(path).ok());
             if let Some(orchestration) = &ctx.capabilities.orchestration {
                 if orchestration.is_unreconciled(&handle_id) {
                     orchestration
@@ -78,14 +83,29 @@ impl Tool for SubagentCollectTool {
                             .reconcile(&handle_id)
                             .map_err(RuntimeError::Tool)?;
                     }
-                    return Ok(json!({
-                        "handle_id": handle_id,
-                        "status": "expired",
-                        "note": "Subagent output expired; orchestration lifecycle remains recoverable.",
-                        "collected": false
-                    })
-                    .to_string());
+                    if archived.is_none() {
+                        return Ok(json!({
+                            "handle_id": handle_id,
+                            "status": "expired",
+                            "note": "Subagent output expired; orchestration lifecycle remains recoverable.",
+                            "collected": false
+                        })
+                        .to_string());
+                    }
                 }
+            }
+            if let (Some(archive), Some(path)) = (archived, archive_path) {
+                return Ok(json!({
+                    "handle_id": handle_id,
+                    "status": archive.status,
+                    "output": archive.output,
+                    "model": archive.meta.model,
+                    "collected": true,
+                    "archive_path": path,
+                    "note": "Handle was reaped; result read from its resume archive. \
+                             subagent_resume can still continue this worker."
+                })
+                .to_string());
             }
             return Err(RuntimeError::Tool(format!(
                 "No subagent found with handle_id '{}'. Finished handles are retained for {} minutes after completion and then garbage-collected.",
@@ -94,12 +114,14 @@ impl Tool for SubagentCollectTool {
             )));
         };
 
+        super::archive::retry_failed_archive(&handle.state, &handle_id);
         let status = handle.status();
         let output: String = handle.partial_output();
         let elapsed = handle.elapsed_secs();
         let model = handle.model.clone();
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
+        let archive_error = handle.archive_error();
 
         // Mark collected on any terminal read so the reaper knows it's safe to GC.
         let already_collected = handle.is_collected();
@@ -158,6 +180,7 @@ impl Tool for SubagentCollectTool {
         // idempotency to the caller.
         let reconciled_now = params["reconciled"].as_bool().unwrap_or(false);
         let mut body = json!({
+            "archiveError": archive_error,
             "handle_id": handle_id,
             "status":    status.as_str(),
             "output":    output,
@@ -179,6 +202,10 @@ impl Tool for SubagentCollectTool {
         }
         if let Some(reason) = status.failure_reason() {
             body["error"] = json!(reason);
+        }
+        if let Some(path) = archive_path {
+            // Full conversation kept: subagent_resume continues it.
+            body["archive_path"] = json!(path);
         }
         Ok(body.to_string())
     }
@@ -222,6 +249,42 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn managed_terminal_waits_for_finalization_before_collection() {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let h = make_finished_handle("sa_pending", "still draining");
+        let state = Arc::clone(&h.state);
+        {
+            let mut s = state.write().unwrap();
+            s.finished_at = None;
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "worker".into(),
+                model: "model".into(),
+                system_prompt: "system".into(),
+                timeout_secs: 1,
+            });
+        }
+        registry.lock().unwrap().register(h);
+        let response = SubagentCollectTool
+            .execute(
+                json!({"handle_id":"sa_pending", "reconciled":true}),
+                make_ctx_with_registry(Arc::clone(&registry)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["status"],
+            "running"
+        );
+        let mut reg = registry.lock().unwrap();
+        assert!(!reg.get("sa_pending").unwrap().is_collected());
+        assert_eq!(reg.display_rows()[0].status, SubagentStatus::Running);
+        reg.release_finished_resources("sa_pending");
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+        assert!(reg.get("sa_pending").is_some());
+        assert!(state.read().unwrap().finished_at.is_none());
+    }
+
     fn make_ctx_with_registry(registry: Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
         let mut ctx = create_tool_context();
         ctx.capabilities.subagent_registry = Some(registry);
@@ -232,6 +295,70 @@ mod tests {
         // orchestration and lifecycle suites.
         ctx.capabilities.orchestration = None;
         ctx
+    }
+
+    #[tokio::test]
+    async fn collect_after_reap_reads_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "test-agent".into(),
+            model: "anthropic/claude-opus-5-5".into(),
+            system_prompt: "s".into(),
+            timeout_secs: 60,
+        };
+        let path = super::super::archive::write_archive(
+            dir.path(),
+            "sa_gone",
+            &meta,
+            "timed_out",
+            "[TIMED OUT after 60s] latest progress",
+            &[Arc::new(json!({"role": "user", "content": "task"}))],
+        )
+        .unwrap();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            let state = Arc::new(RwLock::new(SubagentState::new()));
+            {
+                let mut st = state.write().unwrap();
+                st.status = SubagentStatus::TimedOut;
+                st.finished_at = Some(std::time::Instant::now());
+                st.archive_path = Some(path.clone());
+            }
+            let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+            let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+            let (_result_tx, result_rx) = oneshot::channel();
+            let mut h = SubagentHandle::new(
+                "sa_gone".into(),
+                0,
+                "test-agent".into(),
+                "task".into(),
+                "anthropic/claude-opus-5-5".into(),
+                "s".into(),
+                60,
+                state,
+                Some(steer_tx),
+                Some(shutdown_tx),
+                Some(result_rx),
+            );
+            h.mark_collected();
+            reg.register(h);
+            reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+            assert!(reg.get("sa_gone").is_none());
+        }
+        let body: serde_json::Value = serde_json::from_str(
+            &SubagentCollectTool
+                .execute(
+                    json!({"handle_id": "sa_gone"}),
+                    make_ctx_with_registry(registry),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "timed_out");
+        assert_eq!(body["output"], "[TIMED OUT after 60s] latest progress");
+        assert_eq!(body["archive_path"], json!(path));
     }
 
     // U5: collect marks collected on first read; second read shows collected=true

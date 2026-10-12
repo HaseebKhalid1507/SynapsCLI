@@ -420,7 +420,7 @@ async fn install_mid_round_mutator(rt: &Runtime, tool: Arc<dyn Tool>) {
 }
 
 /// Builtin-origin fixture that dynamically registers `gate_late_fixture`
-/// through the stream's `tool_register_tx` channel (the `connect_mcp_server`
+/// through the stream's `tool_register_tx` channel (the dynamic-registration
 /// seam), which is drained only AFTER the round completes.
 struct DynRegFixtureTool;
 

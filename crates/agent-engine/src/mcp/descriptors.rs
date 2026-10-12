@@ -99,6 +99,13 @@ pub struct McpDescriptorCache {
     pub version: u32,
     #[serde(default)]
     pub servers: BTreeMap<String, CachedServerDescriptors>,
+    /// Negative cache for boot discovery: servers whose last discovery
+    /// attempt failed (error or timeout), keyed by server name. Additive and
+    /// optional on disk (omitted when empty, defaulted when absent), so the
+    /// format version is unchanged and older readers — which do not deny
+    /// unknown fields — simply ignore it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub discovery_failures: BTreeMap<String, DiscoveryFailure>,
 }
 
 impl McpDescriptorCache {
@@ -106,7 +113,50 @@ impl McpDescriptorCache {
         Self {
             version: CACHE_FORMAT_VERSION,
             servers: BTreeMap::new(),
+            discovery_failures: BTreeMap::new(),
         }
+    }
+}
+
+/// Maximum retained discovery-failure entries (oldest attempts evicted).
+pub const DISCOVERY_FAILURES_MAX: usize = 64;
+/// Byte bound on a recorded failure fingerprint (a hex digest in practice).
+const FINGERPRINT_MAX_BYTES: usize = 128;
+/// First retry delay after a failed boot discovery.
+pub const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60 * 60;
+/// Retry delay cap after repeated failed boot discoveries.
+pub const DISCOVERY_BACKOFF_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// One server's failed boot-discovery record: the launch fingerprint it
+/// failed under, when it was last tried (unix seconds) and how many
+/// consecutive attempts under that fingerprint failed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryFailure {
+    pub fingerprint: String,
+    pub last_attempt_unix: u64,
+    pub attempts: u32,
+}
+
+impl DiscoveryFailure {
+    /// `1 h × 2^(attempts−1)`, capped at 24 h.
+    pub fn backoff_secs(&self) -> u64 {
+        let exp = self.attempts.max(1).saturating_sub(1).min(16);
+        (DISCOVERY_BACKOFF_BASE_SECS << exp).min(DISCOVERY_BACKOFF_MAX_SECS)
+    }
+
+    /// Unix second from which the server may be retried.
+    pub fn retry_after_unix(&self) -> u64 {
+        self.last_attempt_unix.saturating_add(self.backoff_secs())
+    }
+
+    /// Whether boot discovery for a server currently fingerprinting as
+    /// `fingerprint` should be skipped at `now_unix`. A changed fingerprint
+    /// (config edit) retries immediately; so does a record stamped in the
+    /// future (the clock moved backwards), rather than stretching the backoff.
+    pub fn suppresses(&self, fingerprint: &str, now_unix: u64) -> bool {
+        self.fingerprint == fingerprint
+            && self.last_attempt_unix <= now_unix
+            && now_unix < self.retry_after_unix()
     }
 }
 
@@ -286,7 +336,43 @@ fn sanitize_cache(raw: McpDescriptorCache) -> Result<McpDescriptorCache, Descrip
             },
         );
     }
+    sanitized.discovery_failures = sanitize_discovery_failures(raw.discovery_failures);
     Ok(sanitized)
+}
+
+/// Bound the negative cache like the rest of the file: valid server names,
+/// bounded control-free fingerprints, `attempts >= 1`, and at most
+/// [`DISCOVERY_FAILURES_MAX`] entries (the most recent attempts are kept).
+fn sanitize_discovery_failures(
+    raw: BTreeMap<String, DiscoveryFailure>,
+) -> BTreeMap<String, DiscoveryFailure> {
+    let mut kept: Vec<(String, DiscoveryFailure)> = raw
+        .into_iter()
+        .filter(|(server, failure)| {
+            let ok = valid_server_name(server)
+                && !failure.fingerprint.is_empty()
+                && failure.fingerprint.len() <= FINGERPRINT_MAX_BYTES
+                && !failure.fingerprint.chars().any(char::is_control);
+            if !ok {
+                tracing::warn!("Dropping invalid MCP discovery-failure cache entry");
+            }
+            ok
+        })
+        .map(|(server, mut failure)| {
+            failure.attempts = failure.attempts.max(1);
+            (server, failure)
+        })
+        .collect();
+    if kept.len() > DISCOVERY_FAILURES_MAX {
+        // Newest first; ties broken by name for determinism.
+        kept.sort_by(|a, b| {
+            b.1.last_attempt_unix
+                .cmp(&a.1.last_attempt_unix)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        kept.truncate(DISCOVERY_FAILURES_MAX);
+    }
+    kept.into_iter().collect()
 }
 
 /// Profile-aware default cache path. Uses the same profile FALLBACK
@@ -353,19 +439,76 @@ pub fn cache_writeback_enabled() -> bool {
 /// that fails to load (corrupt/oversize/version) is REPLACED by a fresh one
 /// carrying only this server — the reader refuses such a file anyway.
 /// Entries are sanitized through the same bounds as a load, so a hostile
-/// listing cannot write what a load would reject. Returns the number of
-/// descriptors recorded for `server`.
+/// listing cannot write what a load would reject. A recorded listing also
+/// clears the server's boot-discovery failure entry, if any. Returns the
+/// number of descriptors recorded for `server`.
 pub fn record_server_listing(
     path: &Path,
     server: &str,
     fingerprint: &str,
     tools: &[CachedToolDescriptor],
 ) -> Result<usize, DescriptorCacheError> {
-    use fs4::fs_std::FileExt;
-
     if !valid_server_name(server) {
         return Err(DescriptorCacheError::Parse("invalid server name".to_string()));
     }
+    let cache = update_cache_locked(path, |cache| {
+        let entry = CachedServerDescriptors {
+            fingerprint: fingerprint.to_string(),
+            tools: tools.to_vec(),
+        };
+        cache.servers.insert(server.to_string(), entry);
+        // A successful listing clears any recorded discovery failure.
+        cache.discovery_failures.remove(server);
+    })?;
+    Ok(cache.servers.get(server).map_or(0, |e| e.tools.len()))
+}
+
+/// Negative-cache sibling of [`record_server_listing`]: record that boot
+/// discovery of `server` under `fingerprint` failed at `now_unix`. Same
+/// locked read-merge-write and sanitisation. Consecutive failures under the
+/// same fingerprint increment `attempts` (driving the backoff); a different
+/// fingerprint restarts at 1. Returns the stored record.
+pub fn record_discovery_failure(
+    path: &Path,
+    server: &str,
+    fingerprint: &str,
+    now_unix: u64,
+) -> Result<DiscoveryFailure, DescriptorCacheError> {
+    if !valid_server_name(server) {
+        return Err(DescriptorCacheError::Parse("invalid server name".to_string()));
+    }
+    let cache = update_cache_locked(path, |cache| {
+        let attempts = cache
+            .discovery_failures
+            .get(server)
+            .filter(|prior| prior.fingerprint == fingerprint)
+            .map_or(1, |prior| prior.attempts.saturating_add(1));
+        cache.discovery_failures.insert(
+            server.to_string(),
+            DiscoveryFailure {
+                fingerprint: fingerprint.to_string(),
+                last_attempt_unix: now_unix,
+                attempts,
+            },
+        );
+    })?;
+    cache
+        .discovery_failures
+        .get(server)
+        .cloned()
+        .ok_or_else(|| DescriptorCacheError::Parse("discovery failure not retained".to_string()))
+}
+
+/// Shared locked read-merge-write for the cache writers: exclusive `fs4`
+/// lock on `<path>.lock`, load (an unreadable cache is replaced by a fresh
+/// one), apply `mutate`, sanitise, [`store_cache_at`]. Returns the stored
+/// (sanitised) cache.
+fn update_cache_locked(
+    path: &Path,
+    mutate: impl FnOnce(&mut McpDescriptorCache),
+) -> Result<McpDescriptorCache, DescriptorCacheError> {
+    use fs4::fs_std::FileExt;
+
     let map_io = |err: std::io::Error| {
         DescriptorCacheError::Io(BoundedText::new(&err.to_string(), ERROR_ECHO_MAX_BYTES).text)
     };
@@ -404,16 +547,11 @@ pub fn record_server_listing(
             McpDescriptorCache::empty()
         }
     };
-    let entry = CachedServerDescriptors {
-        fingerprint: fingerprint.to_string(),
-        tools: tools.to_vec(),
-    };
-    cache.servers.insert(server.to_string(), entry);
+    mutate(&mut cache);
     let cache = sanitize_cache(cache)?;
-    let recorded = cache.servers.get(server).map_or(0, |e| e.tools.len());
     store_cache_at(path, &cache)?;
     let _ = FileExt::unlock(&lock_file);
-    Ok(recorded)
+    Ok(cache)
 }
 
 /// A dormant, descriptor-backed MCP tool. Registered like any live tool
@@ -635,5 +773,108 @@ mod tests {
             "created cache dir must be private"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod discovery_failure_tests {
+    use super::*;
+
+    fn failure(fingerprint: &str, last: u64, attempts: u32) -> DiscoveryFailure {
+        DiscoveryFailure {
+            fingerprint: fingerprint.to_string(),
+            last_attempt_unix: last,
+            attempts,
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_per_attempt_and_caps_at_a_day() {
+        let hour = DISCOVERY_BACKOFF_BASE_SECS;
+        assert_eq!(failure("fp", 0, 0).backoff_secs(), hour, "0 is treated as 1");
+        assert_eq!(failure("fp", 0, 1).backoff_secs(), hour);
+        assert_eq!(failure("fp", 0, 2).backoff_secs(), 2 * hour);
+        assert_eq!(failure("fp", 0, 5).backoff_secs(), 16 * hour);
+        assert_eq!(failure("fp", 0, 6).backoff_secs(), DISCOVERY_BACKOFF_MAX_SECS);
+        assert_eq!(failure("fp", 0, u32::MAX).backoff_secs(), DISCOVERY_BACKOFF_MAX_SECS);
+        assert_eq!(failure("fp", u64::MAX, 1).retry_after_unix(), u64::MAX, "saturates");
+    }
+
+    #[test]
+    fn suppression_is_keyed_to_fingerprint_and_window() {
+        let f = failure("fp", 1_000, 1);
+        assert!(f.suppresses("fp", 1_000));
+        assert!(f.suppresses("fp", 1_000 + 3_599));
+        assert!(!f.suppresses("fp", 1_000 + 3_600), "retry once the backoff expires");
+        assert!(!f.suppresses("other", 1_001), "a config edit retries immediately");
+        assert!(!f.suppresses("fp", 999), "a clock that went backwards retries");
+    }
+
+    #[test]
+    fn failures_are_optional_on_disk_and_omitted_when_empty() {
+        // An older cache (no field) still loads; an empty field is not written.
+        let old: McpDescriptorCache =
+            serde_json::from_str(r#"{"version":1,"servers":{}}"#).unwrap();
+        assert!(old.discovery_failures.is_empty());
+        let json = serde_json::to_string(&McpDescriptorCache::empty()).unwrap();
+        assert!(!json.contains("discovery_failures"), "{json}");
+    }
+
+    #[test]
+    fn sanitize_drops_invalid_entries_and_bounds_the_count() {
+        let mut raw = McpDescriptorCache::empty();
+        raw.discovery_failures.insert("ok".into(), failure("fp", 5, 0));
+        raw.discovery_failures.insert("bad\u{7}".into(), failure("fp", 5, 1));
+        raw.discovery_failures.insert("nofp".into(), failure("", 5, 1));
+        raw.discovery_failures
+            .insert("longfp".into(), failure(&"f".repeat(FINGERPRINT_MAX_BYTES + 1), 5, 1));
+        let clean = sanitize_cache(raw).unwrap();
+        assert_eq!(clean.discovery_failures.len(), 1);
+        assert_eq!(clean.discovery_failures["ok"].attempts, 1, "attempts clamped to >= 1");
+
+        let mut raw = McpDescriptorCache::empty();
+        for i in 0..(DISCOVERY_FAILURES_MAX + 10) {
+            raw.discovery_failures
+                .insert(format!("s{i}"), failure("fp", i as u64, 1));
+        }
+        let clean = sanitize_cache(raw).unwrap();
+        assert_eq!(clean.discovery_failures.len(), DISCOVERY_FAILURES_MAX);
+        assert!(
+            !clean.discovery_failures.contains_key("s0"),
+            "the oldest attempts are evicted first"
+        );
+        let newest = format!("s{}", DISCOVERY_FAILURES_MAX + 9);
+        assert!(clean.discovery_failures.contains_key(&newest));
+    }
+
+    #[test]
+    fn record_failure_counts_per_fingerprint_and_listing_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DESCRIPTOR_CACHE_FILE);
+
+        let first = record_discovery_failure(&path, "srv", "fp1", 100).unwrap();
+        assert_eq!((first.attempts, first.last_attempt_unix), (1, 100));
+        let second = record_discovery_failure(&path, "srv", "fp1", 200).unwrap();
+        assert_eq!((second.attempts, second.last_attempt_unix), (2, 200));
+        let changed = record_discovery_failure(&path, "srv", "fp2", 300).unwrap();
+        assert_eq!(changed.attempts, 1, "a new fingerprint restarts the count");
+        record_discovery_failure(&path, "other", "fp", 300).unwrap();
+
+        let loaded = load_cache_from(&path).unwrap();
+        assert_eq!(loaded.discovery_failures.len(), 2);
+        assert_eq!(loaded.discovery_failures["srv"].fingerprint, "fp2");
+
+        let tools = [CachedToolDescriptor {
+            name: "t".into(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+        }];
+        assert_eq!(record_server_listing(&path, "srv", "fp2", &tools).unwrap(), 1);
+        let loaded = load_cache_from(&path).unwrap();
+        assert!(!loaded.discovery_failures.contains_key("srv"), "success clears");
+        assert!(loaded.discovery_failures.contains_key("other"), "others kept");
+        assert_eq!(loaded.servers["srv"].tools.len(), 1);
+
+        assert!(record_discovery_failure(&path, "bad\u{7}", "fp", 1).is_err());
     }
 }

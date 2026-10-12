@@ -110,9 +110,48 @@ pub struct SubagentState {
     pub step: String,
     /// Tool calls started so far (the "tool #N" in `step`).
     pub tools: u32,
+    /// The worker's real message history, from the runtime's last
+    /// `SessionEvent::MessageHistory`. Written to the resume archive by the
+    /// finalizer and then released, so finished handles stay small.
+    pub history: Option<Vec<crate::SharedMessage>>,
+    /// Byte offset in `partial_text` where the latest model response starts.
+    /// Completion previews show that response (the worker's final word), not
+    /// the first words of the whole run.
+    pub last_response_start: usize,
+    /// Identity needed to resume from the archive after the handle is reaped.
+    pub archive_meta: Option<SubagentArchiveMeta>,
+    /// Archive destination captured at launch, independent of later config changes.
+    pub archive_dir: Option<std::path::PathBuf>,
+    /// Where the finalizer wrote this worker's resume archive.
+    pub archive_path: Option<std::path::PathBuf>,
+    /// Managed workers remain publicly running until their recovery outcome is published.
+    pub finalization_started: bool,
+    pub finalization_ready: bool,
+    pub archive_error: Option<String>,
+}
+
+/// What `subagent_resume` needs to relaunch a worker when only its archive is left.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SubagentArchiveMeta {
+    pub agent_name: String,
+    pub model: String,
+    pub system_prompt: String,
+    pub timeout_secs: u64,
 }
 
 impl SubagentState {
+    pub fn public_status(&self) -> SubagentStatus {
+        if (self.archive_meta.is_some() || self.finalization_started) && !self.finalization_ready {
+            SubagentStatus::Running
+        } else {
+            self.status.clone()
+        }
+    }
+
+    fn recovery_pinned(&self) -> bool {
+        self.history.is_some() && self.archive_path.is_none()
+    }
+
     pub fn new() -> Self {
         Self {
             status: SubagentStatus::Running,
@@ -124,6 +163,14 @@ impl SubagentState {
             terminal: None,
             step: String::new(),
             tools: 0,
+            history: None,
+            last_response_start: 0,
+            archive_meta: None,
+            archive_dir: None,
+            archive_path: None,
+            finalization_started: false,
+            finalization_ready: false,
+            archive_error: None,
         }
     }
 
@@ -132,6 +179,18 @@ impl SubagentState {
         self.step.clear();
         self.step.push_str(step);
         self.tools = tools;
+    }
+
+    /// Text of the latest model response (empty if none started yet).
+    pub fn last_response_text(&self) -> &str {
+        let start = self.last_response_start.min(self.partial_text.len());
+        // `last_response_start` is always recorded at a push boundary, but be
+        // defensive about char boundaries after truncation.
+        let mut start = start;
+        while !self.partial_text.is_char_boundary(start) {
+            start -= 1;
+        }
+        &self.partial_text[start..]
     }
 
     /// Persist only typed, allowlisted failure data. Raw provider errors never enter state.
@@ -186,7 +245,7 @@ pub struct SubagentHandle {
     pub authorization: Option<AuthorizationDiagnostic>,
 
     // Shared state updated by the subagent thread — one lock for everything.
-    state: Arc<RwLock<SubagentState>>,
+    pub(crate) state: Arc<RwLock<SubagentState>>,
 
     // Channels
     steer_tx: Option<mpsc::UnboundedSender<String>>,
@@ -274,8 +333,7 @@ impl SubagentHandle {
         self.state
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .status
-            .clone()
+            .public_status()
     }
 
     /// Partial output accumulated so far.
@@ -296,7 +354,18 @@ impl SubagentHandle {
             .clone()
     }
 
+    pub fn archive_error(&self) -> Option<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .archive_error
+            .clone()
+    }
+
     pub fn terminal_diagnostic(&self) -> Option<TerminalDiagnostic> {
+        if self.status() == SubagentStatus::Running {
+            return None;
+        }
         if let Some(diagnostic) = self.state.read().unwrap().terminal.clone() {
             return Some(diagnostic);
         }
@@ -355,6 +424,14 @@ impl SubagentHandle {
     /// retaining bounded terminal identity/output for collection and reconciliation.
     fn make_tombstone(&mut self) {
         debug_assert!(self.is_finished());
+        if self
+            .state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .recovery_pinned()
+        {
+            return;
+        }
         self.steer_tx.take();
         self.shutdown_tx.take();
         self.result_rx.take();
@@ -371,6 +448,7 @@ impl SubagentHandle {
         }
         state.tool_log.clear();
         state.conversation_state.clear();
+        state.history = None;
     }
 
     /// Send a steering message into the running subagent.
@@ -461,6 +539,9 @@ pub struct SubagentRegistry {
     // are cancelled before their thread can start inference.
     spawn_cancellation: Option<crate::CancellationToken>,
     spawn_epoch: u64,
+    /// Resume archives of handles that were reaped. Handle ids come from a
+    /// process-wide counter, so they are never reused. Paths only: tiny.
+    archived: HashMap<String, std::path::PathBuf>,
 }
 
 impl SubagentRegistry {
@@ -469,7 +550,24 @@ impl SubagentRegistry {
             handles: HashMap::new(),
             spawn_cancellation: None,
             spawn_epoch: 0,
+            archived: HashMap::new(),
         }
+    }
+
+    /// Resume archive of `id`, whether its handle is still live or was reaped.
+    pub fn archive_path(&self, id: &str) -> Option<std::path::PathBuf> {
+        if let Some(handle) = self.handles.get(id) {
+            if let Some(path) = handle
+                .state
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .archive_path
+                .clone()
+            {
+                return Some(path);
+            }
+        }
+        self.archived.get(id).cloned()
     }
 
     /// Register a handle and return its id.
@@ -555,7 +653,7 @@ impl SubagentRegistry {
                 SubagentDisplayRow {
                     subagent_id: h.subagent_id,
                     agent_name: h.agent_name.clone(),
-                    status: s.status.clone(),
+                    status: s.public_status(),
                     cancel_requested: s.cancel_requested,
                     elapsed_secs: h.started_at.elapsed().as_secs_f64(),
                     finished_elapsed: s.finished_at.map(|t| t.elapsed()),
@@ -599,6 +697,11 @@ impl SubagentRegistry {
             .iter()
             .filter(|(_, h)| {
                 h.is_finished()
+                    && !h
+                        .state
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .recovery_pinned()
                     && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
                     && (h.is_collected() || h.finished_elapsed().is_some_and(|d| d >= ttl))
             })
@@ -608,6 +711,15 @@ impl SubagentRegistry {
             if retain {
                 self.release_finished_resources(&id);
             } else if let Some(mut handle) = self.handles.remove(&id) {
+                if let Some(path) = handle
+                    .state
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .archive_path
+                    .clone()
+                {
+                    self.archived.insert(id.clone(), path);
+                }
                 if let Some(th) = handle.thread_handle.take() {
                     let _ = th.join();
                 }

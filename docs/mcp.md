@@ -68,10 +68,10 @@ stable across restarts.
 
 Safety properties:
 
-- only the **exact-lease path** writes (a server the operator configured,
-  started for an already gate-authorized call). The legacy server-wide
-  `connect_mcp_server` gateway never writes — it is not exact-tool
-  authorized and must not be a cache-poisoning bridge;
+- only two paths write: the **exact-lease path** (a server the operator
+  configured, started for an already gate-authorized call), and **boot
+  discovery** for a configured server with no fingerprint-matching entry
+  (below);
 - entries pass the same sanitisation as a load (name bounds, object
   schemas, ≤ 64 KiB per schema, ≤ 256 tools per server, descriptions
   clamped);
@@ -94,3 +94,55 @@ one default-path behaviour change of daemon-mode phase 2; it is listed in
 
 Kill-switch: `SYNAPS_MCP_CACHE_WRITEBACK=0` (also `false`/`off`) — never
 write. The cache remains a supported *input*.
+
+## One MCP path in every mode (legacy gateway removed)
+
+MCP tools are always descriptor-backed registry entries executed through
+per-session leases, whatever `progressive_tool_disclosure` says:
+
+- **Progressive on:** they stay dormant until `activate_tools` (or are sent
+  deferred on Anthropic, see `request-lifecycle-progressive-disclosure.md`).
+- **Progressive off:** they are part of every session's core, sent from the
+  first request. The tools list never changes mid-session.
+
+The old `connect_mcp_server` gateway is gone. It registered a server's tools
+mid-session, which rewrote the prompt cache, and in the daemon it shared one
+connection and one tool registry across every session. The daemon's
+"legacy MCP conflict" refusal went with it; `--allow-legacy-mcp` and
+`SYNAPS_DAEMON_ALLOW_LEGACY_MCP` are accepted and ignored.
+
+### Boot discovery for new servers
+
+A configured server with no fingerprint-matching descriptor-cache entry (a new
+server, or a changed command/args/env) is started **once**: initialize,
+`tools/list`, recorded through `record_server_listing` (same lock and
+sanitisation as the lease write-back), then stopped. Missing servers are
+discovered **in parallel** (at most 8 at once), each bounded to 20 s, so the
+worst case is about one timeout, not 20 s per server. A timeout cannot leak a
+process because children are `kill_on_drop`. `SYNAPS_MCP_CACHE_WRITEBACK=0`
+disables discovery (and the failure records below).
+
+**Failures are negative-cached.** A discovery that errors or times out is
+recorded in the same cache file (`discovery_failures`, keyed by server name:
+config fingerprint, last attempt time, attempt count) through the same locked,
+sanitising write path (`record_discovery_failure`). The server then
+contributes no tools and is **not started again** until its backoff expires:
+1 h after the first failure, doubling per consecutive failure, capped at
+24 h. Boot logs `MCP discovery for '<name>' failed recently; retrying after
+<time>` when it skips one. Editing the server's command/args/env (a new
+fingerprint) retries immediately; a successful listing removes the entry. The
+field is optional and omitted when empty, so the cache format version is
+unchanged and older binaries ignore it.
+
+**Where discovery runs.** In-process modes (TUI without daemon, `chat`,
+`agent`, `server`) discover during boot (`McpDiscovery::Inline`). The daemon
+boots with **cached descriptors only** (`McpDiscovery::Background`): it
+signals ready without waiting for any MCP server, and discovers uncached
+servers in a background task once it is accepting. When that task finishes,
+only the newly discovered servers' tools are added to the shared registry
+(one atomic batch; a rejected batch is logged and adds nothing). With
+progressive disclosure on they are dormant (searchable/activatable). With it
+**off** they are core tools: every live session sends them from its next
+request, which costs one prompt-cache rewrite per live session, once — the
+same effect as an extension registering late. Sessions started after the
+daemon restarts get them from the cache at boot.

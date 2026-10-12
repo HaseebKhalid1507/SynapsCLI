@@ -1,18 +1,12 @@
 //! MCP (Model Context Protocol) integration — JSON-RPC client, tool bridging, lazy loading.
 mod connection;
 pub mod descriptors;
-mod lazy;
 pub mod lease;
-mod tool;
 
-use crate::ToolRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
-pub use lazy::McpConnectTool;
 pub use lease::{McpLeaseCapability, McpRuntimeManager, McpSessionEndGuard};
-pub use tool::McpTool;
 
 /// MCP server configuration — matches claude-code/gemini-cli format.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -159,154 +153,378 @@ pub fn validate_mcp_config(config: &McpConfig) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Connect to all configured MCP servers and register their tools.
-/// Returns the number of tools registered.
-pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
-    let config = match load_mcp_config() {
-        Some(c) => c,
-        None => return 0,
-    };
+/// How engine boot treats configured MCP servers that have no
+/// fingerprint-matching descriptor-cache entry (see [`setup_lazy_mcp`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum McpDiscovery {
+    /// Discover them during boot, before the host is returned (bounded:
+    /// in parallel, each under the seed timeout). In-process modes (TUI
+    /// without daemon, `chat`, `agent`, `server`).
+    #[default]
+    Inline,
+    /// Boot registers cached descriptors only; discovery of the missing
+    /// servers runs later in a background task
+    /// ([`crate::EngineHost::spawn_background_mcp_discovery`]), so a hung or
+    /// dead server can never delay readiness. Used by the daemon, which must
+    /// signal ready within the auto-spawner's bound.
+    Background,
+}
 
-    let mut total_tools = 0;
+/// Upper bound for one server's boot-time discovery (spawn + initialize +
+/// tools/list).
+const SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-    for (server_name, server_config) in &config.mcp_servers {
-        tracing::info!(server = %server_name, command = %server_config.command, "Connecting to MCP server");
+/// How many missing servers are discovered at once. With N missing servers
+/// boot discovery costs at most `ceil(N / DISCOVERY_CONCURRENCY)` seed
+/// timeouts (one for any realistic N), never `N ×` one.
+pub const DISCOVERY_CONCURRENCY: usize = 8;
 
-        match connection::McpConnection::start(server_config).await {
-            Ok(mut conn) => {
-                match conn.list_tools().await {
-                    Ok(tools) => {
-                        let tool_count = tools.len();
-                        let connection = Arc::new(Mutex::new(conn));
+/// Test seam for boot discovery — NOT user-facing configuration. Production
+/// always uses [`McpDiscoveryOpts::default`] (20 s per server, system clock).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct McpDiscoveryOpts {
+    /// Per-server bound on spawn + initialize + tools/list.
+    pub timeout: std::time::Duration,
+    /// Clock override (unix seconds) for the negative-cache backoff; `None`
+    /// uses the system clock.
+    pub now_unix: Option<u64>,
+}
 
-                        for tool_def in tools {
-                            // Prefix tool names with server name to avoid collisions
-                            // e.g. "filesystem__read_file" for server "filesystem"
-                            let prefixed_name = format!("ext__{}__{}", server_name, tool_def.name);
-                            let tool_name_for_log = prefixed_name.clone();
-
-                            let mcp_tool = McpTool {
-                                tool_name: prefixed_name,
-                                server_tool_name: tool_def.name.clone(),
-                                server_name: server_name.clone(),
-                                description: format!(
-                                    "[MCP:{}] {}",
-                                    server_name, tool_def.description
-                                ),
-                                input_schema: tool_def.input_schema,
-                                connection: Arc::clone(&connection),
-                            };
-
-                            if let Err(e) = registry.try_register(Arc::new(mcp_tool)) {
-                                tracing::warn!(
-                                    server = %server_name,
-                                    tool = %tool_name_for_log,
-                                    error = %e,
-                                    "Refusing to expose MCP tool the capability catalog could not record"
-                                );
-                                continue;
-                            }
-                            total_tools += 1;
-                        }
-
-                        tracing::info!(
-                            server = %server_name,
-                            tools = tool_count,
-                            "MCP server connected — {} tools registered",
-                            tool_count
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(server = %server_name, error = %e, "Failed to list MCP tools");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(server = %server_name, error = %e, "Failed to connect to MCP server");
-            }
+impl Default for McpDiscoveryOpts {
+    fn default() -> Self {
+        Self {
+            timeout: SEED_TIMEOUT,
+            now_unix: None,
         }
     }
-
-    total_tools
 }
+
+impl McpDiscoveryOpts {
+    fn now_unix(&self) -> u64 {
+        self.now_unix.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        })
+    }
+}
+
+type SharedRegistry = Arc<tokio::sync::RwLock<crate::ToolRegistry>>;
 
 /// Set up MCP loading at engine boot, before any session tool set exists.
 ///
-/// Flag-off (`progressive_exact_only == false`): the legacy lazy path is
-/// preserved byte-for-byte — register the `connect_mcp_server` gateway and
-/// return the number of available servers.
-///
-/// Flag-on (Task 19, spec §7.4): NO gateway is registered (a server-wide
-/// connect would bypass exact per-tool activation), and cached descriptors
-/// become dormant deferred registry entries instead: searchable, exactly
-/// activatable, execution-gated, spawning nothing until a leased execution.
-/// A server without a fingerprint-matching cache entry contributes no
-/// capabilities — descriptors are never invented from config alone and no
-/// process is started to discover them. Returns the number of dormant tools
-/// registered. The whole dormant batch registers atomically; on failure the
-/// registry is unchanged and MCP capabilities fail closed to zero.
-pub async fn setup_lazy_mcp(
-    registry: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
-    progressive_exact_only: bool,
-) -> usize {
-    let config = match load_mcp_config() {
-        Some(c) => c,
-        None => return 0,
+/// Register every configured server's cached descriptors as registry
+/// entries (Task 19, spec §7.4). They are searchable and exactly activatable
+/// under progressive disclosure, part of the core otherwise, and always
+/// execution-gated; nothing is spawned until a leased execution. Servers
+/// without a fingerprint-matching cache entry are discovered first, in
+/// parallel ([`seed_missing_descriptors`]); one that fails contributes no
+/// tools this run and is not retried until its backoff expires (see
+/// [`descriptors::DiscoveryFailure`]). Descriptors are never invented from
+/// config alone. The batch registers atomically; on failure MCP capabilities
+/// fail closed to zero. Returns the number of tools registered.
+pub async fn setup_lazy_mcp(registry: &SharedRegistry) -> usize {
+    setup_lazy_mcp_with(registry, McpDiscoveryOpts::default()).await
+}
+
+/// [`setup_lazy_mcp`] with an injectable seed timeout and clock (tests).
+#[doc(hidden)]
+pub async fn setup_lazy_mcp_with(registry: &SharedRegistry, opts: McpDiscoveryOpts) -> usize {
+    let Some(config) = load_nonempty_config() else {
+        return 0;
     };
-
-    let server_count = config.mcp_servers.len();
-    if server_count == 0 {
-        return 0;
+    let mut cache = load_cache_or_empty();
+    if seed_missing_descriptors(&config, &cache, &opts).await > 0 {
+        // Re-read through the validating loader: entries written by the seed
+        // pass the same sanitisation as any other cache load.
+        cache = load_cache_or_empty();
     }
+    register_dormant(registry, &config, &cache, "boot").await
+}
 
-    if progressive_exact_only {
-        let cache = match descriptors::load_default_cache() {
-            Ok(cache) => cache,
-            Err(descriptors::DescriptorCacheError::NotFound) => {
-                descriptors::McpDescriptorCache::empty()
-            }
-            Err(err) => {
-                tracing::warn!(error = %err,
-                    "Refusing unsafe MCP descriptor cache; MCP capabilities stay undiscoverable this run");
-                descriptors::McpDescriptorCache::empty()
-            }
-        };
-        let dormant = descriptors::dormant_tools_for_config(&config, &cache);
-        if dormant.is_empty() {
-            tracing::info!(
-                servers = server_count,
-                "MCP exact mode: no valid cached descriptors; MCP tools are not discoverable this run"
-            );
-            return 0;
+/// Background-mode phase 1 ([`McpDiscovery::Background`]): register the
+/// cached descriptors only — never spawns — and hand back the discovery
+/// still owed for servers without a fingerprint-matching entry (`None` when
+/// there is none). Returns `(tools registered, pending discovery)`.
+pub async fn setup_cached_mcp(registry: &SharedRegistry) -> (usize, Option<PendingMcpDiscovery>) {
+    let Some(config) = load_nonempty_config() else {
+        return (0, None);
+    };
+    let cache = load_cache_or_empty();
+    let mut missing = HashMap::new();
+    for (name, server) in &config.mcp_servers {
+        let fingerprint = descriptors::server_config_fingerprint(server);
+        let cached = cache
+            .servers
+            .get(name)
+            .is_some_and(|entry| entry.fingerprint == fingerprint);
+        if !cached {
+            missing.insert(name.clone(), server.clone());
         }
-        return match registry.write().await.try_register_batch(dormant) {
-            Ok(count) => {
-                tracing::info!(
-                    tools = count,
-                    servers = server_count,
-                    "MCP exact mode: dormant descriptor-backed tools registered (no process started)"
-                );
-                count
-            }
-            Err(e) => {
-                tracing::warn!(error = %e,
-                    "MCP dormant descriptor batch rejected; failing closed with zero MCP capabilities");
-                0
-            }
-        };
+    }
+    let count = register_dormant(registry, &config, &cache, "cached").await;
+    let pending = (!missing.is_empty() && descriptors::cache_writeback_enabled()).then_some(
+        PendingMcpDiscovery {
+            config: McpConfig {
+                mcp_servers: missing,
+            },
+        },
+    );
+    (count, pending)
+}
+
+/// Discovery deferred by [`setup_cached_mcp`]: exactly the configured
+/// servers (from the SAME config snapshot phase 1 used) that had no
+/// fingerprint-matching cache entry, so none of them has registered tools.
+#[derive(Debug)]
+pub struct PendingMcpDiscovery {
+    config: McpConfig,
+}
+
+impl PendingMcpDiscovery {
+    /// Names of the servers still to be discovered.
+    pub fn server_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.config.mcp_servers.keys().cloned().collect();
+        names.sort();
+        names
     }
 
-    let server_names: Vec<&str> = config.mcp_servers.keys().map(|s| s.as_str()).collect();
-    tracing::info!(servers = ?server_names, "MCP lazy loading: {} servers available", server_count);
+    /// Discover the pending servers (parallel, bounded, negative-cached)
+    /// and register ONLY their dormant tools into the shared `registry` with
+    /// one atomic `try_register_batch`. Servers already registered at boot
+    /// are never in this set, so nothing is registered twice. A rejected
+    /// batch is logged and fails closed (none of the new tools appear);
+    /// everything registered before is untouched.
+    ///
+    /// The registry is the host's shared catalog, so this mutates it after
+    /// sessions may exist — the same precedent as late extension
+    /// registration. With progressive disclosure on the new tools are
+    /// dormant (searchable/activatable). With it off they are core tools, so
+    /// every live session sends them from its NEXT request: one prompt-cache
+    /// rewrite per live session, once.
+    pub async fn run(self, registry: &SharedRegistry) -> usize {
+        self.run_with(registry, McpDiscoveryOpts::default()).await
+    }
 
-    let connect_tool = McpConnectTool::new(config.mcp_servers);
+    /// [`Self::run`] with an injectable seed timeout and clock (tests).
+    #[doc(hidden)]
+    pub async fn run_with(self, registry: &SharedRegistry, opts: McpDiscoveryOpts) -> usize {
+        // Fresh read: another process may have recorded meanwhile (its
+        // matching entry is then registered here without a spawn).
+        let mut cache = load_cache_or_empty();
+        if seed_missing_descriptors(&self.config, &cache, &opts).await > 0 {
+            cache = load_cache_or_empty();
+        }
+        register_dormant(registry, &self.config, &cache, "background").await
+    }
+}
 
-    if let Err(e) = registry.write().await.try_register(Arc::new(connect_tool)) {
-        tracing::warn!(error = %e, "Refusing to expose MCP gateway the capability catalog could not record");
+fn load_nonempty_config() -> Option<McpConfig> {
+    load_mcp_config().filter(|config| !config.mcp_servers.is_empty())
+}
+
+fn load_cache_or_empty() -> descriptors::McpDescriptorCache {
+    match descriptors::load_default_cache() {
+        Ok(cache) => cache,
+        Err(descriptors::DescriptorCacheError::NotFound) => descriptors::McpDescriptorCache::empty(),
+        Err(err) => {
+            tracing::warn!(error = %err,
+                "Refusing unsafe MCP descriptor cache; MCP capabilities stay undiscoverable this run");
+            descriptors::McpDescriptorCache::empty()
+        }
+    }
+}
+
+/// Register `config`'s fingerprint-matching cached descriptors as one
+/// atomic batch; fail closed (zero) on rejection.
+async fn register_dormant(
+    registry: &SharedRegistry,
+    config: &McpConfig,
+    cache: &descriptors::McpDescriptorCache,
+    phase: &'static str,
+) -> usize {
+    let server_count = config.mcp_servers.len();
+    let dormant = descriptors::dormant_tools_for_config(config, cache);
+    if dormant.is_empty() {
+        tracing::info!(
+            servers = server_count,
+            phase,
+            "MCP: no valid cached descriptors; MCP tools are not discoverable this run"
+        );
         return 0;
     }
+    match registry.write().await.try_register_batch(dormant) {
+        Ok(count) => {
+            tracing::info!(
+                tools = count,
+                servers = server_count,
+                phase,
+                "MCP: descriptor-backed tools registered (no process started)"
+            );
+            count
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, phase,
+                "MCP descriptor batch rejected; failing closed with zero MCP capabilities");
+            0
+        }
+    }
+}
 
-    server_count
+fn format_unix(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+        .map_or_else(|| secs.to_string(), |dt| dt.to_rfc3339())
+}
+
+/// Bounded one-time discovery for configured servers that have no
+/// fingerprint-matching descriptor-cache entry (a new server, or a changed
+/// command/args/env). Without an entry a server contributes no tools, and the
+/// cache was only ever written after a leased call, which needs a tool to
+/// call: a new server stayed invisible forever. Missing servers are
+/// discovered concurrently (at most [`DISCOVERY_CONCURRENCY`] at once), each
+/// started once, listed, recorded through the same locked, sanitising
+/// `record_server_listing` the lease write-back uses, and stopped (children
+/// are `kill_on_drop`, so a timeout cannot leak a process). A failure (error
+/// or timeout) is recorded with `record_discovery_failure`; a server whose
+/// failure under its CURRENT fingerprint is still inside its backoff is
+/// skipped without spawning. Respects `SYNAPS_MCP_CACHE_WRITEBACK=0` (no
+/// discovery). Returns how many servers were recorded.
+async fn seed_missing_descriptors(
+    config: &McpConfig,
+    cache: &descriptors::McpDescriptorCache,
+    opts: &McpDiscoveryOpts,
+) -> usize {
+    use futures::StreamExt;
+
+    if !descriptors::cache_writeback_enabled() {
+        return 0;
+    }
+    let now = opts.now_unix();
+    let mut names: Vec<&String> = config.mcp_servers.keys().collect();
+    names.sort();
+    let mut pending = Vec::new();
+    for name in names {
+        let server = &config.mcp_servers[name];
+        let fingerprint = descriptors::server_config_fingerprint(server);
+        if cache
+            .servers
+            .get(name)
+            .is_some_and(|entry| entry.fingerprint == fingerprint)
+        {
+            continue;
+        }
+        if let Some(failure) = cache.discovery_failures.get(name) {
+            if failure.suppresses(&fingerprint, now) {
+                let when = format_unix(failure.retry_after_unix());
+                tracing::info!(
+                    server = %name,
+                    attempts = failure.attempts,
+                    "MCP discovery for '{}' failed recently; retrying after {}",
+                    name,
+                    when
+                );
+                continue;
+            }
+        }
+        pending.push((name.clone(), server.clone(), fingerprint));
+    }
+    if pending.is_empty() {
+        return 0;
+    }
+    let opts = *opts;
+    let outcomes: Vec<bool> = futures::stream::iter(
+        pending
+            .into_iter()
+            .map(|(name, server, fingerprint)| discover_one(name, server, fingerprint, opts)),
+    )
+    .buffer_unordered(DISCOVERY_CONCURRENCY)
+    .collect()
+    .await;
+    outcomes.into_iter().filter(|recorded| *recorded).count()
+}
+
+/// Discover one server (bounded by `opts.timeout`) and record the outcome:
+/// its listing on success, a negative-cache entry on error or timeout.
+/// Returns whether a listing was recorded.
+async fn discover_one(
+    name: String,
+    server: McpServerConfig,
+    fingerprint: String,
+    opts: McpDiscoveryOpts,
+) -> bool {
+    let listing = tokio::time::timeout(opts.timeout, async {
+        let mut conn = connection::McpConnection::start(&server).await?;
+        let result = conn.list_tools().await;
+        conn.start_kill();
+        result
+    })
+    .await;
+    let path = descriptors::default_cache_path();
+    let defs = match listing {
+        Ok(Ok(defs)) => defs,
+        Ok(Err(err)) => {
+            tracing::warn!(server = %name, error = %err, "MCP discovery failed; its tools stay undiscoverable until a retry");
+            record_failure(path, name, fingerprint, opts.now_unix()).await;
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!(server = %name, "MCP discovery timed out; its tools stay undiscoverable until a retry");
+            record_failure(path, name, fingerprint, opts.now_unix()).await;
+            return false;
+        }
+    };
+    let tools: Vec<descriptors::CachedToolDescriptor> = defs
+        .into_iter()
+        .map(|def| descriptors::CachedToolDescriptor {
+            name: def.name,
+            description: def.description,
+            input_schema: def.input_schema,
+        })
+        .collect();
+    let server_name = name.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        descriptors::record_server_listing(&path, &server_name, &fingerprint, &tools)
+    })
+    .await;
+    match written {
+        Ok(Ok(count)) => {
+            tracing::info!(server = %name, tools = count, "MCP server discovered and cached");
+            true
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(server = %name, error = %err, "MCP discovery could not be cached");
+            false
+        }
+        Err(err) => {
+            tracing::warn!(server = %name, error = %err, "MCP discovery cache write panicked");
+            false
+        }
+    }
+}
+
+async fn record_failure(path: std::path::PathBuf, name: String, fingerprint: String, now: u64) {
+    let server_name = name.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        descriptors::record_discovery_failure(&path, &server_name, &fingerprint, now)
+    })
+    .await;
+    match written {
+        Ok(Ok(failure)) => tracing::info!(
+            server = %name,
+            attempts = failure.attempts,
+            retry_after = %format_unix(failure.retry_after_unix()),
+            "MCP discovery failure recorded"
+        ),
+        Ok(Err(err)) => {
+            tracing::warn!(server = %name, error = %err, "MCP discovery failure could not be cached")
+        }
+        Err(err) => {
+            tracing::warn!(server = %name, error = %err, "MCP discovery failure write panicked")
+        }
+    }
 }
 
 #[cfg(test)]

@@ -27,6 +27,9 @@ pub mod continuation;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
+mod image_limits;
+mod image_retention;
+pub mod keepwarm;
 pub mod memory_context;
 pub mod memory_history;
 pub mod openai;
@@ -427,6 +430,10 @@ pub struct Runtime {
     /// suppresses the downgrade notice on healthy Hybrid turns where the 1h
     /// prefix is already cached. Shared into `ApiOptions` for every request.
     saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When this runtime's foreground request chain last had an Anthropic
+    /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
+    /// shared by `share_ttl_latches`, like the TTL latches above.
+    cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
     /// Last Anthropic message id (`msg_...`) — threaded into the next
     /// request's `diagnostics.previous_message_id` when diagnostics is on.
     /// Reserved for the cache-diagnosis beta wiring (handoff item).
@@ -451,10 +458,17 @@ pub struct Runtime {
     /// These seed the session policy and are replayed when a manifestless
     /// foreground model change replaces that policy snapshot.
     trusted_worker_models: Vec<agent_core::prompt::QualifiedModelId>,
+    /// Subagent fan-out limits (`subagent.*`) used whenever this runtime
+    /// installs a manifestless delegation policy (boot, new session, model
+    /// change). Changing them affects the next install, not running workers.
+    subagent_limits: crate::config::SubagentLimits,
     /// True when this stream should expose only its session projection rather
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// `tools.deferred_loading`: Anthropic `defer_loading` + `tool_reference`
+    /// for progressive disclosure, so activations keep the cached prefix.
+    deferred_tool_loading: bool,
     /// `tools.activation_confirm` host policy for model-initiated
     /// `activate_tools` (auto | prompt | deny). Default `auto`.
     activation_confirm: agent_core::config::ActivationConfirm,
@@ -489,6 +503,11 @@ pub struct Runtime {
     /// existing shared-session behavior). Never persisted; unrelated to
     /// saved session IDs.
     host_tool_session: crate::tools::activation::SessionId,
+    /// Frozen system-prompt catalog of activatable tools (progressive
+    /// disclosure): rendered once per session on first use, then reused
+    /// byte-for-byte so activations and late registrations never change the
+    /// cached prompt prefix. Outer `None` = not rendered yet.
+    tool_catalog_prompt: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// The `SessionToolSet` retained for `host_tool_session` across stream
     /// turns (exact activations are session-scoped). Minted empty with the
     /// runtime and shared by `Clone`, exactly like `host_tool_session`.
@@ -1009,6 +1028,7 @@ impl Runtime {
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_anchor: Default::default(),
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
             hook_bus: host.hook_bus,
@@ -1017,7 +1037,9 @@ impl Runtime {
             credential_source: host.credential_source,
             token_cache: host.token_cache,
             trusted_worker_models: Vec::new(),
+            subagent_limits: crate::config::SubagentLimits::default(),
             progressive_tool_disclosure: host.progressive_tool_disclosure,
+            deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
             mcp_runtime: None,
@@ -1028,6 +1050,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             host_tool_session: fresh_host_tool_session(),
+            tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
             session_id: None,
             cwd: None,
@@ -1103,6 +1126,73 @@ impl Runtime {
     /// - the model identity cannot be canonicalized — fail closed to the
     ///   unmodified base.
     pub async fn effective_system_prompt(&self) -> Option<String> {
+        let base = self.orchestrated_system_prompt().await;
+        // A typed prompt manifest owns the full stack: nothing is appended.
+        if self.effective_prompt.is_some() {
+            return base;
+        }
+        match self.frozen_tool_catalog().await {
+            Some(catalog) => Some(match base {
+                Some(base) if !base.is_empty() => format!("{base}\n\n{catalog}"),
+                _ => catalog,
+            }),
+            None => base,
+        }
+    }
+
+    /// The progressive-disclosure catalog of activatable tools for the
+    /// system prompt, frozen per session (see `tool_catalog_prompt`). `None`
+    /// when progressive disclosure is off, model-initiated activation is
+    /// denied, the runtime cannot activate tools (workers), or nothing
+    /// outside the session core is activatable.
+    pub async fn frozen_tool_catalog(&self) -> Option<String> {
+        if !self.progressive_tool_disclosure
+            || self.activation_confirm == agent_core::config::ActivationConfirm::Deny
+        {
+            return None;
+        }
+        if let Some(frozen) = self
+            .tool_catalog_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return frozen;
+        }
+        let rendered = {
+            let registry = self.tools.read().await;
+            if registry.get("activate_tools").is_none() {
+                None
+            } else {
+                let core_set = continuation::context_tool_set(
+                    self.host_tool_session.clone(),
+                    registry.catalog(),
+                    true,
+                    self.context_management_enabled(),
+                );
+                let core: std::collections::HashSet<String> = core_set
+                    .core_ids()
+                    .map(|id| id.as_str().to_string())
+                    .collect();
+                crate::tools::prompt_catalog::render(
+                    registry.catalog(),
+                    &core,
+                    crate::tools::activation::is_activatable_record,
+                )
+            }
+        };
+        let mut slot = self
+            .tool_catalog_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // First render wins (a concurrent caller may have frozen it already).
+        slot.get_or_insert(rendered).clone()
+    }
+
+    /// The configured base prompt plus the builtin orchestration doctrine
+    /// for the current model (what `effective_system_prompt` returned before
+    /// the tool catalog was appended).
+    async fn orchestrated_system_prompt(&self) -> Option<String> {
         if self.effective_prompt.is_some() {
             return self.system_prompt.clone();
         }
@@ -1291,6 +1381,11 @@ impl Runtime {
         self.orchestration = Some(runtime);
     }
 
+    /// The `subagent.*` limits this runtime sizes delegation policies with.
+    pub fn subagent_limits(&self) -> crate::config::SubagentLimits {
+        self.subagent_limits
+    }
+
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
     }
@@ -1365,8 +1460,9 @@ impl Runtime {
         {
             let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
                 .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
-            let replacement = crate::orchestration::OrchestrationRuntime::baseline(
-                foreground, 8, 64,
+            let replacement = crate::orchestration::OrchestrationRuntime::from_limits(
+                foreground,
+                self.subagent_limits,
             )
             .map_err(|_| "model change blocked: trusted worker catalog unavailable".to_string())?;
             for trusted in &self.trusted_worker_models {
@@ -2393,7 +2489,7 @@ impl Runtime {
     /// `EngineHost::foreground_runtime`: the host already disabled builtins
     /// on the fresh registry before skills/MCP registered (the old boot
     /// point), and a second pass here would also strip `load_skill`,
-    /// `search_skills`, `connect_mcp_server` and dormant MCP tools — which
+    /// `search_skills` and the descriptor-backed MCP tools — which
     /// the old boot never did.
     pub(crate) fn apply_config_keep_tools(&mut self, config: &crate::config::SynapsConfig) {
         self.apply_config_inner(config, false);
@@ -2455,6 +2551,7 @@ impl Runtime {
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
+        self.deferred_tool_loading = config.tools_deferred_loading;
         self.activation_confirm = config.tools_activation_confirm;
         tracing::info!(
             mode = config.tools_activation_confirm.as_str(),
@@ -2480,6 +2577,7 @@ impl Runtime {
             .collect();
         self.trusted_worker_models.sort();
         self.trusted_worker_models.dedup();
+        self.subagent_limits = config.subagent;
         if let Some(orchestration) = &self.orchestration {
             for model in &self.trusted_worker_models {
                 if let Err(error) = orchestration.grant_worker_model(model.as_str()) {
@@ -3352,6 +3450,7 @@ impl Runtime {
     pub fn share_ttl_latches(&mut self, parent: &Runtime) {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
+        self.cache_anchor = parent.cache_anchor.clone();
     }
 
     /// Change the cache TTL strategy mid-session. The next request re-marks
@@ -3499,7 +3598,10 @@ impl Runtime {
                     // policy (fresh default-core, zero activations).
                     session_tool_set: None,
                     request_tools_schema: None,
+                    anthropic_tool_split: None,
                     usage_counters: None,
+                    cache_anchor: None,
+                    keepwarm: None,
                 },
             )
             .await?;
@@ -4036,7 +4138,12 @@ impl Runtime {
             // the first provider round.
             session_tool_set: None,
             request_tools_schema: None,
+            anthropic_tool_split: None,
             usage_counters: None,
+            // The foreground turn's accepted requests are what keep-warm
+            // schedules from.
+            cache_anchor: Some(self.cache_anchor.clone()),
+            keepwarm: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4083,6 +4190,7 @@ impl Runtime {
             delegation_parent: self.delegation_parent.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
@@ -4196,6 +4304,7 @@ impl Clone for Runtime {
             // honored-state isn't inherited from the parent.
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_anchor: Default::default(),
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
@@ -4206,7 +4315,9 @@ impl Clone for Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
             trusted_worker_models: self.trusted_worker_models.clone(),
+            subagent_limits: self.subagent_limits,
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
@@ -4222,6 +4333,7 @@ impl Clone for Runtime {
             // independently constructed runtimes mint fresh identities and
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
+            tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
@@ -4778,6 +4890,50 @@ mod tests {
     }
 
     #[test]
+    fn configured_subagent_limits_size_the_policy_rebuilt_on_model_change() {
+        let mut runtime = Runtime::new_headless();
+        assert_eq!(
+            runtime.subagent_limits(),
+            crate::config::SubagentLimits::default(),
+            "defaults before any config"
+        );
+        runtime.apply_config(&crate::config::SynapsConfig {
+            subagent: crate::config::SubagentLimits {
+                max_concurrent: 24,
+                max_total: 96,
+                max_depth: 2,
+            },
+            ..Default::default()
+        });
+        let foreground =
+            agent_core::prompt::QualifiedModelId::parse("openai-codex/gpt-5.6-sol").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::from_limits(
+                foreground,
+                runtime.subagent_limits(),
+            )
+            .unwrap(),
+        ));
+        runtime
+            .try_set_model("xai-auth/grok-4.5-latest".to_owned())
+            .unwrap();
+
+        let orchestration = runtime.orchestration().unwrap();
+        assert_eq!(orchestration.foreground_model(), "xai-auth/grok-4.5-latest");
+        assert_eq!(
+            orchestration.ultracode_readiness("xai-auth/grok-4.5-latest"),
+            Ok((24, 96)),
+            "the replacement policy uses the configured limits, not a hardcoded 8/64"
+        );
+        assert_eq!(orchestration.reserve_delegation("a", None), Ok(1));
+        assert_eq!(orchestration.reserve_delegation("b", Some("a")), Ok(2));
+        assert_eq!(
+            orchestration.reserve_delegation("c", Some("b")),
+            Err(crate::orchestration::DelegationTreeDenied::DepthLimit { max_depth: 2 })
+        );
+    }
+
+    #[test]
     fn set_model_replaces_manifestless_orchestration_foreground_snapshot() {
         let mut runtime = Runtime::new_headless();
         let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
@@ -5119,6 +5275,91 @@ mod tests {
 #[cfg(test)]
 mod effective_prompt_tests {
     use super::*;
+
+    // ── progressive-disclosure tool catalog in the system prompt ────────────
+
+    struct LateTool;
+    #[async_trait::async_trait]
+    impl crate::Tool for LateTool {
+        fn name(&self) -> &str {
+            "late_tool"
+        }
+        fn description(&self) -> &str {
+            "Registered after the catalog froze."
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _p: Value, _c: crate::ToolContext) -> crate::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_lists_activatable_tools_outside_the_core() {
+        let mut runtime = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        assert!(
+            runtime.frozen_tool_catalog().await.is_none(),
+            "flag off: no catalog"
+        );
+        runtime.progressive_tool_disclosure = true;
+        let catalog = runtime.frozen_tool_catalog().await.expect("catalog");
+        assert!(catalog.starts_with("## Activatable tools\n"));
+        assert!(
+            catalog.contains("not instructions"),
+            "third-party text is framed as data"
+        );
+        assert!(catalog.contains("- builtin:subagent_start"), "{catalog}");
+        for core in [
+            "builtin:bash",
+            "builtin:read",
+            "builtin:activate_tools",
+            "builtin:search_tools",
+        ] {
+            assert!(
+                !catalog.contains(&format!("- {core}")),
+                "core {core} listed"
+            );
+        }
+        let prompt = runtime.effective_system_prompt().await.unwrap();
+        assert!(prompt.starts_with("BASE."), "base stays first");
+        assert!(prompt.ends_with(&catalog), "catalog appended last");
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_is_frozen_per_session() {
+        let mut runtime = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        runtime.progressive_tool_disclosure = true;
+        let first = runtime.effective_system_prompt().await.unwrap();
+        runtime.tools.write().await.register(Arc::new(LateTool));
+        let clone = runtime.clone();
+        assert_eq!(runtime.effective_system_prompt().await.unwrap(), first);
+        assert_eq!(clone.effective_system_prompt().await.unwrap(), first);
+        assert!(
+            !first.contains("late_tool"),
+            "late registration does not rewrite the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_catalog_absent_when_activation_is_denied_or_impossible() {
+        let mut denied = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        denied.progressive_tool_disclosure = true;
+        denied.set_activation_confirm(agent_core::config::ActivationConfirm::Deny);
+        assert!(denied.frozen_tool_catalog().await.is_none());
+        assert_eq!(
+            denied.effective_system_prompt().await.as_deref(),
+            Some("BASE.")
+        );
+
+        let mut worker = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        worker.progressive_tool_disclosure = true;
+        worker.set_tools(crate::ToolRegistry::without_subagent());
+        assert!(
+            worker.frozen_tool_catalog().await.is_none(),
+            "no activate_tools, no catalog"
+        );
+    }
 
     fn headless(model: &str, base: &str) -> Runtime {
         let mut runtime = Runtime::new_headless();

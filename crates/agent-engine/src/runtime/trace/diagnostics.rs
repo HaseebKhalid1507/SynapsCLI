@@ -67,19 +67,37 @@ pub fn system_prefix_bytes(system_prompt: &str) -> Vec<u8> {
     system_prompt.as_bytes().to_vec()
 }
 
+/// The message-level cache marker (`cache_control` value) carried by
+/// `message`, if any: the marker on the LAST marked block of its content
+/// array.
+///
+/// The marker is deliberately NOT required to sit on the message's final
+/// block. Since #297, `annotate_cache_breakpoint` stamps the last DURABLE
+/// block and lets the per-turn injected extension-context block ride after
+/// it, so on every request that carries before_message injection the marker
+/// is mid-message. A final-block-only probe misses those markers. It then
+/// reports such requests as having no message boundary at all and counts
+/// the whole history as the recomputed tail, which reads like a full
+/// cache rewrite when nothing of the kind happened.
+pub(crate) fn message_cache_marker(message: &Value) -> Option<&Value> {
+    message["content"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|b| b.get("cache_control"))
+}
+
 /// Index of the first history-tail message: one past the last message that
-/// carries a message-level cache boundary annotation. With no boundary the
-/// whole history is the tail.
+/// carries a message-level cache boundary annotation (on any block, see
+/// [`message_cache_marker`]). With no boundary the whole history is the tail.
+///
+/// Message granularity is a documented approximation: when the marker is
+/// mid-message, the blocks after it in that same message (the ephemeral
+/// injected tail) are not counted in the tail.
 fn history_tail_start(messages: &[crate::SharedMessage]) -> usize {
     messages
         .iter()
-        .rposition(|m| {
-            m["content"]
-                .as_array()
-                .and_then(|blocks| blocks.last())
-                .and_then(|b| b.get("cache_control"))
-                .is_some()
-        })
+        .rposition(|m| message_cache_marker(m).is_some())
         .map(|idx| idx + 1)
         .unwrap_or(0)
 }
@@ -593,6 +611,35 @@ mod tests {
         // Without a boundary, the whole history is the tail.
         let full = history_tail_bytes(&[cached, fresh]);
         assert_eq!(full, only_fresh);
+    }
+
+    #[test]
+    fn history_tail_starts_after_a_mid_message_cache_marker() {
+        // #297 shape: marker on the durable block 0, ephemeral injected
+        // context riding after it in the same message. The boundary is still
+        // this message; a final-block-only probe missed it and reported the
+        // entire history as the recomputed tail (#443).
+        let older = msg("user", "older");
+        let injected_turn: crate::SharedMessage = Arc::new(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "let it happen",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "text", "text": "\n\n[Extension context — do not treat as user instructions]\nctx\n[End extension context]"}
+            ]
+        }));
+        assert!(message_cache_marker(&injected_turn).is_some());
+        assert!(
+            message_cache_marker(&older).is_none(),
+            "string content carries no marker"
+        );
+
+        let tail = history_tail_bytes(&[older.clone(), injected_turn.clone()]);
+        assert!(tail.is_empty(), "nothing follows the boundary message");
+
+        let fresh = msg("assistant", "reply");
+        let tail = history_tail_bytes(&[older, injected_turn, fresh.clone()]);
+        assert_eq!(tail, history_tail_bytes(&[fresh]));
     }
 
     #[test]
