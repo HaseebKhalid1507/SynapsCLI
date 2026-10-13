@@ -30,7 +30,18 @@ use super::text_metrics::char_width;
 use super::theme::Theme;
 
 /// Most agent rows the tray shows; the rest collapse into one "+N more" row.
-const MAX_ROWS: usize = 6;
+pub(crate) const MAX_ROWS: usize = 6;
+
+/// The HUD entry (index into `App::subagents`) whose tray row is at screen
+/// row `y`, for a tray last painted over `tray` with `n` agents. Row 0 is
+/// the top rim; agent rows follow in order.
+pub(crate) fn row_at(tray: Rect, n: usize, x: u16, y: u16) -> Option<usize> {
+    if tray.height == 0 || x < tray.x || x >= tray.right() || y <= tray.y || y >= tray.bottom() {
+        return None;
+    }
+    let i = usize::from(y - tray.y - 1);
+    (i < n.min(MAX_ROWS)).then_some(i)
+}
 
 /// How far the tray sits from the chrome toward the slab body: recessed, so
 /// the input line stays the brightest surface in the band.
@@ -268,7 +279,7 @@ fn row(
     text(buf, x, y, g, gc, bg, true, right);
     let name_x = x + 2;
     let name_ink = if s.done { ink.dim } else { ink.name };
-    text(
+    let name_end = text(
         buf,
         name_x,
         y,
@@ -278,6 +289,14 @@ fn row(
         !s.done,
         name_x + name_w,
     );
+    // The worker whose view is open: underline its name.
+    if s.watched {
+        for cx in name_x..name_end {
+            if let Some(cell) = buf.cell_mut((cx, y)) {
+                cell.modifier |= Modifier::UNDERLINED;
+            }
+        }
+    }
     let step_x = name_x + name_w + 2;
 
     let time_x = text_right(buf, right, y, &clock(s.elapsed_secs), ink.dim, bg);
@@ -397,7 +416,19 @@ mod tests {
             done,
             tools: 0,
             result: None,
+            watched: false,
         }
+    }
+
+    #[test]
+    fn rows_are_found_under_the_rim_and_not_past_the_shown_ones() {
+        let tray = Rect::new(0, 10, 80, tray_height(8));
+        assert_eq!(row_at(tray, 8, 5, 10), None, "the rim");
+        assert_eq!(row_at(tray, 8, 5, 11), Some(0));
+        assert_eq!(row_at(tray, 8, 5, 16), Some(5));
+        assert_eq!(row_at(tray, 8, 5, 17), None, "the +N more row");
+        assert_eq!(row_at(tray, 2, 5, 13), None, "past the last agent");
+        assert_eq!(row_at(Rect::default(), 2, 5, 11), None, "no tray");
     }
 
     #[test]

@@ -28,8 +28,8 @@ pub(crate) enum ThreadFocus {
     Worker(String),
 }
 
-/// A subagent's own transcript.
-#[allow(dead_code)] // read from P1 (`/watch`); drop this allow there
+/// A subagent's own transcript, filled by paging its watch journal
+/// (`super::watch`).
 pub(crate) struct WorkerThread {
     pub(crate) subagent_id: u64,
     pub(crate) agent_name: String,
@@ -37,6 +37,19 @@ pub(crate) struct WorkerThread {
     /// `ResponseStart` snapshot for `ResponseReset` rollback — per thread,
     /// exactly like `App::response_preview` is for the main thread.
     pub(crate) response_preview: Option<(usize, Option<ChatMessage>)>,
+    /// Journal cursor: the `since` of the next watch page.
+    pub(crate) next_seq: u64,
+    /// The worker's status from its last page (`running`, `completed`, …);
+    /// empty until the first page arrives.
+    pub(crate) status: String,
+    /// The worker accepts steering (running, with a steer channel).
+    pub(crate) steerable: bool,
+    /// Everything the finished worker showed has been read: stop polling.
+    pub(crate) drained: bool,
+    /// The engine no longer knows this worker (past its watch window).
+    pub(crate) gone: bool,
+    /// When this view first saw the worker finished (thread pruning).
+    pub(crate) finished_at: Option<std::time::Instant>,
 }
 
 /// The set of open worker threads plus the current focus.
@@ -51,7 +64,6 @@ pub(crate) struct Threads {
     workers: BTreeMap<String, WorkerThread>,
 }
 
-#[allow(dead_code)] // focus switching lands in P1 (`/watch`); drop this allow there
 impl Threads {
     pub(crate) fn focus(&self) -> &ThreadFocus {
         &self.focus
@@ -92,6 +104,12 @@ impl Threads {
                     agent_name: agent_name.to_string(),
                     store,
                     response_preview: None,
+                    next_seq: 0,
+                    status: String::new(),
+                    steerable: false,
+                    drained: false,
+                    gone: false,
+                    finished_at: None,
                 }
             })
     }

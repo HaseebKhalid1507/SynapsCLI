@@ -48,6 +48,7 @@ mod threads;
 mod toast;
 mod view_model;
 mod viewport;
+mod watch;
 
 /// Single process-global lock for ALL tests that mutate config-env vars
 /// (`SYNAPS_BASE_DIR`, `HOME`).  Both `migration_tests` (this file) and the
@@ -200,6 +201,9 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             }
         }
         idle_purge.observe(app.streaming || app.compacting);
+        // A fixed deadline, read before `select!` borrows `app`: a fresh
+        // `sleep` would restart every 16 ms animation tick and never fire.
+        let watch_due = watch::poll_due_at(&app);
 
         tokio::select! {
 
@@ -268,6 +272,13 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             Some((prompt_id, value)) = prompt_bridge.answers_rx.recv() => {
                 prompt_bridge.on_local_answer(prompt_id);
                 let _ = link.send(SessionCommand::Answer { prompt_id, value }).await;
+            }
+
+            // ── Subagent watch: page the focused worker view's journal ──
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                watch_due.unwrap_or_else(Instant::now),
+            )), if watch_due.is_some() => {
+                watch::poll(&mut app, &mut link, Instant::now()).await;
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──

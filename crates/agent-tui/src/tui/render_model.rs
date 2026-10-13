@@ -20,6 +20,8 @@ pub(crate) struct RenderModel {
     pub(crate) status_text: Option<String>,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
+    /// The focused worker view's banner (header), `None` on the main thread.
+    pub(crate) watch_banner: Option<super::watch::Banner>,
 
     /// Sidecar pills projected out of the live `HashMap<String, SidecarUiState>`.
     /// Ordered by importance desc then display_name asc, as computed on the
@@ -133,6 +135,8 @@ pub(crate) struct SubagentSnap {
     pub(crate) tools: u32,
     /// First line of the result once done.
     pub(crate) result: Option<String>,
+    /// This worker's view is the one in focus.
+    pub(crate) watched: bool,
 }
 
 /// Pre-computed ghost-hint for slash-command completion in the input box.

@@ -16,6 +16,8 @@ pub(super) enum InputAction {
     SlashCommand(String, String),
     /// User submitted input while streaming — contains the raw input string.
     StreamingInput(String),
+    /// Enter in a worker view: steer that subagent with the text.
+    SubagentSteer { handle_id: String, text: String },
     /// Start the quit animation.
     Quit,
     /// Abort the current stream (Esc during streaming).
@@ -184,10 +186,34 @@ fn handle_mouse(
     // lock L3: wheel + click in one input batch maps into rows demoted as of
     // the last frame). The re-render crosses the seam via RenderCtx, same as
     // the draw path — field borrows are disjoint from `app.transcript`.
+    // A click on a tray row opens that worker's view.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some(i) = super::subagent_tray::row_at(
+            app.tray_area,
+            app.subagents.len(),
+            mouse.column,
+            mouse.row,
+        ) {
+            let sa = &app.subagents[i];
+            let c = super::watch::Candidate {
+                handle_id: format!("sa_{}", sa.id),
+                subagent_id: sa.id,
+                agent_name: sa.name.clone(),
+            };
+            super::watch::focus_worker(app, &c, std::time::Instant::now());
+            return InputAction::None;
+        }
+    }
+    // The focused thread renders with its own label and liveness (a
+    // watched worker's, not main's) — same as the draw path.
+    let banner = super::watch::banner(app);
     let ctx = super::transcript::RenderCtx {
         spinner_frame: app.spinner_frame,
-        streaming: app.streaming,
-        agent_name: &app.agent_name,
+        streaming: match &banner {
+            Some(b) => matches!(b.status.as_str(), "running" | "connecting"),
+            None => app.streaming,
+        },
+        agent_name: banner.as_ref().map_or(app.agent_name.as_str(), |b| b.agent_name.as_str()),
     };
     // Scroll + selection act on the FOCUSED thread (main or a watched
     // subagent); other threads' views never move.
@@ -234,10 +260,8 @@ fn handle_mouse(
                 view.clear_selection();
                 if let Some(text) = copied {
                     copy_to_clipboard(&text);
-                    app.push_msg(ChatMessage::System(format!(
-                        "Copied {} chars",
-                        text.chars().count()
-                    )));
+                    // Reported in the thread the user copied from.
+                    super::watch::notice(app, format!("Copied {} chars", text.chars().count()));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
                 app.suppress_paste_until =
@@ -352,6 +376,54 @@ fn handle_key(
                 }
             };
         }
+    }
+    // Subagent thread views (super::watch). Ctrl-↑/↓ are reserved core keys
+    // (never plugin-bindable); they must precede the history arms below,
+    // which match Up/Down with any modifier.
+    let watching = super::watch::focused(app).is_some();
+    match (code, modifiers) {
+        (KeyCode::Up, KeyModifiers::CONTROL) => {
+            if !super::watch::cycle(app, super::watch::Step::Up, std::time::Instant::now()) {
+                app.toasts.upsert(
+                    super::toast::Toast::new("watch", "no subagents to watch").titled("Subagents"),
+                );
+                app.request_redraw();
+            }
+            return InputAction::None;
+        }
+        (KeyCode::Down, KeyModifiers::CONTROL) => {
+            super::watch::cycle(app, super::watch::Step::Down, std::time::Instant::now());
+            return InputAction::None;
+        }
+        // Esc in a worker view returns to main — it never aborts main's turn.
+        (KeyCode::Esc, _) if watching => {
+            super::watch::leave_on_esc(app, std::time::Instant::now());
+            return InputAction::None;
+        }
+        // ...nor does a double-tapped second Esc right after.
+        (KeyCode::Esc, _)
+            if streaming && super::watch::esc_guarded(app, std::time::Instant::now()) =>
+        {
+            return InputAction::None;
+        }
+        // Enter with text in a worker view steers that worker; slash
+        // commands still run as usual.
+        (KeyCode::Enter, m)
+            if watching
+                && !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                && !app.input_is_empty()
+                && !app.input_first_line().starts_with('/') =>
+        {
+            match super::watch::steer_target(app) {
+                Some(Ok(handle_id)) => return process_subagent_steer(app, handle_id),
+                Some(Err(reason)) => {
+                    super::watch::steer_unavailable(app, reason);
+                    return InputAction::None;
+                }
+                None => {}
+            }
+        }
+        _ => {}
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -514,6 +586,19 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     app.pasted_char_count = 0;
 
     InputAction::StreamingInput(input)
+}
+
+/// Enter in a worker view: same input bookkeeping as a submit, but the text
+/// goes to the watched subagent.
+fn process_subagent_steer(app: &mut App, handle_id: String) -> InputAction {
+    let text = app.input_text();
+    app.input_history.push(text.clone());
+    app.history_index = None;
+    app.input_stash.clear();
+    app.clear_input();
+    app.input_before_paste = None;
+    app.pasted_char_count = 0;
+    InputAction::SubagentSteer { handle_id, text }
 }
 
 /// P7.4 stack-routed pane handler for the `/help find` lightbox.

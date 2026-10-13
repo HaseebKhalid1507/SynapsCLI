@@ -49,7 +49,12 @@ pub(crate) struct ViewInputs<'a> {
     // ── status / spinner / identity ──
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
-    pub(crate) agent_name: &'a str,
+    /// Label of the focused thread's assistant messages: the session's agent
+    /// on main, the subagent's name in a worker view.
+    pub(crate) agent_name: std::borrow::Cow<'a, str>,
+    /// Whether the focused thread is live (animates its tail): main's turn,
+    /// or the watched worker still running.
+    pub(crate) thread_streaming: bool,
     pub(crate) status_text: &'a Option<String>,
 
     // ── boot/exit logo animation clocks ──
@@ -84,6 +89,11 @@ pub(crate) struct ViewInputs<'a> {
         &'a std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     pub(crate) secret_prompts: &'a synaps_cli::tools::SecretPromptQueue,
     pub(crate) modal_stack: &'a super::focus::ModalStack,
+
+    /// The focused worker view's header banner (`None` on the main thread).
+    pub(crate) watch_banner: Option<super::watch::Banner>,
+    /// The focused worker's id: the tray marks its row.
+    pub(crate) watched_subagent: Option<u64>,
 }
 
 impl<'a> ViewInputs<'a> {
@@ -97,6 +107,19 @@ impl<'a> ViewInputs<'a> {
         let input = app.input_text();
         let cursor_pos = app.cursor_char_pos();
         let prompt_fx = app.prompt_clock.frame(app.clock.now(), app.streaming);
+        // Owned, before `transcript` borrows `app.threads` mutably.
+        let watch_banner = super::watch::banner(app);
+        let watched_subagent = super::watch::focused_subagent_id(app);
+        let (agent_name, thread_streaming) = match &watch_banner {
+            Some(b) => (
+                std::borrow::Cow::Owned(b.agent_name.clone()),
+                matches!(b.status.as_str(), "running" | "connecting"),
+            ),
+            None => (
+                std::borrow::Cow::Borrowed(app.agent_name.as_str()),
+                app.streaming,
+            ),
+        };
         Self {
             gamba_active: app.gamba_child.is_some(),
             transcript: super::threads::active_mut(&mut app.transcript, &mut app.threads),
@@ -105,7 +128,8 @@ impl<'a> ViewInputs<'a> {
             prompt_fx,
             streaming: app.streaming,
             spinner_frame: app.spinner_frame,
-            agent_name: &app.agent_name,
+            agent_name,
+            thread_streaming,
             status_text: &app.status_text,
             logo_build_t: app.logo_build_t,
             logo_dismiss_t: app.logo_dismiss_t,
@@ -130,6 +154,8 @@ impl<'a> ViewInputs<'a> {
             model_health: &app.model_health,
             secret_prompts: &app.secret_prompts,
             modal_stack: &app.modal_stack,
+            watch_banner,
+            watched_subagent,
         }
     }
 }
@@ -147,6 +173,9 @@ impl<'a> ViewInputs<'a> {
 pub(crate) struct RenderPatch {
     /// `help_find` scroll-window height derived from terminal geometry.
     pub(crate) help_find_visible_height: Option<usize>,
+    /// Where the subagent tray is painted this frame (clicks on its rows
+    /// open that worker's view).
+    pub(crate) tray_area: Option<ratatui::layout::Rect>,
 }
 
 impl RenderPatch {
@@ -159,6 +188,9 @@ impl RenderPatch {
             if let Some(ref mut hf) = app.help_find {
                 hf.set_visible_height(h);
             }
+        }
+        if let Some(area) = self.tray_area {
+            app.tray_area = area;
         }
     }
 }

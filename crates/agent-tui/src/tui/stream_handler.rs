@@ -332,6 +332,10 @@ pub(super) fn on_external(app: &mut App, event: &synaps_cli::events::types::Even
         text: event.content.text.clone(),
     });
 
+    if event.content.content_type == "subagent_steer" {
+        super::watch::steer_accepted(app);
+    }
+
     // Seam 3: subagent_completion → mark HUD entry done directly from
     // event data (no lock needed — data was embedded at finalizer time).
     if event.content.content_type == "subagent_completion" {
@@ -546,9 +550,14 @@ pub(super) async fn handle_session_event_arm(
                 }
             }
         }
-        SessionEventWire::SettingChanged(_) | SessionEventWire::QueryResult { .. } => {
-            // Unsolicited (another client's Set / a host query): the view
-            // was refreshed by `SessionLink::note`; nothing to render.
+        SessionEventWire::QueryResult { id, value } => {
+            // The subagent watch poll is fire-and-forget; anything else is
+            // unsolicited (another client's / a host query): nothing to render.
+            super::watch::on_query_result(app, id, &value, std::time::Instant::now());
+        }
+        SessionEventWire::SettingChanged(_) => {
+            // Unsolicited (another client's Set): the view was refreshed by
+            // `SessionLink::note`; nothing to render.
         }
         SessionEventWire::Attached { .. }
         | SessionEventWire::ClientJoined { .. }
@@ -573,6 +582,7 @@ pub(super) async fn handle_session_event_arm(
             app.push_msg(ChatMessage::Error(abort_msg.to_string()));
         }
         SessionEventWire::Cleared { .. } => {
+            super::watch::reset(app);
             app.transcript.clear();
             app.invalidate();
             app.api_messages_len = 0;
@@ -637,6 +647,7 @@ pub(super) async fn handle_session_event_arm(
                 subagent_hud_redraw(app);
             }
             app.subagent_rows = rows;
+            super::watch::prune(app, std::time::Instant::now());
         }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
@@ -660,7 +671,11 @@ pub(super) async fn handle_session_event_arm(
             command,
             reason,
         } => {
-            if client == me {
+            if client == me && command == "subagent_steer" {
+                // Steering a watched worker: nothing about the main thread's
+                // turn or input changed, so none of the undo below applies.
+                super::watch::steer_refused(app, &reason);
+            } else if client == me {
                 app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
                 // The pre-send presentation assumed a turn: undo it.
                 if app.streaming && app.turn_baseline == app.api_messages_len {

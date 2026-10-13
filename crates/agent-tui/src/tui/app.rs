@@ -108,6 +108,10 @@ pub(crate) struct App {
     /// Per-subagent thread views + which thread has focus (`Main` until the
     /// user watches a worker).
     pub(crate) threads: super::threads::Threads,
+    /// Watch polling + steering bookkeeping for the worker views.
+    pub(crate) watch: super::watch::WatchState,
+    /// Where the subagent tray was last painted (tray-row clicks).
+    pub(crate) tray_area: ratatui::layout::Rect,
     /// Sole input-buffer state (hybrid plan §3.1, tui-textarea-2). Never
     /// rendered — snapshot time derives flat `(text, cursor)` via the
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
@@ -394,6 +398,8 @@ impl App {
         Self {
             transcript: TranscriptStore::new(clock.clone()),
             threads: super::threads::Threads::default(),
+            watch: Default::default(),
+            tray_area: Default::default(),
             editor: tui_textarea::TextArea::default(),
             api_messages_len: 0,
             streaming: false,
@@ -737,12 +743,14 @@ impl App {
     // these are signature-identical delegates.
 
     /// Delegates to [`TranscriptStore::on_tool_use_start`].
+    #[cfg(any(test, feature = "testing"))] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
         self.transcript.on_tool_use_start(tool_id, tool_name);
         self.needs_redraw = true;
     }
 
     /// Delegates to [`TranscriptStore::on_tool_use_delta`].
+    #[cfg(any(test, feature = "testing"))] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_use_delta(&mut self, tool_id: &str, delta: &str) {
         self.transcript.on_tool_use_delta(tool_id, delta);
         self.needs_redraw = true;

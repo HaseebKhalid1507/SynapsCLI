@@ -566,8 +566,9 @@ pub(crate) fn build_render_model(
         width: term_size.width,
         height: term_size.height,
     };
-    let msg_area =
-        AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
+    let areas = AppAreas::from_heights(area, subagent_height, download_height, input_height);
+    let msg_area = areas.body;
+    let tray_area = areas.subagent;
 
     // ── 3. Transcript visible window ──────────────────────────────────────────
     // One call folds the old §3–§6 block: cache sync → scroll growth/clamp
@@ -577,8 +578,8 @@ pub(crate) fn build_render_model(
     let vw = {
         let ctx = super::transcript::RenderCtx {
             spinner_frame: inputs.spinner_frame,
-            streaming: inputs.streaming,
-            agent_name: inputs.agent_name,
+            streaming: inputs.thread_streaming,
+            agent_name: &inputs.agent_name,
         };
         inputs.transcript.visible_window(msg_area, &ctx)
     };
@@ -596,6 +597,7 @@ pub(crate) fn build_render_model(
             done: sa.done,
             tools: sa.tools,
             result: sa.result.clone(),
+            watched: inputs.watched_subagent == Some(sa.id),
         })
         .collect();
 
@@ -688,7 +690,10 @@ pub(crate) fn build_render_model(
     // write-back byte-for-byte) and returned in the RenderPatch for the
     // caller to apply to the authoritative App state.  The builder itself no
     // longer mutates App.
-    let mut patch = RenderPatch::default();
+    let mut patch = RenderPatch {
+        tray_area: Some(tray_area),
+        ..RenderPatch::default()
+    };
     let mut help_find = inputs.help_find.clone();
     if let Some(ref mut hf) = help_find {
         let area_w = term_size.width;
@@ -721,6 +726,7 @@ pub(crate) fn build_render_model(
         status_text: inputs.status_text.clone(),
         streaming: inputs.streaming,
         spinner_frame: inputs.spinner_frame,
+        watch_banner: inputs.watch_banner.clone(),
         sidecar_pills,
         runtime_model,
         runtime_thinking,
@@ -759,6 +765,38 @@ pub(crate) fn build_render_model(
         protected_bottom_rows,
     });
     Some((model, patch))
+}
+
+/// Header spans for a focused worker view: `│ ◉ name · sa_N · status · hint`.
+fn watch_banner_spans(b: &super::watch::Banner) -> Vec<Span<'static>> {
+    let theme = THEME.load();
+    let status_fg = match b.status.as_str() {
+        "running" => theme.status_streaming,
+        "completed" => theme.subagent_done,
+        "failed" | "gone" => theme.error_color,
+        "connecting" => theme.muted,
+        _ => theme.warning_color,
+    };
+    let hint = if b.steerable {
+        " \u{00b7} Enter steers \u{00b7} Esc back "
+    } else {
+        " \u{00b7} read-only \u{00b7} Esc back "
+    };
+    vec![
+        Span::styled("\u{2502}", Style::default().fg(theme.border)),
+        Span::styled(
+            format!(" \u{25c9} {} ", b.agent_name),
+            Style::default()
+                .fg(theme.subagent_name)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} \u{00b7} ", b.handle_id),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(b.status.replace('_', " "), Style::default().fg(status_fg)),
+        Span::styled(hint, Style::default().fg(theme.muted)),
+    ]
 }
 
 /// The footer context bar's colour for this much of the window used:
@@ -961,6 +999,10 @@ pub(crate) fn render_frame_into(
             Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
             status_span,
         ];
+        // Worker view: say whose thread this is and how to get back.
+        if let Some(b) = &model.watch_banner {
+            spans.extend(watch_banner_spans(b));
+        }
         // Sidecar pills from snapshot
         for pill in &model.sidecar_pills {
             spans.push(Span::styled(
@@ -1513,20 +1555,40 @@ pub(crate) fn render_frame_into(
 
     let key_style = Style::default().fg(theme.claude_text);
     let label_style = Style::default().fg(dim);
-    let hints: [(&str, &str); 5] = [
-        ("ctrl+c", "quit"),
-        ("esc", "abort"),
-        ("shift+\u{2191}\u{2193}", "scroll"),
-        (
-            "ctrl+o",
-            if model.show_full_output {
-                "full"
-            } else {
-                "compact"
-            },
-        ),
-        ("enter", "send"),
-    ];
+    // Hints drop whole from the end when narrow, so order is priority. In
+    // a worker view Esc goes back and Enter steers; Ctrl-↑↓ shows up
+    // whenever there is a subagent view to switch to (last on main, so it
+    // never pushes the long-standing hints out).
+    let compact = if model.show_full_output {
+        "full"
+    } else {
+        "compact"
+    };
+    let arrows = "ctrl+\u{2191}\u{2193}";
+    let scroll = "shift+\u{2191}\u{2193}";
+    let hints: Vec<(&str, &str)> = match model.watch_banner.as_ref() {
+        Some(b) => {
+            let mut h = vec![("ctrl+c", "quit"), ("esc", "back")];
+            if b.steerable {
+                h.push(("enter", "steer"));
+            }
+            h.extend([(arrows, "agents"), (scroll, "scroll"), ("ctrl+o", compact)]);
+            h
+        }
+        None => {
+            let mut h = vec![
+                ("ctrl+c", "quit"),
+                ("esc", "abort"),
+                (scroll, "scroll"),
+                ("ctrl+o", compact),
+                ("enter", "send"),
+            ];
+            if !model.subagents.is_empty() {
+                h.push((arrows, "agents"));
+            }
+            h
+        }
+    };
     // One cell of air before the info block.
     let room = usize::from(keybinds_area.width).saturating_sub(1);
     let mut spans = vec![Span::raw(" ")];

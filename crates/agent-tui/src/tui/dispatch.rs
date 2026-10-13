@@ -1159,6 +1159,17 @@ pub(crate) async fn handle_input_action(
                 })
                 .await;
         }
+        InputAction::SubagentSteer { handle_id, text } => {
+            // Owner-only on the engine side; a refusal comes back as
+            // `Refused{command: "subagent_steer"}` (watch::steer_refused).
+            super::watch::steer_sent(app, &handle_id, &text);
+            if let Err(e) = link
+                .send(agent_engine::session::SessionCommand::SubagentSteer { handle_id, text })
+                .await
+            {
+                super::watch::steer_refused(app, &e.to_string());
+            }
+        }
         InputAction::StreamingInput(input) => {
             // Check for streaming slash commands
             if let Some(rest) = input.strip_prefix('/') {

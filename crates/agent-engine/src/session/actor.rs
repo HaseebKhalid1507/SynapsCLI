@@ -3590,13 +3590,13 @@ impl SessionActor {
                 )
             }
             SessionQuery::SubagentWatch { handle_id, since } => {
-                let registry = self
+                let mut registry = self
                     .runtime
                     .subagent_registry()
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                match registry.get(&handle_id) {
-                    Some(h) => serde_json::to_value(h.watch_page(since)).unwrap_or_default(),
+                match registry.watch_page(&handle_id, since) {
+                    Some(page) => serde_json::to_value(page).unwrap_or_default(),
                     None => serde_json::json!({
                         "error": format!("no subagent {handle_id} in this session")
                     }),

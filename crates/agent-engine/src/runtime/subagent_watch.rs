@@ -123,6 +123,46 @@ impl WatchEvent {
         })
     }
 
+    /// The stream event a client replays to render this entry through the
+    /// same transcript path as the main conversation. `Failed` has none:
+    /// clients render its category themselves.
+    pub fn to_stream(&self) -> Option<StreamEvent> {
+        Some(match self {
+            Self::ResponseStart => StreamEvent::Llm(LlmEvent::ResponseStart),
+            Self::ResponseReset => StreamEvent::Llm(LlmEvent::ResponseReset),
+            Self::Thinking { text } => StreamEvent::Llm(LlmEvent::Thinking(text.clone())),
+            Self::Text { text } => StreamEvent::Llm(LlmEvent::Text(text.clone())),
+            Self::ToolUseStart { tool_id, tool_name } => StreamEvent::Llm(LlmEvent::ToolUseStart {
+                tool_name: tool_name.clone(),
+                tool_id: tool_id.clone(),
+            }),
+            Self::ToolUse {
+                tool_id,
+                tool_name,
+                input,
+            } => StreamEvent::Llm(LlmEvent::ToolUse {
+                tool_name: tool_name.clone(),
+                tool_id: tool_id.clone(),
+                input: input.clone(),
+            }),
+            Self::ToolResultDelta { tool_id, delta } => {
+                StreamEvent::Llm(LlmEvent::ToolResultDelta {
+                    tool_id: tool_id.clone(),
+                    delta: delta.clone(),
+                })
+            }
+            Self::ToolResult { tool_id, result } => StreamEvent::Llm(LlmEvent::ToolResult {
+                tool_id: tool_id.clone(),
+                result: result.clone(),
+            }),
+            Self::Steered { text } => StreamEvent::Agent(AgentEvent::SteeringDelivered {
+                message: text.clone(),
+            }),
+            Self::Done => StreamEvent::Session(SessionEvent::Done),
+            Self::Failed { .. } => return None,
+        })
+    }
+
     fn size(&self) -> usize {
         const OVERHEAD: usize = 32;
         OVERHEAD
@@ -285,6 +325,11 @@ impl WatchJournal {
         self.entries.len()
     }
 
+    /// Retained payload bytes (the [`JOURNAL_MAX_BYTES`] measure).
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -296,6 +341,48 @@ mod tests {
 
     fn text(s: &str) -> WatchEvent {
         WatchEvent::Text { text: s.into() }
+    }
+
+    /// Every journal entry replays as the stream event it was recorded
+    /// from, so a client renders it through the main transcript path.
+    #[test]
+    fn entries_replay_as_their_stream_events() {
+        let all = vec![
+            WatchEvent::ResponseStart,
+            WatchEvent::ResponseReset,
+            WatchEvent::Thinking { text: "hmm".into() },
+            text("hi"),
+            WatchEvent::ToolUseStart {
+                tool_id: "t1".into(),
+                tool_name: "bash".into(),
+            },
+            WatchEvent::ToolUse {
+                tool_id: "t1".into(),
+                tool_name: "bash".into(),
+                input: serde_json::json!({ "command": "ls" }),
+            },
+            WatchEvent::ToolResultDelta {
+                tool_id: "t1".into(),
+                delta: "a".into(),
+            },
+            WatchEvent::ToolResult {
+                tool_id: "t1".into(),
+                result: "a\n".into(),
+            },
+            WatchEvent::Steered {
+                text: "focus".into(),
+            },
+            WatchEvent::Done,
+        ];
+        for ev in all {
+            let stream = ev.to_stream().expect("replayable");
+            assert_eq!(WatchEvent::from_stream(&stream), Some(ev));
+        }
+        assert!(WatchEvent::Failed {
+            category: "network".into()
+        }
+        .to_stream()
+        .is_none());
     }
 
     #[test]
