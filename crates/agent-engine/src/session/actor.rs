@@ -265,6 +265,7 @@ fn is_input_command(cmd: &SessionCommand) -> bool {
             | SessionCommand::Submit { .. }
             | SessionCommand::SubmitPrepared { .. }
             | SessionCommand::Steer { .. }
+            | SessionCommand::SubagentSteer { .. }
             | SessionCommand::Cancel
             | SessionCommand::Set { .. }
             | SessionCommand::Compact { .. }
@@ -280,11 +281,38 @@ fn is_input_command(cmd: &SessionCommand) -> bool {
     )
 }
 
+/// The MAIN-conversation note for a user steer of a worker (`SubagentSteer`):
+/// a low-severity event, formatted for the model like any drained event.
+fn subagent_steer_event(handle_id: &str, agent_name: &str, text: &str) -> crate::events::types::Event {
+    use crate::events::types::{Event, EventContent, EventSource, Severity};
+    Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        source: EventSource {
+            source_type: "user".to_string(),
+            name: "user".to_string(),
+            callback: None,
+        },
+        channel: None,
+        sender: None,
+        content: EventContent {
+            text: format!("User steered subagent '{agent_name}' ({handle_id}) directly: {text}"),
+            content_type: "subagent_steer".to_string(),
+            severity: Some(Severity::Low),
+            data: Some(serde_json::json!({ "handle_id": handle_id, "agent_name": agent_name })),
+            disclosure: None,
+        },
+        expects_response: false,
+        reply_to: None,
+    }
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
         SessionCommand::SubmitPrepared { .. } => "submit_prepared",
         SessionCommand::Steer { .. } => "steer",
+        SessionCommand::SubagentSteer { .. } => "subagent_steer",
         SessionCommand::Cancel => "cancel",
         SessionCommand::Answer { .. } => "answer",
         SessionCommand::Set { .. } => "set",
@@ -2408,6 +2436,74 @@ impl SessionActor {
         self.conv.queued_message = Some(text);
     }
 
+    /// `SubagentSteer`: hand the user's text to one of this session's running
+    /// workers, then note it in the MAIN conversation so the main agent knows
+    /// the user redirected its worker. The note travels like a drained event
+    /// (steered into a live turn, buffered while busy, injected while idle)
+    /// but never starts a turn on its own; clients render it from `External`.
+    pub(crate) fn steer_subagent(&mut self, from: Option<ClientId>, handle_id: &str, text: String) {
+        let steered = {
+            let registry = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match registry.get(handle_id) {
+                None => Err(format!("no subagent {handle_id} in this session")),
+                Some(h) => {
+                    let running = h
+                        .state
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .public_status()
+                        == crate::runtime::subagent::SubagentStatus::Running;
+                    if running {
+                        h.steer(&text).map(|()| h.agent_name.clone())
+                    } else {
+                        Err(format!("{} ({handle_id}) is not running", h.agent_name))
+                    }
+                }
+            }
+        };
+        let agent_name = match steered {
+            Ok(name) => name,
+            Err(reason) => {
+                match from {
+                    Some(c) => self.emit(SessionEventWire::Refused {
+                        client: c,
+                        command: "subagent_steer".to_string(),
+                        reason,
+                    }),
+                    None => self.emit(SessionEventWire::SystemNotice(reason)),
+                }
+                return;
+            }
+        };
+        let event = subagent_steer_event(handle_id, &agent_name, &text);
+        let formatted = crate::events::format_event_for_agent(&event);
+        if self.busy() {
+            let into_turn = self
+                .steer_tx
+                .as_ref()
+                .is_some_and(|tx| tx.send(formatted.clone()).is_ok());
+            if into_turn {
+                self.turn_steered_events.push(formatted);
+            } else {
+                self.conv.pending_events.push(formatted);
+            }
+        } else {
+            self.conv
+                .api_messages
+                .push(std::sync::Arc::new(serde_json::json!({
+                    "role": "user",
+                    "content": formatted
+                })));
+            self.request_save();
+        }
+        self.emit(SessionEventWire::External(event));
+        self.emit_conversation();
+    }
+
     /// Every cancel path — `Cancel` (Esc), quit mid-turn (`finish`), the cost
     /// cap, a reload/host checkpoint — behind the TUI's `if streaming` guard
     /// (input.rs:350): a `Cancel` while idle is a no-op that only re-announces
@@ -3437,6 +3533,10 @@ impl SessionActor {
                     "pending_prompts": 0,
                 }),
                 SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
+                // A parked session has no live workers; a watch poll must not wake it.
+                SessionQuery::SubagentWatch { handle_id, .. } => {
+                    serde_json::json!({ "error": format!("no subagent {handle_id} in this session") })
+                }
                 _ => match self.ensure_live().await {
                     Ok(()) => return Box::pin(self.query(id, query)).await,
                     Err(e) => serde_json::json!({ "error": e }),
@@ -3488,6 +3588,19 @@ impl SessionActor {
                         })
                         .collect(),
                 )
+            }
+            SessionQuery::SubagentWatch { handle_id, since } => {
+                let registry = self
+                    .runtime
+                    .subagent_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                match registry.get(&handle_id) {
+                    Some(h) => serde_json::to_value(h.watch_page(since)).unwrap_or_default(),
+                    None => serde_json::json!({
+                        "error": format!("no subagent {handle_id} in this session")
+                    }),
+                }
             }
             SessionQuery::PromptInspection => {
                 serde_json::to_value(self.runtime.prompt_inspection_json()).unwrap_or_default()
@@ -3789,6 +3902,9 @@ impl SessionActor {
                 } else {
                     self.submit(text, vec![], from).await
                 }
+            }
+            SessionCommand::SubagentSteer { handle_id, text } => {
+                self.steer_subagent(from, &handle_id, text)
             }
             SessionCommand::Cancel => {
                 // The user's cancel, even of a driver's turn: noted before
@@ -4100,6 +4216,15 @@ async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
 impl SessionTask {
     pub fn id(&self) -> &SessionId {
         self.0.id()
+    }
+
+    /// Test seam: this session's subagent registry, to seed fake workers
+    /// before `run()` (see `EngineHost::create_session_unspawned`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn subagent_registry(
+        &self,
+    ) -> Arc<std::sync::Mutex<crate::runtime::subagent::SubagentRegistry>> {
+        Arc::clone(self.0.runtime.subagent_registry())
     }
 
     /// Unbiased select (the TUI loop is unbiased too).

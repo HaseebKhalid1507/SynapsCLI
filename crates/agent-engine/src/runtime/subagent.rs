@@ -128,6 +128,9 @@ pub struct SubagentState {
     pub finalization_started: bool,
     pub finalization_ready: bool,
     pub archive_error: Option<String>,
+    /// What the worker has shown so far, for clients watching it in its own
+    /// thread view (`SessionQuery::SubagentWatch`). Bounded.
+    pub watch: super::subagent_watch::WatchJournal,
 }
 
 /// What `subagent_resume` needs to relaunch a worker when only its archive is left.
@@ -171,6 +174,7 @@ impl SubagentState {
             finalization_started: false,
             finalization_ready: false,
             archive_error: None,
+            watch: Default::default(),
         }
     }
 
@@ -454,6 +458,27 @@ impl SubagentHandle {
         state.tool_log.clear();
         state.conversation_state.clear();
         state.history = None;
+    }
+
+    /// One page of this worker's watch journal from `since`, with its
+    /// identity and status (`SessionQuery::SubagentWatch`).
+    pub fn watch_page(&self, since: u64) -> super::subagent_watch::WatchPage {
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let status = state.public_status();
+        let mut page = state.watch.read(since);
+        page.handle_id = self.id.clone();
+        page.subagent_id = self.subagent_id;
+        page.agent_name = self.agent_name.clone();
+        page.steerable = status == SubagentStatus::Running && self.steer_tx.is_some();
+        page.status = match status {
+            SubagentStatus::Running => "running",
+            SubagentStatus::Completed => "completed",
+            SubagentStatus::Cancelled => "cancelled",
+            SubagentStatus::TimedOut => "timed_out",
+            SubagentStatus::Failed(_) => "failed",
+        }
+        .to_string();
+        page
     }
 
     /// Send a steering message into the running subagent.

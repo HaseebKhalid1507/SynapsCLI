@@ -214,7 +214,9 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::Steer { .. }
         | SessionCommand::SubmitPrepared { .. } => Effect::TurnStart,
         SessionCommand::Compact { .. } => Effect::CompactionStart,
-        SessionCommand::NewSession
+        // Idle: injects a note into history (when the worker exists).
+        SessionCommand::SubagentSteer { .. }
+        | SessionCommand::NewSession
         | SessionCommand::Resume { .. }
         | SessionCommand::EngineCommand { .. }
         | SessionCommand::PluginCommand { .. } => Effect::Fingerprint,
@@ -440,6 +442,13 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
             SessionCommand::Set {
                 id: next_id(),
                 setting: SessionSetting::SubagentTimeout { secs: 120 },
+            },
+        ),
+        (
+            "steer an unknown subagent (refused, no note)",
+            SessionCommand::SubagentSteer {
+                handle_id: "sa_404".into(),
+                text: "nope".into(),
             },
         ),
     ];

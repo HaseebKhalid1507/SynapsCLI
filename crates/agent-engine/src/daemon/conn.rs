@@ -36,6 +36,7 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
     match cmd {
         C::Submit { .. }
         | C::Steer { .. }
+        | C::SubagentSteer { .. }
         | C::Cancel
         | C::Answer { .. }
         | C::Set { .. }

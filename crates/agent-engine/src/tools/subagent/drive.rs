@@ -111,6 +111,12 @@ impl WorkerDrive {
         marks: &mut ResponseMarks,
         totals: &mut Totals,
     ) -> Flow {
+        // Everything the worker shows, for clients watching its thread.
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .watch
+            .record(&event);
         match event {
             StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                 self.update("💭 thinking...".to_string(), *tool_count)
@@ -212,11 +218,10 @@ impl WorkerDrive {
         self.cancel.cancel();
         let _ = tokio::time::timeout(CANCEL_DRAIN, async {
             while let Some(event) = stream.next().await {
+                let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+                s.watch.record(&event);
                 if let StreamEvent::Session(SessionEvent::MessageHistory(history)) = event {
-                    self.state
-                        .write()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .history = Some(history);
+                    s.history = Some(history);
                 }
             }
         })
@@ -379,6 +384,45 @@ mod tests {
         let s = state.read().unwrap();
         assert_eq!(s.last_response_text(), "All done: plate renders.");
         assert_eq!(s.history.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[tokio::test]
+    async fn the_watch_journal_records_what_the_worker_showed() {
+        use crate::runtime::subagent_watch::WatchEvent as W;
+        let (d, state, _) = drive(60);
+        let events = vec![
+            StreamEvent::Llm(LlmEvent::ResponseStart),
+            StreamEvent::Llm(LlmEvent::Thinking("plan".into())),
+            text("Look"),
+            text("ing."),
+            StreamEvent::Llm(LlmEvent::ToolUse {
+                tool_name: "bash".into(),
+                tool_id: "t1".into(),
+                input: json!({"command": "ls"}),
+            }),
+            StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "t1".into(), result: "a".into() }),
+            StreamEvent::Session(SessionEvent::Notice("retry: upstream body".into())),
+            history(2),
+            StreamEvent::Session(SessionEvent::Done),
+        ];
+        d.run(Box::pin(futures::stream::iter(events))).await.unwrap();
+        let page = state.write().unwrap().watch.read(0);
+        assert_eq!(
+            page.events,
+            vec![
+                W::ResponseStart,
+                W::Thinking { text: "plan".into() },
+                W::Text { text: "Looking.".into() },
+                W::ToolUse {
+                    tool_id: "t1".into(),
+                    tool_name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+                W::ToolResult { tool_id: "t1".into(), result: "a".into() },
+                W::Done,
+            ],
+            "notices and history are not journaled; deltas coalesce"
+        );
     }
 
     #[tokio::test]
