@@ -1286,6 +1286,40 @@ fn codex_instructions(system_prompt: &Option<String>) -> String {
 }
 
 fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
+    responses_input_messages(messages, false)
+}
+
+/// Meta Muse input: like [`codex_input_messages`], but replayed assistant
+/// text carries the Codex-style message `phase` Muse itself emits.
+///
+/// Muse labels a preamble before tool calls `phase:"commentary"` and a
+/// turn-ending answer `phase:"final_answer"` (or no phase). Replaying every
+/// past assistant message as a phase-less string taught the model that its
+/// "final answers" go on to call tools, and it then ended live turns on a
+/// bare preamble (A/B replay of the failing history: 2/16 runs reproduced
+/// with phase-less replay, 0/16 with phase restored).
+///
+/// Session storage keeps no phase, so it is inferred from structure, which
+/// matches what Muse emits: `messages_to_oai` folds an assistant turn's text
+/// into ONE message that also carries the turn's calls, so text on a message
+/// WITH tool calls is commentary, text on a message without them is the
+/// final answer. Tool-only messages and the whitespace separator
+/// `messages_to_oai` inserts between tool results and plain user text are
+/// harness wire artefacts, not model text: they keep the legacy shape.
+fn muse_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
+    responses_input_messages(messages, true)
+}
+
+/// Wire phase Muse uses for a replayed assistant message's text.
+fn muse_assistant_phase(has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        "commentary"
+    } else {
+        "final_answer"
+    }
+}
+
+fn responses_input_messages(messages: Vec<ChatMessage>, assistant_phase: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
         if msg.role == "tool" {
@@ -1303,7 +1337,22 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
         // A mixed assistant message carries BOTH text and calls. Emit its
         // text first rather than continuing after the calls and losing it.
         // Text-only messages retain the existing string wire representation.
-        if msg.content_parts.is_some() || msg.content.is_some() || msg.tool_calls.is_none() {
+        let phased_text =
+            if assistant_phase && msg.role == "assistant" && msg.content_parts.is_none() {
+                msg.content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            } else {
+                None
+            };
+        if let Some(text) = phased_text {
+            out.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": muse_assistant_phase(msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty())),
+                "content": [{"type": "output_text", "text": text}],
+            }));
+        } else if msg.content_parts.is_some() || msg.content.is_some() || msg.tool_calls.is_none() {
             let content = if let Some(parts) = msg.content_parts {
                 Value::Array(parts.into_iter().map(|part| match part {
                     ChatContentPart::Text { text } => json!({
@@ -1433,6 +1482,19 @@ struct CodexSseDecoder {
     /// Trace (Task 10A): provider-reported usage from `response.completed`
     /// (input including cached, output, cached slice). `None` until observed.
     observed_usage: Option<(u64, u64, u64)>,
+    /// `phase` of the most recent `message` output item (`None` when that
+    /// item had no phase, or no message item was seen). Muse marks an
+    /// unfinished preamble `commentary`; see [`muse_dangling_preamble`].
+    last_message_phase: Option<String>,
+    /// `output_index` of the most recent `message` output item.
+    last_message_index: Option<usize>,
+    /// Text streamed via `output_text.delta`, per `output_index`. Bounded by
+    /// what the UI already received (it duplicates `text_acc`, split by item).
+    message_text: std::collections::BTreeMap<usize, String>,
+    /// Muse only: when a completed message item carries text that extends
+    /// what was streamed for it, emit the missing suffix as a text delta.
+    /// Off for every other provider so their decoding stays unchanged.
+    backfill_message_text: bool,
 }
 
 impl Default for CodexSseDecoder {
@@ -1584,7 +1646,71 @@ impl CodexSseDecoder {
             emitted_output: false,
             saw_content_output: false,
             observed_usage: None,
+            last_message_phase: None,
+            last_message_index: None,
+            message_text: std::collections::BTreeMap::new(),
+            backfill_message_text: false,
         }
+    }
+
+    /// Record a `message` output item's phase/index (added or done event).
+    fn observe_message_item(&mut self, idx: usize, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            return;
+        }
+        self.last_message_index = Some(idx);
+        self.last_message_phase = item
+            .get("phase")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    /// Text of the most recent message item as streamed, if any was.
+    fn last_message_text(&self) -> Option<&str> {
+        self.last_message_index
+            .and_then(|idx| self.message_text.get(&idx))
+            .map(String::as_str)
+    }
+
+    /// Muse-only (C): a completed message item whose text extends what was
+    /// streamed for it (and starts with it) gets the missing suffix emitted
+    /// as a normal text delta. Never rewrites or duplicates streamed text.
+    fn backfill_message_suffix(
+        &mut self,
+        idx: usize,
+        item: &Value,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+        text_acc: &mut String,
+    ) {
+        if !self.backfill_message_text
+            || item.get("type").and_then(Value::as_str) != Some("message")
+        {
+            return;
+        }
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        let full: String = parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect();
+        let streamed = self.message_text.entry(idx).or_default();
+        if full.len() <= streamed.len() || !full.starts_with(streamed.as_str()) {
+            return;
+        }
+        let suffix = full[streamed.len()..].to_string();
+        tracing::debug!(
+            provider = self.provider_label,
+            suffix_bytes = suffix.len(),
+            "backfilling message text missing from the delta stream"
+        );
+        streamed.push_str(&suffix);
+        self.emitted_output = true;
+        text_acc.push_str(&suffix);
+        let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
+            suffix,
+        )));
     }
 
     /// True once anything was streamed to the UI for this attempt (text
@@ -1683,6 +1809,11 @@ impl CodexSseDecoder {
                     if !delta.is_empty() {
                         self.emitted_output = true;
                     }
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    self.message_text.entry(idx).or_default().push_str(delta);
                     text_acc.push_str(delta);
                     let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
                         delta.to_string(),
@@ -1695,6 +1826,7 @@ impl CodexSseDecoder {
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
+                    self.observe_message_item(idx, item);
                     self.add_tool_from_item(idx, item, tx);
                 }
             }
@@ -1725,6 +1857,8 @@ impl CodexSseDecoder {
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
+                    self.observe_message_item(idx, item);
+                    self.backfill_message_suffix(idx, item, tx, text_acc);
                     self.complete_tool_from_item(idx, item, tx);
                 }
             }
@@ -2213,6 +2347,107 @@ mod codex_input_messages_tests {
         );
     }
 
+    /// Anthropic-shaped stored history covering every assistant shape:
+    /// mixed text+tool_use, tool-only, text-only, plus a plain user message
+    /// right after tool results (forces the `" "` separator).
+    fn phase_history() -> Vec<Value> {
+        vec![
+            json!({"role":"user","content":"build it"}),
+            json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"hidden","signature":"s"},
+                {"type":"text","text":"Mapping the repo first."},
+                {"type":"tool_use","id":"call_a","name":"bash","input":{"command":"ls"}},
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call_a","content":"src"},
+            ]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"call_b","name":"bash","input":{"command":"pwd"}},
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call_b","content":"/w"},
+            ]}),
+            json!({"role":"user","content":"also check logs"}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Done: all good."}]}),
+            json!({"role":"user","content":"thanks"}),
+            json!({"role":"assistant","content":"Plain string answer."}),
+        ]
+    }
+
+    fn oai(messages: Vec<Value>) -> Vec<ChatMessage> {
+        let messages: Vec<crate::SharedMessage> =
+            messages.into_iter().map(std::sync::Arc::new).collect();
+        translate::messages_to_oai(&messages, &None, &translate::ToolNameMap::default())
+    }
+
+    #[test]
+    fn muse_input_infers_phase_from_message_structure() {
+        let out = muse_input_messages(oai(phase_history()));
+        assert_eq!(
+            out,
+            vec![
+                json!({"role":"user","content":"build it"}),
+                // Mixed message: its text is commentary and precedes its call.
+                json!({"type":"message","role":"assistant","phase":"commentary",
+                       "content":[{"type":"output_text","text":"Mapping the repo first."}]}),
+                json!({"type":"function_call","call_id":"call_a","name":"bash","arguments":"{\"command\":\"ls\"}"}),
+                json!({"type":"function_call_output","call_id":"call_a","output":"src"}),
+                // Tool-only message: unchanged, no message item invented.
+                json!({"type":"function_call","call_id":"call_b","name":"bash","arguments":"{\"command\":\"pwd\"}"}),
+                json!({"type":"function_call_output","call_id":"call_b","output":"/w"}),
+                // Harness separator keeps the legacy shape (not model text).
+                json!({"role":"assistant","content":" "}),
+                json!({"role":"user","content":"also check logs"}),
+                // Text-only messages (block and string storage) are final.
+                json!({"type":"message","role":"assistant","phase":"final_answer",
+                       "content":[{"type":"output_text","text":"Done: all good."}]}),
+                json!({"role":"user","content":"thanks"}),
+                json!({"type":"message","role":"assistant","phase":"final_answer",
+                       "content":[{"type":"output_text","text":"Plain string answer."}]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_and_xai_input_stay_phase_less_for_the_same_history() {
+        // Codex and xAI both build input with `codex_input_messages`; the
+        // Muse change must not alter a byte of it.
+        let out = codex_input_messages(oai(phase_history()));
+        assert_eq!(
+            out,
+            vec![
+                json!({"role":"user","content":"build it"}),
+                json!({"role":"assistant","content":"Mapping the repo first."}),
+                json!({"type":"function_call","call_id":"call_a","name":"bash","arguments":"{\"command\":\"ls\"}"}),
+                json!({"type":"function_call_output","call_id":"call_a","output":"src"}),
+                json!({"type":"function_call","call_id":"call_b","name":"bash","arguments":"{\"command\":\"pwd\"}"}),
+                json!({"type":"function_call_output","call_id":"call_b","output":"/w"}),
+                json!({"role":"assistant","content":" "}),
+                json!({"role":"user","content":"also check logs"}),
+                json!({"role":"assistant","content":"Done: all good."}),
+                json!({"role":"user","content":"thanks"}),
+                json!({"role":"assistant","content":"Plain string answer."}),
+            ]
+        );
+        assert!(!serde_json::to_string(&out).unwrap().contains("phase"));
+    }
+
+    #[test]
+    fn muse_input_leaves_non_assistant_and_tool_only_messages_identical() {
+        let messages = || {
+            vec![
+                ChatMessage::system("rules"),
+                ChatMessage::user("question"),
+                ChatMessage::assistant_tool_calls(vec![sample_tool_call()]),
+                ChatMessage::tool_result("call_nZYquCuGUh8Qs9H51dwHMDgs", "bash", "done"),
+            ]
+        };
+        assert_eq!(
+            muse_input_messages(messages()),
+            codex_input_messages(messages())
+        );
+    }
+
     #[test]
     fn codex_instructions_appends_autonomous_loop_policy() {
         let instructions = codex_instructions(&Some("Project-specific rules.".to_string()));
@@ -2312,6 +2547,104 @@ mod codex_decoder_tests {
         }
         let events = collect_events(&mut rx);
         (decoder, text_acc, events)
+    }
+
+    fn drive_with(
+        mut decoder: CodexSseDecoder,
+        lines: &[&str],
+    ) -> (CodexSseDecoder, String, Vec<StreamEvent>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut text_acc = String::new();
+        for line in lines {
+            decoder.push_line(line, &tx, &mut text_acc);
+        }
+        let events = collect_events(&mut rx);
+        (decoder, text_acc, events)
+    }
+
+    #[test]
+    fn decoder_captures_phase_of_the_last_message_item() {
+        // Muse shape (ask1.sse): reasoning, commentary message, function_call.
+        let (decoder, text, _) = drive(&[
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_0"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","phase":"commentary","content":[]}}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","output_index":1,"delta":"Mapping first."}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Mapping first."}]}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_1","name":"bash"}}"#,
+            "",
+        ]);
+        assert_eq!(decoder.last_message_phase.as_deref(), Some("commentary"));
+        assert_eq!(decoder.last_message_index, Some(1));
+        assert_eq!(decoder.last_message_text(), Some("Mapping first."));
+        assert_eq!(text, "Mapping first.");
+
+        // A later phase-less (final) message replaces it.
+        let (decoder, _, _) = drive(&[
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","phase":"commentary","content":[]}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","output_index":1,"delta":"Answer"}"#,
+            "",
+        ]);
+        assert_eq!(decoder.last_message_phase, None);
+        assert_eq!(decoder.last_message_text(), Some("Answer"));
+    }
+
+    const TRUNCATED_STREAM: [&str; 6] = [
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#,
+        "",
+        r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"Key facts:"}"#,
+        "",
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Key facts:\nWhich format?"}]}}"#,
+        "",
+    ];
+
+    #[test]
+    fn muse_decoder_backfills_unstreamed_message_suffix_once() {
+        let mut decoder = CodexSseDecoder::for_provider("Meta Muse");
+        decoder.backfill_message_text = true;
+        let mut lines = TRUNCATED_STREAM.to_vec();
+        // A repeated done event must not emit the suffix twice.
+        lines.extend_from_slice(&TRUNCATED_STREAM[4..]);
+        let (decoder, text, events) = drive_with(decoder, &lines);
+        assert_eq!(text, "Key facts:\nWhich format?");
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Llm(LlmEvent::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Key facts:", "\nWhich format?"]);
+        assert_eq!(
+            decoder.last_message_text(),
+            Some("Key facts:\nWhich format?")
+        );
+    }
+
+    #[test]
+    fn backfill_is_off_by_default_and_never_rewrites_divergent_text() {
+        // Default (Codex) decoder: decoding unchanged.
+        let (_, text, _) = drive(&TRUNCATED_STREAM);
+        assert_eq!(text, "Key facts:");
+        // Muse decoder: final text that does not extend the stream is ignored.
+        let mut decoder = CodexSseDecoder::for_provider("Meta Muse");
+        decoder.backfill_message_text = true;
+        let (_, text, _) = drive_with(
+            decoder,
+            &[
+                r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"Hello"}"#,
+                "",
+                r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"Goodbye world"}]}}"#,
+                "",
+            ],
+        );
+        assert_eq!(text, "Hello");
     }
 
     #[test]
@@ -3357,7 +3690,7 @@ pub(crate) async fn call_muse_responses_stream_inner(
     let (tools, names) = translate::tools_to_responses(tools_schema);
     let instructions = system_prompt.clone().unwrap_or_default();
     // The system prompt travels as `instructions`, never duplicated in input.
-    let input = codex_input_messages(translate::messages_to_oai(messages, &None, &names));
+    let input = muse_input_messages(translate::messages_to_oai(messages, &None, &names));
     let cache_key = muse_prompt_cache_key(&instructions, input.first());
     // Validated BEFORE any broker credential access or network I/O.
     let body = build_muse_body(
@@ -3530,6 +3863,7 @@ async fn stream_broker_responses(
         let mut interrupted = false;
         let mut text = String::new();
         let mut parser = CodexSseDecoder::for_provider(profile.label);
+        parser.backfill_message_text = profile.broker_provider == MUSE_RESPONSES.broker_provider;
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = tokio::select! {
             biased;
@@ -3640,8 +3974,105 @@ async fn stream_broker_responses(
             &parser.completed_tools,
             names,
         ));
-        return Ok(json!({"role":"assistant","content":content}));
+        let mut response = json!({"role":"assistant","content":content});
+        if profile.broker_provider == MUSE_RESPONSES.broker_provider {
+            if let Some(reason) = muse_dangling_preamble(
+                !parser.completed_tools.is_empty(),
+                parser.last_message_phase.as_deref(),
+                parser.last_message_text().unwrap_or(&text),
+            ) {
+                tracing::info!(
+                    provider = profile.broker_provider,
+                    reason,
+                    "muse response ended on a preamble without acting"
+                );
+                // Top-level sidecar, never inside `content`: the turn loop
+                // persists only `content`, so nothing reaches stored history.
+                response[DANGLING_PREAMBLE_KEY] = json!(reason);
+            }
+        }
+        return Ok(response);
     }
+}
+
+/// Response sidecar key (top level, outside `content`) set by the Muse route
+/// when a completed response ended on a preamble without acting. Read by the
+/// turn loop's one-shot continuation; never persisted.
+pub(crate) const DANGLING_PREAMBLE_KEY: &str = "synaps_dangling_preamble";
+
+/// Upper bound (chars, trimmed) for the text heuristic. The observed failures
+/// were 32–36 output tokens (~70–130 chars); 300 leaves room for a long
+/// sentence of preamble while excluding real answers that merely end in a
+/// colon after substantive content.
+pub(crate) const PREAMBLE_MAX_CHARS: usize = 300;
+
+/// Decide whether a completed Muse response ended on an unfinished preamble.
+/// Returns the trigger reason, or `None`. Never fires when the response
+/// called a tool.
+///
+/// - `commentary_phase`: the last message item was labelled
+///   `phase:"commentary"` by Muse itself, yet no tool call followed — by the
+///   provider's own contract the turn is unfinished.
+/// - `colon_preamble`: the last message's trimmed text is short
+///   (≤ [`PREAMBLE_MAX_CHARS`]) and ends with ':' — "Blocking question
+///   before I build anything:" with nothing after it.
+pub(crate) fn muse_dangling_preamble(
+    has_tool_calls: bool,
+    last_message_phase: Option<&str>,
+    last_message_text: &str,
+) -> Option<&'static str> {
+    if has_tool_calls {
+        return None;
+    }
+    if last_message_phase == Some("commentary") {
+        return Some("commentary_phase");
+    }
+    let text = last_message_text.trim();
+    if (text.ends_with(':') || text.ends_with('\u{ff1a}'))
+        && text.chars().count() <= PREAMBLE_MAX_CHARS
+    {
+        return Some("colon_preamble");
+    }
+    None
+}
+
+/// Harness-authored nudge appended (once per user turn) after a dangling
+/// preamble. Framed like the context advisories so the model does not read
+/// it as a new user request.
+pub(crate) const PREAMBLE_NUDGE: &str = "[Host harness note, not a new user request] You ended your turn on a preamble without acting. Continue now: run the tool call you announced, or ask your question in full.";
+
+/// Visible system note shown when the nudge fires.
+pub(crate) const PREAMBLE_NUDGE_NOTICE: &str = "Muse ended its turn on a preamble without acting; continuing once automatically (disable: SYNAPS_MUSE_PREAMBLE_NUDGE=0).";
+
+/// `SYNAPS_MUSE_PREAMBLE_NUDGE=0|false|off|no` disables the one-shot
+/// continuation. Enabled by default.
+pub(crate) fn preamble_nudge_enabled() -> bool {
+    preamble_nudge_enabled_value(std::env::var("SYNAPS_MUSE_PREAMBLE_NUDGE").ok().as_deref())
+}
+
+fn preamble_nudge_enabled_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+/// Turn-loop gate for the one-shot preamble continuation. Returns the reason
+/// and arms `already_nudged` when the response carries the Muse sidecar, the
+/// round was not cancelled, the feature is enabled, and this user turn has
+/// not been nudged yet. At most one nudge per user turn: it cannot loop.
+pub(crate) fn take_preamble_nudge(
+    response: &Value,
+    already_nudged: &mut bool,
+    cancelled: bool,
+    enabled: bool,
+) -> Option<String> {
+    if *already_nudged || cancelled || !enabled {
+        return None;
+    }
+    let reason = response.get(DANGLING_PREAMBLE_KEY)?.as_str()?.to_string();
+    *already_nudged = true;
+    Some(reason)
 }
 
 /// Pure, validated body construction for the xAI Responses API.
@@ -6788,5 +7219,175 @@ mod muse_tests {
             }
         }
         assert_eq!(streamed, "Hello");
+    }
+
+    #[test]
+    fn dangling_preamble_trigger_cases() {
+        // (i) Muse's own commentary label with no tool call.
+        assert_eq!(
+            muse_dangling_preamble(false, Some("commentary"), "Now checking prod logs."),
+            Some("commentary_phase")
+        );
+        // (ii) short final text ending in ':' (the observed failures).
+        assert_eq!(
+            muse_dangling_preamble(
+                false,
+                None,
+                "Key facts assembled. Blocking question before I build anything:\n"
+            ),
+            Some("colon_preamble")
+        );
+        assert_eq!(
+            muse_dangling_preamble(
+                false,
+                Some("final_answer"),
+                "Now checking whether prod logs show the error:"
+            ),
+            Some("colon_preamble")
+        );
+        // Never when the response acted.
+        assert_eq!(
+            muse_dangling_preamble(true, Some("commentary"), "Running:"),
+            None
+        );
+        // Real answers: no colon, empty, or long content that ends in ':'.
+        assert_eq!(muse_dangling_preamble(false, None, "All done."), None);
+        assert_eq!(muse_dangling_preamble(false, None, "   "), None);
+        assert_eq!(
+            muse_dangling_preamble(false, Some("final_answer"), "Which format?"),
+            None
+        );
+        let long = format!("{}:", "x".repeat(PREAMBLE_MAX_CHARS));
+        assert_eq!(muse_dangling_preamble(false, None, &long), None);
+        let edge = format!("{}:", "x".repeat(PREAMBLE_MAX_CHARS - 1));
+        assert_eq!(
+            muse_dangling_preamble(false, None, &edge),
+            Some("colon_preamble")
+        );
+    }
+
+    #[test]
+    fn preamble_nudge_fires_at_most_once_per_turn() {
+        let flagged =
+            json!({"role":"assistant","content":[],DANGLING_PREAMBLE_KEY:"colon_preamble"});
+        let clean = json!({"role":"assistant","content":[]});
+        let mut nudged = false;
+        assert_eq!(take_preamble_nudge(&clean, &mut nudged, false, true), None);
+        assert!(!nudged, "a clean response must not consume the one nudge");
+        assert_eq!(
+            take_preamble_nudge(&flagged, &mut nudged, false, true).as_deref(),
+            Some("colon_preamble")
+        );
+        assert!(nudged);
+        // Second dangling preamble in the same turn: the turn ends normally.
+        assert_eq!(
+            take_preamble_nudge(&flagged, &mut nudged, false, true),
+            None
+        );
+        // Cancelled rounds and the disable switch never nudge.
+        let mut fresh = false;
+        assert_eq!(take_preamble_nudge(&flagged, &mut fresh, true, true), None);
+        assert_eq!(
+            take_preamble_nudge(&flagged, &mut fresh, false, false),
+            None
+        );
+        assert!(!fresh);
+    }
+
+    #[test]
+    fn preamble_nudge_env_switch_parses_off_values_only() {
+        assert!(preamble_nudge_enabled_value(None));
+        assert!(preamble_nudge_enabled_value(Some("1")));
+        assert!(preamble_nudge_enabled_value(Some("")));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!preamble_nudge_enabled_value(Some(off)), "{off}");
+        }
+    }
+
+    async fn muse_turn(sse: &'static str, messages: Vec<Value>) -> (Value, Value) {
+        let broker = Arc::new(CaptureBroker {
+            sse,
+            seen: Mutex::new(Vec::new()),
+        });
+        let dyn_broker: Arc<dyn CredentialBroker> = broker.clone();
+        let cfg = ProviderConfig {
+            base_url: crate::auth::muse::API_BASE_URL.into(),
+            model: "muse-wonder-1.0".into(),
+            provider: "muse".into(),
+        };
+        let tools = vec![json!({
+            "name":"bash","description":"run","input_schema":{"type":"object","properties":{}}
+        })];
+        let messages: Vec<crate::SharedMessage> = messages.into_iter().map(Arc::new).collect();
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = call_responses_route_inner(
+            "muse",
+            &cfg,
+            &dyn_broker,
+            &tools,
+            &None,
+            &messages,
+            &tx,
+            None,
+            ReasoningLevel::Adaptive,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await
+        .expect("muse turn completes");
+        let body = broker.seen.lock().unwrap()[0].body.clone().unwrap();
+        (result, body)
+    }
+
+    const PREAMBLE_SSE: &str = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":",
+        "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"delta\":\"Blocking question before I build anything:\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+        "{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn muse_route_flags_dangling_preamble_outside_content() {
+        let (result, _) =
+            muse_turn(PREAMBLE_SSE, vec![json!({"role":"user","content":"go"})]).await;
+        assert_eq!(result[DANGLING_PREAMBLE_KEY], "colon_preamble");
+        // Stored content stays Anthropic-shaped and carries no sidecar/phase.
+        assert_eq!(
+            result["content"],
+            json!([{"type":"text","text":"Blocking question before I build anything:"}])
+        );
+        // A response that acted is not flagged.
+        let (result, _) = muse_turn(SSE, vec![json!({"role":"user","content":"go"})]).await;
+        assert!(result.get(DANGLING_PREAMBLE_KEY).is_none(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn muse_request_replays_assistant_text_with_phase() {
+        let (_, body) = muse_turn(
+            SSE,
+            vec![
+                json!({"role":"user","content":"go"}),
+                json!({"role":"assistant","content":[
+                    {"type":"text","text":"Checking:"},
+                    {"type":"tool_use","id":"call_a","name":"bash","input":{}},
+                ]}),
+                json!({"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_a","content":"ok"},
+                ]}),
+                json!({"role":"assistant","content":[{"type":"text","text":"Done."}]}),
+                json!({"role":"user","content":"next"}),
+            ],
+        )
+        .await;
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["phase"], "commentary");
+        assert_eq!(input[1]["content"][0]["text"], "Checking:");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[4]["phase"], "final_answer");
+        assert_eq!(input[4]["content"][0]["type"], "output_text");
     }
 }
