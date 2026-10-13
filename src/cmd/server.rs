@@ -1461,6 +1461,7 @@ async fn run_engine_command_synced(
     conv: &RwLock<ConversationState>,
 ) -> Option<CommandResult> {
     let mut rt = runtime.lock().await;
+    engine_commands::prepare_engine_command(name, args, &rt).await;
     let result = engine_commands::handle_engine_command(name, args, &mut rt)?;
     match &result {
         CommandResult::ModelChanged { .. } => {

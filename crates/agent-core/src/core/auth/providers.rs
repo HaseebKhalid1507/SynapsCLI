@@ -83,3 +83,17 @@ pub mod kimi_code {
         super::super::kimi_code::refresh_token(client, refresh).await
     }
 }
+
+pub mod muse {
+    use crate::auth::OAuthCredentials;
+    use reqwest::Client;
+    pub async fn login() -> Result<OAuthCredentials, String> {
+        super::super::muse::login().await
+    }
+    pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
+        super::super::muse::login_into(persist_key).await
+    }
+    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+        super::super::muse::refresh_token(client, refresh).await
+    }
+}

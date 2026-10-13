@@ -1675,7 +1675,9 @@ pub async fn fetch_usage(
             let body = get_json_text(client, &url, &headers, opts).await?;
             parse_grok_billing(&body, account_label, crate::epoch_millis())
         }
-        OAuthProviderId::GitHubCopilot | OAuthProviderId::GoogleGemini => {
+        // Muse reports plan usage only as a side effect of the key mint
+        // (`POST /muse-code/key`), which is not a read; no usage adapter.
+        OAuthProviderId::GitHubCopilot | OAuthProviderId::GoogleGemini | OAuthProviderId::Muse => {
             Err(UsageError::UnsupportedProvider {
                 provider: provider.as_str().to_string(),
             })

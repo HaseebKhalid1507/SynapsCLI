@@ -102,6 +102,7 @@ impl SessionActor {
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
+        crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
         if view_changed {

@@ -108,6 +108,61 @@ pub async fn run(
     }
 }
 
+/// Interior width of the login banner box (between the `║` borders).
+const BANNER_INNER: usize = 38;
+
+/// Box rows for `prefix` + `text`, word-wrapped to the banner interior with
+/// continuation lines aligned under the text, so long provider names or
+/// descriptions never break the right border. Over-long single words are
+/// hard-split.
+fn banner_lines(prefix: &str, text: &str) -> Vec<String> {
+    let indent = 2 + prefix.chars().count();
+    let width = BANNER_INNER.saturating_sub(indent).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let push_word = |word: &str, current: &mut String, rows: &mut Vec<String>| {
+        let mut word: Vec<char> = word.chars().collect();
+        loop {
+            let used = current.chars().count();
+            let sep = usize::from(used > 0);
+            if used + sep + word.len() <= width {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.extend(word.iter());
+                return;
+            }
+            if used > 0 {
+                rows.push(std::mem::take(current));
+                continue;
+            }
+            let rest = word.split_off(width);
+            rows.push(word.iter().collect());
+            word = rest;
+            if word.is_empty() {
+                return;
+            }
+        }
+    };
+    for word in text.split_whitespace() {
+        push_word(word, &mut current, &mut rows);
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let lead = if i == 0 {
+                format!("  {prefix}")
+            } else {
+                " ".repeat(indent)
+            };
+            format!("║{lead}{row:<width$}║")
+        })
+        .collect()
+}
+
 async fn run_oauth_login(
     provider: LoginProvider,
     cred: auth::CredentialRef,
@@ -116,9 +171,13 @@ async fn run_oauth_login(
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
-    eprintln!("║  Sign in with {:<20}║", provider.name);
-    eprintln!("║  {:<36}║", provider.description);
-    eprintln!("║  Account: {:<25}║", cred.account.label_str());
+    for line in banner_lines("Sign in with ", provider.name)
+        .into_iter()
+        .chain(banner_lines("", provider.description))
+        .chain(banner_lines("Account: ", cred.account.label_str()))
+    {
+        eprintln!("{line}");
+    }
     eprintln!("╚══════════════════════════════════════╝");
 
     if let Ok(Some(existing)) = auth::load_credential(&cred) {
@@ -817,6 +876,40 @@ mod tests {
 
         // unknown key returns None
         assert!(find_provider(&providers, "totally-bogus-xyz").is_none());
+    }
+
+    #[test]
+    fn banner_rows_always_fit_the_box() {
+        let inner = |row: &str| row.chars().count() - 2;
+        for (prefix, text) in [
+            ("Sign in with ", "Meta Muse"),
+            ("", "Meta account device OAuth for Muse Code (experimental)"),
+            ("", "Google account OAuth for Gemini CLI / Code Assist (experimental)"),
+            ("Account: ", "default"),
+            ("", ""),
+            ("", &"x".repeat(80)),
+        ] {
+            let rows = banner_lines(prefix, text);
+            assert!(!rows.is_empty());
+            for row in &rows {
+                assert_eq!(inner(row), BANNER_INNER, "{row:?}");
+                assert!(row.starts_with('║') && row.ends_with('║'), "{row:?}");
+            }
+            let joined: String = rows
+                .iter()
+                .map(|r| r.trim_matches('║').trim().trim_start_matches(prefix.trim()))
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(
+                joined.replace(' ', ""),
+                text.replace(' ', ""),
+                "no text is lost when wrapping"
+            );
+        }
+        assert_eq!(
+            banner_lines("Sign in with ", "Meta Muse"),
+            ["║  Sign in with Meta Muse              ║"]
+        );
     }
 
     #[test]

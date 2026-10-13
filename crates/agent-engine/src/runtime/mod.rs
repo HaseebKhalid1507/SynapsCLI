@@ -1714,6 +1714,24 @@ impl Runtime {
         &self.client
     }
 
+    /// Load provider capability evidence for `model` into THIS process before
+    /// a model / reasoning mutation is validated against it. Only Meta Muse
+    /// needs this: its exact effort set comes from a live, server-driven
+    /// catalog held in a process-local cache, which a daemon-hosted session
+    /// does not share with the TUI that listed the model. Uses this
+    /// runtime's own credential source (local or remote broker); bounded,
+    /// backed off, and never fails the caller.
+    pub async fn prepare_model_capabilities(&self, model: &str) {
+        if model.starts_with("muse/") {
+            let broker = crate::auth::broker_from_source(
+                &self.credential_source,
+                &self.token_cache,
+                self.client.clone(),
+            );
+            crate::runtime::openai::catalog::ensure_muse_catalog_for(model, &broker).await;
+        }
+    }
+
     /// Whether this runtime projects a progressive (core-only) tool schema.
     pub fn progressive_tool_disclosure(&self) -> bool {
         self.progressive_tool_disclosure
@@ -5112,6 +5130,32 @@ mod tests {
         assert!(orchestration
             .resolve_and_authorize("sa_kimi", Some("openrouter/moonshotai/kimi-k2.7-code"))
             .is_ok());
+    }
+
+    /// Regression ("model change blocked: trusted worker catalog
+    /// unavailable"): a daemon-hosted session has no live Muse catalog in
+    /// its process (the picker fetched it in the TUI process). Switching to
+    /// a Muse id must not depend on that process-local cache.
+    #[test]
+    fn set_model_to_uncached_muse_id_rebuilds_orchestration() {
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &[]);
+        let mut runtime = Runtime::new_headless();
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm, 3, 8).unwrap(),
+        ));
+
+        for model in ["muse/muse-wonder-1.0", "muse/muse-live-only-zz5"] {
+            runtime
+                .try_set_model(model.to_owned())
+                .unwrap_or_else(|e| panic!("{model}: {e}"));
+            assert_eq!(runtime.model(), model);
+            assert_eq!(runtime.orchestration().unwrap().foreground_model(), model);
+        }
+        // Malformed ids still fail closed.
+        assert!(runtime.try_set_model("muse/Bad Id".to_owned()).is_err());
+        assert_eq!(runtime.model(), "muse/muse-live-only-zz5");
     }
 
     #[test]
