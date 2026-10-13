@@ -352,10 +352,11 @@ messages compacted.
 ### `on_message_complete`
 
 `on_message_complete` is emitted after an assistant response is completed and
-added to session history. It requires `privacy.llm_content` and supports only
-`continue`. `message` contains concatenated assistant text blocks when present;
-tool-use blocks are summarized in `data` instead of being serialized into
-`message`.
+added to session history. It requires `privacy.llm_content` and supports
+`continue` plus the advisory [`context_phase`](#context_phase) result. It can
+never block, modify, or inject. `message` contains concatenated assistant text
+blocks when present; tool-use blocks are summarized in `data` instead of being
+serialized into `message`.
 
 ```json
 {
@@ -369,10 +370,27 @@ tool-use blocks are summarized in `data` instead of being serialized into
   "transcript": null,
   "data": {
     "content_block_count": 1,
-    "has_tool_use": false
+    "has_tool_use": false,
+    "context_management": {
+      "enabled": true,
+      "band": "normal",
+      "phase": "execute"
+    }
   }
 }
 ```
+
+`data.context_management` (additive, protocol version 1) describes the host's
+automatic context management at the time the response completed:
+
+| Field     | Type            | Description                                                                                       |
+|-----------|-----------------|---------------------------------------------------------------------------------------------------|
+| `enabled` | boolean         | Whether automatic context management (`/context auto`) is on for this session                    |
+| `band`    | string \| null  | Latest admission band: `"normal"`, `"pressure"`, `"rollover"`, or `"hard_limit"`; `null` when disabled or not yet assessed |
+| `phase`   | string          | Current advisory work phase: `"unknown"`, `"plan"`, `"execute"`, `"wrap_up"`, or `"new_task"` (`"unknown"` when disabled) |
+
+The model's checkpoint note is never included. When context management is
+disabled the object is `{"enabled": false, "band": null, "phase": "unknown"}`.
 
 ---
 
@@ -503,6 +521,44 @@ context]`) before the model sees it.
 | Field     | Type   | Required | Description                                                       |
 |-----------|--------|----------|-------------------------------------------------------------------|
 | `content` | string | yes      | Markdown-formatted text to inject (placement per the hook, above) |
+
+### `context_phase`
+
+Report an **advisory work phase** to the host's automatic context management.
+Only valid on `on_message_complete`; on other hooks it is treated as
+`continue` and logged as an unsupported action.
+
+The semantics are **identical** to the model calling its own
+`context_checkpoint` tool with this phase and no note: the host records the
+phase in its context policy and may roll the context window over at the next
+task boundary (for example after `"new_task"`, or after `"execute"` following
+a `"plan"`). It is a lower-authority report, never capacity or permission
+authority: it cannot force a rollover, replenish any budget, authorize tools,
+or mutate session history, and it never sets a checkpoint note. When context
+management is disabled the report is ignored.
+
+Requires the **`session.lifecycle`** permission *in addition to*
+`privacy.llm_content` (two-key gate). A `context_phase` from an extension
+lacking it is ignored with a warning and treated as `continue`. Unknown
+`phase` strings are ignored with a warning.
+
+Unlike `block`/`modify`/`replace`, a `context_phase` does **not** stop the
+handler chain: every other `on_message_complete` observer still runs. When
+several extensions report in the same event, the first accepted report (in
+registration order) wins. The `data.context_management` field on the event
+tells the extension whether management is enabled and the current band/phase,
+so it can avoid redundant reports.
+
+```json
+{
+  "action": "context_phase",
+  "phase": "new_task"
+}
+```
+
+| Field   | Type   | Required | Description                                                                 |
+|---------|--------|----------|-----------------------------------------------------------------------------|
+| `phase` | string | yes      | One of `"unknown"`, `"plan"`, `"execute"`, `"wrap_up"`, `"new_task"` (case-insensitive; `wrapup`/`wrap-up` and `newtask`/`new-task` accepted) |
 
 ---
 
@@ -646,7 +702,7 @@ Relative command paths and local argument paths are resolved from the plugin dir
 |----------------------|--------------------------------------------------------------------------------------------|
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
 | `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
-| `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
+| `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events; also the second key for the advisory `context_phase` result on `on_message_complete`. |
 | `tools.register`    | Register extension-provided tools during initialization.                                    |
 | `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 

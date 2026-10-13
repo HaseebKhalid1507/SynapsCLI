@@ -22,8 +22,7 @@ fn storm_incident_replay() {
         DelegationPolicy::baseline(foreground.clone(), catalog, 2, 8).unwrap(),
     );
     let digest_before = runtime.telemetry_json();
-    let tempting_log = "historical: anthropic/claude-opus-4-7 and openai-codex/gpt-9";
-    assert!(!tempting_log.is_empty());
+    let _tempting_log = "historical: anthropic/claude-opus-4-7 and openai-codex/gpt-9";
 
     for (index, guess) in [
         "openai/gpt-5.4",

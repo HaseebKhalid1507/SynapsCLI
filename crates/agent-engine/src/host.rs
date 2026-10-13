@@ -366,7 +366,9 @@ impl EngineHost {
         // tools, so a projected schema would silently drop every extension
         // tool.
         host.progressive_tool_disclosure = false;
-        Ok(Runtime::from_parts(RuntimeParts::with_reaper(host)))
+        let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(host));
+        runtime.apply_retry_config(&self.config());
+        Ok(runtime)
     }
 
     /// Cached-or-rebuilt worker registry: `without_subagent_with_extensions`
@@ -719,27 +721,6 @@ impl EngineHost {
 #[cfg(test)]
 mod driver_grant_tests {
     use super::*;
-
-    /// Build a minimal EngineHost for unit testing driver grants.
-    /// Only the driver_grants, sessions, and adjacent fields are initialized;
-    /// nothing boots a runtime or loads extensions.
-    fn test_host() -> Arc<EngineHost> {
-        // Use the real boot path's struct literal so the test fails to compile
-        // if a field is added and not initialised here — belt and suspenders.
-        // We can't call boot() without full config, so we manufacture one.
-        // Instead, reach into the same fields and just test the grant logic.
-        Arc::new_cyclic(|_| {
-            // Minimal construction: only the fields we touch. Others are default.
-            // This is intentionally a helper, not the full EngineHost::boot path.
-            use std::collections::HashMap;
-            use std::sync::Mutex;
-
-            // We cannot construct EngineHost without private fields, so we
-            // test the grant logic via standalone functions that mirror the
-            // Mutex<HashMap> pattern.
-            unreachable!()
-        })
-    }
 
     // Since EngineHost has many private fields we cannot construct in a unit
     // test without the full boot path, test the grant logic on a standalone

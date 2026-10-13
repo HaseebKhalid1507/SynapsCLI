@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 // ── Module declarations ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "command-exec")]
 mod bash;
 pub(crate) mod context_checkpoint;
 mod edit;
@@ -19,6 +20,7 @@ mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
+#[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
 mod secret_prompt;
@@ -49,6 +51,7 @@ pub use crate::runtime::subagent::{
     SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
+#[cfg(feature = "command-exec")]
 pub use bash::{bash_intermediary_snapshot, BashIntermediarySnapshot, BashTool};
 pub use discovery::{ActivateToolsTool, SearchToolsTool};
 pub use edit::EditTool;
@@ -57,6 +60,7 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
+#[cfg(feature = "command-exec")]
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use registry::{
@@ -64,7 +68,9 @@ pub use registry::{
 };
 pub use respond::RespondTool;
 pub use secret_prompt::SecretPromptQueue;
-pub use secret_prompt::{PromptKind, SecretPromptHandle, SecretPromptRequest};
+pub use secret_prompt::{
+    ConfirmChoice, PromptKind, SecretPromptHandle, SecretPromptRequest, CONFIRM_ANSWER_ALLOW_ALL,
+};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
@@ -97,6 +103,10 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
+    /// Parent-session extension Confirm latch. Workers share the Arc (including
+    /// live updates), never a snapshot or host-global approval. This grants no
+    /// `activate_tools` authority. None is for contexts without a parent session.
+    pub session_allow_all: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Host-owned note storage binding. Runtime contexts always provide the
     /// same binding; `None` is reserved for manually constructed contexts.
     /// A present binding is exclusive: errors never permit legacy fallback.

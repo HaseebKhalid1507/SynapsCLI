@@ -244,18 +244,47 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
     }
 }
 
+/// Interactive login into the provider's default slot.
 pub async fn login(id: OAuthProviderId) -> Result<OAuthCredentials, String> {
+    login_into(&super::account::CredentialRef::default_for(id)).await
+}
+
+/// Interactive login persisting ONLY into the addressed slot. A login into a
+/// named account never touches the default slot (or any other).
+pub async fn login_into(
+    cred: &super::account::CredentialRef,
+) -> Result<OAuthCredentials, String> {
+    login_with_persist(cred.provider, Some(&cred.storage_key())).await
+}
+
+/// Interactive login that returns the credential WITHOUT persisting it, so
+/// the caller can run pre-persistence checks (duplicate identity) and then
+/// store it with `save_credential`.
+pub async fn login_unsaved(id: OAuthProviderId) -> Result<OAuthCredentials, String> {
+    login_with_persist(id, None).await
+}
+
+async fn login_with_persist(
+    id: OAuthProviderId,
+    persist_key: Option<&str>,
+) -> Result<OAuthCredentials, String> {
     match registry()
         .get(id)
         .expect("typed built-in provider")
         .behavior
     {
-        ProviderBehavior::Anthropic => super::providers::anthropic::login().await,
-        ProviderBehavior::OpenAiCodex => super::providers::openai_codex::login().await,
-        ProviderBehavior::Xai => super::providers::xai::login().await,
-        ProviderBehavior::GitHubCopilot => super::providers::github_copilot::login().await,
-        ProviderBehavior::GoogleGemini => super::providers::google_gemini::login().await,
-        ProviderBehavior::KimiCode => super::providers::kimi_code::login().await,
+        ProviderBehavior::Anthropic => super::providers::anthropic::login_into(persist_key).await,
+        ProviderBehavior::OpenAiCodex => {
+            super::providers::openai_codex::login_into(persist_key).await
+        }
+        ProviderBehavior::Xai => super::providers::xai::login_into(persist_key).await,
+        ProviderBehavior::GitHubCopilot => {
+            super::providers::github_copilot::login_into(persist_key).await
+        }
+        ProviderBehavior::GoogleGemini => {
+            super::providers::google_gemini::login_into(persist_key).await
+        }
+        ProviderBehavior::KimiCode => super::providers::kimi_code::login_into(persist_key).await,
     }
 }
 

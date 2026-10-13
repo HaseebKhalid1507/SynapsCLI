@@ -144,6 +144,7 @@ impl Tool for SubagentStartTool {
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
+        let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -279,6 +280,7 @@ impl Tool for SubagentStartTool {
                             &mut runtime,
                             &crate::config::load_config(),
                             memory_backend.as_ref(),
+                            session_allow_all.as_ref(),
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,

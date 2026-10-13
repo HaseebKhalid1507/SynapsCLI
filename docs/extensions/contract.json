@@ -35,8 +35,22 @@
       "permission": "privacy.llm_content",
       "tool_filter": false,
       "actions": [
-        "continue"
-      ]
+        "continue",
+        "context_phase"
+      ],
+      "context_phase": {
+        "status": "optional",
+        "compatibility": "additive optional result within extension_protocol_version 1 (no version bump; per docs/STABILITY.md \u00a71): extensions that only return \"continue\" behave exactly as before, and hosts that predate it treat \"context_phase\" as an unsupported action (continue)",
+        "shape": "{\"action\": \"context_phase\", \"phase\": \"unknown\"|\"plan\"|\"execute\"|\"wrap_up\"|\"new_task\"}",
+        "permission": "requires session.lifecycle IN ADDITION to privacy.llm_content (two-key gate); without it the report is ignored with a warning and treated as continue",
+        "semantics": [
+          "identical to the model calling context_checkpoint with this phase and no note: the host records the advisory phase in its context policy and may roll the context window over at the next task boundary",
+          "lower-authority report only: never capacity, permission, budget, or history authority; cannot force a rollover; never sets a checkpoint note; ignored when context management is disabled",
+          "does not stop the handler chain: all other on_message_complete observers still run; the first accepted report in registration order wins",
+          "unknown phase strings are ignored with a warning"
+        ],
+        "event_data": "on_message_complete data gains an additive context_management object: {enabled: bool, band: \"normal\"|\"pressure\"|\"rollover\"|\"hard_limit\"|null, phase: string}; disabled => {enabled:false, band:null, phase:\"unknown\"}; the checkpoint note is never exposed"
+      }
     },
     "on_compaction": {
       "permission": "privacy.llm_content",

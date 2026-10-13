@@ -106,7 +106,12 @@ impl HookKind {
             // than re-appended on every message the way `before_message`
             // injection is.
             Self::OnSessionStart => &["continue", "inject"],
-            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionEnd => &["continue"],
+            // Advisory work-phase report for the host's automatic context
+            // management (same semantics as the model's own
+            // `context_checkpoint` tool without a note). Never capacity or
+            // permission authority.
+            Self::OnMessageComplete => &["continue", "context_phase"],
+            Self::OnCompaction | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -126,6 +131,7 @@ impl HookKind {
                 | (Self::AfterToolCall, HookResult::Replace { .. })
                 | (Self::BeforeMessage, HookResult::Inject { .. })
                 | (Self::OnSessionStart, HookResult::Inject { .. })
+                | (Self::OnMessageComplete, HookResult::ContextPhase { .. })
         )
     }
 
@@ -400,6 +406,17 @@ pub enum HookResult {
     /// output transforms (compression, redaction, summarization) by extensions.
     /// The first transform stops the handler chain.
     Replace { output: String },
+    /// Advisory work-phase report for the host's automatic context
+    /// management. Only valid on `on_message_complete`, and only honoured
+    /// when the extension additionally holds `session.lifecycle`. Semantics
+    /// are identical to the model calling `context_checkpoint` with this
+    /// phase and no note: the host may roll the context window over at the
+    /// next task boundary. It is a lower-authority report — never capacity,
+    /// permission, or history authority — and does not stop the handler
+    /// chain (other observers still run; the first valid report wins).
+    /// `phase` is parsed host-side with `WorkPhase::parse`; unknown strings
+    /// are ignored with a warning.
+    ContextPhase { phase: String },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -434,6 +451,55 @@ mod tests {
         let out = serde_json::to_value(HookResult::Replace { output: "x".into() }).unwrap();
         assert_eq!(out["action"], "replace");
         assert_eq!(out["output"], "x");
+    }
+
+    /// The extension wire format `{"action":"context_phase","phase":"..."}`
+    /// deserializes to HookResult::ContextPhase and round-trips back.
+    #[test]
+    fn context_phase_action_roundtrips_extension_wire_format() {
+        let wire = json!({"action": "context_phase", "phase": "new_task"});
+        let parsed: HookResult = serde_json::from_value(wire).expect("must deserialize");
+        match &parsed {
+            HookResult::ContextPhase { phase } => assert_eq!(phase, "new_task"),
+            other => panic!("expected ContextPhase, got {other:?}"),
+        }
+
+        let out = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(out, json!({"action": "context_phase", "phase": "new_task"}));
+        let back: HookResult = serde_json::from_value(out).unwrap();
+        assert_eq!(back, parsed);
+
+        // A missing `phase` is a malformed result, not a silent default.
+        assert!(serde_json::from_value::<HookResult>(json!({"action": "context_phase"})).is_err());
+    }
+
+    /// on_message_complete may return ContextPhase; no other hook may, and
+    /// on_message_complete advertises "context_phase" in its action contract.
+    #[test]
+    fn only_on_message_complete_allows_context_phase() {
+        let report = HookResult::ContextPhase {
+            phase: "execute".into(),
+        };
+        for kind in HookKind::ALL {
+            assert_eq!(
+                kind.allows_result(&report),
+                *kind == HookKind::OnMessageComplete,
+                "context_phase must be allowed only on on_message_complete (checked {})",
+                kind.as_str()
+            );
+        }
+        assert!(HookKind::OnMessageComplete
+            .allowed_action_names()
+            .contains(&"context_phase"));
+        // Still observe-only for everything else.
+        assert!(
+            !HookKind::OnMessageComplete.allows_result(&HookResult::Block { reason: "r".into() })
+        );
+        assert!(
+            !HookKind::OnMessageComplete.allows_result(&HookResult::Inject {
+                content: "c".into()
+            })
+        );
     }
 
     // ── HookKind ──────────────────────────────────────────────────────────────
@@ -764,7 +830,7 @@ mod tests {
     /// returned "inject" -- caught here now.)
     #[test]
     fn advertised_actions_match_enforced_actions() {
-        let samples: [(&str, HookResult); 6] = [
+        let samples: [(&str, HookResult); 7] = [
             ("continue", HookResult::Continue),
             ("block", HookResult::Block { reason: "r".into() }),
             (
@@ -784,6 +850,12 @@ mod tests {
                 "inject",
                 HookResult::Inject {
                     content: "c".into(),
+                },
+            ),
+            (
+                "context_phase",
+                HookResult::ContextPhase {
+                    phase: "new_task".into(),
                 },
             ),
         ];

@@ -710,6 +710,8 @@ pub(crate) fn build_render_model(
         title: p.title.clone(),
         prompt: p.prompt.clone(),
         masked_buffer_chars: p.buffer.chars().count(),
+        confirm_focus: p.confirm_focus,
+        confirm_offers_allow_all: p.offers_allow_all(),
     });
 
     // ── 13. Runtime strings ───────────────────────────────────────────────────
@@ -1654,7 +1656,9 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
     // body + blank + (field | nothing) + footer, plus 2 border rows. Floor
     // at the legacy fixed 7 so single-line secret prompts render exactly as
     // before (reference-binary differential); grow only for longer bodies.
-    let content_rows = body_lines + 1 + if is_confirm { 0 } else { 1 } + 1;
+    // Confirm: blank + button row + blank + footer + auto-approve hint;
+    // Secret: blank + field + footer.
+    let content_rows = body_lines + if is_confirm { 5 } else { 3 };
     let height = (content_rows as u16 + 2).max(7).min(area.height).max(3);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
@@ -1697,12 +1701,42 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
     let p = super::modal_kit::Palette::for_modal(&theme, None);
     let hint = |h: &str| super::modal_kit::hint_line(&p, h, modal_area.width.saturating_sub(3));
     if is_confirm {
-        let mut l = hint("y allow  n/esc deny");
-        l.spans.push(Span::styled(
-            "   server.auto_approve_confirms=true skips this",
+        // Button lightbox. The focused button renders as a filled pill;
+        // Deny is focused by default so a bare Enter stays fail-closed.
+        use synaps_cli::tools::ConfirmChoice;
+        let focused = Style::default()
+            .fg(theme.bg)
+            .bg(warn)
+            .add_modifier(Modifier::BOLD);
+        let idle = Style::default().fg(theme.help_fg);
+        let style_for = |c: ConfirmChoice| if prompt.confirm_focus == c { focused } else { idle };
+        let mut row: Vec<Span<'_>> = vec![
+            Span::raw("   "),
+            Span::styled("[ Allow (y) ]", style_for(ConfirmChoice::Allow)),
+        ];
+        if prompt.confirm_offers_allow_all {
+            row.push(Span::raw("   "));
+            row.push(Span::styled(
+                "[ Allow all this session (a) ]",
+                style_for(ConfirmChoice::AllowAll),
+            ));
+        }
+        row.push(Span::raw("   "));
+        row.push(Span::styled("[ Deny (n) ]", style_for(ConfirmChoice::Deny)));
+        text.push(ratatui::text::Line::from(row));
+        text.push(ratatui::text::Line::from(""));
+        text.push(ratatui::text::Line::from(Span::styled(
+            if prompt.confirm_offers_allow_all {
+                "y allow · a allow all · n/esc deny · ←/→/Tab select · Enter confirm"
+            } else {
+                "y allow · n/esc deny · ←/→/Tab select · Enter confirm"
+            },
             Style::default().fg(p.dim),
-        ));
-        text.push(l);
+        )));
+        text.push(ratatui::text::Line::from(Span::styled(
+            "server.auto_approve_confirms=true skips this",
+            Style::default().fg(p.dim),
+        )));
     } else {
         let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
         text.push(ratatui::text::Line::from(vec![

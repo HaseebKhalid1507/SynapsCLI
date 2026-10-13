@@ -74,10 +74,12 @@ const SETUP_BODY: &str = r#"{"cloudaicompanionProject":"test-proj","currentTier"
 
 /// Fake broker: answers `loadCodeAssist` for project setup, then serves the
 /// configured chunk script per `proxy_stream` call (one script per attempt).
+type GeminiAttempt = Result<Vec<Result<bytes::Bytes, BrokerError>>, String>;
+
 struct GeminiBroker {
     /// Per-attempt outcomes: `Err(text)` rejects the stream open with a
     /// broker transport error; `Ok(chunks)` serves the byte chunks.
-    attempts: Mutex<Vec<Result<Vec<Result<bytes::Bytes, BrokerError>>, String>>>,
+    attempts: Mutex<Vec<GeminiAttempt>>,
     seen: Mutex<Vec<ProxyRequest>>,
 }
 
@@ -633,8 +635,10 @@ async fn gemini_disabled_context_emits_nothing_and_still_streams() {
 // ═══ Cloud invoke (AWS Bedrock / Azure OpenAI / Google Vertex) ══════════════
 
 /// Fake cloud broker: scripted `cloud_invoke` outcomes; counts invocations.
+type CloudScript = Result<Vec<Result<CloudEvent, BrokerError>>, BrokerError>;
+
 struct CloudBroker {
-    script: Mutex<Option<Result<Vec<Result<CloudEvent, BrokerError>>, BrokerError>>>,
+    script: Mutex<Option<CloudScript>>,
     invokes: AtomicUsize,
 }
 

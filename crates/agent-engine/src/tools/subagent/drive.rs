@@ -192,7 +192,11 @@ impl WorkerDrive {
                 crate::core::rpc_dispatch::merge_split(&mut totals.cache_1h, cache_creation_1h);
             }
             StreamEvent::Session(SessionEvent::Error(e)) => {
-                return Flow::Failed(format!("provider request failed [{}]", e.category_label()))
+                return Flow::Failed(format!(
+                    "provider request failed [{}]: {}",
+                    e.category_label(),
+                    e.message
+                ))
             }
             StreamEvent::Session(SessionEvent::Done) => return Flow::Done,
             _ => {}
@@ -468,6 +472,51 @@ mod tests {
             state.read().unwrap().history.as_ref().map(Vec::len),
             Some(3)
         );
+    }
+
+    #[tokio::test]
+    async fn human_error_survives_completion_and_archive() {
+        let (drive, state, _) = drive(600);
+        let error = crate::runtime::helpers::turn_error_for(
+            &crate::RuntimeError::NetworkTimeout("waiting for response headers"),
+            "turn-test",
+        );
+        let reason = drive
+            .run(Box::pin(futures::stream::iter(vec![StreamEvent::Session(
+                SessionEvent::Error(error),
+            )])))
+            .await
+            .unwrap_err();
+        assert!(reason.contains("network_error"));
+        assert!(reason.contains("waiting for response headers"));
+        let status = SubagentStatus::Failed(reason.clone());
+        let event = super::super::finalize::build_completion_event(
+            "sa_test", 1, "test", &status, "", 1.0, None,
+        );
+        assert_eq!(event.content.data.unwrap()["error"], reason);
+        {
+            let mut s = state.write().unwrap();
+            s.status = status;
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "test".into(),
+                model: "anthropic/claude-opus-5-5".into(),
+                system_prompt: "test".into(),
+                timeout_secs: 600,
+            });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        super::super::archive::archive_finished_worker(&state, "sa_test", dir.path());
+        let path = state.read().unwrap().archive_path.clone().unwrap();
+        let archive = super::super::archive::read_archive(&path).unwrap();
+        assert_eq!(archive.error.as_deref(), Some(reason.as_str()));
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("error");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(super::super::archive::read_archive(&path)
+            .unwrap()
+            .error
+            .is_none());
     }
 
     #[tokio::test(start_paused = true)]

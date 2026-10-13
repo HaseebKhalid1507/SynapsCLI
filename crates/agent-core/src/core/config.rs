@@ -456,9 +456,30 @@ pub struct AuthConfig {
     /// Per-machine bearer presented to the broker (or `SYNAPS_MACHINE_TOKEN`).
     /// This is the machine's own identity, never the provider credential.
     pub machine_token: Option<String>,
+    /// Selected OAuth account per provider from `auth.account.<provider> =
+    /// <label|default|auto>`. Keys are the raw provider ids as written;
+    /// validation (and fail-closed handling of bad labels) happens in
+    /// [`AccountPolicy::from_config_map`](crate::core::auth::AccountPolicy::from_config_map).
+    pub accounts: BTreeMap<String, String>,
+    /// Raw automatic chooser settings, relative to auth.auto.
+    pub auto: BTreeMap<String, String>,
 }
 
 impl AuthConfig {
+    /// Account policy from config only (no env overlay). Invalid entries fail
+    /// closed for their provider; see `AccountPolicy::from_config_map`.
+    pub fn account_policy(&self) -> crate::core::auth::AccountPolicy {
+        crate::core::auth::AccountPolicy::from_config_map(&self.accounts).0
+    }
+
+    /// Effective selector for one provider (env > config > default).
+    pub fn account_selector(
+        &self,
+        provider: crate::core::auth::OAuthProviderId,
+    ) -> crate::core::auth::AccountSelector {
+        self.account_policy().with_env_overlay().selector(provider)
+    }
+
     /// Resolve the credential source. Environment variables take precedence over
     /// config-file values: `SYNAPS_AUTH_ENDPOINT` / `SYNAPS_MACHINE_TOKEN`.
     /// Returns `Remote` iff an endpoint is set (env or config), else `Local`.
@@ -1166,6 +1187,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
+    // Legacy flat spellings of `subagent.max_concurrent` / `subagent.max_total`.
+    "subagent_max_concurrent",
+    "subagent_max_total",
     "api_retries",
     "refusal_retries",
     "telemetry",
@@ -1430,7 +1454,19 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
             };
         }
         _ => {
-            // Unknown auth.* keys preserved (not rejected)
+            if let Some(provider) = key.strip_prefix("auth.account.") {
+                let provider = provider.trim();
+                if !provider.is_empty() {
+                    // Raw value; validated (fail closed) by AccountPolicy.
+                    auth_config
+                        .accounts
+                        .insert(provider.to_string(), v.to_string());
+                }
+            }
+            if let Some(key) = key.strip_prefix("auth.auto.") {
+                auth_config.auto.insert(key.to_string(), v.to_string());
+            }
+            // Other unknown auth.* keys preserved (not rejected)
         }
     }
 }
@@ -1633,6 +1669,15 @@ fn apply_config_content_with(
                     config.subagent_timeout = timeout;
                 }
             }
+            // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
+            "subagent_max_concurrent" | "subagent_max_total" => {
+                let dotted = key.replacen("subagent_", "subagent.", 1);
+                if let Err(reason) =
+                    parse_subagent_config_key(&mut config.subagent, &dotted, val)
+                {
+                    config.warnings.push(format!("{key} — {reason}"));
+                }
+            }
             "api_retries" => {
                 if let Ok(retries) = val.parse::<u32>() {
                     config.api_retries = retries;
@@ -1815,6 +1860,18 @@ fn apply_config_content_with(
                     parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
+                    if let Some(key) = key.strip_prefix("auth.auto.") {
+                        let (_, warnings) = crate::auth::AutoSelectionPolicy::from_config_map(
+                            &BTreeMap::from([(key.to_string(), val.trim().to_string())]));
+                        config.warnings.extend(warnings);
+                    }
+                    if let Some(provider) = key.strip_prefix("auth.account.") {
+                        let mut one = BTreeMap::new();
+                        one.insert(provider.trim().to_string(), val.trim().to_string());
+                        let (_, warnings) =
+                            crate::core::auth::AccountPolicy::from_config_map(&one);
+                        config.warnings.extend(warnings);
+                    }
                 } else if key.starts_with("events.") {
                     if let Err(diagnostic) = parse_events_config_key(&mut config.events, key, val)
                     {
@@ -2303,6 +2360,20 @@ mod tests {
                 "{k} not in KNOWN_CONFIG_KEYS"
             );
         }
+    }
+
+    #[test]
+    fn legacy_flat_subagent_limit_keys_alias_the_dotted_keys() {
+        let c = super::load_config_from_str(concat!(
+            "subagent_max_concurrent = 256\n",
+            "subagent_max_total = 1024\n",
+        ));
+        assert_eq!(c.subagent.max_concurrent, 256);
+        assert_eq!(c.subagent.max_total, 1024);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_max_concurrent = 0\n");
+        assert_eq!(c.subagent, super::SubagentLimits::default());
+        assert!(c.warnings.iter().any(|w| w.starts_with("subagent_max_concurrent")));
     }
 
     #[test]
@@ -3894,6 +3965,8 @@ api_retries = 5
         let auth = AuthConfig {
             remote_endpoint: Some("https://b".into()),
             machine_token: Some("m".into()),
+            accounts: BTreeMap::new(),
+            auto: BTreeMap::new(),
         };
         assert_eq!(
             auth.credential_source(),
@@ -3905,11 +3978,69 @@ api_retries = 5
     }
 
     #[test]
+    fn auth_account_keys_parse_and_invalid_fail_closed_with_warning() {
+        let config = load_config_from_str(
+            "auth.account.openai-codex = astra2\nauth.account.anthropic = auto\nauth.account.kimi-code = Bad Label\nauth.account.groq = x\n",
+        );
+        assert_eq!(
+            config.auth.accounts.get("openai-codex").map(String::as_str),
+            Some("astra2")
+        );
+        assert_eq!(
+            config.auth.accounts.get("anthropic").map(String::as_str),
+            Some("auto")
+        );
+        let policy = config.auth.account_policy();
+        use crate::core::auth::{AccountSelector, OAuthProviderId};
+        assert!(matches!(
+            policy.selector(OAuthProviderId::OpenAiCodex),
+            AccountSelector::Account(_)
+        ));
+        assert_eq!(
+            policy.selector(OAuthProviderId::Anthropic),
+            AccountSelector::Auto
+        );
+        assert!(
+            matches!(
+                policy.selector(OAuthProviderId::KimiCode),
+                AccountSelector::Invalid { .. }
+            ),
+            "malformed label must fail closed"
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.account.kimi-code")),
+            "{:?}",
+            config.warnings
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.account.groq")),
+            "{:?}",
+            config.warnings
+        );
+        assert!(
+            !config
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.account.openai-codex")),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_credential_source_env_overrides_config() {
         let auth = AuthConfig {
             remote_endpoint: Some("https://config-host".into()),
             machine_token: Some("config-tok".into()),
+            accounts: BTreeMap::new(),
+            auto: BTreeMap::new(),
         };
         std::env::set_var("SYNAPS_AUTH_ENDPOINT", "https://env-host");
         std::env::set_var("SYNAPS_MACHINE_TOKEN", "env-tok");

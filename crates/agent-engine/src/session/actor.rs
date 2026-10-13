@@ -3818,7 +3818,7 @@ impl SessionActor {
                 self.persister.flush().await;
                 self.conv.clear(&self.runtime).await;
                 self.runtime
-                    .set_session_id(Some(self.conv.session.id.clone()));
+                    .begin_conversation(Some(self.conv.session.id.clone()));
                 self.journal_id.store(Arc::new(self.conv.session.id.clone()));
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());

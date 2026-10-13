@@ -1063,15 +1063,12 @@ mod reconcile_tests {
 
         // sa_3 expired → removed
         assert!(
-            hud.iter().find(|s| s.id == 3).is_none(),
+            !hud.iter().any(|s| s.id == 3),
             "sa_3 expired flash must be removed"
         );
 
         // sa_4 inserted
-        assert!(
-            hud.iter().find(|s| s.id == 4).is_some(),
-            "sa_4 must be inserted"
-        );
+        assert!(hud.iter().any(|s| s.id == 4), "sa_4 must be inserted");
     }
 
     // R7: done entry not in registry stays until flash expires (oneshot completed)
