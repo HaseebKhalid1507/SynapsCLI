@@ -99,7 +99,7 @@ impl<'a> ViewInputs<'a> {
         let prompt_fx = app.prompt_clock.frame(app.clock.now(), app.streaming);
         Self {
             gamba_active: app.gamba_child.is_some(),
-            transcript: &mut app.transcript,
+            transcript: super::threads::active_mut(&mut app.transcript, &mut app.threads),
             input,
             cursor_pos,
             prompt_fx,

@@ -44,6 +44,7 @@ mod termcaps;
 pub mod testing;
 pub(crate) mod text_metrics;
 mod theme;
+mod threads;
 mod toast;
 mod view_model;
 mod viewport;

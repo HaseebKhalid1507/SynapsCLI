@@ -101,7 +101,13 @@ pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
 /// invisible to the renderer by construction. Builder-requested mutations
 /// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
+    /// The main thread's transcript. Code that should follow the focused
+    /// thread (render, scroll, selection, Ctrl-O) goes through
+    /// [`super::threads::active_mut`] instead of this field.
     pub(crate) transcript: TranscriptStore,
+    /// Per-subagent thread views + which thread has focus (`Main` until the
+    /// user watches a worker).
+    pub(crate) threads: super::threads::Threads,
     /// Sole input-buffer state (hybrid plan §3.1, tui-textarea-2). Never
     /// rendered — snapshot time derives flat `(text, cursor)` via the
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
@@ -387,6 +393,7 @@ impl App {
         let boot_config = synaps_cli::config::load_config();
         Self {
             transcript: TranscriptStore::new(clock.clone()),
+            threads: super::threads::Threads::default(),
             editor: tui_textarea::TextArea::default(),
             api_messages_len: 0,
             streaming: false,
@@ -742,6 +749,7 @@ impl App {
     }
 
     /// Delegates to [`TranscriptStore::on_tool_use_finalized`].
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_use_finalized(
         &mut self,
         tool_id: String,
@@ -754,12 +762,14 @@ impl App {
     }
 
     /// Delegates to [`TranscriptStore::on_tool_result_delta`].
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
         self.transcript.on_tool_result_delta(tool_id, delta);
         self.needs_redraw = true;
     }
 
     /// Delegates to [`TranscriptStore::on_tool_result`].
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
         self.transcript.on_tool_result(tool_id, result);
         self.needs_redraw = true;
@@ -800,11 +810,13 @@ impl App {
         }
     }
 
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
         self.transcript.append_or_update_text(text);
         self.needs_redraw = true;
     }
 
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
         self.transcript.append_or_update_thinking(text);
         self.needs_redraw = true;

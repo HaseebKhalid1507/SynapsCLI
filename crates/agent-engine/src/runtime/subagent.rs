@@ -227,6 +227,11 @@ pub struct SubagentDisplayRow {
     /// Tool calls started so far. Absent from older peers.
     #[serde(default)]
     pub tools: u32,
+    /// The registry handle id (`sa_N`) — the key every `subagent_*` tool and
+    /// the TUI's per-worker thread views address the worker by. Empty from
+    /// older peers.
+    #[serde(default)]
+    pub handle_id: String,
 }
 
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
@@ -659,6 +664,7 @@ impl SubagentRegistry {
                     finished_elapsed: s.finished_at.map(|t| t.elapsed()),
                     step: s.step.clone(),
                     tools: s.tools,
+                    handle_id: h.id.clone(),
                 }
             })
             .collect()
@@ -878,6 +884,7 @@ mod tests {
         state.write().unwrap().note_progress("$ sleep 20", 1);
         let r = row(&registry);
         assert_eq!(r.subagent_id, 7);
+        assert_eq!(r.handle_id, "sa_7", "rows carry the registry handle id");
         assert_eq!((r.step.as_str(), r.tools), ("$ sleep 20", 1));
     }
 
@@ -888,6 +895,7 @@ mod tests {
             "cancel_requested":false,"elapsed_secs":1.0,"finished_elapsed":null}"#;
         let row: SubagentDisplayRow = serde_json::from_str(old).expect("old row");
         assert_eq!((row.step.as_str(), row.tools), ("", 0));
+        assert_eq!(row.handle_id, "", "older peers send no handle id");
     }
 
     #[test]

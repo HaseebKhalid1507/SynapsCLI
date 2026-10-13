@@ -189,45 +189,50 @@ fn handle_mouse(
         streaming: app.streaming,
         agent_name: &app.agent_name,
     };
+    // Scroll + selection act on the FOCUSED thread (main or a watched
+    // subagent); other threads' views never move.
+    let view = super::threads::active_mut(&mut app.transcript, &mut app.threads);
     match mouse.kind {
         // Wheel scroll no longer clears the selection (P10 lock L4):
         // endpoints are content-relative, so the selection scrolls with the
         // content and the highlight clamps to the window. Keypresses still
         // clear (handle_key top) — including Shift+Up/Down keyboard scroll.
         MouseEventKind::ScrollUp => {
-            app.transcript.scroll_up(scroll_lines);
+            view.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
-            app.transcript.scroll_down(scroll_lines);
+            view.scroll_down(scroll_lines);
         }
 
         // Left-click starts a new selection (clears any existing one)
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
-            if app.transcript.hit_test(mouse.column, mouse.row) {
-                app.transcript
-                    .selection_begin(mouse.column, mouse.row, &ctx);
+            if view.hit_test(mouse.column, mouse.row) {
+                view.selection_begin(mouse.column, mouse.row, &ctx);
             } else {
-                app.transcript.clear_selection();
+                view.clear_selection();
             }
         }
 
         // Left-drag extends the selection (no-op without an anchor)
         MouseEventKind::Drag(MouseButton::Left) => {
-            app.transcript.selection_drag(mouse.column, mouse.row, &ctx);
+            view.selection_drag(mouse.column, mouse.row, &ctx);
         }
 
         // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            app.transcript
-                .selection_release(mouse.column, mouse.row, &ctx);
+            view.selection_release(mouse.column, mouse.row, &ctx);
         }
 
         // Right-click: copy if selection exists, paste if not
         MouseEventKind::Down(MouseButton::Right) => {
-            if app.transcript.has_selection() {
-                // Copy selected text to clipboard — right-click with selection is COPY ONLY
-                if let Some(text) = app.transcript.selected_text() {
+            if view.has_selection() {
+                // Copy selected text to clipboard — right-click with selection is COPY ONLY.
+                // Take the text and clear the selection while `view` is
+                // borrowed, then report through the App.
+                let copied = view.selected_text();
+                view.clear_selection();
+                if let Some(text) = copied {
                     copy_to_clipboard(&text);
                     app.push_msg(ChatMessage::System(format!(
                         "Copied {} chars",
@@ -237,8 +242,6 @@ fn handle_mouse(
                 // Suppress any terminal-generated paste event that follows this right-click
                 app.suppress_paste_until =
                     Some(app.clock.now() + std::time::Duration::from_millis(150));
-                // Clear selection after copy
-                app.transcript.clear_selection();
             } else {
                 // No selection — paste from clipboard at cursor position
                 if let Some(text) = paste_from_clipboard() {
@@ -310,7 +313,7 @@ fn handle_key(
 ) -> InputAction {
     let (code, modifiers) = (key.code, key.modifiers);
     // Clear text selection on any keypress (typing dismisses selection)
-    app.transcript.clear_selection();
+    super::threads::active_mut(&mut app.transcript, &mut app.threads).clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
@@ -419,8 +422,8 @@ fn handle_key(
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
             // App only signals the frame scheduler.
-            app.transcript
-                .set_show_full_output(!app.transcript.show_full_output());
+            let view = super::threads::active_mut(&mut app.transcript, &mut app.threads);
+            view.set_show_full_output(!view.show_full_output());
             app.request_redraw();
         }
         // Alt-←/→ word jumps: the lib maps Alt-b/f and Ctrl-←/→ but leaves
@@ -433,10 +436,10 @@ fn handle_key(
                 .move_cursor(tui_textarea::CursorMove::WordForward);
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
-            app.transcript.scroll_up(1);
+            super::threads::active_mut(&mut app.transcript, &mut app.threads).scroll_up(1);
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
-            app.transcript.scroll_down(1);
+            super::threads::active_mut(&mut app.transcript, &mut app.threads).scroll_down(1);
         }
         // Up/Down: history only at buffer edges (§3.3 DECIDED); inside a
         // multi-line buffer they move the cursor.

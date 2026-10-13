@@ -781,6 +781,7 @@ mod render_tests {
                 finished_elapsed: None,
                 step: step.into(),
                 tools,
+                handle_id: "sa_37".into(),
             }])
         };
         h.feed_event(rows("$ date +%T; sleep 20; date +%T", 1));
