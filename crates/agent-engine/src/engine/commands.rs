@@ -176,6 +176,25 @@ pub fn parse_command(input: &str) -> Option<(&str, &str)> {
     Some((cmd, arg))
 }
 
+/// Async pre-step for [`handle_engine_command`]: load the capability
+/// evidence `/model` and `/thinking` are validated against into THIS
+/// process (see [`crate::Runtime::prepare_model_capabilities`]) so the
+/// reasoning clamp / level check is decided on live data, not on an empty
+/// process-local cache. Every async frontend calls this right before the
+/// synchronous handler; it never fails and is a no-op for other commands.
+pub async fn prepare_engine_command(cmd: &str, arg: &str, runtime: &crate::Runtime) {
+    match cmd {
+        "model" | "models" if !arg.trim().is_empty() => {
+            runtime.prepare_model_capabilities(arg.trim()).await
+        }
+        "thinking" if !arg.trim().is_empty() => {
+            let model = runtime.model().to_string();
+            runtime.prepare_model_capabilities(&model).await;
+        }
+        _ => {}
+    }
+}
+
 /// Process commands that are pure engine logic — no TUI state needed.
 /// Returns None if the command needs TUI-level handling.
 pub fn handle_engine_command(

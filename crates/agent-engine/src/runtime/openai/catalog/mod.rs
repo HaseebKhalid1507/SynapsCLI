@@ -79,9 +79,10 @@ pub use kimi::{
     KimiReasoningCapability, KIMI_CODE_TEXT_MODELS,
 };
 pub use muse::{
-    muse_effort_label, muse_routable_id, muse_runtime_model, muse_static_catalog_models,
-    muse_static_model, muse_supported_levels, parse_muse_catalog_models, MuseModelDescriptor,
-    MUSE_MODELS_PATH, MUSE_PROVIDER_KEY, MUSE_PROVIDER_NAME, MUSE_TEXT_MODELS,
+    muse_default_level, muse_effort_label, muse_routable_id, muse_runtime_model,
+    muse_static_catalog_models, muse_static_model, muse_supported_levels,
+    parse_muse_catalog_models, MuseModelDescriptor, MUSE_MODELS_PATH, MUSE_PROVIDER_KEY,
+    MUSE_PROVIDER_NAME, MUSE_TEXT_MODELS,
 };
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
@@ -196,10 +197,13 @@ pub enum ReasoningSupport {
         multi_agent_version: Option<CodexMultiAgentVersion>,
     },
     /// Exact named effort levels advertised by a live provider catalog
-    /// (Meta Muse `reasoning_effort_variants[].effort`), in catalog order.
+    /// (Meta Muse `metadata["muse-code"].variants[*].reasoningEffort`).
     /// Only these levels (plus provider-default `adaptive`) may be sent.
     NamedEffort {
         supported: Vec<agent_core::reasoning::ReasoningLevel>,
+        /// Catalog default (Muse `options.reasoningEffort`); always a member
+        /// of `supported` when present.
+        default_level: Option<agent_core::reasoning::ReasoningLevel>,
     },
     /// Not yet classified.
     Unknown,
@@ -705,10 +709,21 @@ pub async fn ensure_muse_catalog_for(
     let fetch = broker_proxy_catalog_body_via(broker, MUSE_PROVIDER_KEY, MUSE_MODELS_PATH);
     match tokio::time::timeout(MUSE_WARMUP_TIMEOUT, fetch).await {
         Ok(Ok(body)) => match parse_muse_catalog_models(&body) {
-            Ok(models) => capability_cache::replace_provider(MUSE_PROVIDER_KEY, &models),
+            Ok(models) => {
+                let row = models.iter().find(|m| m.id == id);
+                tracing::info!(
+                    models = models.len(),
+                    listed = row.is_some(),
+                    efforts = ?row.map(|m| &m.reasoning),
+                    "muse catalog loaded for {model}"
+                );
+                capability_cache::replace_provider(MUSE_PROVIDER_KEY, &models);
+            }
             Err(err) => tracing::warn!("muse catalog warm-up parse failed: {err}"),
         },
-        Ok(Err(CatalogBrokerError::NotAuthenticated(_))) => {}
+        Ok(Err(CatalogBrokerError::NotAuthenticated(_))) => {
+            tracing::info!("muse catalog warm-up skipped: no Muse login or META_API_KEY")
+        }
         Ok(Err(CatalogBrokerError::Failed(err))) => {
             tracing::warn!("muse catalog warm-up failed: {err}")
         }

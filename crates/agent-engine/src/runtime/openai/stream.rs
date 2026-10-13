@@ -6567,6 +6567,10 @@ mod muse_tests {
 
     #[test]
     fn named_effort_requires_exact_live_evidence_before_any_io() {
+        // Held for the whole test: the seed assertions read the shared
+        // process-global `muse/*` cache rows too.
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &[]);
         // The static seed advertises no effort set: named levels are refused
         // in the pure builder, i.e. before credentials or network.
         for level in [
@@ -6608,7 +6612,6 @@ mod muse_tests {
         )
         .is_err());
 
-        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
         let models = crate::runtime::openai::catalog::parse_muse_catalog_models(
             r#"{"models":[{"id":"muse-body-probe-zz2","reasoning_effort_variants":
                 [{"effort":"none"},{"effort":"xhigh"}]}]}"#,

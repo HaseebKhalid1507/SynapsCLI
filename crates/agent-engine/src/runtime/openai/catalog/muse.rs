@@ -2,17 +2,19 @@
 //!
 //! Evidence: the official Muse Code CLI (`muse 1.4.6-R6000.1`) reads its
 //! model list from `GET https://api.meta.ai/muse-code/models` (Bearer = Model
-//! API key). Rows carry `id`, `display_label`, `visibility`, `display_order`,
-//! `is_default`, `context_limit`, `output_limit` and
-//! `reasoning_effort_variants[].effort`, with efforts drawn from
+//! API key). The live response (observed 2026-10) is an OpenAI-style list;
+//! each row's capabilities sit under `metadata["muse-code"]`: `is_hidden`,
+//! `limit.{context,output}`, `modalities.{input,output}`, client `options`
+//! (`reasoningEffort` default, `forceReasoning`, ...) and `variants` — a map
+//! of named presets each carrying a `reasoningEffort` drawn from
 //! `none|minimal|low|medium|high|xhigh|max|ultra`. Meta's public Model API
 //! example uses `muse-wonder-1.0` on `POST /v1/responses`.
 //!
 //! The catalog is server-driven, so the static table is deliberately tiny:
 //! only the publicly documented id ships as a seed, and it carries NO
 //! reasoning claim (only the provider default is expressible). Anything else
-//! — more ids, exact effort sets, limits — comes from the live catalog via
-//! the capability cache.
+//! — more ids, exact effort sets, default effort, limits, image input —
+//! comes from the live catalog via the capability cache.
 //!
 //! Routing follows the registry precedent for server-catalog providers
 //! (e.g. `inferx/<any published id>`): any id of the safe shape routes to
@@ -103,7 +105,20 @@ pub fn muse_runtime_model(id: &str) -> bool {
 /// the provider default (`adaptive`, field omitted) may be sent.
 pub fn muse_supported_levels(id: &str) -> Option<Vec<ReasoningLevel>> {
     match capability_cache::get(&format!("{MUSE_PROVIDER_KEY}/{id}"))?.reasoning {
-        ReasoningSupport::NamedEffort { supported } if !supported.is_empty() => Some(supported),
+        ReasoningSupport::NamedEffort { supported, .. } if !supported.is_empty() => Some(supported),
+        _ => None,
+    }
+}
+
+/// The live catalog's default effort for `id` (`options.reasoningEffort`,
+/// what the official client sends when the user picks nothing). Only
+/// returned when it is a member of the exact advertised set.
+pub fn muse_default_level(id: &str) -> Option<ReasoningLevel> {
+    match capability_cache::get(&format!("{MUSE_PROVIDER_KEY}/{id}"))?.reasoning {
+        ReasoningSupport::NamedEffort {
+            supported,
+            default_level: Some(level),
+        } if supported.contains(&level) => Some(level),
         _ => None,
     }
 }
@@ -192,6 +207,9 @@ struct MuseCatalogRow {
     output_limit: Option<u64>,
     #[serde(default)]
     reasoning_effort_variants: Option<Vec<MuseEffortVariant>>,
+    /// Observed wire shape: capabilities live under `metadata["muse-code"]`.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -200,10 +218,82 @@ struct MuseEffortVariant {
     effort: Option<String>,
 }
 
-/// Parse `GET /muse-code/models`. Hidden rows and ids outside the safe shape
-/// are dropped; rows that fail to deserialize are skipped individually so one
-/// novel row cannot blank the whole catalog. Effort variants become an exact
-/// [`ReasoningSupport::NamedEffort`] set in catalog order.
+/// `metadata["muse-code"]` as served by `GET /muse-code/models` (models.dev
+/// style descriptor plus client `options` / `variants`). Every field is
+/// optional; a block that fails to deserialize is ignored as a whole (the row
+/// still routes, it just makes no capability claims).
+#[derive(Deserialize, Default)]
+struct MuseCodeMeta {
+    #[serde(default)]
+    is_hidden: Option<bool>,
+    #[serde(default)]
+    limit: Option<MuseLimit>,
+    #[serde(default)]
+    modalities: Option<MuseModalities>,
+    #[serde(default)]
+    options: Option<MuseOptions>,
+    /// `{"<name>": {"reasoningEffort": "<effort>", ...}, ...}`
+    #[serde(default)]
+    variants: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Deserialize, Default)]
+struct MuseLimit {
+    #[serde(default)]
+    context: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct MuseModalities {
+    #[serde(default)]
+    input: Option<Vec<String>>,
+    #[serde(default)]
+    output: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MuseOptions {
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+}
+
+/// Stable display/validation order for named efforts (the wire map's key
+/// order is not meaningful).
+fn effort_rank(level: ReasoningLevel) -> u8 {
+    match level {
+        ReasoningLevel::Off => 0,
+        ReasoningLevel::Low => 1,
+        ReasoningLevel::Medium => 2,
+        ReasoningLevel::High => 3,
+        ReasoningLevel::XHigh => 4,
+        ReasoningLevel::Max => 5,
+        ReasoningLevel::Ultra => 6,
+        ReasoningLevel::Adaptive | ReasoningLevel::UltraCode => u8::MAX,
+    }
+}
+
+fn push_unique(supported: &mut Vec<ReasoningLevel>, level: ReasoningLevel) {
+    if !supported.contains(&level) {
+        supported.push(level);
+    }
+}
+
+/// Parse `GET /muse-code/models`.
+///
+/// Observed wire shape (Meta, 2026-10): `{"object":"list","data":[{"id",
+/// "object","created","owned_by","metadata":{"muse-code":{"is_hidden",
+/// "limit":{"context","output"},"modalities":{"input","output"},
+/// "options":{"reasoningEffort",...},"variants":{"<name>":{"reasoningEffort"}},
+/// ...}}}]}`. A flat `{"models":[{display_label, reasoning_effort_variants,
+/// ...}]}` shape is also accepted. Hidden rows, rows that cannot output text
+/// (e.g. image generators) and ids outside the safe shape are dropped; rows
+/// that fail to deserialize are skipped individually so one novel row cannot
+/// blank the whole catalog. Effort variants become an exact
+/// [`ReasoningSupport::NamedEffort`] set; `options.reasoningEffort` becomes
+/// its default only when that level is in the set.
 pub fn parse_muse_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String> {
     let parsed: MuseCatalogBody =
         serde_json::from_str(body).map_err(|e| format!("invalid Muse catalog JSON: {e}"))?;
@@ -216,7 +306,22 @@ pub fn parse_muse_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String
         let Ok(row) = serde_json::from_value::<MuseCatalogRow>(value) else {
             continue;
         };
-        if row.visibility.as_deref() == Some("hidden") || !valid_muse_id(&row.id) {
+        let meta: MuseCodeMeta = row
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("muse-code"))
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+            .unwrap_or_default();
+        let modalities = meta.modalities.unwrap_or_default();
+        let text_output = modalities
+            .output
+            .as_ref()
+            .map_or(true, |out| out.iter().any(|m| m == "text"));
+        if row.visibility.as_deref() == Some("hidden")
+            || meta.is_hidden == Some(true)
+            || !text_output
+            || !valid_muse_id(&row.id)
+        {
             continue;
         }
         if ordered.iter().any(|(_, _, existing)| existing.id == row.id) {
@@ -227,8 +332,18 @@ pub fn parse_muse_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty());
         let mut model = muse_row(&row.id, label);
-        model.context_tokens = row.context_limit.filter(|n| *n > 0);
-        model.max_output_tokens = row.output_limit.filter(|n| *n > 0);
+        let limit = meta.limit.unwrap_or_default();
+        model.context_tokens = row.context_limit.or(limit.context).filter(|n| *n > 0);
+        model.max_output_tokens = row.output_limit.or(limit.output).filter(|n| *n > 0);
+        if let Some(input) = modalities.input.filter(|i| !i.is_empty()) {
+            let mut parsed = vec![Modality::Text];
+            for m in input.iter().map(|m| Modality::from_str(m.trim())) {
+                if !parsed.contains(&m) {
+                    parsed.push(m);
+                }
+            }
+            model.input_modalities = parsed;
+        }
         let mut supported = Vec::new();
         for effort in row
             .reasoning_effort_variants
@@ -237,12 +352,32 @@ pub fn parse_muse_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String
             .filter_map(|v| v.effort)
             .filter_map(|e| parse_muse_effort(e.trim()))
         {
-            if !supported.contains(&effort) {
-                supported.push(effort);
+            push_unique(&mut supported, effort);
+        }
+        let mut variant_levels = Vec::new();
+        for (name, variant) in meta.variants.unwrap_or_default() {
+            let effort = variant
+                .get("reasoningEffort")
+                .and_then(|e| e.as_str())
+                .unwrap_or(name.as_str());
+            if let Some(level) = parse_muse_effort(effort.trim()) {
+                push_unique(&mut variant_levels, level);
             }
         }
+        variant_levels.sort_by_key(|l| effort_rank(*l));
+        for level in variant_levels {
+            push_unique(&mut supported, level);
+        }
         if !supported.is_empty() {
-            model.reasoning = ReasoningSupport::NamedEffort { supported };
+            let default_level = meta
+                .options
+                .and_then(|o| o.reasoning_effort)
+                .and_then(|e| parse_muse_effort(e.trim()))
+                .filter(|level| supported.contains(level));
+            model.reasoning = ReasoningSupport::NamedEffort {
+                supported,
+                default_level,
+            };
         }
         ordered.push((row.display_order.unwrap_or(i64::MAX), index, model));
     }
@@ -304,7 +439,8 @@ mod tests {
         assert_eq!(
             spark.reasoning,
             ReasoningSupport::NamedEffort {
-                supported: vec![ReasoningLevel::Low, ReasoningLevel::High]
+                supported: vec![ReasoningLevel::Low, ReasoningLevel::High],
+                default_level: None,
             }
         );
         assert!(parse_muse_catalog_models(r#"{"data":[{"id":"m-1"}]}"#)
@@ -313,6 +449,121 @@ mod tests {
             .any(|m| m.id == "m-1"));
         assert!(parse_muse_catalog_models("{}").is_err());
         assert!(parse_muse_catalog_models("nope").is_err());
+    }
+
+    /// Real `GET /muse-code/models` rows (trimmed, 2026-10): capabilities
+    /// live under `metadata["muse-code"]`. Regression for live rows parsing
+    /// as `ReasoningSupport::Unknown`, which made every named level fail
+    /// with "no advertised effort levels".
+    const WIRE: &str = r#"{"object":"list","data":[
+        {"id":"muse-wonder-1.0","object":"model","created":1,"owned_by":"meta","metadata":{"muse-code":{
+          "attachment":true,"description":null,"family":"avocado","is_hidden":false,
+          "limit":{"context":1007997,"output":128000},
+          "modalities":{"input":["text","image"],"output":["text"]},
+          "name":"muse-wonder-1.0",
+          "options":{"forceReasoning":true,"include":["reasoning.encrypted_content"],
+                     "reasoningEffort":"high","temperature":0.9,"top_p":0.9},
+          "reasoning":true,"tool_call":true,
+          "variants":{"high":{"reasoningEffort":"high"},"low":{"reasoningEffort":"low"},
+                      "max":{"reasoningEffort":"max"},"medium":{"reasoningEffort":"medium"},
+                      "minimal":{"reasoningEffort":"minimal"},
+                      "xhigh":{"reasoningEffort":"xhigh","selector":{"description":"d"}}}}}},
+        {"id":"muse-image-1.0","object":"model","owned_by":"meta","metadata":{"muse-code":{
+          "is_hidden":true,"modalities":{"input":["text","image"],"output":["image"]},
+          "options":{},"tool_call":false}}},
+        {"id":"muse-visible-imagegen-zz7","object":"model","metadata":{"muse-code":{
+          "is_hidden":false,"modalities":{"input":["text"],"output":["image"]}}}},
+        {"id":"muse-odd-default-zz8","object":"model","metadata":{"muse-code":{
+          "options":{"reasoningEffort":"ultra"},"variants":{"fast":{"reasoningEffort":"low"}}}}},
+        {"id":"muse-bad-meta-zz9","object":"model","metadata":{"muse-code":{"limit":"nope"}}}
+    ]}"#;
+
+    #[test]
+    fn wire_catalog_reads_muse_code_metadata() {
+        let models = parse_muse_catalog_models(WIRE).unwrap();
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        // Hidden and image-output rows dropped; a malformed metadata block
+        // keeps the row (routable, no claims).
+        assert_eq!(
+            ids,
+            [
+                "muse-wonder-1.0",
+                "muse-odd-default-zz8",
+                "muse-bad-meta-zz9"
+            ]
+        );
+        let wonder = &models[0];
+        assert_eq!(wonder.source, CatalogSource::Live);
+        assert_eq!(wonder.context_tokens, Some(1_007_997));
+        assert_eq!(wonder.max_output_tokens, Some(128_000));
+        assert_eq!(
+            wonder.input_modalities,
+            vec![Modality::Text, Modality::Image]
+        );
+        // Map key order is irrelevant: canonical order, `minimal` dropped,
+        // `options.reasoningEffort` is the default.
+        assert_eq!(
+            wonder.reasoning,
+            ReasoningSupport::NamedEffort {
+                supported: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                default_level: Some(ReasoningLevel::High),
+            }
+        );
+        // Variant name is not the effort; a default outside the set is not
+        // claimed.
+        assert_eq!(
+            models[1].reasoning,
+            ReasoningSupport::NamedEffort {
+                supported: vec![ReasoningLevel::Low],
+                default_level: None,
+            }
+        );
+        let bad = &models[2];
+        assert_eq!(bad.reasoning, ReasoningSupport::Unknown);
+        assert_eq!(bad.input_modalities, vec![Modality::Text]);
+        assert_eq!(bad.context_tokens, None);
+    }
+
+    #[test]
+    fn wire_catalog_default_drives_default_level_for_model() {
+        use crate::runtime::openai::catalog::validation::{
+            default_level_for_model, validate_reasoning_mutation,
+        };
+        let _guard = test_cache_guard();
+        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
+        assert_eq!(
+            default_level_for_model("muse/muse-wonder-1.0"),
+            Some(ReasoningLevel::Adaptive),
+            "no live evidence → provider default"
+        );
+        capability_cache::replace_provider(
+            MUSE_PROVIDER_KEY,
+            &parse_muse_catalog_models(WIRE).unwrap(),
+        );
+        assert_eq!(
+            muse_default_level("muse-wonder-1.0"),
+            Some(ReasoningLevel::High)
+        );
+        assert_eq!(
+            default_level_for_model("muse/muse-wonder-1.0"),
+            Some(ReasoningLevel::High)
+        );
+        assert!(validate_reasoning_mutation("muse/muse-wonder-1.0", ReasoningLevel::XHigh).is_ok());
+        assert!(
+            validate_reasoning_mutation("muse/muse-wonder-1.0", ReasoningLevel::Ultra).is_err()
+        );
+        assert_eq!(muse_default_level("muse-odd-default-zz8"), None);
+        assert_eq!(
+            default_level_for_model("muse/muse-odd-default-zz8"),
+            Some(ReasoningLevel::Adaptive)
+        );
+        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
     }
 
     #[test]

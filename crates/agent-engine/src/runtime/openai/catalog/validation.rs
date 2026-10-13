@@ -12,9 +12,9 @@ use agent_core::reasoning::ReasoningLevel;
 
 use super::{
     anthropic_static_capability, capability_cache, codex_static_capability, kimi_code_capability,
-    kimi_static_capability, muse_routable_id, muse_supported_levels, plan_codex_execution,
-    xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
-    KimiReasoningCapability, ReasoningSupport, XaiReasoningCapability,
+    kimi_static_capability, muse_default_level, muse_routable_id, muse_supported_levels,
+    plan_codex_execution, xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion,
+    CodexRequestRole, KimiReasoningCapability, ReasoningSupport, XaiReasoningCapability,
 };
 
 /// Conservative option set for providers without authoritative exact-model
@@ -266,9 +266,10 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
 /// Model-default reasoning level applied on model switch when the user has
 /// not explicitly chosen a level. `None` = leave the current level untouched.
 pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
-    if model.starts_with("muse/") {
-        // No catalog default is advertised: provider default via omission.
-        return Some(ReasoningLevel::Adaptive);
+    if let Some(model_id) = model.strip_prefix("muse/") {
+        // Live catalog default (what the official client sends) when the
+        // exact row advertised one; otherwise provider default via omission.
+        return Some(muse_default_level(model_id).unwrap_or(ReasoningLevel::Adaptive));
     }
     if let Some(model_id) = model.strip_prefix("openai-codex/") {
         return match codex_reasoning_capability(model, model_id)? {

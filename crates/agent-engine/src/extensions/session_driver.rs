@@ -952,7 +952,7 @@ fn validate_model_capability(model: &str, level: ReasoningLevel) -> Result<(), S
                 ReasoningLevel::Low | ReasoningLevel::Medium | ReasoningLevel::High
             ),
             // Live catalog's exact advertised set (Meta Muse).
-            Some(ReasoningSupport::NamedEffort { supported }) => supported.contains(&level),
+            Some(ReasoningSupport::NamedEffort { supported, .. }) => supported.contains(&level),
             _ => false,
         };
         if !exact_effort {
