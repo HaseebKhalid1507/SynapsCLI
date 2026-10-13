@@ -141,6 +141,22 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
                 wire: WireProtocol::OpenAiChatCompletions,
             });
         }
+        if prefix == "muse" {
+            // Broker-proxied Meta Muse: the broker resolves the Model API key
+            // (env override or minted from the Meta login) and pins
+            // api.meta.ai. Ids must be a documented seed or an exact row
+            // from this process's live Muse catalog — unknown ids fail closed.
+            if !catalog::muse_runtime_model(rest) {
+                return None;
+            }
+            return Some(ResolvedRoute {
+                endpoint: crate::auth::muse::API_BASE_URL.into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::BrokerProxy,
+                wire: WireProtocol::OpenAiResponses,
+            });
+        }
         if prefix == "local" {
             let c = registry::resolve_provider_model(prefix, rest)?;
             return Some(ResolvedRoute {
@@ -260,6 +276,13 @@ pub(crate) async fn try_route_with_memory_backend(
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
+    // Live-only Muse ids route only once this process holds the live catalog;
+    // warm it (once, via the turn's broker) BEFORE attachment validation and
+    // route resolution, both of which consult the capability cache.
+    if model.starts_with("muse/") {
+        let broker = crate::auth::broker_from_source(source, cache, client.clone());
+        catalog::ensure_muse_model_routable(model, &broker).await;
+    }
     if let Err(error) = super::attachments::validate_history_for_request(model, messages) {
         return Some(Err(error.into()));
     }
@@ -335,8 +358,11 @@ pub(crate) async fn try_route_with_memory_backend(
                     "internal sync routing is unavailable for this streaming provider".into(),
                 ));
             }
+            // Same wire, per-provider body/identity: Meta Muse mirrors the
+            // official Muse Code request shape; everything else is xAI.
             Some(
-                stream::call_xai_responses_stream_inner(
+                stream::call_responses_route_inner(
+                    &route.provider,
                     &cfg,
                     &broker,
                     tools_schema,
@@ -499,6 +525,29 @@ mod tests {
             resolve_route("google-gemini/gemini-pro-latest").is_none(),
             "gemini-pro-latest is not a Code Assist wire ID (404 upstream)"
         );
+    }
+
+    #[test]
+    fn muse_routing_is_broker_proxied_responses_and_fail_closed() {
+        let route = resolve_route("muse/muse-wonder-1.0").expect("documented seed routes");
+        assert_eq!(route.provider, "muse");
+        assert_eq!(route.model, "muse-wonder-1.0");
+        assert_eq!(route.endpoint, crate::auth::muse::API_BASE_URL);
+        // The Model API key never reaches the runtime: broker-proxied.
+        assert_eq!(route.auth, AuthPolicy::BrokerProxy);
+        assert_eq!(route.wire, WireProtocol::OpenAiResponses);
+        // Unknown / near-miss / malformed ids fail closed (no live catalog).
+        for banned in [
+            "muse-wonder",
+            "muse-wonder-1.0-preview",
+            "MUSE-WONDER-1.0",
+            "",
+        ] {
+            assert!(
+                resolve_route(&format!("muse/{banned}")).is_none(),
+                "{banned} must not resolve"
+            );
+        }
     }
 
     #[test]

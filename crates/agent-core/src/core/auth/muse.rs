@@ -517,6 +517,13 @@ pub fn api_key_from_env() -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+/// Presence-only check for the `META_API_KEY` override (the value never
+/// leaves this module). Used by pickers: Muse is usable without a stored
+/// login when the override is set.
+pub fn env_api_key_present() -> bool {
+    api_key_from_env().is_some()
+}
+
 // ── Bounded body read ────────────────────────────────────────────────────────
 
 /// Read a response body with a hard byte cap. Fail closed if exceeded.
@@ -1013,7 +1020,10 @@ mod tests {
     fn constants_are_pinned_https_meta_hosts() {
         for url in [DEVICE_AUTH_URL, TOKEN_URL] {
             assert!(validate_device_endpoint(url).is_ok(), "{url}");
-            assert!(url.ends_with('/'), "official CLI sends trailing slash: {url}");
+            assert!(
+                url.ends_with('/'),
+                "official CLI sends trailing slash: {url}"
+            );
         }
         assert!(validate_mint_endpoint(MINT_URL).is_ok());
         assert_eq!(CLIENT_ID, "1031625952748946");
@@ -1264,10 +1274,14 @@ mod tests {
     async fn denial_expiry_and_cancel_stop_polling() {
         let http = FakeHttp::script(&[(400, r#"{"error":"access_denied"}"#)]);
         let authz = parse_device_code_response(DEVICE_OK, 0).unwrap();
-        let err =
-            wait_for_device_authorization(&http, &FakeClock::at(0), &authz, &AtomicBool::new(false))
-                .await
-                .unwrap_err();
+        let err = wait_for_device_authorization(
+            &http,
+            &FakeClock::at(0),
+            &authz,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, MuseAuthError::AccessDenied);
 
         // Deadline passes before the first poll.
@@ -1282,14 +1296,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, MuseAuthError::Expired);
 
-        let err = wait_for_device_authorization(
-            &http,
-            &FakeClock::at(0),
-            &authz,
-            &AtomicBool::new(true),
-        )
-        .await
-        .unwrap_err();
+        let err =
+            wait_for_device_authorization(&http, &FakeClock::at(0), &authz, &AtomicBool::new(true))
+                .await
+                .unwrap_err();
         assert_eq!(err, MuseAuthError::Cancelled);
     }
 

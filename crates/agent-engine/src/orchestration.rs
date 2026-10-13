@@ -138,6 +138,10 @@ pub fn validate_user_authorizable_model(raw: &str) -> Result<QualifiedModelId, S
         crate::runtime::openai::catalog::github_copilot_runtime_model(model.model()).is_some()
     } else if model.provider() == "google-gemini" {
         crate::runtime::openai::catalog::google_gemini_model(model.model()).is_some()
+    } else if model.provider() == "muse" {
+        // Documented seed or an exact row from this process's authenticated
+        // live Muse catalog — never an invented id.
+        crate::runtime::openai::catalog::muse_runtime_model(model.model())
     } else {
         crate::runtime::openai::registry::providers()
             .iter()

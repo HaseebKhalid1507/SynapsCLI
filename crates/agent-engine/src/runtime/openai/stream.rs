@@ -3211,6 +3211,32 @@ mod broker_stream_tests {
 /// Provider display label for the xai-auth Responses route.
 const XAI_PROVIDER_LABEL: &str = "xAI";
 
+/// Broker identity + display label for one OpenAI-Responses-wire provider
+/// routed through the shared streaming loop
+/// ([`stream_broker_responses`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResponsesProfile {
+    /// Broker provider key (credential + pinned origin + path allowlist).
+    pub broker_provider: &'static str,
+    /// Allowlisted broker path for the Responses endpoint.
+    pub path: &'static str,
+    /// User-facing provider name in stream errors and logs.
+    pub label: &'static str,
+}
+
+pub(crate) const XAI_RESPONSES: ResponsesProfile = ResponsesProfile {
+    broker_provider: "xai-auth",
+    path: "/responses",
+    label: XAI_PROVIDER_LABEL,
+};
+
+/// Meta Muse: `https://api.meta.ai` origin, Responses at `/v1/responses`.
+pub(crate) const MUSE_RESPONSES: ResponsesProfile = ResponsesProfile {
+    broker_provider: "muse",
+    path: "/v1/responses",
+    label: "Meta Muse",
+};
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_responses_stream_inner(
     cfg: &ProviderConfig,
@@ -3238,6 +3264,201 @@ pub(crate) async fn call_xai_responses_stream_inner(
         max_tokens,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    stream_broker_responses(
+        XAI_RESPONSES,
+        cfg,
+        broker,
+        body,
+        &names,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        cancel,
+        max_retries,
+        trace,
+        exact_wire_bytes,
+    )
+    .await
+}
+
+/// Dispatch a resolved `OpenAiResponses` route to its provider body builder:
+/// `muse` → [`call_muse_responses_stream_inner`], otherwise xAI.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_responses_route_inner(
+    route_provider: &str,
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if route_provider == MUSE_RESPONSES.broker_provider {
+        call_muse_responses_stream_inner(
+            cfg,
+            broker,
+            tools_schema,
+            system_prompt,
+            messages,
+            tx,
+            max_tokens,
+            reasoning_level,
+            cancel,
+            max_retries,
+            trace,
+            exact_wire_bytes,
+        )
+        .await
+    } else {
+        call_xai_responses_stream_inner(
+            cfg,
+            broker,
+            tools_schema,
+            system_prompt,
+            messages,
+            tx,
+            max_tokens,
+            reasoning_level,
+            cancel,
+            max_retries,
+            trace,
+            exact_wire_bytes,
+        )
+        .await
+    }
+}
+
+/// Meta Muse Responses route (`muse/<id>`). Mirrors the official Muse Code
+/// request shape: system prompt as `instructions`, conversation as typed
+/// input items, `store:false` (stateless), and a `prompt_cache_key` so the
+/// server-side prompt cache routes repeated prefixes to the same cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_muse_responses_stream_inner(
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tools, names) = translate::tools_to_responses(tools_schema);
+    let instructions = system_prompt.clone().unwrap_or_default();
+    // The system prompt travels as `instructions`, never duplicated in input.
+    let input = codex_input_messages(translate::messages_to_oai(messages, &None, &names));
+    let cache_key = muse_prompt_cache_key(&instructions, input.first());
+    // Validated BEFORE any broker credential access or network I/O.
+    let body = build_muse_body(
+        &cfg.model,
+        reasoning_level,
+        Value::Array(input),
+        &instructions,
+        tools,
+        max_tokens,
+        &cache_key,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    stream_broker_responses(
+        MUSE_RESPONSES,
+        cfg,
+        broker,
+        body,
+        &names,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        cancel,
+        max_retries,
+        trace,
+        exact_wire_bytes,
+    )
+    .await
+}
+
+/// Deterministic Muse cache-routing key derived from the stable prompt head
+/// (instructions + first input item), like the Codex key: identical heads
+/// share the prefix the server caches, and a /compact rewrite changes the
+/// key together with the prefix it invalidates. Namespaced so it can never
+/// collide with Codex keys.
+pub(crate) fn muse_prompt_cache_key(instructions: &str, first_item: Option<&Value>) -> String {
+    codex_prompt_cache_key(instructions, first_item).replacen("synaps-", "synaps-muse-", 1)
+}
+
+/// Pure, validated body construction for the Meta Muse Responses API.
+///
+/// Shape mirrors the official Muse Code client (verified by capture):
+/// `model`, `instructions`, `input`, `store:false`, `stream:true`, `tools`,
+/// `max_output_tokens`, `reasoning.effort`, `prompt_cache_key`. Reasoning is
+/// validated against the exact model's capability first; `Adaptive` omits
+/// the field (provider default). Encrypted reasoning is not requested:
+/// Synaps does not replay reasoning items across turns.
+#[allow(clippy::too_many_arguments)] // pure builder mirroring the wire body
+pub(crate) fn build_muse_body(
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    input: Value,
+    instructions: &str,
+    tools: Vec<Value>,
+    max_tokens: Option<u32>,
+    prompt_cache_key: &str,
+) -> Result<Value, String> {
+    crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+        &format!("muse/{model}"),
+        level,
+    )?;
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    if !instructions.is_empty() {
+        body.insert("instructions".into(), json!(instructions));
+    }
+    body.insert("input".into(), input);
+    body.insert("store".into(), json!(false));
+    body.insert("stream".into(), json!(true));
+    if !tools.is_empty() {
+        body.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(max) = max_tokens {
+        body.insert("max_output_tokens".into(), json!(max));
+    }
+    if let Some(effort) = crate::runtime::openai::catalog::muse_effort_label(level) {
+        body.insert("reasoning".into(), json!({ "effort": effort }));
+    }
+    body.insert("prompt_cache_key".into(), json!(prompt_cache_key));
+    Ok(Value::Object(body))
+}
+
+/// Shared streaming loop for broker-proxied OpenAI Responses providers
+/// (xAI, Meta Muse): one exact-bytes request, SSE decode, bounded retries
+/// that never replay after output reached the UI.
+#[allow(clippy::too_many_arguments)]
+async fn stream_broker_responses(
+    profile: ResponsesProfile,
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    body: Value,
+    names: &translate::ToolNameMap,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Serialize ONCE via the sanctioned constructor: the digested bytes are
     // the very bytes the broker sends upstream (`body_bytes` handoff,
     // LocalBroker verbatim) — `body`/`body_bytes` cannot diverge. On a
@@ -3245,8 +3466,12 @@ pub(crate) async fn call_xai_responses_stream_inner(
     // `CloudProxy` kind and no wire-byte claim. Every retry clones this
     // same request (identical `body` and `body_bytes`), so one wire digest
     // is honest for all attempt records.
-    let (proxy_request, body_bytes) =
-        crate::auth::ProxyRequest::post_json_exact("xai-auth", "/responses", body, true)?;
+    let (proxy_request, body_bytes) = crate::auth::ProxyRequest::post_json_exact(
+        profile.broker_provider,
+        profile.path,
+        body,
+        true,
+    )?;
     let tracer = tr::begin_openai_tracer(
         trace,
         &cfg.provider,
@@ -3261,7 +3486,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
         messages,
         system_prompt.as_deref(),
         tools_schema,
-        tr::renamed_tool_losses(&names),
+        tr::renamed_tool_losses(names),
     )
     .await;
     // One-shot explicit content capture (`/trace next content`): a no-op in
@@ -3304,7 +3529,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
         let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
         let mut interrupted = false;
         let mut text = String::new();
-        let mut parser = CodexSseDecoder::for_provider(XAI_PROVIDER_LABEL);
+        let mut parser = CodexSseDecoder::for_provider(profile.label);
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = tokio::select! {
             biased;
@@ -3390,7 +3615,8 @@ pub(crate) async fn call_xai_responses_stream_inner(
                 );
                 tracing::warn!(
                     code = failure.code,
-                    "xai stream retry {stream_retry}/{max_retries} after {delay:?}"
+                    provider = profile.broker_provider,
+                    "responses stream retry {stream_retry}/{max_retries} after {delay:?}"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -3412,7 +3638,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
         }
         content.extend(translate::tool_calls_to_content_blocks(
             &parser.completed_tools,
-            &names,
+            names,
         ));
         return Ok(json!({"role":"assistant","content":content}));
     }
@@ -6278,5 +6504,275 @@ mod interrupted_broker_tests {
             classify_error(&format!("denied: {STREAM_INTERRUPTED}")).0,
             Outcome::Blocked
         );
+    }
+}
+
+#[cfg(test)]
+mod muse_tests {
+    //! Meta Muse Responses route: exact body shape (mirrors the official
+    //! Muse Code client) and an end-to-end turn through a capturing broker.
+    use super::*;
+    use crate::auth::{
+        AccessToken, BrokerError, CredentialBroker, ProxyByteStream, ProxyMethod, ProxyRequest,
+        ProxyResponse,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn body_mirrors_official_client_and_adaptive_omits_reasoning() {
+        let input = json!([{"role":"user","content":[{"type":"input_text","text":"hi"}]}]);
+        let tool = json!({"type":"function","name":"bash","parameters":{"type":"object"}});
+        let key = muse_prompt_cache_key("sys", input.as_array().unwrap().first());
+        let body = build_muse_body(
+            "muse-wonder-1.0",
+            ReasoningLevel::Adaptive,
+            input.clone(),
+            "sys",
+            vec![tool.clone()],
+            Some(2048),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(body["model"], "muse-wonder-1.0");
+        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["input"], input);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"], json!([tool]));
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["prompt_cache_key"], key.as_str());
+        assert!(
+            body.get("reasoning").is_none(),
+            "adaptive = provider default"
+        );
+        assert!(body.get("messages").is_none());
+        assert!(body.get("temperature").is_none());
+
+        // Empty prompt/tools/limit are omitted, not sent empty.
+        let bare = build_muse_body(
+            "muse-wonder-1.0",
+            ReasoningLevel::Adaptive,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            &key,
+        )
+        .unwrap();
+        for absent in ["instructions", "tools", "max_output_tokens", "reasoning"] {
+            assert!(bare.get(absent).is_none(), "{absent}");
+        }
+    }
+
+    #[test]
+    fn named_effort_requires_exact_live_evidence_before_any_io() {
+        // The static seed advertises no effort set: named levels are refused
+        // in the pure builder, i.e. before credentials or network.
+        for level in [
+            ReasoningLevel::Off,
+            ReasoningLevel::High,
+            ReasoningLevel::Max,
+        ] {
+            let err = build_muse_body(
+                "muse-wonder-1.0",
+                level,
+                json!([]),
+                "",
+                Vec::new(),
+                None,
+                "k",
+            )
+            .unwrap_err();
+            assert!(err.contains("adaptive"), "{level}: {err}");
+        }
+        assert!(build_muse_body(
+            "never-cataloged-zz9",
+            ReasoningLevel::Adaptive,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            "k"
+        )
+        .is_err());
+
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        let models = crate::runtime::openai::catalog::parse_muse_catalog_models(
+            r#"{"models":[{"id":"muse-body-probe-zz2","reasoning_effort_variants":
+                [{"effort":"none"},{"effort":"xhigh"}]}]}"#,
+        )
+        .unwrap();
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &models);
+        for (level, effort) in [
+            (ReasoningLevel::Off, "none"),
+            (ReasoningLevel::XHigh, "xhigh"),
+        ] {
+            let body = build_muse_body(
+                "muse-body-probe-zz2",
+                level,
+                json!([]),
+                "",
+                Vec::new(),
+                None,
+                "k",
+            )
+            .unwrap();
+            assert_eq!(body["reasoning"], json!({"effort": effort}));
+        }
+        assert!(build_muse_body(
+            "muse-body-probe-zz2",
+            ReasoningLevel::High,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            "k"
+        )
+        .is_err());
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &[]);
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_namespaced_and_prefix_sensitive() {
+        let first = json!({"role":"user","content":"a"});
+        let k1 = muse_prompt_cache_key("sys", Some(&first));
+        assert_eq!(k1, muse_prompt_cache_key("sys", Some(&first)));
+        assert!(k1.starts_with("synaps-muse-"), "{k1}");
+        assert_ne!(k1, codex_prompt_cache_key("sys", Some(&first)));
+        assert_ne!(k1, muse_prompt_cache_key("sys2", Some(&first)));
+        assert_ne!(
+            k1,
+            muse_prompt_cache_key("sys", Some(&json!({"role":"user","content":"b"})))
+        );
+    }
+
+    struct CaptureBroker {
+        sse: &'static str,
+        seen: Mutex<Vec<ProxyRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialBroker for CaptureBroker {
+        async fn access_token(
+            &self,
+            _: crate::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            unreachable!("the runtime never holds the Muse key")
+        }
+        async fn proxy(&self, _: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            unreachable!()
+        }
+        async fn proxy_stream(
+            &self,
+            request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            self.seen.lock().unwrap().push(request);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                bytes::Bytes::from_static(self.sse.as_bytes()),
+            )])))
+        }
+        async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+            unreachable!()
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    const SSE: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",",
+        "\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+        "{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn turn_streams_through_broker_with_system_prompt_as_instructions() {
+        let broker = Arc::new(CaptureBroker {
+            sse: SSE,
+            seen: Mutex::new(Vec::new()),
+        });
+        let dyn_broker: Arc<dyn CredentialBroker> = broker.clone();
+        let cfg = ProviderConfig {
+            base_url: crate::auth::muse::API_BASE_URL.into(),
+            model: "muse-wonder-1.0".into(),
+            provider: "muse".into(),
+        };
+        let tools = vec![json!({
+            "name":"bash","description":"run","input_schema":{"type":"object","properties":{}}
+        })];
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role":"user","content":"hi muse"}))];
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let result = call_responses_route_inner(
+            "muse",
+            &cfg,
+            &dyn_broker,
+            &tools,
+            &Some("You are Synaps.".into()),
+            &messages,
+            &tx,
+            Some(4096),
+            ReasoningLevel::Adaptive,
+            &cancel,
+            0,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await
+        .expect("muse turn completes");
+
+        // Assistant text + translated tool call come back Anthropic-shaped.
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "Hello");
+        let tool_use = content
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool call surfaced");
+        assert_eq!(tool_use["name"], "bash");
+        assert_eq!(tool_use["input"]["command"], "ls");
+
+        // Exactly one broker-proxied POST to the pinned Responses path.
+        let seen = broker.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let request = &seen[0];
+        assert_eq!(request.provider, "muse");
+        assert_eq!(request.method, ProxyMethod::Post);
+        assert_eq!(request.path, "/v1/responses");
+        assert!(request.stream);
+        let body = request.body.as_ref().unwrap();
+        assert_eq!(body["model"], "muse-wonder-1.0");
+        assert_eq!(body["instructions"], "You are Synaps.");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["max_output_tokens"], 4096);
+        assert!(body["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("synaps-muse-"));
+        // System prompt is NOT duplicated into the input items.
+        let wire = body["input"].to_string();
+        assert!(!wire.contains("You are Synaps."), "{wire}");
+        assert!(wire.contains("hi muse"), "{wire}");
+        assert_eq!(body["tools"][0]["name"], "bash");
+        // Exact-bytes handoff matches the structured body.
+        let bytes = request.body_bytes.as_ref().expect("exact wire bytes");
+        assert_eq!(
+            serde_json::from_slice::<Value>(bytes).unwrap(),
+            body.clone()
+        );
+
+        drop(tx);
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(text)) = event {
+                streamed.push_str(&text);
+            }
+        }
+        assert_eq!(streamed, "Hello");
     }
 }
