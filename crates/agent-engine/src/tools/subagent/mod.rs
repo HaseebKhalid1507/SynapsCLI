@@ -687,9 +687,12 @@ mod codex_ultra_worker_tests {
                 .find("let session_allow_all = ctx.capabilities.session_allow_all.clone();")
                 .unwrap();
             let spawn = source.find("super::spawn_runtime().await").unwrap();
-            let inherit = source
-                .find("memory_backend.as_ref(), session_allow_all.as_ref())")
-                .unwrap();
+            let memory = source.find("memory_backend.as_ref()").unwrap();
+            // Formatting-agnostic: the call may be wrapped across lines.
+            let inherit = memory
+                + source[memory..]
+                    .find("session_allow_all.as_ref()")
+                    .unwrap();
             let stream = source.find("runtime.run_stream").unwrap();
             assert!(
                 capture < spawn && spawn < inherit && inherit < stream,

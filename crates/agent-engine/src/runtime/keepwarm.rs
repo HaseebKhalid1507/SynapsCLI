@@ -1373,7 +1373,12 @@ mod tests {
             auth_type: "oauth".to_string(),
             refresh_token: None,
             token_expires: Some(crate::epoch_millis() + 3_600_000),
-            bound_credential: None,
+            // Bound to the default local seat so the turn's binding check
+            // takes the fast path instead of re-resolving from auth.json.
+            bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                &crate::auth::CredentialSource::Local,
+                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+            )),
         }));
         let o = assert_identity_1h(&rt).await;
         assert!(

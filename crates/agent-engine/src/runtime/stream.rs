@@ -3223,18 +3223,24 @@ mod rich_output_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn serial_streaming_history_respects_hook_outcome() {
+        let _base = crate::test_env::BaseDirGuard::new();
         streaming_history_cases(false).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn parallel_streaming_history_respects_hook_outcome() {
+        let _base = crate::test_env::BaseDirGuard::new();
         streaming_history_cases(true).await;
     }
 
     // Provider-free checks of the internal outcome and compatibility wrapper.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn after_tool_outcome_distinguishes_replace_from_truncation() {
+        let _base = crate::test_env::BaseDirGuard::new();
         for hook in [None, Some(false), Some(true)] {
             let bus = output_hook_bus(hook).await;
             for summary in ["REPLACED BY HOOK".to_string(), "é".repeat(100)] {
