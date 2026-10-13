@@ -313,10 +313,12 @@ pub fn budget_command(arg: &str, runtime: &mut crate::Runtime) -> CommandResult 
                 budget
                     .max_elapsed_secs()
                     .map_or_else(|| "off".into(), |s| format!("{s}s")),
-                budget.max_provider_rounds,
+                budget.max_provider_rounds.map_or_else(|| "off".into(), |v| v.to_string()),
                 budget.max_round_renewals,
-                budget.max_tool_calls,
-                budget.max_accumulated_tool_result_bytes,
+                budget.max_tool_calls.map_or_else(|| "off".into(), |v| v.to_string()),
+                budget
+                    .max_accumulated_tool_result_bytes
+                    .map_or_else(|| "off".into(), |v| v.to_string()),
                 budget.max_context_tokens.map_or_else(|| "unset".into(), |v| v.to_string()),
                 budget.max_cost_usd.map_or_else(|| "unset".into(), |v| v.to_string()),
             ))
@@ -1031,7 +1033,9 @@ mod tests {
             };
             assert!(text.contains("wall-clock: off;"));
             assert!(text.contains("not live usage"));
-            assert!(text.contains("tool calls: 512"));
+            assert!(text.contains("provider rounds: off (+8 bounded renewals)"));
+            assert!(text.contains("tool calls: off;"));
+            assert!(text.contains("tool-result bytes: off\n"));
             assert_eq!(runtime.turn_budget(), &original);
         }
         for arg in [
@@ -1061,7 +1065,7 @@ mod tests {
         let mut runtime = crate::Runtime::new_headless();
         let original = TurnBudget {
             max_elapsed: Some(std::time::Duration::ZERO),
-            max_tool_calls: 11,
+            max_tool_calls: Some(11),
             max_context_tokens: Some(456),
             max_cost_usd: Some(0.75),
             ..TurnBudget::for_role(TurnRole::Foreground)
