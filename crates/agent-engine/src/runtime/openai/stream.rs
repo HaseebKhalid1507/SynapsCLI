@@ -6586,8 +6586,19 @@ mod muse_tests {
             .unwrap_err();
             assert!(err.contains("adaptive"), "{level}: {err}");
         }
+        // Uncataloged-but-routable id: provider default only; malformed: none.
         assert!(build_muse_body(
             "never-cataloged-zz9",
+            ReasoningLevel::Adaptive,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            "k"
+        )
+        .is_ok());
+        assert!(build_muse_body(
+            "Bad Id",
             ReasoningLevel::Adaptive,
             json!([]),
             "",

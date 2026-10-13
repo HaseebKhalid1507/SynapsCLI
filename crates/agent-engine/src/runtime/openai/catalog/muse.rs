@@ -12,7 +12,17 @@
 //! only the publicly documented id ships as a seed, and it carries NO
 //! reasoning claim (only the provider default is expressible). Anything else
 //! — more ids, exact effort sets, limits — comes from the live catalog via
-//! the capability cache. Unknown ids fail closed at route resolution.
+//! the capability cache.
+//!
+//! Routing follows the registry precedent for server-catalog providers
+//! (e.g. `inferx/<any published id>`): any id of the safe shape routes to
+//! the pinned `api.meta.ai` origin and Meta is authoritative for existence.
+//! Routing must NOT depend on the process-local capability cache — the
+//! daemon, a resumed session or a fresh process would otherwise refuse a
+//! model the picker (another process) had listed. Capability claims stay
+//! evidence-gated: named reasoning levels require the live effort set, and
+//! strict validators (subagent authorization, session drivers) still require
+//! a seed or an exact live row ([`muse_runtime_model`]).
 
 use agent_core::reasoning::ReasoningLevel;
 use serde::Deserialize;
@@ -49,10 +59,6 @@ pub fn muse_static_model(id: &str) -> Option<&'static MuseModelDescriptor> {
 
 /// Conservative id shape for live rows: lowercase ascii alnum plus `.-_`,
 /// starting alphanumeric, bounded length. Anything else is dropped.
-pub(crate) fn is_valid_muse_id(id: &str) -> bool {
-    valid_muse_id(id)
-}
-
 fn valid_muse_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     !bytes.is_empty()
@@ -76,8 +82,16 @@ pub(crate) fn test_cache_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// True when `id` is routable: a static seed, or an exact row the live Muse
-/// catalog put in the capability cache this process.
+/// True when `id` may be routed to the pinned Muse origin: the safe id
+/// shape only. Existence is Meta's decision (a typo surfaces as an upstream
+/// error on the first turn, exactly like other server-catalog providers).
+pub fn muse_routable_id(id: &str) -> bool {
+    valid_muse_id(id)
+}
+
+/// True when `id` is KNOWN: a static seed, or an exact row the live Muse
+/// catalog put in the capability cache this process. Strict validators use
+/// this; routing uses [`muse_routable_id`].
 pub fn muse_runtime_model(id: &str) -> bool {
     muse_static_model(id).is_some()
         || capability_cache::get(&format!("{MUSE_PROVIDER_KEY}/{id}"))
@@ -310,7 +324,11 @@ mod tests {
         assert_eq!(seeds[0].source, CatalogSource::StaticFallback);
         assert_eq!(seeds[0].reasoning, ReasoningSupport::Unknown);
         assert!(muse_runtime_model("muse-wonder-1.0"));
+        // Known (strict) vs routable (shape): uncataloged ids route but are
+        // not "known" to strict validators.
         assert!(!muse_runtime_model("never-cataloged-zz9"));
+        assert!(muse_routable_id("never-cataloged-zz9"));
+        assert!(!muse_routable_id("Bad Id"));
         assert_eq!(muse_supported_levels("muse-wonder-1.0"), None);
     }
 

@@ -79,9 +79,9 @@ pub use kimi::{
     KimiReasoningCapability, KIMI_CODE_TEXT_MODELS,
 };
 pub use muse::{
-    muse_effort_label, muse_runtime_model, muse_static_catalog_models, muse_static_model,
-    muse_supported_levels, parse_muse_catalog_models, MuseModelDescriptor, MUSE_MODELS_PATH,
-    MUSE_PROVIDER_KEY, MUSE_PROVIDER_NAME, MUSE_TEXT_MODELS,
+    muse_effort_label, muse_routable_id, muse_runtime_model, muse_static_catalog_models,
+    muse_static_model, muse_supported_levels, parse_muse_catalog_models, MuseModelDescriptor,
+    MUSE_MODELS_PATH, MUSE_PROVIDER_KEY, MUSE_PROVIDER_NAME, MUSE_TEXT_MODELS,
 };
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
@@ -656,36 +656,63 @@ impl ModelCatalogProvider for MuseCatalogProvider {
     }
 }
 
-/// Make a `muse/<id>` model routable in this process before a turn.
+/// Minimum spacing between Muse catalog warm-ups in one process, so an id
+/// absent from the live catalog (or a logged-out / failing broker) can never
+/// turn every turn or setting change into a catalog request.
+const MUSE_WARMUP_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+/// Upper bound on one warm-up: it runs on the model-change / settings path.
+const MUSE_WARMUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+static MUSE_WARMUP_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn reset_muse_warmup_backoff() {
+    *MUSE_WARMUP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Load live Muse capability evidence for `model` into THIS process.
 ///
-/// The Muse catalog is server-driven and the capability cache is
-/// process-local, so a live-only id saved as the default (or resumed in a
-/// fresh process) would not route until `/models` was opened. When `model`
-/// is a `muse/` id that is not yet routable, fetch the live catalog ONCE
-/// through the turn's broker and refresh the cache. This never widens
-/// routing: the id must still appear in the live catalog, otherwise route
-/// resolution fails closed exactly as before. Non-Muse models, already
-/// routable ids and malformed ids are a no-op (no network). Errors are
-/// swallowed here — the subsequent route resolution reports the outcome.
-pub async fn ensure_muse_model_routable(
+/// The capability cache is process-local: the `/models` picker fills the
+/// TUI's, but a daemon-hosted session (or a resumed / fresh process) has
+/// none, so exact effort levels would be unknown there. When `model` is a
+/// well-formed `muse/` id with no live row in this process, fetch the live
+/// catalog once through `broker` and refresh the cache. Bounded: a no-op for
+/// non-Muse / malformed ids or ids already known live; at most one attempt
+/// per [`MUSE_WARMUP_BACKOFF`]; each attempt capped at
+/// [`MUSE_WARMUP_TIMEOUT`]. Never affects routing (shape-based) and never
+/// fails the caller — errors are logged; validation reports the outcome.
+pub async fn ensure_muse_catalog_for(
     model: &str,
     broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
 ) {
     let Some(id) = model.strip_prefix("muse/") else {
         return;
     };
-    if muse_runtime_model(id) || !muse::is_valid_muse_id(id) {
+    if !muse_routable_id(id)
+        || capability_cache::get(&format!("{MUSE_PROVIDER_KEY}/{id}"))
+            .is_some_and(|row| row.source == CatalogSource::Live)
+    {
         return;
     }
-    match broker_proxy_catalog_body_via(broker, MUSE_PROVIDER_KEY, MUSE_MODELS_PATH).await {
-        Ok(body) => match parse_muse_catalog_models(&body) {
+    {
+        let mut last = MUSE_WARMUP_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| at.elapsed() < MUSE_WARMUP_BACKOFF) {
+            return;
+        }
+        // Claimed BEFORE the request: concurrent callers don't stampede.
+        *last = Some(std::time::Instant::now());
+    }
+    let fetch = broker_proxy_catalog_body_via(broker, MUSE_PROVIDER_KEY, MUSE_MODELS_PATH);
+    match tokio::time::timeout(MUSE_WARMUP_TIMEOUT, fetch).await {
+        Ok(Ok(body)) => match parse_muse_catalog_models(&body) {
             Ok(models) => capability_cache::replace_provider(MUSE_PROVIDER_KEY, &models),
             Err(err) => tracing::warn!("muse catalog warm-up parse failed: {err}"),
         },
-        Err(CatalogBrokerError::NotAuthenticated(_)) => {}
-        Err(CatalogBrokerError::Failed(err)) => {
+        Ok(Err(CatalogBrokerError::NotAuthenticated(_))) => {}
+        Ok(Err(CatalogBrokerError::Failed(err))) => {
             tracing::warn!("muse catalog warm-up failed: {err}")
         }
+        Err(_) => tracing::warn!("muse catalog warm-up timed out"),
     }
 }
 
@@ -1730,8 +1757,9 @@ mod tests {
 
 #[cfg(test)]
 mod muse_warmup_tests {
-    //! `ensure_muse_model_routable`: one catalog GET through the turn's
-    //! broker, only when a `muse/` id is not yet routable; never widens.
+    //! `ensure_muse_catalog_for`: at most one catalog GET (backed off)
+    //! through the given broker, only for a well-formed `muse/` id with no
+    //! live row in this process; never affects routing.
     use super::*;
     use crate::auth::{
         AccessToken, BrokerError, CredentialBroker, ProxyByteStream, ProxyMethod, ProxyRequest,
@@ -1783,20 +1811,28 @@ mod muse_warmup_tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(ensure_muse_model_routable(model, &dyn_broker));
+            .block_on(ensure_muse_catalog_for(model, &dyn_broker));
+    }
+
+    fn fresh() {
+        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
+        reset_muse_warmup_backoff();
     }
 
     const CATALOG: &str = r#"{"models":[{"id":"muse-warmup-probe-zz7","display_order":1,
         "reasoning_effort_variants":[{"effort":"high"}]}]}"#;
 
     #[test]
-    fn live_only_id_is_warmed_once_through_the_turn_broker() {
+    fn uncached_id_loads_live_evidence_once_through_the_given_broker() {
         let _guard = muse::test_cache_guard();
-        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
-        assert!(crate::runtime::openai::resolve_route("muse/muse-warmup-probe-zz7").is_none());
+        fresh();
+        let model = "muse/muse-warmup-probe-zz7";
+        // Routes before any catalog (shape-based), but no effort evidence.
+        assert!(crate::runtime::openai::resolve_route(model).is_some());
+        assert_eq!(muse_supported_levels("muse-warmup-probe-zz7"), None);
 
         let b = broker(Ok(CATALOG));
-        run("muse/muse-warmup-probe-zz7", &b);
+        run(model, &b);
         {
             let seen = b.seen.lock().unwrap();
             assert_eq!(seen.len(), 1);
@@ -1805,33 +1841,36 @@ mod muse_warmup_tests {
             assert_eq!(seen[0].path, MUSE_MODELS_PATH);
             assert!(seen[0].body.is_none());
         }
-        let route = crate::runtime::openai::resolve_route("muse/muse-warmup-probe-zz7")
-            .expect("warmed live id routes");
-        assert_eq!(route.provider, "muse");
-        assert_eq!(route.model, "muse-warmup-probe-zz7");
+        assert_eq!(
+            muse_supported_levels("muse-warmup-probe-zz7"),
+            Some(vec![agent_core::reasoning::ReasoningLevel::High])
+        );
 
-        // Now routable → no second fetch.
-        run("muse/muse-warmup-probe-zz7", &b);
+        // Live row now known → no second fetch, even with the backoff reset.
+        reset_muse_warmup_backoff();
+        run(model, &b);
         assert_eq!(b.seen.lock().unwrap().len(), 1);
-        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
+        fresh();
     }
 
     #[test]
-    fn warmup_never_widens_and_skips_non_candidates() {
+    fn warmup_is_backed_off_and_skips_non_candidates() {
         let _guard = muse::test_cache_guard();
-        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
-        // Id absent from the live catalog: fetched, still fails closed.
+        fresh();
+        // Id absent from the live catalog: one fetch, then backed off — an
+        // unknown id can never turn every turn into a catalog request.
         let b = broker(Ok(CATALOG));
         run("muse/not-in-live-catalog-zz8", &b);
+        run("muse/not-in-live-catalog-zz8", &b);
+        run("muse/another-missing-zz9", &b);
         assert_eq!(b.seen.lock().unwrap().len(), 1);
-        assert!(crate::runtime::openai::resolve_route("muse/not-in-live-catalog-zz8").is_none());
 
-        // No network for: non-Muse models, static seeds, malformed ids.
+        // No network for: non-Muse models and malformed ids.
+        fresh();
         let idle = broker(Ok(CATALOG));
         for model in [
             "xai-auth/grok-4.5",
             "anthropic/claude-x",
-            "muse/muse-wonder-1.0",
             "muse/Bad Id",
             "muse/../x",
             "muse/",
@@ -1840,16 +1879,18 @@ mod muse_warmup_tests {
         }
         assert!(idle.seen.lock().unwrap().is_empty());
 
-        // Not logged in / broker failure: swallowed, routing fails closed.
-        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
+        // Not logged in / broker failure: swallowed, attempt still backed off.
         for err in [
             BrokerError::NotConfigured("muse".into()),
             BrokerError::Transport("down".into()),
         ] {
+            fresh();
             let failing = broker(Err(err));
             run("muse/muse-warmup-probe-zz7", &failing);
-            assert!(crate::runtime::openai::resolve_route("muse/muse-warmup-probe-zz7").is_none());
+            run("muse/muse-warmup-probe-zz7", &failing);
+            assert_eq!(failing.seen.lock().unwrap().len(), 1);
+            assert_eq!(muse_supported_levels("muse-warmup-probe-zz7"), None);
         }
-        capability_cache::replace_provider(MUSE_PROVIDER_KEY, &[]);
+        fresh();
     }
 }

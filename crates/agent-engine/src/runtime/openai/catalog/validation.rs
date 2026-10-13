@@ -12,7 +12,7 @@ use agent_core::reasoning::ReasoningLevel;
 
 use super::{
     anthropic_static_capability, capability_cache, codex_static_capability, kimi_code_capability,
-    kimi_static_capability, muse_runtime_model, muse_supported_levels, plan_codex_execution,
+    kimi_static_capability, muse_routable_id, muse_supported_levels, plan_codex_execution,
     xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion, CodexRequestRole,
     KimiReasoningCapability, ReasoningSupport, XaiReasoningCapability,
 };
@@ -98,7 +98,7 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
     if let Some(model_id) = model.strip_prefix("muse/") {
         // Adaptive = provider default (omit `reasoning`) — always expressible
         // on a routable id. Named levels need the exact live effort set.
-        if !muse_runtime_model(model_id) {
+        if !muse_routable_id(model_id) {
             return Err(format!(
                 "no capability metadata for {model}; cannot authorize level '{level}'"
             ));
@@ -110,8 +110,8 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
             Some(levels) if levels.contains(&level) => Ok(()),
             Some(levels) => Err(unsupported_msg(level, model, &levels)),
             None => Err(format!(
-                "{model} has no advertised effort levels yet; level '{level}' cannot be sent — \
-                 use adaptive (open /models to load the live Muse catalog)"
+                "{model} has no advertised effort levels (live Muse catalog not loaded, or the \
+                 model has none); level '{level}' cannot be sent — use adaptive"
             )),
         };
     }
@@ -471,8 +471,11 @@ mod tests {
         }
         assert_eq!(thinking_options_for_model(seed), ["adaptive"]);
         assert_eq!(default_level_for_model(seed), Some(Adaptive));
-        // Unknown id: nothing, not even adaptive, is authorized.
-        assert!(validate_reasoning_mutation("muse/never-cataloged-zz9", Adaptive).is_err());
+        // Uncataloged (routable) id: provider default only.
+        assert!(validate_reasoning_mutation("muse/never-cataloged-zz9", Adaptive).is_ok());
+        assert!(validate_reasoning_mutation("muse/never-cataloged-zz9", High).is_err());
+        // Malformed id: nothing, not even adaptive, is authorized.
+        assert!(validate_reasoning_mutation("muse/Bad Id", Adaptive).is_err());
 
         // A live row with an exact effort set authorizes exactly that set.
         let models = crate::runtime::openai::catalog::parse_muse_catalog_models(

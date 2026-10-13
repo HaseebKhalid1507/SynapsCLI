@@ -144,9 +144,10 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
         if prefix == "muse" {
             // Broker-proxied Meta Muse: the broker resolves the Model API key
             // (env override or minted from the Meta login) and pins
-            // api.meta.ai. Ids must be a documented seed or an exact row
-            // from this process's live Muse catalog — unknown ids fail closed.
-            if !catalog::muse_runtime_model(rest) {
+            // api.meta.ai. Server-driven catalog → registry precedent: any
+            // safe-shaped id routes and Meta decides existence. Routing never
+            // depends on the process-local catalog cache (daemon/resume).
+            if !catalog::muse_routable_id(rest) {
                 return None;
             }
             return Some(ResolvedRoute {
@@ -276,12 +277,12 @@ pub(crate) async fn try_route_with_memory_backend(
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
-    // Live-only Muse ids route only once this process holds the live catalog;
-    // warm it (once, via the turn's broker) BEFORE attachment validation and
-    // route resolution, both of which consult the capability cache.
+    // Muse capability evidence (exact effort set, modalities) lives in the
+    // process-local cache; load it here via the turn's broker when this
+    // process has none for the model, BEFORE body validation consults it.
     if model.starts_with("muse/") {
         let broker = crate::auth::broker_from_source(source, cache, client.clone());
-        catalog::ensure_muse_model_routable(model, &broker).await;
+        catalog::ensure_muse_catalog_for(model, &broker).await;
     }
     if let Err(error) = super::attachments::validate_history_for_request(model, messages) {
         return Some(Err(error.into()));
@@ -536,13 +537,15 @@ mod tests {
         // The Model API key never reaches the runtime: broker-proxied.
         assert_eq!(route.auth, AuthPolicy::BrokerProxy);
         assert_eq!(route.wire, WireProtocol::OpenAiResponses);
-        // Unknown / near-miss / malformed ids fail closed (no live catalog).
-        for banned in [
-            "muse-wonder",
-            "muse-wonder-1.0-preview",
-            "MUSE-WONDER-1.0",
-            "",
-        ] {
+        // Server-driven catalog (registry precedent): any safe-shaped id
+        // routes WITHOUT a live catalog in this process — Meta decides
+        // existence. This is what lets a daemon-hosted session switch to a
+        // model only the TUI's picker fetched.
+        let live_only = resolve_route("muse/muse-spark-9.9").expect("shape-valid id routes");
+        assert_eq!(live_only.model, "muse-spark-9.9");
+        assert_eq!(live_only.wire, WireProtocol::OpenAiResponses);
+        // Malformed ids fail closed: they never reach the request body.
+        for banned in ["MUSE-WONDER-1.0", "", "a b", "../x", "-x", "a/b"] {
             assert!(
                 resolve_route(&format!("muse/{banned}")).is_none(),
                 "{banned} must not resolve"

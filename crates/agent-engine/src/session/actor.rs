@@ -3342,6 +3342,16 @@ impl SessionActor {
             SessionSetting::ReloadPrompt => "reload_prompt",
             SessionSetting::GrantWorkerModel { .. } => "grant_worker_model",
         };
+        // Capability evidence must exist in THIS (possibly daemon) process
+        // before the mutation is validated and a reasoning clamp decided.
+        match &setting {
+            SessionSetting::Model { model } => self.runtime.prepare_model_capabilities(model).await,
+            SessionSetting::ReasoningLevel { .. } => {
+                let model = self.runtime.model().to_string();
+                self.runtime.prepare_model_capabilities(&model).await;
+            }
+            _ => {}
+        }
         let rt = &mut self.runtime;
         let mut clamp_wire = None;
         let result: std::result::Result<Option<String>, String> = match setting {
