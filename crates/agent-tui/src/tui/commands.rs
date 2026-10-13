@@ -14,7 +14,8 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
 /// Commands that work while streaming.
-pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit", "attachments", "detach"];
+pub(super) const STREAMING_COMMANDS: &[&str] =
+    &["gamba", "theme", "quit", "exit", "attachments", "detach", "watch"];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
@@ -858,6 +859,9 @@ pub(super) async fn handle_command(
         "quit" | "exit" => {
             return CommandAction::Quit;
         }
+        "watch" => {
+            super::watch::command(app, arg, std::time::Instant::now());
+        }
         "theme" => {
             app.handle_theme_command(arg);
         }
@@ -1435,6 +1439,14 @@ pub(super) fn handle_streaming_command(
             } else {
                 app.push_msg(super::app::ChatMessage::System("usage: /detach [n|all]".into()));
             }
+            CommandAction::None
+        }
+        "watch" => {
+            let arg = full_input[1..]
+                .split_once(' ')
+                .map(|x| x.1)
+                .unwrap_or("");
+            super::watch::command(app, arg, std::time::Instant::now());
             CommandAction::None
         }
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
@@ -2403,7 +2415,7 @@ mod streaming_command_tests {
     #[test]
     fn theme_and_friends_are_streaming_commands() {
         let cmds = to_owned_commands(STREAMING_COMMANDS);
-        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba"] {
+        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba", "watch"] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");
         }

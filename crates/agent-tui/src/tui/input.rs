@@ -16,6 +16,8 @@ pub(super) enum InputAction {
     SlashCommand(String, String),
     /// User submitted input while streaming — contains the raw input string.
     StreamingInput(String),
+    /// Enter in a worker view: steer that subagent with the text.
+    SubagentSteer { handle_id: String, text: String },
     /// Start the quit animation.
     Quit,
     /// Abort the current stream (Esc during streaming).
@@ -184,61 +186,86 @@ fn handle_mouse(
     // lock L3: wheel + click in one input batch maps into rows demoted as of
     // the last frame). The re-render crosses the seam via RenderCtx, same as
     // the draw path — field borrows are disjoint from `app.transcript`.
+    // A click on a tray row opens that worker's view.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some(i) = super::subagent_tray::row_at(
+            app.tray_area,
+            app.subagents.len(),
+            mouse.column,
+            mouse.row,
+        ) {
+            let sa = &app.subagents[i];
+            let c = super::watch::Candidate {
+                handle_id: format!("sa_{}", sa.id),
+                subagent_id: sa.id,
+                agent_name: sa.name.clone(),
+            };
+            super::watch::focus_worker(app, &c, std::time::Instant::now());
+            return InputAction::None;
+        }
+    }
+    // The focused thread renders with its own label and liveness (a
+    // watched worker's, not main's) — same as the draw path.
+    let banner = super::watch::banner(app);
     let ctx = super::transcript::RenderCtx {
         spinner_frame: app.spinner_frame,
-        streaming: app.streaming,
-        agent_name: &app.agent_name,
+        streaming: match &banner {
+            Some(b) => matches!(b.status.as_str(), "running" | "connecting"),
+            None => app.streaming,
+        },
+        agent_name: banner.as_ref().map_or(app.agent_name.as_str(), |b| b.agent_name.as_str()),
     };
+    // Scroll + selection act on the FOCUSED thread (main or a watched
+    // subagent); other threads' views never move.
+    let view = super::threads::active_mut(&mut app.transcript, &mut app.threads);
     match mouse.kind {
         // Wheel scroll no longer clears the selection (P10 lock L4):
         // endpoints are content-relative, so the selection scrolls with the
         // content and the highlight clamps to the window. Keypresses still
         // clear (handle_key top) — including Shift+Up/Down keyboard scroll.
         MouseEventKind::ScrollUp => {
-            app.transcript.scroll_up(scroll_lines);
+            view.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
-            app.transcript.scroll_down(scroll_lines);
+            view.scroll_down(scroll_lines);
         }
 
         // Left-click starts a new selection (clears any existing one)
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
-            if app.transcript.hit_test(mouse.column, mouse.row) {
-                app.transcript
-                    .selection_begin(mouse.column, mouse.row, &ctx);
+            if view.hit_test(mouse.column, mouse.row) {
+                view.selection_begin(mouse.column, mouse.row, &ctx);
             } else {
-                app.transcript.clear_selection();
+                view.clear_selection();
             }
         }
 
         // Left-drag extends the selection (no-op without an anchor)
         MouseEventKind::Drag(MouseButton::Left) => {
-            app.transcript.selection_drag(mouse.column, mouse.row, &ctx);
+            view.selection_drag(mouse.column, mouse.row, &ctx);
         }
 
         // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            app.transcript
-                .selection_release(mouse.column, mouse.row, &ctx);
+            view.selection_release(mouse.column, mouse.row, &ctx);
         }
 
         // Right-click: copy if selection exists, paste if not
         MouseEventKind::Down(MouseButton::Right) => {
-            if app.transcript.has_selection() {
-                // Copy selected text to clipboard — right-click with selection is COPY ONLY
-                if let Some(text) = app.transcript.selected_text() {
+            if view.has_selection() {
+                // Copy selected text to clipboard — right-click with selection is COPY ONLY.
+                // Take the text and clear the selection while `view` is
+                // borrowed, then report through the App.
+                let copied = view.selected_text();
+                view.clear_selection();
+                if let Some(text) = copied {
                     copy_to_clipboard(&text);
-                    app.push_msg(ChatMessage::System(format!(
-                        "Copied {} chars",
-                        text.chars().count()
-                    )));
+                    // Reported in the thread the user copied from.
+                    super::watch::notice(app, format!("Copied {} chars", text.chars().count()));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
                 app.suppress_paste_until =
                     Some(app.clock.now() + std::time::Duration::from_millis(150));
-                // Clear selection after copy
-                app.transcript.clear_selection();
             } else {
                 // No selection — paste from clipboard at cursor position
                 if let Some(text) = paste_from_clipboard() {
@@ -310,7 +337,7 @@ fn handle_key(
 ) -> InputAction {
     let (code, modifiers) = (key.code, key.modifiers);
     // Clear text selection on any keypress (typing dismisses selection)
-    app.transcript.clear_selection();
+    super::threads::active_mut(&mut app.transcript, &mut app.threads).clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
@@ -349,6 +376,54 @@ fn handle_key(
                 }
             };
         }
+    }
+    // Subagent thread views (super::watch). Ctrl-↑/↓ are reserved core keys
+    // (never plugin-bindable); they must precede the history arms below,
+    // which match Up/Down with any modifier.
+    let watching = super::watch::focused(app).is_some();
+    match (code, modifiers) {
+        (KeyCode::Up, KeyModifiers::CONTROL) => {
+            if !super::watch::cycle(app, super::watch::Step::Up, std::time::Instant::now()) {
+                app.toasts.upsert(
+                    super::toast::Toast::new("watch", "no subagents to watch").titled("Subagents"),
+                );
+                app.request_redraw();
+            }
+            return InputAction::None;
+        }
+        (KeyCode::Down, KeyModifiers::CONTROL) => {
+            super::watch::cycle(app, super::watch::Step::Down, std::time::Instant::now());
+            return InputAction::None;
+        }
+        // Esc in a worker view returns to main — it never aborts main's turn.
+        (KeyCode::Esc, _) if watching => {
+            super::watch::leave_on_esc(app, std::time::Instant::now());
+            return InputAction::None;
+        }
+        // ...nor does a double-tapped second Esc right after.
+        (KeyCode::Esc, _)
+            if streaming && super::watch::esc_guarded(app, std::time::Instant::now()) =>
+        {
+            return InputAction::None;
+        }
+        // Enter with text in a worker view steers that worker; slash
+        // commands still run as usual.
+        (KeyCode::Enter, m)
+            if watching
+                && !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                && !app.input_is_empty()
+                && !app.input_first_line().starts_with('/') =>
+        {
+            match super::watch::steer_target(app) {
+                Some(Ok(handle_id)) => return process_subagent_steer(app, handle_id),
+                Some(Err(reason)) => {
+                    super::watch::steer_unavailable(app, reason);
+                    return InputAction::None;
+                }
+                None => {}
+            }
+        }
+        _ => {}
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -419,8 +494,8 @@ fn handle_key(
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
             // App only signals the frame scheduler.
-            app.transcript
-                .set_show_full_output(!app.transcript.show_full_output());
+            let view = super::threads::active_mut(&mut app.transcript, &mut app.threads);
+            view.set_show_full_output(!view.show_full_output());
             app.request_redraw();
         }
         // Alt-←/→ word jumps: the lib maps Alt-b/f and Ctrl-←/→ but leaves
@@ -433,10 +508,10 @@ fn handle_key(
                 .move_cursor(tui_textarea::CursorMove::WordForward);
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
-            app.transcript.scroll_up(1);
+            super::threads::active_mut(&mut app.transcript, &mut app.threads).scroll_up(1);
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
-            app.transcript.scroll_down(1);
+            super::threads::active_mut(&mut app.transcript, &mut app.threads).scroll_down(1);
         }
         // Up/Down: history only at buffer edges (§3.3 DECIDED); inside a
         // multi-line buffer they move the cursor.
@@ -511,6 +586,19 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     app.pasted_char_count = 0;
 
     InputAction::StreamingInput(input)
+}
+
+/// Enter in a worker view: same input bookkeeping as a submit, but the text
+/// goes to the watched subagent.
+fn process_subagent_steer(app: &mut App, handle_id: String) -> InputAction {
+    let text = app.input_text();
+    app.input_history.push(text.clone());
+    app.history_index = None;
+    app.input_stash.clear();
+    app.clear_input();
+    app.input_before_paste = None;
+    app.pasted_char_count = 0;
+    InputAction::SubagentSteer { handle_id, text }
 }
 
 /// P7.4 stack-routed pane handler for the `/help find` lightbox.

@@ -464,6 +464,7 @@ pub(crate) async fn try_reconnect(
                         let lifecycle = &snapshot.meta.lifecycle;
                         let status = format!("{lifecycle:?}");
                         remirror(app, &snapshot);
+                        super::watch::on_reconnect(app, std::time::Instant::now());
                         app.push_msg(ChatMessage::System(format!(
                             "reconnected to daemon (pid {new_pid}) — session {} {status}",
                             session_id

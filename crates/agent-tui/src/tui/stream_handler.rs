@@ -28,37 +28,137 @@ pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
     )
 }
 
-/// Process a StreamEvent, update app state. Presentation only: history,
-/// saves, queued/pending flushes and auto-turns are the actor's (mirrored
-/// back by `Conversation` / `TurnStarted`).
-pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &RuntimeView) {
+/// What [`apply_transcript_event`] did to the transcript it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Applied {
+    /// Not a transcript event (usage, subagent HUD, checkpoints).
+    Ignored,
+    /// The transcript was (or may have been) mutated — repaint.
+    Changed,
+    /// A transcript event that changed nothing (an orphaned reset, a drained
+    /// engine-event payload riding the steering channel).
+    Unchanged,
+    /// `ResponseReset` rolled the in-flight preview back (structural edit).
+    RolledBack,
+}
+
+/// Apply the transcript half of a stream event to ONE thread's transcript.
+///
+/// Pure presentation over `store` + its `ResponseStart` snapshot: no `App`
+/// state (streaming flags, usage, subagent HUD, queued input, scroll
+/// policy). The main thread runs it on `App::transcript` from
+/// [`handle_stream_event`]; a watched subagent's thread runs the very same
+/// function on its own store, so a worker renders exactly like the main
+/// conversation without being able to touch it.
+pub(super) fn apply_transcript_event(
+    store: &mut super::transcript::TranscriptStore,
+    preview: &mut Option<(usize, Option<ChatMessage>)>,
+    event: &StreamEvent,
+) -> Applied {
     match event {
         StreamEvent::Llm(LlmEvent::Thinking(text)) => {
-            app.append_or_update_thinking(&text);
+            store.append_or_update_thinking(text);
         }
         StreamEvent::Llm(LlmEvent::Text(text)) => {
-            app.append_or_update_text(&text);
+            store.append_or_update_text(text);
         }
         StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
-            app.on_tool_use_start(tool_id, tool_name);
+            store.on_tool_use_start(tool_id.clone(), tool_name.clone());
         }
         StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
-            app.on_tool_use_delta(&tool_id, &delta);
+            store.on_tool_use_delta(tool_id, delta);
         }
         StreamEvent::Llm(LlmEvent::ToolUse {
             tool_name,
             tool_id,
             input,
         }) => {
-            let input_str = serde_json::to_string(&input).unwrap_or_default();
-            app.on_tool_use_finalized(tool_id, tool_name, input_str);
+            let input_str = serde_json::to_string(input).unwrap_or_default();
+            store.on_tool_use_finalized(tool_id.clone(), tool_name.clone(), input_str);
         }
         StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
-            app.on_tool_result_delta(tool_id, delta);
+            store.on_tool_result_delta(tool_id.clone(), delta.clone());
         }
         StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
-            app.on_tool_result(tool_id, result);
+            store.on_tool_result(tool_id.clone(), result.clone());
         }
+        StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
+            // Queue-drained events (subagent completion wakes, watcher
+            // alerts) ride the same steering channel as genuine user
+            // steering, but they were already presented as Event cards at
+            // drain time (handle_event_queue_arm). Rendering them here as
+            // ChatMessage::User made subagent continuation text land in the
+            // transcript as a message the user typed and submitted.
+            if super::helpers::is_event_payload(message) {
+                return Applied::Unchanged;
+            }
+            store.push_msg(ChatMessage::User(message.clone()));
+        }
+        StreamEvent::Session(SessionEvent::Notice(text)) => {
+            // Display-only retry/status notice — system line, not transcript.
+            // Notice text can echo API error bodies; strip control chars
+            // (esp. ESC) so a hostile payload can't inject terminal escapes.
+            store.push_msg(ChatMessage::System(sanitize_notice(text)));
+        }
+        StreamEvent::Session(SessionEvent::Done) => {
+            store.end_response();
+            store.drop_empty_thinking();
+        }
+        StreamEvent::Session(SessionEvent::Error(err)) => {
+            store.end_response();
+            store.drop_empty_thinking();
+            // Typed spec §5.2 outcome from the engine — surface the message
+            // plus the terminal category + correlation ID, never re-derived.
+            store.push_msg(ChatMessage::Error(format!(
+                "{} [{}]",
+                sanitize_notice(&err.message),
+                err.category_label()
+            )));
+        }
+        // ResponseStart: snapshot the transcript position for rollback on reset.
+        StreamEvent::Llm(LlmEvent::ResponseStart) => {
+            store.drop_empty_thinking();
+            *preview = Some((
+                store.messages().len(),
+                store.messages().last().map(|m| m.msg.clone()),
+            ));
+            store.begin_response();
+        }
+        // ResponseReset: roll the in-flight response preview back to the
+        // ResponseStart snapshot. Orphaned resets (no prior start) are
+        // silently ignored (G Q2). The transcript's own start index is
+        // preferred: it stays exact when scrollback drains the front.
+        StreamEvent::Llm(LlmEvent::ResponseReset) => {
+            let Some((start, last)) = preview.take() else {
+                return Applied::Unchanged;
+            };
+            let start = store.response_start().unwrap_or(start);
+            store.reset_response_preview(start, last);
+            return Applied::RolledBack;
+        }
+        StreamEvent::Session(SessionEvent::Usage { .. })
+        | StreamEvent::Session(SessionEvent::MessageHistory(_))
+        | StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. })
+        | StreamEvent::Agent(AgentEvent::SubagentStart { .. })
+        | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
+        | StreamEvent::Agent(AgentEvent::SubagentDone { .. }) => return Applied::Ignored,
+    }
+    Applied::Changed
+}
+
+/// Process a StreamEvent, update app state. Presentation only: history,
+/// saves, queued/pending flushes and auto-turns are the actor's (mirrored
+/// back by `Conversation` / `TurnStarted`).
+///
+/// The transcript half is [`apply_transcript_event`] on the MAIN thread's
+/// store; everything below it is App-level state.
+pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &RuntimeView) {
+    match apply_transcript_event(&mut app.transcript, &mut app.response_preview, &event) {
+        Applied::Changed => app.request_redraw(),
+        Applied::RolledBack => app.invalidate(),
+        Applied::Ignored | Applied::Unchanged => {}
+    }
+    match event {
         // Digest clients never receive it; in-process the `Conversation`
         // that follows carries `messages_len` (phase 4 §2.2).
         StreamEvent::Session(SessionEvent::MessageHistory(_)) => {}
@@ -129,16 +229,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             subagent_hud_redraw(app);
         }
         StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
-            // Queue-drained events (subagent completion wakes, watcher
-            // alerts) ride the same steering channel as genuine user
-            // steering, but they were already presented as Event cards at
-            // drain time (handle_event_queue_arm). Rendering them here as
-            // ChatMessage::User made subagent continuation text land in the
-            // transcript as a message the user typed and submitted.
             let from_user = !super::helpers::is_event_payload(&message);
-            if from_user {
-                app.push_msg(ChatMessage::User(message.clone()));
-            }
             if app.queued_message.as_ref() == Some(&message) {
                 app.queued_message = None;
             }
@@ -174,17 +265,9 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 Some(view.context_window),
             );
         }
-        StreamEvent::Session(SessionEvent::Notice(text)) => {
-            // Display-only retry/status notice — system line, not transcript.
-            // Notice text can echo API error bodies; strip control chars
-            // (esp. ESC) so a hostile payload can't inject terminal escapes.
-            app.push_msg(ChatMessage::System(sanitize_notice(&text)));
-        }
-        StreamEvent::Session(SessionEvent::Done) => {
-            app.transcript.end_response();
+        StreamEvent::Session(SessionEvent::Done) | StreamEvent::Session(SessionEvent::Error(_)) => {
             app.streaming = false;
             app.quit_guard.reset();
-            app.drop_empty_thinking();
             // Reconcile HUD against the registry rows (last `SubagentRows`)
             // instead of clearing — retains running entries whose tx_events
             // is now dead (stream dropped) but threads live on.
@@ -196,49 +279,13 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             // NOTE: cleanup_finished removed — engine now reaps at turn completion
             // inside the tokio::spawn wrapper (runtime/mod.rs) before Done is sent.
             // Pending-event flush / queued auto-send / auto-trigger: the
-            // actor's; it announces the next turn with `TurnStarted`.
+            // actor's; it announces the next turn with `TurnStarted`. History
+            // repair on Error is the actor's too (mirrored by `Conversation`).
         }
-        StreamEvent::Session(SessionEvent::Error(err)) => {
-            app.transcript.end_response();
-            app.drop_empty_thinking();
-            // Typed spec §5.2 outcome from the engine — surface the message
-            // plus the terminal category + correlation ID, never re-derived.
-            app.push_msg(ChatMessage::Error(format!(
-                "{} [{}]",
-                sanitize_notice(&err.message),
-                err.category_label()
-            )));
-            app.streaming = false;
-            app.quit_guard.reset();
-            // Reconcile HUD against registry rows on error path too (same as Done).
-            reconcile_subagents(
-                &mut app.subagents,
-                &app.subagent_rows,
-                std::time::Instant::now(),
-            );
-            // History repair is the actor's (mirrored by `Conversation`).
-        }
-        // ResponseStart: snapshot the transcript position for rollback on reset.
-        StreamEvent::Llm(LlmEvent::ResponseStart) => {
-            app.drop_empty_thinking();
-            app.response_preview = Some((
-                app.transcript.messages().len(),
-                app.transcript.messages().last().map(|m| m.msg.clone()),
-            ));
-            app.transcript.begin_response();
-        }
-        // ResponseReset: roll the in-flight response preview back to the
-        // ResponseStart snapshot. Orphaned resets (no prior start) are
-        // silently ignored (G Q2). The transcript's own start index is
-        // preferred: it stays exact when scrollback drains the front.
-        StreamEvent::Llm(LlmEvent::ResponseReset) => {
-            if let Some((start, last)) = app.response_preview.take() {
-                let start = app.transcript.response_start().unwrap_or(start);
-                app.transcript.reset_response_preview(start, last);
-                app.invalidate();
-            }
-        }
-        StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
+        // Transcript-only events: fully handled by `apply_transcript_event`.
+        StreamEvent::Llm(_)
+        | StreamEvent::Session(SessionEvent::Notice(_))
+        | StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
     }
 }
 
@@ -284,6 +331,10 @@ pub(super) fn on_external(app: &mut App, event: &synaps_cli::events::types::Even
         severity: severity_str,
         text: event.content.text.clone(),
     });
+
+    if event.content.content_type == "subagent_steer" {
+        super::watch::steer_accepted(app);
+    }
 
     // Seam 3: subagent_completion → mark HUD entry done directly from
     // event data (no lock needed — data was embedded at finalizer time).
@@ -471,7 +522,9 @@ pub(super) async fn handle_session_event_arm(
             app.push_msg(ChatMessage::System(format!("dequeued: {}", text)));
         }
         SessionEventWire::SystemNotice(text) => {
-            app.push_msg(ChatMessage::System(sanitize_notice(&text)));
+            if !super::watch::absorb_notice(app, &text) {
+                app.push_msg(ChatMessage::System(sanitize_notice(&text)));
+            }
         }
         SessionEventWire::LoaderProgress(ev) => {
             super::loop_arms::handle_extension_loader_event(app, link.view(), ev, ext_mgr).await;
@@ -499,9 +552,14 @@ pub(super) async fn handle_session_event_arm(
                 }
             }
         }
-        SessionEventWire::SettingChanged(_) | SessionEventWire::QueryResult { .. } => {
-            // Unsolicited (another client's Set / a host query): the view
-            // was refreshed by `SessionLink::note`; nothing to render.
+        SessionEventWire::QueryResult { id, value } => {
+            // The subagent watch poll is fire-and-forget; anything else is
+            // unsolicited (another client's / a host query): nothing to render.
+            super::watch::on_query_result(app, id, &value, std::time::Instant::now());
+        }
+        SessionEventWire::SettingChanged(_) => {
+            // Unsolicited (another client's Set): the view was refreshed by
+            // `SessionLink::note`; nothing to render.
         }
         SessionEventWire::Attached { .. }
         | SessionEventWire::ClientJoined { .. }
@@ -526,6 +584,7 @@ pub(super) async fn handle_session_event_arm(
             app.push_msg(ChatMessage::Error(abort_msg.to_string()));
         }
         SessionEventWire::Cleared { .. } => {
+            super::watch::reset(app);
             app.transcript.clear();
             app.invalidate();
             app.api_messages_len = 0;
@@ -590,6 +649,7 @@ pub(super) async fn handle_session_event_arm(
                 subagent_hud_redraw(app);
             }
             app.subagent_rows = rows;
+            super::watch::prune(app, std::time::Instant::now());
         }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
@@ -613,7 +673,11 @@ pub(super) async fn handle_session_event_arm(
             command,
             reason,
         } => {
-            if client == me {
+            if client == me && command == "subagent_steer" {
+                // Steering a watched worker: nothing about the main thread's
+                // turn or input changed, so none of the undo below applies.
+                super::watch::steer_refused(app, &reason);
+            } else if client == me {
                 app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
                 // The pre-send presentation assumed a turn: undo it.
                 if app.streaming && app.turn_baseline == app.api_messages_len {
@@ -924,6 +988,7 @@ mod reconcile_tests {
             finished_elapsed: None,
             step: String::new(),
             tools: 0,
+            handle_id: format!("sa_{id}"),
         }
     }
 
@@ -1115,5 +1180,209 @@ mod reconcile_tests {
             1,
             "recently-done entry not in registry must stay for flash"
         );
+    }
+}
+
+/// The transcript half of `handle_stream_event` is `apply_transcript_event`
+/// — so a worker thread fed the same events renders exactly what the main
+/// thread would, and never touches the main thread while doing it.
+#[cfg(test)]
+mod transcript_split_tests {
+    use super::super::app::{App, ChatMessage};
+    use super::super::clock::TuiClock;
+    use super::super::threads::Threads;
+    use super::super::transcript::TranscriptStore;
+    use super::{apply_transcript_event, handle_stream_event, Applied};
+    use agent_core::TurnError;
+    use agent_engine::session::RuntimeView;
+    use synaps_cli::{AgentEvent, LlmEvent, Runtime, Session, SessionEvent, StreamEvent};
+
+    fn repr(store: &TranscriptStore) -> Vec<String> {
+        store
+            .messages()
+            .iter()
+            .map(|m| match &m.msg {
+                ChatMessage::User(t) => format!("U|{t}"),
+                ChatMessage::Thinking(t) => format!("K|{t}"),
+                ChatMessage::Text(t) => format!("T|{t}"),
+                ChatMessage::System(t) => format!("S|{t}"),
+                ChatMessage::Error(t) => format!("E|{t}"),
+                ChatMessage::ToolUseStart {
+                    tool_id,
+                    tool_name,
+                    partial_input,
+                } => {
+                    format!("XS|{tool_id}|{tool_name}|{partial_input}")
+                }
+                ChatMessage::ToolUse {
+                    tool_id,
+                    tool_name,
+                    input,
+                } => {
+                    format!("X|{tool_id}|{tool_name}|{input}")
+                }
+                // elapsed_ms depends on each store's clock — not compared.
+                ChatMessage::ToolResult {
+                    tool_id, content, ..
+                } => format!("R|{tool_id}|{content}"),
+                _ => "?".to_string(),
+            })
+            .collect()
+    }
+
+    /// Every transcript-bearing event kind, plus non-transcript events that
+    /// must leave a worker store alone.
+    fn script() -> Vec<StreamEvent> {
+        use AgentEvent as A;
+        use LlmEvent as L;
+        use SessionEvent as S;
+        use StreamEvent::{Agent, Llm, Session as Sess};
+        let s = |v: &str| v.to_string();
+        vec![
+            Llm(L::ResponseStart),
+            Llm(L::Thinking(s("plan the answer"))),
+            Llm(L::Text(s("hello "))),
+            Llm(L::Text(s("world"))),
+            Llm(L::ToolUseStart {
+                tool_name: s("bash"),
+                tool_id: s("t1"),
+            }),
+            Llm(L::ToolUseDelta {
+                tool_id: s("t1"),
+                delta: s("{\"command\":"),
+            }),
+            Llm(L::ToolUse {
+                tool_name: s("bash"),
+                tool_id: s("t1"),
+                input: serde_json::json!({ "command": "ls" }),
+            }),
+            Llm(L::ToolResultDelta {
+                tool_id: s("t1"),
+                delta: s("a\n"),
+            }),
+            Llm(L::ToolResult {
+                tool_id: s("t1"),
+                result: s("a\nb"),
+            }),
+            Agent(A::SubagentStart {
+                subagent_id: 3,
+                agent_name: s("scout"),
+                task_preview: s("look around"),
+            }),
+            Sess(S::Notice(s("retry \x1b[2J in 2s"))),
+            Sess(S::Done),
+            // A response that is rolled back, then an orphaned reset.
+            Llm(L::ResponseStart),
+            Llm(L::Text(s("draft that gets discarded"))),
+            Llm(L::ResponseReset),
+            Llm(L::ResponseReset),
+            Agent(A::SteeringDelivered {
+                message: s("user steering text"),
+            }),
+            Agent(A::SteeringDelivered {
+                message: s(
+                    "<event id=\"e1\" type=\"subagent_completion\" severity=\"high\" \
+                     source=\"subagent\">Subagent 'inline' (sa_1) finished.</event>",
+                ),
+            }),
+            Llm(L::ResponseStart),
+            Llm(L::Text(s("partial"))),
+            Sess(S::Error(TurnError::provider(
+                "boom",
+                "auth_error",
+                "turn-1",
+            ))),
+        ]
+    }
+
+    #[test]
+    fn worker_store_renders_exactly_like_the_main_thread() {
+        let mut app = App::new(Session::new("test-model", "low", None));
+        let runtime = Runtime::new_headless();
+        let view = RuntimeView::snapshot(&runtime, 0);
+        let base = app.transcript.messages().len();
+
+        let mut worker = TranscriptStore::new(TuiClock::test());
+        let mut preview = None;
+        for ev in script() {
+            apply_transcript_event(&mut worker, &mut preview, &ev);
+            handle_stream_event(ev, &mut app, &view);
+        }
+
+        let main = repr(&app.transcript);
+        assert_eq!(
+            main[base..].to_vec(),
+            repr(&worker),
+            "same events, same transcript"
+        );
+        // Spot-check the script actually exercised the interesting paths.
+        let w = repr(&worker);
+        assert!(
+            w.iter().any(|m| m == "R|t1|a\nb"),
+            "tool result routed: {w:?}"
+        );
+        assert!(w.contains(&"U|user steering text".to_string()));
+        assert!(
+            !w.iter().any(|m| m.contains("subagent_completion")),
+            "event payload not a user bubble"
+        );
+        assert!(
+            !w.iter().any(|m| m.contains("discarded")),
+            "reset rolled the draft back"
+        );
+        assert!(
+            w.iter().any(|m| m.starts_with("E|boom [")),
+            "typed error surfaced"
+        );
+        assert!(!w.iter().any(|m| m.contains('\x1b')), "notice sanitized");
+    }
+
+    #[test]
+    fn applied_classifies_events() {
+        let mut store = TranscriptStore::new(TuiClock::test());
+        let mut preview = None;
+        let mut apply = |ev: StreamEvent| apply_transcript_event(&mut store, &mut preview, &ev);
+        assert_eq!(
+            apply(StreamEvent::Llm(LlmEvent::ResponseReset)),
+            Applied::Unchanged,
+            "orphan reset"
+        );
+        assert_eq!(
+            apply(StreamEvent::Agent(AgentEvent::SubagentStart {
+                subagent_id: 1,
+                agent_name: "a".into(),
+                task_preview: "t".into(),
+            })),
+            Applied::Ignored
+        );
+        assert_eq!(
+            apply(StreamEvent::Llm(LlmEvent::ResponseStart)),
+            Applied::Changed
+        );
+        assert_eq!(
+            apply(StreamEvent::Llm(LlmEvent::Text("x".into()))),
+            Applied::Changed
+        );
+        assert_eq!(
+            apply(StreamEvent::Llm(LlmEvent::ResponseReset)),
+            Applied::RolledBack
+        );
+    }
+
+    #[test]
+    fn feeding_a_worker_thread_never_touches_the_main_store() {
+        let mut main = TranscriptStore::new(TuiClock::test());
+        main.push_msg(ChatMessage::Text("main".into()));
+        main.scroll_up(3);
+        let (before, scroll) = (repr(&main), main.scroll_back_pos());
+
+        let mut threads = Threads::default();
+        let w = threads.open_worker("sa_9", 9, "scout", TuiClock::test(), (0, 0));
+        for ev in script() {
+            apply_transcript_event(&mut w.store, &mut w.response_preview, &ev);
+        }
+        assert!(!repr(&threads.worker("sa_9").unwrap().store).is_empty());
+        assert_eq!(repr(&main), before, "main transcript untouched");
+        assert_eq!(main.scroll_back_pos(), scroll, "main scroll untouched");
     }
 }

@@ -193,6 +193,17 @@ impl SessionLink {
         }
     }
 
+    /// Send `Query{id, query}` without waiting: the reply reaches the loop
+    /// as a `QueryResult{id}` envelope (the subagent watch poll, which must
+    /// never stall input or rendering). Returns the id.
+    pub(crate) async fn send_query(&mut self, query: SessionQuery) -> Result<u64, String> {
+        let id = self.alloc_id();
+        self.send(SessionCommand::Query { id, query })
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
     pub(crate) async fn query(&mut self, query: SessionQuery) -> Result<serde_json::Value, String> {
         let id = self.alloc_id();
         self.roundtrip(SessionCommand::Query { id, query }, |ev| match ev {

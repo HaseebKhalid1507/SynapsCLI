@@ -775,6 +775,55 @@ impl TestHarness {
         self
     }
 
+    /// Fire the subagent watch poll arm once (as `run()` does when its
+    /// deadline passes) and return the query id it sent, if any.
+    pub fn drive_watch_poll(&mut self) -> Option<u64> {
+        let now = std::time::Instant::now();
+        block_on_bounded(
+            "watch::poll",
+            super::watch::poll(&mut self.app, &mut self.link, now),
+        );
+        super::watch::pending_poll(&self.app).map(|(id, _)| id)
+    }
+
+    /// Whether the watch poll arm is armed (a worker view is focused and
+    /// still has something to read).
+    pub fn watch_poll_due(&self) -> bool {
+        super::watch::poll_due_at(&self.app).is_some()
+    }
+
+    /// The focused worker view's handle id (`None` on the main thread).
+    pub fn watched(&self) -> Option<String> {
+        super::watch::focused(&self.app).map(str::to_string)
+    }
+
+    /// Plain text of the main thread's transcript.
+    pub fn main_transcript_text(&self) -> String {
+        self.app
+            .transcript
+            .messages()
+            .iter()
+            .map(|m| describe(&m.msg))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Plain text of a worker view's transcript (empty if not open).
+    pub fn worker_transcript_text(&self, handle_id: &str) -> String {
+        self.app
+            .threads
+            .worker(handle_id)
+            .map(|w| {
+                w.store
+                    .messages()
+                    .iter()
+                    .map(|m| describe(&m.msg))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
     /// Stage the engine-side history the scripted session answers
     /// `Query{DisplayTail|Messages}` from (phase 4 Digest-mode rebuilds).
     pub fn set_history(&mut self, msgs: Vec<synaps_cli::SharedMessage>) -> &mut Self {
@@ -931,6 +980,11 @@ impl TestHarness {
                 desc
             }
             InputAction::StreamingInput(text) => format!("streaming-input:{text}"),
+            InputAction::SubagentSteer { handle_id, text } => {
+                // The dispatch arm's App-side half (its send is not run).
+                super::watch::steer_sent(&mut self.app, &handle_id, &text);
+                format!("subagent-steer:{handle_id}:{text}")
+            }
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
@@ -956,6 +1010,23 @@ impl TestHarness {
         };
         self.actions.push(desc);
     }
+}
+
+/// `kind: text` for one transcript message (the transcript-text helpers).
+fn describe(msg: &super::transcript::ChatMessage) -> String {
+    use super::transcript::ChatMessage as M;
+    let kind = match msg {
+        M::User(_) => "user",
+        M::Thinking(_) => "thinking",
+        M::Text(_) => "text",
+        M::ToolUseStart { .. } => "tool-start",
+        M::ToolUse { .. } => "tool",
+        M::ToolResult { .. } => "tool-result",
+        M::Error(_) => "error",
+        M::System(_) => "system",
+        M::Event { .. } => "event",
+    };
+    format!("{kind}: {}", msg.source_text())
 }
 
 /// Cloneable in-memory `Write` sink for [`TestHarness::render_ansi`].

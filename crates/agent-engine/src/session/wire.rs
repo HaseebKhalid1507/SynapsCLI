@@ -1096,6 +1096,7 @@ mod tests {
                 finished_elapsed: Some(std::time::Duration::from_millis(1250)),
                 step: "$ cargo test".into(),
                 tools: 3,
+                handle_id: "sa_1".into(),
             }]),
             S::Resumed { id: 2, old_id: "o".into(), new_id: "n".into(), via: Some("name".into()), clamp_notice: None },
             S::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Takeover },
@@ -1198,6 +1199,42 @@ mod tests {
         let v: WireSessionEvent = serde_json::from_str(r#"{"ev":"from_the_future","x":1}"#).unwrap();
         assert!(matches!(v, WireSessionEvent::Unknown));
         assert!(matches!(SessionEventWire::from(v), SessionEventWire::SystemNotice(_)));
+    }
+
+    /// An older daemon cannot decode a newer client's command; serde names
+    /// the unknown tag in backticks. The TUI keys on exactly that
+    /// (`tui::watch::absorb_notice`, "malformed frame: unknown variant
+    /// `subagent_watch`") to tell the user to reload the daemon.
+    #[test]
+    fn an_unknown_command_or_query_names_its_tag_in_the_decode_error() {
+        let frames = [
+            (
+                ClientFrame::Cmd {
+                    session_id: "s".into(),
+                    cmd: SessionCommand::Query {
+                        id: 1,
+                        query: SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 0 },
+                    },
+                },
+                "subagent_watch",
+            ),
+            (
+                ClientFrame::Cmd {
+                    session_id: "s".into(),
+                    cmd: SessionCommand::SubagentSteer { handle_id: "sa_1".into(), text: "x".into() },
+                },
+                "subagent_steer",
+            ),
+        ];
+        for (frame, tag) in frames {
+            let json = serde_json::to_string(&frame).unwrap();
+            assert!(decode_line::<ClientFrame>(&json).is_ok());
+            // What an older daemon sees: a tag it does not know.
+            let old = json.replace(&format!("\"{tag}\""), "\"zz_from_the_future\"");
+            assert_ne!(old, json, "{tag} is serialized as a quoted tag");
+            let err = decode_line::<ClientFrame>(&old).unwrap_err();
+            assert!(err.contains("unknown variant `zz_from_the_future`"), "{err}");
+        }
     }
 
     #[test]
