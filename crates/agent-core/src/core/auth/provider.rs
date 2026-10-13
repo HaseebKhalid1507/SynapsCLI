@@ -21,6 +21,7 @@ pub enum OAuthProviderId {
     GitHubCopilot,
     GoogleGemini,
     KimiCode,
+    Muse,
 }
 
 impl OAuthProviderId {
@@ -32,6 +33,7 @@ impl OAuthProviderId {
             Self::GitHubCopilot => "github-copilot",
             Self::GoogleGemini => "google-gemini",
             Self::KimiCode => "kimi-code",
+            Self::Muse => "muse",
         }
     }
 }
@@ -52,6 +54,7 @@ impl FromStr for OAuthProviderId {
             "github-copilot" => Ok(Self::GitHubCopilot),
             "google-gemini" => Ok(Self::GoogleGemini),
             "kimi-code" => Ok(Self::KimiCode),
+            "muse" => Ok(Self::Muse),
             _ => Err(format!("unknown canonical OAuth provider id: {value}")),
         }
     }
@@ -99,6 +102,7 @@ pub enum ProviderBehavior {
     GitHubCopilot,
     GoogleGemini,
     KimiCode,
+    Muse,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,7 +167,7 @@ pub fn registry() -> OAuthProviderRegistry {
     OAuthProviderRegistry::validate(DESCRIPTORS, []).expect("built-in OAuth registry must be valid")
 }
 
-pub const DESCRIPTORS: [OAuthProviderDescriptor; 6] = [
+pub const DESCRIPTORS: [OAuthProviderDescriptor; 7] = [
     OAuthProviderDescriptor {
         id: OAuthProviderId::Anthropic,
         display_name: "Claude",
@@ -218,6 +222,16 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 6] = [
         broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
         behavior: ProviderBehavior::KimiCode,
     },
+    OAuthProviderDescriptor {
+        id: OAuthProviderId::Muse,
+        display_name: "Meta Muse",
+        description: "Meta account device OAuth for Muse Code (experimental)",
+        recommended: false,
+        // The vended "access token" is the minted Model API key; the Meta
+        // OAuth access token that re-mints it stays broker-owned.
+        broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
+        behavior: ProviderBehavior::Muse,
+    },
 ];
 
 /// CLI-only normalization. Internal callers must carry the canonical typed ID.
@@ -240,6 +254,8 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
         // (Moonshot platform, API-key) already claims that CLI token and we
         // must not silently redirect it to the Kimi Code OAuth flow.
         "kimi-code" | "kimicode" | "kimi-cli" => Ok(OAuthProviderId::KimiCode),
+        // CLI aliases only; canonical storage key is "muse".
+        "muse" | "muse-code" | "meta" | "meta-ai" | "meta-muse" => Ok(OAuthProviderId::Muse),
         _ => Err(format!("unknown OAuth provider: {value}")),
     }
 }
@@ -285,6 +301,7 @@ async fn login_with_persist(
             super::providers::google_gemini::login_into(persist_key).await
         }
         ProviderBehavior::KimiCode => super::providers::kimi_code::login_into(persist_key).await,
+        ProviderBehavior::Muse => super::providers::muse::login_into(persist_key).await,
     }
 }
 
@@ -310,6 +327,7 @@ pub async fn refresh(
             super::providers::google_gemini::refresh(client, refresh).await
         }
         ProviderBehavior::KimiCode => super::providers::kimi_code::refresh(client, refresh).await,
+        ProviderBehavior::Muse => super::providers::muse::refresh(client, refresh).await,
     }
 }
 
@@ -480,5 +498,32 @@ mod tests {
         );
         assert_eq!(desc.behavior, ProviderBehavior::KimiCode);
         assert!(!desc.recommended, "kimi-code is experimental");
+    }
+
+    #[test]
+    fn muse_canonical_id_and_cli_aliases() {
+        assert_eq!(OAuthProviderId::Muse.as_str(), "muse");
+        assert_eq!(
+            OAuthProviderId::from_str("muse").unwrap(),
+            OAuthProviderId::Muse
+        );
+        // Aliases are CLI-only — canonical FromStr rejects them.
+        for alias in ["meta", "muse-code", "meta-ai", "meta-muse"] {
+            assert!(OAuthProviderId::from_str(alias).is_err(), "{alias}");
+            assert_eq!(
+                parse_cli_provider(alias).unwrap(),
+                OAuthProviderId::Muse,
+                "{alias}"
+            );
+        }
+        assert_eq!(parse_cli_provider("MUSE").unwrap(), OAuthProviderId::Muse);
+        let registry = registry();
+        let desc = registry.get(OAuthProviderId::Muse).expect("descriptor");
+        assert_eq!(desc.behavior, ProviderBehavior::Muse);
+        assert_eq!(
+            desc.broker_strategy,
+            BrokerCredentialStrategy::OAuthAccessToken
+        );
+        assert!(!desc.recommended, "muse is experimental");
     }
 }
