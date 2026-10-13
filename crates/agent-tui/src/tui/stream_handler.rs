@@ -78,7 +78,9 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 tools: 0,
                 result: None,
             });
-            app.invalidate();
+            // Tray-only state: repaint, never touch the main transcript
+            // (its cache, selection, or scroll). See `subagent_hud_redraw`.
+            subagent_hud_redraw(app);
         }
         StreamEvent::Agent(AgentEvent::SubagentUpdate {
             subagent_id,
@@ -95,7 +97,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 }
                 sa.status = status;
             }
-            app.invalidate();
+            subagent_hud_redraw(app);
         }
         StreamEvent::Agent(AgentEvent::SubagentDone {
             subagent_id,
@@ -124,7 +126,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 let first = first.strip_prefix("ERROR: ").unwrap_or(first);
                 sa.result = Some(first.chars().take(120).collect());
             }
-            app.invalidate();
+            subagent_hud_redraw(app);
         }
         StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
             // Queue-drained events (subagent completion wakes, watcher
@@ -133,14 +135,23 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             // drain time (handle_event_queue_arm). Rendering them here as
             // ChatMessage::User made subagent continuation text land in the
             // transcript as a message the user typed and submitted.
-            if !super::helpers::is_event_payload(&message) {
+            let from_user = !super::helpers::is_event_payload(&message);
+            if from_user {
                 app.push_msg(ChatMessage::User(message.clone()));
             }
             if app.queued_message.as_ref() == Some(&message) {
                 app.queued_message = None;
             }
-            app.transcript.scroll_to_bottom();
-            app.invalidate();
+            // Only the user's own steering yanks the view to the bottom. A
+            // drained engine event (a subagent completion wake, a watcher
+            // alert) is background activity: it must not move a view the
+            // user scrolled up.
+            if from_user {
+                app.transcript.scroll_to_bottom();
+                app.invalidate();
+            } else {
+                app.request_redraw();
+            }
         }
         StreamEvent::Session(SessionEvent::Usage {
             input_tokens,
@@ -304,7 +315,10 @@ pub(super) fn on_external(app: &mut App, event: &synaps_cli::events::types::Even
             }
         }
     }
-    app.invalidate();
+    // `push_msg` already dirtied the new tail slot; the HUD mark is tray-only.
+    // A full invalidate here would drop the user's selection on every
+    // background completion.
+    app.request_redraw();
 }
 
 /// The auto-turn cap line (was stream_handler.rs:368-378 / :516-520).
@@ -573,7 +587,7 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::SubagentRows(rows) => {
             if apply_subagent_progress(&mut app.subagents, &rows) {
-                app.invalidate();
+                subagent_hud_redraw(app);
             }
             app.subagent_rows = rows;
         }
@@ -697,6 +711,18 @@ fn finish_compaction(app: &mut App, applied: super::app::CompactionApplied) {
     app.status_text = None;
     app.compacting = false;
     app.invalidate();
+}
+
+/// Repaint after a subagent HUD (tray) change.
+///
+/// Subagent progress lives in `app.subagents` and is painted by the tray —
+/// it is not part of the main transcript. Background workers report on
+/// every tool call and every 1 Hz registry refresh, so this must stay a
+/// plain redraw: invalidating the transcript here re-estimated every message
+/// height, cleared the user's selection, and (through the scroll
+/// bookkeeping) made a scrolled-up main thread drift while subagents worked.
+fn subagent_hud_redraw(app: &mut App) {
+    app.request_redraw();
 }
 
 /// Strip ASCII control characters (except `\n` and `\t`) from notice text
