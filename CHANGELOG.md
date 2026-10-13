@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Turns have no round, tool-call or tool-result-byte limit by default.**
+  Every role used to stop a turn at a compiled cap (foreground 128 rounds /
+  512 tool calls / 32 MiB of tool results; worker 64 / 256 / 16 MiB;
+  autonomous 24 / 96 / 8 MiB), even while it was making progress. A limit
+  now applies only when configured: `turn_budget.<role>.max_provider_rounds`,
+  `max_tool_calls` or `max_accumulated_tool_result_bytes` = N (`0` also
+  means no limit). Round renewals apply only once a round limit is set.
+  `/budget status` shows `off` for an unset limit.
+
+### Upgrade notes
+
+- **`synaps-engine` crate users:** `TurnBudget::max_provider_rounds`,
+  `max_tool_calls` and `max_accumulated_tool_result_bytes` are now `Option`s
+  (`None` = no limit). To keep the old bounds, set them in `config.toml`.
+
 ## [0.10.2] — 2026-10-12
 
 Long turns are no longer cut off after two hours, sessions with many images

@@ -411,7 +411,7 @@ async fn infinite_tool_loop_stops_at_exact_configured_budget() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 3,
+        max_provider_rounds: Some(3),
         max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
@@ -446,7 +446,7 @@ async fn every_tool_use_gets_a_valid_result_at_budget_exhaustion() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_tool_calls: 1,
+        max_tool_calls: Some(1),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let executions = Arc::new(AtomicUsize::new(0));
@@ -918,12 +918,13 @@ fn delegation_depth_is_bounded_before_dispatch() {
 }
 
 #[test]
-fn role_defaults_are_finite_for_every_autonomous_role() {
+fn role_defaults_are_unlimited_for_every_role() {
     for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
         let budget = TurnBudget::for_role(role);
-        assert!(budget.max_provider_rounds > 0);
-        assert!(budget.max_tool_calls > 0);
-        // Wall clock is opt-in (off by default); rounds and tool calls bound every role.
+        // Every per-turn limit is opt-in (off by default).
+        assert_eq!(budget.max_provider_rounds, None);
+        assert_eq!(budget.max_tool_calls, None);
+        assert_eq!(budget.max_accumulated_tool_result_bytes, None);
         assert_eq!(budget.max_elapsed, None);
     }
 }

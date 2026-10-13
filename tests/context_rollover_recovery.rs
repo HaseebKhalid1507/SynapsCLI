@@ -58,7 +58,7 @@ async fn runtime(rounds: u32) -> Runtime {
     rt.set_model("claude-sonnet-4-5".into());
     rt.set_context_window(Some(1_000_000));
     rt.set_turn_budget(TurnBudget {
-        max_provider_rounds: rounds,
+        max_provider_rounds: Some(rounds),
         max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     });

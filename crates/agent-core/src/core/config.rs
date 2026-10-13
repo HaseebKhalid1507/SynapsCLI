@@ -739,11 +739,17 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) -> Resu
 /// parsed from `turn_budget.<role>.<field>` config keys.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnBudgetOverrides {
+    /// Provider rounds per turn. Unset = no limit (the default for every
+    /// role); `0` also means no limit.
     pub max_provider_rounds: Option<u32>,
+    /// Tool calls per turn. Unset = no limit (the default for every role);
+    /// `0` also means no limit.
     pub max_tool_calls: Option<u32>,
     /// Wall-clock limit for one turn, in seconds. Unset = no limit (the
     /// default for every role); `0` also means no limit.
     pub max_elapsed_secs: Option<u64>,
+    /// Accumulated tool-result bytes per turn. Unset = no limit (the default
+    /// for every role); `0` also means no limit.
     pub max_accumulated_tool_result_bytes: Option<usize>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,

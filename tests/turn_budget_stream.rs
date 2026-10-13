@@ -185,7 +185,7 @@ async fn infinite_tool_loop_stops_at_exact_round_budget() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 3,
+        max_provider_rounds: Some(3),
         // Strict fixture: graceful continuation OFF so the round cap is the
         // exact hard stop this test pins. (Foreground defaults to 8
         // renewals, which would yield 3 * (1 + 8) = 27 rounds.)
@@ -223,7 +223,7 @@ async fn tool_call_budget_synthesizes_results_beyond_exact_allowance() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_tool_calls: 2,
+        max_tool_calls: Some(2),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (rt, executions) = runtime_with_fixture(budget, 8).await;
@@ -268,7 +268,7 @@ async fn accumulated_tool_result_bytes_budget_stops_turn() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_accumulated_tool_result_bytes: 1024,
+        max_accumulated_tool_result_bytes: Some(1024),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (rt, executions) = runtime_with_fixture(budget, 4096).await;
@@ -384,12 +384,12 @@ fn per_role_defaults_and_auto_turn_composition() {
     let fg = TurnBudget::for_role(TurnRole::Foreground);
     let auto = TurnBudget::for_role(TurnRole::Autonomous);
     let worker = TurnBudget::for_role(TurnRole::Worker);
-    assert!(fg.max_provider_rounds > auto.max_provider_rounds);
-    assert!(worker.max_provider_rounds <= fg.max_provider_rounds);
-    assert_eq!(
-        (fg.max_elapsed, auto.max_elapsed, worker.max_elapsed),
-        (None, None, None)
-    );
+    for budget in [&fg, &auto, &worker] {
+        assert_eq!(budget.max_provider_rounds, None);
+        assert_eq!(budget.max_tool_calls, None);
+        assert_eq!(budget.max_accumulated_tool_result_bytes, None);
+        assert_eq!(budget.max_elapsed, None);
+    }
     assert!(fg.max_context_tokens.is_none() && fg.max_cost_usd.is_none());
 
     // Typed config overrides per role.
@@ -397,7 +397,7 @@ fn per_role_defaults_and_auto_turn_composition() {
     cfg.worker.max_provider_rounds = Some(3);
     cfg.worker.max_cost_usd = Some(0.25);
     let from_cfg = TurnBudget::from_config(TurnRole::Worker, &cfg);
-    assert_eq!(from_cfg.max_provider_rounds, 3);
+    assert_eq!(from_cfg.max_provider_rounds, Some(3));
     assert_eq!(from_cfg.max_cost_usd, Some(0.25));
     // Unset fields keep the role defaults.
     assert_eq!(from_cfg.max_tool_calls, worker.max_tool_calls);
@@ -474,7 +474,7 @@ async fn budget_exhaustion_is_logged_with_exact_dimension() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 2,
+        max_provider_rounds: Some(2),
         max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
@@ -513,7 +513,7 @@ async fn graceful_round_renewal_is_logged() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 2,
+        max_provider_rounds: Some(2),
         max_round_renewals: 2,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
