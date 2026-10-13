@@ -522,7 +522,9 @@ pub(super) async fn handle_session_event_arm(
             app.push_msg(ChatMessage::System(format!("dequeued: {}", text)));
         }
         SessionEventWire::SystemNotice(text) => {
-            app.push_msg(ChatMessage::System(sanitize_notice(&text)));
+            if !super::watch::absorb_notice(app, &text) {
+                app.push_msg(ChatMessage::System(sanitize_notice(&text)));
+            }
         }
         SessionEventWire::LoaderProgress(ev) => {
             super::loop_arms::handle_extension_loader_event(app, link.view(), ev, ext_mgr).await;

@@ -1201,6 +1201,42 @@ mod tests {
         assert!(matches!(SessionEventWire::from(v), SessionEventWire::SystemNotice(_)));
     }
 
+    /// An older daemon cannot decode a newer client's command; serde names
+    /// the unknown tag in backticks. The TUI keys on exactly that
+    /// (`tui::watch::absorb_notice`, "malformed frame: unknown variant
+    /// `subagent_watch`") to tell the user to reload the daemon.
+    #[test]
+    fn an_unknown_command_or_query_names_its_tag_in_the_decode_error() {
+        let frames = [
+            (
+                ClientFrame::Cmd {
+                    session_id: "s".into(),
+                    cmd: SessionCommand::Query {
+                        id: 1,
+                        query: SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 0 },
+                    },
+                },
+                "subagent_watch",
+            ),
+            (
+                ClientFrame::Cmd {
+                    session_id: "s".into(),
+                    cmd: SessionCommand::SubagentSteer { handle_id: "sa_1".into(), text: "x".into() },
+                },
+                "subagent_steer",
+            ),
+        ];
+        for (frame, tag) in frames {
+            let json = serde_json::to_string(&frame).unwrap();
+            assert!(decode_line::<ClientFrame>(&json).is_ok());
+            // What an older daemon sees: a tag it does not know.
+            let old = json.replace(&format!("\"{tag}\""), "\"zz_from_the_future\"");
+            assert_ne!(old, json, "{tag} is serialized as a quoted tag");
+            let err = decode_line::<ClientFrame>(&old).unwrap_err();
+            assert!(err.contains("unknown variant `zz_from_the_future`"), "{err}");
+        }
+    }
+
     #[test]
     fn driver_armed_round_trips_and_old_client_skips() {
         // A v3 daemon emits DriverArmed; a v2 client decodes it as Unknown.

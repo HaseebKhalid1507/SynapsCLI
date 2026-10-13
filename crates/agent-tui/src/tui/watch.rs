@@ -51,7 +51,14 @@ pub(crate) struct WatchState {
     /// The last steer sent, until the engine accepts or refuses it:
     /// `(handle_id, text)`.
     pending_steer: Option<(String, String)>,
+    /// The attached daemon predates watch/steer: it answered with a
+    /// `malformed frame` error ([`absorb_notice`]). Cleared on reconnect.
+    unsupported: bool,
 }
+
+/// Shown when the attached daemon is an older binary without watch/steer.
+pub(crate) const UNSUPPORTED_HINT: &str = "the attached daemon predates subagent watch \u{2014} \
+     run `synaps daemon reload` (after installing this build) to enable it";
 
 struct PendingPoll {
     id: u64,
@@ -178,9 +185,12 @@ pub(crate) fn focus_worker(app: &mut App, c: &Candidate, now: Instant) {
             "subagent {} ({}) \u{2014} Enter steers it \u{00b7} Esc or Ctrl-\u{2193} returns to the main thread",
             c.agent_name, c.handle_id
         )));
+        if app.watch.unsupported {
+            thread.store.push_msg(ChatMessage::System(UNSUPPORTED_HINT.to_string()));
+        }
     }
     app.threads.focus_worker(&c.handle_id);
-    app.watch.next_poll = Some(now);
+    app.watch.next_poll = (!app.watch.unsupported).then_some(now);
     app.request_immediate_redraw();
 }
 
@@ -414,6 +424,10 @@ pub(crate) fn poll_due_at(app: &App) -> Option<Instant> {
 /// with [`poll_sent`].
 fn poll_query(app: &mut App, now: Instant) -> Option<(String, SessionQuery)> {
     let id = focused(app)?.to_string();
+    if app.watch.unsupported {
+        app.watch.next_poll = None;
+        return None;
+    }
     let Some(w) = app.threads.worker(&id) else {
         app.watch.next_poll = None;
         return None;
@@ -456,6 +470,42 @@ fn poll_sent(app: &mut App, handle_id: String, sent: Result<u64, String>, now: I
     match sent {
         Ok(id) => app.watch.pending = Some(PendingPoll { id, handle_id }),
         Err(_) => app.watch.next_poll = Some(now + POLL_INTERVAL * 4),
+    }
+}
+
+/// A daemon notice. An older daemon cannot decode a watch query or a steer
+/// and answers with `malformed frame: unknown variant `subagent_watch``
+/// (the connection survives). Such a notice is taken here — shown once in
+/// the worker view instead of every poll in the main transcript — and
+/// polling stops until the next reconnect. Returns `true` when taken.
+pub(crate) fn absorb_notice(app: &mut App, text: &str) -> bool {
+    if !text.starts_with("malformed frame") {
+        return false;
+    }
+    let watch = text.contains("`subagent_watch`");
+    let steer = text.contains("`subagent_steer`");
+    if !watch && !steer {
+        return false;
+    }
+    let first = !app.watch.unsupported;
+    app.watch.unsupported = true;
+    app.watch.pending = None;
+    app.watch.next_poll = None;
+    if steer && app.watch.pending_steer.is_some() {
+        steer_refused(app, UNSUPPORTED_HINT);
+    } else if first {
+        notice(app, UNSUPPORTED_HINT.to_string());
+    }
+    true
+}
+
+/// The daemon connection was re-established (possibly a newer image):
+/// try watching again.
+pub(crate) fn on_reconnect(app: &mut App, now: Instant) {
+    app.watch.unsupported = false;
+    app.watch.pending = None;
+    if focused(app).is_some() {
+        app.watch.next_poll = Some(now);
     }
 }
 
@@ -570,7 +620,9 @@ pub(crate) fn apply_page(w: &mut WorkerThread, page: WatchPage, now: Instant) ->
 pub(crate) fn steer_target(app: &App) -> Option<Result<String, String>> {
     let id = focused(app)?;
     let w = app.threads.worker(id)?;
-    Some(if w.steerable {
+    Some(if app.watch.unsupported {
+        Err(UNSUPPORTED_HINT.to_string())
+    } else if w.steerable {
         Ok(id.to_string())
     } else if w.status.is_empty() && !w.gone {
         Err(format!(
@@ -947,6 +999,51 @@ mod tests {
         assert_eq!(poll_due_at(&app), None, "no polling on main");
         assert!(esc_guarded(&app, now + ESC_GUARD / 2));
         assert!(!esc_guarded(&app, now + ESC_GUARD));
+    }
+
+    #[test]
+    fn an_older_daemon_is_told_once_in_the_worker_view_and_polling_stops() {
+        let mut app = app();
+        focus_and_answer(&mut app, "sa_7", page("sa_7", "running", vec![], 0));
+        let now = Instant::now();
+        assert!(poll_query(&mut app, now).is_some());
+        poll_sent(&mut app, "sa_7".to_string(), Ok(42), now);
+
+        let bad = "malformed frame: unknown variant `subagent_watch`, expected one of `context_report`";
+        assert!(absorb_notice(&mut app, bad));
+        assert!(absorb_notice(&mut app, bad), "repeats are taken too");
+        let hints = texts(&app, "sa_7")
+            .iter()
+            .filter(|t| t.contains("predates subagent watch"))
+            .count();
+        assert_eq!(hints, 1, "the hint is shown once");
+        assert!(app.transcript.is_empty(), "nothing in main");
+        assert_eq!(poll_due_at(&app), None);
+        assert!(poll_query(&mut app, now).is_none());
+        assert_eq!(steer_target(&app), Some(Err(UNSUPPORTED_HINT.to_string())));
+
+        // Other notices are not ours.
+        assert!(!absorb_notice(&mut app, "malformed frame: expected value at line 1"));
+        assert!(!absorb_notice(&mut app, "unknown variant `subagent_watch`"));
+
+        // A reconnect (maybe to a reloaded, newer daemon) tries again.
+        on_reconnect(&mut app, now);
+        assert_eq!(poll_due_at(&app), Some(now));
+        assert!(poll_query(&mut app, now).is_some());
+        assert_eq!(steer_target(&app), Some(Ok("sa_7".to_string())));
+
+        // A steer the daemon cannot decode comes back like a refusal.
+        steer_sent(&mut app, "sa_7", "check the tests");
+        assert!(absorb_notice(
+            &mut app,
+            "malformed frame: unknown variant `subagent_steer`, expected one of `submit`"
+        ));
+        assert!(texts(&app, "sa_7")
+            .last()
+            .unwrap()
+            .contains("steer refused: the attached daemon predates"));
+        assert_eq!(app.input_text(), "check the tests");
+        assert!(app.transcript.is_empty(), "nothing in main");
     }
 
     #[test]
