@@ -468,6 +468,18 @@ pub(crate) async fn try_reconnect(
                             "reconnected to daemon (pid {new_pid}) — session {} {status}",
                             session_id
                         )));
+                        // `daemon reload` re-execs only the daemon: after an
+                        // upgrade this client is still the old binary.
+                        let skew = link.transport_mut().daemon_binary().and_then(|d| {
+                            agent_engine::session::transport::version_skew_notice(
+                                &agent_engine::session::transport::BinaryId::this(),
+                                &d,
+                                snapshot.meta.id.as_str(),
+                            )
+                        });
+                        if let Some(skew) = skew {
+                            app.push_msg(ChatMessage::System(format!("⚠ {skew}")));
+                        }
                         app.toasts.upsert(
                             toast::Toast::new("reload", "reconnected").titled("Daemon"),
                         );

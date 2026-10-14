@@ -182,6 +182,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         sessions: state.session_metas(),
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
         generation: state.generation,
+        daemon_build: crate::session::wire::build_id().to_string(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
