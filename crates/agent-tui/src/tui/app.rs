@@ -1141,10 +1141,10 @@ mod tests {
                 "no borders or shade glyphs: {s:?}"
             );
         }
-        // Panel lines carry a gutter bar ▎ and a unified background.
+        // Panel lines carry a gutter bar ▐ and a unified background.
         let panel_line = lines
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{258E}')))
+            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{2590}')))
             .expect("a panel line with a gutter");
         assert!(
             panel_line.spans.iter().any(|s| s.style.bg.is_some()),
