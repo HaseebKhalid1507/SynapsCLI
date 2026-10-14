@@ -680,6 +680,10 @@ impl ClientTransport for SocketTransport {
     fn daemon_pid(&self) -> u32 {
         SocketTransport::daemon_pid(self)
     }
+
+    fn daemon_version(&self) -> Option<String> {
+        Some(self.welcome.daemon_version.clone())
+    }
 }
 
 #[cfg(test)]

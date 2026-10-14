@@ -76,6 +76,26 @@ pub trait ClientTransport: Send {
     fn daemon_pid(&self) -> u32 {
         0
     }
+    /// The daemon's binary version from the latest `Welcome` (it changes
+    /// across `daemon reload`). `None` on `LocalTransport`: same binary.
+    fn daemon_version(&self) -> Option<String> {
+        None
+    }
+}
+
+/// When a client binary differs from the daemon it talks to: what to tell
+/// the user, else `None`. An attached TUI keeps its own binary across
+/// `daemon reload` (only the daemon re-execs), so after an upgrade it lacks
+/// every client-side change — new slash commands, tray fixes, new events —
+/// until it is restarted.
+pub fn version_skew_notice(client_version: &str, daemon_version: &str, session: &str) -> Option<String> {
+    (client_version != daemon_version).then(|| {
+        format!(
+            "this client is synaps {client_version} but the daemon is {daemon_version} — \
+             commands and fixes newer than the client are unavailable here. \
+             Restart the client to pick them up: synaps --attach {session}"
+        )
+    })
 }
 
 /// Attach handshake budget.
@@ -256,6 +276,14 @@ impl ClientTransport for LocalTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn skew_notice_only_when_the_binaries_differ() {
+        assert_eq!(version_skew_notice("0.10.2", "0.10.2", "s"), None);
+        let n = version_skew_notice("0.10.1", "0.10.2", "20261011-041552-79cc").unwrap();
+        assert!(n.starts_with("this client is synaps 0.10.1 but the daemon is 0.10.2"), "{n}");
+        assert!(n.ends_with("synaps --attach 20261011-041552-79cc"), "{n}");
+    }
+
     use super::*;
     use crate::session::types::*;
     use crate::{LlmEvent, SessionEvent, StreamEvent};

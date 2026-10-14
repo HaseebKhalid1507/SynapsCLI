@@ -65,6 +65,9 @@ struct AttachNoticeInputs<'a> {
     /// The daemon's other sessions ([`adopt_banner`]), adopt only.
     others_banner: Option<String>,
     config_warnings: &'a [String],
+    /// `Some(notice)` when this client's binary differs from the daemon's
+    /// ([`version_skew_notice`](agent_engine::session::transport::version_skew_notice)).
+    version_skew: Option<String>,
 }
 
 /// Attach notes, split by whether they need the user.
@@ -90,6 +93,9 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
     }
     for w in i.config_warnings {
         out.transcript.push(format!("⚠ config: {w}"));
+    }
+    if let Some(skew) = i.version_skew {
+        out.transcript.push(format!("⚠ {skew}"));
     }
     let attached = format!("attached to {} as client #{} ({:?})", i.session_id, i.client_id, i.mode);
     match i.owned_elsewhere {
@@ -389,6 +395,11 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None
         },
         config_warnings: &config.warnings,
+        version_skew: agent_engine::session::transport::version_skew_notice(
+            &agent_engine::session::wire::binary_version(),
+            &transport.welcome.daemon_version,
+            snapshot.meta.id.as_str(),
+        ),
     });
     for n in notices.transcript {
         app.push_msg(ChatMessage::System(n));
@@ -456,6 +467,7 @@ mod tests {
             adopted: None,
             others_banner: None,
             config_warnings: warnings,
+            version_skew: None,
         }
     }
 
@@ -497,6 +509,20 @@ mod tests {
         // read-only attach: the attach line is in the transcript, not the toast
         assert!(n.toast.iter().all(|l| !l.starts_with("attached to")), "{n:?}");
         assert_eq!(n.toast[0], "adopted the running daemon (fresh session)");
+    }
+
+    #[test]
+    fn a_client_older_than_the_daemon_says_so_in_the_transcript() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        let skew = agent_engine::session::transport::version_skew_notice("0.10.1", "0.10.2", id.as_str());
+        let n = attach_notices(AttachNoticeInputs { version_skew: skew, ..notice_inputs(&id, &[]) });
+        assert_eq!(n.transcript.len(), 1, "{n:?}");
+        assert!(n.transcript[0].starts_with("⚠ this client is synaps 0.10.1 but the daemon is 0.10.2"), "{n:?}");
+        assert!(n.transcript[0].contains("synaps --attach 20261001-000000-ours"), "{n:?}");
+        // same binary: nothing extra
+        let same = agent_engine::session::transport::version_skew_notice("0.10.2", "0.10.2", id.as_str());
+        let n = attach_notices(AttachNoticeInputs { version_skew: same, ..notice_inputs(&id, &[]) });
+        assert!(n.transcript.is_empty(), "{n:?}");
     }
 
     #[test]
