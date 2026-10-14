@@ -14,6 +14,7 @@ mod effort;
 mod focus;
 mod gamba;
 mod help_find;
+mod header;
 mod helpers;
 mod highlight;
 mod input;

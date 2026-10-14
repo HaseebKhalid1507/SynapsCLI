@@ -3,7 +3,10 @@
 //! every other envelope maps to the `ChatMessage`/state mutation the inline
 //! turn machine used to perform. The actor never renders.
 
+use agent_engine::{TurnError, TurnOutcome};
 use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+
+use super::header::Activity;
 
 use agent_engine::session::{Envelope, RuntimeView, SessionEventWire, TurnTrigger};
 
@@ -34,15 +37,19 @@ pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
 pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &RuntimeView) {
     match event {
         StreamEvent::Llm(LlmEvent::Thinking(text)) => {
+            app.activity = Activity::Thinking;
             app.append_or_update_thinking(&text);
         }
         StreamEvent::Llm(LlmEvent::Text(text)) => {
+            app.activity = Activity::Writing;
             app.append_or_update_text(&text);
         }
         StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
+            app.activity = Activity::Writing;
             app.on_tool_use_start(tool_id, tool_name);
         }
         StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
+            app.activity = Activity::Writing;
             app.on_tool_use_delta(&tool_id, &delta);
         }
         StreamEvent::Llm(LlmEvent::ToolUse {
@@ -51,12 +58,19 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             input,
         }) => {
             let input_str = serde_json::to_string(&input).unwrap_or_default();
+            app.tools_in_flight += 1;
+            app.activity = Activity::Tool;
             app.on_tool_use_finalized(tool_id, tool_name, input_str);
         }
         StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
             app.on_tool_result_delta(tool_id, delta);
         }
         StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+            app.tools_in_flight = app.tools_in_flight.saturating_sub(1);
+            if app.tools_in_flight == 0 {
+                // All results back: the next request is on its way.
+                app.activity = Activity::Waiting;
+            }
             app.on_tool_result(tool_id, result);
         }
         // Digest clients never receive it; in-process the `Conversation`
@@ -167,10 +181,15 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             // Display-only retry/status notice — system line, not transcript.
             // Notice text can echo API error bodies; strip control chars
             // (esp. ESC) so a hostile payload can't inject terminal escapes.
+            // Retry notices all lead with ⏳ (runtime/api.rs).
+            if text.starts_with('\u{23f3}') {
+                app.activity = Activity::Retry;
+            }
             app.push_msg(ChatMessage::System(sanitize_notice(&text)));
         }
         StreamEvent::Session(SessionEvent::Done) => {
             app.transcript.end_response();
+            app.header_turn_ended(None);
             app.streaming = false;
             app.quit_guard.reset();
             app.drop_empty_thinking();
@@ -197,6 +216,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 sanitize_notice(&err.message),
                 err.category_label()
             )));
+            app.header_turn_ended(failure_label(&err));
             app.streaming = false;
             app.quit_guard.reset();
             // Reconcile HUD against registry rows on error path too (same as Done).
@@ -209,6 +229,9 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
         }
         // ResponseStart: snapshot the transcript position for rollback on reset.
         StreamEvent::Llm(LlmEvent::ResponseStart) => {
+            if app.tools_in_flight == 0 {
+                app.activity = Activity::Waiting;
+            }
             app.drop_empty_thinking();
             app.response_preview = Some((
                 app.transcript.messages().len(),
@@ -228,6 +251,21 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             }
         }
         StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
+    }
+}
+
+/// Short label the Ghost header keeps after a failed turn (`None` = the
+/// turn didn't fail in a way worth flagging).
+fn failure_label(err: &TurnError) -> Option<String> {
+    match &err.outcome {
+        TurnOutcome::Completed | TurnOutcome::Canceled => None,
+        TurnOutcome::ProviderFailed { code, .. } => {
+            let code: String = code.chars().filter(|c| !c.is_control()).take(16).collect();
+            Some(if code.is_empty() { "provider".into() } else { code })
+        }
+        TurnOutcome::ToolFailed { .. } => Some("tool failed".into()),
+        TurnOutcome::BudgetExceeded { .. } => Some("budget".into()),
+        TurnOutcome::InterruptedAfterSideEffect { .. } => Some("interrupted".into()),
     }
 }
 
@@ -375,6 +413,9 @@ pub(super) async fn handle_session_event_arm(
                 // The turn was accepted: the attachment drafts it carried are
                 // consumed now (a `Refused` would have left them for a retry).
                 app.pending_attachments.clear();
+                if !app.streaming {
+                    app.header_turn_started();
+                }
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.status_text = None;
@@ -393,6 +434,9 @@ pub(super) async fn handle_session_event_arm(
                 }
                 app.transcript.scroll_to_bottom();
                 app.status_text = Some("connecting…".to_string());
+                if !app.streaming {
+                    app.header_turn_started();
+                }
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.spinner_frame = 0;
@@ -402,6 +446,9 @@ pub(super) async fn handle_session_event_arm(
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
             }
             TurnTrigger::EventAuto | TurnTrigger::Compaction | TurnTrigger::DriverAuto => {
+                if !app.streaming {
+                    app.header_turn_started();
+                }
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.spinner_frame = 0;
@@ -495,6 +542,7 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Ended { .. } => return ArmFlow::Ended,
         SessionEventWire::Aborted { context_saved } => {
             app.transcript.end_response();
+            app.header_turn_ended(None);
             app.streaming = false;
             app.quit_guard.reset();
             app.subagents.clear();
@@ -603,6 +651,7 @@ pub(super) async fn handle_session_event_arm(
                 app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
                 // The pre-send presentation assumed a turn: undo it.
                 if app.streaming && app.turn_baseline == app.api_messages_len {
+                    app.header_turn_ended(None);
                     app.streaming = false;
             app.quit_guard.reset();
                     app.status_text = None;
