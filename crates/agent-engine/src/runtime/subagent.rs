@@ -259,6 +259,11 @@ pub struct SubagentHandle {
 
     /// Set to true once subagent_collect has read the terminal result.
     collected: bool,
+
+    /// Registry turn generation this worker was launched in (see
+    /// [`SubagentRegistry::begin_turn`]). Interrupting a turn cancels only
+    /// the workers it launched; reactive workers from earlier turns run on.
+    pub(crate) launch_turn: u64,
 }
 
 impl std::fmt::Debug for SubagentHandle {
@@ -304,6 +309,7 @@ impl SubagentHandle {
             thread_handle: None,
             result_rx,
             collected: false,
+            launch_turn: 0,
         }
     }
 
@@ -539,9 +545,24 @@ pub struct SubagentRegistry {
     // are cancelled before their thread can start inference.
     spawn_cancellation: Option<crate::CancellationToken>,
     spawn_epoch: u64,
+    /// Foreground turn generation, advanced by the session at every turn
+    /// start and stamped on each handle at registration. `0` until a
+    /// frontend opts in by calling [`Self::begin_turn`].
+    turn_generation: u64,
     /// Resume archives of handles that were reaped. Handle ids come from a
     /// process-wide counter, so they are never reused. Paths only: tiny.
     archived: HashMap<String, std::path::PathBuf>,
+}
+
+/// Which running workers an interruption cancels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerCancelScope {
+    /// Only workers launched by the given turn generation (the user
+    /// interrupted that turn, not the background work it inherited).
+    Turn(u64),
+    /// Every running worker (session teardown, cost cap, host checkpoint,
+    /// driver revocation, or an explicit `/workers cancel all`).
+    All,
 }
 
 impl SubagentRegistry {
@@ -550,8 +571,44 @@ impl SubagentRegistry {
             handles: HashMap::new(),
             spawn_cancellation: None,
             spawn_epoch: 0,
+            turn_generation: 0,
             archived: HashMap::new(),
         }
+    }
+
+    /// A foreground turn is starting: advance the generation that new
+    /// registrations are stamped with, and return it so the caller can
+    /// later cancel exactly this turn's workers.
+    pub fn begin_turn(&mut self) -> u64 {
+        self.turn_generation = self.turn_generation.wrapping_add(1).max(1);
+        self.turn_generation
+    }
+
+    /// Cancel running workers in `scope`; returns the newly cancelled handle
+    /// ids (sorted, for stable reporting). Finished handles, and handles
+    /// whose cancel is already in flight, are not touched.
+    pub fn cancel_running(&mut self, scope: WorkerCancelScope) -> Vec<String> {
+        let mut cancelled: Vec<String> = self
+            .handles
+            .values_mut()
+            .filter(|h| h.status() == SubagentStatus::Running)
+            .filter(|h| {
+                !h.state
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .cancel_requested
+            })
+            .filter(|h| match scope {
+                WorkerCancelScope::All => true,
+                WorkerCancelScope::Turn(generation) => h.launch_turn == generation,
+            })
+            .map(|h| {
+                h.cancel();
+                h.id.clone()
+            })
+            .collect();
+        cancelled.sort();
+        cancelled
     }
 
     /// Resume archive of `id`, whether its handle is still live or was reaped.
@@ -588,6 +645,7 @@ impl SubagentRegistry {
         {
             handle.cancel();
         }
+        handle.launch_turn = self.turn_generation;
         let id = handle.id.clone();
         self.handles.insert(id.clone(), handle);
         id
@@ -905,6 +963,57 @@ mod tests {
         let rendered = format!("{:?}{:?}", state.status, state.terminal);
         assert!(!rendered.contains(canary));
         assert!(rendered.contains("credential_unavailable"));
+    }
+
+    fn cancel_requested(registry: &SubagentRegistry, id: &str) -> bool {
+        registry
+            .get(id)
+            .unwrap()
+            .state
+            .read()
+            .unwrap()
+            .cancel_requested
+    }
+
+    /// Esc cancels the interrupted turn's workers, not reactive workers an
+    /// earlier turn launched (incident 2026-10-13: an interrupt killed a
+    /// waiter started 46 minutes and several turns earlier).
+    #[test]
+    fn turn_scoped_cancel_spares_workers_from_earlier_turns() {
+        let mut registry = SubagentRegistry::new();
+        let first = registry.begin_turn();
+        registry.register(make_handle("sa_1"));
+        let second = registry.begin_turn();
+        assert_ne!(first, second);
+        registry.register(make_handle("sa_2"));
+        registry.register(make_finished_handle("sa_3"));
+
+        let cancelled = registry.cancel_running(WorkerCancelScope::Turn(second));
+        assert_eq!(cancelled, vec!["sa_2".to_string()]);
+        assert!(cancel_requested(&registry, "sa_2"));
+        assert!(
+            !cancel_requested(&registry, "sa_1"),
+            "an earlier turn's worker keeps running"
+        );
+        assert!(
+            !cancel_requested(&registry, "sa_3"),
+            "finished workers are never touched"
+        );
+
+        let all = registry.cancel_running(WorkerCancelScope::All);
+        assert_eq!(all, vec!["sa_1".to_string()], "only still-running workers");
+        assert!(cancel_requested(&registry, "sa_1"));
+    }
+
+    /// Without `begin_turn` (frontends that never opt in) every handle shares
+    /// generation 0, so a turn-scoped cancel degrades to the old cancel-all.
+    #[test]
+    fn registrations_without_turns_share_generation_zero() {
+        let mut registry = SubagentRegistry::new();
+        registry.register(make_handle("sa_1"));
+        registry.register(make_handle("sa_2"));
+        let cancelled = registry.cancel_running(WorkerCancelScope::Turn(0));
+        assert_eq!(cancelled, vec!["sa_1".to_string(), "sa_2".to_string()]);
     }
 
     #[test]
