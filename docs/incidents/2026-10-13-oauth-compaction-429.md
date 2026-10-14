@@ -113,6 +113,8 @@ Or use local compaction (`compaction_mode = local`).
   surfacing directly ("compaction refused; main turns OK") instead of spending
   about four minutes in the retry ladder per attempt.
 - `runtime::helpers::tests::system_blocks_oauth_transport_identity_first_and_marker_on_last`
-  reads the process-wide identity. It fails intermittently under the parallel
-  test runner when a sibling test loads a config with the identity override
-  set. It also fails this way on `dev`; it is not caused by this fix.
+  asserted that the configured identity differs from the transport line. The
+  identity is a process-wide `OnceLock`, so the test failed whenever a sibling
+  test had loaded a config with the override set. Overriding is valid config,
+  so the fix PR drops that assert. The underlying problem remains: some tests
+  read the real `~/.synaps-cli/config` instead of a hermetic one.
