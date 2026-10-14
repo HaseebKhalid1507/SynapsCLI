@@ -54,10 +54,13 @@ phase names or task-planning instructions. `/context status` reports the
 configured capacity, current window, and effective thresholds.
 
 Auto mode alone is not a pressure signal. Model advisories are request-local and
-sent only when the current state changes (preparation, bounded finish, pending
-workers, or an unproductive rollover), not on every tool round. Normal/disabled
-assessments and committed rollovers clear stale advisory state. These notices
-never enter durable history; their bounded size is included in admission reserves.
+sent only when the current state changes (preparation, bounded finish, or an
+unproductive rollover), not on every tool round. The one exception is a due
+rollover waiting on workers: that reminder rides every deferred round, because a
+single notice scrolls out of attention while the wait goes on. UI notices stay
+edge-triggered. Normal/disabled assessments and committed rollovers clear stale
+advisory state. These notices never enter durable history; their bounded size is
+included in admission reserves.
 
 The model should continue normal work, reporting substantial task boundaries,
 not writing routine progress logs. Checkpoint notes are optional, a few lines of
@@ -106,8 +109,15 @@ summarizer. Headless chat's old automatic in-place compaction is suppressed in
 this mode; manual `/compact` is unchanged. `run_single` rejects this mode rather
 than silently behaving differently; the TUI/chat streaming engine supports it.
 
-1. Defer while workers are running/unreconciled; at hard capacity stop without
-   discarding history. Do not replay unknown tool effects.
+1. If workers are running or finished-but-unreconciled, wait up to four admitted
+   rounds (`WORKER_ROLLOVER_GRACE_ROUNDS`) for the model to collect them, then
+   roll over anyway. At hard capacity, never wait. Workers are not migrated or
+   cancelled; the successor envelope lists each one still tracked (handle,
+   agent, state, age, the dispatch preview) and says not to re-dispatch it, so
+   its completion wake is collected in the new window. Do not replay unknown
+   tool effects. (An unbounded wait let a session with near-continuous workers
+   grow ~240K tokens past the threshold until hard capacity refused every
+   request, including the round that would have collected them.)
 2. Prepare a smaller context, preserving actual user-authored turns (including
    image-only turns), system/developer messages, the last assistant/result tail,
    and all tool-call/result dependencies of retained messages.
