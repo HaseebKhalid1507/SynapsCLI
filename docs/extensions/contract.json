@@ -130,6 +130,15 @@
           "description must be non-empty",
           "input_schema must be a JSON object"
         ]
+      },
+      "call": {
+        "method": "tool.call",
+        "params": {
+          "name": "the extension's own tool name (not the plugin-id:name runtime name)",
+          "input": "the model-supplied arguments object",
+          "session_id": "owning conversation id; null for workers/subagents, the extension-provider tool route, contexts with no conversation, and under SYNAPS_HOOK_SESSION_ID=0. Always present."
+        },
+        "compatibility": "session_id is an additive params key within extension_protocol_version 1; extensions must ignore params keys they do not know"
       }
     },
     "providers": {

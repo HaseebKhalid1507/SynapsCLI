@@ -113,6 +113,7 @@ fn manual_ctx() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

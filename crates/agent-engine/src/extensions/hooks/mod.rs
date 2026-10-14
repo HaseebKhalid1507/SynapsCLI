@@ -1131,6 +1131,7 @@ mod tests {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                session_id: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,

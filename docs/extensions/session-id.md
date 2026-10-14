@@ -13,6 +13,7 @@ hooks.
 | `on_compaction`       | new session id      | unchanged                                  |
 | `on_session_start`    | session id          | unchanged                                  |
 | `on_session_end`      | session id          | unchanged                                  |
+| `tool.call` request   | absent              | `params.session_id`: the conversation that invoked the extension's tool (`null` for workers) |
 
 The field already existed as `Option<String>` in the JSON schema
 (`docs/extensions/contract.json`), so the change is **additive**: an
@@ -26,8 +27,11 @@ extension that ignores `session_id` sees the same shape it always did.
   session.
 - **Extension-originated `tool.invoke`.** A tool invoked by a sidecar via the
   extension protocol runs outside a conversation turn; `null`.
+- **`tool.call` outside a conversation.** The extension-provider tool route,
+  skill commands and host-originated lease calls (memory capture/recall)
+  send `params.session_id: null`.
 - **Kill-switch `SYNAPS_HOOK_SESSION_ID=0`** (also `false`/`off`): forces
-  `null` on the four tool/message hooks. Use it if a plugin misbehaves on the
+  `null` on the four tool/message hooks and on `tool.call` `params.session_id`. Use it if a plugin misbehaves on the
   new value. Session-lifecycle hooks are unaffected.
 
 ## Why: one sidecar, many sessions
@@ -52,7 +56,8 @@ The runtime side is done: hooks carry `session_id`; the router keys
 `widget.*` frames on `params.session_id`. A plugin that wants correct
 behaviour with more than one live session must:
 
-1. **Key its state on `session_id`.** One entry per session, created on
+1. **Key its state on `session_id`** — from hook events and, for the
+   extension's own tools, from `tool.call` `params.session_id` (the caller). One entry per session, created on
    the first hook that names the session, removed on `on_session_end`
    for that id. Treat `session_id == null` as "no session (worker /
    extension-originated tool call)" — never fold it into a session entry.
