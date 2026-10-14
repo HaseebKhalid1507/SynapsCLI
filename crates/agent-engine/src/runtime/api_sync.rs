@@ -34,10 +34,18 @@ fn sync_usage_meta(json: &Value) -> Option<crate::runtime::trace::UsageMeta> {
 /// that describes the assembly decision — both are produced in the same
 /// branch so the report can never drift from the wire.
 ///
-/// OAuth transport prepends exactly two synthesized identity/guidance
-/// segments ahead of the caller's compaction prompt (reported as
-/// `Synthesized`/`SystemSegment` with symbolic `system.synthetic[N]` IDs);
-/// API-key transport sends the prompt alone (lossless).
+/// OAuth transport prepends the same three synthesized segments as every
+/// other Anthropic OAuth request — the fixed Claude Code transport identity
+/// FIRST, then the product identity and the assistant guidance — ahead of
+/// the caller's compaction prompt (reported as `Synthesized`/`SystemSegment`
+/// with symbolic `system.synthetic[N]` IDs). API-key transport sends the
+/// prompt alone (lossless).
+///
+/// The transport identity is not optional here: before it was added, an
+/// OAuth compaction request led with the configurable product identity and
+/// Anthropic refused every one with HTTP 429 `rate_limit_error` (while the
+/// session's normal requests, which lead with it, kept succeeding). Unlike
+/// the streaming path, compaction sends no `cache_control` markers.
 fn compaction_system_blocks(
     auth_type: &str,
     system_prompt: &str,
@@ -45,9 +53,10 @@ fn compaction_system_blocks(
     let mut report = crate::runtime::transport::report::TranslationReport::lossless();
     let blocks = if auth_type == "oauth" {
         let identity = crate::core::config::get_identity();
-        let synthesized: [&str; 2] = [
+        let synthesized: [&str; 3] = [
+            super::helpers::CLAUDE_CODE_TRANSPORT_IDENTITY,
             identity.as_str(),
-            "You are a helpful AI assistant with access to tools. Use them when needed.",
+            super::helpers::OAUTH_ASSISTANT_GUIDANCE,
         ];
         let mut blocks = Vec::with_capacity(synthesized.len() + 1);
         for (i, text) in synthesized.into_iter().enumerate() {
@@ -625,8 +634,8 @@ impl ApiMethods {
 
         // System blocks + translation report come from one helper, in one
         // branch: the report is derived from the actual assembly decision
-        // (OAuth synthesizes two identity/guidance segments; api_key is
-        // lossless) and can never drift from the wire bytes.
+        // (OAuth synthesizes transport identity + product identity +
+        // guidance; api_key is lossless) and can never drift from the wire.
         let (system_blocks, compaction_report) =
             compaction_system_blocks(&auth_type, system_prompt);
         body["system"] = system_blocks;
@@ -653,7 +662,7 @@ impl ApiMethods {
 
         // ═══ TRACE (Task 8): compaction requests are traced too ═══
         // Report built above alongside the system blocks (Task 9 fix): OAuth
-        // carries the two synthesized identity/guidance segment entries.
+        // carries the three synthesized identity/guidance segment entries.
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
             &anthropic_url,
@@ -942,16 +951,16 @@ mod compaction_system_blocks_tests {
 
     const PROMPT_SENTINEL: &str = "COMPACTION-PROMPT-SENTINEL-4c1d";
 
-    /// OAuth compaction synthesizes exactly two identity/guidance system
-    /// segments; the report records exactly those two — action, element,
+    /// OAuth compaction synthesizes exactly three identity/guidance system
+    /// segments; the report records exactly those three — action, element,
     /// and symbolic structural ID all exact.
     #[test]
-    fn oauth_report_has_exactly_two_synthesized_system_entries() {
+    fn oauth_report_has_exactly_three_synthesized_system_entries() {
         let (_, report) = compaction_system_blocks("oauth", PROMPT_SENTINEL);
         assert_eq!(
             report.entries.len(),
-            2,
-            "oauth synthesizes exactly two system segments, got {:?}",
+            3,
+            "oauth synthesizes exactly three system segments, got {:?}",
             report
         );
         for (i, entry) in report.entries.iter().enumerate() {
@@ -990,22 +999,62 @@ mod compaction_system_blocks_tests {
         }
     }
 
-    /// Wire bytes are unchanged from the legacy inline assembly: OAuth is
-    /// [identity, guidance, prompt]; api_key is [prompt] — byte-identical.
+    /// OAuth compaction leads with the fixed Claude Code transport identity,
+    /// exactly like the streaming path. Regression: compaction led with the
+    /// configurable product identity, and Anthropic refused every OAuth
+    /// compaction with HTTP 429 while ordinary turns kept working.
     #[test]
-    fn system_blocks_match_legacy_wire_bytes() {
+    fn oauth_compaction_leads_with_transport_identity() {
         let (oauth_blocks, _) = compaction_system_blocks("oauth", PROMPT_SENTINEL);
-        let legacy_oauth = json!([
+        assert_eq!(
+            oauth_blocks[0]["text"], "You are Claude Code, Anthropic's official CLI for Claude.",
+            "OAuth compaction must lead with the transport identity"
+        );
+        let expected = json!([
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
             {"type": "text", "text": crate::core::config::get_identity()},
             {"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."},
             {"type": "text", "text": PROMPT_SENTINEL},
         ]);
         assert_eq!(
             serde_json::to_vec(&oauth_blocks).unwrap(),
-            serde_json::to_vec(&legacy_oauth).unwrap(),
-            "oauth system blocks must be byte-identical to the legacy assembly"
+            serde_json::to_vec(&expected).unwrap(),
+            "oauth compaction system blocks: transport identity, product identity, guidance, prompt"
         );
+    }
 
+    /// Compaction and the streaming path share one OAuth identity layout: the
+    /// synthesized prefix is text-identical (compaction omits cache markers).
+    #[test]
+    fn oauth_compaction_prefix_matches_streaming_system_blocks() {
+        let (compaction, _) = compaction_system_blocks("oauth", PROMPT_SENTINEL);
+        let streaming = HelperMethods::build_system_blocks(
+            "oauth",
+            &Some(PROMPT_SENTINEL.to_string()),
+            crate::core::config::CacheTtl::FiveMinutes,
+        )
+        .unwrap();
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["text"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(texts(&compaction), texts(&streaming));
+        assert!(
+            compaction
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b.get("cache_control").is_none()),
+            "compaction sends no cache markers"
+        );
+    }
+
+    /// API-key compaction is unchanged: the prompt alone, byte-identical.
+    #[test]
+    fn api_key_system_blocks_match_legacy_wire_bytes() {
         let (key_blocks, _) = compaction_system_blocks("api_key", PROMPT_SENTINEL);
         let legacy_key = json!([{"type": "text", "text": PROMPT_SENTINEL}]);
         assert_eq!(

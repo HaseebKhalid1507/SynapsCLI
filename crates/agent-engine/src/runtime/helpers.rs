@@ -42,6 +42,18 @@ pub(super) fn cache_control_value(ttl: CacheTtl, site: MarkerSite) -> Value {
     }
 }
 
+/// Anthropic OAuth routes on the FIRST system block. It is a wire-protocol
+/// contract, not Synaps branding or user-configurable identity: an OAuth
+/// request that does not lead with it is refused (observed as HTTP 429
+/// `rate_limit_error`, not 401/403, so it looks like a quota problem). Every
+/// Anthropic OAuth request builder, compaction included, must lead with it.
+pub(super) const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// General assistant guidance that follows the product identity on OAuth.
+pub(super) const OAUTH_ASSISTANT_GUIDANCE: &str =
+    "You are a helpful AI assistant with access to tools. Use them when needed.";
+
 pub(crate) struct HelperMethods;
 
 /// Map a terminal [`crate::RuntimeError`] to the spec §5.2 typed
@@ -386,14 +398,12 @@ impl HelperMethods {
         ttl: CacheTtl,
     ) -> Option<Value> {
         if auth_type == "oauth" {
-            // Anthropic OAuth routes on this first system block. It is a wire
+            // See CLAUDE_CODE_TRANSPORT_IDENTITY: the first block is a wire
             // protocol contract, not Synaps branding or user-configurable identity.
-            const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
-                "You are Claude Code, Anthropic's official CLI for Claude.";
             let mut system_blocks = vec![
                 json!({"type": "text", "text": CLAUDE_CODE_TRANSPORT_IDENTITY}),
                 json!({"type": "text", "text": crate::core::config::get_identity()}),
-                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
+                json!({"type": "text", "text": OAUTH_ASSISTANT_GUIDANCE}),
             ];
             if let Some(ref prompt) = system_prompt {
                 system_blocks.push(json!({"type": "text", "text": prompt}));
@@ -1103,8 +1113,9 @@ mod tests {
             // OAuth's protocol identity is fixed and FIRST. Product/user identity
             // remains additive and therefore cannot replace the transport contract.
             assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+            // Whatever identity is configured -- including the transport line
+            // itself, which is valid config -- rides after it.
             assert_eq!(blocks[1]["text"], crate::core::config::get_identity());
-            assert_ne!(blocks[0]["text"], blocks[1]["text"]);
             assert!(blocks[0].get("cache_control").is_none());
             assert!(blocks[1].get("cache_control").is_none());
             assert!(blocks[2].get("cache_control").is_none());
