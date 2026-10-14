@@ -4,6 +4,7 @@
 //! messages/tools/content-blocks (the internal synaps representation) and
 //! OpenAI `chat/completions` SSE wire.
 
+pub(crate) mod account_routing;
 pub mod catalog;
 pub(crate) mod extension_route;
 pub mod net;

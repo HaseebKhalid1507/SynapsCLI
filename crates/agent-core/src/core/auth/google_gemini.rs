@@ -85,8 +85,15 @@ pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
 /// Interactive login against the production Google OAuth endpoints.
 pub async fn login() -> Result<OAuthCredentials, String> {
+    login_into(Some(PROVIDER)).await
+}
+
+/// Interactive production login; `Some(key)` persists ONLY into that slot
+/// (`google-gemini` or `google-gemini@<label>`), `None` returns unsaved.
+pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
     let registration = GeminiRegistration::production()?;
-    login_with_registration(
+    login_with_registration_into(
+        persist_key,
         CALLBACK_PORT,
         TOKEN_URL,
         /* allow_http_token_endpoint = */ false,
@@ -186,6 +193,30 @@ pub async fn login_with_registration<F>(
 where
     F: FnOnce(&str) -> Result<(), String> + Send + 'static,
 {
+    login_with_registration_into(
+        Some(PROVIDER),
+        port,
+        token_endpoint,
+        allow_http_token_endpoint,
+        registration,
+        browser,
+    )
+    .await
+}
+
+/// Like [`login_with_registration`] but persists ONLY into `persist_key`
+/// when given (`None` returns the credential unsaved).
+pub async fn login_with_registration_into<F>(
+    persist_key: Option<&str>,
+    port: u16,
+    token_endpoint: &str,
+    allow_http_token_endpoint: bool,
+    registration: GeminiRegistration,
+    browser: F,
+) -> Result<OAuthCredentials, String>
+where
+    F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+{
     // Endpoint policy: production callers pass TOKEN_URL and must satisfy the
     // Google-host allowlist. Tests set `allow_http_token_endpoint` to permit a
     // loopback http endpoint; that path is never reachable through login().
@@ -259,8 +290,10 @@ where
     )
     .await?;
 
-    save_provider_auth(PROVIDER, &creds)
-        .map_err(|e| format!("google-gemini: failed to persist credentials: {e}"))?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)
+            .map_err(|e| format!("google-gemini: failed to persist credentials: {e}"))?;
+    }
     Ok(creds)
 }
 

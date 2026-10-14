@@ -882,6 +882,8 @@ impl StreamMethods {
                     &client,
                     &credential_source,
                     &token_cache,
+                    Some(&model),
+                    super::auth::RefreshPoint::WithinTurn,
                 )
                 .await?;
             }
@@ -3177,6 +3179,7 @@ mod rich_output_tests {
                 auth_type: "api_key".into(),
                 refresh_token: None,
                 token_expires: Some(9_999_999_999_999),
+                bound_credential: None,
             })),
             client: Client::new(),
             credential_source: crate::auth::CredentialSource::Local,
@@ -4248,6 +4251,7 @@ mod rich_output_tests {
                 auth_type: "api_key".into(),
                 refresh_token: None,
                 token_expires: Some(9_999_999_999_999),
+                bound_credential: None,
             })),
             client: reqwest::Client::new(),
             credential_source: crate::auth::CredentialSource::Local,

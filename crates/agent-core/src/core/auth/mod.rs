@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+pub mod account;
+pub mod anthropic_profile;
 pub mod aws_bedrock;
 pub mod azure_openai;
 pub mod broker;
@@ -22,25 +24,38 @@ mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;
 pub mod google_vertex;
+pub mod identity;
 pub mod kimi_code;
 mod openai_codex;
 mod pkce;
 pub mod provider;
 pub mod providers;
+pub mod quota_keeper;
+pub mod quota_policy;
 pub mod static_providers;
+pub mod auto_selection;
+pub use auto_selection::{AutoSelectionPolicy, PlanRow, SelectionPlan};
 mod storage;
 mod token;
+pub mod usage;
 mod xai;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
+pub use account::{
+    account_config_key, account_env_var, seat_fingerprint, Account, AccountLabel, AccountPolicy,
+    AccountSelector, AccountSummary, CredentialRef, SeatIdentity, AUTO_ACCOUNT_NAME,
+    DEFAULT_ACCOUNT_NAME,
+};
+pub use anthropic_profile::{
+    fetch_anthropic_profile, parse_anthropic_profile, AnthropicProfile, ANTHROPIC_PROFILE_URL,
+};
 pub use broker::{
     broker_from_source, global_broker, global_broker_install_count, preflight_cloud_capability,
-    set_global_broker, AccessToken,
-    BrokerError, CredentialBroker, CredentialKind, LocalBroker, ProviderStatus, ProxyByteStream,
-    ProxyMethod, ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus,
-    MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES,
-    PROXY_REQUEST_TIMEOUT,
+    set_global_broker, AccessToken, BrokerError, CredentialBroker, CredentialKind, LocalBroker,
+    PinnedToken, ProviderStatus, ProxyByteStream, ProxyMethod, ProxyRequest, ProxyResponse,
+    RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES,
+    MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
 };
 pub use browser::open_browser;
 pub use callback::{
@@ -55,9 +70,13 @@ pub use credential_source::{
     BrokerClient, BrokerToken, CredentialSource, TokenCache, TokenFetcher, DEFAULT_MARGIN_MS,
 };
 pub use github_copilot::login as login_github_copilot;
+pub use identity::{
+    identity_http_client, resolve_seat, supports_seat_identity, ResolvedSeat, SeatResolution,
+};
 pub use kimi_code::login as login_kimi_code;
 pub use openai_codex::{
-    extract_account_id as extract_codex_account_id, login as login_openai_codex,
+    extract_account_id as extract_codex_account_id, extract_email as extract_codex_email,
+    login as login_openai_codex,
 };
 pub use pkce::{build_auth_url, generate_code_challenge, generate_code_verifier, generate_state};
 pub use provider::{
@@ -65,12 +84,18 @@ pub use provider::{
 };
 pub use static_providers::{static_provider, StaticProviderSpec, LOCAL_PROVIDER_KEY};
 pub use storage::{
-    auth_file_path, load_auth, load_cloud_state, load_provider_auth, load_static_key, save_auth,
-    save_cloud_state, save_provider_auth, save_static_key,
+    any_oauth_credential_present, auth_file_path, find_duplicate_identity, list_accounts,
+    list_accounts_detailed, list_all_accounts, load_auth, load_cloud_state, load_credential,
+    load_provider_auth, load_static_key, remove_credential, save_account_metadata, save_auth,
+    save_cloud_state, save_credential, save_credential_unless_duplicate, save_provider_auth,
+    save_static_key, set_slot_identity, AccountInventory, AccountMetadata, IdentityEvidence,
+    LoginPersistOutcome,
 };
 pub use token::{
-    ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
+    ensure_fresh_credential, ensure_fresh_provider_token, ensure_fresh_token,
+    exchange_code_for_tokens, refresh_token,
 };
+pub use usage::{fetch_usage, UsageError, UsageSnapshot};
 pub use xai::login as login_xai;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
@@ -209,8 +234,17 @@ fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
 
 // ── High-level login flow ───────────────────────────────────────────────────
 
-/// Run the full OAuth login flow. Returns saved credentials.
+/// Run the full OAuth login flow into the default Anthropic slot.
 pub async fn login() -> std::result::Result<OAuthCredentials, String> {
+    login_into(Some(OAuthProviderId::Anthropic.as_str())).await
+}
+
+/// Run the full OAuth login flow. With `Some(key)` the credential is persisted
+/// ONLY into that slot (`anthropic` or `anthropic@<label>`); with `None` it
+/// is returned unsaved so the caller can run pre-persistence checks.
+pub async fn login_into(
+    persist_key: Option<&str>,
+) -> std::result::Result<OAuthCredentials, String> {
     let port = CALLBACK_PORT;
 
     // 1. Generate PKCE
@@ -297,8 +331,10 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     // 7. Shut down callback server
     server_handle.shutdown().await;
 
-    // 8. Save to auth.json
-    save_auth(&creds)?;
+    // 8. Save to auth.json — exactly one slot (or none: caller persists).
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)?;
+    }
 
     Ok(creds)
 }
