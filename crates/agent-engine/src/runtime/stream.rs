@@ -755,11 +755,11 @@ impl StreamMethods {
                     elapsed_secs = budget_meter.elapsed().as_secs(),
                     max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                     rounds_used = budget_meter.rounds_used(),
-                    max_provider_rounds = budget_meter.budget().max_provider_rounds,
+                    max_provider_rounds = ?budget_meter.budget().max_provider_rounds,
                     round_renewals_used = budget_meter.round_renewals_used(),
                     max_round_renewals = budget_meter.budget().max_round_renewals,
                     tool_calls_used = budget_meter.tool_calls_used(),
-                    max_tool_calls = budget_meter.budget().max_tool_calls,
+                    max_tool_calls = ?budget_meter.budget().max_tool_calls,
                     tool_result_bytes = budget_meter.tool_result_bytes_used(),
                     "turn ended: budget exhausted"
                 );
@@ -2192,7 +2192,7 @@ impl StreamMethods {
                         dimension = agent_core::BudgetDimension::ToolCalls.as_str(),
                         not_executed = over_budget_tool_uses.len(),
                         tool_calls_used = budget_meter.tool_calls_used(),
-                        max_tool_calls = budget_meter.budget().max_tool_calls,
+                        max_tool_calls = ?budget_meter.budget().max_tool_calls,
                         elapsed_secs = budget_meter.elapsed().as_secs(),
                         "tool calls dropped: turn tool-call budget exhausted"
                     );
