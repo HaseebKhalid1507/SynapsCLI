@@ -58,20 +58,84 @@ fn has_any(s: &str, glyphs: &[char]) -> bool {
 }
 
 #[test]
-fn idle_session_shows_only_the_wordmark_and_label() {
+fn idle_session_shows_the_wordmark_label_and_build() {
     let mut h = TestHarness::boot_with_size(100, 30);
     let line = header(&mut h);
     assert!(line.contains("synaps"), "wordmark missing: {line:?}");
+    assert!(
+        line.contains("test-session"),
+        "session label missing: {line:?}"
+    );
     assert!(!line.contains("0:0"), "idle header shows a clock: {line:?}");
     assert!(
         !line.contains("ready"),
         "Ghost drops the 'ready' text: {line:?}"
     );
-    let after_wordmark = &line[line.find("synaps").unwrap_or(0) + "synaps".len()..];
+
+    // Right side: the build, `v<version> · <hash>`, and nothing else.
+    let r = right(&mut h);
+    let prefix = concat!("v", env!("CARGO_PKG_VERSION"), " · ");
     assert!(
-        !has_any(after_wordmark, INDICATOR_GLYPHS),
+        r.starts_with(prefix),
+        "idle right side should be the build: {r:?}"
+    );
+    let hash = &r[prefix.len()..];
+    assert!(
+        !hash.is_empty() && hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "hash: {r:?}"
+    );
+
+    // No indicator anywhere between the wordmark and the build.
+    let start = line.find("synaps").unwrap() + "synaps".len();
+    let end = line.rfind(prefix).unwrap();
+    assert!(
+        !has_any(&line[start..end], INDICATOR_GLYPHS),
         "idle header shows an indicator: {line:?}"
     );
+}
+
+#[test]
+fn a_narrow_idle_header_drops_the_build_before_the_label() {
+    let mut h = TestHarness::boot_with_size(40, 20);
+    let line = header(&mut h);
+    assert!(
+        line.contains("test-session"),
+        "label must survive: {line:?}"
+    );
+    assert!(!line.contains(" · "), "build should give way: {line:?}");
+}
+
+/// The turn clock holds its column while the indicator after it changes
+/// shape (breathe 1 col, scope 6, scanner 6, dots 3).
+#[test]
+fn the_clock_holds_still_across_indicator_changes() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.feed_event(turn());
+    h.advance_clock_ms(5_000);
+    let mut cols = Vec::new();
+    for ev in [
+        llm(WireLlmEvent::Thinking { text: "hmm".into() }),
+        llm(WireLlmEvent::Text { text: "hi".into() }),
+        llm(WireLlmEvent::ToolUse {
+            tool_name: "bash".into(),
+            tool_id: "t1".into(),
+            input: serde_json::json!({"command": "ls"}),
+        }),
+        llm(WireLlmEvent::ToolResult {
+            tool_id: "t1".into(),
+            result: "ok".into(),
+        }),
+    ] {
+        h.feed_event(ev);
+        let line = header(&mut h);
+        let col = line
+            .find("0:05")
+            .unwrap_or_else(|| panic!("clock missing: {line:?}"));
+        cols.push((col, line));
+    }
+    for (col, line) in &cols[1..] {
+        assert_eq!(*col, cols[0].0, "clock moved:\n{}\n{line}", cols[0].1);
+    }
 }
 
 #[test]

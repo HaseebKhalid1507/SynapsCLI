@@ -10,9 +10,12 @@
 //!   works, and takes the error colour after a failed turn.
 //! * Sidecar pills follow the wordmark, as before.
 //! * The session's name (or its auto title, or its id) sits in the centre.
-//! * The right side is empty when idle. Otherwise it is a short label (turn
-//!   clock, `done/total` workers, `retrying`, …) followed by an indicator
-//!   whose *shape* names the state: see [`Indicator::for_state`].
+//! * Idle, the right side shows the build (`v0.10.2 · ae490b32`), dim; it
+//!   gives way to the session label when the row is tight. Otherwise it is
+//!   a short label (turn clock, `done/total` workers, `retrying`, …)
+//!   followed by an indicator whose *shape* names the state (see
+//!   [`Indicator::for_state`]), in a fixed-width slot so the label never
+//!   moves when the indicator changes.
 //!
 //! The message pane's top border is drawn as an upper half-block in the
 //! header colour ([`style_top_edge`]), so the bar reads 1½ rows tall while
@@ -95,6 +98,12 @@ impl HeaderState {
 
 /// Most bars the worker equalizer draws.
 pub(crate) const MAX_BARS: usize = 6;
+
+/// Columns reserved for the indicator: the widest one (scanner, scope, a
+/// full equalizer). Indicators are left-aligned in it, so the label to
+/// their left (turn clock, `1/3`, `retrying`, `✗ 401`) keeps one right
+/// edge whichever indicator, or none, is drawing.
+pub(crate) const INDICATOR_SLOT: usize = 6;
 
 /// Derive the header state. `status_text` wins (it is the explicit
 /// connecting/compacting/reconnecting/aborting signal); then the streaming
@@ -285,9 +294,11 @@ fn state_color(t: &Theme, state: &HeaderState) -> Color {
 
 // ─── text ───────────────────────────────────────────────────────────────────
 
-/// This build, as `/status` reports it: the header no longer carries the
-/// version and git hash, so this is where to check which binary a session
-/// runs (e.g. after a daemon reload).
+/// This build, as the idle header shows it: `v<version> · <git hash>`.
+pub(crate) const BUILD: &str = concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"));
+
+/// This build, as `/status` reports it (the header drops it when the row
+/// is too narrow for it and the session label).
 pub(crate) fn build_line() -> &'static str {
     concat!(
         "synaps v",
@@ -422,6 +433,61 @@ fn wordmark(t: &Theme, state: &HeaderState, tick: u64) -> Vec<Span<'static>> {
         .collect()
 }
 
+/// The right-hand cluster: `label␣␣[indicator, padded to the slot]␣␣`, or
+/// nothing when idle. The indicator slot has a fixed width, so the label
+/// never moves when the indicator changes shape.
+fn right_cluster(
+    t: &Theme,
+    state: &HeaderState,
+    turn_secs: Option<u64>,
+    tick: u64,
+) -> Vec<Span<'static>> {
+    let label = right_label(state, turn_secs);
+    let kind = Indicator::for_state(state);
+    if label.is_none() && kind.is_none() {
+        return Vec::new();
+    }
+    let mut right = Vec::new();
+    if let Some(label) = label {
+        let c = if matches!(state, HeaderState::Failed(_)) {
+            t.error_color
+        } else {
+            t.muted
+        };
+        right.push(Span::styled(label, fg(c)));
+        right.push(Span::raw("  "));
+    }
+    let bars: &[bool] = match state {
+        HeaderState::Agents { bars, .. } => bars,
+        _ => &[],
+    };
+    let ind = kind
+        .map(|k| indicator_spans(k, tick, state_color(t, state), t.bg, bars))
+        .unwrap_or_default();
+    let pad = INDICATOR_SLOT.saturating_sub(spans_width(&ind));
+    right.extend(ind);
+    right.push(Span::raw(" ".repeat(pad + 2)));
+    right
+}
+
+/// The idle right side: the build, dim, unless showing it would cut or
+/// hide the session label (the label matters more).
+fn idle_right(t: &Theme, label: &str, width: usize, left_w: usize) -> Vec<Span<'static>> {
+    let build = vec![
+        Span::styled(BUILD, fg(mix(t.muted, t.bg, 0.3))),
+        Span::raw("  "),
+    ];
+    let label_whole = match place_centre(label, width, left_w, spans_width(&build)) {
+        Some((_, text)) => text == label,
+        None => label.is_empty() && width >= left_w + spans_width(&build) + 3,
+    };
+    if label_whole {
+        build
+    } else {
+        Vec::new()
+    }
+}
+
 /// Draw the header row.
 pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, model: &RenderModel) {
     let t = THEME.load();
@@ -443,33 +509,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, model: &RenderModel) {
         left.push(super::draw::sidecar_pill_span(pill, model.spinner_frame));
     }
 
-    let mut right = Vec::new();
-    if let Some(label) = right_label(&state, snap.turn_elapsed_secs) {
-        let c = if matches!(state, HeaderState::Failed(_)) {
-            t.error_color
-        } else {
-            t.muted
-        };
-        right.push(Span::styled(label, fg(c)));
-    }
-    if let Some(kind) = Indicator::for_state(&state) {
-        if !right.is_empty() {
-            right.push(Span::raw("  "));
-        }
-        let bars: &[bool] = match &state {
-            HeaderState::Agents { bars, .. } => bars,
-            _ => &[],
-        };
-        right.extend(indicator_spans(
-            kind,
-            tick,
-            state_color(&t, &state),
-            t.bg,
-            bars,
-        ));
-    }
-    if !right.is_empty() {
-        right.push(Span::raw("  "));
+    let mut right = right_cluster(&t, &state, snap.turn_elapsed_secs, tick);
+    if right.is_empty() {
+        right = idle_right(
+            &t,
+            &snap.session_label,
+            area.width as usize,
+            spans_width(&left),
+        );
     }
 
     let (left_w, right_w) = (spans_width(&left), spans_width(&right));
@@ -711,11 +758,89 @@ mod tests {
     }
 
     #[test]
+    fn every_indicator_fits_the_slot() {
+        let (c, bg) = (Color::Rgb(200, 100, 50), Color::Rgb(10, 10, 20));
+        let full = [true; MAX_BARS];
+        for kind in [
+            Indicator::Breathe,
+            Indicator::Ripple,
+            Indicator::Dots,
+            Indicator::Scanner,
+            Indicator::Scope,
+            Indicator::Equalizer,
+        ] {
+            for tick in 0..120 {
+                let w = spans_width(&indicator_spans(kind, tick, c, bg, &full));
+                assert!(w <= INDICATOR_SLOT, "{kind:?} is {w} wide at tick {tick}");
+            }
+        }
+    }
+
+    /// The label (turn clock, `1/3`, `retrying`, `✗ 401`) ends at the same
+    /// column in every state and on every frame: only the indicator after
+    /// it changes, inside its fixed slot.
+    #[test]
+    fn the_label_never_moves_when_the_indicator_changes() {
+        let t = THEME.load();
+        let states = [
+            HeaderState::Connecting,
+            HeaderState::Thinking,
+            HeaderState::Streaming,
+            HeaderState::Tool,
+            HeaderState::Agents {
+                done: 1,
+                total: 3,
+                bars: vec![false, true, true],
+            },
+            HeaderState::Agents {
+                done: 0,
+                total: 6,
+                bars: vec![true; 6],
+            },
+            HeaderState::Retry,
+            HeaderState::Busy("compacting".into()),
+            HeaderState::Failed("401".into()),
+        ];
+        for state in &states {
+            for tick in 0..120 {
+                let right = right_cluster(&t, state, Some(42), tick);
+                assert!(!right.is_empty(), "{state:?}");
+                let after_label = spans_width(&right[1..]);
+                assert_eq!(after_label, 2 + INDICATOR_SLOT + 2, "{state:?} tick {tick}");
+            }
+        }
+        assert!(right_cluster(&t, &HeaderState::Idle, None, 0).is_empty());
+    }
+
+    #[test]
+    fn idle_shows_the_build_unless_it_would_cut_the_label() {
+        let t = THEME.load();
+        let left_w = 8; // "  synaps"
+        let shown = |label: &str, w: usize| !idle_right(&t, label, w, left_w).is_empty();
+        let build_w = BUILD.chars().count() + 2;
+
+        assert!(shown("axon-overnight", 100));
+        assert_eq!(
+            spans_width(&idle_right(&t, "axon-overnight", 100, left_w)),
+            build_w
+        );
+        // Just room for the whole label next to the build: shown.
+        let label = "axon-overnight";
+        let exact = left_w + 3 + label.len() + 3 + build_w;
+        assert!(shown(label, exact), "width {exact}");
+        // One column less would cut the label: the build gives way.
+        assert!(!shown(label, exact - 1), "width {}", exact - 1);
+        // A long title that won't fit whole anyway: no build either.
+        assert!(!shown(&"x".repeat(200), 120));
+    }
+
+    #[test]
     fn build_line_names_version_and_hash() {
         let line = build_line();
         assert!(line.starts_with("synaps v"), "{line}");
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
         assert!(line.ends_with(env!("GIT_HASH")), "{line}");
+        assert!(line.ends_with(BUILD), "header and /status agree: {line}");
     }
 
     #[test]
