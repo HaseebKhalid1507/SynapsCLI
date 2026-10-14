@@ -472,6 +472,13 @@ impl Tool for SubagentResumeTool {
                 start_time,
                 Some(&prior_handle_for_finalizer),
             );
+            // A cancelled worker publishes no wake, so nothing would ever
+            // prompt a collect: retire it before any terminal publication.
+            super::finalize::retire_if_cancelled(
+                &state_for_finalizer,
+                &orchestration_for_worker,
+                &handle_id_inner,
+            );
             // All terminal publications follow the recovery/finalization barrier.
             if let Some(ref tx) = tx_events_inner {
                 let s = state_for_finalizer
@@ -515,6 +522,9 @@ impl Tool for SubagentResumeTool {
                 .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
+        // The thread may have been cancelled and finalized before it was
+        // marked running; its own retire attempt was then too early.
+        super::finalize::retire_if_cancelled(&state, orchestration, &handle_id);
 
         Ok(json!({
             "handle_id":    handle_id,
