@@ -752,6 +752,81 @@ mod render_tests {
         );
     }
 
+    fn rows_named(buf: &Buffer, needle: &str) -> Vec<String> {
+        (0..buf.area().height)
+            .map(|y| row(buf, y))
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+
+    /// `daemon reload` re-execs the daemon and its workers die with it: the
+    /// tray must not keep ticking them as running (2026-10-14: two ghost
+    /// rows looked like live duplicates of the resumed workers).
+    #[test]
+    fn a_daemon_reload_ends_running_rows_as_stopped() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 1, "integrator");
+        start(&mut h, 2, "qwen3-builder");
+        update(&mut h, 2, "$ sleep 290");
+        h.feed_event(SessionEventWire::Reloading {
+            generation: 10,
+            retry_after_ms: 500,
+        });
+        let buf = h.render().clone();
+        for name in ["integrator", "qwen3-builder"] {
+            let line = rows_named(&buf, name).pop().unwrap_or_else(|| panic!("{name} missing"));
+            assert!(line.contains("stopped by daemon reload"), "{line:?}");
+            assert!(!line.contains("sleep 290"), "no longer shown as working: {line:?}");
+        }
+    }
+
+    /// The marked rows are finished rows: reconcile drops them once their
+    /// flash is over, though the registry never lists them again.
+    #[test]
+    fn rows_stopped_by_a_reload_flash_out() {
+        use super::super::app::SubagentState;
+        use super::super::stream_handler::{
+            mark_workers_stopped_by_reload, reconcile_subagents, SUBAGENT_DONE_FLASH_SECS,
+        };
+        let t0 = std::time::Instant::now();
+        let row = |id: u64, done: bool| SubagentState {
+            id,
+            name: format!("w{id}"),
+            status: "$ sleep 290".into(),
+            start_time: t0,
+            done,
+            duration_secs: done.then_some(1.0),
+            done_at: done.then_some(t0),
+            tools: 1,
+            result: None,
+        };
+        let mut hud = vec![row(1, false), row(2, true)];
+        assert!(mark_workers_stopped_by_reload(&mut hud, t0));
+        assert!(hud[0].done && hud[0].status.contains("stopped by daemon reload"));
+        assert_eq!(hud[1].status, "$ sleep 290", "a finished row keeps its ending");
+        assert!(!mark_workers_stopped_by_reload(&mut hud, t0), "idempotent");
+        let later = t0 + std::time::Duration::from_secs_f64(SUBAGENT_DONE_FLASH_SECS + 1.0);
+        reconcile_subagents(&mut hud, &[], later);
+        assert!(hud.is_empty(), "{:?}", hud.iter().map(|s| &s.status).collect::<Vec<_>>());
+    }
+
+    /// An older daemon restarts handle ids at 1 after a reload: a new worker
+    /// under a reused id replaces the stale row instead of adding a twin.
+    #[test]
+    fn a_reused_worker_id_replaces_its_row() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 1, "integrator");
+        h.feed_event(SessionEventWire::Reloading {
+            generation: 10,
+            retry_after_ms: 500,
+        });
+        start(&mut h, 1, "integrator");
+        let buf = h.render().clone();
+        let lines = rows_named(&buf, "integrator");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("starting"), "{lines:?}");
+    }
+
     /// A background worker outlives the turn that started it: its progress
     /// reaches the tray through the registry rows, not the ended stream.
     #[test]
