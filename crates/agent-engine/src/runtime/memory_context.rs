@@ -276,6 +276,11 @@ pub enum UserIntentProof {
         /// Digest of that exact user message.
         user_message_digest: MessageDigest,
     },
+    /// The operator's durable default (spec §12): a non-off
+    /// `memory.default_mode` together with `memory.default_mode_confirmed =
+    /// true`, hand-written in the same config file. Minted only by the host
+    /// when it starts a foreground session; never from model or plugin text.
+    OperatorConfig,
 }
 
 /// Mint one host-owned `ExplicitCommand` intent proof for a `/memory`

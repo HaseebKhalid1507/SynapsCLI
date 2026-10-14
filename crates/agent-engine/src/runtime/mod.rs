@@ -2988,6 +2988,62 @@ impl Runtime {
         result
     }
 
+    /// Start this fresh foreground session in the operator's confirmed
+    /// `memory.default_mode` (spec §12). Called once per session runtime by
+    /// [`crate::host::EngineHost::foreground_runtime_for`], after the memory
+    /// backend is bound; workers never call it, so they inherit storage but
+    /// not the default lease. The grant takes the exact `/memory` path —
+    /// provider resolution and validation first, fail-closed — under
+    /// [`memory_context::UserIntentProof::OperatorConfig`].
+    ///
+    /// `None`: nothing to apply (default off, consent latch unset, or the
+    /// session already has memory state). `/memory off` still revokes the
+    /// default for the rest of the session.
+    pub(crate) fn apply_memory_default_mode(
+        &self,
+        config: &agent_core::config::MemoryConfig,
+    ) -> Option<
+        std::result::Result<
+            memory_context::MemoryContextStatus,
+            memory_context::MemoryContextError,
+        >,
+    > {
+        use memory_context::MemoryContextMode as Mode;
+        // The parser already reverts an unconfirmed mode to off; re-check so
+        // a directly constructed config can never fail open.
+        if !config.default_mode_confirmed {
+            return None;
+        }
+        let mode = match config.default_mode.as_str() {
+            "recall_once" => Mode::RecallOnce,
+            "recall_each_prompt" => Mode::RecallEachPrompt,
+            "capture_only" => Mode::CaptureOnly,
+            "capture_and_recall" => Mode::CaptureAndRecall,
+            _ => return None,
+        };
+        if self.memory_context_status().durable != memory_context::DurableStatus::Off {
+            return None;
+        }
+        let proof = memory_context::UserIntentProof::OperatorConfig;
+        let result = if mode == Mode::RecallOnce {
+            self.memory_context_recall_once(proof)
+        } else {
+            self.memory_context_enable(mode, proof)
+        };
+        match &result {
+            Ok(_) => tracing::info!(
+                mode = mode.as_str(),
+                "memory.default_mode applied to session"
+            ),
+            Err(e) => tracing::warn!(
+                mode = mode.as_str(),
+                error = %e,
+                "memory.default_mode not applied; session starts with memory off"
+            ),
+        }
+        Some(result)
+    }
+
     /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
     /// the caller-supplied host-owned intent proof. Provider-validated
     /// exactly like [`Self::memory_context_enable`] (task A6). Fails typed
@@ -6201,6 +6257,135 @@ mod memory_context_provider_tests {
             assert!(error.contains("restart required"), "{error}");
             assert!(runtime.resolve_memory_provider(None).is_err());
         }
+    }
+
+    fn default_mode_config(mode: &str, confirmed: bool) -> agent_core::config::MemoryConfig {
+        agent_core::config::MemoryConfig {
+            default_mode: mode.to_string(),
+            default_mode_confirmed: confirmed,
+            ..Default::default()
+        }
+    }
+
+    /// Spec §12: a confirmed non-off `memory.default_mode` starts the
+    /// session in that mode under the host-owned `OperatorConfig` proof.
+    #[test]
+    fn memory_default_mode_confirmed_grants_session_lease() {
+        for (name, mode) in [
+            (
+                "recall_each_prompt",
+                memory_context::MemoryContextMode::RecallEachPrompt,
+            ),
+            (
+                "capture_only",
+                memory_context::MemoryContextMode::CaptureOnly,
+            ),
+            (
+                "capture_and_recall",
+                memory_context::MemoryContextMode::CaptureAndRecall,
+            ),
+        ] {
+            let runtime = Runtime::new_headless();
+            let status = runtime
+                .apply_memory_default_mode(&default_mode_config(name, true))
+                .expect("a confirmed non-off default applies")
+                .expect("legacy backend grants");
+            assert!(
+                matches!(status.durable, memory_context::DurableStatus::Active { mode: m, .. } if m == mode),
+                "{name}: got {:?}",
+                status.durable
+            );
+            assert_eq!(
+                runtime.memory_durable_proof_for_test(),
+                Some(memory_context::UserIntentProof::OperatorConfig),
+                "{name}"
+            );
+        }
+
+        let runtime = Runtime::new_headless();
+        runtime
+            .apply_memory_default_mode(&default_mode_config("recall_once", true))
+            .expect("applies")
+            .expect("grants");
+        assert_eq!(
+            runtime.memory_context_status().durable,
+            memory_context::DurableStatus::Off
+        );
+        assert_eq!(
+            runtime.memory_one_shot_proof_for_test(),
+            Some(memory_context::UserIntentProof::OperatorConfig)
+        );
+    }
+
+    /// Off, unknown, or unconfirmed defaults grant nothing (fail closed).
+    #[test]
+    fn memory_default_mode_off_unknown_or_unconfirmed_grants_nothing() {
+        for (mode, confirmed) in [
+            ("off", true),
+            ("off", false),
+            ("capture_and_recall", false),
+            ("recall_once", false),
+            ("recall_everything_forever", true),
+        ] {
+            let runtime = Runtime::new_headless();
+            assert!(
+                runtime
+                    .apply_memory_default_mode(&default_mode_config(mode, confirmed))
+                    .is_none(),
+                "{mode}/{confirmed} must not apply"
+            );
+            assert_memory_off_no_lease(&runtime);
+        }
+    }
+
+    /// The default never overrides memory state the session already has,
+    /// and `/memory off` still revokes a defaulted lease.
+    #[test]
+    fn memory_default_mode_keeps_existing_state_and_off_revokes() {
+        let runtime = Runtime::new_headless();
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::RecallEachPrompt,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .unwrap();
+        assert!(runtime
+            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+            .is_none());
+        assert!(matches!(
+            runtime.memory_context_status().durable,
+            memory_context::DurableStatus::Active {
+                mode: memory_context::MemoryContextMode::RecallEachPrompt,
+                ..
+            }
+        ));
+        assert!(matches!(
+            runtime.memory_durable_proof_for_test(),
+            Some(memory_context::UserIntentProof::ExplicitCommand { .. })
+        ));
+
+        let runtime = Runtime::new_headless();
+        runtime
+            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+            .unwrap()
+            .unwrap();
+        runtime.memory_context_disable();
+        assert_memory_off_no_lease(&runtime);
+    }
+
+    /// A default whose backend cannot serve fails closed: typed error,
+    /// memory stays off, no fallback provider.
+    #[test]
+    fn memory_default_mode_unusable_backend_fails_closed() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = invalid-not-axel-not-legacy\n",
+        ));
+        assert!(runtime
+            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+            .expect("a confirmed default is attempted")
+            .is_err());
+        assert_memory_off_no_lease(&runtime);
     }
 
     #[test]

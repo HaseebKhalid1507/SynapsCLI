@@ -43,7 +43,6 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("shell.readiness_strategy", NOT_READ_YET),
     ("shell.readiness_timeout_ms", NOT_READ_YET),
     ("shell.max_readiness_timeout_ms", NOT_READ_YET),
-    ("memory.default_mode", NOT_READ_YET),
     ("memory.capture_user", NOT_READ_YET),
     ("memory.capture_assistant", NOT_READ_YET),
     ("memory.capture_tools", NOT_READ_YET),
@@ -594,6 +593,11 @@ define_settings! {
 
     // ── Memory ───────────────────────────────────────────────────────────
 
+    "memory.default_mode", "Default memory mode", Memory,
+        EditorKind::Cycler(&["off", "recall_once", "recall_each_prompt", "capture_only", "capture_and_recall"]),
+        "Memory mode every new session starts in (default off). A non-off mode needs memory.default_mode_confirmed = true in the config, added by hand; until then this setting is refused. /memory off still turns it off for that session. Takes effect next launch.",
+        |_app, value| config_edit("memory.default_mode", value);
+
     "memory.backend", "Memory backend", Memory, EditorKind::Cycler(&["legacy", "axel"]),
         "Note storage: legacy (default) or axel (needs the Axel executable below). Selecting a backend never enables capture or recall. Restart required.",
         |_app, value| config_edit("memory.backend", value);
@@ -847,7 +851,14 @@ mod tests {
                 continue;
             };
             for option in options.iter() {
-                let content = format!("{} = {option}\n", def.key);
+                // A non-off default mode is valid only alongside the
+                // operator's hand-set consent latch (spec §12).
+                let latch = if def.key == "memory.default_mode" {
+                    "memory.default_mode_confirmed = true\n"
+                } else {
+                    ""
+                };
+                let content = format!("{latch}{} = {option}\n", def.key);
                 temp.write(&content);
                 let config = synaps_cli::config::load_config();
                 if !config.warnings.is_empty() {
@@ -1058,6 +1069,56 @@ mod tests {
         assert_eq!(
             synaps_cli::config::read_config_value("subagent.max_concurrent"),
             None
+        );
+
+        // A non-off default memory mode needs the hand-set consent latch.
+        temp.write("");
+        assert!(is_ok(apply_setting_dispatch(
+            "memory.default_mode",
+            "off",
+            &mut app
+        )));
+        assert!(is_err(apply_setting_dispatch(
+            "memory.default_mode",
+            "capture_and_recall",
+            &mut app
+        )));
+        assert!(is_err(apply_setting_dispatch(
+            "memory.default_mode",
+            "everything",
+            &mut app
+        )));
+        temp.write("memory.default_mode_confirmed = true\n");
+        assert!(is_ok(apply_setting_dispatch(
+            "memory.default_mode",
+            "capture_and_recall",
+            &mut app
+        )));
+        drop(temp);
+    }
+
+    /// The default-mode row shows the effective mode: off until the
+    /// operator's consent latch is set alongside it.
+    #[test]
+    fn memory_default_mode_display_requires_the_consent_latch() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        let temp = TempConfig::new("memory.default_mode = capture_and_recall\n");
+        assert_eq!(
+            config_row_display("memory.default_mode").as_deref(),
+            Some("off")
+        );
+        temp.write(
+            "memory.default_mode = capture_and_recall\nmemory.default_mode_confirmed = true\n",
+        );
+        assert_eq!(
+            config_row_display("memory.default_mode").as_deref(),
+            Some("capture_and_recall")
+        );
+        temp.write("memory.default_mode = bogus\nmemory.default_mode_confirmed = true\n");
+        assert_eq!(
+            config_row_display("memory.default_mode").as_deref(),
+            Some("off")
         );
         drop(temp);
     }
