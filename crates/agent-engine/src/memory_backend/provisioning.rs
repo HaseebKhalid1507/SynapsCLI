@@ -7,7 +7,7 @@ pub(super) fn ensure_default_parent(base: &Path, brain: &Path) -> Result<()> {
     if brain != base.join("memory/axel/brain.r8") || !base.is_absolute() {
         return Err(error("invalid managed Axel brain path"));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -68,17 +68,21 @@ pub(super) fn ensure_default_parent(base: &Path, brain: &Path) -> Result<()> {
             .map_err(|_| error("Axel parent durability unavailable"))?;
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
-    Err(error("shared Axel storage requires Linux/procfs"))
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err(error("shared Axel storage requires Linux or macOS"))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    /// Symlink-free base: macOS temp dirs live under the /var symlink.
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
     #[test]
     fn existing_group_writable_legacy_parent_is_not_chmodded_but_leaf_is_private() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let base = tmp.path().join("host");
         let memory = base.join("memory");
         std::fs::create_dir_all(&memory).unwrap();
@@ -109,7 +113,7 @@ mod tests {
     #[test]
     fn provision_is_private_idempotent_and_symlink_refusing() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let base = tmp.path().join("host");
         let brain = base.join("memory/axel/brain.r8");
         ensure_default_parent(&base, &brain).unwrap();
