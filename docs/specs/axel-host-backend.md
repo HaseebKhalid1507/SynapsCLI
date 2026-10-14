@@ -17,7 +17,8 @@ counts in this document are historical; they are not verification of the revisio
 The service remains an independent Cargo workspace so Axel's SQLite/vector/ONNX
 build dependencies do not enter the ordinary Synaps dependency graph. It pins
 Axel to `edbdea401d66feedb87fcad28c879ece54e3ccd2`; the service constructs the
-storage-only `Brain`, never an embedder/model. Linux with procfs is required.
+storage-only `Brain`, never an embedder/model. Linux with procfs or macOS is
+required (see the service README for macOS volfs/descriptor anchoring).
 
 ```sh
 cargo build --manifest-path sidecars/axel-memory-service/Cargo.toml --locked
