@@ -755,6 +755,10 @@ pub(crate) async fn handle_animation_tick(
         }
         app.request_redraw();
     }
+    if app.spinner_frame % 3 == 0 && app.header_animating() {
+        // Ghost header indicators (~20 fps; their speed is wall-clock).
+        app.request_redraw();
+    }
     if app.advance_animations() {
         // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
         // active tool animation). Mark just the last slot dirty instead of

@@ -134,6 +134,7 @@ fn begin_turn_presentation(
     render_handle: &render_thread::RenderHandle,
 ) {
     app.status_text = Some("connecting…".to_string());
+    app.header_turn_started();
     app.streaming = true;
     app.turn_baseline = app.api_messages_len;
     app.spinner_frame = 0;
@@ -597,6 +598,7 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::Status => {
+                    app.push_msg(ChatMessage::System(super::header::build_line().to_string()));
                     if link.view().model.contains('/') {
                         app.push_msg(ChatMessage::System(
                             "Usage stats are only available for Anthropic models.".to_string(),

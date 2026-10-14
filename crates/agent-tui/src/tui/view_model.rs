@@ -47,6 +47,8 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── status / spinner / identity ──
+    /// Ghost header snapshot (header.rs), built once per frame.
+    pub(crate) header: super::header::HeaderSnap,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
     pub(crate) agent_name: &'a str,
@@ -97,7 +99,9 @@ impl<'a> ViewInputs<'a> {
         let input = app.input_text();
         let cursor_pos = app.cursor_char_pos();
         let prompt_fx = app.prompt_clock.frame(app.clock.now(), app.streaming);
+        let header = app.header_snap();
         Self {
+            header,
             gamba_active: app.gamba_child.is_some(),
             transcript: &mut app.transcript,
             input,
