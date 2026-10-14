@@ -76,10 +76,39 @@ pub trait ClientTransport: Send {
     fn daemon_pid(&self) -> u32 {
         0
     }
-    /// The daemon's binary version from the latest `Welcome` (it changes
-    /// across `daemon reload`). `None` on `LocalTransport`: same binary.
-    fn daemon_version(&self) -> Option<String> {
+    /// The daemon's binary from the latest `Welcome` (it changes across
+    /// `daemon reload`). `None` on `LocalTransport`: same binary.
+    fn daemon_binary(&self) -> Option<BinaryId> {
         None
+    }
+}
+
+/// Which binary a process runs: its version and build
+/// ([`binary_version`](super::wire::binary_version),
+/// [`build_id`](super::wire::build_id)); the build is empty when unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryId {
+    pub version: String,
+    pub build: String,
+}
+
+impl BinaryId {
+    /// This process's own binary.
+    pub fn this() -> Self {
+        Self { version: super::wire::binary_version(), build: super::wire::build_id().to_string() }
+    }
+
+    /// The daemon's, from its handshake.
+    pub fn of(welcome: &super::wire::Welcome) -> Self {
+        Self { version: welcome.daemon_version.clone(), build: welcome.daemon_build.clone() }
+    }
+
+    fn label(&self, show_build: bool) -> String {
+        if show_build && !self.build.is_empty() {
+            format!("{} ({})", self.version, self.build)
+        } else {
+            self.version.clone()
+        }
     }
 }
 
@@ -87,15 +116,22 @@ pub trait ClientTransport: Send {
 /// the user, else `None`. An attached TUI keeps its own binary across
 /// `daemon reload` (only the daemon re-execs), so after an upgrade it lacks
 /// every client-side change — new slash commands, tray fixes, new events —
-/// until it is restarted.
-pub fn version_skew_notice(client_version: &str, daemon_version: &str, session: &str) -> Option<String> {
-    (client_version != daemon_version).then(|| {
-        format!(
-            "this client is synaps {client_version} but the daemon is {daemon_version} — \
-             commands and fixes newer than the client are unavailable here. \
-             Restart the client to pick them up: synaps --attach {session}"
-        )
-    })
+/// until it is restarted. Builds count, not just versions: a reload onto a
+/// newer build of the same release is the common case. An unknown build
+/// (empty: older daemon, packaged build) compares by version only.
+pub fn version_skew_notice(client: &BinaryId, daemon: &BinaryId, session: &str) -> Option<String> {
+    let builds_differ = !client.build.is_empty() && !daemon.build.is_empty() && client.build != daemon.build;
+    if client.version == daemon.version && !builds_differ {
+        return None;
+    }
+    let show_build = client.version == daemon.version;
+    Some(format!(
+        "this client is synaps {} but the daemon is {} — different builds, so some commands \
+         and fixes are unavailable here. Restart the client to match the daemon: \
+         synaps --attach {session}",
+        client.label(show_build),
+        daemon.label(show_build),
+    ))
 }
 
 /// Attach handshake budget.
@@ -278,10 +314,32 @@ impl ClientTransport for LocalTransport {
 mod tests {
     #[test]
     fn skew_notice_only_when_the_binaries_differ() {
-        assert_eq!(version_skew_notice("0.10.2", "0.10.2", "s"), None);
-        let n = version_skew_notice("0.10.1", "0.10.2", "20261011-041552-79cc").unwrap();
-        assert!(n.starts_with("this client is synaps 0.10.1 but the daemon is 0.10.2"), "{n}");
+        use super::{version_skew_notice, BinaryId};
+        let bin = |version: &str, build: &str| BinaryId { version: version.into(), build: build.into() };
+        assert_eq!(version_skew_notice(&bin("0.10.2", "cd1fbf50"), &bin("0.10.2", "cd1fbf50"), "s"), None);
+        // An older release.
+        let n = version_skew_notice(&bin("0.10.1", "be670c09"), &bin("0.10.2", "cd1fbf50"), "20261011-041552-79cc")
+            .unwrap();
+        assert!(n.starts_with("this client is synaps 0.10.1 but the daemon is 0.10.2 —"), "{n}");
         assert!(n.ends_with("synaps --attach 20261011-041552-79cc"), "{n}");
+        // Same release, another build (a reload onto a newer merge batch).
+        let n = version_skew_notice(&bin("0.10.2", "ae490b32"), &bin("0.10.2", "cd1fbf50"), "s").unwrap();
+        assert!(n.starts_with("this client is synaps 0.10.2 (ae490b32) but the daemon is 0.10.2 (cd1fbf50)"), "{n}");
+        // Unknown build on either side (an older daemon, a packaged build):
+        // versions only.
+        assert_eq!(version_skew_notice(&bin("0.10.2", "ae490b32"), &bin("0.10.2", ""), "s"), None);
+        assert_eq!(version_skew_notice(&bin("0.10.2", ""), &bin("0.10.2", "cd1fbf50"), "s"), None);
+    }
+
+    /// An older daemon's `Welcome` has no build: it parses, build unknown.
+    #[test]
+    fn welcome_without_a_build_parses() {
+        let w: super::super::wire::Welcome = serde_json::from_value(serde_json::json!({
+            "protocol_version": 3, "daemon_version": "0.10.1", "pid": 7, "profile": null,
+            "sessions": [], "progressive_tool_disclosure": true, "generation": 2
+        }))
+        .unwrap();
+        assert_eq!(super::BinaryId::of(&w), super::BinaryId { version: "0.10.1".into(), build: String::new() });
     }
 
     use super::*;

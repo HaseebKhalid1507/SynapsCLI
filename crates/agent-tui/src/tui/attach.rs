@@ -396,8 +396,8 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         },
         config_warnings: &config.warnings,
         version_skew: agent_engine::session::transport::version_skew_notice(
-            &agent_engine::session::wire::binary_version(),
-            &transport.welcome.daemon_version,
+            &agent_engine::session::transport::BinaryId::this(),
+            &agent_engine::session::transport::BinaryId::of(&transport.welcome),
             snapshot.meta.id.as_str(),
         ),
     });
@@ -514,13 +514,15 @@ mod tests {
     #[test]
     fn a_client_older_than_the_daemon_says_so_in_the_transcript() {
         let id = SessionId::from("20261001-000000-ours".to_string());
-        let skew = agent_engine::session::transport::version_skew_notice("0.10.1", "0.10.2", id.as_str());
+        use agent_engine::session::transport::{version_skew_notice, BinaryId};
+        let bin = |version: &str| BinaryId { version: version.into(), build: String::new() };
+        let skew = version_skew_notice(&bin("0.10.1"), &bin("0.10.2"), id.as_str());
         let n = attach_notices(AttachNoticeInputs { version_skew: skew, ..notice_inputs(&id, &[]) });
         assert_eq!(n.transcript.len(), 1, "{n:?}");
         assert!(n.transcript[0].starts_with("⚠ this client is synaps 0.10.1 but the daemon is 0.10.2"), "{n:?}");
         assert!(n.transcript[0].contains("synaps --attach 20261001-000000-ours"), "{n:?}");
         // same binary: nothing extra
-        let same = agent_engine::session::transport::version_skew_notice("0.10.2", "0.10.2", id.as_str());
+        let same = version_skew_notice(&bin("0.10.2"), &bin("0.10.2"), id.as_str());
         let n = attach_notices(AttachNoticeInputs { version_skew: same, ..notice_inputs(&id, &[]) });
         assert!(n.transcript.is_empty(), "{n:?}");
     }

@@ -470,9 +470,9 @@ pub(crate) async fn try_reconnect(
                         )));
                         // `daemon reload` re-execs only the daemon: after an
                         // upgrade this client is still the old binary.
-                        let skew = link.transport_mut().daemon_version().and_then(|d| {
+                        let skew = link.transport_mut().daemon_binary().and_then(|d| {
                             agent_engine::session::transport::version_skew_notice(
-                                &agent_engine::session::wire::binary_version(),
+                                &agent_engine::session::transport::BinaryId::this(),
                                 &d,
                                 snapshot.meta.id.as_str(),
                             )
