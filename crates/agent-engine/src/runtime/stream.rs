@@ -1147,28 +1147,33 @@ impl StreamMethods {
                             tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
                     }
-                    let workers_pending = orchestration
-                        .as_ref()
-                        .is_some_and(|o| !o.unreconciled_runtime_handles().is_empty())
-                        || subagent_registry
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .list_active()
-                            .iter()
-                            .any(|(_, _, status)| {
-                                matches!(status, super::subagent::SubagentStatus::Running)
-                            });
-                    if workers_pending {
-                        if time_checkpoint {
-                            finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
-                        }
-                        if decision.action == ContextAction::HardStop {
-                            let _ = tx
-                                .send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
-                            return Err(crate::RuntimeError::Config("context hard limit reached with pending workers; collect/reconcile before continuing; history retained".into()));
-                        }
+                    // Workers still in flight (running, or finished but not
+                    // collected+reconciled). A due rollover waits a bounded
+                    // grace for the model to collect them, then proceeds and
+                    // carries a manifest of them into the next window. Hard
+                    // capacity never waits: refusing there used to deadlock
+                    // the session, since collecting needs the very model
+                    // round being refused (incident 2026-10-13).
+                    let pending_workers = super::subagent::pending_workers(
+                        &subagent_registry,
+                        orchestration.as_deref(),
+                    );
+                    let gate = continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .worker_gate(
+                            !pending_workers.is_empty(),
+                            decision.action == ContextAction::HardStop,
+                            time_checkpoint,
+                        );
+                    if gate == super::continuation::WorkerGate::EndTurnForTime {
+                        finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
+                    }
+                    if gate == super::continuation::WorkerGate::Defer {
                         current_advisory = Some(ContextAdvisory::WorkersPending);
                     } else {
+                        let worker_manifest =
+                            super::subagent::render_worker_manifest(&pending_workers);
                         let minimum_reserve = continuation
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1192,6 +1197,7 @@ impl StreamMethods {
                             history_budget,
                             &cancel,
                             time_checkpoint,
+                            &worker_manifest,
                         )
                         .await
                         {
@@ -1242,7 +1248,16 @@ impl StreamMethods {
                                 // Already published: the next round checkpoint
                                 // must not re-send the identical head.
                                 round_checkpoint.mark_published(&messages);
-                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction."))));
+                                let carried = if pending_workers.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " Carried {} pending worker{} into the new window.",
+                                        pending_workers.len(),
+                                        if pending_workers.len() == 1 { "" } else { "s" }
+                                    )
+                                };
+                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction.{carried}"))));
                                 continue;
                             }
                             Err(error) => {
@@ -1256,18 +1271,22 @@ impl StreamMethods {
                 } else {
                     current_advisory = ContextAdvisory::from_assessment(&decision);
                 }
-                context_advisory = continuation
+                let transition = continuation
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .update_advisory(current_advisory);
-                if let Some(advisory) = context_advisory {
+                if let Some(advisory) = transition {
                     let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
                         advisory.notice(assessment.used_tokens()),
                     )));
                 }
+                // UI notices are edge-triggered; the model's reminder to collect
+                // pending workers rides every deferred round.
+                context_advisory = ContextAdvisory::for_request(transition, current_advisory);
             }
 
-            // Request-only pressure message, once per state transition.
+            // Request-only advisory: once per state transition, or every
+            // round while a due rollover waits on workers.
             let pressure_request;
             let request_messages = if let Some(advisory) = context_advisory {
                 pressure_request = request_messages
