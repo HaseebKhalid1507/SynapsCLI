@@ -234,6 +234,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "ping",
     "keybinds",
     "sidecar",
+    "watch",
 ];
 
 /// Load all skills, apply disable filters, build the command registry,

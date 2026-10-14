@@ -128,6 +128,9 @@ pub struct SubagentState {
     pub finalization_started: bool,
     pub finalization_ready: bool,
     pub archive_error: Option<String>,
+    /// What the worker has shown so far, for clients watching it in its own
+    /// thread view (`SessionQuery::SubagentWatch`). Bounded.
+    pub watch: super::subagent_watch::WatchJournal,
 }
 
 /// What `subagent_resume` needs to relaunch a worker when only its archive is left.
@@ -171,6 +174,7 @@ impl SubagentState {
             finalization_started: false,
             finalization_ready: false,
             archive_error: None,
+            watch: Default::default(),
         }
     }
 
@@ -227,6 +231,11 @@ pub struct SubagentDisplayRow {
     /// Tool calls started so far. Absent from older peers.
     #[serde(default)]
     pub tools: u32,
+    /// The registry handle id (`sa_N`) — the key every `subagent_*` tool and
+    /// the TUI's per-worker thread views address the worker by. Empty from
+    /// older peers.
+    #[serde(default)]
+    pub handle_id: String,
 }
 
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
@@ -455,6 +464,22 @@ impl SubagentHandle {
         state.tool_log.clear();
         state.conversation_state.clear();
         state.history = None;
+        // Tombstones are past FINISHED_HANDLE_TTL: no longer watchable.
+        state.watch = Default::default();
+    }
+
+    /// One page of this worker's watch journal from `since`, with its
+    /// identity and status (`SessionQuery::SubagentWatch`).
+    pub fn watch_page(&self, since: u64) -> super::subagent_watch::WatchPage {
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let status = state.public_status();
+        let mut page = state.watch.read(since);
+        page.handle_id = self.id.clone();
+        page.subagent_id = self.subagent_id;
+        page.agent_name = self.agent_name.clone();
+        page.steerable = status == SubagentStatus::Running && self.steer_tx.is_some();
+        page.status = watch_status_label(&status).to_string();
+        page
     }
 
     /// Send a steering message into the running subagent.
@@ -537,7 +562,34 @@ pub const FINISHED_HANDLE_TTL: std::time::Duration = std::time::Duration::from_s
 /// Maximum terminal text retained by a transport-free tombstone.
 pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 
+/// `WatchPage::status` for a worker status.
+fn watch_status_label(status: &SubagentStatus) -> &'static str {
+    match status {
+        SubagentStatus::Running => "running",
+        SubagentStatus::Completed => "completed",
+        SubagentStatus::Cancelled => "cancelled",
+        SubagentStatus::TimedOut => "timed_out",
+        SubagentStatus::Failed(_) => "failed",
+    }
+}
+
+/// Most reaped workers whose watch journal is kept (oldest finish drops first).
+const RETAINED_WATCH_MAX: usize = 16;
+/// Total journal bytes kept for reaped workers (oldest finish drops first).
+const RETAINED_WATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A reaped worker's watch journal. A collected handle is reaped at the next
+/// turn end, but its thread view stays watchable until
+/// [`FINISHED_HANDLE_TTL`] after the worker finished.
 #[derive(Debug)]
+struct RetainedWatch {
+    subagent_id: u64,
+    agent_name: String,
+    status: &'static str,
+    finished_at: std::time::Instant,
+    journal: super::subagent_watch::WatchJournal,
+}
+
 pub struct SubagentRegistry {
     pub(crate) handles: HashMap<String, SubagentHandle>,
     // A local session driver owns worker launches until explicit user takeover.
@@ -552,6 +604,9 @@ pub struct SubagentRegistry {
     /// Resume archives of handles that were reaped. Handle ids come from a
     /// process-wide counter, so they are never reused. Paths only: tiny.
     archived: HashMap<String, std::path::PathBuf>,
+    /// Watch journals of reaped workers, by handle id (bounded, see
+    /// [`RetainedWatch`]).
+    retained_watch: HashMap<String, RetainedWatch>,
 }
 
 /// Which running workers an interruption cancels.
@@ -573,6 +628,70 @@ impl SubagentRegistry {
             spawn_epoch: 0,
             turn_generation: 0,
             archived: HashMap::new(),
+            retained_watch: HashMap::new(),
+        }
+    }
+
+    /// One page of worker `id`'s watch journal (`SessionQuery::SubagentWatch`):
+    /// live or recently reaped (until [`FINISHED_HANDLE_TTL`] after it
+    /// finished). `None` for an unknown or expired worker.
+    pub fn watch_page(&mut self, id: &str, since: u64) -> Option<super::subagent_watch::WatchPage> {
+        if let Some(handle) = self.handles.get(id) {
+            return Some(handle.watch_page(since));
+        }
+        self.prune_retained_watch(FINISHED_HANDLE_TTL);
+        let kept = self.retained_watch.get_mut(id)?;
+        let mut page = kept.journal.read(since);
+        page.handle_id = id.to_string();
+        page.subagent_id = kept.subagent_id;
+        page.agent_name = kept.agent_name.clone();
+        page.status = kept.status.to_string();
+        page.steerable = false;
+        Some(page)
+    }
+
+    /// Keep a reaped worker's journal for its thread view.
+    fn retain_watch(&mut self, handle: &SubagentHandle) {
+        let mut state = handle.state.write().unwrap_or_else(|p| p.into_inner());
+        if state.watch.is_empty() {
+            return;
+        }
+        let kept = RetainedWatch {
+            subagent_id: handle.subagent_id,
+            agent_name: handle.agent_name.clone(),
+            status: watch_status_label(&state.public_status()),
+            finished_at: state.finished_at.unwrap_or_else(std::time::Instant::now),
+            journal: std::mem::take(&mut state.watch),
+        };
+        drop(state);
+        self.retained_watch.insert(handle.id.clone(), kept);
+        self.prune_retained_watch(FINISHED_HANDLE_TTL);
+    }
+
+    /// Drop retained journals past `ttl`, then the oldest finishes until the
+    /// count and byte bounds hold.
+    fn prune_retained_watch(&mut self, ttl: std::time::Duration) {
+        self.retained_watch
+            .retain(|_, w| w.finished_at.elapsed() < ttl);
+        loop {
+            let bytes: usize = self
+                .retained_watch
+                .values()
+                .map(|w| w.journal.bytes())
+                .sum();
+            if self.retained_watch.len() <= RETAINED_WATCH_MAX && bytes <= RETAINED_WATCH_MAX_BYTES
+            {
+                return;
+            }
+            let Some(oldest) = self
+                .retained_watch
+                .iter()
+                .min_by_key(|(_, w)| w.finished_at)
+                .map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            self.retained_watch.remove(&oldest);
         }
     }
 
@@ -717,6 +836,7 @@ impl SubagentRegistry {
                     finished_elapsed: s.finished_at.map(|t| t.elapsed()),
                     step: s.step.clone(),
                     tools: s.tools,
+                    handle_id: h.id.clone(),
                 }
             })
             .collect()
@@ -769,6 +889,7 @@ impl SubagentRegistry {
             if retain {
                 self.release_finished_resources(&id);
             } else if let Some(mut handle) = self.handles.remove(&id) {
+                self.retain_watch(&handle);
                 if let Some(path) = handle
                     .state
                     .read()
@@ -1044,6 +1165,7 @@ mod tests {
         state.write().unwrap().note_progress("$ sleep 20", 1);
         let r = row(&registry);
         assert_eq!(r.subagent_id, 7);
+        assert_eq!(r.handle_id, "sa_7", "rows carry the registry handle id");
         assert_eq!((r.step.as_str(), r.tools), ("$ sleep 20", 1));
     }
 
@@ -1054,6 +1176,7 @@ mod tests {
             "cancel_requested":false,"elapsed_secs":1.0,"finished_elapsed":null}"#;
         let row: SubagentDisplayRow = serde_json::from_str(old).expect("old row");
         assert_eq!((row.step.as_str(), row.tools), ("", 0));
+        assert_eq!(row.handle_id, "", "older peers send no handle id");
     }
 
     #[test]
@@ -1506,6 +1629,71 @@ mod tests {
             .expect("gate-relevant handle must remain collectible");
         assert!(h.is_tombstone(), "expired handle must release transports");
         assert!(h.partial_output().len() <= TOMBSTONE_OUTPUT_MAX_BYTES);
+    }
+
+    /// A collected worker is reaped at the next turn end, but its thread
+    /// view stays watchable (read-only) until the finished TTL.
+    #[test]
+    fn reaped_worker_stays_watchable_until_the_ttl() {
+        use crate::runtime::subagent_watch::WatchEvent;
+        let mut reg = SubagentRegistry::new();
+        let mut h = make_finished_handle("sa_1");
+        h.state.write().unwrap().watch.push(WatchEvent::Text {
+            text: "done it".into(),
+        });
+        h.mark_collected();
+        reg.register(h);
+        reg.register(make_finished_handle("sa_2")); // never showed anything
+
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+        assert!(reg.get("sa_1").is_none(), "reaped as before");
+
+        let page = reg.watch_page("sa_1", 0).expect("journal kept");
+        assert_eq!(page.handle_id, "sa_1");
+        assert_eq!(page.status, "completed");
+        assert!(!page.steerable);
+        assert_eq!(
+            page.events,
+            vec![WatchEvent::Text {
+                text: "done it".into()
+            }]
+        );
+        assert!(
+            reg.watch_page("sa_2", 0).is_none(),
+            "an empty journal is not kept"
+        );
+        assert!(reg.watch_page("sa_404", 0).is_none());
+
+        reg.prune_retained_watch(std::time::Duration::ZERO);
+        assert!(reg.watch_page("sa_1", 0).is_none(), "gone after the TTL");
+    }
+
+    #[test]
+    fn retained_watch_journals_are_bounded_oldest_first() {
+        use crate::runtime::subagent_watch::WatchEvent;
+        let mut reg = SubagentRegistry::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..(RETAINED_WATCH_MAX + 2) {
+            let mut h = make_handle(&format!("sa_{i}"));
+            {
+                let mut s = h.state.write().unwrap();
+                s.status = SubagentStatus::Completed;
+                s.finished_at = Some(t0 + std::time::Duration::from_millis(i as u64));
+                s.watch.push(WatchEvent::Text { text: "x".into() });
+            }
+            h.mark_collected();
+            reg.register(h);
+            reg.cleanup_finished_with_ttl(FINISHED_HANDLE_TTL);
+        }
+        assert_eq!(reg.retained_watch.len(), RETAINED_WATCH_MAX);
+        assert!(
+            reg.watch_page("sa_0", 0).is_none(),
+            "oldest finish dropped first"
+        );
+        assert!(reg.watch_page("sa_1", 0).is_none());
+        assert!(reg
+            .watch_page(&format!("sa_{}", RETAINED_WATCH_MAX + 1), 0)
+            .is_some());
     }
 
     #[test]

@@ -452,6 +452,20 @@ impl EngineHost {
         Ok(handle)
     }
 
+    /// Test seam: [`Self::create_session`] without spawning the actor, so a
+    /// test can seed session state (e.g. a fake worker in the subagent
+    /// registry) before `task.run()`. The handle is registered; the caller
+    /// spawns the task.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn create_session_unspawned(
+        self: &Arc<Self>,
+        cfg: SessionConfig,
+    ) -> Result<(SessionHandle, crate::session::SessionTask)> {
+        let (handle, task) = SessionActor::create(self, cfg).await?;
+        self.adopt_session(handle.clone());
+        Ok((handle, task))
+    }
+
     /// Register a handle built elsewhere (daemon test factories). The
     /// caller owns the task; `remove_session` when it ends.
     pub fn adopt_session(&self, handle: SessionHandle) {

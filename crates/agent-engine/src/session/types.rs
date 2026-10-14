@@ -490,6 +490,11 @@ pub enum SessionCommand {
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
     Steer { text: String },
+    /// Steer one of this session's running subagents (`sa_N`) from its watch
+    /// view. Owner-only like `Steer`. The note also enters the MAIN
+    /// conversation as an event (no auto-turn), so the main agent knows the
+    /// user redirected its worker. Failure → `Refused`.
+    SubagentSteer { handle_id: String, text: String },
     /// Esc. Cancel, adopt the turn's partial history + append the
     /// interruption marker (`engine::interrupt`), dequeue, flush pending
     /// events, cancel subagents, save.
@@ -587,6 +592,11 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::Steer { .. } => f
                 .debug_struct("Steer")
+                .field("text", &format_args!("<redacted>"))
+                .finish(),
+            Self::SubagentSteer { handle_id, .. } => f
+                .debug_struct("SubagentSteer")
+                .field("handle_id", handle_id)
                 .field("text", &format_args!("<redacted>"))
                 .finish(),
             Self::SubmitPrepared { .. } => f
@@ -735,6 +745,10 @@ pub enum SessionQuery {
     ContextReport,
     /// `display::DisplayTail` of the last `items` display items (phase 4).
     DisplayTail { items: usize },
+    /// `runtime::subagent_watch::WatchPage`: one of this session's workers,
+    /// its journal from `since` (the previous page's `next_seq`; 0 = all).
+    /// Unknown handle → `{"error": ..}`.
+    SubagentWatch { handle_id: String, since: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1295,6 +1309,11 @@ mod tests {
             SessionCommand::Checkpoint { reason: CheckpointReason::Reload },
             SessionCommand::KeepWarm { on: true },
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
+            SessionCommand::Query {
+                id: 4,
+                query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 7 },
+            },
+            SessionCommand::SubagentSteer { handle_id: "sa_2".into(), text: "focus on X".into() },
             SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
         ];
         for cmd in cmds {
@@ -1312,6 +1331,7 @@ mod tests {
         let cmds = vec![
             SessionCommand::Submit { text: secret.into(), attachments: vec![] },
             SessionCommand::Steer { text: secret.into() },
+            SessionCommand::SubagentSteer { handle_id: "sa_1".into(), text: secret.into() },
             SessionCommand::SubmitPrepared {
                 messages: vec![std::sync::Arc::new(serde_json::json!({"content": secret}))],
                 user_text: Some(secret.into()),

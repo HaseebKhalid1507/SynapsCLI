@@ -115,6 +115,12 @@ impl KeybindRegistry {
             (KeyCode::Right, KeyModifiers::ALT, "Jump word right"),
             (KeyCode::Up, KeyModifiers::SHIFT, "Scroll up"),
             (KeyCode::Down, KeyModifiers::SHIFT, "Scroll down"),
+            (KeyCode::Up, KeyModifiers::CONTROL, "Watch older subagent"),
+            (
+                KeyCode::Down,
+                KeyModifiers::CONTROL,
+                "Watch newer subagent / main",
+            ),
             (KeyCode::Up, KeyModifiers::NONE, "History up"),
             (KeyCode::Down, KeyModifiers::NONE, "History down"),
             (KeyCode::Left, KeyModifiers::NONE, "Cursor left"),

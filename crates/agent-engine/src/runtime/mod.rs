@@ -39,6 +39,7 @@ mod sse;
 mod sse_types;
 mod stream;
 pub mod subagent;
+pub mod subagent_watch;
 pub mod telemetry;
 pub mod trace;
 pub(crate) mod transport;
