@@ -25,6 +25,7 @@ Durable references live here at the top level. Working history is filed by kind 
 | [plans/](plans/) | Implementation plans. |
 | [reviews/](reviews/) | Code and architecture review records. |
 | [decisions/](decisions/) | Accepted decision records. |
+| [incidents/](incidents/) | Incident write-ups: timeline, root cause, fixes. |
 | [extensions/](extensions/) | Extension authoring: protocol, hooks, permissions, tutorial. |
 | [smoke/](smoke/) | Manual smoke-test procedures. |
 
