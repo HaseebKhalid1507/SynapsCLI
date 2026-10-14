@@ -197,6 +197,7 @@ pub fn handle_engine_command(
         "context" => return Some(context_command(runtime, None)),
         "trace" => return Some(trace_command(arg, runtime)),
         "budget" => return Some(budget_command(arg, runtime)),
+        "workers" => return Some(workers_command(arg, runtime)),
         "memory" => return Some(memory_command(arg, runtime)),
         _ => {}
     }
@@ -294,6 +295,185 @@ pub fn context_command(
         runtime.context_report(history).render(),
         runtime.context_management_status()
     ))
+}
+
+/// `/workers [status] | cancel <sa_N|all> | reconcile <sa_N|all>` — the
+/// user's direct handle on reactive workers, independent of the model:
+/// - `status` lists every tracked worker and whether it still holds the
+///   orchestration gate (rollover, model change, completion);
+/// - `cancel` stops running workers (Esc only stops the interrupted turn's
+///   own workers, so this is how background workers are stopped);
+/// - `reconcile` is the user's attestation for FINISHED workers the model
+///   never collected — the escape hatch when they pin the session. It never
+///   touches a running worker (cancel it first). No inference, no history.
+pub fn workers_command(arg: &str, runtime: &mut crate::Runtime) -> CommandResult {
+    use crate::runtime::subagent::{SubagentStatus, WorkerCancelScope};
+    const USAGE: &str =
+        "usage: /workers [status] | /workers cancel <sa_N|all> | /workers reconcile <sa_N|all>";
+    let words: Vec<_> = arg.split_whitespace().collect();
+    // Lock order: orchestration snapshot BEFORE the subagent registry.
+    let unreconciled = runtime
+        .orchestration()
+        .map(|o| o.unreconciled_runtime_handles())
+        .unwrap_or_default();
+    match words.as_slice() {
+        [] | ["status"] => {
+            let registry = runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut rows: Vec<(String, String)> = registry
+                .handles
+                .values()
+                .map(|h| {
+                    let status = h.status();
+                    let gate = match (status == SubagentStatus::Running, unreconciled.contains(&h.id)) {
+                        (true, _) => "",
+                        (false, true) => "  — finished, not collected (holds rollover: collect or /workers reconcile)",
+                        (false, false) => "",
+                    };
+                    let mins = (h.elapsed_secs() / 60.0).floor() as u64;
+                    (
+                        h.id.clone(),
+                        format!("  {}  {}  {}  {}m{}", h.id, h.agent_name, status.as_str(), mins, gate),
+                    )
+                })
+                .collect();
+            // Reaped from the registry but never reconciled (output expired).
+            for id in &unreconciled {
+                if !registry.handles.contains_key(id) {
+                    rows.push((
+                        id.clone(),
+                        format!("  {id}  (expired)  — not collected (holds rollover: /workers reconcile {id})"),
+                    ));
+                }
+            }
+            drop(registry);
+            if rows.is_empty() {
+                return CommandResult::Output("No workers tracked in this session.".into());
+            }
+            rows.sort_by(|a, b| natural_handle_order(&a.0, &b.0));
+            let lines: Vec<String> = rows.into_iter().map(|(_, line)| line).collect();
+            CommandResult::Output(format!("Workers ({}):\n{}", lines.len(), lines.join("\n")))
+        }
+        ["cancel", target] => {
+            let mut registry = runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let cancelled = if *target == "all" {
+                registry.cancel_running(WorkerCancelScope::All)
+            } else {
+                match registry.get_mut(target) {
+                    None => {
+                        return CommandResult::Error(format!("no worker {target} (see /workers)"))
+                    }
+                    Some(h) if h.status() != SubagentStatus::Running => {
+                        return CommandResult::Error(format!(
+                            "{target} is already {} — nothing to cancel",
+                            h.status().as_str()
+                        ))
+                    }
+                    Some(h) => {
+                        h.cancel();
+                        vec![target.to_string()]
+                    }
+                }
+            };
+            if cancelled.is_empty() {
+                CommandResult::Output("No running workers to cancel.".into())
+            } else {
+                CommandResult::Output(format!(
+                    "Cancelled {} (they stop at their next step; no completion wake is sent).",
+                    cancelled.join(", ")
+                ))
+            }
+        }
+        ["reconcile", target] => {
+            let Some(orchestration) = runtime.orchestration().cloned() else {
+                return CommandResult::Output(
+                    "Worker orchestration is not active; nothing to reconcile.".into(),
+                );
+            };
+            let candidates: Vec<String> = if *target == "all" {
+                let mut ids: Vec<String> = unreconciled.iter().cloned().collect();
+                ids.sort_by(|a, b| natural_handle_order(a, b));
+                ids
+            } else if unreconciled.contains(*target) {
+                vec![target.to_string()]
+            } else {
+                return CommandResult::Error(format!(
+                    "{target} is not awaiting reconciliation (see /workers)"
+                ));
+            };
+            let statuses: Vec<(String, Option<SubagentStatus>)> = {
+                let registry = runtime
+                    .subagent_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                candidates
+                    .into_iter()
+                    .map(|id| {
+                        let status = registry.get(&id).map(|h| h.status());
+                        (id, status)
+                    })
+                    .collect()
+            };
+            let (mut done, mut running, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+            for (id, status) in statuses {
+                let terminal = match status {
+                    Some(SubagentStatus::Running) => {
+                        running.push(id);
+                        continue;
+                    }
+                    Some(SubagentStatus::Completed) => {
+                        agent_core::orchestration::WorkerTerminal::Completed
+                    }
+                    Some(SubagentStatus::TimedOut) => {
+                        agent_core::orchestration::WorkerTerminal::TimedOut
+                    }
+                    _ => agent_core::orchestration::WorkerTerminal::Failed,
+                };
+                match orchestration
+                    .terminal_and_collect(&id, terminal)
+                    .and_then(|()| orchestration.reconcile(&id))
+                {
+                    Ok(()) => done.push(id),
+                    Err(e) => failed.push(format!("{id} ({e})")),
+                }
+            }
+            let mut out = Vec::new();
+            if !done.is_empty() {
+                out.push(format!(
+                    "Reconciled {} on your authority; their results stay readable via subagent_collect until reaped.",
+                    done.join(", ")
+                ));
+            }
+            if !running.is_empty() {
+                out.push(format!(
+                    "Still running, left alone: {} (/workers cancel <id> first).",
+                    running.join(", ")
+                ));
+            }
+            if !failed.is_empty() {
+                out.push(format!("Could not reconcile: {}.", failed.join(", ")));
+            }
+            if out.is_empty() {
+                out.push("Nothing awaiting reconciliation.".into());
+            }
+            CommandResult::Output(out.join("\n"))
+        }
+        _ => CommandResult::Error(USAGE.into()),
+    }
+}
+
+/// `sa_9` before `sa_10`; anything unparseable falls back to string order.
+fn natural_handle_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let num = |s: &str| s.strip_prefix("sa_").and_then(|n| n.parse::<u64>().ok());
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
 }
 
 /// Explicit operator control of future turns. No config writes, inference,
@@ -1017,6 +1197,133 @@ mod tests {
         ] {
             assert_eq!(parse_turn_duration(input), None, "{input}");
         }
+    }
+
+    // ── /workers ────────────────────────────────────────────────────────────
+
+    fn worker_handle(
+        id: &str,
+        status: crate::runtime::subagent::SubagentStatus,
+    ) -> crate::runtime::subagent::SubagentHandle {
+        let state = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::runtime::subagent::SubagentState::new(),
+        ));
+        state.write().unwrap().status = status;
+        crate::runtime::subagent::SubagentHandle::new(
+            id.into(),
+            id.trim_start_matches("sa_").parse().unwrap_or(0),
+            "spike".into(),
+            "task".into(),
+            "claude-sonnet-4-6".into(),
+            "system".into(),
+            60,
+            state,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn runtime_with_workers() -> (
+        crate::Runtime,
+        std::sync::Arc<crate::orchestration::OrchestrationRuntime>,
+    ) {
+        use crate::runtime::subagent::SubagentStatus;
+        let mut runtime = crate::Runtime::new_headless();
+        let model = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(model, 3, 8).unwrap(),
+        );
+        for id in ["sa_9", "sa_10"] {
+            orchestration.resolve_and_authorize(id, None).unwrap();
+            orchestration.mark_starting(id).unwrap();
+            orchestration.mark_running(id).unwrap();
+        }
+        runtime.install_orchestration(orchestration.clone());
+        {
+            let mut registry = runtime.subagent_registry().lock().unwrap();
+            registry.register(worker_handle("sa_9", SubagentStatus::Running));
+            registry.register(worker_handle("sa_10", SubagentStatus::Completed));
+        }
+        (runtime, orchestration)
+    }
+
+    fn command_text(result: Option<CommandResult>) -> String {
+        match result {
+            Some(CommandResult::Output(text)) | Some(CommandResult::Error(text)) => text,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workers_status_lists_workers_and_flags_uncollected_ones() {
+        let (mut runtime, _) = runtime_with_workers();
+        let text = command_text(handle_engine_command("workers", "", &mut runtime));
+        let sa9 = text.find("sa_9").expect(&text);
+        let sa10 = text.find("sa_10").expect(&text);
+        assert!(sa9 < sa10, "natural handle order: {text}");
+        let line10 = text.lines().find(|l| l.contains("sa_10")).unwrap();
+        assert!(
+            line10.contains("completed") && line10.contains("holds rollover"),
+            "{line10}"
+        );
+        let line9 = text.lines().find(|l| l.contains("sa_9")).unwrap();
+        assert!(
+            line9.contains("running") && !line9.contains("holds rollover"),
+            "{line9}"
+        );
+        assert!(crate::skills::BUILTIN_COMMANDS.contains(&"workers"));
+    }
+
+    #[test]
+    fn workers_reconcile_releases_finished_workers_and_never_running_ones() {
+        let (mut runtime, orchestration) = runtime_with_workers();
+        let text = command_text(handle_engine_command(
+            "workers",
+            "reconcile all",
+            &mut runtime,
+        ));
+        assert!(text.contains("Reconciled sa_10"), "{text}");
+        assert!(text.contains("Still running, left alone: sa_9"), "{text}");
+        assert!(!orchestration.is_unreconciled("sa_10"));
+        assert!(orchestration.is_unreconciled("sa_9"));
+        // A handle that is not awaiting reconciliation is refused.
+        let Some(CommandResult::Error(e)) =
+            handle_engine_command("workers", "reconcile sa_10", &mut runtime)
+        else {
+            panic!("already reconciled must be refused")
+        };
+        assert!(e.contains("not awaiting"), "{e}");
+    }
+
+    #[test]
+    fn workers_cancel_targets_running_workers_only() {
+        let (mut runtime, _) = runtime_with_workers();
+        let Some(CommandResult::Error(e)) =
+            handle_engine_command("workers", "cancel sa_10", &mut runtime)
+        else {
+            panic!("finished worker cannot be cancelled")
+        };
+        assert!(e.contains("already completed"), "{e}");
+        let text = command_text(handle_engine_command("workers", "cancel all", &mut runtime));
+        assert!(text.contains("Cancelled sa_9"), "{text}");
+        let registry = runtime.subagent_registry().lock().unwrap();
+        assert!(
+            registry
+                .get("sa_9")
+                .unwrap()
+                .state
+                .read()
+                .unwrap()
+                .cancel_requested
+        );
+        drop(registry);
+        let Some(CommandResult::Error(usage)) =
+            handle_engine_command("workers", "explode", &mut runtime)
+        else {
+            panic!("usage")
+        };
+        assert!(usage.starts_with("usage: /workers"));
     }
 
     #[test]

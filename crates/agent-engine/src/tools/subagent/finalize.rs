@@ -232,6 +232,29 @@ fn finalize_subagent_impl(
     }
 }
 
+/// Fix for workers that outlive their cancellation in the orchestration
+/// registry: a user-cancelled worker suppresses its completion wake (above),
+/// so nothing would ever prompt the model to collect it, and it stayed
+/// "unreconciled" forever — deferring context rollover until the hard limit.
+///
+/// Once the finalizer has run for a cancelled worker, retire it in the
+/// orchestration registry. Called from the worker thread right after
+/// [`finalize_subagent`], and again by the launcher after `mark_running`
+/// (the thread can finish before the launcher marks it running). Returns
+/// whether the worker is now retired; a no-op for anything not cancelled.
+#[doc(hidden)]
+pub fn retire_if_cancelled(
+    state: &Arc<RwLock<SubagentState>>,
+    orchestration: &crate::orchestration::OrchestrationRuntime,
+    handle_id: &str,
+) -> bool {
+    let cancelled_and_final = {
+        let s = state.read().unwrap_or_else(|p| p.into_inner());
+        s.cancel_requested && s.finalization_ready
+    };
+    cancelled_and_final && orchestration.retire_cancelled(handle_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +323,81 @@ mod tests {
         );
         assert_eq!(queue.len(), count);
         assert_eq!(state.read().unwrap().status, SubagentStatus::Completed);
+    }
+
+    fn orchestration_with_running(id: &str) -> crate::orchestration::OrchestrationRuntime {
+        let model = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let orchestration =
+            crate::orchestration::OrchestrationRuntime::baseline(model, 3, 8).unwrap();
+        orchestration.resolve_and_authorize(id, None).unwrap();
+        orchestration.mark_starting(id).unwrap();
+        orchestration.mark_running(id).unwrap();
+        orchestration
+    }
+
+    /// A user-cancelled worker publishes no completion wake, so the model is
+    /// never told to collect it. It must not stay "unreconciled" forever:
+    /// that deferred context rollover until the hard limit refused every
+    /// further request (incident 2026-10-13).
+    #[test]
+    fn cancelled_worker_is_retired_from_orchestration() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = orchestration_with_running("sa_cancel");
+        let state = make_state(SubagentStatus::Running, "partial");
+        state.write().unwrap().cancel_requested = true;
+
+        // Before the finalizer runs there is nothing to retire yet.
+        assert!(!retire_if_cancelled(&state, &orchestration, "sa_cancel"));
+        assert!(orchestration.is_unreconciled("sa_cancel"));
+
+        let queue = Arc::new(EventQueue::new(100));
+        finalize_subagent_in(
+            &state,
+            Some(&queue),
+            "sa_cancel",
+            1,
+            "worker",
+            std::time::Instant::now(),
+            None,
+            dir.path(),
+        );
+        assert!(queue.is_empty(), "cancel still suppresses the wake");
+        assert!(retire_if_cancelled(&state, &orchestration, "sa_cancel"));
+        assert!(!orchestration.is_unreconciled("sa_cancel"));
+        assert!(
+            orchestration.unreconciled_runtime_handles().is_empty(),
+            "nothing left to pin rollover"
+        );
+        // Idempotent: the launcher's post-mark_running re-check is harmless,
+        // and a later model collect still succeeds.
+        assert!(retire_if_cancelled(&state, &orchestration, "sa_cancel"));
+        orchestration
+            .terminal_and_collect(
+                "sa_cancel",
+                agent_core::orchestration::WorkerTerminal::Failed,
+            )
+            .unwrap();
+        orchestration.reconcile("sa_cancel").unwrap();
+    }
+
+    /// Completed (not cancelled) workers keep the collect-and-attest contract.
+    #[test]
+    fn completed_worker_is_never_auto_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = orchestration_with_running("sa_done");
+        let state = make_state(SubagentStatus::Completed, "result");
+        finalize_subagent_in(
+            &state,
+            None,
+            "sa_done",
+            1,
+            "worker",
+            std::time::Instant::now(),
+            None,
+            dir.path(),
+        );
+        assert!(!retire_if_cancelled(&state, &orchestration, "sa_done"));
+        assert!(orchestration.is_unreconciled("sa_done"));
     }
 
     #[test]

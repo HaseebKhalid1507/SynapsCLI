@@ -389,6 +389,9 @@ pub struct SessionActor {
     pub(crate) ext_ready: Option<oneshot::Receiver<()>>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
+    /// Worker-registry generation of the current/last turn: a user
+    /// interrupt cancels only the workers this turn launched.
+    pub(crate) turn_worker_generation: u64,
     /// Mirrors `handle.lifecycle()` (B3 writes Parking/Parked).
     pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
     /// Mirrors `handle.journal_id()` (B2 stores the successor id).
@@ -655,6 +658,7 @@ impl SessionActor {
             compact: None,
             ext_ready,
             subagent_tick: None,
+            turn_worker_generation: 0,
             lifecycle,
             journal_id,
             presence,
@@ -2123,6 +2127,13 @@ impl SessionActor {
         // turns already pass `false` from the tick's Prepared arm; this guards
         // any foreground turn that starts while armed.)
         let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
+        // Stamp this turn's worker launches before the stream can start any.
+        self.turn_worker_generation = self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_turn();
         let completion = crate::runtime::TurnCompletion::new();
         self.turn_completion = Some(completion.clone());
         let stream = self
@@ -2527,9 +2538,17 @@ impl SessionActor {
         }
         // Queues the save of this history, then the draft removal.
         self.clear_stream();
-        // Cancel all running reactive subagents; recover a poisoned guard
-        // rather than skip cancellation.
+        // Cancel running reactive subagents; recover a poisoned guard rather
+        // than skip cancellation. A user interrupt (Esc) stops the turn it
+        // interrupted and the workers THAT turn launched; reactive workers
+        // started by earlier turns are background work and keep running
+        // (`/workers cancel` stops them). Every other reason — session
+        // teardown, cost cap, host checkpoint, driver revocation — stops all.
         {
+            use crate::runtime::subagent::WorkerCancelScope;
+            let ending = self.lifecycle.load(std::sync::atomic::Ordering::Acquire)
+                == SessionLifecycle::Ending as u8;
+            let scope = worker_cancel_scope(reason, ending, self.turn_worker_generation);
             let mut registry = match self.runtime.subagent_registry().lock() {
                 Ok(g) => g,
                 Err(poisoned) => {
@@ -2539,9 +2558,30 @@ impl SessionActor {
                     poisoned.into_inner()
                 }
             };
-            for handle in registry.iter_mut_handles() {
-                if handle.status() == crate::runtime::subagent::SubagentStatus::Running {
-                    handle.cancel();
+            let cancelled = registry.cancel_running(scope);
+            if !cancelled.is_empty() {
+                tracing::info!(
+                    ?scope,
+                    workers = ?cancelled,
+                    "turn interrupted: cancelled running workers"
+                );
+            }
+            if let WorkerCancelScope::Turn(_) = scope {
+                let spared = registry
+                    .list_active()
+                    .iter()
+                    .filter(|(_, _, status)| {
+                        *status == crate::runtime::subagent::SubagentStatus::Running
+                    })
+                    .count();
+                drop(registry);
+                if spared > 0 {
+                    self.emit(SessionEventWire::Stream(StreamEvent::Session(
+                        SessionEvent::Notice(format!(
+                            "{spared} background worker{} from earlier turns still running — /workers to list, /workers cancel all to stop",
+                            if spared == 1 { "" } else { "s" }
+                        )),
+                    )));
                 }
             }
         }
@@ -4033,6 +4073,24 @@ fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
     streaming || any_running
 }
 
+/// Which running workers an interrupted turn cancels. Only the user's own
+/// interrupt of a live session is turn-scoped: Esc stops what that turn
+/// started, not reactive workers inherited from earlier turns (which the
+/// user may be waiting on). Quitting/teardown (`ending`), the cost cap, host
+/// checkpoints/restarts and driver revocation stop every running worker.
+fn worker_cancel_scope(
+    reason: crate::engine::interrupt::InterruptReason,
+    ending: bool,
+    turn_generation: u64,
+) -> crate::runtime::subagent::WorkerCancelScope {
+    use crate::engine::interrupt::InterruptReason;
+    use crate::runtime::subagent::WorkerCancelScope;
+    match reason {
+        InterruptReason::User if !ending => WorkerCancelScope::Turn(turn_generation),
+        _ => WorkerCancelScope::All,
+    }
+}
+
 async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
     match tick {
         Some(t) => {
@@ -4192,6 +4250,39 @@ impl SessionTask {
             }
         };
         self.0.finish(reason).await;
+    }
+}
+
+#[cfg(test)]
+mod worker_cancel_scope_tests {
+    use super::worker_cancel_scope;
+    use crate::engine::interrupt::InterruptReason;
+    use crate::runtime::subagent::WorkerCancelScope;
+
+    #[test]
+    fn only_a_live_user_interrupt_is_turn_scoped() {
+        assert_eq!(
+            worker_cancel_scope(InterruptReason::User, false, 7),
+            WorkerCancelScope::Turn(7),
+            "Esc stops the interrupted turn's workers only"
+        );
+        assert_eq!(
+            worker_cancel_scope(InterruptReason::User, true, 7),
+            WorkerCancelScope::All,
+            "quitting the client mid-turn tears every worker down"
+        );
+        for reason in [
+            InterruptReason::CostCap,
+            InterruptReason::Restart,
+            InterruptReason::Host,
+            InterruptReason::Driver,
+        ] {
+            assert_eq!(
+                worker_cancel_scope(reason, false, 7),
+                WorkerCancelScope::All,
+                "{reason:?} stops every running worker"
+            );
+        }
     }
 }
 
