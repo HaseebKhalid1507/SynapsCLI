@@ -338,7 +338,12 @@ impl EngineHost {
     pub async fn foreground_runtime_for(&self, cwd: Option<std::path::PathBuf>) -> Result<Runtime> {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(self.parts.clone()));
         runtime.set_cwd(cwd);
-        runtime.apply_config_keep_tools(&self.config());
+        let config = self.config();
+        runtime.apply_config_keep_tools(&config);
+        // Every interactive session starts in the operator's confirmed
+        // `memory.default_mode` (after the backend binding above). A failed
+        // grant is logged and leaves memory off; it never fails the session.
+        let _ = runtime.apply_memory_default_mode(&config.memory);
         Ok(runtime)
     }
 
