@@ -77,6 +77,11 @@ impl EventQueue {
         self.inner.lock().unwrap().is_empty()
     }
 
+    /// Clone of every queued event, front first; the queue is untouched.
+    pub fn snapshot(&self) -> Vec<Event> {
+        self.inner.lock().unwrap().iter().cloned().collect()
+    }
+
     pub fn drain(&self) -> Vec<Event> {
         let mut q = self.inner.lock().unwrap();
         q.drain(..).collect()

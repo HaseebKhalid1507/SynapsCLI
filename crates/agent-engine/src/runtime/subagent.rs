@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
+mod reload;
+pub use reload::{handle_number, CarriedWorker, MAX_CARRIED_ARCHIVES};
+
 // ── SubagentResult ───────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -101,6 +104,9 @@ pub struct SubagentState {
     /// Set by cancel() before the shutdown signal is sent.
     /// Read by finalize_subagent to label the terminal status correctly.
     pub cancel_requested: bool,
+    /// Stopped by a daemon reload (`SubagentRegistry::stop_for_reload`), not
+    /// by the user: the run is resumable from its archive.
+    pub stopped_by_reload: bool,
     pub terminal: Option<TerminalDiagnostic>,
     /// What the worker is doing right now: the same text as its latest
     /// `SubagentUpdate` ("💭 thinking...", "⚙ bash (tool #2)", "$ cargo test").
@@ -160,6 +166,7 @@ impl SubagentState {
             conversation_state: Vec::new(),
             finished_at: None,
             cancel_requested: false,
+            stopped_by_reload: false,
             terminal: None,
             step: String::new(),
             tools: 0,
@@ -540,6 +547,11 @@ pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 #[derive(Debug)]
 pub struct SubagentRegistry {
     pub(crate) handles: HashMap<String, SubagentHandle>,
+    /// Archived ids whose run a daemon reload stopped (not the user): status
+    /// says so, so neither the model nor a person reads it as a user cancel.
+    /// Reaped/carried archives live in `archived`; ids stay unique across a
+    /// reload because it carries the counter (`ReloadState::next_subagent_id`).
+    stopped_by_reload: std::collections::HashSet<String>,
     // A local session driver owns worker launches until explicit user takeover.
     // Keep the cancelled fence after revocation so racing late registrations
     // are cancelled before their thread can start inference.
@@ -569,6 +581,7 @@ impl SubagentRegistry {
     pub fn new() -> Self {
         Self {
             handles: HashMap::new(),
+            stopped_by_reload: Default::default(),
             spawn_cancellation: None,
             spawn_epoch: 0,
             turn_generation: 0,

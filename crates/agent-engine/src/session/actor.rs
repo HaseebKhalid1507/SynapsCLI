@@ -302,6 +302,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Checkpoint { .. } => "checkpoint",
         SessionCommand::KeepWarm { .. } => "keep_warm",
         SessionCommand::Park => "park",
+        SessionCommand::AdoptWorkers { .. } => "adopt_workers",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -893,6 +894,7 @@ impl SessionActor {
             cache_keepwarm: self.cache_keepwarm.override_mode.map(|m| m.to_string()),
             model: view.model.clone(),
             thinking_level: view.thinking_level.clone(),
+            workers: Vec::new(),
         }
     }
 
@@ -3713,9 +3715,22 @@ impl SessionActor {
         if self.driver.is_some() {
             self.driver_revoke("daemon reloaded");
         }
+        // Workers cannot survive the exec either (they are threads of this
+        // process). Flag + cancel them BEFORE `cancel_turn` (whose own
+        // cancel would otherwise label them user-cancelled).
+        let stopping = match reason {
+            CheckpointReason::Reload => self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .stop_for_reload(),
+            CheckpointReason::HostRequest => Vec::new(),
+        };
         if self.streaming {
             self.cancel_turn(interrupt).await;
         }
+        let stopped_workers = await_stopped_workers(self.id.as_str(), stopping).await;
         self.abort_compaction();
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
             let _ = tx.send(None);
@@ -3735,12 +3750,98 @@ impl SessionActor {
             }
         };
         self.emit(SessionEventWire::SystemNotice(notice.to_string()));
+        if !stopped_workers.is_empty() {
+            self.emit(SessionEventWire::SystemNotice(format!(
+                "daemon reloading — stopped worker{} {} (archived; resumable after the reload)",
+                if stopped_workers.len() == 1 { "" } else { "s" },
+                stopped_workers.join(", ")
+            )));
+        }
         self.runtime.session_manager().shutdown_all();
-        let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
+        let mut record = self.reload_record();
+        if matches!(reason, CheckpointReason::Reload) {
+            record.workers = self.reload_carried_workers();
+        }
+        let record = serde_json::to_value(record).unwrap_or_default();
         self.emit(SessionEventWire::QueryResult {
             id: super::wire::CHECKPOINT_QUERY_ID,
             value: serde_json::json!({ "ok": true, "record": record }),
         });
+    }
+
+    /// The workers a reload carries for this session: every registry entry,
+    /// plus whether a finished worker's completion wake is still queued
+    /// (the exec discards the queue, so the next image re-posts it).
+    pub(crate) fn reload_carried_workers(&self) -> Vec<crate::runtime::subagent::CarriedWorker> {
+        let undelivered: std::collections::HashSet<String> = self
+            .event_queue
+            .snapshot()
+            .iter()
+            .filter(|e| e.content.content_type == "subagent_completion")
+            .filter_map(|e| {
+                e.content
+                    .data
+                    .as_ref()?
+                    .get("handle_id")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        self.runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reload_carry(&undelivered)
+    }
+
+    /// Host-only (`SessionCommand::AdoptWorkers`, sent by reload's
+    /// rehydrate): the workers the previous daemon image stopped or still
+    /// owed a wake. Their ids resolve to their archives again, and the
+    /// parent is woken once per worker — it was waiting for completions the
+    /// exec destroyed.
+    pub(crate) fn adopt_workers(&mut self, workers: Vec<crate::runtime::subagent::CarriedWorker>) {
+        if workers.is_empty() {
+            return;
+        }
+        {
+            let mut registry = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for w in &workers {
+                registry.adopt_carried(w);
+            }
+        }
+        let woken: Vec<&crate::runtime::subagent::CarriedWorker> =
+            workers.iter().filter(|w| w.needs_wake()).collect();
+        for w in &woken {
+            let ev = crate::tools::build_reload_carry_event(w);
+            if self.event_queue.push(ev.clone()).is_err() {
+                self.event_queue.push_priority(ev);
+            }
+        }
+        let stopped: Vec<&str> = woken
+            .iter()
+            .filter(|w| w.stopped_by_reload)
+            .map(|w| w.id.as_str())
+            .collect();
+        tracing::info!(
+            session = %self.id,
+            carried = workers.len(),
+            stopped = ?stopped,
+            woken = woken.len(),
+            "reload: adopted workers from the previous image"
+        );
+        if !stopped.is_empty() {
+            self.emit(SessionEventWire::SystemNotice(format!(
+                "daemon reloaded — worker{} {} stopped by the reload; subagent_resume continues {} from {} archive",
+                if stopped.len() == 1 { "" } else { "s" },
+                stopped.join(", "),
+                if stopped.len() == 1 { "it" } else { "them" },
+                if stopped.len() == 1 { "its" } else { "their" },
+            )));
+        }
     }
 
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.
@@ -3913,6 +4014,7 @@ impl SessionActor {
             } => self.plugin_command(id, plugin, name, arg).await,
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
+            SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();
@@ -4251,6 +4353,43 @@ impl SessionTask {
         };
         self.0.finish(reason).await;
     }
+}
+
+/// Wait (bounded by [`budgets::WORKER_RELOAD_STOP_TIMEOUT`]) until every worker
+/// `stop_for_reload` cancelled has run its finalizer: its resume archive
+/// is on disk and its in-flight tool was dropped, which kills that
+/// tool's process group — after the exec nothing could. Returns the
+/// stopped ids.
+async fn await_stopped_workers(
+    session: &str,
+    stopping: Vec<(String, Arc<std::sync::RwLock<crate::runtime::subagent::SubagentState>>)>,
+) -> Vec<String> {
+    if stopping.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<String> = stopping.iter().map(|(id, _)| id.clone()).collect();
+    tracing::info!(session, workers = ?ids, "reload: stopping running workers");
+    let deadline = tokio::time::Instant::now() + budgets::WORKER_RELOAD_STOP_TIMEOUT;
+    loop {
+        let pending: Vec<&str> = stopping
+            .iter()
+            .filter(|(_, s)| !s.read().unwrap_or_else(|p| p.into_inner()).finalization_ready)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                session,
+                workers = ?pending,
+                "reload: workers did not stop in time; only their last archive survives the exec"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    ids
 }
 
 #[cfg(test)]
