@@ -838,6 +838,7 @@ mod render_tests {
             finished_elapsed: None,
             step: "$ cargo test -p synaps-tui".into(),
             tools: 3,
+            handle_id: format!("sa_{id}"),
         }
     }
 
