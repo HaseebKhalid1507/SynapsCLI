@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
+mod reload;
+pub use reload::{handle_number, CarriedWorker, MAX_CARRIED_ARCHIVES};
+
 // ── SubagentResult ───────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -101,6 +104,13 @@ pub struct SubagentState {
     /// Set by cancel() before the shutdown signal is sent.
     /// Read by finalize_subagent to label the terminal status correctly.
     pub cancel_requested: bool,
+    /// Stopped by a daemon reload (`SubagentRegistry::stop_for_reload`), not
+    /// by the user: the run is resumable from its archive.
+    pub stopped_by_reload: bool,
+    /// The finalizer ran to its end: the archive is written and the
+    /// completion wake pushed (or deliberately withheld, e.g. a cancel). A
+    /// reload waits for this so the wake is in the queue it carries.
+    pub completion_settled: bool,
     pub terminal: Option<TerminalDiagnostic>,
     /// What the worker is doing right now: the same text as its latest
     /// `SubagentUpdate` ("💭 thinking...", "⚙ bash (tool #2)", "$ cargo test").
@@ -160,6 +170,8 @@ impl SubagentState {
             conversation_state: Vec::new(),
             finished_at: None,
             cancel_requested: false,
+            stopped_by_reload: false,
+            completion_settled: false,
             terminal: None,
             step: String::new(),
             tools: 0,
@@ -540,6 +552,15 @@ pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 #[derive(Debug)]
 pub struct SubagentRegistry {
     pub(crate) handles: HashMap<String, SubagentHandle>,
+    /// Archived ids whose run a daemon reload stopped (not the user): status
+    /// says so, so neither the model nor a person reads it as a user cancel.
+    /// Reaped/carried archives live in `archived`; ids stay unique across a
+    /// reload because it carries the counter (`ReloadState::next_subagent_id`).
+    stopped_by_reload: std::collections::HashSet<String>,
+    /// Workers whose reload wake this image posted (`AdoptWorkers`). The
+    /// next reload re-carries a wake only while it is still queued; once the
+    /// parent has it, never again.
+    reload_woken: HashMap<String, CarriedWorker>,
     // A local session driver owns worker launches until explicit user takeover.
     // Keep the cancelled fence after revocation so racing late registrations
     // are cancelled before their thread can start inference.
@@ -550,7 +571,8 @@ pub struct SubagentRegistry {
     /// frontend opts in by calling [`Self::begin_turn`].
     turn_generation: u64,
     /// Resume archives of handles that were reaped. Handle ids come from a
-    /// process-wide counter, so they are never reused. Paths only: tiny.
+    /// process-wide counter that a daemon reload carries, so they are never
+    /// reused. Paths only: tiny.
     archived: HashMap<String, std::path::PathBuf>,
 }
 
@@ -569,6 +591,8 @@ impl SubagentRegistry {
     pub fn new() -> Self {
         Self {
             handles: HashMap::new(),
+            stopped_by_reload: Default::default(),
+            reload_woken: HashMap::new(),
             spawn_cancellation: None,
             spawn_epoch: 0,
             turn_generation: 0,

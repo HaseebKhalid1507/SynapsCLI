@@ -10,8 +10,10 @@
 //! The finalizer now writes `<base>/subagent-history/<process>/<handle>.json`
 //! with the worker's identity, terminal status, output text and full message
 //! history. Resume continues that history; collect falls back to it. Handle ids
-//! come from a process-wide counter, so one directory per process cannot
-//! collide. Directories older than [`KEEP_DAYS`] are pruned on first use.
+//! come from a process-wide counter, so one directory per process image
+//! cannot collide (a daemon reload starts a new directory: the uuid suffix
+//! is per image, and the reload carries the counter forward). Directories
+//! older than [`KEEP_DAYS`] are pruned on first use.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

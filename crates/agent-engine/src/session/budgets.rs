@@ -31,6 +31,16 @@ pub const CANCEL_DRAIN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_MS.div_ceil(1000
 /// interrupted turn's save before it announces `Idle` (`announce_idle`).
 pub const CANCEL_TURN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS + SAVE_TIMEOUT_SECS;
 
+/// `SessionActor::checkpoint` for a daemon reload: how long the workers it
+/// stopped get to finish stopping (cancel → the runtime's cancel-path
+/// history → the finalizer's resume archive) before the exec destroys them.
+/// Cancellation is cooperative and normally takes milliseconds; a worker
+/// blocked in a tool that ignores cancellation is abandoned with whatever
+/// archive it already had.
+pub const WORKER_RELOAD_STOP_TIMEOUT_SECS: u64 = 10;
+pub const WORKER_RELOAD_STOP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(WORKER_RELOAD_STOP_TIMEOUT_SECS);
+
 /// Session end's bounded observability flush (`finish` STEP 3).
 pub const OBSERVABILITY_FLUSH_TIMEOUT_SECS: u64 =
     crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs();

@@ -37,14 +37,20 @@ use crate::session::{
 pub const RELOAD_STATE_ENV: &str = "SYNAPS_DAEMON_RELOAD_STATE";
 /// Env: inherited `daemon.lock` fd (mandatory when `RELOAD_STATE_ENV` is set).
 pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
+/// Env: the subagent handle counter read at the `execv` itself, later than
+/// `ReloadState::next_subagent_id` (written after the checkpoints): a worker
+/// that ignored its stop could still dispatch in between.
+pub const SUBAGENT_ID_FLOOR_ENV: &str = "SYNAPS_DAEMON_SUBAGENT_ID_FLOOR";
 /// Env: default drain budget in seconds.
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (the drain + its
-/// bounded save) + the checkpoint's own bounded save + 1 s margin.
+/// bounded save) + stopping the session's workers + the checkpoint's own
+/// bounded save + 1 s margin.
 const CHECKPOINT_BUDGET: Duration = Duration::from_secs(
     crate::session::budgets::CANCEL_TURN_TIMEOUT_SECS
+        + crate::session::budgets::WORKER_RELOAD_STOP_TIMEOUT_SECS
         + crate::session::budgets::SAVE_TIMEOUT_SECS
         + 1,
 );
@@ -117,6 +123,10 @@ pub struct ReloadSession {
     #[serde(default)]
     pub cache_keepwarm: Option<String>,
     pub input_owner_kind: Option<crate::session::ClientKind>,
+    /// Workers the checkpoint stopped (or that still owed the parent a
+    /// completion wake), handed to the new image (`AdoptWorkers`).
+    #[serde(default)]
+    pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -126,6 +136,27 @@ pub struct ReloadState {
     pub written_at: chrono::DateTime<chrono::Utc>,
     pub sessions: Vec<ReloadSession>,
     pub expected_clients: usize,
+    /// The subagent handle counter (`sa_N`) at the exec. The new image never
+    /// hands out a lower id, so a model's remembered handles keep meaning
+    /// the worker they named. `0` (older reload-state): derived from the
+    /// carried workers only.
+    #[serde(default)]
+    pub next_subagent_id: u64,
+}
+
+impl ReloadState {
+    /// The first handle number the new image may use: past the old image's
+    /// counter and every carried worker id.
+    pub fn subagent_id_floor(&self) -> u64 {
+        let carried = self
+            .sessions
+            .iter()
+            .flat_map(|s| &s.workers)
+            .filter_map(|w| crate::runtime::subagent::handle_number(&w.id))
+            .max()
+            .map_or(0, |n| n + 1);
+        self.next_subagent_id.max(carried)
+    }
 }
 
 pub fn reload_state_path(paths: &DaemonPaths) -> PathBuf {
@@ -287,7 +318,14 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
     let journal_id = handle.journal_id();
-    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model) = match rec {
+    if rec.is_none() {
+        tracing::warn!(
+            session = %handle.id,
+            "reload: no checkpoint reply in time — this session's workers are not carried: \
+             no archive is guaranteed and their parent will not be woken"
+        );
+    }
+    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers) = match rec {
         Some(r) => (
             r.config,
             r.keep_warm,
@@ -295,6 +333,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             r.settings_replay,
             r.cache_keepwarm,
             r.model,
+            r.workers,
         ),
         None => (
             SessionConfig {
@@ -310,6 +349,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             // `/keepwarm` choice must survive a reload that timed out.
             handle.cache_keepwarm_override(),
             handle.view().model.clone(),
+            // No checkpoint reply: whatever workers ran are lost to the exec
+            // without a record (the actor never answered).
+            Vec::new(),
         ),
     };
     ReloadSession {
@@ -329,6 +371,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         settings_replay,
         cache_keepwarm,
         input_owner_kind: None,
+        workers,
     }
 }
 
@@ -340,6 +383,9 @@ pub struct Prepared {
     pub exe: PathBuf,
     pub rs_path: PathBuf,
     pub generation: u64,
+    /// What was recorded: on a failed exec the old image keeps serving, and
+    /// the workers its checkpoint stopped are re-announced from here.
+    pub state: ReloadState,
 }
 
 pub async fn prepare(
@@ -401,6 +447,8 @@ pub async fn prepare(
         written_at: chrono::Utc::now(),
         sessions,
         expected_clients: state.connections.load(Ordering::SeqCst),
+        // After every checkpoint: no session can launch a worker any more.
+        next_subagent_id: crate::tools::peek_next_subagent_id(),
     };
     let rs_path = reload_state_path(paths);
     // If either write fails we early-return WITHOUT reaching exec() (which is the
@@ -424,7 +472,7 @@ pub async fn prepare(
     while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(1) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Ok(Prepared { exe, rs_path, generation })
+    Ok(Prepared { exe, rs_path, generation, state: rs })
 }
 
 /// Step 5: rewrite `daemon.json` (generation+1, same pid), stop sidecars,
@@ -483,6 +531,9 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
     if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
         tracing::warn!("daemon: extension re-discovery still running after 10 s");
     }
+    // The checkpoint stopped every worker for an exec that did not happen:
+    // their parents are still here and still waiting — tell them.
+    readopt_workers(state, &p.state).await;
     state.reloading.store(false, Ordering::SeqCst);
     ReloadError::ExecFailed(err)
 }
@@ -511,7 +562,8 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
     cmd.args(&args)
         .env("SYNAPS_DAEMON", "1")
         .env(LOCK_FD_ENV, lock_fd.to_string())
-        .env(RELOAD_STATE_ENV, rs_path);
+        .env(RELOAD_STATE_ENV, rs_path)
+        .env(SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
     let e = cmd.exec();
     // Only reached on failure: restore CLOEXEC.
     // SAFETY: as above.
@@ -543,9 +595,14 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("{RELOAD_STATE_ENV} set without {LOCK_FD_ENV}: refusing to start (the flock is the liveness oracle)"))?;
     std::env::remove_var(LOCK_FD_ENV);
+    let id_floor = std::env::var(SUBAGENT_ID_FLOOR_ENV).ok().and_then(|s| s.parse::<u64>().ok());
+    std::env::remove_var(SUBAGENT_ID_FLOOR_ENV);
     let lock = DaemonLock::adopt(fd)?;
     let body = std::fs::read_to_string(&rs_path)?;
-    let rs: ReloadState = serde_json::from_str(&body)?;
+    let mut rs: ReloadState = serde_json::from_str(&body)?;
+    if let Some(floor) = id_floor {
+        rs.next_subagent_id = rs.next_subagent_id.max(floor);
+    }
     Ok(Some((lock, rs, rs_path)))
 }
 
@@ -576,7 +633,22 @@ fn parse_holder_from_error(e: &str) -> String {
     "unknown holder".to_string()
 }
 
+/// Failed exec: hand each still-live session back the workers its
+/// checkpoint stopped, exactly as the next image would have.
+async fn readopt_workers(state: &Arc<DaemonState>, rs: &ReloadState) {
+    for s in rs.sessions.iter().filter(|s| !s.workers.is_empty()) {
+        if let Some(h) = state.live_sessions().into_iter().find(|h| h.id.as_str() == s.id) {
+            let _ = h
+                .send(SessionCommand::AdoptWorkers { workers: s.workers.clone() })
+                .await;
+        }
+    }
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
+    // Before any session can dispatch: ids continue where the old image
+    // stopped, so `sa_1` never names two different workers.
+    crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
         let created = match state.create(s.config.clone()).await {
             Ok(h) => Ok(h),
@@ -639,6 +711,13 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                         })
                         .await;
                 }
+                // Before any Park: re-register the stopped workers and wake
+                // their parent (it was waiting on completions the exec ate).
+                if !s.workers.is_empty() {
+                    let _ = h
+                        .send(SessionCommand::AdoptWorkers { workers: s.workers.clone() })
+                        .await;
+                }
                 if matches!(s.lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking) {
                     let _ = h.send(SessionCommand::Park).await;
                 }
@@ -652,6 +731,64 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reload-state written by an older image (no workers, no counter)
+    /// still parses: the new fields default.
+    #[test]
+    fn reload_state_from_an_older_image_parses() {
+        let rs: ReloadState = serde_json::from_value(serde_json::json!({
+            "generation": 9,
+            "written_at": "2026-10-14T18:17:03Z",
+            "sessions": [],
+            "expected_clients": 1
+        }))
+        .unwrap();
+        assert_eq!(rs.next_subagent_id, 0);
+        assert_eq!(rs.subagent_id_floor(), 0);
+    }
+
+    /// The new image's first handle is past the old counter AND past every
+    /// carried id (an older writer that only carried workers still works).
+    #[test]
+    fn subagent_id_floor_covers_the_counter_and_every_carried_id() {
+        let worker = |id: &str| crate::runtime::subagent::CarriedWorker {
+            id: id.into(),
+            subagent_id: 0,
+            agent: String::new(),
+            status: "cancelled".into(),
+            archive_path: None,
+            stopped_by_reload: true,
+            wake_lost: false,
+            wake: true,
+            elapsed_secs: 0,
+            preview: String::new(),
+        };
+        let session = |workers| ReloadSession {
+            id: "s".into(),
+            journal_id: "j".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers,
+        };
+        let mut rs = ReloadState {
+            generation: 10,
+            written_at: chrono::Utc::now(),
+            sessions: vec![session(vec![worker("sa_288"), worker("sa_286")]), session(vec![])],
+            expected_clients: 0,
+            next_subagent_id: 0,
+        };
+        assert_eq!(rs.subagent_id_floor(), 289);
+        rs.next_subagent_id = 300;
+        assert_eq!(rs.subagent_id_floor(), 300);
+        // Round trip keeps both.
+        let back: ReloadState = serde_json::from_slice(&serde_json::to_vec(&rs).unwrap()).unwrap();
+        assert_eq!(back.subagent_id_floor(), 300);
+        assert_eq!(back.sessions[0].workers.len(), 2);
+    }
 
     fn pv(b: &str, p: u32) -> PrintVersion {
         PrintVersion { binary_version: b.into(), protocol_version: p }
