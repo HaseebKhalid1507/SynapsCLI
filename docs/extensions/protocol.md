@@ -205,10 +205,22 @@ Called when the model invokes an extension-provided tool declared during
   "method": "tool.call",
   "params": {
     "name": "echo",
-    "input": { "text": "hello" }
+    "input": { "text": "hello" },
+    "session_id": "20261014-050933-a06f"
   }
 }
 ```
+
+| Field        | Type           | Description |
+|--------------|----------------|-------------|
+| `name`       | string         | The extension's own tool name, as declared in `capabilities.tools` (not the `plugin-id:name` runtime name). |
+| `input`      | object         | The arguments the model supplied. |
+| `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, the extension-provider tool route, contexts with no conversation, and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
+
+In daemon mode one extension process serves every session, so key any
+per-caller tool state on `params.session_id` (see
+[session-id.md](session-id.md)). Older hosts omit the field; treat a
+missing key like `null`.
 
 **Response:**
 

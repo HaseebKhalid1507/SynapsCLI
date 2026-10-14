@@ -3756,6 +3756,7 @@ impl Runtime {
                                         env: self.env.clone(),
                                         env_stripped: self.env_stripped.clone(),
                                         env_warned: self.env_warned.clone(),
+                                        session_id: self.session_id.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3922,6 +3923,7 @@ impl Runtime {
                                                     env: env_inner,
                                                     env_stripped: env_stripped_inner,
                                                     env_warned: env_warned_inner,
+                                                    session_id: session_id_inner.clone(),
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,

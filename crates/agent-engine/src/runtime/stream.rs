@@ -1649,7 +1649,7 @@ impl StreamMethods {
                                     let input_for_hook = input.clone();
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -2017,7 +2017,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -3281,6 +3281,7 @@ mod rich_output_tests {
             tool_uses,
             hook_bus,
             std::time::Duration::from_secs(20),
+            None,
         )
         .await
     }
@@ -3305,6 +3306,7 @@ mod rich_output_tests {
             tool_uses,
             hook_bus,
             deadline,
+            None,
         )
         .await;
         eprintln!(
@@ -3314,6 +3316,10 @@ mod rich_output_tests {
         driven
     }
 
+    /// `conversation_id` is the owning conversation id the stream runs
+    /// under (`StreamSession.session_id`); `None` = worker/no conversation,
+    /// the harness default.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_with_model_and_deadline(
         model: &str,
         messages: Vec<SharedMessage>,
@@ -3321,6 +3327,7 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
         deadline: std::time::Duration,
+        conversation_id: Option<&str>,
     ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
@@ -3339,7 +3346,7 @@ mod rich_output_tests {
         ))
         .unwrap();
 
-        let session = harness_session(
+        let mut session = harness_session(
             base_url,
             tools,
             tx,
@@ -3350,6 +3357,7 @@ mod rich_output_tests {
             false,
             model,
         );
+        session.session_id = conversation_id.map(str::to_string);
 
         let started = std::time::Instant::now();
         let run = tokio::time::timeout(
@@ -3790,6 +3798,69 @@ mod rich_output_tests {
         assert!(!serde_json::to_string(&d.bodies[1])
             .unwrap()
             .contains(REAL_PNG_B64));
+    }
+
+    /// Records the owning conversation id each call's `ToolContext` carries.
+    struct SessionProbe(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+    #[async_trait::async_trait]
+    impl Tool for SessionProbe {
+        fn name(&self) -> &str {
+            "session_probe"
+        }
+        fn description(&self) -> &str {
+            "records ctx.capabilities.session_id"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(ctx.capabilities.session_id.clone());
+            Ok("probed".to_string())
+        }
+    }
+
+    /// Tool dispatch hands the owning conversation id to every tool's
+    /// context (serial and parallel lanes) — what extension `tool.call`
+    /// forwards as `params.session_id`. Workers (`None`) stay `None`.
+    #[tokio::test]
+    async fn tool_context_carries_owning_conversation_id() {
+        for (conversation, uses) in [
+            (Some("conv-1"), &[("toolu_1", "session_probe")][..]),
+            (
+                Some("conv-2"),
+                &[("toolu_1", "session_probe"), ("toolu_2", "session_probe")][..],
+            ),
+            (None, &[("toolu_1", "session_probe")][..]),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_with_model_and_deadline(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(seen.clone()))],
+                uses,
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                std::time::Duration::from_secs(20),
+                conversation,
+            )
+            .await;
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![conversation.map(str::to_string); uses.len()],
+                "{} tool use(s) under {conversation:?}",
+                uses.len()
+            );
+        }
     }
 
     #[tokio::test]

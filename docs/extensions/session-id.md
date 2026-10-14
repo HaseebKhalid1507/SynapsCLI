@@ -13,6 +13,7 @@ hooks.
 | `on_compaction`       | new session id      | unchanged                                  |
 | `on_session_start`    | session id          | unchanged                                  |
 | `on_session_end`      | session id          | unchanged                                  |
+| `tool.call` request   | absent              | `params.session_id`: the conversation that invoked the extension's tool (`null` for workers) |
 
 The field already existed as `Option<String>` in the JSON schema
 (`docs/extensions/contract.json`), so the change is **additive**: an
@@ -26,8 +27,11 @@ extension that ignores `session_id` sees the same shape it always did.
   session.
 - **Extension-originated `tool.invoke`.** A tool invoked by a sidecar via the
   extension protocol runs outside a conversation turn; `null`.
+- **`tool.call` outside a conversation.** The extension-provider tool route,
+  skill commands and host-originated lease calls (memory capture/recall)
+  send `params.session_id: null`.
 - **Kill-switch `SYNAPS_HOOK_SESSION_ID=0`** (also `false`/`off`): forces
-  `null` on the four tool/message hooks. Use it if a plugin misbehaves on the
+  `null` on the four tool/message hooks and on `tool.call` `params.session_id`. Use it if a plugin misbehaves on the
   new value. Session-lifecycle hooks are unaffected.
 
 ## Why: one sidecar, many sessions
@@ -52,7 +56,8 @@ The runtime side is done: hooks carry `session_id`; the router keys
 `widget.*` frames on `params.session_id`. A plugin that wants correct
 behaviour with more than one live session must:
 
-1. **Key its state on `session_id`.** One entry per session, created on
+1. **Key its state on `session_id`** — from hook events and, for the
+   extension's own tools, from `tool.call` `params.session_id` (the caller). One entry per session, created on
    the first hook that names the session, removed on `on_session_end`
    for that id. Treat `session_id == null` as "no session (worker /
    extension-originated tool call)" — never fold it into a session entry.
@@ -75,6 +80,35 @@ Concretely, for the two in-tree plugins that have state today:
 
 Those plugin edits live in their own repos (`~/.synaps-cli/plugins`) and are
 a follow-up PR there; nothing in this repo depends on them landing.
+
+## Hosts without `tool.call` `params.session_id`
+
+Builds before this field (0.10.2 and earlier) send `tool.call` with only
+`name` and `input`. A plugin that has to support them can find out which
+session called its tool from `before_tool_call`, which already carries
+`session_id`:
+
+1. Subscribe to `before_tool_call`. For your own tools only (match on
+   `tool_runtime_name` `"<plugin-id>:<tool>"`), return `modify` with the
+   input plus a single-use random token, for example
+   `{"_caller": "<token>"}`. Remember `token → session_id` in memory.
+2. In `tool.call`, pop the token from `input` and redeem it. An unknown or
+   reused token means "no caller": treat it like `null`, never as a session.
+   The hook overwrites any token the model supplies, and tokens are
+   unguessable, so the model cannot pose as another session.
+
+Prefer `params.session_id` whenever the key is present. The token pattern
+has costs the field does not:
+
+- It needs `tools.intercept`, a permission that lets the plugin block or
+  rewrite every tool call it subscribes to.
+- The first `modify`, `confirm` or `block` result stops the handler chain.
+  If another extension acts on the call first, there is no token. And once
+  you stamp a call, extensions after you never see it.
+
+Do not match a `tool.call` to the preceding `before_tool_call` by tool name
+and input. Two sessions can make identical calls at the same time, and the
+hooks and calls can arrive interleaved.
 
 ## In-tree plugin audit (2026-09, jade 16 / bella 2)
 

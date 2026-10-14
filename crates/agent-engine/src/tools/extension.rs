@@ -56,7 +56,11 @@ impl crate::tools::Tool for ExtensionTool {
         }
         let value = self
             .handler
-            .call_tool(&self.tool_name, params)
+            .call_tool_for(
+                &self.tool_name,
+                params,
+                ctx.capabilities.session_id.as_deref(),
+            )
             .await
             .map_err(RuntimeError::Tool)?;
         if let Some(text) = value.as_str() {

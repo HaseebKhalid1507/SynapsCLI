@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Registers one tool, `whoami`, that answers with the `tool.call` params'
+`session_id`, so tests can check the caller identity a daemon-shared
+plugin receives. The reply is JSON text:
+{"has_key": <bool>, "session_id": <str|null>, "input": <object>}.
+"""
+import json
+import sys
+
+
+def read_message():
+    content_length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line == b"":
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, _, value = line.decode("ascii").partition(":")
+        if name.lower() == "content-length":
+            content_length = int(value.strip())
+    if content_length is None:
+        raise RuntimeError("missing Content-Length")
+    return json.loads(sys.stdin.buffer.read(content_length))
+
+
+def write_message(request, result=None, error=None):
+    payload = {"jsonrpc": "2.0", "id": request.get("id")}
+    if error is None:
+        payload["result"] = result
+    else:
+        payload["error"] = error
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+    sys.stdout.buffer.flush()
+
+
+WHOAMI = {
+    "name": "whoami",
+    "description": "Report the caller session id",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+while True:
+    request = read_message()
+    if request is None:
+        break
+    method = request.get("method")
+    if method == "initialize":
+        write_message(request, {"protocol_version": 1, "capabilities": {"tools": [WHOAMI]}})
+    elif method == "tool.call":
+        params = request.get("params") or {}
+        if params.get("name") == "whoami":
+            write_message(request, {"content": json.dumps({
+                "has_key": "session_id" in params,
+                "session_id": params.get("session_id"),
+                "input": params.get("input"),
+            })})
+        else:
+            write_message(request, error={"code": -32602, "message": "unknown tool"})
+    elif method == "hook.handle":
+        write_message(request, {"action": "continue"})
+    elif method == "shutdown":
+        write_message(request, None)
+        break
+    else:
+        write_message(request, error={"code": -32601, "message": f"unknown method: {method}"})

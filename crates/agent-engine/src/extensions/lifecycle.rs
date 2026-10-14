@@ -642,11 +642,12 @@ impl Tool for DeferredExtensionTool {
             )));
         };
         match leases
-            .call_exact(
+            .call_exact_for(
                 &self.plugin_id,
                 &self.tool_name,
                 &self.expected_digest,
                 params,
+                ctx.capabilities.session_id.as_deref(),
             )
             .await
         {
