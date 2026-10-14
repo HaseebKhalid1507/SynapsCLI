@@ -68,7 +68,8 @@ fn call(path: &Path, op: &str, payload: Value) -> Value {
     call_scope(path, PROJECT, op, payload)
 }
 fn temp() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+    // Symlink-free base: macOS temp dirs live under the /var symlink.
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let path = dir.path().join("synthetic.r8");
     (dir, path)

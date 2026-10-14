@@ -47,7 +47,7 @@ Git sources, including transitive `velocirag`; there are no local path patches.
 
 ## Build and verify
 
-From this directory (Linux with procfs, Rust 1.93 tested):
+From this directory (Linux with procfs, Rust 1.93 tested; macOS 26 arm64, Rust 1.99 tested):
 
 ```sh
 cargo build --locked
@@ -204,13 +204,27 @@ flock serializes cooperating service processes with a bounded eight-second
 pre-write wait (25 ms polling), not an immediate contention failure. No database
 operation is retried. Timeout fails before opening/writing SQLite; cancellation
 releases the CLOEXEC descriptor lock when the host terminates/reaps the process. All SQLite opens, preflight,
-sidecar checks and fsync paths are anchored to the held directory descriptor
-through `/proc/<pid>/fd/<fd>/<basename>`. The proc path must have procfs magic
-and resolve to the held device/inode. A minimal process-local SQLite VFS wrapper
+sidecar checks and fsync paths are anchored to the held directory descriptor.
+On Linux that is `/proc/<pid>/fd/<fd>/<basename>`; the proc path must have procfs
+magic and resolve to the held device/inode. A minimal process-local SQLite VFS wrapper
 preserves this anchored full pathname (the stock VFS would resolve it back to
-a mutable pathname). The actual SQLite/WAL ancestor-replacement regression
-passes. Non-Linux builds fail closed. This still is not an isolation boundary
-against the OS owner modifying files *inside* the private directory.
+a mutable pathname). Sidecar checks, fsync and legacy source reads use
+`fstatat`/`openat` on the held descriptor directly.
+
+macOS has no procfs. The anchored pathname is the volfs name
+`/.vol/<fsid>/<file id>/<basename>`, which must resolve to the held
+device/inode, so Axel's own existence probe works unmodified. XNU re-resolves a
+volfs name through the directory's *current* ancestry on every lookup, so SQLite
+never performs that lookup: the wrapper is based on the stock `unix-posix` VFS
+(the Apple default would `statfs` the path first), and every path-taking entry
+of SQLite's Unix syscall table (`open`, `access`, `stat`, `lstat`, `unlink`,
+`mkdir`, `rmdir`, `readlink`) is replaced once per process. Exact `/.vol` paths
+of a directory held by a live `PrivatePath` map to the `*at()` call on its
+descriptor; any other `/.vol` path fails with `EACCES`; all other paths pass
+through. Regressions cover ancestor replacement, SQLite/WAL I/O plus sidecar
+checks/fsync under an unsearchable ancestor, and refusal of unheld or released
+volfs paths. Other platforms fail to build. This still is not an isolation
+boundary against the OS owner modifying files *inside* the private directory.
 
 Axel's default `synchronous=NORMAL` is overridden to **FULL before service
 schema/store/delete writes**. Success follows full WAL checkpoint, database

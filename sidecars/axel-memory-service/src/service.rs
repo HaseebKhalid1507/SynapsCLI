@@ -33,7 +33,7 @@ impl Service {
         }
         let private = PrivatePath::acquire(path)?;
         let path = &private.path;
-        let exists = path.try_exists()?;
+        let exists = private.try_exists()?;
         if exists {
             // Read-only preflight BEFORE Brain::open (which changes journal mode).
             // Never migrate/adopt a legacy, unmarked or differently scoped brain.

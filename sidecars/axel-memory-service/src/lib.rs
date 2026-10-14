@@ -1,5 +1,7 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("synaps-axel-memory-service requires Linux proc-fd filesystem anchoring");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "synaps-axel-memory-service requires Linux proc-fd or macOS volfs filesystem anchoring"
+);
 pub mod contract;
 mod forum;
 #[path = "../../../crates/agent-core/src/memory/forum.rs"]

@@ -133,7 +133,7 @@ pub fn upgrade(path: &Path, project: &str, q: Upgrade, user_scope: bool) -> Resu
         return Err(Error::Scope);
     }
     let private = PrivatePath::acquire(path)?;
-    if !private.path.try_exists()? {
+    if !private.try_exists()? {
         return Err(Error::NotFound);
     }
     let mut c = Connection::open_with_flags(
