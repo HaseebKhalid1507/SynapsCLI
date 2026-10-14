@@ -118,6 +118,7 @@ fn test_context() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,

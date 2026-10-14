@@ -523,6 +523,7 @@ fn live_reactive_subagent_end_to_end() {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                session_id: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -607,6 +608,7 @@ fn live_reactive_subagent_end_to_end() {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                session_id: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,

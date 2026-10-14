@@ -1814,6 +1814,7 @@ impl ProcessExtension {
         &self,
         name: &str,
         input: Value,
+        session_id: Option<&str>,
     ) -> Result<Value, String> {
         let fut = async {
             let _call_guard = self.call_lock.lock().await;
@@ -1835,7 +1836,7 @@ impl ProcessExtension {
                 .call_once_locked(
                     &mut state,
                     "tool.call",
-                    serde_json::json!({"name": name, "input": input}),
+                    tool_call_params(name, input, session_id),
                     id,
                 )
                 .await;
@@ -2105,6 +2106,33 @@ impl ProcessExtension {
     }
 }
 
+/// `tool.call` params. `session_id` is the owning conversation id, `null`
+/// for workers/no conversation and under the `SYNAPS_HOOK_SESSION_ID=0`
+/// kill switch, so plugins can key tool state on the same value the hook
+/// events carry. Always present (`null`, never omitted), like hook fields.
+pub(crate) fn tool_call_params(name: &str, input: Value, session_id: Option<&str>) -> Value {
+    tool_call_params_gated(
+        name,
+        input,
+        session_id,
+        crate::extensions::hooks::events::hook_session_id_enabled(),
+    )
+}
+
+fn tool_call_params_gated(
+    name: &str,
+    input: Value,
+    session_id: Option<&str>,
+    session_id_enabled: bool,
+) -> Value {
+    let session_id = if session_id_enabled { session_id } else { None };
+    serde_json::json!({
+        "name": name,
+        "input": input,
+        "session_id": session_id,
+    })
+}
+
 #[async_trait]
 impl ExtensionHandler for ProcessExtension {
     fn id(&self) -> &str {
@@ -2117,14 +2145,17 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-        self.call(
-            "tool.call",
-            serde_json::json!({
-                "name": name,
-                "input": input,
-            }),
-        )
-        .await
+        self.call_tool_for(name, input, None).await
+    }
+
+    async fn call_tool_for(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Option<&str>,
+    ) -> Result<Value, String> {
+        self.call("tool.call", tool_call_params(name, input, session_id))
+            .await
     }
 
     async fn provider_complete(
@@ -2494,6 +2525,33 @@ mod exclusive_memory_tests {
             .await;
             assert!(result.unwrap_err().1.contains("disabled"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_call_params_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn carries_caller_session_id() {
+        assert_eq!(
+            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), true),
+            json!({"name": "echo", "input": {"text": "hi"}, "session_id": "sess-A"})
+        );
+    }
+
+    #[test]
+    fn worker_call_has_null_session_id_key() {
+        let params = tool_call_params_gated("echo", json!({}), None, true);
+        assert_eq!(params.get("session_id"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn kill_switch_forces_null() {
+        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), false);
+        assert_eq!(params.get("session_id"), Some(&Value::Null));
+        assert_eq!(params["name"], json!("echo"));
     }
 }
 

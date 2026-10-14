@@ -157,6 +157,12 @@ pub struct ToolCapabilities {
     /// set survives across tool calls (caps are rebuilt per call in
     /// stream.rs). Poisoned-mutex recovery via `into_inner`.
     pub env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Owning conversation id of the tool call, as carried on hook events.
+    /// `None` for workers/subagents and for host contexts with no
+    /// conversation. Forwarded to extension `tool.call` as
+    /// `params.session_id` so a daemon-shared plugin knows its caller.
+    /// Not the lease scope (`tool_session_id`, a random runtime id).
+    pub session_id: Option<String>,
 }
 
 /// Configuration limits and timeouts.
