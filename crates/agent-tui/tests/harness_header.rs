@@ -72,22 +72,28 @@ fn idle_session_shows_the_wordmark_label_and_build() {
         "Ghost drops the 'ready' text: {line:?}"
     );
 
-    // Right side: the build, `v<version> · <hash>`, and nothing else.
+    // Right side: the build and nothing else. `v<version> · <hash>` in a
+    // checkout, `v<version>` alone in a packaged build (no hash to show).
     let r = right(&mut h);
-    let prefix = concat!("v", env!("CARGO_PKG_VERSION"), " · ");
+    let ver = concat!("v", env!("CARGO_PKG_VERSION"));
     assert!(
-        r.starts_with(prefix),
+        r.starts_with(ver),
         "idle right side should be the build: {r:?}"
     );
-    let hash = &r[prefix.len()..];
-    assert!(
-        !hash.is_empty() && hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-        "hash: {r:?}"
-    );
+    if let Some(hash) = r[ver.len()..].strip_prefix(" · ") {
+        assert!(
+            !hash.is_empty()
+                && hash != "release"
+                && hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "hash: {r:?}"
+        );
+    } else {
+        assert_eq!(r, ver, "build: {r:?}");
+    }
 
     // No indicator anywhere between the wordmark and the build.
     let start = line.find("synaps").unwrap() + "synaps".len();
-    let end = line.rfind(prefix).unwrap();
+    let end = line.rfind(ver).unwrap();
     assert!(
         !has_any(&line[start..end], INDICATOR_GLYPHS),
         "idle header shows an indicator: {line:?}"
@@ -102,7 +108,10 @@ fn a_narrow_idle_header_drops_the_build_before_the_label() {
         line.contains("test-session"),
         "label must survive: {line:?}"
     );
-    assert!(!line.contains(" · "), "build should give way: {line:?}");
+    assert!(
+        !line.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+        "build should give way: {line:?}"
+    );
 }
 
 /// The turn clock holds its column while the indicator after it changes
