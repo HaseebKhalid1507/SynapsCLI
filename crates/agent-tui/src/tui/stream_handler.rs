@@ -572,7 +572,16 @@ pub(super) async fn handle_session_event_arm(
             app.invalidate();
         }
         SessionEventWire::SubagentRows(rows) => {
-            if apply_subagent_progress(&mut app.subagents, &rows) {
+            // A running worker the tray doesn't show yet: the client
+            // reattached to a daemon whose workers kept running, or an abort
+            // cleared the tray while `subagent_start` workers lived on. Add
+            // it now. The tick only reconciles a non-empty tray, so an empty
+            // one would otherwise wait for the agent to start another worker.
+            let untracked = has_untracked_worker(&app.subagents, &rows);
+            if untracked {
+                reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
+            }
+            if apply_subagent_progress(&mut app.subagents, &rows) || untracked {
                 app.invalidate();
             }
             app.subagent_rows = rows;
@@ -745,6 +754,20 @@ pub(super) fn apply_subagent_progress(
 
 /// How long a done entry stays visible before reconcile removes it.
 pub(super) const SUBAGENT_DONE_FLASH_SECS: f64 = 5.0;
+
+/// A row reconcile would add to the tray: running, not being cancelled, and
+/// not already shown.
+fn has_untracked_worker(
+    hud: &[SubagentState],
+    rows: &[synaps_cli::tools::SubagentDisplayRow],
+) -> bool {
+    use synaps_cli::runtime::subagent::SubagentStatus;
+    rows.iter().any(|r| {
+        matches!(r.status, SubagentStatus::Running)
+            && !r.cancel_requested
+            && !hud.iter().any(|s| s.id == r.subagent_id)
+    })
+}
 
 /// Status line between Esc and the actor's `Aborted` (it drains the
 /// cancelled stream first, bounded by `budgets::CANCEL_DRAIN_TIMEOUT`).
