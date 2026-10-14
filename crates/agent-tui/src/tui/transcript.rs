@@ -1124,6 +1124,7 @@ impl TranscriptStore {
                 // just preserved: the re-render from `at` writes identical
                 // content into the shifted slots.
                 self.selection_remap_insert(at);
+                self.anchor_remap_insert(at);
                 // Insert mid-list — watermark at the matched ToolUse index
                 // `i`, not the insert point `at` (lock L2): the arriving
                 // result flips the use's "⠋ running…" header to done, and
@@ -1173,9 +1174,90 @@ impl TranscriptStore {
     /// Lock L3: a full invalidate is an invalidate at k = 0 — any active
     /// selection is cleared (content anywhere may have changed; no remap is
     /// sound).
+    ///
+    /// Coordinate-preserving: the rendered pixels are dropped, but every
+    /// slot keeps its last known height as an ESTIMATE (positions past a
+    /// dirty watermark get a fresh estimate). The next frame exact-renders
+    /// the viewport + halo exactly as after a cold rebuild, but `cum_heights`
+    /// — the coordinate system the scroll anchor, scroll offset and wheel
+    /// events are expressed in — stays continuous, so a full invalidate (a
+    /// theme frame, a toast, a background event card) can never move a
+    /// scrolled-up view. Falls back to [`CacheState::Missing`] when the
+    /// message list no longer lines up positionally with the cache.
     pub(crate) fn invalidate(&mut self) {
         self.selection_on_invalidate(0);
+        self.cache = match std::mem::replace(&mut self.cache, CacheState::Missing) {
+            CacheState::Missing => CacheState::Missing,
+            CacheState::Clean(c) if c.per_msg.len() == self.messages.len() => {
+                let known = c.per_msg.len();
+                self.demoted_cache(c, known)
+            }
+            // Clean but misaligned: a structural edit without a watermark.
+            CacheState::Clean(_) => CacheState::Missing,
+            CacheState::Dirty(c, k) => {
+                let known = k.min(c.per_msg.len()).min(self.messages.len());
+                self.demoted_cache(c, known)
+            }
+        };
+    }
+
+    /// Full invalidate for structural edits (message removal / reshuffle)
+    /// whose indices no longer line up with the cache: drop the coordinate
+    /// system entirely (fresh estimates on the next frame).
+    fn invalidate_structural(&mut self) {
+        self.selection_on_invalidate(0);
         self.cache = CacheState::Missing;
+    }
+
+    /// Demote every slot to an ESTIMATED height (`lines`/`meta` dropped):
+    /// slots `[0..known)` keep their current height, the rest get a fresh
+    /// estimate. The returned cache is Clean — `promote_window` exact-renders
+    /// the viewport neighbourhood on the next frame and splices corrections
+    /// anchor-stably (§4.3).
+    fn demoted_cache(&self, cache: LineCache, known: usize) -> CacheState {
+        let width = cache.width;
+        let mut per_msg: Vec<MsgSlot> = Vec::with_capacity(self.messages.len());
+        for (i, m) in self.messages.iter().enumerate() {
+            let h = if i < known {
+                cache.per_msg[i].height()
+            } else {
+                estimate::estimate_message_height(&m.msg, width)
+            };
+            per_msg.push(MsgSlot {
+                lines: None,
+                meta: None,
+                height: HeightState::Estimated(h),
+            });
+        }
+        let cache = LineCache::new(width, per_msg);
+        #[cfg(any(test, feature = "testing"))]
+        self.probe.cum_writes.fetch_add(
+            cache.cum_heights.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        CacheState::Clean(cache)
+    }
+
+    /// Keep the scroll anchor on the same message across an insert at `at`.
+    fn anchor_remap_insert(&mut self, at: usize) {
+        if let Some(a) = self.scroll_anchor.as_mut() {
+            if at <= a.msg_idx {
+                a.msg_idx += 1;
+            }
+        }
+    }
+
+    /// Keep the scroll anchor on the same message across a removal at `at`.
+    /// Removing the anchor message itself re-anchors at the top of whatever
+    /// slid into its place.
+    fn anchor_remap_remove(&mut self, at: usize) {
+        if let Some(a) = self.scroll_anchor.as_mut() {
+            if at < a.msg_idx {
+                a.msg_idx -= 1;
+            } else if at == a.msg_idx {
+                a.row_in_msg = 0;
+            }
+        }
     }
 
     /// Mark messages from index `idx` onwards as dirty (cheapest granularity).
@@ -1259,7 +1341,11 @@ impl TranscriptStore {
     /// Bodies verbatim from draw.rs §3 (the old lines 517–575), including the
     /// two-phase immutable-render-then-mutable-apply structure — borrow rules
     /// are identical inside the store (design §3.5).
-    pub(crate) fn sync_cache(&mut self, content_width: usize, ctx: &RenderCtx<'_>) {
+    ///
+    /// Returns `true` when the cache was rebuilt from scratch (fresh
+    /// ESTIMATED heights): its `total_height` is then a new coordinate system
+    /// that must not be compared against last frame's total.
+    pub(crate) fn sync_cache(&mut self, content_width: usize, ctx: &RenderCtx<'_>) -> bool {
         let needs_full_rebuild = self.line_cache().map_or(true, |c| c.width != content_width);
 
         // Width change ⇒ rewrap ⇒ every content coordinate is re-derived;
@@ -1344,6 +1430,7 @@ impl TranscriptStore {
             self.cache = CacheState::Clean(LineCache::new(content_width, per_msg));
         }
         self.debug_assert_cum_identity();
+        needs_full_rebuild
     }
 
     /// The P11 §0 identity, executable: summed exact per-message heights and
@@ -1405,20 +1492,44 @@ impl TranscriptStore {
         let content_width = msg_area.width.saturating_sub(2) as usize;
 
         // ── Cache sync (old draw.rs §3) ──
-        self.sync_cache(content_width, ctx);
+        let rebuilt = self.sync_cache(content_width, ctx);
         // P11 (design §2.1): `total` is sourced from the cumulative-offset
         // cache — the same numbers the flat buffer's len() used to be (§0
-        // identity). The growth-adjust/clamp code below is untouched, only
-        // re-sourced.
+        // identity).
         let total = self.line_cache().map_or(0, |c| c.total_height());
 
         // ── Scroll bookkeeping (old draw.rs §4) ──
-        // Order is load-bearing: growth-adjust THEN clamp THEN last_line_count write.
+        //
+        // Pinned: follow the bottom. Unpinned with an anchor: the anchor
+        // (message index + row inside it, captured from what the user was
+        // looking at) is the ONLY source of truth for the viewport top, and
+        // `scroll_back` is re-derived from it every frame. Inferring "growth"
+        // from total deltas is wrong whenever the total changes without
+        // content being appended below the viewport — a full invalidate
+        // rebuilds every height as an ESTIMATE, the body rect shrinks/grows
+        // when the subagent tray or input box changes height, rows are
+        // inserted above the viewport — and each of those used to move a
+        // scrolled-up view on its own (background subagent activity being
+        // the loudest trigger). Nothing but the user moves an unpinned view.
         if self.scroll_pinned {
             self.scroll_back = 0;
+            self.scroll_anchor = None;
+        } else if let (Some(anchor), Some(cache)) = (&self.scroll_anchor, self.cache.line_cache()) {
+            let sb = Self::anchor_to_scroll_back(anchor, cache, content_height);
+            self.scroll_back = sb.min(u16::MAX as usize) as u16;
+            // The anchor is deliberately NOT re-captured here: on a rebuilt
+            // cache the coordinates are estimates, and re-capturing would
+            // launder the estimate error into the anchor. `promote_window`
+            // exact-renders the anchor's neighbourhood and re-derives
+            // `scroll_back` from this same anchor.
         } else {
+            // No anchor yet (e.g. scrolled while the cache was missing):
+            // legacy offset-from-bottom bookkeeping. Order is load-bearing:
+            // growth-adjust THEN clamp THEN last_line_count write. A rebuilt
+            // cache's total is a different coordinate system — never treat
+            // its delta as growth.
             let prev = self.last_line_count;
-            if total > prev && prev > 0 {
+            if !rebuilt && total > prev && prev > 0 {
                 let growth = (total - prev) as u16;
                 self.scroll_back = self.scroll_back.saturating_add(growth);
             }
@@ -1426,16 +1537,16 @@ impl TranscriptStore {
             if self.scroll_back > max_back {
                 self.scroll_back = max_back;
             }
+            // Capture the anchor so later frames run in anchored mode.
+            // viewport field not yet set at this point, so supply content_height directly.
+            if self.scroll_back == 0 {
+                self.scroll_anchor = None;
+            } else if let Some(cache) = self.cache.line_cache() {
+                self.scroll_anchor =
+                    Self::capture_anchor(cache, self.scroll_back as usize, content_height);
+            }
         }
         self.last_line_count = total;
-        // Slice 2: re-sync shadow anchor after the growth-adjust/clamp pass.
-        // viewport field not yet set at this point, so supply content_height directly.
-        if self.scroll_back == 0 {
-            self.scroll_anchor = None;
-        } else if let Some(cache) = self.cache.line_cache() {
-            self.scroll_anchor =
-                Self::capture_anchor(cache, self.scroll_back as usize, content_height);
-        }
         // ── T241 Slice 3: promote the viewport + halo to exact ──
         // Every frame, idempotent (§4.4): exact-render any Estimated slot
         // intersecting the window ± PROMOTE_HALO_MSGS, splice corrections
@@ -1566,12 +1677,13 @@ impl TranscriptStore {
             // mode derives from (msg_idx, row_in_msg); a scroll offset
             // without a captured anchor falls back to the raw conversion.
             let max_top = total.saturating_sub(content_height);
-            let s_top = if self.scroll_back == 0 {
-                max_top
-            } else if let Some(anchor) = &self.scroll_anchor {
+            let anchored = if self.scroll_pinned { None } else { self.scroll_anchor.as_ref() };
+            let s_top = if let Some(anchor) = anchored {
                 let mi = anchor.msg_idx.min(n - 1);
                 let h = cache.per_msg[mi].height().max(1);
                 (cache.cum_heights[mi] + anchor.row_in_msg.min(h - 1)).min(max_top)
+            } else if self.scroll_back == 0 {
+                max_top
             } else {
                 Self::scroll_back_to_stop(self.scroll_back as usize, total, content_height)
             };
@@ -1624,10 +1736,12 @@ impl TranscriptStore {
 
                 let cache = self.cache.line_cache().expect("cache existed at loop head");
                 let new_total = cache.total_height();
-                if self.scroll_back != 0 {
+                if !self.scroll_pinned {
                     // Anchored: recompute scroll_back so the anchor message
                     // stays at the same screen row (§4.3). Without an anchor
-                    // (defensive), just clamp (I-CLAMP).
+                    // (defensive), just clamp (I-CLAMP). The anchor survives
+                    // a zero offset: the view is still the user's, not the
+                    // tail-follower's.
                     let sb = match &self.scroll_anchor {
                         Some(anchor) => Self::anchor_to_scroll_back(anchor, cache, content_height),
                         None => Self::clamp_scroll_back(
@@ -1637,9 +1751,6 @@ impl TranscriptStore {
                         ),
                     };
                     self.scroll_back = sb.min(u16::MAX as usize) as u16;
-                    if self.scroll_back == 0 {
-                        self.scroll_anchor = None;
-                    }
                 }
                 // The growth-adjust in `visible_window` compares next frame's
                 // total against `last_line_count`; fold the correction in NOW
@@ -2682,8 +2793,9 @@ impl TranscriptStore {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
                 if t == THINKING_PLACEHOLDER || t.is_empty() {
                     self.messages.remove(idx);
+                    self.anchor_remap_remove(idx);
                     // Structural change (remove) — full invalidate to resync per_msg lengths.
-                    self.invalidate();
+                    self.invalidate_structural();
                 }
             }
         }
@@ -2721,8 +2833,16 @@ impl TranscriptStore {
         if self.tool_start_times.is_empty() {
             self.tool_start_time = None;
         }
+        // An anchor inside the discarded preview re-anchors on the restored
+        // message the preview hung off.
+        if let Some(a) = self.scroll_anchor.as_mut() {
+            if a.msg_idx >= start {
+                a.msg_idx = start.saturating_sub(1);
+                a.row_in_msg = 0;
+            }
+        }
         self.clear_selection();
-        self.invalidate();
+        self.invalidate_structural();
     }
 
     // ── Query surface (§3.4) ─────────────────────────────────────────────
@@ -2761,6 +2881,8 @@ impl TranscriptStore {
         self.response_start = None;
         self.clear_selection();
         self.cache = CacheState::Missing;
+        // The anchor indexed messages that no longer exist.
+        self.scroll_anchor = None;
         // Scrollback bookkeeping restarts with the transcript (L3): the next
         // sentinel must not count messages `/clear` or `/resync` removed.
         self.scrollback_dropped = 0;
@@ -3034,6 +3156,158 @@ mod visible_window_tests {
             to_str(&oracle[o_len - 15..o_len - 10]),
             "mid-scroll window must equal the oracle's bottom-relative slice"
         );
+    }
+}
+
+#[cfg(test)]
+mod scroll_isolation_tests {
+    //! A scrolled-up (unpinned) view is the user's: nothing but the user's
+    //! own scrolling may move it. Background activity — subagent tray
+    //! updates resizing the body, full invalidates re-estimating heights,
+    //! event cards, tool results landing above the viewport — must leave
+    //! the visible rows byte-identical.
+    use super::*;
+
+    fn ctx() -> RenderCtx<'static> {
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
+    }
+
+    fn area(height: u16) -> ratatui::layout::Rect {
+        ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: 82,
+            height,
+        }
+    }
+
+    fn rows(vw: &VisibleWindow) -> Vec<String> {
+        vw.lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// Mixed content whose cheap height ESTIMATES differ from the exact
+    /// render (fenced code, lists, long wrapping lines) — the case where
+    /// re-estimating used to shift a scrolled-up view.
+    fn varied_store() -> TranscriptStore {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..40 {
+            store.push_msg(ChatMessage::User(format!("question {i}")));
+            store.push_msg(ChatMessage::Text(format!(
+                "answer {i}\n\n```rust\nfn f{i}() {{\n    let x = {i};\n}}\n```\n\n- bullet a {i}\n- bullet b {}\n\n> quoted {i}",
+                "wrapping words ".repeat(i % 7 * 5)
+            )));
+        }
+        store
+    }
+
+    fn scrolled_store(lines: u16) -> (TranscriptStore, Vec<String>) {
+        let mut store = varied_store();
+        let _ = store.visible_window(area(22), &ctx());
+        store.scroll_up(lines);
+        let vw = store.visible_window(area(22), &ctx());
+        assert!(!store.is_pinned(), "precondition: user scrolled up");
+        (store, rows(&vw))
+    }
+
+    #[test]
+    fn full_invalidate_never_moves_a_scrolled_up_view() {
+        let (mut store, before) = scrolled_store(57);
+        for _ in 0..4 {
+            store.invalidate();
+            let vw = store.visible_window(area(22), &ctx());
+            assert_eq!(rows(&vw), before, "full invalidate moved the scrolled-up view");
+        }
+    }
+
+    #[test]
+    fn cold_rebuild_restores_a_scrolled_up_view_from_its_anchor() {
+        let (mut store, before) = scrolled_store(57);
+        // Drop the coordinate system entirely: every height becomes a
+        // fresh estimate (the structural-edit / pre-fix invalidate path).
+        store.test_put_cache(CacheState::Missing);
+        let vw = store.visible_window(area(22), &ctx());
+        assert_eq!(rows(&vw), before, "cold rebuild moved the scrolled-up view");
+    }
+
+    #[test]
+    fn body_resize_keeps_the_top_row_while_scrolled_up() {
+        // The subagent tray growing/shrinking resizes the transcript body.
+        let (mut store, before) = scrolled_store(57);
+        let vw = store.visible_window(area(17), &ctx());
+        let shrunk = rows(&vw);
+        assert_eq!(shrunk.len(), 15);
+        assert_eq!(shrunk[..], before[..15], "tray growth moved the top row");
+        let vw = store.visible_window(area(22), &ctx());
+        assert_eq!(rows(&vw), before, "tray shrink did not restore the view");
+    }
+
+    #[test]
+    fn tail_growth_and_event_cards_leave_a_scrolled_up_view_alone() {
+        let (mut store, before) = scrolled_store(57);
+        for i in 0..10 {
+            store.push_msg(ChatMessage::Event {
+                source: "subagent".into(),
+                severity: "high".into(),
+                text: format!("subagent {i} finished\nwith a second line"),
+            });
+            store.push_msg(ChatMessage::Text(format!("tail text {i}")));
+            let vw = store.visible_window(area(22), &ctx());
+            assert_eq!(rows(&vw), before, "tail growth moved the view");
+        }
+    }
+
+    #[test]
+    fn tool_result_inserted_above_the_view_does_not_shift_it() {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        store.on_tool_use_start("t-early".into(), "bash".into());
+        store.on_tool_use_finalized("t-early".into(), "bash".into(), r#"{"command": "ls"}"#.into());
+        for i in 0..30 {
+            store.push_msg(ChatMessage::Text(format!("after the tool {i}\nmore {i}")));
+        }
+        let _ = store.visible_window(area(22), &ctx());
+        store.scroll_up(20);
+        let before = rows(&store.visible_window(area(22), &ctx()));
+        assert!(
+            before.iter().all(|r| !r.contains("bash")),
+            "precondition: the tool block is above the viewport"
+        );
+        store.push_tool_result(
+            "t-early".into(),
+            "line one\nline two\nline three\nline four".into(),
+            Some(12),
+        );
+        let after = rows(&store.visible_window(area(22), &ctx()));
+        assert_eq!(after, before, "a result landing above the view shifted it");
+    }
+
+    #[test]
+    fn pinned_view_still_follows_the_tail() {
+        let mut store = varied_store();
+        let _ = store.visible_window(area(22), &ctx());
+        store.invalidate();
+        store.push_msg(ChatMessage::Text("the newest line".into()));
+        let vw = store.visible_window(area(17), &ctx());
+        assert_eq!(vw.scroll_back, 0);
+        assert!(rows(&vw).iter().any(|r| r.contains("the newest line")));
+    }
+
+    #[test]
+    fn scrolling_back_down_re_pins() {
+        let (mut store, _) = scrolled_store(9);
+        store.invalidate();
+        let _ = store.visible_window(area(17), &ctx());
+        store.scroll_down(u16::MAX);
+        assert!(store.is_pinned());
+        store.push_msg(ChatMessage::Text("followed".into()));
+        let vw = store.visible_window(area(22), &ctx());
+        assert!(rows(&vw).iter().any(|r| r.contains("followed")));
     }
 }
 
