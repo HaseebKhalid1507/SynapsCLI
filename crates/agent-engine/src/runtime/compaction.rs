@@ -388,12 +388,22 @@ impl CompactionDisclosure {
                         .collect::<Vec<_>>()
                         .join(",")
                 };
+                // A provider-qualified model (`anthropic/claude-opus-5-5`)
+                // already names its provider; do not print it twice.
+                let target = if self
+                    .model
+                    .strip_prefix(self.provider.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    self.model.clone()
+                } else {
+                    format!("{}/{}", self.provider, self.model)
+                };
                 format!(
-                    "compaction: sending ~{} KB of conversation ({} messages) to {}/{} — excluded classes: {}",
+                    "compaction: sending ~{} KB of conversation ({} messages) to {} — excluded classes: {}",
                     self.approx_conversation_bytes.div_ceil(1024),
                     self.message_count,
-                    self.provider,
-                    self.model,
+                    target,
                     excluded
                 )
             }
@@ -1953,6 +1963,36 @@ mod disclosure_tests {
         assert!(
             line.contains("of conversation"),
             "the rendered line must scope the byte figure: {line}"
+        );
+    }
+
+    /// A provider-qualified compaction model names its provider once
+    /// (`anthropic/claude-opus-5-5`, never `anthropic/anthropic/...`); a bare
+    /// model id still gets the provider prefix.
+    #[test]
+    fn disclosure_line_names_the_provider_once() {
+        let disclosure = |model: &str| CompactionDisclosure {
+            mode: agent_core::compaction::CompactionMode::Remote,
+            provider: "anthropic".into(),
+            model: model.into(),
+            approx_conversation_bytes: 2048,
+            message_count: 3,
+            included_classes: Vec::new(),
+            excluded_classes: Vec::new(),
+        };
+        let qualified = disclosure("anthropic/claude-opus-5-5").render_line();
+        assert!(
+            qualified.contains(" to anthropic/claude-opus-5-5 "),
+            "{qualified}"
+        );
+        assert!(!qualified.contains("anthropic/anthropic/"), "{qualified}");
+        let bare = disclosure("claude-sonnet-4-6").render_line();
+        assert!(bare.contains(" to anthropic/claude-sonnet-4-6 "), "{bare}");
+        // A model that merely starts with the provider's letters is not qualified.
+        let lookalike = disclosure("anthropicish-model").render_line();
+        assert!(
+            lookalike.contains(" to anthropic/anthropicish-model "),
+            "{lookalike}"
         );
     }
 
