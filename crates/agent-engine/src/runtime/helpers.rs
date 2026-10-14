@@ -1113,8 +1113,9 @@ mod tests {
             // OAuth's protocol identity is fixed and FIRST. Product/user identity
             // remains additive and therefore cannot replace the transport contract.
             assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+            // Whatever identity is configured -- including the transport line
+            // itself, which is valid config -- rides after it.
             assert_eq!(blocks[1]["text"], crate::core::config::get_identity());
-            assert_ne!(blocks[0]["text"], blocks[1]["text"]);
             assert!(blocks[0].get("cache_control").is_none());
             assert!(blocks[1].get("cache_control").is_none());
             assert!(blocks[2].get("cache_control").is_none());
