@@ -33,13 +33,22 @@ pub struct CarriedWorker {
     /// The resume archive, when the worker's finalizer wrote one.
     #[serde(default)]
     pub archive_path: Option<std::path::PathBuf>,
-    /// The reload stopped this worker mid-run.
+    /// A daemon reload (this one or an earlier one) stopped this run, not
+    /// the user. A label for status and the wake's wording; whether the
+    /// parent is told again is [`Self::wake`].
     #[serde(default)]
     pub stopped_by_reload: bool,
-    /// Finished before the reload, and its completion wake was still queued
-    /// (undelivered) in the old image's event queue, which the exec discards.
+    /// Finished on its own, and its completion wake never reached the
+    /// parent: still queued in the old image's event queue (which the exec
+    /// discards), or not yet pushed when the checkpoint ended.
     #[serde(default)]
     pub wake_lost: bool,
+    /// The next image must wake the parent about this worker: this reload
+    /// stopped it, its completion wake was lost, or the reload wake an
+    /// earlier image posted is still undelivered. Exactly once per stop:
+    /// a later reload does not repeat a delivered wake.
+    #[serde(default)]
+    pub wake: bool,
     #[serde(default)]
     pub elapsed_secs: u64,
     /// Latest words of the worker (≤ 300 chars), for the wake preview.
@@ -50,7 +59,7 @@ pub struct CarriedWorker {
 impl CarriedWorker {
     /// Whether the parent must be woken about this worker after the reload.
     pub fn needs_wake(&self) -> bool {
-        self.stopped_by_reload || self.wake_lost
+        self.wake
     }
 }
 
@@ -83,6 +92,14 @@ impl SubagentRegistry {
                 // stays a user cancel).
                 let stopped_by_reload =
                     s.stopped_by_reload || (!terminal && !s.cancel_requested);
+                // A completion the parent never got: its wake is still
+                // queued, or the finalizer had not pushed it yet (it finished
+                // on its own during the checkpoint and outlasted the wait).
+                // A cancel withholds the wake, so it owes none.
+                let wake_lost = !stopped_by_reload
+                    && !h.collected
+                    && (undelivered_wakes.contains(&h.id)
+                        || (!s.completion_settled && !s.cancel_requested));
                 let latest = s.last_response_text().trim();
                 let source = if latest.is_empty() { s.partial_text.trim() } else { latest };
                 CarriedWorker {
@@ -98,11 +115,8 @@ impl SubagentRegistry {
                     },
                     archive_path: s.archive_path.clone(),
                     stopped_by_reload,
-                    wake_lost: !stopped_by_reload
-                        && terminal
-                        && !h.collected
-                        && !s.cancel_requested
-                        && undelivered_wakes.contains(&h.id),
+                    wake_lost,
+                    wake: stopped_by_reload || wake_lost,
                     elapsed_secs: h.elapsed_secs() as u64,
                     preview: source.chars().take(300).collect(),
                 }
@@ -125,10 +139,25 @@ impl SubagentRegistry {
                 archive_path: Some(path.clone()),
                 stopped_by_reload: self.stopped_by_reload.contains(id),
                 wake_lost: false,
+                wake: false,
                 elapsed_secs: 0,
                 preview: String::new(),
             }
         }));
+        // Wakes an earlier reload made this image post: carried again only
+        // while still queued (this exec would discard it), never once the
+        // parent has it, however many reloads follow.
+        for (id, posted) in &self.reload_woken {
+            let pending = undelivered_wakes.contains(id);
+            match carried.iter_mut().find(|w| &w.id == id) {
+                Some(w) if pending && !self.handles.contains_key(id) => {
+                    *w = CarriedWorker { wake: true, ..posted.clone() };
+                }
+                Some(w) => w.wake = pending,
+                None if pending => carried.push(CarriedWorker { wake: true, ..posted.clone() }),
+                None => {}
+            }
+        }
         carried.sort_by_key(|w| (handle_number(&w.id), w.id.clone()));
         carried
     }
@@ -148,6 +177,12 @@ impl SubagentRegistry {
         }
     }
 
+    /// This image posted the parent's wake for a carried worker
+    /// (`AdoptWorkers`): see [`Self::reload_carry`].
+    pub fn note_reload_wake(&mut self, worker: &CarriedWorker) {
+        self.reload_woken.insert(worker.id.clone(), worker.clone());
+    }
+
     /// Whether a daemon reload (not the user) stopped `id`'s run.
     pub fn was_stopped_by_reload(&self, id: &str) -> bool {
         self.stopped_by_reload.contains(id)
@@ -158,29 +193,37 @@ impl SubagentRegistry {
 
     /// Stop every running worker for a daemon reload: cancel it, flagged so
     /// the carried record and the next image say "stopped by reload", not
-    /// "cancelled by user". Returns every running worker (including one
-    /// whose user cancel is already in flight), to await its finalizer.
+    /// "cancelled by user". Returns every worker whose finalizer has not
+    /// settled, to await before the exec: the ones stopped here, one whose
+    /// user cancel is already in flight, and one finishing on its own (its
+    /// completion wake must reach the queue the reload carries).
     pub fn stop_for_reload(&mut self) -> Vec<(String, Arc<RwLock<SubagentState>>)> {
-        let mut stopping = Vec::new();
+        let mut awaited = Vec::new();
         for h in self.handles.values_mut() {
-            if h.status() != SubagentStatus::Running {
-                continue;
-            }
-            let fresh = {
+            let stop = {
+                // Decided under the lock the worker thread takes to record
+                // its completion (only while no cancel is requested): the
+                // worker either finished first (it keeps its completion) or
+                // is stopped here (it ends cancelled), never both.
                 let mut s = h.state.write().unwrap_or_else(|p| p.into_inner());
-                let fresh = !s.cancel_requested;
-                if fresh {
-                    s.stopped_by_reload = true;
+                if s.completion_settled {
+                    continue;
                 }
-                fresh
+                let running = matches!(s.status, SubagentStatus::Running) && !s.finalization_started;
+                let stop = running && !s.cancel_requested;
+                if stop {
+                    s.stopped_by_reload = true;
+                    s.cancel_requested = true;
+                }
+                stop
             };
-            if fresh {
+            if stop {
                 h.cancel();
             }
-            stopping.push((h.id.clone(), Arc::clone(&h.state)));
+            awaited.push((h.id.clone(), Arc::clone(&h.state)));
         }
-        stopping.sort_by(|a, b| a.0.cmp(&b.0));
-        stopping
+        awaited.sort_by(|a, b| a.0.cmp(&b.0));
+        awaited
     }
 }
 
@@ -230,40 +273,78 @@ mod tests {
         s.finished_at = Some(std::time::Instant::now());
         s.finalization_started = true;
         s.finalization_ready = true;
+        s.completion_settled = true;
         s.archive_path = archive.map(std::path::PathBuf::from);
         s.partial_text = "latest words".into();
     }
 
     /// A reload stops exactly the running workers, flagged as the reload's
     /// doing; a user cancel already in flight stays the user's, but is still
-    /// awaited (its archive must land before the exec).
+    /// awaited (its archive must land before the exec). A worker that
+    /// finished on its own but whose finalizer has not settled is awaited
+    /// too (its wake must reach the carried queue), never stopped.
     #[test]
     fn stop_for_reload_cancels_running_workers_flagged_and_skips_finished() {
         let mut registry = SubagentRegistry::new();
         let running = make_handle("sa_4");
         let user_cancelled = make_handle("sa_5");
         let finished = make_finished_handle("sa_6");
-        let (running_state, user_state, finished_state) = (
+        finalize_as(&finished, SubagentStatus::Completed, Some("/a/sa_6.json"));
+        let finishing = make_finished_handle("sa_7");
+        let (running_state, user_state, finished_state, finishing_state) = (
             Arc::clone(&running.state),
             Arc::clone(&user_cancelled.state),
             Arc::clone(&finished.state),
+            Arc::clone(&finishing.state),
         );
         registry.register(running);
         registry.register(user_cancelled);
         registry.register(finished);
+        registry.register(finishing);
         registry.get_mut("sa_5").unwrap().cancel();
 
         let stopping: Vec<String> = registry.stop_for_reload().into_iter().map(|(id, _)| id).collect();
-        assert_eq!(stopping, ["sa_4", "sa_5"]);
+        assert_eq!(stopping, ["sa_4", "sa_5", "sa_7"]);
         let r = running_state.read().unwrap();
         assert!(r.cancel_requested && r.stopped_by_reload);
         let u = user_state.read().unwrap();
         assert!(u.cancel_requested && !u.stopped_by_reload, "a user cancel stays a user cancel");
         let f = finished_state.read().unwrap();
         assert!(!f.cancel_requested && !f.stopped_by_reload);
-        drop((r, u, f));
-        // Idempotent: nothing new to flag, still awaited until finalized.
-        assert_eq!(registry.stop_for_reload().len(), 2);
+        let g = finishing_state.read().unwrap();
+        assert!(!g.cancel_requested && !g.stopped_by_reload, "its completion stands");
+        assert_eq!(g.status, SubagentStatus::Completed);
+        drop((r, u, f, g));
+        // Idempotent: nothing new to flag, still awaited until settled.
+        assert_eq!(registry.stop_for_reload().len(), 3);
+    }
+
+    /// The race the checkpoint must not lose: a worker finishes on its own
+    /// while the reload stops the others. Until its finalizer settles, its
+    /// wake may not be in the carried queue yet: it is owed (lost) unless it
+    /// was cancelled. Once settled, only a still-queued wake is owed.
+    #[test]
+    fn a_worker_finishing_during_the_checkpoint_keeps_its_wake() {
+        let mut registry = SubagentRegistry::new();
+        registry.register(make_finished_handle("sa_20"));
+        let cancelled = make_finished_handle("sa_21");
+        cancelled.state.write().unwrap().cancel_requested = true;
+        registry.register(cancelled);
+        let none = std::collections::HashSet::new();
+        let carried = registry.reload_carry(&none);
+        let by = |id: &str| carried.iter().find(|w| w.id == id).unwrap().clone();
+        let w = by("sa_20");
+        assert!(w.wake_lost && w.wake && !w.stopped_by_reload, "{w:?}");
+        assert_eq!(w.status, "completed");
+        assert!(!by("sa_21").wake, "a cancel owes no wake");
+
+        // Settled, and its wake delivered: nothing owed.
+        finalize_as(registry.get("sa_20").unwrap(), SubagentStatus::Completed, Some("/a/sa_20.json"));
+        assert!(!registry.reload_carry(&none).iter().any(|w| w.wake));
+        // Settled, wake still queued: owed.
+        let queued: std::collections::HashSet<String> = ["sa_20".to_string()].into();
+        let w = registry.reload_carry(&queued).into_iter().find(|w| w.id == "sa_20").unwrap();
+        assert!(w.wake_lost && w.wake);
     }
 
     /// What a reload records per worker, and how the next image's registry
@@ -327,10 +408,13 @@ mod tests {
         assert!(!w.needs_wake());
         assert_eq!(w.status, "archived");
 
-        // The next image.
+        // The next image (as `adopt_workers` does it).
         let mut new = SubagentRegistry::new();
         for w in &carried {
             new.adopt_carried(w);
+            if w.needs_wake() {
+                new.note_reload_wake(w);
+            }
         }
         assert_eq!(new.archive_path("sa_10"), Some("/a/sa_10.json".into()));
         assert_eq!(new.archive_path("sa_3"), Some("/a/sa_3.json".into()));
@@ -349,15 +433,26 @@ mod tests {
         live.adopt_carried(&by("sa_10"));
         assert_eq!(live.archive_path("sa_10"), Some("/live/sa_10.json".into()));
 
-        // A second reload carries the adopted ones forward again.
-        let again: Vec<String> = new
-            .reload_carry(&Default::default())
-            .into_iter()
-            .filter(|w| w.stopped_by_reload)
-            .map(|w| w.id)
-            .collect();
+        // A second reload, every wake delivered: the records ride along
+        // (old ids keep resolving, the label stays) but nobody is woken
+        // again — a repeated "resume it" would start a duplicate worker.
+        let again = new.reload_carry(&Default::default());
+        assert!(again.iter().all(|w| !w.needs_wake()), "{again:?}");
+        let labelled: Vec<&str> =
+            again.iter().filter(|w| w.stopped_by_reload).map(|w| w.id.as_str()).collect();
         // Only ids with an archive survive as records (sa_11 had none).
-        assert_eq!(again, ["sa_10"]);
+        assert_eq!(labelled, ["sa_10"]);
+
+        // A second reload before the parent got its wakes: exactly the
+        // undelivered ones are carried again, as first posted.
+        let queued: std::collections::HashSet<String> =
+            ["sa_11".to_string(), "sa_12".to_string()].into();
+        let again = new.reload_carry(&queued);
+        let woken: Vec<&CarriedWorker> = again.iter().filter(|w| w.needs_wake()).collect();
+        assert_eq!(woken.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["sa_11", "sa_12"]);
+        assert_eq!(*woken[0], by("sa_11"), "the stuck worker's stop, as posted");
+        assert_eq!(*woken[1], by("sa_12"), "the lost completion, as posted");
+        assert!(!again.iter().any(|w| w.id == "sa_10" && w.needs_wake()));
     }
 
     #[test]

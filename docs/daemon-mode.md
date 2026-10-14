@@ -437,26 +437,37 @@ destroys them, and nothing that only lives in memory survives (their in-flight t
 kill is a `Drop`, which an exec never runs). So `Checkpoint{Reload}`:
 
 - **stops** every running worker (`SubagentRegistry::stop_for_reload`, flagged *stopped by reload*, not
-  a user cancel) before the turn is cancelled, and waits ≤ 10 s for each finalizer: its in-flight tool
-  is dropped (killing that command's process group before the exec instead of leaving it running in
-  the worktree) and its resume archive is written (`subagent-history/<pid>-<uuid>/sa_N.json`,
-  `status: cancelled`);
+  a user cancel) before the turn is cancelled, and waits ≤ 10 s for each finalizer to settle: its
+  in-flight tool is dropped (killing that command's process group before the exec instead of leaving
+  it running in the worktree; a job the command detached with `setsid` is its own and lives on) and
+  its resume archive is written (`subagent-history/<pid>-<uuid>/sa_N.json`, `status: cancelled`).
+  The stop is decided under the lock the worker takes to record its completion, so a worker that
+  finished first keeps its completion; one still finishing is awaited too, so its wake reaches the
+  queue the reload carries;
 - records every registry entry in `SessionReloadRecord.workers` (`CarriedWorker`): stopped workers,
-  finished workers whose completion wake was still queued (the exec discards the event queue), and
-  reaped ids with an archive (≤ 1024, newest first).
+  finished workers whose completion wake never reached the parent (still queued, which the exec
+  discards, or not yet pushed when the wait ended), and reaped ids with an archive (≤ 1024, newest
+  first).
 
 The new image adopts them (`AdoptWorkers`): each old id resolves to its archive again
 (`subagent_status` answers from the archive with `stopped_by_reload`; `subagent_collect` and
 `subagent_resume` work by the old id), and the parent is woken once per stopped worker ("stopped by a
 daemon reload, not by the user; `subagent_resume` continues it") or lost wake (the normal completion).
-The model decides whether to resume. Handle ids continue from the old counter, so `sa_1` never names
-two workers. A failed exec re-adopts the same records in the old image (its parents are still waiting).
+The model decides whether to resume. **Exactly once**: `CarriedWorker.wake` is set only by the reload
+that stopped the worker or lost the wake; the *stopped by reload* label rides along for status, but a
+later reload repeats the wake only if the parent has not received it yet (still queued), never after —
+a repeated "resume it" would start a duplicate worker. Handle ids continue from the old counter
+(`next_subagent_id`, raised again by `SYNAPS_DAEMON_SUBAGENT_ID_FLOOR`, read at the `execv` itself),
+so `sa_1` never names two workers. A failed exec re-adopts the same records in the old image (its
+parents are still waiting).
 A worker that does not stop within 10 s (a tool that ignores cancellation) is still announced, but
 only its previous archive (if any) survives.
 
 Tested against a real daemon (`tests/daemon_reload_workers.rs`): a worker mid-`bash` is stopped, its
-shell's process group is gone after the reload, its archive is `cancelled` with history, the parent is
-woken, `subagent_status` of the old id reports `stopped_by_reload`, and the next worker is `sa_2`.
+shell and the background `sleep` it waited on are gone after the reload while its `setsid` job lives,
+its archive is `cancelled` with history, the parent is woken once, `subagent_status` of the old id
+reports `stopped_by_reload`, the next worker is `sa_2`, and a second reload neither repeats the wake
+nor loses or doubles the second worker's completion.
 
 ## cwd caveats (risk §6.1)
 

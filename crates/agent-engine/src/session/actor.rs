@@ -3811,6 +3811,11 @@ impl SessionActor {
                 .unwrap_or_else(|p| p.into_inner());
             for w in &workers {
                 registry.adopt_carried(w);
+                if w.needs_wake() {
+                    // The next reload repeats this wake only while it is
+                    // still queued.
+                    registry.note_reload_wake(w);
+                }
             }
         }
         let woken: Vec<&crate::runtime::subagent::CarriedWorker> =
@@ -4356,10 +4361,11 @@ impl SessionTask {
 }
 
 /// Wait (bounded by [`budgets::WORKER_RELOAD_STOP_TIMEOUT`]) until every worker
-/// `stop_for_reload` cancelled has run its finalizer: its resume archive
-/// is on disk and its in-flight tool was dropped, which kills that
-/// tool's process group — after the exec nothing could. Returns the
-/// stopped ids.
+/// `stop_for_reload` returned has settled its finalizer: a stopped worker's
+/// resume archive is on disk and its in-flight tool was dropped, which kills
+/// that tool's process group (after the exec nothing could); a worker that
+/// finished on its own has pushed its completion wake into the queue the
+/// reload carries. Returns the ids the reload stopped.
 async fn await_stopped_workers(
     session: &str,
     stopping: Vec<(String, Arc<std::sync::RwLock<crate::runtime::subagent::SubagentState>>)>,
@@ -4373,7 +4379,7 @@ async fn await_stopped_workers(
     loop {
         let pending: Vec<&str> = stopping
             .iter()
-            .filter(|(_, s)| !s.read().unwrap_or_else(|p| p.into_inner()).finalization_ready)
+            .filter(|(_, s)| !s.read().unwrap_or_else(|p| p.into_inner()).completion_settled)
             .map(|(id, _)| id.as_str())
             .collect();
         if pending.is_empty() {
@@ -4389,7 +4395,11 @@ async fn await_stopped_workers(
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    ids
+    stopping
+        .iter()
+        .filter(|(_, s)| s.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 #[cfg(test)]

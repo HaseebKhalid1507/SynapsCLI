@@ -210,6 +210,15 @@ pub(crate) fn finalize_subagent_in(
     );
 }
 
+/// Marks [`SubagentState::completion_settled`] when the finalizer returns.
+struct SettleOnDrop<'a>(&'a Arc<RwLock<SubagentState>>);
+
+impl Drop for SettleOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).completion_settled = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_subagent_impl(
     state: &Arc<RwLock<SubagentState>>,
@@ -249,6 +258,9 @@ fn finalize_subagent_impl(
         let preview: String = source.chars().take(300).collect();
         (s.status.clone(), preview, s.cancel_requested)
     };
+    // However this returns from here on: settled, so a reload's checkpoint
+    // knows the wake (if any) is in the queue it is about to carry.
+    let _settled = SettleOnDrop(state);
 
     // Archive the full conversation (every terminal status, cancel included) so
     // subagent_resume and subagent_collect still work after the handle is reaped.
@@ -340,6 +352,7 @@ mod tests {
             archive_path: archive.map(std::path::PathBuf::from),
             stopped_by_reload: stopped,
             wake_lost,
+            wake: stopped || wake_lost,
             elapsed_secs: 1234,
             preview: "polling the build".into(),
         }

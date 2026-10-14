@@ -37,6 +37,10 @@ use crate::session::{
 pub const RELOAD_STATE_ENV: &str = "SYNAPS_DAEMON_RELOAD_STATE";
 /// Env: inherited `daemon.lock` fd (mandatory when `RELOAD_STATE_ENV` is set).
 pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
+/// Env: the subagent handle counter read at the `execv` itself, later than
+/// `ReloadState::next_subagent_id` (written after the checkpoints): a worker
+/// that ignored its stop could still dispatch in between.
+pub const SUBAGENT_ID_FLOOR_ENV: &str = "SYNAPS_DAEMON_SUBAGENT_ID_FLOOR";
 /// Env: default drain budget in seconds.
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
@@ -314,6 +318,13 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
     let journal_id = handle.journal_id();
+    if rec.is_none() {
+        tracing::warn!(
+            session = %handle.id,
+            "reload: no checkpoint reply in time — this session's workers are not carried: \
+             no archive is guaranteed and their parent will not be woken"
+        );
+    }
     let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers) = match rec {
         Some(r) => (
             r.config,
@@ -551,7 +562,8 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
     cmd.args(&args)
         .env("SYNAPS_DAEMON", "1")
         .env(LOCK_FD_ENV, lock_fd.to_string())
-        .env(RELOAD_STATE_ENV, rs_path);
+        .env(RELOAD_STATE_ENV, rs_path)
+        .env(SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
     let e = cmd.exec();
     // Only reached on failure: restore CLOEXEC.
     // SAFETY: as above.
@@ -583,9 +595,14 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("{RELOAD_STATE_ENV} set without {LOCK_FD_ENV}: refusing to start (the flock is the liveness oracle)"))?;
     std::env::remove_var(LOCK_FD_ENV);
+    let id_floor = std::env::var(SUBAGENT_ID_FLOOR_ENV).ok().and_then(|s| s.parse::<u64>().ok());
+    std::env::remove_var(SUBAGENT_ID_FLOOR_ENV);
     let lock = DaemonLock::adopt(fd)?;
     let body = std::fs::read_to_string(&rs_path)?;
-    let rs: ReloadState = serde_json::from_str(&body)?;
+    let mut rs: ReloadState = serde_json::from_str(&body)?;
+    if let Some(floor) = id_floor {
+        rs.next_subagent_id = rs.next_subagent_id.max(floor);
+    }
     Ok(Some((lock, rs, rs_path)))
 }
 
@@ -742,6 +759,7 @@ mod tests {
             archive_path: None,
             stopped_by_reload: true,
             wake_lost: false,
+            wake: true,
             elapsed_secs: 0,
             preview: String::new(),
         };
