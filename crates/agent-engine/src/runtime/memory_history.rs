@@ -130,6 +130,7 @@ impl ConfirmedUserIntent {
             UserIntentProof::ExplicitCommand { command_id } => command_id.as_str(),
             UserIntentProof::ConfirmedPrompt { confirmation_id } => confirmation_id.as_str(),
             UserIntentProof::ExactCurrentRequest { .. } => "exact-current-request",
+            UserIntentProof::OperatorConfig => "operator-config",
         }
     }
 
