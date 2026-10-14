@@ -789,4 +789,92 @@ mod render_tests {
         assert!(line.contains("1 tool"), "{line:?}");
         assert!(!line.contains("starting"), "{line:?}");
     }
+
+    /// One registry row, as the daemon's 1 Hz `SubagentRows` carries it.
+    fn registry_row(
+        id: u64,
+        name: &str,
+        status: synaps_cli::runtime::subagent::SubagentStatus,
+        cancel_requested: bool,
+    ) -> synaps_cli::tools::SubagentDisplayRow {
+        synaps_cli::tools::SubagentDisplayRow {
+            subagent_id: id,
+            agent_name: name.into(),
+            status,
+            cancel_requested,
+            elapsed_secs: 42.0,
+            finished_elapsed: None,
+            step: "$ cargo test -p synaps-tui".into(),
+            tools: 3,
+        }
+    }
+
+    fn line_with(buf: &Buffer, needle: &str) -> Option<String> {
+        (0..buf.area().height)
+            .map(|y| row(buf, y))
+            .find(|l| l.contains(needle))
+    }
+
+    /// Reattaching (`--attach`, or the client reconnecting after a daemon
+    /// reload): workers started before kept running, and the client's only
+    /// news of them is the registry rows. They show from the first rows, with
+    /// their step and tool count, without waiting for the agent to start
+    /// another worker.
+    #[test]
+    fn reattaching_shows_the_workers_that_kept_running() {
+        use synaps_cli::runtime::subagent::SubagentStatus::Running;
+        let mut h = TestHarness::boot_with_size(W, H);
+        assert!(tray_rows(&h.render().clone()).is_none(), "fresh client");
+
+        h.feed_event(SessionEventWire::SubagentRows(vec![
+            registry_row(7, "chrollo", Running, false),
+            registry_row(8, "spike", Running, false),
+        ]));
+        let buf = h.render().clone();
+        assert!(tray_rows(&buf).is_some(), "the tray is back");
+        for name in ["chrollo", "spike"] {
+            let line = line_with(&buf, name).unwrap_or_else(|| panic!("{name} missing"));
+            assert!(line.contains("$ cargo test -p synaps-tui"), "{line:?}");
+            assert!(line.contains("3 tools"), "{line:?}");
+        }
+    }
+
+    /// Esc clears the tray, but a `subagent_start` worker outlives the turn
+    /// it was started in: the next rows bring it back.
+    #[test]
+    fn an_abort_does_not_hide_a_background_worker() {
+        use synaps_cli::runtime::subagent::SubagentStatus::Running;
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 37, "sleeper-1");
+        assert!(line_with(&h.render().clone(), "sleeper-1").is_some());
+
+        h.feed_event(SessionEventWire::Aborted {
+            context_saved: true,
+        });
+        h.feed_event(SessionEventWire::SubagentRows(vec![registry_row(
+            37,
+            "sleeper-1",
+            Running,
+            false,
+        )]));
+        let buf = h.render().clone();
+        let line = line_with(&buf, "sleeper-1").expect("the worker survives the abort");
+        assert!(line.contains("$ cargo test -p synaps-tui"), "{line:?}");
+    }
+
+    /// Only running workers come back: a finished one, or one being
+    /// cancelled, isn't added to an empty tray.
+    #[test]
+    fn rows_do_not_bring_back_finished_or_cancelling_workers() {
+        use synaps_cli::runtime::subagent::SubagentStatus::{Completed, Running};
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.feed_event(SessionEventWire::SubagentRows(vec![
+            registry_row(1, "finished-one", Completed, false),
+            registry_row(2, "cancelling-one", Running, true),
+        ]));
+        let buf = h.render().clone();
+        assert!(tray_rows(&buf).is_none(), "nothing to show");
+        assert!(line_with(&buf, "finished-one").is_none());
+        assert!(line_with(&buf, "cancelling-one").is_none());
+    }
 }
