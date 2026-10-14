@@ -81,6 +81,35 @@ Concretely, for the two in-tree plugins that have state today:
 Those plugin edits live in their own repos (`~/.synaps-cli/plugins`) and are
 a follow-up PR there; nothing in this repo depends on them landing.
 
+## Hosts without `tool.call` `params.session_id`
+
+Builds before this field (0.10.2 and earlier) send `tool.call` with only
+`name` and `input`. A plugin that has to support them can find out which
+session called its tool from `before_tool_call`, which already carries
+`session_id`:
+
+1. Subscribe to `before_tool_call`. For your own tools only (match on
+   `tool_runtime_name` `"<plugin-id>:<tool>"`), return `modify` with the
+   input plus a single-use random token, for example
+   `{"_caller": "<token>"}`. Remember `token → session_id` in memory.
+2. In `tool.call`, pop the token from `input` and redeem it. An unknown or
+   reused token means "no caller": treat it like `null`, never as a session.
+   The hook overwrites any token the model supplies, and tokens are
+   unguessable, so the model cannot pose as another session.
+
+Prefer `params.session_id` whenever the key is present. The token pattern
+has costs the field does not:
+
+- It needs `tools.intercept`, a permission that lets the plugin block or
+  rewrite every tool call it subscribes to.
+- The first `modify`, `confirm` or `block` result stops the handler chain.
+  If another extension acts on the call first, there is no token. And once
+  you stamp a call, extensions after you never see it.
+
+Do not match a `tool.call` to the preceding `before_tool_call` by tool name
+and input. Two sessions can make identical calls at the same time, and the
+hooks and calls can arrive interleaved.
+
 ## In-tree plugin audit (2026-09, jade 16 / bella 2)
 
 Plugins with hook handlers and what the new field means for them:
