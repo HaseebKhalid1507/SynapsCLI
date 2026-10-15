@@ -680,6 +680,10 @@ impl ClientTransport for SocketTransport {
     fn daemon_pid(&self) -> u32 {
         SocketTransport::daemon_pid(self)
     }
+
+    fn daemon_binary(&self) -> Option<crate::session::transport::BinaryId> {
+        Some(crate::session::transport::BinaryId::of(&self.welcome))
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +725,7 @@ mod tests {
                         sessions: vec![],
                         progressive_tool_disclosure: true,
                         generation: 1,
+                        daemon_build: String::new(),
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -958,6 +963,7 @@ mod tests {
                 sessions: vec![],
                 progressive_tool_disclosure: true,
                 generation: 1,
+                daemon_build: String::new(),
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();

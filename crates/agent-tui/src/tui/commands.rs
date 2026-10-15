@@ -1242,12 +1242,116 @@ pub(super) async fn handle_command(
                         .join(", ")
                 )));
             }
+            // Nothing here handled it: ask the session. A daemon newer than
+            // this client (an attached TUI keeps its binary across `daemon
+            // reload`) may know it — `/workers` reached daemons before the
+            // TUIs attached to them — and some builtins are engine-only
+            // (`/budget`). The actor answers `unhandled` for anything it
+            // doesn't know either.
             Resolution::Builtin | Resolution::Unknown => {
-                app.push_msg(ChatMessage::Error(format!("unknown command: /{}", cmd)));
+                return forward_unhandled_command(cmd, arg, app, link).await
             }
         },
     }
     CommandAction::None
+}
+
+/// A `/cmd` the client didn't handle, forwarded as an engine command;
+/// renders the generic reply kinds (`output`/`notice`/`error`/`quit`), and
+/// "unknown command" when the session doesn't know it either.
+async fn forward_unhandled_command(
+    cmd: &str,
+    arg: &str,
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+) -> CommandAction {
+    let unknown = || ChatMessage::Error(format!("unknown command: /{}", cmd));
+    let value = match link.engine_command(cmd, arg).await {
+        Ok(v) => v,
+        Err(_) => {
+            app.push_msg(unknown());
+            return CommandAction::None;
+        }
+    };
+    match forwarded_reply(&value) {
+        ForwardedReply::Unknown => app.push_msg(unknown()),
+        ForwardedReply::Quit => return CommandAction::Quit,
+        ForwardedReply::Error(text) => app.push_msg(ChatMessage::Error(text)),
+        ForwardedReply::Text(text) => app.push_msg(ChatMessage::System(text)),
+        ForwardedReply::Nothing => {}
+    }
+    CommandAction::None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardedReply {
+    Unknown,
+    Quit,
+    Error(String),
+    Text(String),
+    Nothing,
+}
+
+/// How a forwarded command's `QueryResult` renders (`engine_command_reply`
+/// kinds). Pure, for tests.
+fn forwarded_reply(value: &serde_json::Value) -> ForwardedReply {
+    let text = value["text"].as_str().unwrap_or("").to_string();
+    match value["kind"].as_str().unwrap_or("unhandled") {
+        "unhandled" => ForwardedReply::Unknown,
+        "quit" => ForwardedReply::Quit,
+        "error" => ForwardedReply::Error(text),
+        _ if text.is_empty() => ForwardedReply::Nothing,
+        _ => ForwardedReply::Text(text),
+    }
+}
+
+#[cfg(test)]
+mod forwarded_command_tests {
+    use super::{forwarded_reply, ForwardedReply};
+    use serde_json::json;
+
+    #[test]
+    fn a_command_the_session_knows_renders_its_reply() {
+        assert_eq!(
+            forwarded_reply(&json!({"kind": "output", "text": "2 workers running"})),
+            ForwardedReply::Text("2 workers running".into())
+        );
+        assert_eq!(
+            forwarded_reply(&json!({"kind": "notice", "text": "done"})),
+            ForwardedReply::Text("done".into())
+        );
+        assert_eq!(
+            forwarded_reply(&json!({"kind": "error", "text": "no such worker"})),
+            ForwardedReply::Error("no such worker".into())
+        );
+        assert_eq!(forwarded_reply(&json!({"kind": "quit"})), ForwardedReply::Quit);
+        assert_eq!(forwarded_reply(&json!({"kind": "none"})), ForwardedReply::Nothing);
+    }
+
+    #[test]
+    fn a_command_nobody_knows_is_unknown() {
+        assert_eq!(forwarded_reply(&json!({"kind": "unhandled"})), ForwardedReply::Unknown);
+        assert_eq!(forwarded_reply(&json!({})), ForwardedReply::Unknown);
+    }
+
+    /// End to end over the scripted session: a command only the engine
+    /// handles (`/budget`) answers instead of "unknown command" (that is how
+    /// a client older than its daemon reaches the daemon's new commands),
+    /// and a command nobody knows is still reported as unknown.
+    #[test]
+    fn unhandled_commands_go_to_the_session() {
+        use crate::tui::testing::TestHarness;
+        let mut h = TestHarness::boot_with_size(120, 30);
+        h.run_slash_command("budget", "");
+        let frame = h.snapshot();
+        assert!(frame.contains("Turn budget"), "{frame}");
+        assert!(!frame.contains("unknown command"), "{frame}");
+
+        let mut h = TestHarness::boot_with_size(120, 30);
+        h.run_slash_command("zzz-no-such-command", "");
+        let frame = h.snapshot();
+        assert!(frame.contains("unknown command: /zzz-no-such-command"), "{frame}");
+    }
 }
 
 /// Build the /stats session receipt string.

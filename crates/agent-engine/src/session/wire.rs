@@ -61,6 +61,14 @@ pub fn binary_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Which build of [`binary_version`] this is: the short commit it was built
+/// from (`-dirty` with uncommitted changes), `SYNAPS_BUILD_ID` from the
+/// build environment, or empty when unknown (build script). Two builds of
+/// one release share the version, not this.
+pub fn build_id() -> &'static str {
+    env!("SYNAPS_BUILD_ID")
+}
+
 // ── client → daemon ───────────────────────────────────────────────────────────
 
 /// Client → daemon. First frame on a connection MUST be `Hello`.
@@ -272,6 +280,11 @@ pub struct Welcome {
     /// Reload counter (starts at 1).
     #[serde(default = "one")]
     pub generation: u64,
+    /// The daemon's [`build_id`]: tells two builds of one version apart.
+    /// Empty from older daemons (unknown). `daemon_version` stays the plain
+    /// semver the reload gate parses.
+    #[serde(default)]
+    pub daemon_build: String,
 }
 
 fn one() -> u64 {
@@ -1328,6 +1341,7 @@ mod tests {
                 sessions: vec![meta()],
                 progressive_tool_disclosure: true,
                 generation: 1,
+                daemon_build: "abc1234".into(),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -1432,6 +1446,7 @@ mod tests {
             sessions: vec![meta()],
             progressive_tool_disclosure: false,
             generation: 1,
+            daemon_build: String::new(),
         })
         .unwrap()
         .to_lowercase();

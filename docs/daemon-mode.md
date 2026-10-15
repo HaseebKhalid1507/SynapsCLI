@@ -165,7 +165,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
@@ -175,7 +175,9 @@ C: bye | socket close = Detach (turn keeps running)
 ```
 
 - Version policy: exact match on `protocol_version` (min == max == 1) → `Refused{Version}` **loudly**
-  (client exit 2). Different *binary* version, same protocol → allowed; `attach` prints a notice.
+  (client exit 2). Different *binary* (version, or `daemon_build`: the commit it was built from) → allowed;
+  the TUI leaves a transcript notice on attach and after every reload reconnect (an attached TUI keeps
+  its own binary across `daemon reload`), and sends slash commands it does not handle to the session.
   `WireSessionEvent` has `#[serde(other)] Unknown` so additive variants from a newer daemon are tolerated.
 - `WireSessionEvent` mirrors `SessionEventWire` variant-for-variant (`StreamEvent`/`TurnError`/
   `ExtensionLoaderEvent` included; round-trip test covers every variant), with **one lossy variant**:
