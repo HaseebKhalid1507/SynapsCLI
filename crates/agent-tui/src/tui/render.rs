@@ -59,8 +59,24 @@ fn tool_panel_margin(viewport: usize) -> usize {
     viewport / 20
 }
 
+/// Half-row lip above a tool card, so the card starts half a row above its
+/// header instead of on the header row (which read as chopped): `▗` carries
+/// the gutter bar up in `accent`, then `▄` in the card's `bg`, both over the
+/// pane. Spans exactly the panel as [`panel_block`] lays it out (`margin`
+/// transparent, the gutter cell, `width` inner cells). It replaces the blank
+/// spacer row above the card, so the transcript's row count does not change.
+fn panel_top_edge(accent: Color, bg: Color, width: usize, margin: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
+    if margin > 0 {
+        spans.push(Span::raw(" ".repeat(margin)));
+    }
+    spans.push(Span::styled("\u{2597}", Style::default().fg(accent))); // ▗
+    spans.push(Span::styled("\u{2584}".repeat(width.max(4)), Style::default().fg(bg))); // ▄
+    Line::from(spans)
+}
+
 /// Render a tool block as a panel: an inset, subtle-background card (`bg` fills
-/// text and padding) fronted by a coloured gutter bar in `accent`. The left
+/// text and padding) fronted by a coloured `▐` gutter bar in `accent`. The left
 /// `margin` stays transparent so the panel reads as inset; content is padded to
 /// `width` for a clean rectangle.
 fn panel_block(
@@ -75,7 +91,10 @@ fn panel_block(
     }
     let inner_w = width.max(4);
     let fill = Style::default().bg(bg);
-    let gutter = Style::default().fg(accent).bg(bg);
+    // The bar is the card's outer edge: `▐` over the pane, flush against the
+    // fill. A cell holds two colours, so this (not a `▎` on the fill) is what
+    // lets the half-row lip carry the bar to the card's top (`▗`).
+    let gutter = Style::default().fg(accent);
     inner
         .into_iter()
         .map(|l| {
@@ -88,7 +107,7 @@ fn panel_block(
             if margin > 0 {
                 spans.push(Span::raw(" ".repeat(margin)));
             }
-            spans.push(Span::styled("\u{258E}", gutter)); // ▎ gutter bar
+            spans.push(Span::styled("\u{2590}", gutter)); // ▐ gutter bar
             spans.append(&mut line.spans);
             if pad > 0 {
                 spans.push(Span::styled(" ".repeat(pad), fill));
@@ -488,8 +507,9 @@ impl TranscriptStore {
             } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
-                // Breathing room before tool block
-                lines.push(Line::from(""));
+                // Breathing room before the tool block; its lower half is the
+                // card's top lip.
+                lines.push(panel_top_edge(tool_accent(tool_name), input_panel_bg(), width, margin));
                 let block_start = lines.len();
                 let (icon, display_name, server_tag) = format_tool_name(tool_name);
                 let accent = tool_accent(tool_name);
@@ -600,8 +620,9 @@ impl TranscriptStore {
             } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
-                // Breathing room before tool block
-                lines.push(Line::from(""));
+                // Breathing room before the tool block; its lower half is the
+                // card's top lip.
+                lines.push(panel_top_edge(tool_accent(tool_name), input_panel_bg(), width, margin));
                 // Compact tool header
                 let block_start = lines.len();
                 let (icon, display_name, server_tag) = format_tool_name(tool_name);
@@ -1405,5 +1426,70 @@ mod meta_tests {
                 .any(|m| matches!(m, LineMeta::ContentLine { .. })),
             "ToolResult content rows must be ContentLine-mapped"
         );
+    }
+
+    /// Tool cards open with a half-row lip: the row above the header is `▄`
+    /// in the card's background over the pane, spanning exactly the panel
+    /// (margin left transparent). It replaces the old blank spacer, so the
+    /// header is still the second row and the card's height is unchanged.
+    /// Same for the streaming card, so nothing jumps when it completes.
+    #[test]
+    fn tool_card_has_half_row_top_lip() {
+        use unicode_width::UnicodeWidthStr;
+        let bg = super::input_panel_bg();
+        for streaming in [false, true] {
+            let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
+            store.push_msg(if streaming {
+                ChatMessage::ToolUseStart {
+                    tool_id: "t1".into(),
+                    tool_name: "bash".into(),
+                    partial_input: r#"{"command":"ls"#.into(),
+                }
+            } else {
+                ChatMessage::ToolUse {
+                    tool_id: "t1".into(),
+                    tool_name: "bash".into(),
+                    input: r#"{"command":"ls"}"#.into(),
+                }
+            });
+            for width in [40usize, 80, 120] {
+                let entry = store.render_message_lines(0, width, &ctx());
+                let rows: Vec<String> = entry.lines().iter().map(flatten).collect();
+                let header = rows.iter().position(|r| r.contains("bash")).expect("header row");
+                assert_eq!(header, 1, "streaming={streaming} width={width}: {rows:?}");
+                let lip = &rows[0];
+                let body = lip.trim_start_matches(' ');
+                assert!(
+                    body.starts_with('\u{2597}') && body.chars().skip(1).all(|c| c == '\u{2584}'),
+                    "lip is ▗ then ▄: {lip:?}"
+                );
+                assert!(
+                    rows[header].trim_start_matches(' ').starts_with('\u{2590}'),
+                    "the bar is ▐ under the lip's ▗: {:?}",
+                    rows[header]
+                );
+                assert_eq!(lip.len() - body.len(), super::tool_panel_margin(width), "margin");
+                assert_eq!(
+                    UnicodeWidthStr::width(lip.as_str()),
+                    UnicodeWidthStr::width(rows[header].as_str()),
+                    "lip spans the card exactly (width {width})"
+                );
+                let accent = super::tool_accent("bash");
+                for span in &entry.lines()[0].spans {
+                    if span.content.contains('\u{2597}') {
+                        assert_eq!(span.style.fg, Some(accent), "lip corner in the bar colour");
+                    } else if span.content.contains('\u{2584}') {
+                        assert_eq!(span.style.fg, Some(bg), "lip in the card background");
+                    }
+                    assert_eq!(span.style.bg, None, "upper half shows the pane");
+                }
+                let bar = entry.lines()[header]
+                    .spans
+                    .iter()
+                    .find(|s| s.content.contains('\u{2590}'))
+                    .expect("bar span");
+                assert_eq!((bar.style.fg, bar.style.bg), (Some(accent), None), "bar on the pane");
+            }
+        }
     }
 }
