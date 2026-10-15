@@ -167,7 +167,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             agent_name,
             task_preview,
         }) => {
-            app.subagents.push(SubagentState {
+            let row = SubagentState {
                 id: subagent_id,
                 name: agent_name,
                 status: format!("starting: {}", task_preview),
@@ -177,7 +177,15 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
                 done_at: None,
                 tools: 0,
                 result: None,
-            });
+            };
+            // One row per id: a daemon older than the reload-carried handle
+            // counter restarts ids at 1 after `daemon reload`, and a second
+            // row under the same id would mirror the first one's progress
+            // and outlive it as a ghost.
+            match app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+                Some(existing) => *existing = row,
+                None => app.subagents.push(row),
+            }
             // Tray-only state: repaint, never touch the main transcript
             // (its cache, selection, or scroll). See `subagent_hud_redraw`.
             subagent_hud_redraw(app);
@@ -715,6 +723,14 @@ pub(super) async fn handle_session_event_arm(
             app.request_redraw();
         }
         SessionEventWire::Reloading { generation, .. } => {
+            // The daemon re-execs: none of its workers survive (they are its
+            // threads; the new image reports what it re-adopts). Running rows
+            // would otherwise tick on forever as ghosts — reconcile keeps a
+            // running row the registry doesn't list (in-flight oneshots).
+            if mark_workers_stopped_by_reload(&mut app.subagents, std::time::Instant::now()) {
+                app.invalidate();
+            }
+            app.subagent_rows.clear();
             app.toasts.upsert(
                 super::toast::Toast::new(
                     "reload",
@@ -840,6 +856,28 @@ pub(super) fn apply_subagent_progress(
             sa.tools = row.tools;
             changed = true;
         }
+    }
+    changed
+}
+
+/// Status of a tray row whose worker a daemon reload stopped.
+pub(super) const STOPPED_BY_RELOAD_STATUS: &str = "\u{26a0} stopped by daemon reload";
+
+/// `Reloading`: every running row ends as stopped by the reload and flashes
+/// out like any finished row. Returns whether any row changed.
+pub(super) fn mark_workers_stopped_by_reload(
+    hud: &mut [SubagentState],
+    now: std::time::Instant,
+) -> bool {
+    let mut changed = false;
+    for sa in hud.iter_mut().filter(|s| !s.done) {
+        sa.done = true;
+        sa.done_at = Some(now);
+        if sa.duration_secs.is_none() {
+            sa.duration_secs = Some(now.saturating_duration_since(sa.start_time).as_secs_f64());
+        }
+        sa.status = STOPPED_BY_RELOAD_STATUS.to_string();
+        changed = true;
     }
     changed
 }
