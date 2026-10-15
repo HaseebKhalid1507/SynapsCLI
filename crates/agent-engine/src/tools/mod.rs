@@ -23,6 +23,7 @@ mod powershell;
 pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
+pub(crate) use subagent::finalize::build_reload_carry_event;
 #[doc(hidden)]
 pub use subagent::{legacy_fresh_runtime, spawn_runtime};
 mod write;
@@ -75,7 +76,9 @@ pub use watcher_exit::WatcherExitTool;
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
-pub(crate) use util::{resolve_path_in, strip_ansi, NEXT_SUBAGENT_ID};
+pub(crate) use util::{
+    peek_next_subagent_id, resolve_path_in, seed_next_subagent_id, strip_ansi, NEXT_SUBAGENT_ID,
+};
 
 // Facade: expose finalize internals for integration tests without making the
 // subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.

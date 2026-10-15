@@ -377,10 +377,13 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    first start — not `/proc/self/exe`, which reads "(deleted)" after an in-place rebuild) or `--exe`.
 2. **Drain**: `Attach::Create` → `Refused{Busy}`, `Submit`/`SubmitPrepared`/`Compact` → `Error("daemon
    reloading; retry in a moment")`; wait ≤ `--drain-secs` for every session to be idle; then
-   `Checkpoint{Reload}` every session concurrently (≤ `CHECKPOINT_BUDGET` each): cancel (partial history
-   kept + restart marker), answer prompts `None`, save, close PTYs, notice.
+   `Checkpoint{Reload}` every session concurrently (≤ `CHECKPOINT_BUDGET` each): stop every running
+   reactive worker and wait ≤ `WORKER_RELOAD_STOP_TIMEOUT_SECS` (10) for its finalizer (§Workers below),
+   cancel (partial history kept + restart marker), answer prompts `None`, save, close PTYs, notice.
+   Workers do not hold the drain: an idle parent waiting on workers counts as idle.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
-   (continue_session = journal_id, cwd, model), keep_warm, lifecycle}`.
+   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers}`, and `next_subagent_id`
+   (the `sa_N` counter).
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
    `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
@@ -395,14 +398,17 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
-   ids for one generation (they differ only after a LinkedSuccessor compaction).
+   ids for one generation (they differ only after a LinkedSuccessor compaction). Before the first session
+   the handle counter is raised to `next_subagent_id` (and past every carried id); each session with
+   carried workers gets the host-only `AdoptWorkers` (before any `Park`).
 7. **Clients**: `SocketTransport::next_event` returns `None` with `last_error = Reloading{generation}`;
    `reconnect(mode)` backs off, sends `Hello{reconnect_of}` and `Attach::Existing{id, Takeover iff
    was_owner else mode}` — two reconnecting mirrors cannot both take over.
 
 **Not preserved** (stated once): in-flight turns (checkpointed = cancelled; partial history + restart
 marker kept), pending prompts (`None`), PTY/background shells (closed, announced before exec),
-`turn_replay`, input ownership (re-established by reconnect order + `was_owner`), the subagent registry.
+`turn_replay`, input ownership (re-established by reconnect order + `was_owner`), running reactive
+workers (stopped resumably, see below).
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
 image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
 LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
@@ -423,6 +429,45 @@ owner again, second turn works; older `--exe` refused with the daemon still serv
 checkpointed and its partial history + restart marker come back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
+
+### Workers across a reload
+
+Reactive workers (`subagent_start`/`subagent_resume`) are threads of the daemon process: the exec
+destroys them, and nothing that only lives in memory survives (their in-flight tool's process-group
+kill is a `Drop`, which an exec never runs). So `Checkpoint{Reload}`:
+
+- **stops** every running worker (`SubagentRegistry::stop_for_reload`, flagged *stopped by reload*, not
+  a user cancel) before the turn is cancelled, and waits ≤ 10 s for each finalizer to settle: its
+  in-flight tool is dropped (killing that command's process group before the exec instead of leaving
+  it running in the worktree; a job the command detached with `setsid` is its own and lives on) and
+  its resume archive is written (`subagent-history/<pid>-<uuid>/sa_N.json`, `status: cancelled`).
+  The stop is decided under the lock the worker takes to record its completion, so a worker that
+  finished first keeps its completion; one still finishing is awaited too, so its wake reaches the
+  queue the reload carries;
+- records every registry entry in `SessionReloadRecord.workers` (`CarriedWorker`): stopped workers,
+  finished workers whose completion wake never reached the parent (still queued, which the exec
+  discards, or not yet pushed when the wait ended), and reaped ids with an archive (≤ 1024, newest
+  first).
+
+The new image adopts them (`AdoptWorkers`): each old id resolves to its archive again
+(`subagent_status` answers from the archive with `stopped_by_reload`; `subagent_collect` and
+`subagent_resume` work by the old id), and the parent is woken once per stopped worker ("stopped by a
+daemon reload, not by the user; `subagent_resume` continues it") or lost wake (the normal completion).
+The model decides whether to resume. **Exactly once**: `CarriedWorker.wake` is set only by the reload
+that stopped the worker or lost the wake; the *stopped by reload* label rides along for status, but a
+later reload repeats the wake only if the parent has not received it yet (still queued), never after —
+a repeated "resume it" would start a duplicate worker. Handle ids continue from the old counter
+(`next_subagent_id`, raised again by `SYNAPS_DAEMON_SUBAGENT_ID_FLOOR`, read at the `execv` itself),
+so `sa_1` never names two workers. A failed exec re-adopts the same records in the old image (its
+parents are still waiting).
+A worker that does not stop within 10 s (a tool that ignores cancellation) is still announced, but
+only its previous archive (if any) survives.
+
+Tested against a real daemon (`tests/daemon_reload_workers.rs`): a worker mid-`bash` is stopped, its
+shell and the background `sleep` it waited on are gone after the reload while its `setsid` job lives,
+its archive is `cancelled` with history, the parent is woken once, `subagent_status` of the old id
+reports `stopped_by_reload`, the next worker is `sa_2`, and a second reload neither repeats the wake
+nor loses or doubles the second worker's completion.
 
 ## cwd caveats (risk §6.1)
 

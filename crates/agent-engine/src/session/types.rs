@@ -545,6 +545,12 @@ pub enum SessionCommand {
     /// a Parked session Parked). A no-op otherwise.
     #[serde(skip)]
     Park,
+    /// Host-only (never wire): reload's rehydrate hands the new image the
+    /// workers the old image stopped or still owed a wake
+    /// (`SessionReloadRecord::workers`). The actor re-registers their ids
+    /// against their archives and wakes the parent once per worker.
+    #[serde(skip)]
+    AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -575,6 +581,10 @@ pub struct SessionReloadRecord {
     pub cache_keepwarm: Option<String>,
     pub model: String,
     pub thinking_level: String,
+    /// Workers a reload stopped (or that still owed a completion wake), so
+    /// the next image can re-register their ids and wake the parent.
+    #[serde(default)]
+    pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -624,6 +634,10 @@ impl std::fmt::Debug for SessionCommand {
             Self::NewSession => f.write_str("NewSession"),
             Self::Save => f.write_str("Save"),
             Self::Park => f.write_str("Park"),
+            Self::AdoptWorkers { workers } => f
+                .debug_struct("AdoptWorkers")
+                .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
+                .finish(),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }

@@ -2,8 +2,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Global counter for unique subagent IDs across all dispatches
+/// Global counter for unique subagent IDs across all dispatches. A daemon
+/// reload `execv`s the process, which would restart it at 1 and hand out
+/// ids the sessions' models still remember (`sa_1` aliasing a worker of the
+/// previous image): reload carries it in `ReloadState::next_subagent_id`
+/// and the new image calls [`seed_next_subagent_id`] before rehydrating.
 pub(crate) static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The id the next dispatched subagent will get (`sa_N`).
+pub(crate) fn peek_next_subagent_id() -> u64 {
+    NEXT_SUBAGENT_ID.load(Ordering::SeqCst)
+}
+
+/// Never hand out an id below `next` again. Monotonic: a lower value is a
+/// no-op, so seeding from several sources is order-independent.
+pub(crate) fn seed_next_subagent_id(next: u64) {
+    NEXT_SUBAGENT_ID.fetch_max(next, Ordering::SeqCst);
+}
 
 /// Monotonic counter to disambiguate concurrent temp files within one process.
 static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -105,6 +120,18 @@ pub(crate) fn resolve_path_in(raw: &str, cwd: Option<&std::path::Path>) -> PathB
 mod tests {
     use super::*;
     use std::env;
+
+    /// Seeding is monotonic: a reload's floor raises the counter, a lower
+    /// seed never lowers it (other tests dispatch concurrently: inequalities).
+    #[test]
+    fn seed_next_subagent_id_only_raises() {
+        let floor = peek_next_subagent_id() + 1_000;
+        seed_next_subagent_id(floor);
+        assert!(peek_next_subagent_id() >= floor);
+        seed_next_subagent_id(1);
+        assert!(peek_next_subagent_id() >= floor);
+        assert!(NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed) >= floor);
+    }
 
     #[test]
     fn resolve_path_in_anchors_relative_to_cwd() {
