@@ -126,8 +126,8 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
    session's first request is pinned if it fits ~30% of the target; a larger
    one is replaced by an archive pointer and preview carried into later
    windows. Remaining user-authored turns (including image-only turns) fill the
-   budget newest-first, typed requests before pushed `<event …>` messages, with
-   events capped at ~30% of the target. Retained messages keep source order
+   budget newest-first: every typed request that fits first, then pushed
+   `<event …>` messages fill whatever room remains up to the target. Retained messages keep source order
    and their complete tool-call/result groups; no tool result is synthesized.
    The continuation message lists what was not retained (count plus one line
    per recent item, bounded to ~2k tokens) and points to

@@ -223,9 +223,8 @@ pub fn successor_budget(
     }
 }
 
-/// Share of the target the pinned first request and pushed events may use.
+/// Share of the target the pinned first request may use.
 const PINNED_SHARE_PERCENT: u64 = 30;
-const EVENT_SHARE_PERCENT: u64 = 30;
 /// Bound on the dropped-message index inside the continuation message.
 const DROPPED_INDEX_TOKENS: u64 = 2_000;
 const PREVIEW_CHARS: usize = 80;
@@ -339,7 +338,8 @@ fn pinned_stub(
 /// request that started the current turn (kept even when over budget); the
 /// session's first request if it fits ~30% of the target (else an archive
 /// stub); then remaining requests newest-first, typed before pushed events,
-/// events capped at ~30%. Source order and tool call/result groups are kept.
+/// events filling the remaining room. Source order and tool call/result
+/// groups are kept.
 fn successor(
     messages: &[SharedMessage],
     archive: &ArchiveRef,
@@ -422,24 +422,17 @@ fn successor(
         }
     }
 
-    // Fill newest-first: typed requests, then pushed events under their cap.
-    let mut events_used = 0u64;
+    // Fill newest-first: every typed request that fits first, then pushed
+    // events into whatever room remains up to the target.
     for typed_pass in [true, false] {
         for &i in requests.iter().rev() {
             if retained.contains(&i) || stubbed == Some(i) || is_event(&messages[i]) == typed_pass {
                 continue;
             }
             let cost = group_cost(&retained, i);
-            if used + cost > fill_limit {
-                continue;
+            if used + cost <= fill_limit {
+                used += add_group(&mut retained, i);
             }
-            if !typed_pass {
-                if events_used + cost > share(EVENT_SHARE_PERCENT) {
-                    continue;
-                }
-                events_used += cost;
-            }
-            used += add_group(&mut retained, i);
         }
     }
 
@@ -1906,24 +1899,43 @@ mod budget_tests {
         for m in &input[input.len() - 3..] {
             assert!(contains(&next, m), "tail and turn start kept");
         }
-        // Newest events survive; events stay under ~30% of the target.
+        // Newest events survive and fill the room typed requests left.
         assert!(contains(&next, &input[input.len() - 5]));
         assert!(!contains(&next, &input[1]), "oldest event dropped");
-        let events: u64 = next
-            .iter()
-            .filter(|m| {
-                m["content"]
-                    .as_str()
-                    .is_some_and(|c| c.starts_with("<event"))
-            })
-            .map(|m| estimate_history(std::slice::from_ref(m)))
-            .sum();
-        assert!(events <= TARGET * 3 / 10, "events {events}");
+        let fp = footprint(&next);
+        assert!(
+            fp >= TARGET * 9 / 10 && fp <= TARGET * 11 / 10,
+            "successor footprint {fp} not within 10% of target {TARGET}"
+        );
         in_source_order(&input, &next);
         let marker = next[0]["content"].as_str().unwrap();
         assert!(marker.contains("memory_search(source=history)"));
         assert!(marker.contains("not retained"), "dropped index present");
         assert!(marker.contains("worker-"), "index lines name the source");
+    }
+
+    #[test]
+    fn events_fill_room_left_after_every_typed_request() {
+        let mut input = vec![charter()];
+        for i in 0..300 {
+            if i % 30 == 0 {
+                input.push(user(format!("TYPED {i}: {}", "t".repeat(2_000))));
+            }
+            input.push(event(i, 1_100));
+            input.push(assistant("ack"));
+        }
+        input.extend(tail("t3", 2_000));
+        let next = successor(&input, &archive(), "", 2, budget());
+        for m in input.iter().filter(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("TYPED"))
+        }) {
+            assert!(contains(&next, m), "typed requests come first");
+        }
+        let fp = footprint(&next);
+        assert!(fp >= TARGET * 9 / 10 && fp <= TARGET * 11 / 10, "{fp}");
+        in_source_order(&input, &next);
     }
 
     #[test]
