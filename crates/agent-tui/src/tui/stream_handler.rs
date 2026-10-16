@@ -430,12 +430,16 @@ pub(super) async fn handle_session_event_arm(
                 )));
             }
         }
-        SessionEventWire::Prompt(req) => prompt_bridge.on_prompt(req),
+        SessionEventWire::Prompt(req) => {
+            prompt_bridge.on_prompt(req);
+            sync_waiting_confirms(app, prompt_bridge);
+        }
         SessionEventWire::PromptResolved { prompt_id } => {
             if prompt_bridge.on_resolved(prompt_id) {
                 app.secret_prompts.dismiss();
                 app.invalidate();
             }
+            sync_waiting_confirms(app, prompt_bridge);
         }
         SessionEventWire::External(ev) => on_external(app, &ev),
         SessionEventWire::AutoTurnCapReached { cap } => on_auto_turn_cap(app, cap),
@@ -697,6 +701,52 @@ fn finish_compaction(app: &mut App, applied: super::app::CompactionApplied) {
     app.status_text = None;
     app.compacting = false;
     app.invalidate();
+}
+
+/// Toast id of the confirm prompts left to another client.
+const WAITING_CONFIRMS_TOAST: &str = "confirms-waiting";
+/// How many waiting confirms the toast lists by id.
+const WAITING_CONFIRMS_SHOWN: usize = 4;
+
+/// Show (or clear) the confirm prompts this client leaves to another one
+/// (`--no-confirm-answers`, [`super::session_link::ConfirmPolicy::ViewOnly`]):
+/// one resident toast listing them, gone once none is waiting. Under the
+/// default policy nothing ever waits, so this never shows.
+pub(super) fn sync_waiting_confirms(app: &mut App, bridge: &PromptBridge) {
+    let waiting = bridge.waiting_confirms();
+    if waiting.is_empty() {
+        if app.toasts.dismiss(WAITING_CONFIRMS_TOAST) {
+            app.request_redraw();
+        }
+        return;
+    }
+    let mut lines = vec![
+        "answer it in another client:".to_string(),
+        "this one runs with --no-confirm-answers".to_string(),
+    ];
+    for (id, title) in waiting.iter().take(WAITING_CONFIRMS_SHOWN) {
+        let title: String = sanitize_notice(title)
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .take(48)
+            .collect();
+        lines.push(format!("#{id} {title}"));
+    }
+    if waiting.len() > WAITING_CONFIRMS_SHOWN {
+        lines.push(format!("+{} more", waiting.len() - WAITING_CONFIRMS_SHOWN));
+    }
+    let title = if waiting.len() == 1 {
+        "Approval waiting".to_string()
+    } else {
+        format!("{} approvals waiting", waiting.len())
+    };
+    app.toasts.upsert(
+        super::toast::Toast::new(WAITING_CONFIRMS_TOAST, String::new())
+            .titled(title)
+            .lines(lines)
+            .ttl(None),
+    );
+    app.request_redraw();
 }
 
 /// Strip ASCII control characters (except `\n` and `\t`) from notice text

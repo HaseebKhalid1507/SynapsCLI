@@ -722,6 +722,14 @@ impl TestHarness {
         self.app.toasts.visible().count()
     }
 
+    /// Run as `--attach --no-confirm-answers` does: confirm prompts are
+    /// never opened or answered, only listed as waiting.
+    pub fn no_confirm_answers(&mut self) -> &mut Self {
+        self.prompt_bridge
+            .set_confirm_policy(super::session_link::ConfirmPolicy::ViewOnly);
+        self
+    }
+
     /// Force the app's streaming flag — lets scenarios exercise the
     /// streaming-input command refusal path without a live engine stream.
     pub fn set_streaming(&mut self, streaming: bool) -> &mut Self {

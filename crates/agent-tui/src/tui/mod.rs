@@ -265,8 +265,9 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
 
             // ── Secret-prompt answers from the pane (PromptBridge) → Answer ──
             Some((prompt_id, value)) = prompt_bridge.answers_rx.recv() => {
-                prompt_bridge.on_local_answer(prompt_id);
-                let _ = link.send(SessionCommand::Answer { prompt_id, value }).await;
+                if prompt_bridge.on_local_answer(prompt_id) {
+                    let _ = link.send(SessionCommand::Answer { prompt_id, value }).await;
+                }
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──

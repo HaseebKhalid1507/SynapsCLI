@@ -143,6 +143,50 @@ fn session_prompt_activates_pane_and_resolution_by_other_dismisses() {
     assert!(!h.secret_prompt_active(), "foreign resolution dismisses");
 }
 
+/// `--attach --no-confirm-answers`: a confirm prompt never opens the
+/// approval pane, so a `y` typed into the TUI answers nothing; it is listed
+/// in a resident toast until another client's answer resolves it. A secret
+/// prompt still opens the pane.
+#[test]
+fn no_confirm_answers_lists_a_confirm_and_never_opens_the_pane() {
+    use agent_engine::session::{PromptKind, PromptRequest, SessionEventWire};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let prompt = |id, kind, title: &str| {
+        SessionEventWire::Prompt(PromptRequest {
+            id,
+            kind,
+            title: title.into(),
+            prompt: "bash: rm -rf build".into(),
+            raised_at: chrono::Utc::now(),
+        })
+    };
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.no_confirm_answers();
+    h.feed_events(&[prompt(7, PromptKind::Confirm, "Confirm tool call")]);
+    assert!(!h.secret_prompt_active(), "a confirm never opens the pane");
+    let frame = h.snapshot();
+    assert!(frame.contains("Approval waiting"), "{frame}");
+    assert!(frame.contains("#7 Confirm tool call"), "{frame}");
+    assert!(frame.contains("--no-confirm-answers"), "{frame}");
+    h.key(KeyCode::Char('y'), KeyModifiers::empty());
+    assert!(!h.secret_prompt_active());
+    assert!(
+        !h.sent_commands().iter().any(|c| c.contains("Answer")),
+        "{:?}",
+        h.sent_commands()
+    );
+
+    h.feed_events(&[SessionEventWire::PromptResolved { prompt_id: 7 }]);
+    let frame = h.snapshot();
+    assert!(!frame.contains("Approval waiting"), "cleared: {frame}");
+
+    h.feed_events(&[prompt(8, PromptKind::Secret, "API key")]);
+    assert!(
+        h.secret_prompt_active(),
+        "a secret prompt still opens the pane"
+    );
+}
+
 #[test]
 fn session_refused_is_rendered_only_for_me() {
     let (mine, _) = frame_for(vec![W::Refused {
