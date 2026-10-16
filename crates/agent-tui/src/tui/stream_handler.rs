@@ -989,6 +989,7 @@ mod reconcile_tests {
             step: String::new(),
             tools: 0,
             handle_id: format!("sa_{id}"),
+            model: String::new(),
         }
     }
 

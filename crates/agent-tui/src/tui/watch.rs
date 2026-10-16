@@ -706,6 +706,7 @@ mod tests {
             step: String::new(),
             tools: 0,
             handle_id: format!("sa_{id}"),
+            model: String::new(),
         }
     }
 
@@ -728,6 +729,7 @@ mod tests {
             handle_id: handle.into(),
             subagent_id: handle[3..].parse().unwrap(),
             agent_name: "scout".into(),
+            model: String::new(),
             status: status.into(),
             steerable: status == "running",
             next_seq,

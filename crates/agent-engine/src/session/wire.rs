@@ -1097,6 +1097,7 @@ mod tests {
                 step: "$ cargo test".into(),
                 tools: 3,
                 handle_id: "sa_1".into(),
+                model: "provider/model-a".into(),
             }]),
             S::Resumed { id: 2, old_id: "o".into(), new_id: "n".into(), via: Some("name".into()), clamp_notice: None },
             S::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Takeover },
