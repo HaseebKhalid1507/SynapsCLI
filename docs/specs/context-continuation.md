@@ -138,10 +138,11 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
    continuation message and working note, system/developer messages, the last
    assistant/result tail, the request that started the current turn (when a
    turn is admitted the host tags a new plain user request with a stable
-   `_synaps_turn` id that persists with the session; a re-entry with only
-   pushed events or tool traffic since, e.g. after cancel and resume, keeps
-   the recorded start; like `_synaps_context`, the key is stripped from every
-   provider request), and every user turn carrying an attachment (image,
+   `_synaps_turn` id that persists with the session; interruption markers
+   never start a turn, so a re-entry with only markers, pushed events or tool
+   traffic since (e.g. cancel, save, resume, event wake) keeps the recorded
+   start; like `_synaps_context`, the key is stripped from every provider
+   request, including the compaction transport), and every user turn carrying an attachment (image,
    document, ...) because the archive excludes those payloads and could not
    return them. All of these keep their tool-call/result groups and are kept
    even if together they exceed the target (hard admission still applies). The

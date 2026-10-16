@@ -995,10 +995,22 @@ fn turn_id(message: &Value) -> Option<&str> {
     message[TURN_KEY]["id"].as_str()
 }
 
+fn is_interruption(message: &Value) -> bool {
+    message["content"]
+        .as_str()
+        .is_some_and(crate::engine::interrupt::is_interruption_marker)
+}
+
+/// Any user request except an interruption marker.
+fn is_turn_candidate(message: &Value) -> bool {
+    is_user_request(message) && !is_interruption(message)
+}
+
 /// A plain user-authored request that can start a turn: not a pushed event,
-/// not a tool-result carrier, not the continuation marker.
+/// not a tool-result carrier, not the continuation marker, not a host
+/// interruption marker (a record that work stopped, not a new task).
 fn starts_turn(message: &Value) -> bool {
-    is_user_request(message)
+    is_turn_candidate(message)
         && !is_event(message)
         && !message["content"]
             .as_array()
@@ -1023,7 +1035,7 @@ pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &mut [Shar
         .or_else(|| {
             last_tagged
                 .is_none()
-                .then(|| messages.iter().rposition(|m| is_user_request(m)))
+                .then(|| messages.iter().rposition(|m| is_turn_candidate(m)))
                 .flatten()
         });
     let id = match (fresh, last_tagged) {
@@ -2419,6 +2431,17 @@ mod budget_tests {
         let next_id = resumed.lock().unwrap().turn_start.clone().unwrap();
         assert_ne!(next_id, id);
         assert_eq!(turn_id(m.last().unwrap()), Some(next_id.as_str()));
+        // Interruption markers never start a turn, including legacy history
+        // with no recorded start (the fallback path).
+        for reason in crate::engine::interrupt::InterruptReason::ALL {
+            let mut legacy = vec![charter(), user("REAL TASK")];
+            crate::engine::interrupt::append_marker(&mut legacy, reason);
+            legacy.push(event(1, 50));
+            record_turn_start(&resumed, &mut legacy);
+            assert_eq!(legacy[1]["content"], "REAL TASK");
+            assert!(turn_id(&legacy[1]).is_some(), "{reason:?}");
+            assert!(turn_id(&legacy[2]).is_none(), "{reason:?} marker untagged");
+        }
         // The id is host metadata: stripped from the wire, alongside the marker.
         let wire = wire_messages(&m).expect("host keys present");
         assert!(wire.iter().all(|x| x.get(TURN_KEY).is_none()));
@@ -2765,6 +2788,8 @@ mod calibration_transport_tests {
     struct Mock {
         calls: Arc<AtomicUsize>,
         respond: Respond,
+        /// Every request body, as sent on the wire.
+        bodies: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     fn sse(usage: Option<&Value>) -> String {
@@ -2794,12 +2819,14 @@ mod calibration_transport_tests {
         let mock = Mock {
             calls: Arc::default(),
             respond,
+            bodies: Arc::default(),
         };
         let app = Router::new()
             .route(
                 "/v1/messages",
                 post(|State(m): State<Mock>, body: String| async move {
                     let n = m.calls.fetch_add(1, Ordering::SeqCst);
+                    m.bodies.lock().unwrap().push(body.clone());
                     let proxy = crate::runtime::context::conservative_token_estimate(&body);
                     let (status, usage) = (m.respond)(n, proxy);
                     if status != 200 {
@@ -2991,7 +3018,7 @@ mod calibration_transport_tests {
         let c = cancel.clone();
         let phase = Arc::new(AtomicUsize::new(0));
         let p = phase.clone();
-        let (url, _mock) = spawn(Arc::new(move |_, _| {
+        let (url, mock) = spawn(Arc::new(move |_, _| {
             if p.load(Ordering::SeqCst) == 0 {
                 c.cancel(); // the user cancels while the first round is in flight
             }
@@ -3015,23 +3042,72 @@ mod calibration_transport_tests {
             !first.history.is_empty(),
             "cancelled turn published its history"
         );
-        // Resume the saved session, then pushed events arrive and wake a turn.
-        rt.reset_context_continuation("resumed", &first.history);
+        // The frontend records the interruption with the shared marker code
+        // (actor/RPC/server all call `append_marker`), then saves.
+        let mut history = first.history.clone();
+        assert!(crate::engine::interrupt::append_marker(
+            &mut history,
+            crate::engine::interrupt::InterruptReason::User
+        ));
+        let mut session = agent_core::core::session::Session::new("claude-sonnet-4-6", "low", None);
+        session.api_messages = history;
+        session.save().await.unwrap();
+        // Load it back, as a resumed session would.
+        let loaded = agent_core::core::session::Session::load(&session.id)
+            .unwrap()
+            .api_messages;
+        assert!(
+            loaded.iter().any(|m| m["_synaps_turn"]["id"].is_string()),
+            "id persisted"
+        );
+        rt.reset_context_continuation(&session.id, &loaded);
         phase.store(1, Ordering::SeqCst);
-        let mut resumed = first.history.clone();
+        // Pushed events arrive and wake a turn: resumed work, not a new task.
+        let mut resumed = loaded.clone();
         resumed.extend((0..260).map(event));
         low_thresholds(&rt);
         let out = turn_with(&rt, resumed, Default::default()).await;
         assert_eq!(out.heads.len(), 1, "rolled over");
         assert!(
             out.heads[0].iter().any(|m| m["content"] == task.as_str()),
-            "resumed work keeps the request that started it"
+            "resumed work keeps the request that started it, not the marker"
         );
-        // Host turn metadata never reaches the provider.
-        assert!(crate::runtime::continuation::wire_messages(&out.heads[0])
-            .unwrap_or_else(|| out.heads[0].clone())
+        let tagged: Vec<_> = out.heads[0]
             .iter()
-            .all(|m| m.get("_synaps_turn").is_none()));
+            .filter(|m| m["_synaps_turn"]["id"].is_string())
+            .collect();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0]["content"], task.as_str(), "marker never tagged");
+        // Host metadata never reaches the provider.
+        for body in mock.bodies.lock().unwrap().iter() {
+            assert!(!body.contains("_synaps_turn") && !body.contains("_synaps_context"));
+        }
+    }
+
+    /// The compaction transport sends caller-supplied history directly; host
+    /// keys must be stripped there too.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn compaction_requests_never_carry_host_metadata() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = runtime();
+        rt.set_api_retries(0);
+        rt.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let messages = vec![
+            Arc::new(
+                json!({"role":"user","_synaps_context":{"schema":MARKER,"archive":"a","window":2},"content":"CONTINUATION"}),
+            ),
+            Arc::new(json!({"role":"user","_synaps_turn":{"id":"t-1"},"content":"TAGGED REQUEST"})),
+            Arc::new(json!({"role":"assistant","content":"ok"})),
+        ];
+        let _ = rt.compact_call(messages).await; // the reply shape is irrelevant
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "one compaction request captured");
+        assert!(bodies[0].contains("TAGGED REQUEST"));
+        assert!(!bodies[0].contains("_synaps_turn"));
+        assert!(!bodies[0].contains("_synaps_context"));
     }
 
     fn calibration(rt: &crate::Runtime) -> Option<TokenCalibration> {
