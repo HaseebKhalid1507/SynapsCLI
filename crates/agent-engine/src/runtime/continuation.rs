@@ -2002,7 +2002,7 @@ mod budget_tests {
     }
     /// Charter, `events` ~1.1 KB pushed events each followed by a short
     /// assistant reply, then a protocol-complete tail.
-    fn foreman(events: usize) -> Vec<SharedMessage> {
+    fn event_heavy_history(events: usize) -> Vec<SharedMessage> {
         let mut m = vec![charter()];
         for i in 0..events {
             m.push(event(i, 1_100));
@@ -2055,8 +2055,8 @@ mod budget_tests {
     }
 
     #[test]
-    fn foreman_shaped_history_lands_within_target() {
-        let input = foreman(400);
+    fn event_heavy_history_lands_within_target() {
+        let input = event_heavy_history(400);
         let next = successor(&input, &archive(), "note", 2, budget(), None);
         assert!(
             footprint(&next) <= TARGET + TARGET / 50,
@@ -2192,7 +2192,7 @@ mod budget_tests {
 
     #[test]
     fn charter_is_pinned_or_stubbed_and_survives_repeated_rollovers() {
-        let input = foreman(600);
+        let input = event_heavy_history(600);
         let first = successor(&input, &archive(), "", 2, budget(), None);
         assert_eq!(first[1], input[0], "small charter pinned verbatim first");
         let mut again = first.clone();
@@ -2215,7 +2215,7 @@ mod budget_tests {
         assert!(footprint(&third) <= TARGET + TARGET / 50, "converges");
 
         // A charter over ~30% of the target is replaced by an archive stub.
-        let mut huge = foreman(50);
+        let mut huge = event_heavy_history(50);
         huge[0] = user(format!("HUGE CHARTER {}", "c".repeat(120_000)));
         let next = successor(&huge, &archive(), "", 2, budget(), None);
         assert!(!contains(&next, &huge[0]));
@@ -2246,7 +2246,7 @@ mod budget_tests {
     fn fresh_successor_does_not_rethrash_on_new_task() {
         // ~260k tokens of retained user requests: the old successor stayed
         // above pressure, so the next NewTask boundary rolled over again.
-        let input = foreman(520);
+        let input = event_heavy_history(520);
         let next = successor(&input, &archive(), "", 2, budget(), None);
         let config = agent_core::config::ContextManagementConfig {
             mode: agent_core::config::ContextManagementMode::Auto,
@@ -2270,7 +2270,7 @@ mod budget_tests {
 
     #[test]
     fn dropped_index_is_bounded() {
-        let input = foreman(5_000);
+        let input = event_heavy_history(5_000);
         let next = successor(&input, &archive(), "", 2, budget(), None);
         let marker = next[0]["content"].as_str().unwrap();
         assert!(marker.contains("not retained"), "dropped count reported");
