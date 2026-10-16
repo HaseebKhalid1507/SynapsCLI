@@ -3564,7 +3564,7 @@ impl SessionActor {
         let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
-        self.cache_keepwarm_note_attach(kind);
+        self.cache_keepwarm_note_attach(kind, mode);
         let snapshot_meta = client.clone();
         self.attached.insert(cid, AttachedClient { meta: client, mode });
         self.update_attach_state();
