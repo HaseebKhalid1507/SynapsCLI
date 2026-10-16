@@ -251,6 +251,7 @@ impl Theme {
             "ice" => Some(Self::ice()),
             "forest" => Some(Self::forest()),
             "lavender" => Some(Self::lavender()),
+            "paper" => Some(Self::paper()),
             _ => None,
         }
     }
@@ -599,14 +600,63 @@ fn derive_reset(raw: Color, derived: Color) -> Color {
     }
 }
 
+/// Environment variable that picks the theme for one process (one TUI run),
+/// ahead of `~/.synaps-cli/theme` and `theme = <name>` in config. For an app
+/// that embeds the TUI (e.g. a terminal pane in a light window) and must not
+/// change the user's global theme. The value is a theme name: a user theme
+/// file `~/.synaps-cli/themes/<name>`, else a builtin. A value that is not a
+/// plain name, or names no theme, is ignored, so the usual order applies.
+pub(crate) const THEME_ENV: &str = "SYNAPS_THEME";
+
+/// A theme name from `SYNAPS_THEME`, if it is a plain name: 1 to 64 ASCII
+/// letters, digits, `-`, `_` or `.`, not starting with `.`. Anything else
+/// (a path, `..`, empty, non-UTF-8) is not a name and is ignored, so the
+/// value can never reach outside `themes/`.
+fn theme_env_name(value: Option<&std::ffi::OsStr>) -> Option<&str> {
+    let name = value?.to_str()?.trim();
+    let plain = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    plain.then_some(name)
+}
+
+/// The theme `SYNAPS_THEME` names, resolved by `resolve` (a user theme file,
+/// else a builtin: [`load_theme_by_name`]); `None` when it is unset, not a
+/// plain name, or names no theme.
+fn theme_from_env(
+    value: Option<&std::ffi::OsStr>,
+    resolve: impl FnOnce(&str) -> Option<Theme>,
+) -> Option<Theme> {
+    theme_env_name(value).and_then(resolve)
+}
+
+/// The theme name `SYNAPS_THEME` sets for this process, if it names a theme.
+/// Boot uses it instead of the config's `theme` (e.g. whether the live-MXC
+/// subscriber starts for "myx").
+pub(crate) fn env_theme_name() -> Option<String> {
+    let value = std::env::var_os(THEME_ENV);
+    let name = theme_env_name(value.as_deref())?;
+    load_theme_by_name(name).map(|_| name.to_string())
+}
+
 /// Global theme, loaded in this order:
-/// 1. `~/.synaps-cli/theme` file (if exists) — overrides everything
+/// 0. `SYNAPS_THEME=<name>` in the environment (see [`THEME_ENV`]), if it
+///    names a theme — for this process only
+/// 1. `~/.synaps-cli/theme` file (if exists) — overrides everything else
 /// 2. `theme = <name>` in config:
 ///    a. Check `~/.synaps-cli/themes/<name>` file first (user-editable)
 ///    b. Fall back to compiled-in builtin
 /// 3. Falls back to default
 pub(crate) fn load_theme_from_config() -> Theme {
-    // First check for a theme file (highest priority)
+    if let Some(theme) = theme_from_env(std::env::var_os(THEME_ENV).as_deref(), load_theme_by_name)
+    {
+        return theme;
+    }
+
+    // First check for a theme file (highest priority after the environment)
     let path = synaps_cli::config::resolve_read_path("theme");
     if path.exists() {
         return Theme::load_from(&path);
@@ -685,6 +735,73 @@ pub(crate) fn set_theme(theme: Theme) {
 mod theme_tests {
     use super::*;
 
+    /// `SYNAPS_THEME=<name>` picks a theme (trimmed); unset, empty or an
+    /// unknown name gives `None`, so `load_theme_from_config` falls through
+    /// to the theme file and config as before. Resolved through an injected
+    /// resolver: the process environment and the user's themes folder are
+    /// shared by every test, so nothing here sets or reads them.
+    #[test]
+    fn synaps_theme_names_the_theme_for_this_process() {
+        use std::ffi::OsStr;
+        let builtin = |n: &str| Theme::builtin(n);
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("paper")), builtin),
+            Theme::builtin("paper")
+        );
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("  nord\n")), builtin),
+            Theme::builtin("nord"),
+            "trimmed"
+        );
+        assert_eq!(theme_from_env(None, builtin), None, "unset");
+        assert_eq!(theme_from_env(Some(OsStr::new("")), builtin), None, "empty");
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("  ")), builtin),
+            None,
+            "blank"
+        );
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("no-such-theme")), builtin),
+            None,
+            "unknown: fall through"
+        );
+    }
+
+    /// The value is joined under `themes/`, so it must be a plain name:
+    /// anything path-like is ignored before any file is looked up.
+    #[test]
+    fn synaps_theme_is_a_name_never_a_path() {
+        use std::ffi::OsStr;
+        let long = "a".repeat(65);
+        for v in [
+            "..",
+            "../theme",
+            ".hidden",
+            "a/b",
+            "/etc/passwd",
+            "a\\b",
+            "x y",
+            "pa\0per",
+            "nörd",
+            long.as_str(),
+        ] {
+            let mut asked = false;
+            let got = theme_from_env(Some(OsStr::new(v)), |_| {
+                asked = true;
+                Some(Theme::default())
+            });
+            assert!(got.is_none() && !asked, "{v:?} must not be looked up");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(theme_env_name(Some(OsStr::from_bytes(b"pa\xffper"))), None);
+        }
+        for ok in ["paper", "solarized-dark", "my_theme.v2", &long[..64]] {
+            assert_eq!(theme_env_name(Some(OsStr::new(ok))), Some(ok));
+        }
+    }
+
     #[test]
     fn default_tool_panels_are_explicit() {
         // The default theme is hand-tuned: argument and result panels must
@@ -760,6 +877,7 @@ mod theme_tests {
             "ice",
             "forest",
             "lavender",
+            "paper",
         ] {
             let t = Theme::builtin(name).unwrap();
             let canvas = t.message_background();
@@ -840,8 +958,8 @@ mod theme_tests {
         // Every built-in palette, with no part overrides, must resolve each
         // part to its base token — the "zero regression across 18 palettes"
         // guarantee, asserted directly against the resolvers.
-        // The 19 named palettes plus the built-in `default` (20 total).
-        const NAMES: [&str; 20] = [
+        // The 20 named palettes plus the built-in `default` (21 total).
+        const NAMES: [&str; 21] = [
             "default",
             "night-city",
             "neon-rain",
@@ -862,6 +980,7 @@ mod theme_tests {
             "ice",
             "forest",
             "lavender",
+            "paper",
         ];
         for name in NAMES {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
@@ -1051,6 +1170,7 @@ mod message_canvas_tests {
         "ice",
         "forest",
         "lavender",
+        "paper",
     ];
 
     fn rgb(c: Color) -> (u8, u8, u8) {
@@ -1187,10 +1307,15 @@ mod message_canvas_tests {
     /// `solarized-dark` is exempt: its `code_bg` (0,36,43) is already darker
     /// than its `bg` (0,43,54), so code blocks recess by that palette's own
     /// design. Its canvas is raised toward its separator instead.
+    ///
+    /// `paper` is exempt: it is the light palette, and its code blocks are
+    /// dark islands on purpose (syntax highlighting is always a dark syntect
+    /// theme), so they sit far below its canvas. `paper_is_light_with_dark_code_islands`
+    /// pins that instead.
     #[test]
     fn canvas_never_outranks_code_blocks() {
         for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
-            if *name == "solarized-dark" {
+            if *name == "solarized-dark" || *name == "paper" {
                 continue;
             }
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
@@ -1198,6 +1323,75 @@ mod message_canvas_tests {
                 luminance(rgb(t.message_background())) < luminance(rgb(t.code_bg)),
                 "{name}: canvas must sit below code_bg in elevation"
             );
+        }
+    }
+
+    /// `paper`, the light palette: a light canvas and chrome, dark code
+    /// islands, body text at 11:1 or more on the canvas, and every accent
+    /// that is drawn as text at 4.5:1 (WCAG AA) or more on the chrome and the
+    /// canvas. Every surface it paints is explicit, never a `Reset` derived
+    /// from a dark-canvas rule.
+    #[test]
+    fn paper_is_light_with_dark_code_islands() {
+        let t = Theme::builtin_for_test("paper");
+        let (bg, canvas) = (rgb(t.bg), rgb(t.message_background()));
+        assert!(
+            luminance(bg) > 0.5 && luminance(canvas) > luminance(bg),
+            "light, canvas brightest"
+        );
+        assert!(
+            luminance(rgb(t.code_bg)) < 0.05,
+            "code blocks stay dark islands"
+        );
+        assert!(
+            contrast(rgb(t.code_fg), rgb(t.code_bg)) >= 7.0,
+            "inline code reads on its island"
+        );
+        for (what, c) in [
+            ("claude_text", t.claude_text),
+            ("user_color", t.user_color),
+            ("input_fg", t.input_fg),
+            ("table_cell_color", t.table_cell_color),
+        ] {
+            let got = contrast(rgb(c), canvas);
+            assert!(got >= 11.0, "paper: {what} {got:.2} on the canvas");
+        }
+        for (what, c) in [
+            ("border_active", t.border_active),
+            ("prompt_fg", t.prompt_fg),
+            ("claude_label", t.claude_label),
+            ("heading_color", t.heading_color),
+            ("list_bullet_color", t.list_bullet_color),
+            ("table_header_color", t.table_header_color),
+            ("system_msg", t.system_msg),
+            ("header_fg", t.header_fg),
+            ("tool_label", t.tool_label),
+            ("tool_param", t.tool_param),
+            ("tool_result_color", t.tool_result_color),
+            ("tool_result_ok", t.tool_result_ok),
+            ("error_color", t.error_color),
+            ("warning_color", t.warning_color),
+            ("status_streaming", t.status_streaming),
+            ("status_ready", t.status_ready),
+            ("cost_color", t.cost_color),
+            ("subagent_name", t.subagent_name),
+            ("subagent_status", t.subagent_status),
+            ("subagent_done", t.subagent_done),
+        ] {
+            for (on, ground) in [("chrome", bg), ("canvas", canvas)] {
+                let got = contrast(rgb(c), ground);
+                assert!(got >= 4.5, "paper: {what} {got:.2} on the {on}");
+            }
+        }
+        for (what, c) in [
+            ("bg", t.bg),
+            ("message_bg", t.message_bg),
+            ("user_bg", t.user_bg),
+            ("border", t.border),
+            ("separator", t.separator),
+            ("code_bg", t.code_bg),
+        ] {
+            assert_ne!(c, Color::Reset, "paper: {what} is explicit");
         }
     }
 
@@ -1261,6 +1455,7 @@ mod chrome_dim_tests {
             "ice",
             "forest",
             "lavender",
+            "paper",
         ] {
             let t = Theme::builtin_for_test(name);
             let dim = t.chrome_dim();

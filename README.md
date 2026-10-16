@@ -130,7 +130,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
 - **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
 - **Lean is fast.** One 25MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
-- **20 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
+- **21 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`, and one light theme, `paper`. Hot-swap with `/theme`, or set `SYNAPS_THEME=<name>` for a single run without changing your config.
 
 ## Benchmarks
 

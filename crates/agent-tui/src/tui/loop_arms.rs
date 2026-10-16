@@ -776,10 +776,13 @@ pub(crate) async fn handle_animation_tick(
     false
 }
 
-/// Live-MXC (myx theme) boot: start the subscriber iff the configured theme
-/// is "myx". Later /theme switches reconcile via `App::sync_myx_live`.
+/// Live-MXC (myx theme) boot: start the subscriber iff the theme this
+/// process starts with is "myx": `SYNAPS_THEME` if it names a theme, else
+/// the configured one. Later /theme switches reconcile via
+/// `App::sync_myx_live`.
 pub(crate) fn boot_myx_live(app: &mut App) {
-    if theme::configured_theme_name().as_deref() == Some("myx") {
+    let boot = theme::env_theme_name().or_else(theme::configured_theme_name);
+    if boot.as_deref() == Some("myx") {
         app.sync_myx_live("myx");
     }
 }
