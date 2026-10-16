@@ -80,6 +80,22 @@ pub fn engine_command_reply(
     }
 }
 
+/// `/auth reload` → `{kind: output|error, text}`. Token values never appear:
+/// success text is built by `Runtime::reload_auth`, failures carry the broker
+/// error (which is token-free by construction).
+pub async fn auth_command_reply(arg: &str, runtime: &crate::Runtime) -> serde_json::Value {
+    match arg.trim() {
+        "reload" => match runtime.reload_auth().await {
+            Ok(text) => serde_json::json!({ "kind": "output", "text": text }),
+            Err(e) => serde_json::json!({
+                "kind": "error",
+                "text": format!("auth reload failed: {e}"),
+            }),
+        },
+        _ => serde_json::json!({ "kind": "error", "text": "usage: /auth reload" }),
+    }
+}
+
 impl SessionActor {
     /// `engine::commands::handle_engine_command` on THE runtime; reply as a
     /// `QueryResult` the client renders. `kind`/`text` are what chat.rs
@@ -99,6 +115,13 @@ impl SessionActor {
         // keep-warm state (task #444).
         if cmd == "keepwarm" {
             let value = self.cache_keepwarm_command(&arg).await;
+            self.emit(SessionEventWire::QueryResult { id, value });
+            return;
+        }
+        // `/auth reload` is async (broker round-trip), so it cannot live in
+        // the sync `handle_engine_command`. Never echoes a token.
+        if cmd == "auth" {
+            let value = auth_command_reply(&arg, &self.runtime).await;
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
@@ -380,5 +403,28 @@ mod tests {
             agent_core::reasoning::ReasoningLevel::High
         );
         assert!(runtime.is_reasoning_explicit());
+    }
+}
+
+#[cfg(test)]
+mod auth_command_tests {
+    use super::auth_command_reply;
+
+    #[tokio::test]
+    async fn auth_command_usage_and_token_free_error() {
+        let rt = crate::Runtime::new_headless(); // api_key "test-token"
+        let v = auth_command_reply("bogus", &rt).await;
+        assert_eq!(v["kind"], "error");
+        assert!(v["text"].as_str().unwrap().contains("usage: /auth reload"));
+        let v = auth_command_reply("  reload ", &rt).await;
+        let t = v["text"].as_str().unwrap();
+        assert_eq!(v["kind"], "error");
+        assert!(t.contains("nothing to reload"), "{t}");
+        assert!(!t.contains("test-token"), "{t}");
+    }
+
+    #[test]
+    fn auth_is_a_builtin_command() {
+        assert!(crate::skills::BUILTIN_COMMANDS.contains(&"auth"));
     }
 }
