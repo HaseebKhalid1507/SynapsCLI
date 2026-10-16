@@ -1094,6 +1094,9 @@ impl StreamMethods {
 
             // ═══ CONTEXT CONTINUATION: pre-request assessment ═══
             let mut context_advisory = None;
+            // (estimated footprint, usage records before the call) for this
+            // round's request; pairs with the provider-reported usage below.
+            let mut calibration_probe = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
                 use agent_core::core::context_policy::{assess_context, ContextAction};
@@ -1112,6 +1115,7 @@ impl StreamMethods {
                     thinking_budget as u64,
                     max_tool_output as u64,
                 );
+                calibration_probe = Some((assessment.used_tokens(), usage_counters.records()));
                 let decision = {
                     let mut s = continuation
                         .lock()
@@ -1185,11 +1189,36 @@ impl StreamMethods {
                                         super::context::estimate_history(&messages),
                                     )),
                             );
+                        // Aim the successor at the configured footprint, measured
+                        // like `used_tokens` (system + schemas + messages) and
+                        // calibrated to the provider-reported count when known.
+                        let target = {
+                            let s = continuation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let thresholds =
+                                agent_core::core::context_policy::ContextThresholds::resolve(
+                                    &s.config,
+                                    context_window,
+                                );
+                            match thresholds {
+                                Ok(t) => super::continuation::successor_budget(
+                                    t.target_tokens(&s.config),
+                                    t.pressure_tokens,
+                                    assessment.used_tokens().saturating_sub(
+                                        super::context::estimate_history(&messages),
+                                    ),
+                                    s.token_calibration,
+                                ),
+                                Err(_) => super::continuation::SuccessorBudget::UNBOUNDED,
+                            }
+                        };
                         match super::continuation::rollover_for_boundary(
                             &messages,
                             &continuation,
                             &memory_backend,
                             history_budget,
+                            target,
                             &cancel,
                             time_checkpoint,
                         )
@@ -1317,6 +1346,18 @@ impl StreamMethods {
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
             segment_has_provider_round = true;
+            if let Some((estimated_tokens, before)) = calibration_probe {
+                let provider_tokens = usage_counters.latest_context_tokens();
+                if usage_counters.records() > before && provider_tokens > 0 {
+                    continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .token_calibration = Some(super::continuation::TokenCalibration {
+                        provider_tokens,
+                        estimated_tokens,
+                    });
+                }
+            }
             if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
                 finish_budget_exceeded!(dimension);
             }
