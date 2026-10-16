@@ -249,6 +249,9 @@ pub struct WatchPage {
     pub handle_id: String,
     pub subagent_id: u64,
     pub agent_name: String,
+    /// The model the worker runs on. Empty from older peers.
+    #[serde(default)]
+    pub model: String,
     /// `running`, `completed`, `cancelled`, `timed_out` or `failed`.
     pub status: String,
     /// The worker accepts steering (it is running and has a steer channel).
@@ -515,5 +518,16 @@ mod tests {
         let page = j.read(0);
         let back: WatchPage = serde_json::from_value(serde_json::to_value(&page).unwrap()).unwrap();
         assert_eq!(back, page);
+    }
+
+    /// A page from a peer that predates `model` still deserializes.
+    #[test]
+    fn page_without_a_model_deserializes() {
+        let old = r#"{"handle_id":"sa_1","subagent_id":1,"agent_name":"scout",
+            "status":"running","steerable":true,"next_seq":0,"truncated":false,
+            "more":false,"events":[]}"#;
+        let page: WatchPage = serde_json::from_str(old).expect("old page");
+        assert_eq!(page.model, "", "older peers send no model");
+        assert_eq!(page.agent_name, "scout");
     }
 }
