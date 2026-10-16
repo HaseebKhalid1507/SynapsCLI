@@ -677,6 +677,7 @@ mod tests {
         "ice",
         "forest",
         "lavender",
+        "paper",
     ];
 
     fn rgb_of(c: Color) -> Rgb {

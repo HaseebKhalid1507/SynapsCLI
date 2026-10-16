@@ -838,6 +838,7 @@ impl App {
             ("ice", "frozen arctic pale blues"),
             ("forest", "deep greens and browns"),
             ("lavender", "rich purple/violet"),
+            ("paper", "light: dark ink on paper, dark code blocks"),
         ];
 
         if arg.is_empty() {

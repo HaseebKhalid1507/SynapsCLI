@@ -33,6 +33,7 @@ const BUILTIN_THEMES: &[&str] = &[
     "ice",
     "forest",
     "lavender",
+    "paper",
 ];
 
 /// Compute the thinking level options for `model_runtime_id`.
