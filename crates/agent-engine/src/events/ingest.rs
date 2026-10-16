@@ -58,10 +58,31 @@ async fn process_file(path: &Path, queue: &EventQueue) {
     }
 }
 
-async fn scan_inbox(dir: &Path, queue: &EventQueue) {
+/// Predicate deciding whether this consumer may take an inbox file.
+pub type InboxFilter = fn(&Path) -> bool;
+
+fn accept_all(_: &Path) -> bool {
+    true
+}
+
+/// Filter for headless watcher agents: never consume supervisor completion
+/// notices (`watcher-*.json`) — those are meant for a human's session, and an
+/// agent stealing them would both lose the notice and inject noise into the
+/// agent's own run.
+pub fn not_watcher_notice(path: &Path) -> bool {
+    !path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("watcher-"))
+}
+
+async fn scan_inbox(dir: &Path, queue: &EventQueue, accept: InboxFilter) {
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            process_file(&entry.path(), queue).await;
+            let path = entry.path();
+            if accept(&path) {
+                process_file(&path, queue).await;
+            }
         }
     }
 }
@@ -70,6 +91,17 @@ pub async fn watch_inbox(
     inbox_dir: PathBuf,
     queue: Arc<EventQueue>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    watch_inbox_filtered(inbox_dir, queue, shutdown, accept_all).await
+}
+
+/// Like [`watch_inbox`] but only consumes files for which `accept` is true;
+/// rejected files are left in place for their intended consumer.
+pub async fn watch_inbox_filtered(
+    inbox_dir: PathBuf,
+    queue: Arc<EventQueue>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    accept: InboxFilter,
 ) {
     let _ = tokio::fs::create_dir_all(&inbox_dir).await;
     #[cfg(unix)]
@@ -81,7 +113,7 @@ pub async fn watch_inbox(
             let _ = tokio::fs::set_permissions(&inbox_dir, perms).await;
         }
     }
-    scan_inbox(&inbox_dir, &queue).await;
+    scan_inbox(&inbox_dir, &queue, accept).await;
 
     // Use a tokio channel so the async runtime isn't blocked
     let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
@@ -139,11 +171,11 @@ pub async fn watch_inbox(
             result = async_rx.recv() => {
                 match result {
                     Some(paths) => {
-                        for path in &paths {
+                        for path in paths.iter().filter(|p| accept(p)) {
                             process_file(path, queue_ref).await;
                         }
                         // Sweep for any files inotify missed in the batch
-                        scan_inbox(dir_ref, queue_ref).await;
+                        scan_inbox(dir_ref, queue_ref, accept).await;
                     }
                     None => break, // Watcher thread exited, channel closed
                 }
@@ -153,7 +185,7 @@ pub async fn watch_inbox(
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                scan_inbox(dir_ref, queue_ref).await;
+                scan_inbox(dir_ref, queue_ref, accept).await;
             }
         }
     }
@@ -161,6 +193,15 @@ pub async fn watch_inbox(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn watcher_notice_filter() {
+        use std::path::Path;
+        assert!(!super::not_watcher_notice(Path::new("/x/inbox/watcher-ev-20260925-1.json")));
+        assert!(super::not_watcher_notice(Path::new("/x/inbox/1727-abc.json")));
+        assert!(super::not_watcher_notice(Path::new("/x/inbox/alert-1.md")));
+    }
+
     use super::*;
     use crate::events::{Event, Severity};
 
