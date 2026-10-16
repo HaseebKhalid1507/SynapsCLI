@@ -628,7 +628,11 @@ impl StreamMethods {
         ))?;
         // Host-owned identity of the request that started this turn; later
         // steered/pushed messages must not displace it at rollover.
-        super::continuation::record_turn_start(&continuation, &messages);
+        // Tags a genuinely new turn's request with a stable id (host metadata,
+        // stripped from every provider wire) or keeps a resumed turn's start.
+        if context_enabled {
+            super::continuation::record_turn_start(&continuation, &mut messages);
+        }
         if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
             return Err(crate::RuntimeError::Config(
                 "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
@@ -1211,7 +1215,7 @@ impl StreamMethods {
                                     assessment.used_tokens().saturating_sub(
                                         super::context::estimate_history(&messages),
                                     ),
-                                    s.token_calibration,
+                                    s.calibration_for(&model),
                                 ),
                                 Err(_) => super::continuation::SuccessorBudget::UNBOUNDED,
                             }
@@ -1354,16 +1358,19 @@ impl StreamMethods {
             // tell them from a real zero); an implausible ratio clears the
             // sample so selection falls back to the conservative estimator.
             if let Some((estimated_tokens, before)) = calibration_probe {
-                let provider_tokens = usage_counters.latest_context_tokens();
-                if usage_counters.records() > before && provider_tokens > 0 {
-                    let sample = super::continuation::TokenCalibration {
-                        provider_tokens,
-                        estimated_tokens,
-                    };
+                if usage_counters.records() > before {
+                    // A booked zero count is a sample too: it fails the
+                    // plausibility check and clears any stale ratio.
                     continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .token_calibration = sample.plausible().then_some(sample);
+                        .record_calibration(
+                            &model,
+                            super::continuation::TokenCalibration {
+                                provider_tokens: usage_counters.latest_context_tokens(),
+                                estimated_tokens,
+                            },
+                        );
                 }
             }
             if let Err(dimension) = budget_meter.check_usage(&usage_counters) {

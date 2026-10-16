@@ -88,9 +88,12 @@ pub struct ContinuationState {
     /// Latest provider-reported vs estimated footprint of one request. Kept
     /// across rollovers (same tokenizer); cleared with the session binding.
     pub token_calibration: Option<TokenCalibration>,
-    /// The request that started the current turn, recorded by the host when
-    /// the turn is admitted (never inferred from later history).
-    pub(crate) turn_start: Option<SharedMessage>,
+    /// Model whose request produced `token_calibration`. A sample is only
+    /// applied to that model (tokenizers differ across providers/models).
+    pub calibration_model: Option<String>,
+    /// Stable id (`_synaps_turn.id` on the message) of the request that
+    /// started the current turn, recorded by the host at turn admission.
+    pub(crate) turn_start: Option<String>,
 }
 impl Default for ContinuationState {
     fn default() -> Self {
@@ -107,6 +110,7 @@ impl Default for ContinuationState {
             durability_blocked: false,
             restore_pending: false,
             token_calibration: None,
+            calibration_model: None,
             turn_start: None,
         }
     }
@@ -114,6 +118,19 @@ impl Default for ContinuationState {
 impl ContinuationState {
     pub fn enabled(&self) -> bool {
         self.config.mode == ContextManagementMode::Auto
+    }
+
+    /// The calibration sample, only if it was measured on `model`.
+    pub fn calibration_for(&self, model: &str) -> Option<TokenCalibration> {
+        self.token_calibration
+            .filter(|_| self.calibration_model.as_deref() == Some(model))
+    }
+
+    /// Record the outcome of one request that booked provider usage. An
+    /// implausible (including zero) count clears the sample.
+    pub fn record_calibration(&mut self, model: &str, sample: TokenCalibration) {
+        self.token_calibration = sample.plausible().then_some(sample);
+        self.calibration_model = self.token_calibration.map(|_| model.to_owned());
     }
     /// Return a notice only on a transition. Normal/disabled assessments clear
     /// stale pressure; phase reports and repeated admissions do not re-arm it.
@@ -383,7 +400,7 @@ fn successor(
     note: &str,
     window: u64,
     budget: SuccessorBudget,
-    turn_start: Option<&SharedMessage>,
+    turn_start: Option<&str>,
 ) -> Vec<SharedMessage> {
     let groups = tool_groups(messages);
     let mut members = std::collections::HashMap::<usize, Vec<usize>>::new();
@@ -423,15 +440,10 @@ fn successor(
     let requests: Vec<usize> = (0..messages.len())
         .filter(|&i| is_user_request(&messages[i]))
         .collect();
-    // The turn's starting request as recorded by the host; only without that
-    // identity (or if it is no longer present) fall back to the last request.
+    // The turn's starting request, by the stable id the host recorded at
+    // admission; without one (legacy history) fall back to the last request.
     let current = turn_start
-        .and_then(|start| {
-            messages
-                .iter()
-                .rposition(|m| Arc::ptr_eq(m, start))
-                .or_else(|| messages.iter().rposition(|m| m == start))
-        })
+        .and_then(|id| messages.iter().position(|m| turn_id(m) == Some(id)))
         .or_else(|| requests.last().copied());
     if let Some(i) = current {
         used += add_group(&mut retained, i);
@@ -703,7 +715,7 @@ pub(crate) async fn rollover_for_boundary(
         &note,
         window,
         target,
-        turn_start.as_ref(),
+        turn_start.as_deref(),
     );
     let estimate = super::context::estimate_history(&candidate);
     let original = super::context::estimate_history(messages);
@@ -736,7 +748,7 @@ pub(crate) async fn rollover_for_boundary(
             &stored_note,
             window,
             target,
-            turn_start.as_ref(),
+            turn_start.as_deref(),
         ),
         logical_id,
         epoch,
@@ -948,22 +960,27 @@ impl crate::Runtime {
     }
 }
 
+/// Host-only message metadata keys; never sent on any provider wire.
+const HOST_KEYS: [&str; 2] = ["_synaps_context", TURN_KEY];
+
 /// Host continuation metadata never goes onto any provider wire.
-#[allow(dead_code)] // merge(112): consumed in phase 5
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
-    if !messages.iter().any(|m| m.get("_synaps_context").is_some()) {
+    let has_host_key = |m: &SharedMessage| HOST_KEYS.iter().any(|k| m.get(*k).is_some());
+    if !messages.iter().any(has_host_key) {
         return None;
     }
     Some(
         messages
             .iter()
             .map(|m| {
-                if m.get("_synaps_context").is_none() {
+                if !has_host_key(m) {
                     return m.clone();
                 }
                 let mut m = (**m).clone();
                 if let Some(obj) = m.as_object_mut() {
-                    obj.remove("_synaps_context");
+                    for key in HOST_KEYS {
+                        obj.remove(key);
+                    }
                 }
                 Arc::new(m)
             })
@@ -971,13 +988,59 @@ pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMess
     )
 }
 
-/// Record the request that starts a turn, at turn admission.
-pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &[SharedMessage]) {
-    let start = messages.iter().rev().find(|m| is_user_request(m)).cloned();
+/// Message key carrying the host's turn identity: `{"id": "<uuid>"}`.
+pub(crate) const TURN_KEY: &str = "_synaps_turn";
+
+fn turn_id(message: &Value) -> Option<&str> {
+    message[TURN_KEY]["id"].as_str()
+}
+
+/// A plain user-authored request that can start a turn: not a pushed event,
+/// not a tool-result carrier, not the continuation marker.
+fn starts_turn(message: &Value) -> bool {
+    is_user_request(message)
+        && !is_event(message)
+        && !message["content"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|b| b["type"] == "tool_result"))
+}
+
+/// Record the request that starts a turn, at turn admission, and return it
+/// so the caller can keep it in history. A plain request newer than the last
+/// recorded turn start is a genuinely new turn: it is tagged with a fresh
+/// stable id (it is the unsaved tail of a just-submitted turn in practice).
+/// Otherwise (only pushed events or tool traffic since, e.g. a wake after a
+/// cancel and resume) the work is resumed and the recorded start is kept.
+/// The id lives in the message, so it survives checkpoints and restore.
+pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &mut [SharedMessage]) {
+    let last_tagged = messages.iter().rposition(|m| turn_id(m).is_some());
+    let newer = last_tagged.map_or(0, |i| i + 1);
+    let fresh = (newer..messages.len())
+        .rev()
+        .find(|&i| starts_turn(&messages[i]))
+        // Legacy history without any recorded start: an event-only tail is
+        // the best available start.
+        .or_else(|| {
+            last_tagged
+                .is_none()
+                .then(|| messages.iter().rposition(|m| is_user_request(m)))
+                .flatten()
+        });
+    let id = match (fresh, last_tagged) {
+        (Some(i), _) => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut tagged = (*messages[i]).clone();
+            tagged[TURN_KEY] = json!({ "id": id });
+            messages[i] = Arc::new(tagged);
+            Some(id)
+        }
+        (None, Some(i)) => turn_id(&messages[i]).map(str::to_owned),
+        (None, None) => None,
+    };
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .turn_start = start;
+        .turn_start = id;
 }
 
 fn is_user_request(message: &Value) -> bool {
@@ -2253,22 +2316,113 @@ mod budget_tests {
             json!({"role":"assistant","content":[{"type":"tool_use","id":"g1","name":"read","input":{}}]}),
         ));
         // The current turn starts with a mixed result + typed message.
-        input.push(msg(json!({"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"g1","content":"z".repeat(200)},
-            {"type":"text","text":"TASK-2: the ongoing task"}
-        ]})));
+        input.push(msg(
+            json!({"role":"user","_synaps_turn":{"id":"turn-2"},"content":[
+                {"type":"tool_result","tool_use_id":"g1","content":"z".repeat(200)},
+                {"type":"text","text":"TASK-2: the ongoing task"}
+            ]}),
+        ));
         let turn_start = input.last().unwrap().clone();
+        let id = turn_id(&turn_start).unwrap().to_owned();
         for i in 0..40 {
             input.push(event(i, 1_100)); // steered in mid-turn
         }
         input.extend(tail("t5", 200)[1..].to_vec());
         let none = SuccessorBudget { history_tokens: 0 };
-        let next = successor(&input, &archive(), "", 2, none, Some(&turn_start));
+        let next = successor(&input, &archive(), "", 2, none, Some(&id));
         assert!(contains(&next, &turn_start), "host-owned turn start kept");
         assert!(contains(&next, &input[2]), "with its tool_use dependency");
         assert_pairs_intact(&next);
         assert!(!contains(&next, &input[1]), "earlier task is optional");
         in_source_order(&input, &next);
+    }
+
+    /// Two value-identical requests: the id selects the right occurrence and
+    /// its own tool group, never the last (or first) equal value.
+    #[test]
+    fn duplicate_request_values_resolve_by_turn_id() {
+        let group = |id: &str| {
+            vec![
+                msg(
+                    json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"read","input":{}}]}),
+                ),
+                msg(
+                    json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"r"}]}),
+                ),
+            ]
+        };
+        let mut input = vec![charter()];
+        // The ongoing turn started with the FIRST "continue" (mixed with its
+        // result so it carries a dependency group).
+        input.push(msg(json!({"role":"assistant","content":[{"type":"tool_use","id":"d1","name":"read","input":{}}]})));
+        input.push(msg(
+            json!({"role":"user","_synaps_turn":{"id":"first"},"content":[
+            {"type":"tool_result","tool_use_id":"d1","content":"one"},
+            {"type":"text","text":"continue"}]}),
+        ));
+        input.extend(group("x1"));
+        // A later, value-identical message without the id (e.g. steering).
+        input.push(msg(json!({"role":"assistant","content":[{"type":"tool_use","id":"d2","name":"read","input":{}}]})));
+        input.push(msg(json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"d2","content":"one"},
+            {"type":"text","text":"continue"}]})));
+        for i in 0..20 {
+            input.push(event(i, 1_100));
+        }
+        input.extend(tail("t7", 100)[1..].to_vec());
+        let none = SuccessorBudget { history_tokens: 0 };
+        let next = successor(&input, &archive(), "", 2, none, Some("first"));
+        assert!(contains(&next, &input[2]), "tagged occurrence kept");
+        assert!(contains(&next, &input[1]), "with its own call");
+        assert!(!contains(&next, &input[6]), "not the later equal value");
+        assert!(!contains(&next, &input[5]), "nor that one's group");
+        assert_pairs_intact(&next);
+    }
+
+    #[test]
+    fn turn_start_is_tagged_for_new_turns_and_kept_for_resumed_work() {
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        // Value-identical requests: only the newest is the new turn's start.
+        let mut m = vec![
+            charter(),
+            user("continue"),
+            assistant("ok"),
+            user("continue"),
+        ];
+        record_turn_start(&state, &mut m);
+        let id = state
+            .lock()
+            .unwrap()
+            .turn_start
+            .clone()
+            .expect("new turn recorded");
+        assert_eq!(turn_id(&m[3]), Some(id.as_str()));
+        assert_eq!(turn_id(&m[1]), None);
+        assert_eq!(m[3]["content"], "continue", "content untouched");
+        // Re-entry with only pushed events / tool traffic since: resumed work.
+        m.push(assistant("working"));
+        m.extend((0..5).map(|i| event(i, 50)));
+        let resumed = Arc::new(Mutex::new(ContinuationState::default())); // after restore
+        record_turn_start(&resumed, &mut m);
+        assert_eq!(
+            resumed.lock().unwrap().turn_start.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            m.iter().filter(|x| turn_id(x).is_some()).count(),
+            1,
+            "no re-tag"
+        );
+        // A genuinely new typed request starts a new turn with a new id.
+        m.push(user("continue"));
+        record_turn_start(&resumed, &mut m);
+        let next_id = resumed.lock().unwrap().turn_start.clone().unwrap();
+        assert_ne!(next_id, id);
+        assert_eq!(turn_id(m.last().unwrap()), Some(next_id.as_str()));
+        // The id is host metadata: stripped from the wire, alongside the marker.
+        let wire = wire_messages(&m).expect("host keys present");
+        assert!(wire.iter().all(|x| x.get(TURN_KEY).is_none()));
+        assert_eq!(wire.last().unwrap()["content"], "continue");
     }
 
     #[test]
@@ -2454,14 +2608,16 @@ mod rollover_path_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn rollover_keeps_the_host_recorded_turn_start() {
         let _env = BaseDirGuard::new();
-        let task = user("TASK-2: the ongoing task");
+        let task = msg(
+            json!({"role":"user","content":"TASK-2: the ongoing task","_synaps_turn":{"id":"t-2"}}),
+        );
         let mut messages = vec![user("charter"), user("TASK-1: done"), task.clone()];
         for i in 0..100 {
             messages.push(event(i, 1_100));
         }
         messages.extend(tail("h1", 200)[1..].to_vec());
         let state = auto_state();
-        state.lock().unwrap().turn_start = Some(task.clone());
+        state.lock().unwrap().turn_start = Some("t-2".into());
         let target = SuccessorBudget {
             history_tokens: 2_000,
         };
@@ -2673,6 +2829,8 @@ mod calibration_transport_tests {
         let mut rt = crate::Runtime::new_headless();
         rt.set_model("claude-sonnet-4-6".to_string());
         rt.set_api_retries(1);
+        // Room for a forced rollover's hard budget (not the 1m beta window).
+        rt.set_context_window(Some(500_000));
         rt.continuation.lock().unwrap().config.mode = ContextManagementMode::Auto;
         rt
     }
@@ -2692,6 +2850,188 @@ mod calibration_transport_tests {
                 panic!("turn failed: {e:?}");
             }
         }
+    }
+
+    /// Outcome of one turn over explicit history: last published history,
+    /// every durable head the runtime asked to save (acknowledged).
+    struct Turn {
+        history: Vec<SharedMessage>,
+        heads: Vec<Vec<SharedMessage>>,
+    }
+
+    async fn turn_with(
+        rt: &crate::Runtime,
+        messages: Vec<SharedMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Turn {
+        let mut stream = rt
+            .run_stream_with_messages(messages, cancel, None, None, false)
+            .await;
+        let mut out = Turn {
+            history: Vec::new(),
+            heads: Vec::new(),
+        };
+        while let Some(event) = stream.next().await {
+            match event {
+                agent_core::StreamEvent::Session(agent_core::SessionEvent::Error(e)) => {
+                    // A user cancel is a clean stop, anything else fails the test.
+                    assert!(
+                        matches!(e.outcome, agent_core::TurnOutcome::Canceled),
+                        "turn failed: {e:?}"
+                    )
+                }
+                agent_core::StreamEvent::Session(agent_core::SessionEvent::MessageHistory(h)) => {
+                    out.history = h
+                }
+                agent_core::StreamEvent::Session(
+                    agent_core::SessionEvent::ContextHeadCheckpoint {
+                        messages, receipt, ..
+                    },
+                ) => {
+                    out.heads.push(messages);
+                    receipt.complete(Ok(()));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn event(i: usize) -> SharedMessage {
+        Arc::new(json!({"role":"user","content":format!(
+            "<event id=\"e{i}\" type=\"worker_report\" severity=\"low\" source=\"worker-{}\">report {i}: {}</event>",
+            i % 4,
+            "x".repeat(1_100)
+        )}))
+    }
+
+    /// Low soft thresholds so ~120k tokens of events force a rollover at
+    /// the first round of the next turn; target well under pressure.
+    fn low_thresholds(rt: &crate::Runtime) {
+        let mut s = rt.continuation.lock().unwrap();
+        s.config.pressure_tokens = Some(60_000);
+        s.config.rollover_tokens = Some(80_000);
+        s.config.target_tokens = Some(25_000);
+    }
+
+    fn big_history() -> Vec<SharedMessage> {
+        let mut m = vec![Arc::new(json!({"role":"user","content":"charter"}))];
+        m.extend((0..260).map(event));
+        m.push(Arc::new(json!({"role":"user","content":"next"})));
+        m
+    }
+
+    /// Size of the first durable head of a forced rollover after a turn
+    /// that recorded a ~1.9 estimate/provider sample on the first model.
+    async fn head_after_sample(switch_model: bool) -> u64 {
+        let phase = Arc::new(AtomicUsize::new(0));
+        let p = phase.clone();
+        let (url, _mock) = spawn(Arc::new(move |_, proxy| {
+            if p.load(Ordering::SeqCst) == 0 {
+                (200, Some(json!({"input_tokens":proxy * 10 / 19,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})))
+            } else {
+                (200, None) // the next model's transport reports no usage
+            }
+        }))
+        .await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = runtime();
+        turn(&rt).await;
+        assert!(calibration(&rt).is_some(), "sample on the first model");
+        phase.store(1, Ordering::SeqCst);
+        if switch_model {
+            rt.set_model("claude-opus-4-7".to_string());
+        }
+        low_thresholds(&rt);
+        let out = turn_with(&rt, big_history(), Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "exactly one rollover");
+        crate::runtime::context::estimate_history(&out.heads[0])
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_model_switch_does_not_reuse_the_previous_models_ratio() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let same = head_after_sample(false).await;
+        let switched = head_after_sample(true).await;
+        assert!(
+            switched + 8_000 < same,
+            "switched {switched} must use the plain estimator, same-model {same} the ratio"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_new_record_reporting_zero_tokens_clears_the_sample() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let p = phase.clone();
+        let (url, _mock) = spawn(Arc::new(move |_, proxy| {
+            if p.load(Ordering::SeqCst) == 0 {
+                (200, Some(json!({"input_tokens":proxy,"output_tokens":3})))
+            } else {
+                (200, Some(json!({"input_tokens":0,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})))
+            }
+        }))
+        .await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = runtime();
+        turn(&rt).await;
+        assert!(calibration(&rt).is_some());
+        phase.store(1, Ordering::SeqCst);
+        turn(&rt).await;
+        assert_eq!(calibration(&rt), None, "valid -> zero clears");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn cancel_then_restore_keeps_the_original_turn_start_through_later_events() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let c = cancel.clone();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let p = phase.clone();
+        let (url, _mock) = spawn(Arc::new(move |_, _| {
+            if p.load(Ordering::SeqCst) == 0 {
+                c.cancel(); // the user cancels while the first round is in flight
+            }
+            (200, None)
+        }))
+        .await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = runtime();
+        // Larger than any optional budget below: kept only as the turn start.
+        let task = format!("TASK-2: the ongoing task {}", "t".repeat(40_000));
+        let first = turn_with(
+            &rt,
+            vec![
+                Arc::new(json!({"role":"user","content":"charter"})),
+                Arc::new(json!({"role":"user","content":task.clone()})),
+            ],
+            cancel,
+        )
+        .await;
+        assert!(
+            !first.history.is_empty(),
+            "cancelled turn published its history"
+        );
+        // Resume the saved session, then pushed events arrive and wake a turn.
+        rt.reset_context_continuation("resumed", &first.history);
+        phase.store(1, Ordering::SeqCst);
+        let mut resumed = first.history.clone();
+        resumed.extend((0..260).map(event));
+        low_thresholds(&rt);
+        let out = turn_with(&rt, resumed, Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "rolled over");
+        assert!(
+            out.heads[0].iter().any(|m| m["content"] == task.as_str()),
+            "resumed work keeps the request that started it"
+        );
+        // Host turn metadata never reaches the provider.
+        assert!(crate::runtime::continuation::wire_messages(&out.heads[0])
+            .unwrap_or_else(|| out.heads[0].clone())
+            .iter()
+            .all(|m| m.get("_synaps_turn").is_none()));
     }
 
     fn calibration(rt: &crate::Runtime) -> Option<TokenCalibration> {

@@ -57,9 +57,12 @@ messages). An explicit value must be positive and below the effective pressure
 threshold. When a provider has reported usage for a recent request, the target
 is read in provider-reported tokens (what the status bar shows) and converted
 with that request's estimate/actual ratio; otherwise it is applied to the
-conservative estimate directly. A sample is used only when the provider count
-is nonzero and the estimate/actual ratio lies within 0.5–2.0; an out-of-band
-sample clears calibration and the conservative estimate applies. Usage is input
+conservative estimate directly. A sample applies only to the model whose request
+produced it (switching models falls back to the estimator until that model
+reports usage), and only when the provider count is nonzero and the
+estimate/actual ratio lies within 0.5–2.0. Any newly booked usage replaces the
+sample; an out-of-band or zero count clears it and the conservative estimate
+applies. Usage is input
 plus cache read plus cache write; the transport reads an omitted cache field as
 zero and cannot distinguish it from a reported zero (an understated count shows
 up as a high ratio and is rejected by the band above). Transports that do not
@@ -133,9 +136,12 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
    discarding history. Do not replay unknown tool effects.
 2. Prepare a smaller context under `target_tokens`. Always kept: the
    continuation message and working note, system/developer messages, the last
-   assistant/result tail, the request that started the current turn (recorded
-   by the host when the turn is admitted, so later pushed or steered messages
-   cannot displace it), and every user turn carrying an attachment (image,
+   assistant/result tail, the request that started the current turn (when a
+   turn is admitted the host tags a new plain user request with a stable
+   `_synaps_turn` id that persists with the session; a re-entry with only
+   pushed events or tool traffic since, e.g. after cancel and resume, keeps
+   the recorded start; like `_synaps_context`, the key is stripped from every
+   provider request), and every user turn carrying an attachment (image,
    document, ...) because the archive excludes those payloads and could not
    return them. All of these keep their tool-call/result groups and are kept
    even if together they exceed the target (hard admission still applies). The
