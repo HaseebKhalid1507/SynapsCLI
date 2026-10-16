@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_engine::session::{
-    CheckpointReason, ClientKind, ClientMeta, ClientTransport, EndReason, HostEvent,
+    AttachMode, CheckpointReason, ClientKind, ClientMeta, ClientTransport, EndReason, HostEvent,
     LocalTransport, SessionCommand, SessionConfig, SessionHandle, SessionLifecycle, SessionQuery,
     SessionSetting,
 };
@@ -837,6 +837,63 @@ async fn keepwarm_auto_on_an_idle_session_starts_a_period_now() {
     let st = keepwarm(&mut t, 603, "6h").await;
     assert_eq!(st["active"], true, "<N>h starts it too: {st}");
     end(&mut t).await;
+}
+
+/// An `Observe` attach never makes a session keep-warm eligible, whatever
+/// its client kind. Watching (`synaps attach --observe`, a read-only pane in
+/// another app) is not someone who will be back to type.
+/// A TUI that can type (`Mirror`) still marks it, even after observers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_observe_attach_never_makes_a_session_eligible() {
+    let h = Home::new();
+    write_config(
+        &h,
+        "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n",
+    );
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    // The client that drives the turn is not interactive by kind.
+    let (mut script, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    // Both interactive kinds attach, observe-only.
+    let mut watchers = Vec::new();
+    for kind in [ClientKind::Tui, ClientKind::Attach] {
+        let (w, snap) =
+            LocalTransport::attach_with(handle.clone(), ClientMeta::new(kind), AttachMode::Observe)
+                .await
+                .unwrap();
+        assert_eq!(w.mode(), AttachMode::Observe);
+        assert!(
+            snap.clients.iter().any(|(_, k)| *k == kind),
+            "{kind:?} is attached"
+        );
+        watchers.push(w);
+    }
+    turn(&mut script, "hello").await;
+    let st = keepwarm(&mut script, 700, "status").await;
+    assert_eq!(
+        (st["mode"].as_str(), st["active"].as_bool()),
+        (Some("auto"), Some(false)),
+        "the turn's Idle started no period: {st}"
+    );
+    // On an idle session `/keepwarm auto` starts a period at once if the
+    // session is eligible (see the test above): observe-only, it is not.
+    let st = keepwarm(&mut script, 701, "auto").await;
+    assert_eq!(st["active"], false, "observe-only is never eligible: {st}");
+    assert_eq!(pings(&bodies), 0);
+
+    // A TUI that can type marks the session: the same command now starts one.
+    let (_tui, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let st = keepwarm(&mut script, 702, "auto").await;
+    assert_eq!(st["active"], true, "a Mirror TUI makes it eligible: {st}");
+    drop(watchers);
+    end(&mut script).await;
 }
 
 /// Spend is booked on every path: a ping that was billed and then failed

@@ -677,6 +677,7 @@ variant exhaustively and drives them through the actor.
 | Session detached | Keep-warm continues (cost bounded by §7.2). The idle **auto-park** is deferred while a period is active (`can_park`); when it ends, `rearm_park` and the session parks after the normal grace. |
 | Explicit `Park` (host / reload) while a period is active | The period ends (`parked by request`), then the session parks. |
 | Script/RPC-only session | No period: requires a TUI or `synaps attach` client to have attached once. |
+| Observe-only session (`--observe` attaches only) | No period: an `Observe` attach cannot type, so it never marks the session interactive, whatever its client kind. A later `Mirror`/`Takeover` TUI or `synaps attach` does. |
 
 Why defer the auto-park rather than ping while parked: parking drops the
 runtime and conversation, and the ping must be built by that runtime from

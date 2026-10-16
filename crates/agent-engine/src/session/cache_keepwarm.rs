@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::actor::SessionActor;
-use super::types::ClientKind;
+use super::types::{AttachMode, ClientKind};
 use crate::core::config::{CacheKeepWarm, CacheTtl};
 use crate::runtime::keepwarm::{
     CacheAnchor, KeepWarmProbe, KeepWarmUsage, PingBill, PingFailure, PingOutcome, PingReport,
@@ -855,8 +855,9 @@ pub(crate) struct KeepWarmState {
     turn_started_at: Option<Instant>,
     /// Usage of the latest real request (`None` until one reported).
     last_request: Option<KeepWarmUsage>,
-    /// A TUI/attach client has been attached at some point. Script/RPC-only
-    /// sessions (nobody will be back in human time) never keep warm.
+    /// A TUI/attach client that can type (not `Observe`) has been attached
+    /// at some point. Script/RPC-only or observe-only sessions (nobody will
+    /// be back to type in human time) never keep warm.
     pub(crate) interactive_seen: bool,
     last_end: Option<String>,
     session_pings: u32,
@@ -956,8 +957,15 @@ impl SessionActor {
         None
     }
 
-    /// A client attached: TUI/attach clients mark the session interactive.
-    pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind) {
+    /// A client attached: TUI/attach clients that can type (`Mirror` or
+    /// `Takeover`) mark the session interactive. An `Observe` attach never
+    /// does: it cannot send input, so only watching a session (`synaps
+    /// attach --observe`, a read-only pane in another app) must not make it
+    /// eligible for paid keep-warm.
+    pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind, mode: AttachMode) {
+        if mode == AttachMode::Observe {
+            return;
+        }
         if matches!(kind, ClientKind::Tui | ClientKind::Attach) {
             self.cache_keepwarm.interactive_seen = true;
         }
