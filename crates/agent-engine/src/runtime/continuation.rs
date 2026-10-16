@@ -88,6 +88,9 @@ pub struct ContinuationState {
     /// Latest provider-reported vs estimated footprint of one request. Kept
     /// across rollovers (same tokenizer); cleared with the session binding.
     pub token_calibration: Option<TokenCalibration>,
+    /// The request that started the current turn, recorded by the host when
+    /// the turn is admitted (never inferred from later history).
+    pub(crate) turn_start: Option<SharedMessage>,
 }
 impl Default for ContinuationState {
     fn default() -> Self {
@@ -104,6 +107,7 @@ impl Default for ContinuationState {
             durability_blocked: false,
             restore_pending: false,
             token_calibration: None,
+            turn_start: None,
         }
     }
 }
@@ -183,6 +187,29 @@ pub struct TokenCalibration {
     pub estimated_tokens: u64,
 }
 
+impl TokenCalibration {
+    /// Accepted estimate/provider ratios. The conservative estimator should
+    /// read at or above the provider; outside this band a sample is more
+    /// likely a transport/accounting artifact (omitted cache fields, a proxy,
+    /// a mismatched request) than a tokenizer difference, so the plain
+    /// estimator is used instead.
+    pub const MIN_RATIO: (u64, u64) = (1, 2);
+    pub const MAX_RATIO: (u64, u64) = (2, 1);
+
+    pub fn plausible(&self) -> bool {
+        let (e, p) = (
+            u128::from(self.estimated_tokens),
+            u128::from(self.provider_tokens),
+        );
+        let (min_n, min_d) = Self::MIN_RATIO;
+        let (max_n, max_d) = Self::MAX_RATIO;
+        e > 0
+            && p > 0
+            && e * u128::from(min_d) >= p * u128::from(min_n)
+            && e * u128::from(max_d) <= p * u128::from(max_n)
+    }
+}
+
 /// Size budget for successor selection, in conservative-estimator tokens for
 /// the successor's MESSAGES (fixed system/tool-schema overhead subtracted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,11 +237,9 @@ pub fn successor_budget(
     calibration: Option<TokenCalibration>,
 ) -> SuccessorBudget {
     let estimated_target = match calibration {
-        Some(c) if c.provider_tokens > 0 && c.estimated_tokens > 0 => {
-            (u128::from(target_tokens) * u128::from(c.estimated_tokens)
-                / u128::from(c.provider_tokens))
-            .min(u128::from(u64::MAX)) as u64
-        }
+        Some(c) if c.plausible() => (u128::from(target_tokens) * u128::from(c.estimated_tokens)
+            / u128::from(c.provider_tokens))
+        .min(u128::from(u64::MAX)) as u64,
         _ => target_tokens,
     };
     let estimated_target = estimated_target.min(pressure_tokens.saturating_mul(2) / 3);
@@ -231,6 +256,18 @@ const PREVIEW_CHARS: usize = 80;
 
 fn message_tokens(message: &SharedMessage) -> u64 {
     super::context::estimate_history(std::slice::from_ref(message))
+}
+
+/// A user turn carrying non-text, non-tool-result content (image, document,
+/// ...). The archive deliberately omits those payloads, so such a turn can
+/// never be recovered from history and must stay in the active context.
+fn has_attachment(message: &Value) -> bool {
+    message["role"] == "user"
+        && message["content"].as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| !matches!(b["type"].as_str(), Some("text") | Some("tool_result")))
+        })
 }
 
 fn is_event(message: &Value) -> bool {
@@ -346,6 +383,7 @@ fn successor(
     note: &str,
     window: u64,
     budget: SuccessorBudget,
+    turn_start: Option<&SharedMessage>,
 ) -> Vec<SharedMessage> {
     let groups = tool_groups(messages);
     let mut members = std::collections::HashMap::<usize, Vec<usize>>::new();
@@ -385,8 +423,23 @@ fn successor(
     let requests: Vec<usize> = (0..messages.len())
         .filter(|&i| is_user_request(&messages[i]))
         .collect();
-    if let Some(&i) = requests.last() {
+    // The turn's starting request as recorded by the host; only without that
+    // identity (or if it is no longer present) fall back to the last request.
+    let current = turn_start
+        .and_then(|start| {
+            messages
+                .iter()
+                .rposition(|m| Arc::ptr_eq(m, start))
+                .or_else(|| messages.iter().rposition(|m| m == start))
+        })
+        .or_else(|| requests.last().copied());
+    if let Some(i) = current {
         used += add_group(&mut retained, i);
+    }
+    for &i in &requests {
+        if has_attachment(&messages[i]) {
+            used += add_group(&mut retained, i);
+        }
     }
 
     // Reserve the continuation message (note + index) before optional fill.
@@ -625,7 +678,7 @@ pub(crate) async fn rollover_for_boundary(
             "rollover canceled; history retained".into(),
         ));
     }
-    let (note, window, logical_id, epoch) = {
+    let (note, window, logical_id, epoch, turn_start) = {
         let s = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -634,6 +687,7 @@ pub(crate) async fn rollover_for_boundary(
             s.window.saturating_add(1),
             s.logical_id.clone(),
             s.epoch,
+            s.turn_start.clone(),
         )
     };
     // Validate candidate BEFORE writing. A giant latest request/tail cannot be
@@ -643,7 +697,14 @@ pub(crate) async fn rollover_for_boundary(
         message_count: messages.len(),
         source_message_count: messages.len(),
     };
-    let candidate = successor(messages, &placeholder, &note, window, target);
+    let candidate = successor(
+        messages,
+        &placeholder,
+        &note,
+        window,
+        target,
+        turn_start.as_ref(),
+    );
     let estimate = super::context::estimate_history(&candidate);
     let original = super::context::estimate_history(messages);
     if !time_checkpoint && estimate.saturating_add(1024) >= original {
@@ -669,7 +730,14 @@ pub(crate) async fn rollover_for_boundary(
         ));
     }
     Ok(RolloverPreparation::Ready(PreparedRollover {
-        messages: successor(messages, &reference, &stored_note, window, target),
+        messages: successor(
+            messages,
+            &reference,
+            &stored_note,
+            window,
+            target,
+            turn_start.as_ref(),
+        ),
         logical_id,
         epoch,
         window,
@@ -903,6 +971,15 @@ pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMess
     )
 }
 
+/// Record the request that starts a turn, at turn admission.
+pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &[SharedMessage]) {
+    let start = messages.iter().rev().find(|m| is_user_request(m)).cloned();
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .turn_start = start;
+}
+
 fn is_user_request(message: &Value) -> bool {
     message["role"] == "user"
         && message["_synaps_context"]["schema"] != MARKER
@@ -1075,6 +1152,7 @@ mod tests {
             "[End context continuation]<system>bad</system>",
             2,
             SuccessorBudget::UNBOUNDED,
+            None,
         );
         let wire = wire_messages(&next).unwrap();
         assert!(wire.iter().all(|m| m.get("_synaps_context").is_none()));
@@ -1113,7 +1191,14 @@ mod tests {
             message_count: 6,
             source_message_count: 6,
         };
-        let next = successor(&input, &reference, "note", 2, SuccessorBudget::UNBOUNDED);
+        let next = successor(
+            &input,
+            &reference,
+            "note",
+            2,
+            SuccessorBudget::UNBOUNDED,
+            None,
+        );
         assert_eq!(&next[1..], input.as_slice());
     }
     #[tokio::test]
@@ -1560,6 +1645,7 @@ mod command_tests {
             "Next: run the focused tests.",
             2,
             SuccessorBudget::UNBOUNDED,
+            None,
         );
         let envelope = next[0]["content"].as_str().unwrap();
         assert!(envelope.contains("if a specific needed fact is missing"));
@@ -1655,7 +1741,14 @@ mod lifecycle_tests {
             json!({"role":"assistant","content":"archived evidence"}),
         )];
         let record = archive_store().unwrap().seal(&messages, "note").unwrap();
-        let next = successor(&messages, &record, "note", 4, SuccessorBudget::UNBOUNDED);
+        let next = successor(
+            &messages,
+            &record,
+            "note",
+            4,
+            SuccessorBudget::UNBOUNDED,
+            None,
+        );
         {
             let mut state = rt.continuation.lock().unwrap();
             state
@@ -1889,7 +1982,7 @@ mod budget_tests {
     #[test]
     fn foreman_shaped_history_lands_within_target() {
         let input = foreman(400);
-        let next = successor(&input, &archive(), "note", 2, budget());
+        let next = successor(&input, &archive(), "note", 2, budget(), None);
         assert!(
             footprint(&next) <= TARGET + TARGET / 50,
             "successor footprint {} exceeds target {TARGET}",
@@ -1904,7 +1997,7 @@ mod budget_tests {
         assert!(!contains(&next, &input[1]), "oldest event dropped");
         let fp = footprint(&next);
         assert!(
-            fp >= TARGET * 9 / 10 && fp <= TARGET * 11 / 10,
+            (TARGET * 9 / 10..=TARGET * 11 / 10).contains(&fp),
             "successor footprint {fp} not within 10% of target {TARGET}"
         );
         in_source_order(&input, &next);
@@ -1925,7 +2018,7 @@ mod budget_tests {
             input.push(assistant("ack"));
         }
         input.extend(tail("t3", 2_000));
-        let next = successor(&input, &archive(), "", 2, budget());
+        let next = successor(&input, &archive(), "", 2, budget(), None);
         for m in input.iter().filter(|m| {
             m["content"]
                 .as_str()
@@ -1934,7 +2027,7 @@ mod budget_tests {
             assert!(contains(&next, m), "typed requests come first");
         }
         let fp = footprint(&next);
-        assert!(fp >= TARGET * 9 / 10 && fp <= TARGET * 11 / 10, "{fp}");
+        assert!((TARGET * 9 / 10..=TARGET * 11 / 10).contains(&fp), "{fp}");
         in_source_order(&input, &next);
     }
 
@@ -1948,7 +2041,7 @@ mod budget_tests {
             input.push(assistant("ok"));
         }
         input.extend(tail("t2", 100));
-        let next = successor(&input, &archive(), "", 2, budget());
+        let next = successor(&input, &archive(), "", 2, budget(), None);
         assert!(
             footprint(&next) <= TARGET + TARGET / 50,
             "{}",
@@ -1996,7 +2089,7 @@ mod budget_tests {
             input.push(event(i, 1_100));
         }
         input.extend(tail("big", 400_000)); // tail alone is ~160k estimated tokens
-        let next = successor(&input, &archive(), "", 2, budget());
+        let next = successor(&input, &archive(), "", 2, budget(), None);
         assert_pairs_intact(&next);
         for m in &input[input.len() - 3..] {
             assert!(contains(&next, m), "oversized tail retained whole");
@@ -2010,7 +2103,7 @@ mod budget_tests {
         // Within budget the mixed result+text turns are kept with their calls.
         let mut small = input[..input.len() - 3].to_vec();
         small.extend(tail("small", 100));
-        let next = successor(&small, &archive(), "", 2, budget());
+        let next = successor(&small, &archive(), "", 2, budget(), None);
         assert_pairs_intact(&next);
         assert!(next
             .iter()
@@ -2025,7 +2118,7 @@ mod budget_tests {
     #[test]
     fn charter_is_pinned_or_stubbed_and_survives_repeated_rollovers() {
         let input = foreman(600);
-        let first = successor(&input, &archive(), "", 2, budget());
+        let first = successor(&input, &archive(), "", 2, budget(), None);
         assert_eq!(first[1], input[0], "small charter pinned verbatim first");
         let mut again = first.clone();
         for i in 600..1200 {
@@ -2033,7 +2126,7 @@ mod budget_tests {
             again.push(assistant("ack"));
         }
         again.extend(tail("t9", 2_000));
-        let second = successor(&again, &archive(), "", 3, budget());
+        let second = successor(&again, &archive(), "", 3, budget(), None);
         assert!(
             footprint(&second) <= TARGET + TARGET / 50,
             "{}",
@@ -2043,13 +2136,13 @@ mod budget_tests {
             second[1], input[0],
             "charter still pinned after a second rollover"
         );
-        let third = successor(&second, &archive(), "", 4, budget());
+        let third = successor(&second, &archive(), "", 4, budget(), None);
         assert!(footprint(&third) <= TARGET + TARGET / 50, "converges");
 
         // A charter over ~30% of the target is replaced by an archive stub.
         let mut huge = foreman(50);
         huge[0] = user(format!("HUGE CHARTER {}", "c".repeat(120_000)));
-        let next = successor(&huge, &archive(), "", 2, budget());
+        let next = successor(&huge, &archive(), "", 2, budget(), None);
         assert!(!contains(&next, &huge[0]));
         let marker = next[0]["content"].as_str().unwrap();
         assert!(
@@ -2067,6 +2160,7 @@ mod budget_tests {
             "",
             3,
             budget(),
+            None,
         );
         let marker2 = next2[0]["content"].as_str().unwrap();
         assert!(marker2.contains("HUGE CHARTER"));
@@ -2078,7 +2172,7 @@ mod budget_tests {
         // ~260k tokens of retained user requests: the old successor stayed
         // above pressure, so the next NewTask boundary rolled over again.
         let input = foreman(520);
-        let next = successor(&input, &archive(), "", 2, budget());
+        let next = successor(&input, &archive(), "", 2, budget(), None);
         let config = agent_core::config::ContextManagementConfig {
             mode: agent_core::config::ContextManagementMode::Auto,
             ..Default::default()
@@ -2102,7 +2196,7 @@ mod budget_tests {
     #[test]
     fn dropped_index_is_bounded() {
         let input = foreman(5_000);
-        let next = successor(&input, &archive(), "", 2, budget());
+        let next = successor(&input, &archive(), "", 2, budget(), None);
         let marker = next[0]["content"].as_str().unwrap();
         assert!(marker.contains("not retained"), "dropped count reported");
         assert!(
@@ -2130,19 +2224,599 @@ mod budget_tests {
             successor_budget(TARGET, PRESSURE, OVERHEAD, Some(cal)).history_tokens,
             150_000 - OVERHEAD
         );
-        // Never start a successor inside (or near) the estimated pressure band.
+        // An implausible sample (ratio 9) is ignored: plain estimator target.
         let wild = TokenCalibration {
             provider_tokens: 10_000,
             estimated_tokens: 90_000,
         };
         assert_eq!(
             successor_budget(TARGET, PRESSURE, OVERHEAD, Some(wild)).history_tokens,
-            PRESSURE * 2 / 3 - OVERHEAD
+            TARGET - OVERHEAD
         );
         // Overhead alone over target: nothing optional fits.
         assert_eq!(
             successor_budget(TARGET, PRESSURE, 200_000, None).history_tokens,
             0
         );
+    }
+
+    fn tight() -> SuccessorBudget {
+        SuccessorBudget {
+            history_tokens: 3_000,
+        }
+    }
+
+    #[test]
+    fn host_turn_start_survives_later_events_and_keeps_its_group() {
+        let mut input = vec![charter(), user("TASK-1: an earlier, finished task")];
+        input.push(msg(
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"g1","name":"read","input":{}}]}),
+        ));
+        // The current turn starts with a mixed result + typed message.
+        input.push(msg(json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"g1","content":"z".repeat(200)},
+            {"type":"text","text":"TASK-2: the ongoing task"}
+        ]})));
+        let turn_start = input.last().unwrap().clone();
+        for i in 0..40 {
+            input.push(event(i, 1_100)); // steered in mid-turn
+        }
+        input.extend(tail("t5", 200)[1..].to_vec());
+        let none = SuccessorBudget { history_tokens: 0 };
+        let next = successor(&input, &archive(), "", 2, none, Some(&turn_start));
+        assert!(contains(&next, &turn_start), "host-owned turn start kept");
+        assert!(contains(&next, &input[2]), "with its tool_use dependency");
+        assert_pairs_intact(&next);
+        assert!(!contains(&next, &input[1]), "earlier task is optional");
+        in_source_order(&input, &next);
+    }
+
+    #[test]
+    fn attachment_turns_are_must_keep_and_never_stubbed() {
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}});
+        let doc = json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0x"}});
+        let mut input = vec![msg(json!({"role":"user","content":[
+            {"type":"text","text":format!("BRIEF {}", "b".repeat(120_000))},
+            image.clone()
+        ]}))];
+        input.push(msg(json!({"role":"user","content":[image.clone()]})));
+        input.push(msg(
+            json!({"role":"user","content":[{"type":"text","text":"compare this"}, doc]}),
+        ));
+        for i in 0..200 {
+            input.push(event(i, 1_100));
+        }
+        input.extend(tail("t6", 200));
+        let next = successor(&input, &archive(), "", 2, tight(), None);
+        for m in &input[..3] {
+            assert!(contains(&next, m), "attachment-bearing turn kept verbatim");
+        }
+        let marker = next[0]["content"].as_str().unwrap();
+        assert!(
+            !marker.contains("too large to retain"),
+            "brief with an attachment is never stubbed"
+        );
+        assert!(next[0]["_synaps_context"].get("pinned_stub").is_none());
+    }
+
+    #[test]
+    fn implausible_calibration_falls_back_to_the_estimator() {
+        let at = |provider_tokens, estimated_tokens| {
+            successor_budget(
+                TARGET,
+                PRESSURE,
+                OVERHEAD,
+                Some(TokenCalibration {
+                    provider_tokens,
+                    estimated_tokens,
+                }),
+            )
+            .history_tokens
+        };
+        let plain = TARGET - OVERHEAD;
+        assert_eq!(
+            at(100, 50),
+            TARGET / 2 - OVERHEAD,
+            "0.5 is inside the bounds"
+        );
+        assert_eq!(at(100, 49), plain, "below 0.5 is rejected");
+        assert_eq!(
+            at(100, 200),
+            PRESSURE * 2 / 3 - OVERHEAD,
+            "2.0 accepted, then capped"
+        );
+        assert_eq!(at(100, 201), plain, "above 2.0 is rejected");
+        assert!(TokenCalibration {
+            provider_tokens: 100,
+            estimated_tokens: 150
+        }
+        .plausible());
+        assert!(!TokenCalibration {
+            provider_tokens: 0,
+            estimated_tokens: 150
+        }
+        .plausible());
+        assert!(!TokenCalibration {
+            provider_tokens: 150,
+            estimated_tokens: 0
+        }
+        .plausible());
+    }
+}
+
+#[cfg(test)]
+mod rollover_path_tests {
+    use super::*;
+    use crate::runtime::context::estimate_history;
+    use crate::test_env::BaseDirGuard;
+    use agent_core::core::context_policy::{assess_context, ContextBudget};
+
+    fn msg(v: Value) -> SharedMessage {
+        Arc::new(v)
+    }
+    fn user(text: impl Into<String>) -> SharedMessage {
+        msg(json!({"role":"user","content":text.into()}))
+    }
+    fn event(i: usize, bytes: usize) -> SharedMessage {
+        user(format!(
+            "<event id=\"e{i}\" type=\"worker_report\" severity=\"low\" source=\"worker-{}\">report {i}: {}</event>",
+            i % 4,
+            "x".repeat(bytes)
+        ))
+    }
+    fn tail(id: &str, result_bytes: usize) -> Vec<SharedMessage> {
+        vec![
+            user("TURN-START: continue"),
+            msg(
+                json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"read","input":{}}]}),
+            ),
+            msg(
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"r".repeat(result_bytes)}]}),
+            ),
+        ]
+    }
+    fn auto_state() -> SharedContinuation {
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        state.lock().unwrap().config.mode = ContextManagementMode::Auto;
+        state
+    }
+    async fn roll(
+        messages: &[SharedMessage],
+        state: &SharedContinuation,
+        target: SuccessorBudget,
+    ) -> Result<RolloverPreparation> {
+        rollover_for_boundary(
+            messages,
+            state,
+            &MemoryBinding::legacy_current(),
+            1_000_000,
+            target,
+            &Default::default(),
+            false,
+        )
+        .await
+    }
+    fn ready(result: Result<RolloverPreparation>) -> PreparedRollover {
+        match result {
+            Ok(RolloverPreparation::Ready(p)) => p,
+            Ok(RolloverPreparation::Unproductive) => panic!("unexpected unproductive rollover"),
+            Err(e) => panic!("rollover failed: {e}"),
+        }
+    }
+    fn new_task_assessment(state: &SharedContinuation, used: u64) -> ContextAssessment {
+        let s = state.lock().unwrap();
+        let mut policy = s.policy;
+        policy.report_phase(WorkPhase::NewTask);
+        assess_context(
+            &s.config,
+            &policy,
+            ContextBudget {
+                context_window_tokens: 1_000_000,
+                used_tokens: used,
+                hard_remaining_tokens: 1_000_000 - used,
+                required_next_round_tokens: 8_000,
+            },
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn attachment_turns_survive_rollover_because_the_archive_omits_them() {
+        let _env = BaseDirGuard::new();
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"ATTACH_IMAGE_PAYLOAD"}});
+        let doc = json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"ATTACH_DOC_PAYLOAD"}});
+        let image_only = msg(json!({"role":"user","content":[image]}));
+        let mixed =
+            msg(json!({"role":"user","content":[{"type":"text","text":"compare these two"}, doc]}));
+        let mut messages = vec![user("charter"), image_only.clone(), mixed.clone()];
+        for i in 0..200 {
+            messages.push(event(i, 1_100));
+        }
+        messages.extend(tail("a1", 200));
+        let state = auto_state();
+        let target = SuccessorBudget {
+            history_tokens: 5_000,
+        };
+        let next = ready(roll(&messages, &state, target).await)
+            .commit(&state)
+            .unwrap();
+        assert!(next.contains(&image_only), "image-only turn kept");
+        assert!(next.contains(&mixed), "text+document turn kept");
+        // The sealed archive cannot give them back: payloads are excluded.
+        let id = state.lock().unwrap().latest_archive.clone().unwrap();
+        let fetched = archive_store().unwrap().fetch(&id, 0, 8).unwrap();
+        let archived = serde_json::to_string(&fetched).unwrap();
+        assert!(archived.contains("compare these two"));
+        assert!(!archived.contains("ATTACH_"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn rollover_keeps_the_host_recorded_turn_start() {
+        let _env = BaseDirGuard::new();
+        let task = user("TASK-2: the ongoing task");
+        let mut messages = vec![user("charter"), user("TASK-1: done"), task.clone()];
+        for i in 0..100 {
+            messages.push(event(i, 1_100));
+        }
+        messages.extend(tail("h1", 200)[1..].to_vec());
+        let state = auto_state();
+        state.lock().unwrap().turn_start = Some(task.clone());
+        let target = SuccessorBudget {
+            history_tokens: 2_000,
+        };
+        let next = ready(roll(&messages, &state, target).await)
+            .commit(&state)
+            .unwrap();
+        assert!(next.iter().any(|m| Arc::ptr_eq(m, &task)));
+        assert!(!next.iter().any(|m| m["content"] == "TASK-1: done"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn oversized_mandatory_set_rolls_once_then_defers_instead_of_looping() {
+        let _env = BaseDirGuard::new();
+        let mut messages = vec![user("charter")];
+        for i in 0..300 {
+            messages.push(event(i, 1_100));
+        }
+        // A protocol-complete tail far above the target and the pressure line.
+        messages.extend(tail("big", 700_000));
+        let state = auto_state();
+        let target = successor_budget(100_000, 250_000, 0, None);
+        let next = ready(roll(&messages, &state, target).await)
+            .commit(&state)
+            .unwrap();
+        for m in &messages[messages.len() - 3..] {
+            assert!(next.iter().any(|n| Arc::ptr_eq(n, m)), "tail kept whole");
+        }
+        let used = estimate_history(&next);
+        assert!(
+            used > 250_000,
+            "mandatory set alone exceeds pressure: {used}"
+        );
+        let first = new_task_assessment(&state, used);
+        assert_eq!(first.action, ContextAction::Rollover);
+        state.lock().unwrap().policy = first.next_state;
+        // Re-rolling its own output converges to a typed no-op within one
+        // more window (only the dropped index can still shrink): no loop.
+        let mut again = next.clone();
+        let mut windows = 2;
+        loop {
+            again.push(event(999 + windows as usize, 100));
+            let archive_before = state.lock().unwrap().latest_archive.clone();
+            match roll(&again, &state, target).await {
+                Ok(RolloverPreparation::Unproductive) => {
+                    assert_eq!(state.lock().unwrap().latest_archive, archive_before);
+                    assert_eq!(state.lock().unwrap().window, windows);
+                    break;
+                }
+                Ok(RolloverPreparation::Ready(p)) => {
+                    again = p.commit(&state).unwrap();
+                    windows += 1;
+                    assert!(windows <= 3, "repeated rollover must converge");
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let used = estimate_history(&again);
+        state
+            .lock()
+            .unwrap()
+            .policy
+            .defer_unproductive_rollover(used);
+        let deferred = new_task_assessment(&state, used);
+        assert_eq!(deferred.action, ContextAction::Advisory);
+        assert_eq!(deferred.reason, ContextReason::UnproductiveRollover);
+        // Hard budget still applies to an oversized mandatory set.
+        let refused = rollover_for_boundary(
+            &messages,
+            &auto_state(),
+            &MemoryBinding::legacy_current(),
+            200_000,
+            target,
+            &Default::default(),
+            false,
+        )
+        .await;
+        assert!(refused.is_err());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn shrink_gate_is_exactly_1024_tokens_through_the_rollover_path() {
+        let _env = BaseDirGuard::new();
+        let none = SuccessorBudget { history_tokens: 0 };
+        let placeholder = ArchiveRef {
+            id: "0".repeat(32),
+            message_count: 0,
+            source_message_count: 0,
+        };
+        let build = |bytes: usize| {
+            let mut m = vec![user("charter"), event(0, bytes)];
+            m.extend(tail("g", 2_000));
+            m
+        };
+        let delta = |m: &[SharedMessage]| {
+            let candidate = successor(
+                m,
+                &ArchiveRef {
+                    message_count: m.len(),
+                    source_message_count: m.len(),
+                    ..placeholder.clone()
+                },
+                "",
+                2,
+                none,
+                None,
+            );
+            estimate_history(m) as i64 - estimate_history(&candidate) as i64
+        };
+        let below = (1_000..6_000)
+            .rev()
+            .find(|&b| delta(&build(b)) <= 1024)
+            .expect("a size at the gate");
+        let above = below + 1;
+        assert!(delta(&build(above)) > 1024);
+        let state = auto_state();
+        assert!(matches!(
+            roll(&build(below), &state, none).await,
+            Ok(RolloverPreparation::Unproductive)
+        ));
+        assert_eq!(
+            state.lock().unwrap().latest_archive,
+            None,
+            "no archive for a no-op"
+        );
+        assert!(matches!(
+            roll(&build(above), &state, none).await,
+            Ok(RolloverPreparation::Ready(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod calibration_transport_tests {
+    use super::*;
+    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// (HTTP status, usage object for message_start/message_delta or none).
+    type Respond = Arc<dyn Fn(usize, u64) -> (u16, Option<Value>) + Send + Sync>;
+
+    #[derive(Clone)]
+    struct Mock {
+        calls: Arc<AtomicUsize>,
+        respond: Respond,
+    }
+
+    fn sse(usage: Option<&Value>) -> String {
+        let mut start = json!({"type":"message_start","message":{"id":"msg_c","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null}});
+        let mut delta =
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}});
+        if let Some(u) = usage {
+            start["message"]["usage"] = u.clone();
+            delta["usage"] = u.clone();
+        }
+        [
+            start,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+            json!({"type":"content_block_stop","index":0}),
+            delta,
+            json!({"type":"message_stop"}),
+        ]
+        .iter()
+        .map(|e| format!("data: {e}\n\n"))
+        .collect()
+    }
+
+    /// Serves Anthropic SSE; `respond` sees the call index and a conservative
+    /// estimate of the request body (a proxy for the runtime's own estimate).
+    async fn spawn(respond: Respond) -> (String, Mock) {
+        let mock = Mock {
+            calls: Arc::default(),
+            respond,
+        };
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(|State(m): State<Mock>, body: String| async move {
+                    let n = m.calls.fetch_add(1, Ordering::SeqCst);
+                    let proxy = crate::runtime::context::conservative_token_estimate(&body);
+                    let (status, usage) = (m.respond)(n, proxy);
+                    if status != 200 {
+                        return (
+                            StatusCode::from_u16(status).unwrap(),
+                            [("content-type", "application/json")],
+                            r#"{"type":"error","error":{"type":"api_error","message":"synthetic"}}"#.to_string(),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        sse(usage.as_ref()),
+                    )
+                        .into_response()
+                }),
+            )
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), mock)
+    }
+
+    fn runtime() -> crate::Runtime {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("claude-sonnet-4-6".to_string());
+        rt.set_api_retries(1);
+        rt.continuation.lock().unwrap().config.mode = ContextManagementMode::Auto;
+        rt
+    }
+
+    async fn turn(rt: &crate::Runtime) {
+        let mut stream = rt
+            .run_stream_with_messages(
+                vec![Arc::new(json!({"role":"user","content":"hello"}))],
+                Default::default(),
+                None,
+                None,
+                false,
+            )
+            .await;
+        while let Some(event) = stream.next().await {
+            if let agent_core::StreamEvent::Session(agent_core::SessionEvent::Error(e)) = event {
+                panic!("turn failed: {e:?}");
+            }
+        }
+    }
+
+    fn calibration(rt: &crate::Runtime) -> Option<TokenCalibration> {
+        rt.continuation.lock().unwrap().token_calibration
+    }
+
+    async fn run(respond: Respond) -> (crate::Runtime, Mock, crate::test_env::EnvVarGuard) {
+        let (url, mock) = spawn(respond).await;
+        let guard = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = runtime();
+        turn(&rt).await;
+        (rt, mock, guard)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn no_usage_or_zero_usage_leaves_the_estimator_in_charge() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (rt, _, _g) = run(Arc::new(|_, _| (200, None))).await;
+        assert_eq!(calibration(&rt), None, "first round without usage");
+        let zero = json!({"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
+        let (rt, _, _g) = run(Arc::new(move |_, _| (200, Some(zero.clone())))).await;
+        assert_eq!(calibration(&rt), None, "all-zero usage is not a sample");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn cache_read_and_write_count_toward_the_provider_footprint() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (rt, _, _g) = run(Arc::new(|_, proxy| {
+            let (read, write) = (proxy / 2, proxy / 4);
+            (200, Some(json!({"input_tokens":proxy - read - write,"output_tokens":3,"cache_read_input_tokens":read,"cache_creation_input_tokens":write})))
+        }))
+        .await;
+        let c = calibration(&rt).expect("plausible sample recorded");
+        assert!(c.plausible(), "{c:?}");
+        let ratio = c.estimated_tokens as f64 / c.provider_tokens as f64;
+        assert!(
+            (0.8..1.25).contains(&ratio),
+            "input+read+write ≈ request size: {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn omitted_cache_fields_read_as_zero() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let seen = Arc::new(std::sync::Mutex::new(0u64));
+        let s = seen.clone();
+        let (rt, _, _g) = run(Arc::new(move |_, proxy| {
+            *s.lock().unwrap() = proxy;
+            (200, Some(json!({"input_tokens":proxy,"output_tokens":3})))
+        }))
+        .await;
+        let c = calibration(&rt).expect("sample recorded");
+        assert_eq!(c.provider_tokens, *seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_retried_request_calibrates_from_the_attempt_that_answered() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (rt, mock, _g) = run(Arc::new(|n, proxy| {
+            if n == 0 {
+                (500, None)
+            } else {
+                (200, Some(json!({"input_tokens":proxy + 7,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})))
+            }
+        }))
+        .await;
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "one retry");
+        let c = calibration(&rt).expect("sample from the successful attempt");
+        assert!(c.plausible());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ratio_extremes_are_rejected_and_clear_an_earlier_sample() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        for factor in [5.0f64, 0.2] {
+            let phase = Arc::new(AtomicUsize::new(0));
+            let p = phase.clone();
+            let (url, _mock) = spawn(Arc::new(move |_, proxy| {
+                let provider = if p.load(Ordering::SeqCst) == 0 {
+                    proxy
+                } else {
+                    ((proxy as f64) * factor) as u64
+                };
+                (200, Some(json!({"input_tokens":provider,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})))
+            }))
+            .await;
+            let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+            let rt = runtime();
+            turn(&rt).await;
+            assert!(calibration(&rt).is_some(), "plausible sample first");
+            phase.store(1, Ordering::SeqCst);
+            turn(&rt).await;
+            assert_eq!(
+                calibration(&rt),
+                None,
+                "factor {factor}: estimator fallback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_round_without_usage_keeps_the_previous_sample() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let p = phase.clone();
+        let (url, _mock) = spawn(Arc::new(move |_, proxy| {
+            if p.load(Ordering::SeqCst) == 0 {
+                (200, Some(json!({"input_tokens":proxy,"output_tokens":3})))
+            } else {
+                (200, None)
+            }
+        }))
+        .await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = runtime();
+        turn(&rt).await;
+        let first = calibration(&rt).expect("sample");
+        phase.store(1, Ordering::SeqCst);
+        turn(&rt).await;
+        assert_eq!(calibration(&rt), Some(first));
     }
 }

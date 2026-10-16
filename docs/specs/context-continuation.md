@@ -57,8 +57,20 @@ messages). An explicit value must be positive and below the effective pressure
 threshold. When a provider has reported usage for a recent request, the target
 is read in provider-reported tokens (what the status bar shows) and converted
 with that request's estimate/actual ratio; otherwise it is applied to the
-conservative estimate directly. Either way the estimated successor stays at or
-below 2/3 of the pressure threshold so a fresh window never re-triggers rollover.
+conservative estimate directly. A sample is used only when the provider count
+is nonzero and the estimate/actual ratio lies within 0.5–2.0; an out-of-band
+sample clears calibration and the conservative estimate applies. Usage is input
+plus cache read plus cache write; the transport reads an omitted cache field as
+zero and cannot distinguish it from a reported zero (an understated count shows
+up as a high ratio and is rejected by the band above). Transports that do not
+report usage never calibrate.
+
+The 2/3-of-pressure ceiling caps only *optional* retention. The mandatory set
+(below) plus the continuation message can exceed it, and even the pressure or
+rollover thresholds. That case is not handled by selection: hard admission
+still refuses a request that does not fit, and a successor that cannot shrink
+by more than 1,024 tokens is reported as an unproductive rollover and deferred
+(item 3), so it does not loop.
 
 User-facing pressure notices show only the estimated token count, not internal
 phase names or task-planning instructions. `/context status` reports the
@@ -121,17 +133,22 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
    discarding history. Do not replay unknown tool effects.
 2. Prepare a smaller context under `target_tokens`. Always kept: the
    continuation message and working note, system/developer messages, the last
-   assistant/result tail, and the request that started the current turn, even
-   if together they exceed the target (hard admission still applies). The
+   assistant/result tail, the request that started the current turn (recorded
+   by the host when the turn is admitted, so later pushed or steered messages
+   cannot displace it), and every user turn carrying an attachment (image,
+   document, ...) because the archive excludes those payloads and could not
+   return them. All of these keep their tool-call/result groups and are kept
+   even if together they exceed the target (hard admission still applies). The
    session's first request is pinned if it fits ~30% of the target; a larger
-   one is replaced by an archive pointer and preview carried into later
-   windows. Remaining user-authored turns (including image-only turns) fill the
-   budget newest-first: every typed request that fits first, then pushed
-   `<event …>` messages fill whatever room remains up to the target. Retained messages keep source order
-   and their complete tool-call/result groups; no tool result is synthesized.
-   The continuation message lists what was not retained (count plus one line
-   per recent item, bounded to ~2k tokens) and points to
-   `memory_search(source=history)`; the archive still seals the full history.
+   text-only one is replaced by an archive pointer and preview carried into
+   later windows (one with an attachment is never stubbed). Remaining
+   user-authored turns fill the budget newest-first: every typed request that
+   fits first, then pushed `<event …>` messages fill whatever room remains up
+   to the target. Retained messages keep source order and their complete
+   tool-call/result groups; no tool result is synthesized. The continuation
+   message lists what was not retained (count plus one line per recent item,
+   bounded to ~2k tokens) and points to `memory_search(source=history)`; the
+   archive still seals the full eligible history.
 3. If retained material cannot meaningfully shrink at a soft boundary, keep the
    current history and continue only if the full request still passes hard
    admission. Reassess after four admitted rounds or an 8,192-token footprint

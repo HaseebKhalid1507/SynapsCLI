@@ -626,6 +626,9 @@ impl StreamMethods {
             &continuation,
             &memory_backend
         ))?;
+        // Host-owned identity of the request that started this turn; later
+        // steered/pushed messages must not displace it at rollover.
+        super::continuation::record_turn_start(&continuation, &messages);
         if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
             return Err(crate::RuntimeError::Config(
                 "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
@@ -1346,16 +1349,21 @@ impl StreamMethods {
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
             segment_has_provider_round = true;
+            // Only a request that booked provider usage yields a sample. The
+            // Anthropic transport reads omitted cache fields as zero (it cannot
+            // tell them from a real zero); an implausible ratio clears the
+            // sample so selection falls back to the conservative estimator.
             if let Some((estimated_tokens, before)) = calibration_probe {
                 let provider_tokens = usage_counters.latest_context_tokens();
                 if usage_counters.records() > before && provider_tokens > 0 {
+                    let sample = super::continuation::TokenCalibration {
+                        provider_tokens,
+                        estimated_tokens,
+                    };
                     continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .token_calibration = Some(super::continuation::TokenCalibration {
-                        provider_tokens,
-                        estimated_tokens,
-                    });
+                        .token_calibration = sample.plausible().then_some(sample);
                 }
             }
             if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
