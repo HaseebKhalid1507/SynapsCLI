@@ -69,7 +69,8 @@ pub use storage::{
     save_cloud_state, save_provider_auth, save_static_key,
 };
 pub use token::{
-    ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
+    ensure_fresh_provider_token, ensure_fresh_provider_token_after_rejection, ensure_fresh_token,
+    exchange_code_for_tokens, refresh_token,
 };
 pub use xai::login as login_xai;
 

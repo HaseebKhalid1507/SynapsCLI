@@ -1372,6 +1372,7 @@ mod tests {
             auth_type: "oauth".to_string(),
             refresh_token: None,
             token_expires: Some(crate::epoch_millis() + 3_600_000),
+            auth_file_mtime: None,
         }));
         let o = assert_identity_1h(&rt).await;
         assert!(

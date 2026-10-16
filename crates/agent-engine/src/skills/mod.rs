@@ -230,6 +230,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "keepwarm",
     "trace",
     "memory",
+    "auth",
     "ping",
     "keybinds",
     "sidecar",

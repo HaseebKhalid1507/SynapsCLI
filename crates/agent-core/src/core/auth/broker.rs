@@ -489,6 +489,22 @@ pub trait CredentialBroker: Send + Sync {
     /// Vend a fresh OAuth access token (token + expiry ONLY).
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError>;
 
+    /// Vend a fresh access token after the provider REJECTED `rejected_access`
+    /// (HTTP 401). A broker that owns refresh tokens should force a refresh
+    /// when its stored credential is still that exact token (revoked but not
+    /// yet expired). The default simply re-vends via [`Self::access_token`],
+    /// which keeps [`RemoteBroker`] behaviour unchanged (its caller already
+    /// invalidates the client-side `TokenCache`). `rejected_access` is for
+    /// equality comparison only and must never be logged or forwarded.
+    async fn access_token_after_rejection(
+        &self,
+        provider: OAuthProviderId,
+        rejected_access: &str,
+    ) -> Result<AccessToken, BrokerError> {
+        let _ = rejected_access;
+        self.access_token(provider).await
+    }
+
     /// Execute a non-streaming provider request with the broker-owned key.
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError>;
 
@@ -1897,6 +1913,24 @@ impl CredentialBroker for LocalBroker {
             .await
             .map_err(BrokerError::Credential)?;
         // Strip to token + expiry: the refresh token stays behind the boundary.
+        Ok(AccessToken {
+            token: creds.access,
+            expires: creds.expires,
+        })
+    }
+
+    async fn access_token_after_rejection(
+        &self,
+        provider: OAuthProviderId,
+        rejected_access: &str,
+    ) -> Result<AccessToken, BrokerError> {
+        let creds = super::ensure_fresh_provider_token_after_rejection(
+            &self.http,
+            provider,
+            rejected_access,
+        )
+        .await
+        .map_err(BrokerError::Credential)?;
         Ok(AccessToken {
             token: creds.access,
             expires: creds.expires,
