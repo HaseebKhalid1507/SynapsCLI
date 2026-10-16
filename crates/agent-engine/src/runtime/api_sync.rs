@@ -545,6 +545,10 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<String> {
+        // Host-only message metadata never reaches any provider, whatever
+        // history the caller passes in; strip before routing/serializing.
+        let wire_messages = super::continuation::wire_messages(messages);
+        let messages = wire_messages.as_deref().unwrap_or(messages);
         let tools_schema = Arc::new(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

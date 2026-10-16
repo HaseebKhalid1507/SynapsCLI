@@ -47,7 +47,33 @@ context_management.pressure_tokens = auto
 context_management.rollover_tokens = auto
 context_management.reserve_tokens = 16000
 context_management.finish_rounds = 2
+# Successor footprint after a rollover; auto = min(100000, 2/3 of pressure):
+context_management.target_tokens = auto
 ```
+
+`target_tokens` is the size a rolled-over context aims for, measured over the
+same footprint as the policy's usage (system prompt + tool schemas + retained
+messages). An explicit value must be positive and below the effective pressure
+threshold. When a provider has reported usage for a recent request, the target
+is read in provider-reported tokens (what the status bar shows) and converted
+with that request's estimate/actual ratio; otherwise it is applied to the
+conservative estimate directly. A sample applies only to the model whose request
+produced it (switching models falls back to the estimator until that model
+reports usage), and only when the provider count is nonzero and the
+estimate/actual ratio lies within 0.5–2.0. Any newly booked usage replaces the
+sample; an out-of-band or zero count clears it and the conservative estimate
+applies. Usage is input
+plus cache read plus cache write; the transport reads an omitted cache field as
+zero and cannot distinguish it from a reported zero (an understated count shows
+up as a high ratio and is rejected by the band above). Transports that do not
+report usage never calibrate.
+
+The 2/3-of-pressure ceiling caps only *optional* retention. The mandatory set
+(below) plus the continuation message can exceed it, and even the pressure or
+rollover thresholds. That case is not handled by selection: hard admission
+still refuses a request that does not fit, and a successor that cannot shrink
+by more than 1,024 tokens is reported as an unproductive rollover and deferred
+(item 3), so it does not loop.
 
 User-facing pressure notices show only the estimated token count, not internal
 phase names or task-planning instructions. `/context status` reports the
@@ -108,16 +134,35 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
 
 1. Defer while workers are running/unreconciled; at hard capacity stop without
    discarding history. Do not replay unknown tool effects.
-2. Prepare a smaller context, preserving actual user-authored turns (including
-   image-only turns), system/developer messages, the last assistant/result tail,
-   and all tool-call/result dependencies of retained messages.
+2. Prepare a smaller context under `target_tokens`. Always kept: the
+   continuation message and working note, system/developer messages, the last
+   assistant/result tail, the request that started the current turn (when a
+   turn is admitted the host tags a new plain user request with a stable
+   `_synaps_turn` id that persists with the session; interruption markers
+   never start a turn, so a re-entry with only markers, pushed events or tool
+   traffic since (e.g. cancel, save, resume, event wake) keeps the recorded
+   start; like `_synaps_context`, the key is stripped from every provider
+   request, including the compaction transport), and every user turn carrying an attachment (image,
+   document, ...) because the archive excludes those payloads and could not
+   return them. All of these keep their tool-call/result groups and are kept
+   even if together they exceed the target (hard admission still applies). The
+   session's first request is pinned if it fits ~30% of the target; a larger
+   text-only one is replaced by an archive pointer and preview carried into
+   later windows (one with an attachment is never stubbed). Remaining
+   user-authored turns fill the budget newest-first: every typed request that
+   fits first, then pushed `<event …>` messages fill whatever room remains up
+   to the target. Retained messages keep source order and their complete
+   tool-call/result groups; no tool result is synthesized. The continuation
+   message lists what was not retained (count plus one line per recent item,
+   bounded to ~2k tokens) and points to `memory_search(source=history)`; the
+   archive still seals the full eligible history.
 3. If retained material cannot meaningfully shrink at a soft boundary, keep the
    current history and continue only if the full request still passes hard
    admission. Reassess after four admitted rounds or an 8,192-token footprint
    change; repeated phase reports do not force another attempt. No archive,
    window advance or budget reset occurs for this no-op. If the current request
    cannot fit safely, stop without clearing history. User constraints are not
-   silently selected or summarized away. See `context-rollover-recovery.md`.
+   summarized away: dropped turns stay archived and indexed. See `context-rollover-recovery.md`.
 4. Seal the old eligible source projection and working note to a private archive,
    with data/directory sync and retry deduplication. Verify the note before commit.
 5. Request a frontend durable-head checkpoint. The frontend validates the logical

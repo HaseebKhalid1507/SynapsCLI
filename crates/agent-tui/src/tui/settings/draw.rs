@@ -741,7 +741,9 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .unwrap_or_default()
             .as_str()
             .to_string(),
-        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+        "context_management.pressure_tokens"
+        | "context_management.rollover_tokens"
+        | "context_management.target_tokens" => {
             match raw_config(key).and_then(|v| v.parse::<u64>().ok()) {
                 Some(n) => n.to_string(),
                 None => "auto".to_string(),

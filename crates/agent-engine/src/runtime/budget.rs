@@ -149,6 +149,9 @@ pub struct UsageCounters {
     /// Latest request's context footprint (input + cache read + cache
     /// write) — the context-token dimension compares against this.
     latest_context_tokens: std::sync::atomic::AtomicU64,
+    /// Number of requests booked; lets a caller tell whether the latest
+    /// footprint belongs to the request it just sent.
+    records: std::sync::atomic::AtomicU64,
 }
 
 impl UsageCounters {
@@ -190,6 +193,11 @@ impl UsageCounters {
             input.saturating_add(cache_read).saturating_add(cache_write),
             Ordering::Relaxed,
         );
+        Self::saturating_add(&self.records, 1);
+    }
+
+    pub fn records(&self) -> u64 {
+        self.records.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn saturating_add(counter: &std::sync::atomic::AtomicU64, value: u64) {
