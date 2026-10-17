@@ -2394,11 +2394,26 @@ mod lock_tests {
         use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
-        /// Lets the child exec on every path, panics included.
-        struct Release(io::PipeWriter);
-        impl Drop for Release {
+        use std::process::ExitStatus;
+        use std::thread::JoinHandle;
+        /// Releases the child and reaps it on every path, unwinding included.
+        struct Child {
+            release: Option<io::PipeWriter>,
+            spawner: Option<JoinHandle<io::Result<ExitStatus>>>,
+        }
+        impl Child {
+            fn release_and_reap(&mut self) -> Option<std::thread::Result<io::Result<ExitStatus>>> {
+                // The byte, or failing that EOF, ends the child's wait.
+                if let Some(mut release) = self.release.take() {
+                    let _ = release.write_all(b"r");
+                }
+                // The spawner returns once the child has exited and is reaped.
+                self.spawner.take().map(JoinHandle::join)
+            }
+        }
+        impl Drop for Child {
             fn drop(&mut self) {
-                let _ = self.0.write_all(b"r");
+                let _ = self.release_and_reap();
             }
         }
         let (_tmp, store) = setup();
@@ -2408,37 +2423,60 @@ mod lock_tests {
         // Close-on-exec, like every descriptor the archive opens.
         let (mut forked, signal) = io::pipe().unwrap();
         let (hold, release) = io::pipe().unwrap();
-        let release = Release(release);
         let (signal_fd, hold_fd) = (signal.as_raw_fd(), hold.as_raw_fd());
         let held = store.fs.lock().unwrap();
-        let child = std::thread::spawn(move || {
-            let mut command = std::process::Command::new("true");
-            // Only async-signal-safe calls between fork and exec.
-            unsafe {
-                command.pre_exec(move || {
-                    libc::write(signal_fd, b"f".as_ptr().cast(), 1);
-                    let mut byte = 0u8;
-                    loop {
-                        let read = libc::read(hold_fd, (&mut byte as *mut u8).cast(), 1);
-                        if read >= 0
-                            || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                        {
-                            break;
+        let mut child = Child {
+            release: Some(release),
+            spawner: Some(std::thread::spawn(move || {
+                let mut command = std::process::Command::new("true");
+                // Only async-signal-safe calls between fork and exec.
+                unsafe {
+                    command.pre_exec(move || {
+                        let interrupted =
+                            || io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+                        loop {
+                            match libc::write(signal_fd, b"f".as_ptr().cast(), 1) {
+                                1 => break,
+                                -1 if interrupted() => {}
+                                // EOF on the parent's side fails the test.
+                                _ => libc::_exit(1),
+                            }
                         }
-                    }
-                    Ok(())
-                });
+                        let mut byte = 0u8;
+                        while libc::read(hold_fd, (&mut byte as *mut u8).cast(), 1) < 0
+                            && interrupted()
+                        {}
+                        Ok(())
+                    });
+                }
+                let status = command.status();
+                drop((signal, hold));
+                status
+            })),
+        };
+        // Bounded: a child that never signals fails the test, and the guard
+        // releases and reaps it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut ready = libc::pollfd {
+                fd: forked.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            let timeout = left.as_millis().try_into().unwrap_or(i32::MAX);
+            match unsafe { libc::poll(&mut ready, 1, timeout) } {
+                1 => break,
+                0 => panic!("the forked child never signaled"),
+                _ => assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR)),
             }
-            let status = command.status();
-            drop((signal, hold));
-            status
-        });
+        }
         forked.read_exact(&mut [0; 1]).unwrap();
         drop(held);
         // The child is blocked before exec, holding an inherited copy.
         let fetched = store.fetch(&reference.id, 0, 1);
-        drop(release);
-        assert!(child.join().unwrap().unwrap().success());
+        let status = child.release_and_reap().unwrap().unwrap().unwrap();
+        assert!(status.success());
         assert_eq!(fetched.unwrap().len(), 1);
     }
 
