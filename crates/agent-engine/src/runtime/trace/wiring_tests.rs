@@ -590,6 +590,87 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
     assert_eq!(wire.digest, expected_wire_digest(&h.key_path, &received[0]));
 }
 
+/// `/compact` over Anthropic OAuth: the whole request body the server
+/// receives, byte for byte. OAuth routes on the first system block, so it is
+/// the transport identity a conversation turn starts with, followed by the
+/// product identity, the guidance and the compaction prompt.
+#[tokio::test]
+async fn compaction_oauth_request_body_golden() {
+    let bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
+    // (bearer authorization present, x-api-key present): presence only.
+    let auth_seen: Arc<Mutex<Vec<(bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let (bodies_c, auth_c) = (Arc::clone(&bodies), Arc::clone(&auth_seen));
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(move |headers: axum::http::HeaderMap, body: Bytes| {
+            let (bodies, auth_seen) = (Arc::clone(&bodies_c), Arc::clone(&auth_c));
+            async move {
+                let bearer = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("Bearer "));
+                auth_seen
+                    .lock()
+                    .unwrap()
+                    .push((bearer, headers.contains_key("x-api-key")));
+                bodies.lock().unwrap().push(body.to_vec());
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    json!({
+                        "content": [{"type": "text", "text": "summary"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 3, "output_tokens": 1}
+                    })
+                    .to_string(),
+                )
+            }
+        }),
+    );
+    let url = serve(app).await;
+    let h = harness(url);
+    let oauth = Arc::new(RwLock::new(AuthState {
+        auth_token: "oauth-test-token".into(),
+        auth_type: "oauth".into(),
+        refresh_token: None,
+        token_expires: Some(9_999_999_999_999),
+    }));
+    let messages = vec![Arc::new(json!({"role": "user", "content": "compact this"}))];
+    let text = ApiMethods::call_api_simple(
+        &oauth,
+        &Client::new(),
+        "claude-opus-4-7",
+        "COMPACTION-PROMPT",
+        0,
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+        &messages,
+        0,
+        &h.options,
+    )
+    .await
+    .expect("compaction call must succeed");
+    assert_eq!(text, "summary");
+
+    assert_eq!(*auth_seen.lock().unwrap(), vec![(true, false)], "OAuth route");
+    let identity = serde_json::to_string(&crate::core::config::get_identity()).unwrap();
+    let golden = concat!(
+        r#"{"max_tokens":128000,"#,
+        r#""messages":[{"content":"compact this","role":"user"}],"#,
+        r#""model":"claude-opus-4-7","#,
+        r#""output_config":{"effort":"low"},"#,
+        r#""system":["#,
+        r#"{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"},"#,
+        r#"{"text":IDENTITY,"type":"text"},"#,
+        r#"{"text":"You are a helpful AI assistant with access to tools. Use them when needed.","type":"text"},"#,
+        r#"{"text":"COMPACTION-PROMPT","type":"text"}],"#,
+        r#""thinking":{"display":"summarized","type":"adaptive"}}"#,
+    )
+    .replace("IDENTITY", &identity);
+    let received = bodies.lock().unwrap();
+    assert_eq!(received.len(), 1, "one request");
+    assert_eq!(String::from_utf8_lossy(&received[0]), golden);
+}
+
 // ─── Task 11: slow persistence must not delay the model turn ────────────────
 
 /// Loopback request through a `TraceContext` whose sink is the production

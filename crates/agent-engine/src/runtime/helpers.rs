@@ -18,6 +18,13 @@ pub(super) enum MarkerSite {
     MessageTail,
 }
 
+/// The first system block of every Anthropic OAuth request (conversation
+/// turns and the simple request `/compact` uses). Anthropic OAuth routes on
+/// it: it is a wire protocol contract, not Synaps branding or a
+/// user-configurable identity. Without it the provider rejects the request.
+pub(super) const OAUTH_TRANSPORT_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /// The single source of the cache_control JSON value. Bare ephemeral (5m)
 /// omits `ttl` entirely — byte-identical to today's payloads, so the
 /// default path cannot invalidate existing cached prefixes.
@@ -386,12 +393,8 @@ impl HelperMethods {
         ttl: CacheTtl,
     ) -> Option<Value> {
         if auth_type == "oauth" {
-            // Anthropic OAuth routes on this first system block. It is a wire
-            // protocol contract, not Synaps branding or user-configurable identity.
-            const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
-                "You are Claude Code, Anthropic's official CLI for Claude.";
             let mut system_blocks = vec![
-                json!({"type": "text", "text": CLAUDE_CODE_TRANSPORT_IDENTITY}),
+                json!({"type": "text", "text": OAUTH_TRANSPORT_IDENTITY}),
                 json!({"type": "text", "text": crate::core::config::get_identity()}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
