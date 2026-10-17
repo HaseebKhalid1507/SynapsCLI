@@ -40,7 +40,11 @@ impl Env {
         let home = tempfile::tempdir().unwrap();
         let base = home.path().join(".synaps-cli");
         std::fs::create_dir_all(base.join("work")).unwrap();
-        std::fs::write(base.join("config"), format!("model = {MAIN_MODEL}\ndaemon.idle_exit_secs = 0\n")).unwrap();
+        std::fs::write(
+            base.join("config"),
+            format!("model = {MAIN_MODEL}\ndaemon.idle_exit_secs = 0\n"),
+        )
+        .unwrap();
         std::fs::write(
             base.join("work").join("config"),
             format!("model = {PROFILE_MODEL}\ndaemon.idle_exit_secs = 1\n"),
@@ -80,7 +84,12 @@ impl Env {
             args.extend(["--profile", p]);
         }
         args.extend(["daemon", "stop", "--force"]);
-        let _ = self.cmd(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = self
+            .cmd(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -121,7 +130,11 @@ impl Client {
                 }
             }
         });
-        Self { child, out_rx, out: String::new() }
+        Self {
+            child,
+            out_rx,
+            out: String::new(),
+        }
     }
 
     fn wait_ready(&mut self, secs: u64) {
@@ -133,7 +146,11 @@ impl Client {
             if let Some(st) = self.child.try_wait().unwrap() {
                 panic!("client exited ({st}) before ready:\n{}", self.out);
             }
-            assert!(t0.elapsed() < Duration::from_secs(secs), "timeout waiting for ready:\n{}", self.out);
+            assert!(
+                t0.elapsed() < Duration::from_secs(secs),
+                "timeout waiting for ready:\n{}",
+                self.out
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -176,11 +193,22 @@ fn profile_client_spawns_and_uses_the_profile_daemon() {
 
     // The daemon is the profile's, and its session runs the profile config.
     assert!(registry::is_alive(&work), "daemon-work not running");
-    assert!(!registry::is_alive(&env.paths(None)), "a default-profile daemon was started");
+    assert!(
+        !registry::is_alive(&env.paths(None)),
+        "a default-profile daemon was started"
+    );
     let info = registry::read_daemon_json(&work).expect("daemon-work.json");
     assert_eq!(info.profile.as_deref(), Some("work"));
-    assert!(a.out.contains(PROFILE_MODEL), "session not on the profile model:\n{}", a.out);
-    assert!(!a.out.contains(MAIN_MODEL), "session on the MAIN model:\n{}", a.out);
+    assert!(
+        a.out.contains(PROFILE_MODEL),
+        "session not on the profile model:\n{}",
+        a.out
+    );
+    assert!(
+        !a.out.contains(MAIN_MODEL),
+        "session on the MAIN model:\n{}",
+        a.out
+    );
 
     // The client's own config reads were the profile's too: the idle-exit it
     // handed the daemon is work's 1 s, not main's "never" (0.10.1: main).
@@ -189,7 +217,22 @@ fn profile_client_spawns_and_uses_the_profile_daemon() {
         wait_dead(&work, 20),
         "daemon-work never idle-exited: the client spawned it with the MAIN config's idle_exit_secs"
     );
-    assert!(!env.base().join("sessions").exists(), "a session was written to the MAIN sessions dir");
+    // The global session index (sessions/index.jsonl) is shared across
+    // profiles by design (each record carries `profile`); anything else in
+    // the main sessions dir would be a profile session leaking out.
+    let main_sessions = env.base().join("sessions");
+    if main_sessions.exists() {
+        let leaked: Vec<_> = std::fs::read_dir(&main_sessions)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "index.jsonl" && !n.starts_with("index.jsonl."))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a session was written to the MAIN sessions dir: {leaked:?}"
+        );
+    }
 }
 
 #[test]
@@ -199,8 +242,14 @@ fn synaps_profile_env_selects_the_profile_daemon() {
     cmd.env("SYNAPS_PROFILE", "work");
     let mut a = Client::spawn(cmd);
     a.wait_ready(30);
-    assert!(registry::is_alive(&env.paths(Some("work"))), "env profile did not pick daemon-work");
-    assert!(!registry::is_alive(&env.paths(None)), "env-profiled client spawned the default daemon");
+    assert!(
+        registry::is_alive(&env.paths(Some("work"))),
+        "env profile did not pick daemon-work"
+    );
+    assert!(
+        !registry::is_alive(&env.paths(None)),
+        "env-profiled client spawned the default daemon"
+    );
     assert!(a.out.contains(PROFILE_MODEL), "{}", a.out);
     a.detach();
 }
@@ -209,10 +258,22 @@ fn synaps_profile_env_selects_the_profile_daemon() {
 fn client_refuses_a_daemon_serving_another_profile() {
     let env = Env::new();
     // `a.b` and `a_b` sanitise to the same socket stem (`daemon-a_b`).
-    let start = env.cmd(&["--profile", "a.b", "daemon", "--detach"]).stdin(Stdio::null()).output().unwrap();
-    assert!(start.status.success(), "{}", String::from_utf8_lossy(&start.stderr));
+    let start = env
+        .cmd(&["--profile", "a.b", "daemon", "--detach"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
     let paths = env.paths(Some("a.b"));
-    assert_eq!(paths.sock, env.paths(Some("a_b")).sock, "precondition: shared socket");
+    assert_eq!(
+        paths.sock,
+        env.paths(Some("a_b")).sock,
+        "precondition: shared socket"
+    );
     assert!(registry::is_alive(&paths));
 
     let out = env
@@ -221,8 +282,15 @@ fn client_refuses_a_daemon_serving_another_profile() {
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(agent_engine::daemon::EXIT_REFUSED), "{err}");
+    assert_eq!(
+        out.status.code(),
+        Some(agent_engine::daemon::EXIT_REFUSED),
+        "{err}"
+    );
     assert!(err.contains("refusing to attach"), "{err}");
-    assert!(err.contains("profile `a.b`") && err.contains("profile `a_b`"), "{err}");
+    assert!(
+        err.contains("profile `a.b`") && err.contains("profile `a_b`"),
+        "{err}"
+    );
     env.stop(Some("a.b"));
 }
