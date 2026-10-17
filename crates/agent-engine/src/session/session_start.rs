@@ -8,7 +8,7 @@
 //! session's own creation, waits for is served before background ones.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -18,16 +18,22 @@ use tokio::task::JoinHandle;
 use crate::extensions::hooks::HookBus;
 use crate::host::EngineHost;
 
+const WAITING: u8 = 0;
+const RUNNING: u8 = 1;
+const WITHDRAWN: u8 = 2;
+
 /// One session's place in line at the gate.
 pub(crate) struct StartTicket {
     /// A turn (or the session's creation) waits for this hook.
     foreground: AtomicBool,
+    phase: AtomicU8,
 }
 
 impl StartTicket {
     pub(crate) fn new(foreground: bool) -> Arc<Self> {
         Arc::new(Self {
             foreground: AtomicBool::new(foreground),
+            phase: AtomicU8::new(WAITING),
         })
     }
 
@@ -39,6 +45,21 @@ impl StartTicket {
 
     fn is_foreground(&self) -> bool {
         self.foreground.load(Ordering::Acquire)
+    }
+
+    /// The holder is about to call the hook; `false` if it was withdrawn
+    /// first. Decides, together with [`Self::withdraw`], exactly once.
+    pub(crate) fn begin(&self) -> bool {
+        self.phase
+            .compare_exchange(WAITING, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Take back a hook that has not been called yet; `false` once it runs.
+    pub(crate) fn withdraw(&self) -> bool {
+        self.phase
+            .compare_exchange(WAITING, WITHDRAWN, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -132,11 +153,13 @@ pub(crate) enum SessionStart {
     /// It ran in this process (or the session awaited it at create).
     Done,
     /// A task waits for extension discovery and its turn at the gate, then
-    /// calls the hook.
+    /// calls the hook; it yields `true` once the hook ran.
     Queued {
-        task: JoinHandle<()>,
+        task: JoinHandle<bool>,
         ticket: Arc<StartTicket>,
     },
+    /// Not in line: the session is parked. It joins the line once unparked.
+    Pending,
 }
 
 impl SessionStart {
@@ -162,6 +185,20 @@ impl SessionStart {
     pub(crate) fn is_done(&self) -> bool {
         matches!(self, Self::Done)
     }
+
+    /// The session parks: a hook not yet called leaves the line (nothing
+    /// held, nothing queued) and waits for the unpark. One already running
+    /// finishes. (A session that ends drops this, which stops the wait; a
+    /// hook already called may still be answered by its extension, and
+    /// nothing reads that answer.)
+    pub(crate) fn withdraw_for_park(&mut self) {
+        if let Self::Queued { task, ticket } = self {
+            if ticket.withdraw() {
+                task.abort();
+                *self = Self::Pending;
+            }
+        }
+    }
 }
 
 impl Drop for SessionStart {
@@ -178,7 +215,7 @@ async fn run_queued(
     journal_id: Arc<arc_swap::ArcSwap<String>>,
     discovery: Duration,
     ticket: Arc<StartTicket>,
-) {
+) -> bool {
     if tokio::time::timeout(discovery, host.extensions_ready())
         .await
         .is_err()
@@ -189,9 +226,13 @@ async fn run_queued(
         );
     }
     let permit = host.session_start_gate().acquire(&ticket).await;
+    if !ticket.begin() {
+        return false;
+    }
     let id = (**journal_id.load()).clone();
     crate::extensions::loader::emit_session_start(&bus, &id).await;
     drop(permit);
+    true
 }
 
 /// `on_session_start` for a session that waits for it at create: through
@@ -312,5 +353,15 @@ mod tests {
             t.await.unwrap();
         }
         assert_eq!(most.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_ticket_is_either_run_or_withdrawn_once() {
+        let t = StartTicket::new(false);
+        assert!(t.withdraw());
+        assert!(!t.begin(), "withdrawn: the hook is not called");
+        let t = StartTicket::new(false);
+        assert!(t.begin());
+        assert!(!t.withdraw(), "running: a park cannot take it back");
     }
 }

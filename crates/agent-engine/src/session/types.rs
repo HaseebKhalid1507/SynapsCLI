@@ -193,6 +193,11 @@ pub struct SessionConfig {
         deserialize_with = "SessionMemoryMode::deserialize_lenient"
     )]
     pub memory_mode: Option<SessionMemoryMode>,
+    /// Set by a daemon reload for a session it restores Parked (never on
+    /// the wire): with `await_extensions=false`, `on_session_start` waits
+    /// until the session is unparked instead of running right after create.
+    #[serde(skip)]
+    pub restore_parked: bool,
 }
 
 /// A durable `/memory` mode the user chose for a session
@@ -290,6 +295,7 @@ impl Default for SessionConfig {
             name: None,
             max_session_cost: None,
             memory_mode: None,
+            restore_parked: false,
         }
     }
 }

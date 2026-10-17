@@ -683,12 +683,14 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
 
 /// The config a session is restored with: as saved, except that the
 /// restore never waits on `on_session_start`. Each restored session runs
-/// the hook from its own loop (the deferred path quick-start sessions
+/// the hook in the background (the deferred path quick-start sessions
 /// use), so the restore of N sessions does not take N hook round trips
-/// while the socket waits.
-fn restore_config(saved: &SessionConfig) -> SessionConfig {
+/// while the socket waits. A session restored Parked runs it only once it
+/// is unparked.
+fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
     SessionConfig {
         await_extensions: false,
+        restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
         ..saved.clone()
     }
 }
@@ -698,7 +700,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // stopped, so `sa_1` never names two different workers.
     crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let config = restore_config(&s.config);
+        let config = restore_config(&s.config, s.lifecycle);
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
@@ -886,7 +888,8 @@ mod tests {
     }
 
     /// A restored session never waits on `on_session_start` at create; the
-    /// rest of its saved config is kept.
+    /// rest of its saved config is kept. One restored Parked defers the hook
+    /// to its unpark, and that flag never goes on the wire.
     #[test]
     fn a_restore_does_not_wait_on_the_session_start_hook() {
         let saved = SessionConfig {
@@ -895,8 +898,9 @@ mod tests {
             await_extensions: true,
             ..Default::default()
         };
-        let restored = restore_config(&saved);
+        let restored = restore_config(&saved, SessionLifecycle::Live);
         assert!(!restored.await_extensions);
+        assert!(!restored.restore_parked);
         let as_saved = SessionConfig {
             await_extensions: true,
             ..restored
@@ -905,6 +909,13 @@ mod tests {
             serde_json::to_value(&as_saved).unwrap(),
             serde_json::to_value(&saved).unwrap()
         );
+        for parked in [SessionLifecycle::Parked, SessionLifecycle::Parking] {
+            let restored = restore_config(&saved, parked);
+            assert!(restored.restore_parked, "{parked:?}");
+            assert!(!restored.await_extensions);
+            let wire = serde_json::to_value(&restored).unwrap();
+            assert!(wire.get("restore_parked").is_none(), "never on the wire");
+        }
     }
 
     #[test]

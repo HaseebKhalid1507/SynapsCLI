@@ -774,6 +774,9 @@ impl SessionActor {
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {
             super::session_start::SessionStart::Done
+        } else if cfg.restore_parked {
+            // Parked right after create: the hook waits for the unpark.
+            super::session_start::SessionStart::Pending
         } else {
             super::session_start::SessionStart::queue(
                 host,
@@ -2088,6 +2091,19 @@ impl SessionActor {
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
+        let flow = self.park_now().await;
+        // Restored to be parked but still live (it could not park): its
+        // `on_session_start` runs now, as for any live session.
+        if flow.is_continue()
+            && !self.is_parked()
+            && matches!(self.session_start, super::session_start::SessionStart::Pending)
+        {
+            self.queue_session_start();
+        }
+        flow
+    }
+
+    async fn park_now(&mut self) -> std::ops::ControlFlow<EndReason> {
         // Fired by a worker re-check (not the grace, not an explicit Park)?
         let recheck = self.park_deadline.is_some() && self.park_deadline == self.park_recheck_at;
         self.park_recheck_at = None;
@@ -2162,6 +2178,9 @@ impl SessionActor {
         // pick up the parked session (the daemon will fail to re-acquire
         // on unpark and surface a clear error instead of a zombie).
         self.session_lock = None;
+        // A hook not called yet waits for the unpark, out of line.
+        self.session_start.withdraw_for_park();
+        self.keepwarm_awaits_start = false;
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
@@ -2296,6 +2315,10 @@ impl SessionActor {
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
         self.update_attach_state();
+        // A hook that waited for the unpark runs now (once per session).
+        if matches!(self.session_start, super::session_start::SessionStart::Pending) {
+            self.queue_session_start();
+        }
         tracing::info!(session = %self.id, ms = started.elapsed().as_millis() as u64, "session unparked");
         Ok(())
     }
@@ -2385,12 +2408,23 @@ impl SessionActor {
     /// for it: a started turn's request, a due keep-warm ping.
     async fn session_start_finished(
         &mut self,
-        ran: std::result::Result<(), tokio::task::JoinError>,
+        ran: std::result::Result<bool, tokio::task::JoinError>,
     ) {
-        if let Err(e) = ran {
-            tracing::warn!(session = %self.id, "on_session_start task failed: {e}");
+        use super::session_start::SessionStart;
+        match ran {
+            Ok(true) => {}
+            // Withdrawn before it was called (a park): not run yet. Anything
+            // waiting for it puts it back in line.
+            Ok(false) => {
+                self.session_start = SessionStart::Pending;
+                if self.turn_awaiting_start.is_some() || self.keepwarm_awaits_start {
+                    self.session_start_ready();
+                }
+                return;
+            }
+            Err(e) => tracing::warn!(session = %self.id, "on_session_start task failed: {e}"),
         }
-        self.session_start = super::session_start::SessionStart::Done;
+        self.session_start = SessionStart::Done;
         if self.runtime.is_live() {
             self.publish_view().await;
         }
@@ -2413,22 +2447,37 @@ impl SessionActor {
     /// it builds its own prompt; a rolling summary reuses the request of the
     /// turn before it or builds its own prompt.) A session created with
     /// `await_extensions=false` (quick start, every session a reload
-    /// restores) has a task in line at the host's gate for it.
+    /// restores) has a task in line at the host's gate for it, or, while
+    /// parked, nothing in line until the unpark.
     ///
-    /// `true` once the hook has run. Otherwise it moves the hook ahead of
-    /// background hooks; the caller waits for `session_start_finished`
-    /// without blocking the loop. The hook itself always runs in that task,
-    /// through the gate, so it is never called twice or beside another
-    /// session's.
+    /// `true` once the hook has run. Otherwise it puts the hook in line if
+    /// it is not (after a park) and moves it ahead of background hooks; the
+    /// caller waits for `session_start_finished` without blocking the loop.
+    /// The hook itself always runs in that task, through the gate, so it is
+    /// never called twice or beside another session's.
     pub(crate) fn session_start_ready(&mut self) -> bool {
         use super::session_start::SessionStart;
+        if matches!(self.session_start, SessionStart::Pending) {
+            self.queue_session_start();
+        }
         match &self.session_start {
             SessionStart::Done => true,
             SessionStart::Queued { ticket, .. } => {
                 ticket.prefer();
                 false
             }
+            SessionStart::Pending => false,
         }
+    }
+
+    /// Put this session's `on_session_start` in line (in the background).
+    fn queue_session_start(&mut self) {
+        self.session_start = super::session_start::SessionStart::queue(
+            &self.host,
+            Arc::clone(&self.hook_bus),
+            Arc::clone(&self.journal_id),
+            extensions_ready_timeout(&self.host.config()),
+        );
     }
 
     /// Open the turn's stream: the request goes out.
@@ -5013,7 +5062,7 @@ fn extensions_ready_timeout(config: &crate::SynapsConfig) -> Duration {
 /// This session's `on_session_start` task, while it is in line or running.
 async fn session_start_task(
     start: &mut super::session_start::SessionStart,
-) -> std::result::Result<(), tokio::task::JoinError> {
+) -> std::result::Result<bool, tokio::task::JoinError> {
     match start {
         super::session_start::SessionStart::Queued { task, .. } => task.await,
         _ => std::future::pending().await,
