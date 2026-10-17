@@ -211,6 +211,15 @@ Storage exhaustion stops rollover; no automatic source eviction or tombstoning.
 The index is currently a bounded scan, not a large-corpus search engine.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
 
+Concurrency: operations on one project's archive (rollover seals, parallel
+history tool calls, subagents in the same process) queue in-process for at most
+30 seconds instead of failing; a seal and its stored note are one operation.
+Another process holding the archive lock still fails closed immediately
+("archive busy"; history retained). The lock is released explicitly, so a
+child process forked concurrently by another thread cannot keep it held. A
+caller canceled while its operation is queued never starts it; a started
+operation completes.
+
 ## Axel integration: one selected memory authority
 
 **Shared-repository update:** the host now uses one shared brain with durable Git
