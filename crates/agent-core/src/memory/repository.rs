@@ -45,6 +45,22 @@ thread_local! {
     static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Force the one-option-per-process `rev-parse` path (tests only).
     static FORCE_SINGLE_REV_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Wait operations performed by `git()` on this thread (tests only).
+    static GIT_WAITS: std::cell::RefCell<Vec<GitWait>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How `git()` waited (tests only): polling for output, or sleeping before
+/// or after stdout EOF.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitWait {
+    PollOutput,
+    Sleep { after_eof: bool, duration: Duration },
+}
+
+#[cfg(test)]
+fn record_wait(wait: GitWait) {
+    GIT_WAITS.with(|w| w.borrow_mut().push(wait));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +195,8 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError
             let slice = POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
             // Round up so a sub-millisecond remainder does not spin.
             let timeout_ms = slice.as_micros().div_ceil(1000) as libc::c_int;
+            #[cfg(test)]
+            record_wait(GitWait::PollOutput);
             let mut pfd = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -210,6 +228,11 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError
             if remaining.is_zero() {
                 return Err(timed_out());
             }
+            #[cfg(test)]
+            record_wait(GitWait::Sleep {
+                after_eof: true,
+                duration: backoff.min(remaining),
+            });
             std::thread::sleep(backoff.min(remaining));
             backoff = (backoff * 2).min(POLL_INTERVAL);
         }
@@ -846,19 +869,44 @@ mod tests {
         }
     }
 
-    // Smoke check, not a benchmark: the old wait slept a fixed 10 ms per call
-    // (>= 300 ms for 30 calls); an event-driven wait is ~1-2 ms per call.
+    // Deterministic, not a timing check: before EOF git() must wait for its
+    // output with poll(2), never with a fixed sleep (the old loop slept 10 ms).
+    // Only the bounded post-EOF reaping backoff may sleep, starting far below
+    // that. Elapsed time is measured only by the ignored benchmark.
     #[test]
     #[serial(umask, process_spawn)]
-    fn git_fast_path_has_no_fixed_sleep() {
+    fn git_waits_for_output_by_poll_not_fixed_sleep() {
         let tmp = TempDir::new().unwrap();
         let (main, _) = fixture(&tmp, 0, &[]);
-        let started = Instant::now();
-        for _ in 0..30 {
+        let mut polls = 0;
+        for _ in 0..10 {
+            GIT_WAITS.with(|w| w.borrow_mut().clear());
             git(&main, &["rev-parse", "--git-common-dir"]).unwrap();
+            let waits = GIT_WAITS.with(|w| w.take());
+            // Pre-EOF waits are polls; then only the reaping backoff.
+            let reaping = waits
+                .iter()
+                .position(|w| matches!(w, GitWait::Sleep { .. }))
+                .unwrap_or(waits.len());
+            for (i, wait) in waits.iter().enumerate() {
+                match *wait {
+                    GitWait::PollOutput => assert!(i < reaping, "{waits:?}"),
+                    GitWait::Sleep {
+                        after_eof,
+                        duration,
+                    } => {
+                        assert!(after_eof, "fixed sleep before EOF: {waits:?}");
+                        if i == reaping {
+                            assert!(duration < Duration::from_millis(1), "{waits:?}");
+                        }
+                    }
+                }
+            }
+            polls += reaping;
         }
-        let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+        // Git takes about a millisecond: its output cannot all be ready at
+        // the first read in every one of ten calls.
+        assert!(polls > 0);
     }
 
     /// `cargo test -p synaps-core --lib -- --ignored --nocapture discovery_bench`
