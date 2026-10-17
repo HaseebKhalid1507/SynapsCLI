@@ -212,13 +212,14 @@ The index is currently a bounded scan, not a large-corpus search engine.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
 
 Concurrency: operations on one project's archive (rollover seals, parallel
-history tool calls, subagents in the same process) queue in-process for at most
-30 seconds instead of failing; a seal and its stored note are one operation.
-Another process holding the archive lock still fails closed immediately
-("archive busy"; history retained). The lock is released explicitly, so a
-child process forked concurrently by another thread cannot keep it held. A
-caller canceled while its operation is queued never starts it; a started
-operation completes.
+history tool calls, subagents in the same process) wait for each other
+in-process (not in FIFO order) and fail as busy if not admitted within 30
+seconds; a seal and its stored note are one operation. Another process holding
+the archive lock still fails closed without waiting for it ("archive busy";
+history retained). The lock is released explicitly, so a child process forked
+concurrently by another thread cannot keep it held. A caller canceled before
+its operation is admitted reads and writes no records (opening the store may
+already have happened); an admitted operation completes.
 
 ## Axel integration: one selected memory authority
 

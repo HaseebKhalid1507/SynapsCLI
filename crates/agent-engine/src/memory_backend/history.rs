@@ -24,9 +24,13 @@ fn valid_id(id: &str) -> bool {
 }
 /// Run one local archive operation on a blocking worker. The archive queues
 /// operations within this process, so a worker that outlives its dropped
-/// caller delays later operations rather than making them fail as busy. If the
-/// caller is dropped before the operation starts, the abort flag stops it from
-/// touching the archive at all.
+/// caller delays later operations rather than making them fail as busy.
+///
+/// Dropping the caller sets the abort flag. A worker that sees it before it
+/// starts does nothing; one that sees it while waiting for admission reads and
+/// writes no records, although opening the store (creating the private
+/// directories) and projecting a seal may already have happened. Once admitted
+/// an operation always completes, so an abandoned seal may still be published.
 async fn archive_worker<T: Send + 'static>(
     work: impl FnOnce(Arc<AtomicBool>) -> std::io::Result<T> + Send + 'static,
 ) -> Result<T> {
@@ -38,10 +42,18 @@ async fn archive_worker<T: Send + 'static>(
     }
     let abort = AbortOnDrop(Arc::new(AtomicBool::new(false)));
     let flag = abort.0.clone();
-    tokio::task::spawn_blocking(move || work(flag))
-        .await
-        .map_err(|_| error("history worker failed"))?
-        .map_err(|e| error(e.to_string()))
+    tokio::task::spawn_blocking(move || {
+        if flag.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "archive operation canceled before it started",
+            ));
+        }
+        work(flag)
+    })
+    .await
+    .map_err(|_| error("history worker failed"))?
+    .map_err(|e| error(e.to_string()))
 }
 impl MemoryBinding {
     pub async fn history_seal(
