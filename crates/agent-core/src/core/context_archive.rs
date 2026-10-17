@@ -1603,7 +1603,11 @@ mod projection_tests {
     }
 }
 
+// Archive locks are non-blocking: a concurrently spawned test process can
+// briefly hold an inherited lock descriptor until it executes, see
+// memory::repository tests.
 #[cfg(all(test, unix))]
+#[serial_test::parallel(process_spawn)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};

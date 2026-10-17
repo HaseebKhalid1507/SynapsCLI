@@ -694,6 +694,11 @@ mod private {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    // Fixture tests create directories (racing the crate's umask-mutating
+    // tests) and spawn Git. A forked child briefly inherits other threads'
+    // descriptors, including held advisory locks, until it executes Git; tests
+    // that require uncontended try-locks join `process_spawn` as `parallel`.
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn fixture_git(root: &Path, args: &[&str]) {
@@ -780,6 +785,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(umask, process_spawn)]
     fn discovery_spawns_one_git_per_registered_worktree() {
         let tmp = TempDir::new().unwrap();
         let (main, roots) = fixture(&tmp, 40, &[]);
@@ -793,6 +799,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(umask, process_spawn)]
     fn checkout_batches_rev_parse_and_newline_paths_fall_back() {
         let tmp = TempDir::new().unwrap();
         let (main, roots) = fixture(&tmp, 1, &["worker a", "worker\n\"b"]);
@@ -810,6 +817,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(umask, process_spawn)]
     fn batched_and_single_rev_parse_resolve_identical_identity() {
         let tmp = TempDir::new().unwrap();
         let (main, roots) = fixture(&tmp, 3, &["worker a", "worker\n\"b"]);
@@ -841,6 +849,7 @@ mod tests {
     // Smoke check, not a benchmark: the old wait slept a fixed 10 ms per call
     // (>= 300 ms for 30 calls); an event-driven wait is ~1-2 ms per call.
     #[test]
+    #[serial(umask, process_spawn)]
     fn git_fast_path_has_no_fixed_sleep() {
         let tmp = TempDir::new().unwrap();
         let (main, _) = fixture(&tmp, 0, &[]);
@@ -854,6 +863,7 @@ mod tests {
 
     /// `cargo test -p synaps-core --lib -- --ignored --nocapture discovery_bench`
     #[test]
+    #[serial(umask, process_spawn)]
     #[ignore]
     fn discovery_bench_132_worktrees() {
         let tmp = TempDir::new().unwrap();
