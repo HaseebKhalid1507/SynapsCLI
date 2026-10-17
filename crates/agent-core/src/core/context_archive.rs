@@ -202,10 +202,14 @@ struct Locked {
 
 struct GateGuard(Arc<Gate>);
 
+/// Device and inode of an archive directory.
+type DirIdentity = (u64, u64);
+type Gates = Mutex<HashMap<DirIdentity, Weak<Gate>>>;
+
 impl Gate {
     /// One gate per directory identity, however the directory was reached.
-    fn for_directory(identity: (u64, u64)) -> Arc<Gate> {
-        static GATES: OnceLock<Mutex<HashMap<(u64, u64), Weak<Gate>>>> = OnceLock::new();
+    fn for_directory(identity: DirIdentity) -> Arc<Gate> {
+        static GATES: OnceLock<Gates> = OnceLock::new();
         let mut gates = GATES
             .get_or_init(Default::default)
             .lock()
@@ -1304,7 +1308,7 @@ impl PrivateDir {
         ))
     }
     /// Directory identity for the in-process gate.
-    fn identity(&self) -> io::Result<(u64, u64)> {
+    fn identity(&self) -> io::Result<DirIdentity> {
         use std::os::unix::fs::MetadataExt;
         let meta = self.0.metadata()?;
         Ok((meta.dev(), meta.ino()))
@@ -1415,7 +1419,7 @@ impl PrivateDir {
     fn new(_: &Path, _: &str) -> io::Result<Self> {
         Self::unsupported()
     }
-    fn identity(&self) -> io::Result<(u64, u64)> {
+    fn identity(&self) -> io::Result<DirIdentity> {
         Self::unsupported()
     }
     fn lock(&self) -> io::Result<FlockGuard> {
