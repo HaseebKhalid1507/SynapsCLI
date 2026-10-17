@@ -551,3 +551,66 @@ async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
 
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }
+
+/// What the slow session-start fixture injects (tests/fixtures).
+const SLOW_START_SENTINEL: &str = "SLOW-START-SENTINEL";
+
+/// The request body whose messages carry `marker`, if the stub saw one.
+fn body_with(bodies: &Bodies, marker: &str) -> Option<serde_json::Value> {
+    let bodies = bodies.lock().unwrap_or_else(|p| p.into_inner());
+    bodies
+        .iter()
+        .filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .find(|b| b["messages"].to_string().contains(marker))
+}
+
+/// The restored sessions' hooks run after the restore, but still one at a
+/// time: 30 hooks at once would queue in the single extension process and
+/// the tail would pass the 5 s handler timeout and lose its injection for
+/// the whole session. Every restored session's first turn carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn every_restored_session_gets_its_session_start_injection() {
+    const SESSIONS: usize = 30;
+    let guard = HomeGuard::new();
+    let plugin = install_slow_start_plugin(&guard);
+    let (url, _hits, bodies) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let ids = sessions_with_one_turn(&d.paths, guard.home.path(), SESSIONS).await;
+    for i in 0..SESSIONS {
+        let body = body_with(&bodies, &format!("before reload {i}")).expect("pre-reload request");
+        assert!(body["system"].to_string().contains(SLOW_START_SENTINEL), "fixture wired: session {i}");
+    }
+
+    // 30 x 300 ms one after another fits every hook in the handler timeout;
+    // 30 at once does not.
+    std::fs::write(plugin.join("slow-ms"), "300").unwrap();
+    let log = plugin.join("session-start.jsonl");
+    let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
+    assert_eq!(gen, 2);
+    let t0 = std::time::Instant::now();
+    assert!(answered_within(&d.paths, 2, t0, Duration::from_secs(10)).await.is_some(), "new image answers");
+    // Let the background hooks finish before any turn (a turn would run its
+    // own session's hook at once; this test is about the background wave).
+    let lines = || std::fs::read_to_string(&log).map(|s| s.lines().count()).unwrap_or(0);
+    while lines() < 2 * SESSIONS {
+        assert!(t0.elapsed() < Duration::from_secs(60), "hooks after the reload: {}", lines() - SESSIONS);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    for (i, id) in ids.iter().enumerate() {
+        let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: id.clone(), mode: AttachMode::Mirror })
+            .await
+            .expect("reattached");
+        one_turn(&mut t, &format!("after reload {i}")).await;
+        t.detach().await;
+        let body = body_with(&bodies, &format!("after reload {i}")).expect("post-reload request");
+        assert!(
+            body["system"].to_string().contains(SLOW_START_SENTINEL),
+            "session {i} lost its session-start injection in the restore"
+        );
+    }
+
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
