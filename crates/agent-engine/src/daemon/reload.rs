@@ -681,12 +681,25 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
     }
 }
 
+/// The config a session is restored with: as saved, except that the
+/// restore never waits on `on_session_start`. Each restored session runs
+/// the hook from its own loop (the deferred path quick-start sessions
+/// use), so the restore of N sessions does not take N hook round trips
+/// while the socket waits.
+fn restore_config(saved: &SessionConfig) -> SessionConfig {
+    SessionConfig {
+        await_extensions: false,
+        ..saved.clone()
+    }
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // Before any session can dispatch: ids continue where the old image
     // stopped, so `sa_1` never names two different workers.
     crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let created = match state.create(s.config.clone()).await {
+        let config = restore_config(&s.config);
+        let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
             // placeholder under the SAME id. No alias, no fresh session.
@@ -710,7 +723,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 state
                     .create(SessionConfig {
                         continue_session: None,
-                        ..s.config.clone()
+                        ..config.clone()
                     })
                     .await
             }
@@ -870,6 +883,28 @@ mod tests {
         let l = d.path().join("link");
         std::os::unix::fs::symlink(&f, &l).unwrap();
         assert_eq!(validate_exe(&l).unwrap(), f.canonicalize().unwrap());
+    }
+
+    /// A restored session never waits on `on_session_start` at create; the
+    /// rest of its saved config is kept.
+    #[test]
+    fn a_restore_does_not_wait_on_the_session_start_hook() {
+        let saved = SessionConfig {
+            model_override: Some("claude-sonnet-4-5".into()),
+            keep_warm: true,
+            await_extensions: true,
+            ..Default::default()
+        };
+        let restored = restore_config(&saved);
+        assert!(!restored.await_extensions);
+        let as_saved = SessionConfig {
+            await_extensions: true,
+            ..restored
+        };
+        assert_eq!(
+            serde_json::to_value(&as_saved).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
     }
 
     #[test]
