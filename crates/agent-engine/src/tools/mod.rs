@@ -300,6 +300,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// The operation name this tool was registered under by its source (an
+    /// extension's own tool name, before the `<extension>:` runtime prefix),
+    /// when that differs from [`Tool::name`]. Typed metadata for policy that
+    /// must not depend on the exposed name alone; `None` when not declared.
+    fn source_operation(&self) -> Option<&str> {
+        None
+    }
+
     /// Runtime-origin identity used for catalog provenance. Conservative by
     /// default: tools that declare nothing are `Unknown` (fail-closed source
     /// trust), and tools that declare an owning extension classify as
