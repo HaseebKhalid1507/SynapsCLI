@@ -50,22 +50,24 @@ impl Drop for BaseDirGuard {
     }
 }
 
-/// RAII guard for any other process env var (set or unset → restore on drop).
+/// RAII guard for any other process env var (set or unset → restore on
+/// drop). The previous value is kept as an `OsString`, so a value that is
+/// not UTF-8 (a valid Unix path can be) is restored byte for byte.
 pub(crate) struct EnvVarGuard {
     key: &'static str,
-    old: Option<String>,
+    old: Option<std::ffi::OsString>,
 }
 
 impl EnvVarGuard {
     pub(crate) fn set(key: &'static str, value: &str) -> Self {
-        let old = std::env::var(key).ok();
+        let old = std::env::var_os(key);
         std::env::set_var(key, value);
         Self { key, old }
     }
 
     /// Unset `key` for the guard's lifetime.
     pub(crate) fn remove(key: &'static str) -> Self {
-        let old = std::env::var(key).ok();
+        let old = std::env::var_os(key);
         std::env::remove_var(key);
         Self { key, old }
     }
@@ -77,5 +79,45 @@ impl Drop for EnvVarGuard {
             Some(v) => std::env::set_var(self.key, v),
             None => std::env::remove_var(self.key),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::EnvVarGuard;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+
+    const KEY: &str = "SYNAPS_TEST_ENV_GUARD_NON_UTF8";
+
+    /// A valid Unix path need not be UTF-8 (0xff here).
+    fn non_utf8() -> OsString {
+        OsStr::from_bytes(b"/var/run/syn\xffaps").to_os_string()
+    }
+
+    /// Removing a variable whose value is not UTF-8 restores the exact bytes.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn remove_restores_a_non_utf8_value() {
+        std::env::set_var(KEY, non_utf8());
+        {
+            let _guard = EnvVarGuard::remove(KEY);
+            assert_eq!(std::env::var_os(KEY), None);
+        }
+        assert_eq!(std::env::var_os(KEY), Some(non_utf8()));
+        std::env::remove_var(KEY);
+    }
+
+    /// Setting over a value that is not UTF-8 restores the exact bytes.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn set_restores_a_non_utf8_value() {
+        std::env::set_var(KEY, non_utf8());
+        {
+            let _guard = EnvVarGuard::set(KEY, "plain");
+            assert_eq!(std::env::var_os(KEY), Some(OsString::from("plain")));
+        }
+        assert_eq!(std::env::var_os(KEY), Some(non_utf8()));
+        std::env::remove_var(KEY);
     }
 }
