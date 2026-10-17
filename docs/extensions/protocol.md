@@ -511,6 +511,14 @@ live in the system prompt):
 
 - **`on_session_start`** — content is **appended to the system prompt** once
   and carried unchanged for the whole session. Session-stable, cache-safe.
+  A session that does not wait for extensions when it is created (quick
+  start, and every session a daemon reload restores) runs the hook in the
+  background, one session at a time per host. No turn and no keep-warm
+  request of that session goes out before its hook has run: a turn that
+  comes first waits for it (and goes ahead of other sessions' background
+  hooks), while Cancel and End still act at once. A manual `/compact`
+  builds its own prompt and does not wait. A session restored Parked runs
+  the hook once it is unparked.
 - **`before_message`** — content is re-evaluated per turn and **attached to
   the newest user message** as a trailing text block on the outgoing request,
   positioned **after** the conversational cache breakpoint: the cache marker

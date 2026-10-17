@@ -1,11 +1,14 @@
-//! A session never sends its first request before `on_session_start` has run.
+//! A session's first turn never sends its request before `on_session_start`
+//! has run (nor does a keep-warm ping; a manual `/compact` builds its own
+//! prompt and does not wait).
 //!
 //! The hook's answer (a session-scoped injection) goes into the system prompt
-//! of every request. A session created with `await_extensions = false` (the
-//! TUI quick-start path, and every session a daemon reload restores) runs the
-//! hook from its own loop once extension discovery is done. A turn submitted
-//! before that must wait for the hook; otherwise its first request goes out
-//! without the injection and the next one changes the cached system prompt.
+//! of every turn request. A session created with `await_extensions = false`
+//! (the TUI quick-start path, and every session a daemon reload restores) runs
+//! the hook in the background once extension discovery is done. A turn
+//! submitted before that waits for the hook; otherwise its first request goes
+//! out without the injection and the next one changes the cached system
+//! prompt.
 //!
 //! Here discovery is held open for 1.5 s by an extension whose `initialize`
 //! sleeps, and the turn is submitted at once.
