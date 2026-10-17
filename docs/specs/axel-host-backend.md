@@ -57,7 +57,12 @@ by implementation/testing.
 - Foreground, worker and extension-provider tool loops share the immutable host
   binding. Independent extension/MCP memory tools and legacy reverse-memory RPC
   remain refused in Axel mode. The installed memory-manager plugin is not another
-  authority, and no plugin process is needed for these operations.
+  authority, and no plugin process is needed for these operations. A tool counts
+  as memory when its registered operation, its runtime name or that name's last
+  `:` segment is a memory tool's name, exactly or in the form it is offered to
+  the model under (ignoring ASCII case): an extension `memory` registering
+  `search` is offered as `memory_search` and is refused. Other custom names
+  cannot be recognized generically.
 
 ## Continuous memory and explicit history import
 

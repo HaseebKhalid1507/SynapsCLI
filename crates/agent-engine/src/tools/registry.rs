@@ -226,6 +226,12 @@ impl ToolRegistry {
         Self::api_safe_identifier(name, used, 128, false)
     }
 
+    /// The wire name `runtime_name` is exposed under when nothing else
+    /// claims it first (no collision suffix).
+    pub(crate) fn unclaimed_wire_name(runtime_name: &str) -> String {
+        Self::api_safe_name(runtime_name, &HashSet::new())
+    }
+
     fn api_safe_property_name(name: &str, used: &HashSet<String>) -> String {
         Self::api_safe_identifier(name, used, 64, true)
     }

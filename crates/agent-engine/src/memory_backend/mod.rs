@@ -11,6 +11,7 @@ use agent_core::memory::store::{
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+mod competing;
 pub mod forum;
 mod history;
 pub mod migration;
@@ -29,6 +30,7 @@ pub fn competing_note_tool(name: &str) -> bool {
             | "memory_recall"
     )
 }
+pub use competing::competing_memory_tool;
 
 pub const CONTRACT: &str = "synaps-axel/2";
 pub const USER_SCOPE: &str = "p0000000000000000";

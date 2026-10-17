@@ -610,6 +610,10 @@ impl Tool for DeferredExtensionTool {
         }
     }
 
+    fn source_operation(&self) -> Option<&str> {
+        Some(&self.tool_name)
+    }
+
     fn name(&self) -> &str {
         &self.runtime_name
     }
@@ -629,7 +633,7 @@ impl Tool for DeferredExtensionTool {
             .memory_backend
             .clone()
             .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
-        if binding.exclusive() && crate::memory_backend::competing_note_tool(&self.tool_name) {
+        if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
             return Err(crate::RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
         }
         // Without the typed session lease capability, a deferred extension
@@ -771,6 +775,13 @@ mod tests {
     }
 
     // ── regression proof: empty/absent context_providers change NOTHING ─
+
+    #[test]
+    fn a_deferred_extension_tool_names_its_registered_operation() {
+        let tool = DeferredExtensionTool::new("plug", &declared_tool("memory_fetch"));
+        assert_eq!(tool.name(), "plug:memory_fetch");
+        assert_eq!(tool.source_operation(), Some("memory_fetch"));
+    }
 
     #[test]
     fn absent_or_empty_deferred_blocks_classify_exactly_as_before() {
@@ -1061,5 +1072,65 @@ mod tests {
             }),
             Err("invalid_declared_tool_name"),
         );
+    }
+
+    // ── an exclusive memory binding refuses aliased memory tools ────────
+
+    const MEMORY_REFUSAL: &str = "independent extension memory is disabled by the selected host backend; use short memory tools";
+
+    async fn call_deferred(
+        plugin: &str,
+        operation: &str,
+        kind: agent_core::config::MemoryBackendKind,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let binding = crate::tools::test_helpers::memory_binding(kind, dir.path());
+        let tool = DeferredExtensionTool::new(plugin, &declared_tool(operation));
+        match tool
+            .execute(json!({}), crate::tools::test_helpers::context_with_memory(binding))
+            .await
+        {
+            Err(crate::RuntimeError::Tool(message)) => message,
+            other => panic!("expected a tool error, got {other:?}"),
+        }
+    }
+
+    /// Regression: `memory:search` is offered as `memory_search`, yet only
+    /// its operation `search` was checked.
+    #[tokio::test]
+    async fn an_exclusive_binding_refuses_deferred_extension_memory_aliases() {
+        use agent_core::config::MemoryBackendKind::Axel;
+        for (plugin, operation) in [
+            ("memory", "search"),
+            ("memory", "fetch"),
+            ("plug", "memory.store"),
+            ("axel-memory-manager", "memory_search"),
+            ("axel-memory-manager", "memory_forget"),
+        ] {
+            assert_eq!(
+                call_deferred(plugin, operation, Axel).await,
+                MEMORY_REFUSAL,
+                "{plugin}:{operation}"
+            );
+        }
+    }
+
+    /// Other tools, and every tool without an exclusive binding, go on to
+    /// the lease check exactly as before (no lease here, so nothing starts).
+    #[tokio::test]
+    async fn other_deferred_tools_and_legacy_bindings_reach_the_lease_check() {
+        use agent_core::config::MemoryBackendKind::{Axel, Legacy};
+        for (plugin, operation, kind) in [
+            ("weather", "search", Axel),
+            ("memory", "summarize", Axel),
+            ("memory", "search", Legacy),
+            ("axel-memory-manager", "memory_search", Legacy),
+        ] {
+            let message = call_deferred(plugin, operation, kind).await;
+            assert!(
+                message.contains("is activation-deferred"),
+                "{plugin}:{operation}: {message}"
+            );
+        }
     }
 }
