@@ -1103,7 +1103,9 @@ mod tests {
         for (plugin, operation) in [
             ("memory", "search"),
             ("memory", "fetch"),
+            ("Memory", "Search"),
             ("plug", "memory.store"),
+            ("plug", "MEMORY_STORE"),
             ("axel-memory-manager", "memory_search"),
             ("axel-memory-manager", "memory_forget"),
         ] {
@@ -1113,6 +1115,55 @@ mod tests {
                 "{plugin}:{operation}"
             );
         }
+    }
+
+    /// The suffixed wire name the model sees beside the host's own tool
+    /// reaches the deferred alias, which refuses.
+    #[tokio::test]
+    async fn the_suffixed_wire_name_of_a_deferred_alias_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::tools::ToolRegistry::from_tools_for_tests(vec![
+            Arc::new(crate::tools::memory::MemorySearchTool),
+            Arc::new(DeferredExtensionTool::new("memory", &declared_tool("search"))),
+        ]);
+        assert_eq!(registry.runtime_name_for_api("memory_search"), "memory_search");
+        assert_eq!(registry.runtime_name_for_api("memory_search_2"), "memory:search");
+        let alias = registry
+            .get(registry.runtime_name_for_api("memory_search_2"))
+            .expect("alias registered");
+        let binding = crate::tools::test_helpers::memory_binding(
+            agent_core::config::MemoryBackendKind::Axel,
+            dir.path(),
+        );
+        match alias
+            .execute(json!({}), crate::tools::test_helpers::context_with_memory(binding))
+            .await
+        {
+            Err(crate::RuntimeError::Tool(message)) => assert_eq!(message, MEMORY_REFUSAL),
+            other => panic!("expected the memory refusal, got {other:?}"),
+        }
+    }
+
+    /// A nested `:` (`plug:memory:fetch`) cannot reach a deferred tool: the
+    /// manifest refuses `:` in declared tool names, and a plugin id with `:`
+    /// gets no deferred tools. The classifier still covers it for other
+    /// routes (`memory_backend::competing`).
+    #[test]
+    fn a_nested_colon_name_never_becomes_a_deferred_tool() {
+        assert_eq!(
+            validate_deferred(&DeferredDeclarations {
+                tools: vec![declared_tool("memory:fetch")],
+                ..Default::default()
+            }),
+            Err("invalid_declared_tool_name"),
+        );
+        let mut manifest = base_manifest(&["tools.register"]);
+        manifest.deferred = Some(DeferredDeclarations {
+            tools: vec![declared_tool("fetch")],
+            ..DeferredDeclarations::default()
+        });
+        assert_eq!(dormant_extension_tools("plug", &manifest).len(), 1);
+        assert!(dormant_extension_tools("plug:memory", &manifest).is_empty());
     }
 
     /// Other tools, and every tool without an exclusive binding, go on to
