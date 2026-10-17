@@ -165,8 +165,12 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError
     let timed_out = || invalid("Git discovery timed out after 5 seconds");
     // A reader thread or blocking read_to_end can outlive the timeout when a
     // descendant retains stdout. Read the nonblocking pipe, waiting for it with
-    // poll(2) in slices of at most POLL_INTERVAL so a child that exits early
-    // (with a descendant still holding the pipe) is noticed as before.
+    // poll(2) in slices of at most POLL_INTERVAL (no sleep before EOF), and
+    // check the direct child after each slice. A child that fails while a
+    // descendant still holds the pipe is reported at once; one that succeeds
+    // but leaves a descendant holding stdout still waits for EOF until the
+    // deadline and then times out, as before. After EOF the child is reaped
+    // with a bounded sleep backoff (20 us doubling, capped at POLL_INTERVAL).
     let result = (|| {
         let fd = stdout.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -218,7 +222,7 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError
             }
         }
         // EOF: Git normally exits immediately after closing stdout. Reap it
-        // with a short bounded backoff instead of a fixed sleep.
+        // with a short exponential backoff, bounded by the same deadline.
         let mut backoff = Duration::from_micros(20);
         loop {
             if let Some(status) = child.try_wait()? {
