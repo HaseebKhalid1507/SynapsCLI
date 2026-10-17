@@ -22,7 +22,7 @@
 //! 65536 visited nodes and depth 32; excluded payload descendants are opaque.
 //! Notes are limited to 8 KiB. Fetch returns <=128 messages and <=16 MiB;
 //! search queries <=512 bytes, results <=32 with <=256-byte snippets. Every
-//! operation scans at most 128 files / 256 MiB; lock acquisition is nonblocking.
+//! operation scans at most 128 files / 256 MiB; the cross-process lock never waits.
 //! Budget exhaustion and corruption fail closed, never silently truncate seal.
 //!
 //! Unix-only private, handle-relative no-symlink filesystem; other platforms
@@ -35,15 +35,25 @@
 //! returning; callers MUST keep source history on any error (even if publication
 //! happened before a directory-fsync error). Advisory locks serialize cooperating
 //! processes, not malicious processes running as the same OS user.
+//!
+//! Within one process, operations on the same archive directory queue for at
+//! most [`LOCK_WAIT`] instead of failing; another process holding the lock
+//! still fails closed at once ("archive busy"). The lock is released
+//! explicitly, so a descriptor inherited by a concurrently forked child cannot
+//! keep it held. An operation can be abandoned before it starts
+//! ([`ArchiveStore::with_abort`]); once started it always completes.
 
 use crate::core::disclosure::{gate_for_model, may_persist, DisclosureClass, ModelVisibility};
 use crate::core::stream_types::SharedMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 pub const MAX_SEGMENTS: usize = 128;
 pub const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -53,7 +63,14 @@ pub const MAX_MESSAGES: usize = 4096;
 pub const MAX_NOTE_BYTES: usize = 8192;
 pub const MAX_FETCH_MESSAGES: usize = 128;
 pub const MAX_SEARCH_RESULTS: usize = 32;
+/// Longest an operation waits for earlier operations on the same archive in
+/// this process before failing closed as busy.
+pub const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// How often a queued operation with an abort flag rechecks it.
+const ABORT_POLL: Duration = Duration::from_millis(20);
 const WITHHELD: &str = "[archive: withheld]";
+const BUSY: &str = "archive busy; retain source and retry";
+const BUSY_EXPORT: &str = "archive busy; retry export";
 
 /// Host-owned sanitizer, never supplied by model input. Must not expand output
 /// beyond the archive budgets. Tool arguments are passed as serialized JSON;
@@ -165,6 +182,104 @@ pub struct ArchiveStore {
     scope: String,
     logical: String,
     redactor: Option<Arc<ArchiveRedactor>>,
+    abort: Option<Arc<AtomicBool>>,
+    wait: Duration,
+}
+
+/// Process-local queue for one archive directory. The advisory file lock
+/// excludes other processes, but each operation opens its own descriptor, so
+/// without this two threads of one process would see each other as busy.
+struct Gate {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+/// Field order is drop order: unlock the file, then admit the next operation.
+struct Locked {
+    file: Option<FlockGuard>,
+    _gate: GateGuard,
+}
+
+struct GateGuard(Arc<Gate>);
+
+impl Gate {
+    /// One gate per directory identity, however the directory was reached.
+    fn for_directory(identity: (u64, u64)) -> Arc<Gate> {
+        static GATES: OnceLock<Mutex<HashMap<(u64, u64), Weak<Gate>>>> = OnceLock::new();
+        let mut gates = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(gate) = gates.get(&identity).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Gate {
+            held: Mutex::new(false),
+            released: Condvar::new(),
+        });
+        gates.insert(identity, Arc::downgrade(&gate));
+        gate
+    }
+
+    fn enter(
+        gate: Arc<Gate>,
+        wait: Duration,
+        abort: Option<&AtomicBool>,
+        busy: &'static str,
+    ) -> io::Result<GateGuard> {
+        let deadline = Instant::now() + wait;
+        {
+            let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if abort.is_some_and(|abort| abort.load(Ordering::Acquire)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "archive operation canceled before it started",
+                    ));
+                }
+                if !*held {
+                    *held = true;
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, busy));
+                }
+                let mut slice = deadline - now;
+                if abort.is_some() {
+                    slice = slice.min(ABORT_POLL);
+                }
+                held = gate
+                    .released
+                    .wait_timeout(held, slice)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
+        Ok(GateGuard(gate))
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        *self.0.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        // Every waiter rechecks; an aborted or expired one must not absorb the
+        // only wakeup.
+        self.0.released.notify_all();
+    }
+}
+
+/// Unlocks explicitly before closing. A flock belongs to the open file
+/// description, and a child forked by any thread holds a copy of it until it
+/// execs (O_CLOEXEC applies only at exec); closing our copy alone would leave
+/// the archive locked meanwhile.
+struct FlockGuard(std::fs::File);
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        let _ = fs4::fs_std::FileExt::unlock(&self.0);
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -219,6 +334,8 @@ impl ArchiveStore {
             scope,
             logical,
             redactor: None,
+            abort: None,
+            wait: LOCK_WAIT,
         })
     }
 
@@ -229,7 +346,44 @@ impl ArchiveStore {
         self
     }
 
+    /// Once `abort` is set, an operation that has not started yet (for example
+    /// one queued behind another operation in this process) fails with
+    /// `Interrupted` without touching the archive. A started operation always
+    /// completes, so callers must still treat an abandoned seal as possibly
+    /// published.
+    pub fn with_abort(mut self, abort: Arc<AtomicBool>) -> Self {
+        self.abort = Some(abort);
+        self
+    }
+
+    /// Queue behind other operations on this archive in this process, then
+    /// take the cross-process lock without waiting.
+    fn exclusive(&self) -> io::Result<Locked> {
+        let gate = self.enter(BUSY)?;
+        Ok(Locked {
+            file: Some(self.fs.lock()?),
+            _gate: gate,
+        })
+    }
+
+    fn enter(&self, busy: &'static str) -> io::Result<GateGuard> {
+        let gate = Gate::for_directory(self.fs.identity()?);
+        Gate::enter(gate, self.wait, self.abort.as_deref(), busy)
+    }
+
     pub fn seal(&self, messages: &[SharedMessage], note: &str) -> io::Result<ArchiveRef> {
+        self.seal_with_note(messages, note)
+            .map(|(reference, _)| reference)
+    }
+
+    /// [`seal`](Self::seal) that also returns the screened note stored with the
+    /// segment (the earlier note when this projection was already sealed), in
+    /// the same locked operation.
+    pub fn seal_with_note(
+        &self,
+        messages: &[SharedMessage],
+        note: &str,
+    ) -> io::Result<(ArchiveRef, String)> {
         let projection = project_hashed(&self.logical, messages, note, self.redactor.clone())?;
         let ArchiveProjection {
             digest,
@@ -238,18 +392,18 @@ impl ArchiveStore {
             note,
             ..
         } = projection;
-        let _lock = self.fs.lock()?;
+        let _lock = self.exclusive()?;
         let (records, used) = self.scan()?;
         if let Some((_, record)) = records.iter().find(|(_, r)| r.digest == digest) {
-            if matches!(record.body, Body::Tombstone) {
+            let Body::Live { note: stored, .. } = &record.body else {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "archive projection was forgotten",
                 ));
-            }
+            };
             // A previous call may have failed AFTER rename but BEFORE fsync.
             self.fs.sync()?;
-            return record.reference();
+            return Ok((record.reference()?, stored.clone()));
         }
         let slot = (0..MAX_SEGMENTS)
             .find(|slot| !records.iter().any(|(s, _)| s == slot))
@@ -263,7 +417,7 @@ impl ArchiveStore {
             body: Body::Live {
                 source_message_count,
                 messages: eligible,
-                note,
+                note: note.clone(),
             },
         };
         let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
@@ -271,7 +425,7 @@ impl ArchiveStore {
             return Err(invalid("archive storage byte budget exhausted"));
         }
         self.fs.publish(slot, &bytes)?;
-        record.reference()
+        Ok((record.reference()?, note))
     }
 
     pub fn fetch(&self, id: &str, start: usize, limit: usize) -> io::Result<Vec<SharedMessage>> {
@@ -294,7 +448,7 @@ impl ArchiveStore {
         if limit > MAX_FETCH_MESSAGES {
             return Err(invalid("archive fetch limit exceeds 128"));
         }
-        let _lock = self.fs.lock()?;
+        let _lock = self.exclusive()?;
         let (records, _) = self.scan()?;
         let record = find_record(records, id)?;
         match record.body {
@@ -309,7 +463,7 @@ impl ArchiveStore {
     /// in search descriptors or inject it as system/developer instructions.
     pub fn fetch_note(&self, id: &str) -> io::Result<String> {
         validate_id(id)?;
-        let _lock = self.fs.lock()?;
+        let _lock = self.exclusive()?;
         let (records, _) = self.scan()?;
         match find_record(records, id)?.body {
             Body::Live { note, .. } => Ok(note),
@@ -328,7 +482,7 @@ impl ArchiveStore {
             return Ok(Vec::new());
         }
         let query = query.to_lowercase();
-        let _lock = self.fs.lock()?;
+        let _lock = self.exclusive()?;
         let (records, _) = self.scan()?;
         let mut result = Vec::new();
         for (_, record) in records {
@@ -367,7 +521,7 @@ impl ArchiveStore {
     /// This is logical deletion, not secure erasure of filesystem snapshots.
     pub fn forget(&self, id: &str) -> io::Result<()> {
         validate_id(id)?;
-        let _lock = self.fs.lock()?;
+        let _lock = self.exclusive()?;
         let (records, _) = self.scan()?;
         let (slot, mut record) = records
             .into_iter()
@@ -385,9 +539,13 @@ impl ArchiveStore {
     /// tombstones. Includes hidden notes: this is HOST data, never a model tool.
     /// No files, directories, permissions or archive contents are changed.
     pub fn export_records(&self) -> io::Result<Vec<Value>> {
-        let lock = self.fs.lock_existing()?;
+        let gate = self.enter(BUSY_EXPORT)?;
+        let lock = Locked {
+            file: self.fs.lock_existing()?,
+            _gate: gate,
+        };
         let (records, _) = self.scan_with(true)?;
-        if lock.is_none() && !records.is_empty() {
+        if lock.file.is_none() && !records.is_empty() {
             return Err(corrupt());
         }
         Ok(records
@@ -636,6 +794,8 @@ pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
         scope,
         logical: String::new(), // export scans all logical conversations in this scope
         redactor: None,
+        abort: None,
+        wait: LOCK_WAIT,
     }
     .export_records()
 }
@@ -1143,7 +1303,13 @@ impl PrivateDir {
             crate::core::private_fs::FILE_MODE,
         ))
     }
-    fn lock_existing(&self) -> io::Result<Option<std::fs::File>> {
+    /// Directory identity for the in-process gate.
+    fn identity(&self) -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = self.0.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    fn lock_existing(&self) -> io::Result<Option<FlockGuard>> {
         let file = match self.open(&c_name("lock")?, libc::O_RDONLY) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1151,23 +1317,18 @@ impl PrivateDir {
         };
         Self::check_readonly(&file)?;
         if !fs4::fs_std::FileExt::try_lock_shared(&file)? {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "archive busy; retry export",
-            ));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY_EXPORT));
         }
-        Ok(Some(file))
+        Ok(Some(FlockGuard(file)))
     }
-    fn lock(&self) -> io::Result<std::fs::File> {
+    /// Never waits: a lock held by another process fails closed at once.
+    fn lock(&self) -> io::Result<FlockGuard> {
         let file = self.open(&c_name("lock")?, libc::O_RDWR | libc::O_CREAT)?;
         Self::check(&file)?;
         if !fs4::fs_std::FileExt::try_lock_exclusive(&file)? {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "archive busy; retain source and retry",
-            ));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY));
         }
-        Ok(file)
+        Ok(FlockGuard(file))
     }
     fn read_with(
         &self,
@@ -1254,13 +1415,16 @@ impl PrivateDir {
     fn new(_: &Path, _: &str) -> io::Result<Self> {
         Self::unsupported()
     }
-    fn lock(&self) -> io::Result<std::fs::File> {
+    fn identity(&self) -> io::Result<(u64, u64)> {
+        Self::unsupported()
+    }
+    fn lock(&self) -> io::Result<FlockGuard> {
         Self::unsupported()
     }
     fn open_existing(_: &Path, _: &str) -> io::Result<Self> {
         Self::unsupported()
     }
-    fn lock_existing(&self) -> io::Result<Option<std::fs::File>> {
+    fn lock_existing(&self) -> io::Result<Option<FlockGuard>> {
         Self::unsupported()
     }
     fn read_with(&self, _: usize, _: usize, _: bool) -> io::Result<Option<Vec<u8>>> {
@@ -2165,5 +2329,197 @@ mod tests {
         assert!(store.seal(&[msg("user", json!("overflow"))], "").is_err());
         store.forget(&descriptors[0].id).unwrap();
         assert!(store.seal(&[msg("user", json!("still full"))], "").is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn msg(role: &str, content: Value) -> SharedMessage {
+        Arc::new(json!({"role":role,"content":content}))
+    }
+    fn setup() -> (tempfile::TempDir, ArchiveStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-logical").unwrap();
+        (tmp, store)
+    }
+
+    /// A flock belongs to the open file description. A child forked by another
+    /// thread holds copies of every descriptor (O_CLOEXEC applies only at
+    /// exec), so closing our copy alone does not release the lock.
+    #[test]
+    fn a_descriptor_inherited_by_a_forked_child_does_not_keep_the_archive_locked() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let (_tmp, store) = setup();
+        let reference = store
+            .seal(&[msg("user", json!("evidence"))], "note")
+            .unwrap();
+        // Close-on-exec, like every descriptor the archive opens.
+        let (mut forked, signal) = io::pipe().unwrap();
+        let signal_fd = signal.as_raw_fd();
+        let held = store.fs.lock().unwrap();
+        let child = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("true");
+            // Only async-signal-safe calls between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::write(signal_fd, b"f".as_ptr().cast(), 1);
+                    let pause = libc::timespec {
+                        tv_sec: 2,
+                        tv_nsec: 0,
+                    };
+                    libc::nanosleep(&pause, std::ptr::null_mut());
+                    Ok(())
+                });
+            }
+            let status = command.status();
+            drop(signal);
+            status
+        });
+        forked.read_exact(&mut [0; 1]).unwrap();
+        drop(held);
+        // The child is still between fork and exec, holding an inherited copy.
+        let fetched = store.fetch(&reference.id, 0, 1);
+        assert!(child.join().unwrap().unwrap().success());
+        assert_eq!(fetched.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_operations_in_one_process_wait_instead_of_reporting_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let base = tmp.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let logical = format!("synthetic-logical-{worker}");
+                    let store = ArchiveStore::new(&base, "synthetic-project", &logical)?;
+                    barrier.wait();
+                    for round in 0..8 {
+                        let text = format!("worker {worker} round {round}");
+                        let reference = store.seal(&[msg("user", json!(text))], "note")?;
+                        assert_eq!(store.fetch(&reference.id, 0, 1)?.len(), 1);
+                        assert_eq!(store.fetch_note(&reference.id)?, "note");
+                        store.search("worker", 4)?;
+                    }
+                    Ok::<_, io::Error>(())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for result in results {
+            result.unwrap();
+        }
+        let store = ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-reader").unwrap();
+        assert_eq!(store.scan().unwrap().0.len(), workers * 8);
+    }
+
+    /// A separate open file description is what another process holds.
+    #[test]
+    fn a_lock_held_outside_this_process_still_fails_closed_without_waiting() {
+        let (_tmp, store) = setup();
+        let reference = store
+            .seal(&[msg("user", json!("evidence"))], "note")
+            .unwrap();
+        let foreign = store.fs.lock().unwrap();
+        let started = Instant::now();
+        let results = [
+            store
+                .seal(&[msg("user", json!("other evidence"))], "")
+                .map(drop),
+            store.fetch(&reference.id, 0, 1).map(drop),
+            store.fetch_note(&reference.id).map(drop),
+            store.search("", 1).map(drop),
+            store.forget(&reference.id),
+        ];
+        for result in results {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(foreign);
+        assert_eq!(store.fetch(&reference.id, 0, 1).unwrap().len(), 1);
+        assert_eq!(store.scan().unwrap().0.len(), 1);
+    }
+
+    fn other(tmp: &tempfile::TempDir) -> ArchiveStore {
+        ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-other").unwrap()
+    }
+
+    #[test]
+    fn an_operation_queues_behind_the_one_in_progress_in_this_process() {
+        let (tmp, store) = setup();
+        let held = store.exclusive().unwrap();
+        let queued = other(&tmp);
+        let waiter =
+            std::thread::spawn(move || queued.seal(&[msg("user", json!("queued evidence"))], ""));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        drop(held);
+        let reference = waiter.join().unwrap().unwrap();
+        assert_eq!(store.fetch(&reference.id, 0, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stuck_operation_in_this_process_fails_closed_after_the_bounded_wait() {
+        let (tmp, store) = setup();
+        let held = store.exclusive().unwrap();
+        let mut queued = other(&tmp);
+        queued.wait = Duration::from_millis(50);
+        let started = Instant::now();
+        let error = queued.search("", 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), BUSY);
+        assert!(started.elapsed() >= queued.wait);
+        drop(held);
+        assert!(queued.search("", 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_aborted_operation_never_starts_even_while_queued() {
+        let (tmp, store) = setup();
+        let abort = Arc::new(AtomicBool::new(true));
+        let error = other(&tmp)
+            .with_abort(abort.clone())
+            .seal(&[msg("user", json!("abandoned before start"))], "")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+        abort.store(false, Ordering::Release);
+        let held = store.exclusive().unwrap();
+        let queued = other(&tmp).with_abort(abort.clone());
+        let waiter = std::thread::spawn(move || {
+            queued.seal(&[msg("user", json!("abandoned while queued"))], "")
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        abort.store(true, Ordering::Release);
+        // Returns while the earlier operation still holds the archive.
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        drop(held);
+        assert!(store.scan().unwrap().0.is_empty());
+        assert!(store.search("", 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn seal_with_note_returns_the_note_stored_with_the_segment() {
+        let (_tmp, store) = setup();
+        let messages = [msg("user", json!("evidence"))];
+        let (first, note) = store.seal_with_note(&messages, "first note").unwrap();
+        assert_eq!(note, "first note");
+        let (again, note) = store.seal_with_note(&messages, "second note").unwrap();
+        assert_eq!(again, first);
+        assert_eq!(note, "first note");
+        assert_eq!(store.fetch_note(&first.id).unwrap(), "first note");
+        store.forget(&first.id).unwrap();
+        let error = store.seal_with_note(&messages, "").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
