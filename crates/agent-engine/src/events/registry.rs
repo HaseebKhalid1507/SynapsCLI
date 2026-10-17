@@ -1131,20 +1131,25 @@ mod tests {
     }
 
     #[test]
-    // Keyed to the same lock as every HOME/SYNAPS_BASE_DIR mutator: unkeyed
-    // `#[serial]` and `#[serial(synaps_base_dir)]` do NOT exclude each other,
-    // so this base-dir *reader* raced mutator tests that point
-    // SYNAPS_BASE_DIR at a tempdir under /tmp.
+    // Keyed to the same lock as every HOME/SYNAPS_BASE_DIR mutator (it pins
+    // the base dir itself): unkeyed `#[serial]` and
+    // `#[serial(synaps_base_dir)]` do NOT exclude each other.
     #[serial(synaps_base_dir)]
     fn socket_path_format() {
+        // Pin the roots: an ambient SYNAPS_BASE_DIR (often itself under
+        // /tmp or /var/tmp) or SYNAPS_RUNTIME_DIR must not decide the result.
+        let base = crate::test_env::BaseDirGuard::new();
+        let _runtime = crate::test_env::EnvVarGuard::remove("SYNAPS_RUNTIME_DIR");
         let path = socket_path_for_session("20240101-120000-ab12");
-        // Sockets now live in the registry dir, not /tmp
-        assert!(
-            path.ends_with("/run/20240101-120000-ab12.sock"),
+        // Sockets live in the registry's run dir under the base dir, not in
+        // the system temp dir.
+        let run = std::fs::canonicalize(base.path().join("run")).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(&path),
+            run.join("20240101-120000-ab12.sock"),
             "got: {}",
             path
         );
-        assert!(!path.contains("/tmp/"), "socket should not be in /tmp");
     }
 
     // Regression: an EFS-backed SYNAPS_BASE_DIR can exceed Linux's 108-byte

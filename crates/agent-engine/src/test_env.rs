@@ -50,7 +50,7 @@ impl Drop for BaseDirGuard {
     }
 }
 
-/// RAII guard for any other process env var (set → restore on drop).
+/// RAII guard for any other process env var (set or unset → restore on drop).
 pub(crate) struct EnvVarGuard {
     key: &'static str,
     old: Option<String>,
@@ -60,6 +60,13 @@ impl EnvVarGuard {
     pub(crate) fn set(key: &'static str, value: &str) -> Self {
         let old = std::env::var(key).ok();
         std::env::set_var(key, value);
+        Self { key, old }
+    }
+
+    /// Unset `key` for the guard's lifetime.
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::remove_var(key);
         Self { key, old }
     }
 }
