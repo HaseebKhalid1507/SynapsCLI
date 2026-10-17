@@ -513,6 +513,8 @@ pub struct SessionActor {
     pub(crate) compact: Option<CompactionJob>,
     /// `await_extensions=false`: fires when process-level discovery is done;
     /// the actor then emits `on_session_start` without having blocked boot.
+    /// `Some` until the hook has run: a model request first settles it
+    /// (`settle_session_start`).
     pub(crate) ext_ready: Option<oneshot::Receiver<()>>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
@@ -646,14 +648,7 @@ impl SessionActor {
         // `ext_ready` arm instead, so boot never blocks on discovery.
         // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
         // the wait on extension discovery; the const remains the fallback.
-        let ext_ready_timeout = {
-            let secs = config.startup.extensions_ready_timeout_secs;
-            if secs == 0 {
-                budgets::EXTENSIONS_READY_TIMEOUT
-            } else {
-                std::time::Duration::from_secs(secs)
-            }
-        };
+        let ext_ready_timeout = extensions_ready_timeout(&config);
         let mut ext_ready = None;
         if cfg.await_extensions {
             if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())
@@ -2363,7 +2358,45 @@ impl SessionActor {
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
+    /// Emit the deferred `on_session_start` (keyed injection) for this
+    /// session's journal id, then refresh the view.
+    async fn run_session_start(&mut self) {
+        let id = (**self.journal_id.load()).clone();
+        let bus = Arc::clone(&self.hook_bus);
+        crate::extensions::loader::emit_session_start(&bus, &id).await;
+        if self.runtime.is_live() {
+            self.publish_view().await;
+        }
+    }
+
+    /// No model request goes out before `on_session_start` has run. Its
+    /// injection is part of every request's system prompt, so a request sent
+    /// before it would lack the extension context and the next request would
+    /// change the cached system prompt. A session created with
+    /// `await_extensions=false` (quick start, every session a reload
+    /// restores) runs the hook from its loop; when a turn or a keep-warm ping
+    /// comes first, it waits here for discovery (same bound as the waiter)
+    /// and runs the hook now. No-op once the hook has run.
+    pub(crate) async fn settle_session_start(&mut self) {
+        let Some(rx) = self.ext_ready.take() else {
+            return;
+        };
+        drop(rx);
+        let wait = extensions_ready_timeout(&self.host.config());
+        if tokio::time::timeout(wait, self.host.extensions_ready())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                budget_secs = wait.as_secs(),
+                "extensions_ready timed out — on_session_start may miss late extensions"
+            );
+        }
+        self.run_session_start().await;
+    }
+
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
+        self.settle_session_start().await;
         self.cache_keepwarm_turn_started();
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
@@ -4912,6 +4945,16 @@ async fn driver_tick_timer(
     }
 }
 
+/// How long a session waits for process-level extension discovery before
+/// `on_session_start`: `startup.extensions_ready_timeout_secs`, or the
+/// budget constant when that is 0.
+fn extensions_ready_timeout(config: &crate::SynapsConfig) -> Duration {
+    match config.startup.extensions_ready_timeout_secs {
+        0 => budgets::EXTENSIONS_READY_TIMEOUT,
+        secs => Duration::from_secs(secs),
+    }
+}
+
 async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
     match rx {
         Some(r) => {
@@ -4989,12 +5032,7 @@ impl SessionTask {
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
                 _ = ext_ready(&mut actor.ext_ready) => {
                     actor.ext_ready = None;
-                    let id = (**actor.journal_id.load()).clone();
-                    let bus = Arc::clone(&actor.hook_bus);
-                    crate::extensions::loader::emit_session_start(&bus, &id).await;
-                    if actor.runtime.is_live() {
-                        actor.publish_view().await;
-                    }
+                    actor.run_session_start().await;
                 },
                 _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
                     actor.driver_tick().await;
