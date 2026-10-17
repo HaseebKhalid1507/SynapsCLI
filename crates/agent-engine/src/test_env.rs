@@ -22,16 +22,16 @@
 use std::path::Path;
 
 /// RAII guard: point `SYNAPS_BASE_DIR` at a fresh private temp dir and
-/// restore the previous value on drop (panic-safe).
+/// restore the previous value on drop (panic-safe), byte for byte.
 pub(crate) struct BaseDirGuard {
-    old: Option<String>,
+    old: Option<std::ffi::OsString>,
     _dir: tempfile::TempDir,
 }
 
 impl BaseDirGuard {
     pub(crate) fn new() -> Self {
         let dir = tempfile::TempDir::new().unwrap();
-        let old = std::env::var("SYNAPS_BASE_DIR").ok();
+        let old = std::env::var_os("SYNAPS_BASE_DIR");
         agent_core::config::set_base_dir_for_tests(dir.path().to_path_buf());
         Self { old, _dir: dir }
     }
@@ -106,6 +106,27 @@ mod tests {
         }
         assert_eq!(std::env::var_os(KEY), Some(non_utf8()));
         std::env::remove_var(KEY);
+    }
+
+    /// A base dir that is not UTF-8 is restored exactly when the guard drops.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn the_base_dir_guard_restores_a_non_utf8_value() {
+        let outer = std::env::var_os("SYNAPS_BASE_DIR");
+        std::env::set_var("SYNAPS_BASE_DIR", non_utf8());
+        {
+            let guard = super::BaseDirGuard::new();
+            assert_eq!(
+                std::env::var_os("SYNAPS_BASE_DIR").as_deref(),
+                Some(guard.path().as_os_str())
+            );
+        }
+        let restored = std::env::var_os("SYNAPS_BASE_DIR");
+        match outer {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        assert_eq!(restored, Some(non_utf8()));
     }
 
     /// Setting over a value that is not UTF-8 restores the exact bytes.
