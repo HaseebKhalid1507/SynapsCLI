@@ -39,6 +39,14 @@ const LOCK: &str = "synaps-memory-identity.lock";
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_ROOTS: usize = 4096;
 
+#[cfg(test)]
+thread_local! {
+    /// Git processes spawned by `git()` on this thread (tests only).
+    static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Force the one-option-per-process `rev-parse` path (tests only).
+    static FORCE_SINGLE_REV_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryIdentity {
     /// Canonical repository key, with the currently verified repository root.
@@ -128,6 +136,8 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, MemoryError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let deadline = Instant::now() + WAIT_TIMEOUT;
+    #[cfg(test)]
+    GIT_SPAWNS.with(|n| n.set(n.get() + 1));
     let mut child = cmd.spawn()?;
     let mut stdout = child.stdout.take().unwrap();
     // A reader thread or blocking read_to_end can outlive the timeout when a
@@ -614,5 +624,155 @@ mod private {
             }
             self.sync_all()
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fixture_git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", root)
+            .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
+            .args(["-c", "user.name=Synthetic", "-c", "user.email=test@example.invalid"])
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A synthetic repository with `extra` plain worktrees plus the given
+    /// specially named ones. Returns (main, all worktree roots).
+    fn fixture(tmp: &TempDir, extra: usize, named: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let main = tmp.path().join("main");
+        fs::create_dir(&main).unwrap();
+        fixture_git(&main, &["init", "-q"]);
+        fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "synthetic"]);
+        let main = main.canonicalize().unwrap();
+        let names = (0..extra)
+            .map(|i| format!("wt{i}"))
+            .chain(named.iter().map(|s| s.to_string()));
+        let mut roots = Vec::new();
+        for (i, name) in names.enumerate() {
+            let path = tmp.path().join(name);
+            let branch = format!("b{i}");
+            fixture_git(
+                &main,
+                &["worktree", "add", "-q", "-b", &branch, path.to_str().unwrap()],
+            );
+            roots.push(path.canonicalize().unwrap());
+        }
+        (main, roots)
+    }
+
+    fn spawns<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = GIT_SPAWNS.with(|n| n.get());
+        let value = f();
+        (value, GIT_SPAWNS.with(|n| n.get()) - before)
+    }
+
+    fn single<T>(f: impl FnOnce() -> T) -> T {
+        FORCE_SINGLE_REV_PARSE.with(|f| f.set(true));
+        let value = f();
+        FORCE_SINGLE_REV_PARSE.with(|f| f.set(false));
+        value
+    }
+
+    fn discover(root: &Path) -> RepositoryIdentity {
+        ProjectScope::discover_repository_with_override(root, None).unwrap()
+    }
+
+    #[test]
+    fn discovery_spawns_one_git_per_registered_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 40, &[]);
+        // N+1 checkouts, one worktree listing, one current-checkout re-check.
+        let budget = roots.len() + 1 + 4;
+        for start in [&main, &roots[7]] {
+            let (identity, count) = spawns(|| discover(start));
+            assert_eq!(identity.aliases.len(), roots.len() + 2);
+            assert!(count <= budget, "{count} Git spawns > {budget}");
+        }
+    }
+
+    #[test]
+    fn checkout_batches_rev_parse_and_newline_paths_fall_back() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 1, &["worker a", "worker\n\"b"]);
+        for root in [&main, &roots[0], &roots[1]] {
+            let (batched, count) = spawns(|| checkout(root).unwrap());
+            assert_eq!(count, 1, "{root:?}");
+            assert!(batched == single(|| checkout(root).unwrap()));
+        }
+        // Four output lines: identical result via the per-option fallback.
+        let newline = &roots[2];
+        let (batched, count) = spawns(|| checkout(newline).unwrap());
+        assert_eq!(count, 4);
+        assert!(batched == single(|| checkout(newline).unwrap()));
+        assert_eq!(&batched.root, newline);
+    }
+
+    #[test]
+    fn batched_and_single_rev_parse_resolve_identical_identity() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 3, &["worker a", "worker\n\"b"]);
+        for start in std::iter::once(&main).chain(&roots) {
+            let slow = single(|| discover(start));
+            let fast = discover(start);
+            assert_eq!(fast, slow);
+            assert_eq!(fast.aliases.len(), roots.len() + 2);
+        }
+        assert!(single(|| checkout(&main)).unwrap() == checkout(&main).unwrap());
+    }
+
+    // Smoke check, not a benchmark: the old wait slept a fixed 10 ms per call
+    // (>= 300 ms for 30 calls); an event-driven wait is ~1-2 ms per call.
+    #[test]
+    fn git_fast_path_has_no_fixed_sleep() {
+        let tmp = TempDir::new().unwrap();
+        let (main, _) = fixture(&tmp, 0, &[]);
+        let started = Instant::now();
+        for _ in 0..30 {
+            git(&main, &["rev-parse", "--git-common-dir"]).unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+    }
+
+    /// `cargo test -p synaps-core --lib -- --ignored --nocapture discovery_bench`
+    #[test]
+    #[ignore]
+    fn discovery_bench_132_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 132, &[]);
+        discover(&main);
+        let mut times = Vec::new();
+        let mut count = 0;
+        for _ in 0..5 {
+            let started = Instant::now();
+            count = spawns(|| discover(&roots[50])).1;
+            times.push(started.elapsed());
+        }
+        times.sort();
+        println!(
+            "discovery 132 worktrees: median {:?} min {:?} max {:?}, {count} Git spawns",
+            times[2], times[0], times[4]
+        );
     }
 }
