@@ -442,3 +442,112 @@ async fn exe_validation_refuses_and_exec_failure_keeps_serving() {
     t.detach().await;
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }
+
+// ── restore with a slow `on_session_start` hook ─────────────────────────────
+
+/// Install `tests/fixtures/slow_session_start_extension.py` as a plugin under
+/// the guard's base dir. Its knobs are files in the returned plugin dir
+/// (`slow-ms`); the daemon clears an extension's environment.
+fn install_slow_start_plugin(guard: &HomeGuard) -> PathBuf {
+    let dir = guard.base_dir().join("plugins/slow-start");
+    std::fs::create_dir_all(dir.join(".synaps-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("extensions")).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/slow_session_start_extension.py"),
+        dir.join("extensions/slow_session_start_extension.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".synaps-plugin/plugin.json"),
+        r#"{
+  "name": "slow-start",
+  "version": "0.1.0",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/slow_session_start_extension.py"],
+    "permissions": ["session.lifecycle"],
+    "hooks": [{"hook": "on_session_start"}]
+  }
+}
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+/// Create `n` sessions, each with one finished turn, and detach.
+async fn sessions_with_one_turn(paths: &registry::DaemonPaths, cwd: &Path, n: usize) -> Vec<SessionId> {
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let (mut t, _) = attach_create(paths, cwd).await;
+        one_turn(&mut t, &format!("before reload {i}")).await;
+        ids.push(t.session_id().clone());
+        t.detach().await;
+    }
+    ids
+}
+
+/// Wait for the new image (`generation`) to answer Ping; returns how long
+/// that took after `t0`, or `None` past `budget`. A bound but not yet
+/// accepting socket holds the handshake, so every attempt is time-boxed.
+async fn answered_within(paths: &registry::DaemonPaths, generation: u64, t0: std::time::Instant, budget: Duration) -> Option<Duration> {
+    loop {
+        if registry::read_daemon_json(paths).is_some_and(|i| i.generation == generation)
+            && tokio::time::timeout(Duration::from_millis(500), SocketTransport::ping(&paths.sock))
+                .await
+                .is_ok_and(|r| r.is_ok())
+        {
+            return Some(t0.elapsed());
+        }
+        if t0.elapsed() > budget {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A reload with 30 sessions and an extension whose `on_session_start` takes
+/// 3 s: the restore no longer waits on the hook, so the new image answers
+/// within 5 s (it took about 90 s, one hook after another) and every session
+/// reattaches under its id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
+    const SESSIONS: usize = 30;
+    let guard = HomeGuard::new();
+    let plugin = install_slow_start_plugin(&guard);
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let pid_before = d.child.id();
+    let ids = sessions_with_one_turn(&d.paths, guard.home.path(), SESSIONS).await;
+
+    std::fs::write(plugin.join("slow-ms"), "3000").unwrap();
+    let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
+    assert_eq!(gen, 2);
+    let t0 = std::time::Instant::now();
+    let took = answered_within(&d.paths, 2, t0, Duration::from_secs(5)).await;
+    assert!(took.is_some(), "the new image did not answer within 5 s of the reload");
+    assert_eq!(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
+
+    let listed = SocketTransport::sessions(&d.paths.sock).await.expect("sessions");
+    for id in &ids {
+        assert!(listed.iter().any(|m| &m.id == id), "{id} listed after the reload");
+    }
+    for id in &ids {
+        let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+        let (t, snap) = tokio::time::timeout(
+            Duration::from_secs(15),
+            SocketTransport::attach(conn, Attach::Existing { session_id: id.clone(), mode: AttachMode::Mirror }),
+        )
+        .await
+        .expect("attach budget")
+        .expect("reattached");
+        assert_eq!(t.session_id(), id, "same id, not a fresh session");
+        assert_eq!(snap.conversation.api_messages.len(), 2, "{id}: history survived");
+        t.detach().await;
+    }
+
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
