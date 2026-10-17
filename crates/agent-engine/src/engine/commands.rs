@@ -616,24 +616,17 @@ mod tests {
     #[test]
     #[serial_test::serial(synaps_base_dir)]
     fn persist_to_config_reports_write_result() {
-        let home = std::path::PathBuf::from("/tmp/synaps-engine-persist-test");
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(home.join(".synaps-cli")).unwrap();
-        let original = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        // The config lives under the base directory, which tests pin with
+        // the guard (an ambient SYNAPS_BASE_DIR wins over HOME).
+        let base = crate::test_env::BaseDirGuard::new();
 
         let status = persist_to_config("model", "claude-sonnet-4-6");
 
-        if let Some(h) = original {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-
         assert_eq!(status, "(saved to config)");
-        let contents = std::fs::read_to_string(home.join(".synaps-cli/config")).unwrap();
+        let path = agent_core::config::resolve_read_path("config");
+        assert!(path.starts_with(base.path()), "written outside the base dir: {path:?}");
+        let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("model = claude-sonnet-4-6"));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
