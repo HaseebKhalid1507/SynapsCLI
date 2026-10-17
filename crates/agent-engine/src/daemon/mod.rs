@@ -81,6 +81,34 @@ pub fn autospawn_enabled() -> bool {
 /// One-line reason used by every attach path when the flag is off.
 pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
 
+/// A client running `client` profile must never drive a daemon that serves
+/// another one: its sessions, model and config writes would land in the
+/// wrong profile. The socket is per profile, but its stem is sanitised
+/// (`a.b` and `a_b` share `daemon-a_b.sock`), so the handshake's
+/// `Welcome.profile` is the authority. `None` and `Some("")` both mean the
+/// default profile. Returns the refusal message on a mismatch.
+pub fn profile_mismatch(daemon: Option<&str>, client: Option<&str>) -> Option<String> {
+    let norm = |p: Option<&str>| p.filter(|s| !s.is_empty()).map(str::to_owned);
+    let (daemon, client) = (norm(daemon), norm(client));
+    if daemon == client {
+        return None;
+    }
+    let name = |p: &Option<String>| match p {
+        Some(p) => format!("profile `{p}`"),
+        None => "the default profile".to_string(),
+    };
+    let stop = match &daemon {
+        Some(p) => format!("synaps --profile {p} daemon stop"),
+        None => "synaps daemon stop".to_string(),
+    };
+    Some(format!(
+        "refusing to attach: this daemon serves {}, but this client runs {} — \
+         stop it ({stop}) or use the matching --profile",
+        name(&daemon),
+        name(&client),
+    ))
+}
+
 /// Builds a session for `Attach::Create`: `host_factory` (real actor) or
 /// `echo_factory` (tests).
 pub type SessionFactory = Arc<
@@ -876,6 +904,23 @@ mod flag_tests {
         for off in ["0", "false", "off", "no", "FALSE", " 0 ", "Off"] {
             assert!(!enabled_from(Some(off)), "{off:?} → off");
         }
+    }
+
+    #[test]
+    fn profile_mismatch_refuses_a_daemon_of_another_profile() {
+        assert_eq!(profile_mismatch(None, None), None);
+        assert_eq!(profile_mismatch(Some("axon"), Some("axon")), None);
+        // empty == default
+        assert_eq!(profile_mismatch(Some(""), None), None);
+        assert_eq!(profile_mismatch(None, Some("")), None);
+        // a profile client on the default daemon (the 0.10.1 clobber) and back
+        let m = profile_mismatch(None, Some("axon")).expect("mismatch");
+        assert!(m.contains("the default profile") && m.contains("profile `axon`"), "{m}");
+        assert!(m.contains("synaps daemon stop"), "{m}");
+        let m = profile_mismatch(Some("axon"), None).expect("mismatch");
+        assert!(m.contains("synaps --profile axon daemon stop"), "{m}");
+        // sanitised socket stems collide; the profile names do not
+        assert!(profile_mismatch(Some("a.b"), Some("a_b")).is_some());
     }
 
     #[test]

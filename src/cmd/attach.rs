@@ -276,6 +276,10 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow
         }
         Err(e) => anyhow::bail!("connect: {e}"),
     };
+    if let Some(msg) = agent_engine::daemon::profile_mismatch(conn.welcome.profile.as_deref(), profile.as_deref()) {
+        eprintln!("synaps attach: {msg}");
+        std::process::exit(EXIT_REFUSED);
+    }
     if conn.welcome.daemon_version != binary_version() {
         eprintln!("[notice] daemon binary {} differs from client {} (same protocol)", conn.welcome.daemon_version, binary_version());
     }

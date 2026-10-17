@@ -353,6 +353,42 @@ enum ThinClient {
     Adopt { profile: Option<String> },
 }
 
+impl ThinClient {
+    fn profile_mut(&mut self) -> &mut Option<String> {
+        match self {
+            ThinClient::Tui { profile } | ThinClient::Line { profile } | ThinClient::Adopt { profile } => profile,
+        }
+    }
+}
+
+/// Pin the process profile before ANY config read. `config::get_profile()`
+/// latches on first use (falling back to `SYNAPS_PROFILE`) and
+/// `set_profile` is first-write-wins, so a single `load_config()` before
+/// the pin — `ensure_daemon`'s idle-exit lookup and scope probe did that in
+/// 0.10.1 — silently drops `--profile` for the rest of the process: the
+/// TUI fell back to the default profile's config, sessions and `/model`
+/// writes. Returns the profile actually in effect (flag, else env), which
+/// is the one the daemon socket must be chosen by.
+fn pin_profile(flag: Option<String>) -> Option<String> {
+    if flag.is_some() {
+        synaps_cli::config::set_profile(flag);
+    }
+    synaps_cli::config::get_profile()
+}
+
+/// `--profile X` must be the profile in effect; if something latched
+/// another one first, refuse instead of running (and writing config,
+/// sessions) under the wrong profile.
+fn check_profile_applied(requested: Option<&str>, active: Option<&str>) -> anyhow::Result<()> {
+    match requested {
+        Some(want) if active != Some(want) => anyhow::bail!(
+            "--profile {want} could not be applied (profile `{}` was already in effect); refusing to run under the wrong profile",
+            active.unwrap_or("default")
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// `SYNAPS_DAEMON_ADOPT`: ON unless `0`/`false`/`off`/`no`. Off means a
 /// plain `synaps` never looks for a running daemon (always in-process).
 fn adopt_enabled() -> bool {
@@ -572,7 +608,10 @@ fn scrub_reexec_env() {
 
 fn main() -> anyhow::Result<()> {
     let mut thin = false;
-    if let Some(kind) = thin_client() {
+    if let Some(mut kind) = thin_client() {
+        // Before `ensure_daemon`: it reads config (idle-exit, process scopes).
+        let profile = pin_profile(kind.profile_mut().take());
+        *kind.profile_mut() = profile;
         // Adopt and --attach share one path: a running daemon or a freshly
         // spawned one; a failed spawn falls back to the in-process boot.
         match ensure_daemon(&kind) {
@@ -636,6 +675,10 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(ref prof) = cli.profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
+    // Flag, else `SYNAPS_PROFILE`: daemon sockets are chosen by this, so an
+    // env-profiled client never lands on the default profile's daemon.
+    let active_profile = synaps_cli::config::get_profile();
+    check_profile_applied(cli.profile.as_deref(), active_profile.as_deref())?;
 
     match cli.command {
         None if cli.attach.is_some() => {
@@ -656,7 +699,7 @@ async fn async_main() -> anyhow::Result<()> {
             } else {
                 let id = cli.attach.flatten();
                 tui::attach::run_attached(tui::attach::AttachOpts {
-                    profile: cli.profile,
+                    profile: active_profile,
                     id,
                     continue_session: cli.continue_session,
                     system: cli.system,
@@ -777,10 +820,10 @@ async fn async_main() -> anyhow::Result<()> {
             cmd::retention::run(action)?;
         }
         Some(Command::Daemon(args)) => {
-            cmd::daemon::run(cli.profile, args).await?;
+            cmd::daemon::run(active_profile, args).await?;
         }
         Some(Command::Attach(args)) => {
-            cmd::attach::run(cli.profile, args).await?;
+            cmd::attach::run(active_profile, args).await?;
         }
         Some(Command::Rpc {
             continue_id,
@@ -928,6 +971,33 @@ mod worker_threads_tests {
         let named = super::Cli::try_parse_from(["synaps", "--attach", "--new", "--name", "ambient"]).unwrap();
         assert_eq!(named.session_name.as_deref(), Some("ambient"));
         assert!(super::Cli::try_parse_from(["synaps", "--name", "ambient"]).is_err());
+    }
+
+    #[test]
+    fn profile_must_be_the_one_in_effect() {
+        use super::check_profile_applied as check;
+        assert!(check(None, None).is_ok());
+        // no flag: whatever SYNAPS_PROFILE latched is legitimate
+        assert!(check(None, Some("work")).is_ok());
+        assert!(check(Some("axon"), Some("axon")).is_ok());
+        // the 0.10.1 incident: `--profile axon` but the default had latched
+        let e = check(Some("axon"), None).unwrap_err().to_string();
+        assert!(e.contains("--profile axon") && e.contains("`default`"), "{e}");
+        assert!(check(Some("axon"), Some("work")).is_err());
+    }
+
+    #[test]
+    fn thin_client_profile_is_rewritable_for_every_kind() {
+        use super::ThinClient;
+        for argv in [&["--profile", "axon"][..], &["--profile=axon", "--attach"], &["--profile", "axon", "attach"]] {
+            let mut kind = thin_client_from(v(argv), true, true).expect("thin");
+            assert_eq!(kind.profile_mut().as_deref(), Some("axon"), "{argv:?}");
+            *kind.profile_mut() = Some("pinned".into());
+            let profile = match kind {
+                ThinClient::Tui { profile } | ThinClient::Line { profile } | ThinClient::Adopt { profile } => profile,
+            };
+            assert_eq!(profile.as_deref(), Some("pinned"));
+        }
     }
 
     #[test]
