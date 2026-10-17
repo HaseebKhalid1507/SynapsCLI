@@ -514,8 +514,9 @@ pub struct SessionActor {
     /// `await_extensions=false`: fires when process-level discovery is done;
     /// the actor then emits `on_session_start` without having blocked boot.
     /// `Some` until the hook has run: a model request first settles it
-    /// (`settle_session_start`).
-    pub(crate) ext_ready: Option<oneshot::Receiver<()>>,
+    /// (`settle_session_start`). Carries the host's session-start gate
+    /// permit (one deferred hook at a time), held while the hook runs.
+    pub(crate) ext_ready: Option<oneshot::Receiver<SessionStartTurn>>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
     /// Worker-registry generation of the current/last turn: a user
@@ -663,12 +664,20 @@ impl SessionActor {
             crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id)
                 .await;
         } else {
-            let (tx, rx) = oneshot::channel();
+            let (mut tx, rx) = oneshot::channel();
             let waiter_host = Arc::clone(host);
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(ext_ready_timeout, waiter_host.extensions_ready())
                     .await;
-                let _ = tx.send(());
+                // One deferred hook at a time on this host (a reload restores
+                // every session at once). A session that settles its hook
+                // first drops the receiver and leaves the queue.
+                let gate = waiter_host.session_start_gate();
+                let permit = tokio::select! {
+                    permit = gate.acquire_owned() => permit.ok(),
+                    _ = tx.closed() => return,
+                };
+                let _ = tx.send(permit);
             });
             ext_ready = Some(rx);
         }
@@ -2378,9 +2387,17 @@ impl SessionActor {
     /// comes first, it waits here for discovery (same bound as the waiter)
     /// and runs the hook now. No-op once the hook has run.
     pub(crate) async fn settle_session_start(&mut self) {
-        let Some(rx) = self.ext_ready.take() else {
+        let Some(mut rx) = self.ext_ready.take() else {
             return;
         };
+        // Its turn at the gate already came: run the hook holding it.
+        if let Ok(permit) = rx.try_recv() {
+            self.run_session_start().await;
+            drop(permit);
+            return;
+        }
+        // Still on discovery or queued behind other sessions' hooks: leave
+        // the queue and run this session's hook now.
         drop(rx);
         let wait = extensions_ready_timeout(&self.host.config());
         if tokio::time::timeout(wait, self.host.extensions_ready())
@@ -4955,11 +4972,13 @@ fn extensions_ready_timeout(config: &crate::SynapsConfig) -> Duration {
     }
 }
 
-async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
+/// A deferred session's turn at the host's session-start gate (`None` if
+/// the gate is unavailable): held while `on_session_start` runs.
+pub(crate) type SessionStartTurn = Option<tokio::sync::OwnedSemaphorePermit>;
+
+async fn ext_ready(rx: &mut Option<oneshot::Receiver<SessionStartTurn>>) -> SessionStartTurn {
     match rx {
-        Some(r) => {
-            let _ = r.await;
-        }
+        Some(r) => r.await.ok().flatten(),
         None => std::future::pending().await,
     }
 }
@@ -5030,9 +5049,10 @@ impl SessionTask {
                     actor.on_cache_keepwarm_done(res);
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
-                _ = ext_ready(&mut actor.ext_ready) => {
+                permit = ext_ready(&mut actor.ext_ready) => {
                     actor.ext_ready = None;
                     actor.run_session_start().await;
+                    drop(permit);
                 },
                 _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
                     actor.driver_tick().await;
