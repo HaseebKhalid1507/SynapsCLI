@@ -1226,8 +1226,12 @@ impl SessionActor {
             return;
         }
         // The ping repeats the next turn's prefix, session-start injection
-        // included.
-        self.settle_session_start().await;
+        // included: it waits for that hook (timer off meanwhile) and is
+        // reconsidered once it has run (`session_start_finished`).
+        if !self.session_start_ready() {
+            self.keepwarm_awaits_start = true;
+            return;
+        }
         if let Some(why) = self.cache_keepwarm_blocker() {
             self.cache_keepwarm_end(PeriodEnd::Blocked(why));
             return;

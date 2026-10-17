@@ -76,6 +76,15 @@ pub(crate) struct TurnDraftState {
     dirty: bool,
 }
 
+/// What a started turn needs to open its stream (`start_turn`), held while
+/// its request waits for `on_session_start`.
+pub(crate) struct TurnStart {
+    cancel: CancellationToken,
+    steer_rx: mpsc::UnboundedReceiver<String>,
+    auto_approve: bool,
+    completion: crate::runtime::TurnCompletion,
+}
+
 /// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
 /// turn's stream.
 #[derive(Default)]
@@ -511,12 +520,21 @@ pub struct SessionActor {
     pub(crate) background: BackgroundTasks,
     /// B2: spawned compaction in flight (`busy` while `Some`).
     pub(crate) compact: Option<CompactionJob>,
-    /// `await_extensions=false`: fires when process-level discovery is done;
-    /// the actor then emits `on_session_start` without having blocked boot.
-    /// `Some` until the hook has run: a model request first settles it
-    /// (`settle_session_start`). Carries the host's session-start gate
-    /// permit (one deferred hook at a time), held while the hook runs.
-    pub(crate) ext_ready: Option<oneshot::Receiver<SessionStartTurn>>,
+    /// `on_session_start` for this session. `await_extensions=false`: a
+    /// task waits for process-level discovery and its turn at the host's
+    /// gate (one hook at a time), then calls it, so boot never blocks on
+    /// it. A turn or a keep-warm ping that comes first moves it ahead of
+    /// background hooks and waits for it without blocking the loop
+    /// (`turn_awaiting_start`, `keepwarm_awaits_start`).
+    pub(crate) session_start: super::session_start::SessionStart,
+    /// A started turn whose request waits for `on_session_start`: its
+    /// stream opens when the hook has run. The turn is live meanwhile
+    /// (`streaming`), so Cancel, End and a driver revocation end it as any
+    /// turn, with nothing sent.
+    pub(crate) turn_awaiting_start: Option<TurnStart>,
+    /// A due keep-warm ping waits for `on_session_start` (its timer is off
+    /// meanwhile); it is reconsidered once the hook has run.
+    pub(crate) keepwarm_awaits_start: bool,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
     /// Worker-registry generation of the current/last turn: a user
@@ -645,12 +663,12 @@ impl SessionActor {
 
         // C2: per-session on_session_start (keyed injection) once the
         // process-level discovery is known-finished. Never re-runs discovery.
-        // `await_extensions=false` (TUI): a spawned waiter fires the
-        // `ext_ready` arm instead, so boot never blocks on discovery.
+        // Every call goes through the host's session-start gate.
+        // `await_extensions=false` (TUI, a reload's restore): a spawned task
+        // runs it (`session_start` below), so boot never blocks on it.
         // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
         // the wait on extension discovery; the const remains the fallback.
         let ext_ready_timeout = extensions_ready_timeout(&config);
-        let mut ext_ready = None;
         if cfg.await_extensions {
             if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())
                 .await
@@ -661,25 +679,7 @@ impl SessionActor {
                     "extensions_ready timed out — on_session_start may miss late extensions"
                 );
             }
-            crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id)
-                .await;
-        } else {
-            let (mut tx, rx) = oneshot::channel();
-            let waiter_host = Arc::clone(host);
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(ext_ready_timeout, waiter_host.extensions_ready())
-                    .await;
-                // One deferred hook at a time on this host (a reload restores
-                // every session at once). A session that settles its hook
-                // first drops the receiver and leaves the queue.
-                let gate = waiter_host.session_start_gate();
-                let permit = tokio::select! {
-                    permit = gate.acquire_owned() => permit.ok(),
-                    _ = tx.closed() => return,
-                };
-                let _ = tx.send(permit);
-            });
-            ext_ready = Some(rx);
+            super::session_start::run_at_create(host, runtime.hook_bus(), &sb.session.id).await;
         }
 
         let id = SessionId::from(sb.session.id.clone());
@@ -772,6 +772,16 @@ impl SessionActor {
         ) = SessionHandle::new(meta.clone(), view);
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
+        let session_start = if cfg.await_extensions {
+            super::session_start::SessionStart::Done
+        } else {
+            super::session_start::SessionStart::queue(
+                host,
+                Arc::clone(&hook_bus),
+                Arc::clone(&journal_id),
+                ext_ready_timeout,
+            )
+        };
 
         let mut actor = SessionActor {
             id,
@@ -820,7 +830,9 @@ impl SessionActor {
             state: AttachState::Detached { running: false },
             background,
             compact: None,
-            ext_ready,
+            session_start,
+            turn_awaiting_start: None,
+            keepwarm_awaits_start: false,
             subagent_tick: None,
             turn_worker_generation: 0,
             lifecycle,
@@ -1415,7 +1427,7 @@ impl SessionActor {
         if self.compact.is_some() {
             return Some("compaction");
         }
-        if self.ext_ready.is_some() {
+        if !self.session_start.is_done() {
             return Some("extensions loading or reloading");
         }
         if self.conv.context_head.is_blocked(&self.conv.session) {
@@ -2367,53 +2379,78 @@ impl SessionActor {
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
-    /// Emit the deferred `on_session_start` (keyed injection) for this
-    /// session's journal id, then refresh the view.
-    async fn run_session_start(&mut self) {
-        let id = (**self.journal_id.load()).clone();
-        let bus = Arc::clone(&self.hook_bus);
-        crate::extensions::loader::emit_session_start(&bus, &id).await;
+    /// This session's `on_session_start` task ended: the hook ran (or the
+    /// task failed, which counts as done: fail-open like a hook timeout).
+    /// Refresh the view, which shows the injection, then send what waited
+    /// for it: a started turn's request, a due keep-warm ping.
+    async fn session_start_finished(
+        &mut self,
+        ran: std::result::Result<(), tokio::task::JoinError>,
+    ) {
+        if let Err(e) = ran {
+            tracing::warn!(session = %self.id, "on_session_start task failed: {e}");
+        }
+        self.session_start = super::session_start::SessionStart::Done;
         if self.runtime.is_live() {
             self.publish_view().await;
         }
+        if let Some(start) = self.turn_awaiting_start.take() {
+            // A turn canceled from outside (a driver revocation) ends on its
+            // own path (`finish_revoked_turn`) with nothing sent.
+            if !start.cancel.is_cancelled() {
+                self.open_turn_stream(start).await;
+            }
+        }
+        if std::mem::take(&mut self.keepwarm_awaits_start) {
+            self.on_cache_keepwarm_due().await;
+        }
     }
 
-    /// No model request goes out before `on_session_start` has run. Its
-    /// injection is part of every request's system prompt, so a request sent
+    /// No turn and no keep-warm ping goes out before `on_session_start` has
+    /// run. Its injection is part of their system prompt, so a request sent
     /// before it would lack the extension context and the next request would
-    /// change the cached system prompt. A session created with
+    /// change the cached system prompt. (A manual `/compact` does not wait:
+    /// it builds its own prompt; a rolling summary reuses the request of the
+    /// turn before it or builds its own prompt.) A session created with
     /// `await_extensions=false` (quick start, every session a reload
-    /// restores) runs the hook from its loop; when a turn or a keep-warm ping
-    /// comes first, it waits here for discovery (same bound as the waiter)
-    /// and runs the hook now. No-op once the hook has run.
-    pub(crate) async fn settle_session_start(&mut self) {
-        let Some(mut rx) = self.ext_ready.take() else {
-            return;
-        };
-        // Its turn at the gate already came: run the hook holding it.
-        if let Ok(permit) = rx.try_recv() {
-            self.run_session_start().await;
-            drop(permit);
-            return;
+    /// restores) has a task in line at the host's gate for it.
+    ///
+    /// `true` once the hook has run. Otherwise it moves the hook ahead of
+    /// background hooks; the caller waits for `session_start_finished`
+    /// without blocking the loop. The hook itself always runs in that task,
+    /// through the gate, so it is never called twice or beside another
+    /// session's.
+    pub(crate) fn session_start_ready(&mut self) -> bool {
+        use super::session_start::SessionStart;
+        match &self.session_start {
+            SessionStart::Done => true,
+            SessionStart::Queued { ticket, .. } => {
+                ticket.prefer();
+                false
+            }
         }
-        // Still on discovery or queued behind other sessions' hooks: leave
-        // the queue and run this session's hook now.
-        drop(rx);
-        let wait = extensions_ready_timeout(&self.host.config());
-        if tokio::time::timeout(wait, self.host.extensions_ready())
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                budget_secs = wait.as_secs(),
-                "extensions_ready timed out — on_session_start may miss late extensions"
-            );
-        }
-        self.run_session_start().await;
     }
 
+    /// Open the turn's stream: the request goes out.
+    async fn open_turn_stream(&mut self, start: TurnStart) {
+        let stream = self
+            .runtime
+            .run_stream_tracked(
+                self.conv.api_messages.clone(),
+                start.cancel,
+                Some(start.steer_rx),
+                Some(self.secret_prompt_handle.clone()),
+                start.auto_approve,
+                start.completion,
+            )
+            .await;
+        self.stream = Some(stream);
+    }
+
+    /// Start a turn. Its request goes out at once, or, while this session's
+    /// `on_session_start` has not run, once it has (`session_start_ready`);
+    /// the turn is live from here either way.
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
-        self.settle_session_start().await;
         self.cache_keepwarm_turn_started();
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
@@ -2449,6 +2486,18 @@ impl SessionActor {
             .begin_turn();
         let completion = crate::runtime::TurnCompletion::new();
         self.turn_completion = Some(completion.clone());
+        self.cancel = Some(ct.clone());
+        self.steer_tx = Some(s_tx);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.reset();
+        self.subagent_tick = Some(tick);
+        let start = TurnStart {
+            cancel: ct,
+            steer_rx: s_rx,
+            auto_approve,
+            completion,
+        };
         // A turn started by events (nobody typed it) runs under the event
         // turn budget for this turn only; the stream copies the budget when
         // it starts, so the session budget is restored right after.
@@ -2461,27 +2510,15 @@ impl SessionActor {
             self.runtime.set_turn_budget(event_budget);
             session_budget
         });
-        let stream = self
-            .runtime
-            .run_stream_tracked(
-                self.conv.api_messages.clone(),
-                ct.clone(),
-                Some(s_rx),
-                Some(self.secret_prompt_handle.clone()),
-                auto_approve,
-                completion,
-            )
-            .await;
+        if self.session_start_ready() {
+            self.open_turn_stream(start).await;
+        } else {
+            tracing::debug!(session = %self.id, "turn waits for on_session_start");
+            self.turn_awaiting_start = Some(start);
+        }
         if let Some(session_budget) = session_budget {
             self.runtime.set_turn_budget(session_budget);
         }
-        self.stream = Some(stream);
-        self.cancel = Some(ct);
-        self.steer_tx = Some(s_tx);
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.reset();
-        self.subagent_tick = Some(tick);
     }
 
     /// Every turn-end path (Done/Error/Cancel/stream EOF). `streaming=false`
@@ -2493,6 +2530,7 @@ impl SessionActor {
     /// turn's final history, then the draft removal (`close_turn_draft`).
     pub(crate) fn clear_stream(&mut self) {
         self.stream = None;
+        self.turn_awaiting_start = None;
         self.cancel = None;
         self.steer_tx = None;
         self.streaming = false;
@@ -3336,8 +3374,8 @@ impl SessionActor {
                 // Starting a competing turn here would race the driver.
                 if self.driver.is_some() {
                     tracing::debug!("on_queue_wake: RunTurn inhibited — driver armed");
-                } else if self.stream.is_some() {
-                    tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
+                } else if self.streaming || self.stream.is_some() {
+                    tracing::warn!("handle_event_arm: RunTurn with active turn — skipping");
                 } else {
                     self.consecutive_auto_turns += 1;
                     self.start_turn(TurnTrigger::EventAuto, None).await;
@@ -4972,14 +5010,13 @@ fn extensions_ready_timeout(config: &crate::SynapsConfig) -> Duration {
     }
 }
 
-/// A deferred session's turn at the host's session-start gate (`None` if
-/// the gate is unavailable): held while `on_session_start` runs.
-pub(crate) type SessionStartTurn = Option<tokio::sync::OwnedSemaphorePermit>;
-
-async fn ext_ready(rx: &mut Option<oneshot::Receiver<SessionStartTurn>>) -> SessionStartTurn {
-    match rx {
-        Some(r) => r.await.ok().flatten(),
-        None => std::future::pending().await,
+/// This session's `on_session_start` task, while it is in line or running.
+async fn session_start_task(
+    start: &mut super::session_start::SessionStart,
+) -> std::result::Result<(), tokio::task::JoinError> {
+    match start {
+        super::session_start::SessionStart::Queued { task, .. } => task.await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -5042,17 +5079,17 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if actor.reload_fence.is_none() => {
+                _ = super::cache_keepwarm::keepwarm_timer(
+                    (!actor.keepwarm_awaits_start).then(|| actor.cache_keepwarm.deadline()).flatten()
+                ), if actor.reload_fence.is_none() => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
                     actor.on_cache_keepwarm_done(res);
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
-                permit = ext_ready(&mut actor.ext_ready) => {
-                    actor.ext_ready = None;
-                    actor.run_session_start().await;
-                    drop(permit);
+                ran = session_start_task(&mut actor.session_start) => {
+                    actor.session_start_finished(ran).await;
                 },
                 _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
                     actor.driver_tick().await;

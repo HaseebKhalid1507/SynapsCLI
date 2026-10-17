@@ -15,6 +15,7 @@ pub mod display;
 pub mod driver;
 pub mod handle;
 mod persister;
+pub(crate) mod session_start;
 pub mod socket_transport;
 pub mod transport;
 pub mod types;
