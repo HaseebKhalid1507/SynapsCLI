@@ -529,6 +529,7 @@ async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
     let t0 = std::time::Instant::now();
     let took = answered_within(&d.paths, 2, t0, Duration::from_secs(5)).await;
     assert!(took.is_some(), "the new image did not answer within 5 s of the reload");
+    eprintln!("reload with {SESSIONS} slow hooks: answered after {took:?}");
     assert_eq!(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
 
     let listed = SocketTransport::sessions(&d.paths.sock).await.expect("sessions");
