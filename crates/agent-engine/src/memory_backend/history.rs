@@ -6,6 +6,7 @@ use agent_core::context_archive::{
     self, ArchiveDescriptor, ArchiveRedactor, ArchiveRef, ArchiveStore, ArchivedMessage,
 };
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 fn redactor() -> Arc<ArchiveRedactor> {
@@ -21,6 +22,27 @@ fn redactor() -> Arc<ArchiveRedactor> {
 fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
+/// Run one local archive operation on a blocking worker. The archive queues
+/// operations within this process, so a worker that outlives its dropped
+/// caller delays later operations rather than making them fail as busy. If the
+/// caller is dropped before the operation starts, the abort flag stops it from
+/// touching the archive at all.
+async fn archive_worker<T: Send + 'static>(
+    work: impl FnOnce(Arc<AtomicBool>) -> std::io::Result<T> + Send + 'static,
+) -> Result<T> {
+    struct AbortOnDrop(Arc<AtomicBool>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let abort = AbortOnDrop(Arc::new(AtomicBool::new(false)));
+    let flag = abort.0.clone();
+    tokio::task::spawn_blocking(move || work(flag))
+        .await
+        .map_err(|_| error("history worker failed"))?
+        .map_err(|e| error(e.to_string()))
+}
 impl MemoryBinding {
     pub async fn history_seal(
         &self,
@@ -34,16 +56,14 @@ impl MemoryBinding {
             let logical = logical_id.to_owned();
             let source = messages.to_vec();
             let note = note.to_owned();
-            return tokio::task::spawn_blocking(move || {
-                let store =
-                    ArchiveStore::new(&base, scope.key(), &logical)?.with_redactor(redactor());
-                let r = store.seal(&source, &note)?;
-                let stored = store.fetch_note(&r.id)?;
-                Ok::<_, std::io::Error>((r, stored))
+            // One locked operation: the stored note comes from the same scan.
+            return archive_worker(move |abort| {
+                ArchiveStore::new(&base, scope.key(), &logical)?
+                    .with_redactor(redactor())
+                    .with_abort(abort)
+                    .seal_with_note(&source, &note)
             })
-            .await
-            .map_err(|_| error("history worker failed"))?
-            .map_err(|e| error(e.to_string()));
+            .await;
         }
         let projection =
             context_archive::project_archive(logical_id, messages, note, Some(redactor()))
@@ -82,12 +102,12 @@ impl MemoryBinding {
         if !self.exclusive() {
             let base = self.base().to_owned();
             let query = query.to_owned();
-            return tokio::task::spawn_blocking(move || {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?.search(&query, limit)
+            return archive_worker(move |abort| {
+                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
+                    .with_abort(abort)
+                    .search(&query, limit)
             })
-            .await
-            .map_err(|_| error("history worker failed"))?
-            .map_err(|e| error(e.to_string()));
+            .await;
         }
         let rows: Vec<ArchiveDescriptor> = serde_json::from_value(
             self.rpc("history_search", json!({"query":query,"limit":limit}))
@@ -119,13 +139,12 @@ impl MemoryBinding {
         if !self.exclusive() {
             let base = self.base().to_owned();
             let id = id.to_owned();
-            return tokio::task::spawn_blocking(move || {
+            return archive_worker(move |abort| {
                 ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
+                    .with_abort(abort)
                     .fetch_with_provenance(&id, start, limit)
             })
-            .await
-            .map_err(|_| error("history worker failed"))?
-            .map_err(|e| error(e.to_string()));
+            .await;
         }
         let rows: Vec<ArchivedMessage> = serde_json::from_value(
             self.rpc(
@@ -148,12 +167,12 @@ impl MemoryBinding {
         if !self.exclusive() {
             let base = self.base().to_owned();
             let id = id.to_owned();
-            return tokio::task::spawn_blocking(move || {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?.fetch_note(&id)
+            return archive_worker(move |abort| {
+                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
+                    .with_abort(abort)
+                    .fetch_note(&id)
             })
-            .await
-            .map_err(|_| error("history worker failed"))?
-            .map_err(|e| error(e.to_string()));
+            .await;
         }
         let note: String =
             serde_json::from_value(self.rpc("history_note", json!({"id":id})).await?)
@@ -171,12 +190,12 @@ impl MemoryBinding {
         if !self.exclusive() {
             let base = self.base().to_owned();
             let id = id.to_owned();
-            return tokio::task::spawn_blocking(move || {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?.forget(&id)
+            return archive_worker(move |abort| {
+                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
+                    .with_abort(abort)
+                    .forget(&id)
             })
-            .await
-            .map_err(|_| error("history worker failed"))?
-            .map_err(|e| error(e.to_string()));
+            .await;
         }
         if self.rpc("history_forget", json!({"id":id})).await? != true {
             return Err(error("history not found in project"));
@@ -239,11 +258,13 @@ mod budget_tests {
         );
         assert_eq!(fetched[1].message, messages[2]);
         assert_eq!(messages, original);
-        let (retry, _) = binding
+        let (retry, retry_note) = binding
             .history_seal("budget-session", &messages, "different note")
             .await
             .unwrap();
         assert_eq!(retry.id, receipt.id);
+        // A deduplicated seal reports the note actually stored with the segment.
+        assert_eq!(retry_note, "bounded note");
         let before = binding.history_search("", 8).await.unwrap();
         let too_big = vec![Arc::new(
             json!({"role":"assistant", "content":"x".repeat(context_archive::MAX_INPUT_BYTES + 1)}),
@@ -301,5 +322,65 @@ mod budget_tests {
         ))
         .await;
         assert!(!temp.path().join("context-archives").exists());
+    }
+
+    /// Parallel history tools and rollovers share one archive directory per
+    /// project; in-process overlap must queue, never surface "archive busy".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_legacy_history_operations_queue_instead_of_reporting_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(temp.path(), MemoryBackendKind::Legacy, None);
+        let tasks: Vec<_> = (0..8)
+            .map(|worker| {
+                let binding = binding.clone();
+                tokio::spawn(async move {
+                    for round in 0..6 {
+                        let text = format!("worker {worker} round {round}");
+                        let messages = vec![Arc::new(json!({"role":"user","content":text}))];
+                        let logical = format!("synthetic-session-{worker}");
+                        let (reference, note) =
+                            binding.history_seal(&logical, &messages, "note").await?;
+                        assert_eq!(note, "note");
+                        assert_eq!(binding.history_fetch(&reference.id, 0, 1).await?.len(), 1);
+                        binding.history_search("worker", 4).await?;
+                    }
+                    Ok::<_, crate::RuntimeError>(())
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(binding.history_search("", 32).await.unwrap().len(), 32);
+    }
+
+    /// A caller dropped while its operation waits (e.g. a canceled rollover
+    /// queued behind a history read) must not start it later.
+    #[tokio::test]
+    async fn a_dropped_caller_aborts_its_archive_operation_before_it_starts() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let call = archive_worker(move |abort| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            seen_tx.send(abort.load(Ordering::Acquire)).unwrap();
+            Ok(())
+        });
+        tokio::select! {
+            biased;
+            _ = tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()) => {}
+            _ = call => panic!("worker cannot finish before release"),
+        }
+        // `call` is dropped; the worker is still running and must see it.
+        release_tx.send(()).unwrap();
+        assert!(tokio::task::spawn_blocking(move || seen_rx.recv().unwrap())
+            .await
+            .unwrap());
+
+        let completed = archive_worker(|abort| Ok(abort.load(Ordering::Acquire)))
+            .await
+            .unwrap();
+        assert!(!completed, "an awaited operation is never aborted");
     }
 }
