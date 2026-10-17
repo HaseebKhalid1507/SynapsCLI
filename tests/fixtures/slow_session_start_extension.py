@@ -10,7 +10,8 @@ file's directory):
   slow-ms             if present: milliseconds to sleep in every
                       `on_session_start` before answering (absent = answer
                       at once)
-  session-start.jsonl one line per handled `on_session_start`:
+  session-start.jsonl one line per handled `on_session_start`, written
+                      after its answer has been sent:
                       {"session_id": ..., "start": <unix s>, "end": <unix s>}
 
 The answer is `{"action": "inject", "content": SENTINEL}`, like the live
@@ -84,17 +85,19 @@ def main():
                 delay = knob_ms(SLOW_PATH)
                 if delay > 0:
                     time.sleep(delay / 1000.0)
-                with open(LOG_PATH, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({
-                        "session_id": params.get("session_id"),
-                        "start": start,
-                        "end": time.time(),
-                    }) + "\n")
+                end = time.time()
+                # Answer first: a logged hook has its answer on the wire.
                 write_message({
                     "jsonrpc": "2.0",
                     "id": msg["id"],
                     "result": {"action": "inject", "content": SENTINEL},
                 })
+                with open(LOG_PATH, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "session_id": params.get("session_id"),
+                        "start": start,
+                        "end": end,
+                    }) + "\n")
             else:
                 write_message({
                     "jsonrpc": "2.0",

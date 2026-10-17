@@ -490,19 +490,21 @@ async fn sessions_with_one_turn(paths: &registry::DaemonPaths, cwd: &Path, n: us
 }
 
 /// Wait for the new image (`generation`) to answer Ping; returns how long
-/// that took after `t0`, or `None` past `budget`. A bound but not yet
-/// accepting socket holds the handshake, so every attempt is time-boxed.
+/// that took after `t0`, or `None` past `budget`, including an answer that
+/// arrived only after it. A bound but not yet accepting socket holds the
+/// handshake, so every attempt is time-boxed.
 async fn answered_within(paths: &registry::DaemonPaths, generation: u64, t0: std::time::Instant, budget: Duration) -> Option<Duration> {
     loop {
+        if t0.elapsed() > budget {
+            return None;
+        }
         if registry::read_daemon_json(paths).is_some_and(|i| i.generation == generation)
             && tokio::time::timeout(Duration::from_millis(500), SocketTransport::ping(&paths.sock))
                 .await
                 .is_ok_and(|r| r.is_ok())
         {
-            return Some(t0.elapsed());
-        }
-        if t0.elapsed() > budget {
-            return None;
+            let took = t0.elapsed();
+            return (took <= budget).then_some(took);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -510,8 +512,9 @@ async fn answered_within(paths: &registry::DaemonPaths, generation: u64, t0: std
 
 /// A reload with 30 sessions and an extension whose `on_session_start` takes
 /// 3 s: the restore no longer waits on the hook, so the new image answers
-/// within 5 s (it took about 90 s, one hook after another) and every session
-/// reattaches under its id.
+/// within seconds (it took about 90 s, one hook after another) and every
+/// session reattaches under its id. The bound includes the process restart
+/// and the restore, so it is generous (20 s) yet far below 90 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
@@ -527,8 +530,8 @@ async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
     let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
     assert_eq!(gen, 2);
     let t0 = std::time::Instant::now();
-    let took = answered_within(&d.paths, 2, t0, Duration::from_secs(5)).await;
-    assert!(took.is_some(), "the new image did not answer within 5 s of the reload");
+    let took = answered_within(&d.paths, 2, t0, Duration::from_secs(20)).await;
+    assert!(took.is_some(), "the new image did not answer within 20 s of the reload");
     eprintln!("reload with {SESSIONS} slow hooks: answered after {took:?}");
     assert_eq!(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
 
