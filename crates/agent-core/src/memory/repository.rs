@@ -47,6 +47,8 @@ thread_local! {
     static FORCE_SINGLE_REV_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Wait operations performed by `git()` on this thread (tests only).
     static GIT_WAITS: std::cell::RefCell<Vec<GitWait>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reads of Git's stdout to report as WouldBlock before reading (tests only).
+    static FORCE_WOULD_BLOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How `git()` waited (tests only): polling for output, or sleeping before
@@ -61,6 +63,17 @@ enum GitWait {
 #[cfg(test)]
 fn record_wait(wait: GitWait) {
     GIT_WAITS.with(|w| w.borrow_mut().push(wait));
+}
+
+/// Read Git's nonblocking stdout. Tests can force the next reads to report
+/// WouldBlock, so the not-yet-ready path runs regardless of scheduling.
+#[cfg(unix)]
+fn read_pipe(pipe: &mut impl std::io::Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(test)]
+    if FORCE_WOULD_BLOCK.with(|n| n.replace(n.get().saturating_sub(1))) > 0 {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    pipe.read(buffer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +152,7 @@ fn git_output(_: &Path, _: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
 /// `Ok(None)`: Git exited unsuccessfully (the direct child is already reaped).
 #[cfg(unix)]
 fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
-    use std::io::{ErrorKind, Read};
+    use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     let mut cmd = Command::new("git");
     for (name, _) in std::env::vars_os() {
@@ -183,7 +196,7 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError
             if Instant::now() >= deadline {
                 return Err(timed_out());
             }
-            match stdout.read(&mut buffer) {
+            match read_pipe(&mut stdout, &mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
                     if bytes.len() + n > MAX_BYTES as usize {
@@ -873,21 +886,27 @@ mod tests {
         }
     }
 
-    // Deterministic, not a timing check: before EOF git() must wait for its
-    // output with poll(2), never with a fixed sleep (the old loop slept 10 ms).
-    // Only the bounded post-EOF reaping backoff may sleep, starting far below
-    // that. Elapsed time is measured only by the ignored benchmark.
+    // Checks the kind and order of waits, not elapsed time: before EOF git()
+    // must wait for its output with poll(2), never with a fixed sleep (the
+    // old loop slept 10 ms). Only the bounded post-EOF reaping backoff may
+    // sleep, starting far below that. The first read of every call is forced
+    // to report WouldBlock, so the not-yet-ready path runs even when Git's
+    // output is already available. Elapsed time is measured only by the
+    // ignored benchmark.
     #[test]
     #[serial(umask, process_spawn)]
     fn git_waits_for_output_by_poll_not_fixed_sleep() {
         let tmp = TempDir::new().unwrap();
         let (main, _) = fixture(&tmp, 0, &[]);
-        let mut polls = 0;
         for _ in 0..10 {
             GIT_WAITS.with(|w| w.borrow_mut().clear());
-            git(&main, &["rev-parse", "--git-common-dir"]).unwrap();
+            FORCE_WOULD_BLOCK.with(|n| n.set(1));
+            let output = git(&main, &["rev-parse", "--git-common-dir"]).unwrap();
+            assert_eq!(output, b".git\n");
+            assert_eq!(FORCE_WOULD_BLOCK.with(|n| n.get()), 0);
             let waits = GIT_WAITS.with(|w| w.take());
-            // Pre-EOF waits are polls; then only the reaping backoff.
+            // At least one pre-EOF wait, all polls; then only reaping sleeps.
+            assert_eq!(waits.first(), Some(&GitWait::PollOutput), "{waits:?}");
             let reaping = waits
                 .iter()
                 .position(|w| matches!(w, GitWait::Sleep { .. }))
@@ -906,11 +925,7 @@ mod tests {
                     }
                 }
             }
-            polls += reaping;
         }
-        // Git takes about a millisecond: its output cannot all be ready at
-        // the first read in every one of ten calls.
-        assert!(polls > 0);
     }
 
     /// `cargo test -p synaps-core --lib -- --ignored --nocapture discovery_bench`
