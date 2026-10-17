@@ -36,12 +36,13 @@
 //! happened before a directory-fsync error). Advisory locks serialize cooperating
 //! processes, not malicious processes running as the same OS user.
 //!
-//! Within one process, operations on the same archive directory queue for at
-//! most [`LOCK_WAIT`] instead of failing; another process holding the lock
-//! still fails closed at once ("archive busy"). The lock is released
-//! explicitly, so a descriptor inherited by a concurrently forked child cannot
-//! keep it held. An operation can be abandoned before it starts
-//! ([`ArchiveStore::with_abort`]); once started it always completes.
+//! Within one process, operations on the same archive directory wait for each
+//! other (not in FIFO order) and are admitted within [`LOCK_WAIT`] or fail as
+//! busy; another process holding the lock still fails closed ("archive busy")
+//! without waiting for it. The lock is released explicitly, so a descriptor
+//! inherited by a concurrently forked child cannot keep it held. An operation
+//! can be abandoned before it is admitted ([`ArchiveStore::with_abort`]); once
+//! admitted it always completes.
 
 use crate::core::disclosure::{gate_for_model, may_persist, DisclosureClass, ModelVisibility};
 use crate::core::stream_types::SharedMessage;
@@ -186,12 +187,16 @@ pub struct ArchiveStore {
     wait: Duration,
 }
 
-/// Process-local queue for one archive directory. The advisory file lock
-/// excludes other processes, but each operation opens its own descriptor, so
-/// without this two threads of one process would see each other as busy.
+/// Process-local mutual exclusion for one archive directory. The advisory
+/// file lock excludes other processes, but each operation opens its own
+/// descriptor, so without this two threads of one process would see each
+/// other as busy. Waiters are not served in FIFO order.
 struct Gate {
     held: Mutex<bool>,
     released: Condvar,
+    /// Operations that have waited at least once (tests synchronize on it).
+    #[cfg(test)]
+    waited: std::sync::atomic::AtomicUsize,
 }
 
 /// Field order is drop order: unlock the file, then admit the next operation.
@@ -221,6 +226,8 @@ impl Gate {
         let gate = Arc::new(Gate {
             held: Mutex::new(false),
             released: Condvar::new(),
+            #[cfg(test)]
+            waited: Default::default(),
         });
         gates.insert(identity, Arc::downgrade(&gate));
         gate
@@ -235,6 +242,7 @@ impl Gate {
         let deadline = Instant::now() + wait;
         {
             let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut waited = false;
             loop {
                 if abort.is_some_and(|abort| abort.load(Ordering::Acquire)) {
                     return Err(io::Error::new(
@@ -242,11 +250,17 @@ impl Gate {
                         "archive operation canceled before it started",
                     ));
                 }
+                // An uncontended first attempt is admitted at once; after
+                // waiting, an expired operation is never admitted, even when
+                // the gate has just become free.
+                let now = Instant::now();
+                if waited && now >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, busy));
+                }
                 if !*held {
                     *held = true;
                     break;
                 }
-                let now = Instant::now();
                 if now >= deadline {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, busy));
                 }
@@ -254,6 +268,11 @@ impl Gate {
                 if abort.is_some() {
                     slice = slice.min(ABORT_POLL);
                 }
+                #[cfg(test)]
+                if !waited {
+                    gate.waited.fetch_add(1, Ordering::AcqRel);
+                }
+                waited = true;
                 held = gate
                     .released
                     .wait_timeout(held, slice)
@@ -350,11 +369,12 @@ impl ArchiveStore {
         self
     }
 
-    /// Once `abort` is set, an operation that has not started yet (for example
-    /// one queued behind another operation in this process) fails with
-    /// `Interrupted` without touching the archive. A started operation always
-    /// completes, so callers must still treat an abandoned seal as possibly
-    /// published.
+    /// Once `abort` is set, an operation that has not been admitted yet (for
+    /// example one waiting behind another operation in this process) fails
+    /// with `Interrupted` without reading or writing any record. Setup before
+    /// admission (opening the store, projecting a seal) is not undone. An
+    /// admitted operation always completes, so callers must still treat an
+    /// abandoned seal as possibly published.
     pub fn with_abort(mut self, abort: Arc<AtomicBool>) -> Self {
         self.abort = Some(abort);
         self
@@ -2351,21 +2371,45 @@ mod lock_tests {
         (tmp, store)
     }
 
+    /// Wait (bounded) for a condition another thread establishes.
+    fn wait_until(condition: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !condition() {
+            assert!(started.elapsed() < Duration::from_secs(30), "timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The process-local gate of `store`'s archive directory.
+    fn gate_of(store: &ArchiveStore) -> Arc<Gate> {
+        Gate::for_directory(store.fs.identity().unwrap())
+    }
+
     /// A flock belongs to the open file description. A child forked by another
     /// thread holds copies of every descriptor (O_CLOEXEC applies only at
-    /// exec), so closing our copy alone does not release the lock.
+    /// exec), so closing our copy alone does not release the lock. The child
+    /// stays between fork and exec until the parent has fetched.
     #[test]
     fn a_descriptor_inherited_by_a_forked_child_does_not_keep_the_archive_locked() {
-        use std::io::Read;
+        use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
+        /// Lets the child exec on every path, panics included.
+        struct Release(io::PipeWriter);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"r");
+            }
+        }
         let (_tmp, store) = setup();
         let reference = store
             .seal(&[msg("user", json!("evidence"))], "note")
             .unwrap();
         // Close-on-exec, like every descriptor the archive opens.
         let (mut forked, signal) = io::pipe().unwrap();
-        let signal_fd = signal.as_raw_fd();
+        let (hold, release) = io::pipe().unwrap();
+        let release = Release(release);
+        let (signal_fd, hold_fd) = (signal.as_raw_fd(), hold.as_raw_fd());
         let held = store.fs.lock().unwrap();
         let child = std::thread::spawn(move || {
             let mut command = std::process::Command::new("true");
@@ -2373,24 +2417,56 @@ mod lock_tests {
             unsafe {
                 command.pre_exec(move || {
                     libc::write(signal_fd, b"f".as_ptr().cast(), 1);
-                    let pause = libc::timespec {
-                        tv_sec: 2,
-                        tv_nsec: 0,
-                    };
-                    libc::nanosleep(&pause, std::ptr::null_mut());
+                    let mut byte = 0u8;
+                    loop {
+                        let read = libc::read(hold_fd, (&mut byte as *mut u8).cast(), 1);
+                        if read >= 0
+                            || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                        {
+                            break;
+                        }
+                    }
                     Ok(())
                 });
             }
             let status = command.status();
-            drop(signal);
+            drop((signal, hold));
             status
         });
         forked.read_exact(&mut [0; 1]).unwrap();
         drop(held);
-        // The child is still between fork and exec, holding an inherited copy.
+        // The child is blocked before exec, holding an inherited copy.
         let fetched = store.fetch(&reference.id, 0, 1);
+        drop(release);
         assert!(child.join().unwrap().unwrap().success());
         assert_eq!(fetched.unwrap().len(), 1);
+    }
+
+    /// After waiting, an operation past its deadline is refused even when the
+    /// gate has become free by the time it rechecks.
+    #[test]
+    fn an_expired_waiter_is_not_admitted_when_the_gate_frees_late() {
+        let gate = Gate::for_directory((u64::MAX, u64::MAX));
+        let holder = Gate::enter(gate.clone(), Duration::ZERO, None, BUSY).unwrap();
+        let wait = Duration::from_millis(50);
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || Gate::enter(gate, wait, None, BUSY).map(drop))
+        };
+        wait_until(|| gate.waited.load(Ordering::Acquire) == 1);
+        {
+            // Free the gate but keep the waiter from rechecking until its
+            // deadline has certainly passed.
+            let mut held = gate.held.lock().unwrap();
+            *held = false;
+            std::thread::sleep(wait * 2);
+        }
+        let error = waiter.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), BUSY);
+        drop(holder);
+        // An uncontended first attempt is still admitted at once.
+        Gate::enter(gate, Duration::ZERO, None, BUSY).unwrap();
     }
 
     #[test]
@@ -2463,7 +2539,8 @@ mod lock_tests {
         let queued = other(&tmp);
         let waiter =
             std::thread::spawn(move || queued.seal(&[msg("user", json!("queued evidence"))], ""));
-        std::thread::sleep(Duration::from_millis(100));
+        let gate = gate_of(&store);
+        wait_until(|| gate.waited.load(Ordering::Acquire) == 1);
         assert!(!waiter.is_finished());
         drop(held);
         let reference = waiter.join().unwrap().unwrap();
@@ -2501,7 +2578,8 @@ mod lock_tests {
         let waiter = std::thread::spawn(move || {
             queued.seal(&[msg("user", json!("abandoned while queued"))], "")
         });
-        std::thread::sleep(Duration::from_millis(100));
+        let gate = gate_of(&store);
+        wait_until(|| gate.waited.load(Ordering::Acquire) == 1);
         assert!(!waiter.is_finished());
         abort.store(true, Ordering::Release);
         // Returns while the earlier operation still holds the archive.
