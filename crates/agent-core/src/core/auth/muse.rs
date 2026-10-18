@@ -170,7 +170,7 @@ impl fmt::Display for MuseAuthError {
             Self::PaymentRequired => write!(
                 f,
                 "your Meta account needs an active Model API plan or payment method — set it \
-                 up at {ONBOARDING_URL}, then run `synaps login --provider muse` again"
+                 up at {ONBOARDING_URL}, then retry"
             ),
             Self::LoginRejected(code) => write!(
                 f,
@@ -991,6 +991,16 @@ impl MuseBrowser for ProductionBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Billing is fixed outside synaps; the next re-mint just works, so the
+    /// text says "retry", not "log in again".
+    #[test]
+    fn payment_required_text_does_not_send_the_user_to_login() {
+        let text = MuseAuthError::PaymentRequired.to_string();
+        assert!(text.contains(ONBOARDING_URL), "{text}");
+        assert!(text.ends_with("then retry"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+    }
 
     /// Round-2 I2: a corrupt store at login is reported with its repair
     /// command, not as "credential persistence failed".
