@@ -2326,7 +2326,7 @@ impl StreamMethods {
                 }
                 for tool_use in &over_budget_tool_uses {
                     if let Some(tool_id) = tool_use["id"].as_str() {
-                        let content = "Tool call not executed: turn tool-call budget exhausted";
+                        let content = crate::runtime::budget::TOOL_CALL_BUDGET_REFUSAL;
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.to_string(),
                             result: content.to_string(),

@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 
 use agent_core::BudgetDimension;
 
+/// Content of the synthetic tool_result for a call the engine refused
+/// because the turn's tool-call allowance was used up. Hosts that count
+/// executed calls (the watcher agent) skip results with this content.
+pub const TOOL_CALL_BUDGET_REFUSAL: &str =
+    "Tool call not executed: turn tool-call budget exhausted";
+
 /// Per-turn limits (spec §8.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnBudget {
