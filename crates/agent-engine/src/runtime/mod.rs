@@ -975,6 +975,7 @@ impl Runtime {
                 auth_type,
                 refresh_token,
                 token_expires,
+                auth_file_mtime: None,
             })),
             model: crate::models::default_model().to_string(),
             tools: host.tools,
@@ -1103,6 +1104,7 @@ impl Runtime {
             auth_type: "api_key".to_string(),
             refresh_token: None,
             token_expires: None,
+            auth_file_mtime: None,
         }));
         runtime
     }
@@ -3529,6 +3531,34 @@ impl Runtime {
     /// Check if the OAuth token is expired and refresh it if needed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
         self.refresh_if_needed_for_model(&self.model).await
+    }
+
+    /// `/auth reload`: drop the in-memory Anthropic token and re-vend it
+    /// through the credential broker (re-reads auth.json locally, forcing a
+    /// refresh if the file still holds the token we had). Returns a
+    /// token-free status line.
+    pub async fn reload_auth(&self) -> Result<String> {
+        AuthMethods::reload_after_rejection(
+            Arc::clone(&self.auth),
+            &self.client,
+            &self.credential_source,
+            &self.token_cache,
+            None,
+        )
+        .await?;
+        let expires = self.auth.read().await.token_expires;
+        let source = if self.credential_source.is_remote() {
+            "remote broker"
+        } else {
+            "auth.json"
+        };
+        Ok(match expires {
+            Some(exp) => {
+                let mins = exp.saturating_sub(crate::epoch_millis()) / 60_000;
+                format!("Anthropic credentials reloaded from {source} (valid ~{mins} min)")
+            }
+            None => format!("Anthropic credentials reloaded from {source}"),
+        })
     }
 
     async fn refresh_if_needed_for_model(&self, model: &str) -> Result<()> {

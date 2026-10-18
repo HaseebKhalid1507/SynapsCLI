@@ -439,7 +439,7 @@ pub(super) async fn handle_command(
         };
     }
     if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
-        || matches!(cmd, "context" | "trace" | "memory" | "workers")
+        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "auth")
     {
         use synaps_cli::engine::commands::persist_to_config;
         let value = match link.engine_command(cmd, arg).await {
