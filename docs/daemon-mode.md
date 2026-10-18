@@ -107,7 +107,7 @@ is printed to stderr so scripts piping stdout are not affected.
 | `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup) |
 | `daemon.lock` | 0600 | **flock = liveness oracle.** Alive iff someone holds it. Nobody unlinks on ECONNREFUSED alone; `reap_stale` unlinks sock/json/pid only when the lock is free. A second daemon on the same paths is refused. |
 | `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
-| `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket}` — never credentials |
+| `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (tmp + rename, 0600; one INFO line `daemon.json rewritten` per 10 min). `daemon status` and `daemon reload` Ping before they read it. |
 | `daemon.pid` | 0600 | pid |
 
 ## Per-session event endpoint ownership
@@ -376,7 +376,7 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 
 1. **Version gate** before anything is disturbed: `<exe> daemon --print-version` (hidden flag, 5 s) must
    succeed, speak protocol ≥ ours, and be **newer or equal** by semver (`RefuseReason::ReloadRefused{why}`
-   otherwise; equal allows same-version rebuilds). `exe` = `daemon.json.exe` (argv[0] canonicalised at
+   otherwise; equal allows same-version rebuilds). `exe` = the recorded exe (`daemon.json.exe`, taken from the image's in-memory record; argv[0] canonicalised at
    first start — not `/proc/self/exe`, which reads "(deleted)" after an in-place rebuild) or `--exe`.
 2. **Drain**: `Attach::Create` → `Refused{Busy}`, `Submit`/`SubmitPrepared`/`Compact` → `Error("daemon
    reloading; retry in a moment")`; wait ≤ `--drain-secs` for every session to be idle; then
