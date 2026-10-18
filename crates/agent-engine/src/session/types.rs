@@ -187,7 +187,11 @@ pub struct SessionConfig {
     /// re-applying the operator's `memory.default_mode`. `None` = no choice
     /// yet: the default applies. Host-recorded: the daemon drops a value a
     /// client sends at create.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "SessionMemoryMode::deserialize_lenient"
+    )]
     pub memory_mode: Option<SessionMemoryMode>,
 }
 
@@ -204,6 +208,24 @@ pub enum SessionMemoryMode {
 }
 
 impl SessionMemoryMode {
+    /// `SessionConfig::memory_mode` reader: a value this build does not know
+    /// (a newer image's mode) is no choice — the operator default applies —
+    /// rather than an error that would fail the whole reload state and
+    /// rehydrate no session at all.
+    fn deserialize_lenient<'de, D>(d: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(d)?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(v.clone()).ok().or_else(|| {
+            tracing::warn!(value = %v, "unknown session memory mode; treating as no choice");
+            None
+        }))
+    }
+
     /// The mode `/memory <arg>` sets, if it sets one.
     pub fn from_command_arg(arg: &str) -> Option<Self> {
         match arg.trim() {

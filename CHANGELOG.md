@@ -91,6 +91,12 @@ All notable changes to this project will be documented in this file.
 - **Turn cost budgets bind on every provider.** `turn_budget.<role>.max_cost_usd`
   was only checked against usage from the native Anthropic transport;
   OpenAI-compatible and cloud-broker routes now count too.
+- **A session's memory choice survives park and `daemon reload`.** With a
+  confirmed `memory.default_mode`, a session whose memory was turned off
+  (`/memory off`, or the agent's `memory_context` tool) got the default
+  back the next time it was unparked or the daemon reloaded. The session
+  now keeps its own choice; the default applies only to a session that
+  never made one.
 
 ### Upgrade notes
 
@@ -125,6 +131,11 @@ All notable changes to this project will be documented in this file.
     `runtime::budget::{TOOL_CALL_NOT_EXECUTED, TOOL_CALL_BUDGET_REFUSAL}`,
     `tools::WATCHER_EXIT_ACK`, `EngineHost::report_config_warnings`, and the
     `synaps_cli::watcher_session` module.
+- **`/memory off` made before this version is not carried.** The daemon
+  that recorded it did not save the choice, so the first `daemon reload`
+  into this version (or the next unpark on the old daemon) starts such a
+  session in `memory.default_mode` again. Run `/memory off` once more after
+  upgrading; from then on it sticks.
 
 ## [0.10.2] — 2026-10-12
 

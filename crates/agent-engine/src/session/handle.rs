@@ -531,6 +531,11 @@ pub mod locked_placeholder {
             prompt_inspection: None,
         };
         let (handle, ep) = SessionHandle::new(meta, view);
+        // It never answers a checkpoint: a reload records it from the
+        // handle, which must carry its memory choice like a live actor's.
+        *ep.memory_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config.memory_mode;
         let handle = handle.with_placeholder_config(config.clone());
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
