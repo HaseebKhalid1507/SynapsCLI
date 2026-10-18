@@ -410,7 +410,7 @@ pub const MINT_BODY: &str = r#"{"onboard":false}"#;
 
 // ── Parsing (pure) ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceCodeJson {
     device_code: String,
     user_code: String,
@@ -421,6 +421,19 @@ struct DeviceCodeJson {
     expires_in: Option<u64>,
     #[serde(default)]
     interval: Option<u64>,
+}
+
+impl fmt::Debug for DeviceCodeJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceCodeJson")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1453,6 +1466,20 @@ mod tests {
         let dbg = format!("{a:?}");
         assert!(
             !dbg.contains("device-secret") && dbg.contains("ABCD-EFGH"),
+            "{dbg}"
+        );
+
+        let c = DeviceCodeJson {
+            device_code: "code-json-secret".into(),
+            user_code: "WXYZ-1234".into(),
+            verification_uri: "https://example.invalid".into(),
+            verification_uri_complete: None,
+            expires_in: Some(600),
+            interval: Some(5),
+        };
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("code-json-secret") && dbg.contains("WXYZ-1234"),
             "{dbg}"
         );
 
