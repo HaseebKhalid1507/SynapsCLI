@@ -399,7 +399,7 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    reconnects to the same generation). From its checkpoint to the exec a session is fenced: no
    queued event, park, keep-warm ping or driver tick starts work, and commands that would are refused
    (`daemon reloading; retry in a moment`); a failed exec lifts the fence (`ReloadAborted`). Work that
-   also waits for the session's `on_session_start` runs once, after both. `--exe` is validated **before** the probe: canonical path, regular
+   also waits for the session's `on_session_start` starts once both have cleared (the hook itself may run while fenced). `--exe` is validated **before** the probe: canonical path, regular
    file, executable, owned by our uid or root, not group/world-writable; then `--print-version` must parse
    and pass the gate. A failed `daemon.json` write at the exec or at the restore logs one WARN line. Tested:
    `exe_validation_refuses_and_exec_failure_keeps_serving`,
@@ -411,8 +411,9 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    the handle counter is raised to `next_subagent_id` (and past every carried id); each session with
    carried workers gets the host-only `AdoptWorkers` (before any `Park`). The restore does not wait
    for `on_session_start`: each session runs it in the background, one hook at a time per host (a
-   session restored Parked once it is unparked), so the new image answers within seconds however
-   slow the hooks are; a session's first request still waits for its hook.
+   session restored Parked once it is unparked), so the restore does not add the hooks' serial
+   latency (this does not bound the restore's other work); a session's first request still waits
+   for its hook.
 7. **Clients**: `SocketTransport::next_event` returns `None` with `last_error = Reloading{generation}`;
    `reconnect(mode)` backs off, sends `Hello{reconnect_of}` and `Attach::Existing{id, Takeover iff
    was_owner else mode}` — two reconnecting mirrors cannot both take over.

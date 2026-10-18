@@ -517,14 +517,22 @@ live in the system prompt):
   request of that session goes out before its hook has run: a turn that
   comes first waits for it (and goes ahead of other sessions' background
   hooks), while Cancel and End still act at once; a due keep-warm ping
-  waits with its timer off and goes out once the hook has run. A manual
-  `/compact` builds its own prompt and does not wait. A session restored
-  Parked runs the hook once it is unparked; a park takes a hook not yet
-  called out of line, a park that does not happen (held by running or
-  uncollected workers) leaves it in place. While a daemon reload has
-  checkpointed the session (until the exec, or until the daemon reports
-  that it failed), nothing starts at all; work that waited for both the
-  reload and the hook runs once, after both. The order is strict: a hook
+  waits with its timer off and goes out once the hook has run. Unlike a
+  turn, a due ping does not move its hook ahead of other sessions'
+  background hooks: the one behaviour change from when each source checked
+  the hook on its own. Production does not reach that state: a keep-warm
+  period starts only with an accepted request, and that request already
+  waited for the hook (only a test seam builds a due ping with the hook
+  pending). A manual `/compact` builds its own prompt and does not wait.
+  A session restored Parked runs the hook once it is unparked; a park
+  takes a hook not yet called out of line, a park that does not happen
+  (held by running or uncollected workers) leaves it in place. While a
+  daemon reload has checkpointed the session (until the exec, until the
+  daemon reports that it failed, or until the fence's backstop timeout of
+  120 s), no queued event, keep-warm ping, park or driver tick starts
+  work, and commands that would are refused; a hook already in line may
+  still run. Work that waited for both the reload and the hook starts
+  once both have cleared. The order is strict: a hook
   that a turn or a session's creation waits for goes before background
   ones, which run in arrival order only while no such hook waits, so the
   background hooks of idle sessions can be held back for as long as others
