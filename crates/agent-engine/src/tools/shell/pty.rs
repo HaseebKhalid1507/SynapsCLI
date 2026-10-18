@@ -742,6 +742,40 @@ mod tests {
         );
     }
 
+    /// A shell that exits while a background job still holds the terminal
+    /// is "alive" to the reader when its handle drops: the drop's reap
+    /// reports the shell's own exit, not a kill.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn a_dropped_handle_reports_the_exit_it_reaped() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("pty-test-session");
+        let sink = route.sink("toolu_pty", "shell_start");
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle.watch_child(Some(&sink), "shell_t");
+        let pid = match rx.try_recv() {
+            Ok(ChildProcessEvent::Spawned(spawn)) => spawn.child.pid,
+            other => panic!("{other:?}"),
+        };
+        handle.write(b"sleep 2 & exit 5\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::session::children::read_stat(pid).is_some_and(|stat| stat.is_live()) {
+            assert!(std::time::Instant::now() < deadline, "the shell never exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.alive.load(Ordering::SeqCst), "the background job keeps the terminal open");
+        drop(handle);
+        match rx.try_recv() {
+            Ok(ChildProcessEvent::Ended { exit_code, signal, .. }) => {
+                assert_eq!((exit_code, signal), (Some(5), None));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_exit_code_detection() {
