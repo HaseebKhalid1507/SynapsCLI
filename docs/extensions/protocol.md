@@ -525,7 +525,13 @@ live in the system prompt):
   keep arriving. `startup.extensions_ready_timeout_secs` bounds extension
   discovery only, not this wait: a session created with
   `await_extensions = true` waits for the hook that is running and for any
-  older foreground ones, each bounded by the handler timeout.
+  older foreground ones, each bounded by the handler timeout. A hook call
+  already sent is not abandoned when its session ends or parks: the next
+  session's hook goes out only once that call has returned, so these hooks
+  do not queue inside one extension process (an ended session's injection
+  is dropped). The exception is a handler that runs past its timeout: the
+  host fails open for that session, and the extension may still be working
+  on the call when the next session's hook arrives.
 - **`before_message`** — content is re-evaluated per turn and **attached to
   the newest user message** as a trailing text block on the outgoing request,
   positioned **after** the conversational cache breakpoint: the cache marker
