@@ -14,8 +14,9 @@
 //! `SYNAPS_BUILD_ID` from the build environment wins (packagers). Otherwise
 //! the short commit, but only when git's repo root IS our workspace root: a
 //! source tarball extracted inside an unrelated repo must not borrow that
-//! repo's hash (as in `agent-tui`'s build script). Otherwise empty: unknown,
-//! and clients compare versions only.
+//! repo's hash. Otherwise empty: unknown, and clients compare versions only.
+//! This is the only build id: the TUI header reads it through the engine
+//! (`BinaryId::this()`), and `agent-tui`'s build script computes none.
 //!
 //! `-dirty` is computed whenever the script runs, which is when HEAD moves
 //! (commit, checkout, reset; see the watch list in `repo_build_id`). It
