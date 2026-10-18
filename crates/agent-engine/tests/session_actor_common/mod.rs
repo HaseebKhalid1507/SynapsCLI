@@ -406,7 +406,12 @@ impl agent_engine::Tool for RewrittenConfirmFixtureTool {
                 sources: vec!["jev".into()],
                 generations: vec![],
                 tool: Some("bash".into()),
-                modified_input: Some(serde_json::json!({"command": "echo rewritten"})),
+                // A credential-injecting modifier (prA I-R3-1): the secrets
+                // must never reach any client's prompt.
+                modified_input: Some(serde_json::json!({
+                    "command": "echo rewritten && curl -H 'Authorization: Bearer SECRET-BEARER-123' 'https://api.example/v1?api_key=SECRET-KEY-456'",
+                    "api_key": "SECRET-FIELD-789",
+                })),
                 modified_by: vec!["rewriter".into()],
             },
             Some(&handle),
@@ -415,7 +420,10 @@ impl agent_engine::Tool for RewrittenConfirmFixtureTool {
         )
         .await;
         Ok(match result {
-            HookResult::Modify { input } => format!("ran:{}", input["command"].as_str().unwrap_or("")),
+            HookResult::Modify { input } => format!(
+                "ran:{}",
+                input["command"].as_str().unwrap_or("").split(" &&").next().unwrap_or("")
+            ),
             HookResult::Continue => "ran:original".to_string(),
             _ => "blocked".to_string(),
         })

@@ -249,6 +249,29 @@ async fn approving_rewritten_input_is_announced_to_every_client() {
     };
     assert!(pr.prompt.contains("Input rewritten by: rewriter"), "{}", pr.prompt);
     assert!(pr.prompt.contains("echo rewritten"), "{}", pr.prompt);
+    // prA I-R3-1: injected credentials are redacted in the body every
+    // client gets — the observer's live copy and a later attach's replay.
+    const SECRETS: [&str; 3] = ["SECRET-BEARER-123", "SECRET-KEY-456", "SECRET-FIELD-789"];
+    let no_secrets = |body: &str| {
+        for s in SECRETS {
+            assert!(!body.contains(s), "{s} leaked:\n{body}");
+        }
+        assert!(body.contains("[REDACTED]"), "{body}");
+    };
+    no_secrets(&pr.prompt);
+    let seen_o = until(&mut o, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let SessionEventWire::Prompt(observed) = &seen_o.last().unwrap().event else {
+        unreachable!()
+    };
+    no_secrets(&observed.prompt);
+    let (late, snap) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+    let replayed = snap
+        .pending_prompts
+        .iter()
+        .find(|p| p.id == pr.id)
+        .expect("pending prompt replayed on attach");
+    no_secrets(&replayed.prompt);
+    drop(late);
     a.send_from_self(SessionCommand::Answer {
         prompt_id: pr.id,
         value: Some("y".into()),

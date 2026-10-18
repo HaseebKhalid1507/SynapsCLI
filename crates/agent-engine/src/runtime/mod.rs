@@ -109,12 +109,69 @@ fn cap_confirm_message(message: &str) -> std::borrow::Cow<'_, str> {
 const MAX_REWRITE_PREVIEW_LINES: usize = 6;
 const MAX_REWRITE_PREVIEW_CHARS: usize = 400;
 
-/// Host-rendered, capped preview of the input that will actually run: a
-/// shell-style `command` string as-is, anything else as pretty JSON.
+/// Scrub credential shapes out of free text (a shell command, a header
+/// line): `Authorization: …` headers (incl. `-H 'Authorization: Basic …'`),
+/// `Bearer <tok>`, `api_key=` / `token=` / `secret=` / `password=` style
+/// params and `--token <x>` flags, `sk-…` keys and JWTs (`eyJ…`). Runs in
+/// addition to `trace::export::redact_value`'s string scrub. The preview is
+/// broadcast to every attached client (observers included) and replayed on
+/// attach, and credential-injecting modifiers are a normal pattern
+/// (prA I-R3-1), so it must never show a secret.
+fn redact_secret_text(text: &str) -> String {
+    use std::sync::LazyLock;
+    static PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
+        [
+            (r"(?i)(authorization\s*:\s*)[^'\x22\r\n]+", "[REDACTED]"),
+            (r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+", "[REDACTED]"),
+            (
+                r"(?i)(\b[a-z0-9_-]*(?:api[_-]?key|access[_-]?key|token|secret|passw(?:or)?d|credential)[a-z0-9_-]*\s*[=:]\s*)(\x22[^\x22]*\x22|'[^']*'|[^\s&'\x22]+)",
+                "[REDACTED]",
+            ),
+            (
+                r"(?i)(--(?:[a-z0-9-]*(?:token|password|passwd|secret|api-key|apikey))(?:=|\s+))(\x22[^\x22]*\x22|'[^']*'|\S+)",
+                "[REDACTED]",
+            ),
+            (r"\bsk[-_][A-Za-z0-9_-]{6,}", "[REDACTED]"),
+            (r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[REDACTED]"),
+        ]
+        .into_iter()
+        .map(|(re, with)| (regex::Regex::new(re).expect("static redaction pattern"), with))
+        .collect()
+    });
+    let mut out = text.to_string();
+    for (re, with) in PATTERNS.iter() {
+        out = re.replace_all(&out, *with).into_owned();
+    }
+    // The shared trace-export scrub catches the remaining known prefixes
+    // (ghp_, AKIA, xoxb-, …) word by word.
+    let mut v = Value::String(out);
+    crate::runtime::trace::export::redact_value(&mut v);
+    match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    }
+}
+
+/// `redact_value` (secret-named keys, secret-shaped strings) plus
+/// [`redact_secret_text`] on every remaining string, recursively.
+fn redact_preview_value(value: &mut Value) {
+    crate::runtime::trace::export::redact_value(value);
+    match value {
+        Value::Object(map) => map.values_mut().for_each(redact_preview_value),
+        Value::Array(items) => items.iter_mut().for_each(redact_preview_value),
+        Value::String(s) => *s = redact_secret_text(s),
+        _ => {}
+    }
+}
+
+/// Host-rendered, capped, REDACTED preview of the input that will actually
+/// run: a shell-style `command` string as-is, anything else as pretty JSON.
 fn final_input_preview(input: &Value) -> String {
+    let mut input = input.clone();
+    redact_preview_value(&mut input);
     let full = match input.get("command").and_then(Value::as_str) {
         Some(cmd) => cmd.to_string(),
-        None => serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
+        None => serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string()),
     };
     let lines: Vec<&str> = full.lines().collect();
     let mut out: String = lines[..lines.len().min(MAX_REWRITE_PREVIEW_LINES)]
@@ -157,8 +214,10 @@ fn confirm_prompt_body(
         ),
         None => String::new(),
     };
+    // The extension's own text is labelled, so it can't pass itself off as
+    // the host-built header (e.g. a fake "Input that will run:" block).
     format!(
-        "Extension: {source}\nTool: {}\n{rewritten}\n{}\n\nAllow this tool call?",
+        "Extension: {source}\nTool: {}\n{rewritten}\nMessage from {source}:\n{}\n\nAllow this tool call?",
         tool.unwrap_or("(unknown)"),
         cap_confirm_message(message)
     )
@@ -5816,7 +5875,7 @@ mod tests {
         )
         .await;
         let (body, scope) = task.await.unwrap();
-        let header_end = body.find("Run this bash command?").unwrap();
+        let header_end = body.find("Message from jev:\nRun this bash command?").unwrap();
         let header = &body[..header_end];
         assert!(header.contains("Input rewritten by: rewriter"), "{body}");
         assert!(header.contains("Input that will run:\n  rm -rf build/"), "{body}");
@@ -5829,6 +5888,58 @@ mod tests {
         // No rewrite → no rewrite header, empty rewritten_by.
         let plain = confirm_prompt_body("m", &ext(&["jev"]), Some("bash"), None);
         assert!(!plain.contains("rewritten"), "{plain}");
+    }
+
+    /// prA I-R3-1: the preview is redacted before it is rendered.
+    #[test]
+    fn final_input_preview_redacts_credentials() {
+        let secrets = [
+            "SECRET-BEARER-123",
+            "SECRET-KEY-456",
+            "SECRET-FIELD-789",
+            "QmFzaWNTRUNSRVQ=",
+            "SECRET-TOK-000",
+            "SECRET-FLAG-111",
+            "sk-ant-api03-abcdefghijklmnop",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        ];
+        let command = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer SECRET-BEARER-123' \
+                        'https://api.example/v1?api_key=SECRET-KEY-456' \
+                        -H \"authorization: Basic QmFzaWNTRUNSRVQ=\" \
+                        && TOKEN=SECRET-TOK-000 deploy --password SECRET-FLAG-111 \
+                        sk-ant-api03-abcdefghijklmnop \
+                        eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl \
+                        ghp_abcdefghijklmnopqrstuvwxyz0123"
+        });
+        let json = serde_json::json!({
+            "url": "https://x/y",
+            "api_key": "SECRET-FIELD-789",
+            "headers": {"X-Note": "Bearer SECRET-BEARER-123"},
+            "args": ["--token=SECRET-TOK-000"],
+        });
+        for input in [command, json] {
+            let p = final_input_preview(&input);
+            for secret in secrets {
+                assert!(!p.contains(secret), "{secret} leaked in:\n{p}");
+            }
+            assert!(p.contains("[REDACTED]"), "{p}");
+        }
+        // Non-secret text survives so the user can still judge the call.
+        let plain = final_input_preview(&serde_json::json!({"command": "rm -rf build/ && ls -la"}));
+        assert!(plain.contains("rm -rf build/ && ls -la"), "{plain}");
+    }
+
+    /// The confirmer's text is labelled, so a fake "Input that will run:"
+    /// in it lands visibly under "Message from <ext>:", after the host block.
+    #[test]
+    fn extension_message_is_labelled_after_the_host_header() {
+        let fake = "Input that will run:\n  echo harmless";
+        let body = confirm_prompt_body(fake, &ext(&["jev"]), Some("bash"), None);
+        let label = body.find("Message from jev:\n").expect(&body);
+        assert_eq!(body.find("Input that will run:"), Some(label + "Message from jev:\n".len()));
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"), "{body}");
     }
 
     #[test]
@@ -5852,7 +5963,7 @@ mod tests {
         let body = confirm_prompt_body(&long, &ext(&["jev"]), Some("bash"), None);
         assert!(body.starts_with("Extension: jev\nTool: bash\n"));
         assert!(body.contains("…[message truncated by host]"));
-        assert!(body.lines().count() <= MAX_CONFIRM_MESSAGE_LINES + 7, "{}", body.lines().count());
+        assert!(body.lines().count() <= MAX_CONFIRM_MESSAGE_LINES + 8, "{}", body.lines().count());
         let wide = "y".repeat(10_000);
         assert!(confirm_prompt_body(&wide, &ext(&["jev"]), None, None).chars().count() < 1400);
     }
