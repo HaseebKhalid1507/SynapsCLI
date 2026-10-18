@@ -896,6 +896,15 @@ fn a_temp_left_after_a_hard_link_publish_is_named_in_the_result() {
         out.contains(&format!("{} published; could not remove temp {}:", p(&f), p(&temp))),
         "{out}"
     );
+    // Accounted as written, with exactly one warning, and the cleanup error.
+    assert!(out.starts_with("multi_edit: 1 file(s) written, 1 edit(s) applied, 0 skipped"), "{out}");
+    let target = std::fs::canonicalize(d.path()).unwrap().join("new.md");
+    assert!(out.lines().any(|l| l == format!("written: {}", target.display())), "{out}");
+    let warnings: Vec<&str> = out.lines().filter(|l| l.starts_with("warning: ")).collect();
+    assert_eq!(warnings.len(), 1, "{out}");
+    let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
+    assert!(warnings[0].ends_with(&format!(": {unsupported}")), "{out}");
+    assert_eq!(out.lines().last(), Some(warnings[0]), "{out}");
 }
 
 // Without the exclusive rename, a hard link still creates the file without
