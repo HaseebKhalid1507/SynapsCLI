@@ -294,18 +294,29 @@ fn state_color(t: &Theme, state: &HeaderState) -> Color {
 
 // ─── text ───────────────────────────────────────────────────────────────────
 
-/// This build, as the idle header shows it: `v<version> · <git hash>`.
-pub(crate) const BUILD: &str = concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"));
+/// `v<version> · <hash>`, or `v<version>` alone when the build has no
+/// hash. `build.rs` bakes `release` in place of the hash for packaged
+/// builds (AUR, Homebrew, crates.io build from a source tarball, not a
+/// synaps checkout), and a released version already names its commit, so
+/// `· release` would only read as a missing hash.
+fn build_label(version: &str, hash: &str) -> String {
+    if hash.is_empty() || hash == "release" {
+        format!("v{version}")
+    } else {
+        format!("v{version} \u{b7} {hash}")
+    }
+}
+
+/// This build, as the idle header shows it (see [`build_label`]).
+pub(crate) fn build() -> &'static str {
+    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| build_label(env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
+}
 
 /// This build, as `/status` reports it (the header drops it when the row
 /// is too narrow for it and the session label).
-pub(crate) fn build_line() -> &'static str {
-    concat!(
-        "synaps v",
-        env!("CARGO_PKG_VERSION"),
-        " · ",
-        env!("GIT_HASH")
-    )
+pub(crate) fn build_line() -> String {
+    format!("synaps {}", build())
 }
 
 pub(crate) fn clock(secs: u64) -> String {
@@ -474,7 +485,7 @@ fn right_cluster(
 /// hide the session label (the label matters more).
 fn idle_right(t: &Theme, label: &str, width: usize, left_w: usize) -> Vec<Span<'static>> {
     let build = vec![
-        Span::styled(BUILD, fg(mix(t.muted, t.bg, 0.3))),
+        Span::styled(build(), fg(mix(t.muted, t.bg, 0.3))),
         Span::raw("  "),
     ];
     let label_whole = match place_centre(label, width, left_w, spans_width(&build)) {
@@ -823,7 +834,7 @@ mod tests {
         let t = THEME.load();
         let left_w = 8; // "  synaps"
         let shown = |label: &str, w: usize| !idle_right(&t, label, w, left_w).is_empty();
-        let build_w = BUILD.chars().count() + 2;
+        let build_w = build().chars().count() + 2;
 
         assert!(shown("axon-overnight", 100));
         assert_eq!(
@@ -843,10 +854,25 @@ mod tests {
     #[test]
     fn build_line_names_version_and_hash() {
         let line = build_line();
-        assert!(line.starts_with("synaps v"), "{line}");
-        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
-        assert!(line.ends_with(env!("GIT_HASH")), "{line}");
-        assert!(line.ends_with(BUILD), "header and /status agree: {line}");
+        assert_eq!(
+            line,
+            format!("synaps {}", build()),
+            "header and /status agree"
+        );
+        assert!(build().starts_with(concat!("v", env!("CARGO_PKG_VERSION"))));
+    }
+
+    /// Packaged builds (`GIT_HASH=release`, see build.rs) show the version
+    /// alone; checkouts show the hash, `-dirty` included.
+    #[test]
+    fn build_label_drops_the_placeholder_hash() {
+        assert_eq!(build_label("0.10.2", "release"), "v0.10.2");
+        assert_eq!(build_label("0.10.2", ""), "v0.10.2");
+        assert_eq!(build_label("0.10.2", "4a47bc5f"), "v0.10.2 \u{b7} 4a47bc5f");
+        assert_eq!(
+            build_label("0.10.2", "4a47bc5f-dirty"),
+            "v0.10.2 \u{b7} 4a47bc5f-dirty"
+        );
     }
 
     #[test]

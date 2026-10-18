@@ -598,7 +598,7 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::Status => {
-                    app.push_msg(ChatMessage::System(super::header::build_line().to_string()));
+                    app.push_msg(ChatMessage::System(super::header::build_line()));
                     if link.view().model.contains('/') {
                         app.push_msg(ChatMessage::System(
                             "Usage stats are only available for Anthropic models.".to_string(),
