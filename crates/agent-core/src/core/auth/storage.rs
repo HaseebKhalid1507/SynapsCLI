@@ -61,8 +61,8 @@ pub fn load_credential(
 /// Persist a credential into exactly one account slot. Other slots (including
 /// the provider's default slot) and any non-secret metadata already stored in
 /// this slot are preserved. A corrupt store is an error — the account path
-/// never resets the file (that would wipe every other slot); only the legacy
-/// single-credential [`save_provider_auth`] keeps the recovery behaviour.
+/// never resets the file (that would wipe every other slot); the legacy
+/// single-credential [`save_provider_auth`] resets only an empty file.
 pub fn save_credential(
     cred: &CredentialRef,
     creds: &OAuthCredentials,
@@ -809,8 +809,9 @@ fn save_provider_fields_at(
 ///
 /// Holds the exclusive `auth.json.lock` for the whole cycle, hands the parsed
 /// root to `edit`, and — when `edit` returns `(true, _)` — writes the result
-/// atomically (0600 tmp + rename). `recover_corrupt` selects the login-path
-/// behaviour of resetting an unparseable file (with a backup) versus failing.
+/// atomically (0600 tmp + rename). `recover_corrupt` lets the legacy
+/// single-credential writers reset an EMPTY file (with a backup); any other
+/// unparseable content is always an error.
 fn with_locked_root<T>(
     path: &std::path::Path,
     recover_corrupt: bool,
@@ -909,15 +910,25 @@ fn with_locked_root_typed<T>(
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        // Corrupt-file recovery: if the existing auth.json is not a JSON
-        // object (truncated write, manual edit error, swap-file detritus),
-        // log a warning and start fresh rather than refusing to save the
-        // new credential. The alternative is permanently locking the user
-        // out of `synaps login`.
+        // Corrupt-file recovery is limited to a file with nothing in it
+        // (zero-length or whitespace, e.g. a crash before the first write):
+        // that holds no account to lose. Anything else that does not parse
+        // (a truncated write, a manual edit error) may still hold every
+        // named slot's refresh token; resetting it would log the user out
+        // of all of them, so it is an error for the user to repair.
         match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content) {
             Ok(map) => map,
             Err(e) if !recover_corrupt => {
                 return Err(format!("Failed to parse {}: {}", path.display(), e).into());
+            }
+            Err(e) if !content.trim().is_empty() => {
+                return Err(format!(
+                    "{} is not valid JSON ({}); refusing to overwrite it because it may hold \
+                     other accounts. Repair it or move it aside, then retry.",
+                    path.display(),
+                    e
+                )
+                .into());
             }
             Err(e) => {
                 tracing::warn!(
@@ -1064,40 +1075,61 @@ mod tests {
         assert!(parsed.get("openai-codex").is_some());
     }
 
+    /// 147 I4: a corrupt multi-account store is never reset by a legacy
+    /// save (it would drop every named slot). The save fails and the file is
+    /// left exactly as it was, for the user to repair.
     #[test]
-    fn save_provider_auth_at_recovers_from_corrupt_file() {
-        // Pre-fix: a corrupt auth.json would lock the user out of
-        // `synaps login` entirely because save_provider_auth would fail
-        // to parse and bail. After fix: corrupt content is replaced with
-        // a fresh structure containing the new credential.
+    fn legacy_save_refuses_to_reset_a_corrupt_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("auth.json");
-        std::fs::write(&path, "this is not json {{{").unwrap();
-        save_provider_auth_at(&path, "openai-codex", &fresh_creds())
-            .expect("save must succeed even on corrupt input");
-        let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&content).expect("file must now contain valid JSON");
-        assert!(parsed.get("openai-codex").is_some());
-        assert!(
-            parsed.get("anthropic").is_none(),
-            "corrupt fallback discards old (unrecoverable) entries"
-        );
+        // A truncated multi-account store.
+        let corrupt = r#"{"anthropic":{"type":"oauth","refresh":"r1"},"anthropic@work":{"type":"oau"#;
+        std::fs::write(&path, corrupt).unwrap();
+        for save in [
+            save_provider_auth_at(&path, "openai-codex", &fresh_creds()),
+            save_static_key_at(&path, "groq", "gsk-1"),
+        ] {
+            let err = save.expect_err("must not reset a corrupt store");
+            assert!(err.contains("not valid JSON"), "{err}");
+            assert!(err.contains("other accounts"), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt, "file untouched");
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".corrupt."))
+            .count();
+        assert_eq!(backups, 0, "nothing reset, nothing to back up");
     }
 
     #[test]
-    fn save_provider_auth_at_recovers_from_array_root() {
-        // auth.json was a JSON array (perhaps from a botched migration).
-        // Treat it as corrupt — same recovery as garbage input.
+    fn legacy_save_refuses_a_non_object_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("auth.json");
         std::fs::write(&path, "[1, 2, 3]").unwrap();
         save_provider_auth_at(&path, "openai-codex", &fresh_creds())
-            .expect("save must succeed against non-object root");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(parsed.is_object());
-        assert!(parsed.get("openai-codex").is_some());
+            .expect_err("a non-object root may still hold data");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1, 2, 3]");
+    }
+
+    /// An empty / whitespace-only file holds nothing to lose: it is reset
+    /// (with the usual `.corrupt.<ts>` backup) so `synaps login` still works.
+    #[test]
+    fn legacy_save_resets_an_empty_store_with_a_backup() {
+        for content in ["", "  \n\t "] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("auth.json");
+            std::fs::write(&path, content).unwrap();
+            save_provider_auth_at(&path, "openai-codex", &fresh_creds())
+                .expect("empty store is reset");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(parsed.get("openai-codex").is_some());
+            let backups = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".corrupt."))
+                .count();
+            assert_eq!(backups, 1, "{content:?}");
+        }
     }
 
     // ── Broker-owned static-key storage ──────────────────────────────────────
