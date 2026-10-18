@@ -610,7 +610,10 @@ impl RefreshFileLock {
 /// Acquire the per-credential refresh lock off the async runtime (flock
 /// blocks). Polls `try_lock_exclusive` so a wedged peer cannot hang this
 /// process forever.
-async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileLock, RefreshFailure> {
+async fn acquire_refresh_lock(
+    path: PathBuf,
+    wait: std::time::Duration,
+) -> std::result::Result<RefreshFileLock, RefreshFailure> {
     tokio::task::spawn_blocking(move || {
         use fs4::fs_std::FileExt;
         let other = |m: String| RefreshFailure::new(RefreshFailureKind::Other, m);
@@ -630,7 +633,7 @@ async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileL
         let file = open
             .open(&path)
             .map_err(|e| other(format!("Failed to open refresh lock {}: {}", path.display(), e)))?;
-        let deadline = std::time::Instant::now() + REFRESH_LOCK_WAIT;
+        let deadline = std::time::Instant::now() + wait;
         loop {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(true) => return Ok(RefreshFileLock { file }),
@@ -764,7 +767,7 @@ where
             )
         })?;
     let file_lock = match lock_path {
-        Some(path) => Some(acquire_refresh_lock(path).await?),
+        Some(path) => Some(acquire_refresh_lock(path, REFRESH_LOCK_WAIT).await?),
         None => None,
     };
     for _ in 0..MAX_CAS_ROUNDS {
@@ -1554,6 +1557,27 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
         drop(holder);
         wait_for_rotation(&path, "b", "b-r-rotated");
+    }
+
+    /// Ported from dev's `refresh_file_lock_excludes_second_holder_until_released`
+    /// (#237/#238): a second holder of the same refresh lock (flock is per
+    /// open file description, so this contends exactly like another process)
+    /// times out as `LockBusy`, and the lock is acquirable again once the
+    /// first holder releases it.
+    #[tokio::test]
+    async fn refresh_file_lock_excludes_second_holder_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json.anthropic.refresh.lock");
+        let short = std::time::Duration::from_millis(150);
+        let held = super::acquire_refresh_lock(path.clone(), short).await.unwrap();
+        let err = match super::acquire_refresh_lock(path.clone(), short).await {
+            Ok(_) => panic!("second holder must time out"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, super::RefreshFailureKind::LockBusy);
+        assert!(err.message().contains("timed out"), "{err}");
+        drop(held);
+        super::acquire_refresh_lock(path, short).await.unwrap();
     }
 
     /// The fresh-token fast path never takes the cross-process lock: a

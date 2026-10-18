@@ -147,6 +147,9 @@ fn archived_status(
         "handle_id":      handle_id,
         "agent_name":     archive.meta.agent_name,
         "status":         archive.status,
+        // Same contract as the live path and subagent_collect: a failed
+        // worker's reason travels with its status.
+        "error":          archive.error,
         "partial_output": partial_output,
         "model":          archive.meta.model,
         "archived":       true,
@@ -177,7 +180,7 @@ mod tests {
             "sa_288",
             &meta,
             "cancelled",
-            None,
+            Some("boom"),
             "partial words",
             &[],
         )
@@ -185,6 +188,7 @@ mod tests {
         let v: Value =
             serde_json::from_str(&archived_status("sa_288", Some(path.clone()), true).unwrap()).unwrap();
         assert_eq!(v["status"], "cancelled");
+        assert_eq!(v["error"], "boom", "archived status keeps the archive's error");
         assert_eq!(v["agent_name"], "integrator");
         assert_eq!(v["archived"], true);
         assert_eq!(v["stopped_by_reload"], true);
