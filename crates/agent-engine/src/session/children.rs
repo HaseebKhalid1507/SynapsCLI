@@ -20,7 +20,9 @@
 //!   or a zombie turns its record ended in the ledger, under the lock and
 //!   only if it is still that process, before the reply says anything. A
 //!   record never turns back to running. With a sid filter only the
-//!   matching records are read.
+//!   matching records are read. The reply's global flags
+//!   (`refused_records`, `ledger_full`) are read after the check, under the
+//!   same lock, from the ledger as the check left it.
 //! - **Bounds.** At most [`MAX_PER_SESSION`] records per session and
 //!   [`MAX_TOTAL`] in all, for live spawns and restored records alike (one
 //!   bounded insertion). Over a cap the oldest *ended* record goes first; a
@@ -28,10 +30,15 @@
 //!   new record is refused and counted (`refused_records`). Either way the
 //!   session reads `truncated: true`, also when it has no record left (then
 //!   it lists as an empty group until the next sweep, at most
-//!   [`MAX_TRUNCATED_EMPTY`] such sessions). `ledger_full` says the total
-//!   cap is reached with no ended record left to evict. Members are listed
-//!   up to [`MAX_MEMBERS_PER_SID`] per sid and [`MAX_MEMBERS_PER_REPLY`] per
-//!   reply; a group with a list cut short reads truncated.
+//!   [`MAX_TRUNCATED_EMPTY`] such sessions). A truncated group, empty or
+//!   not, says the listing is incomplete: it is no evidence that nothing
+//!   (more) was spawned. `ledger_full` says the total cap is reached with no
+//!   ended record left to evict. It is a global diagnostic of stored
+//!   admission, also under a filter: `false` does not promise that a given
+//!   session's next record is kept, since that session's own cap can still
+//!   refuse it. Members are listed up to [`MAX_MEMBERS_PER_SID`] per sid and
+//!   [`MAX_MEMBERS_PER_REPLY`] per reply; a group with a list cut short
+//!   reads truncated.
 //! - **States.** A record is `running` while its leader (the spawned
 //!   process itself) is alive with the same start ticks. It turns `ended`
 //!   when the tool reaps the leader (`tool_child_ended`), or when a sweep, a
@@ -42,7 +49,8 @@
 //! - **Retention.** A record is kept while its leader runs. After it ends,
 //!   it is kept until a sweep finds no live (non-zombie) process left in its
 //!   session id (sid). A sweep is one `/proc` walk, run lazily on a spawn or
-//!   a query at most once per [`SWEEP_EVERY`], on a blocking thread. It
+//!   a query at most once per [`SWEEP_EVERY`], on a blocking thread, with
+//!   its own walk (never the member queries' shared one). It
 //!   judges only records (and host entries) inserted before it began: each
 //!   carries an insert sequence, and a record added during or after the walk
 //!   is never ended or dropped by it. Records outlive their daemon session.
@@ -669,7 +677,9 @@ pub fn attach_members(listing: &mut ChildListing, scan: &[(u32, StatFields)]) {
 /// Check each running entry's leader now (`stat_of` reads it fresh): when
 /// it is gone, reused or a zombie, its record turns ended in `ledger` (only
 /// if it is still that process and running), and the entry shows the record
-/// as it then is. Never ended to running.
+/// as it then is. Never ended to running. Then the listing's global flags
+/// (`refused_records`, `ledger_full`) are read again, under the same lock,
+/// from the ledger as the check left it.
 fn validate_leaders_in(ledger: &Mutex<Ledger>, listing: &mut ChildListing, stat_of: impl Fn(u32) -> Option<StatFields>) {
     let mut gone: Vec<&mut ChildEntry> = listing
         .sessions
@@ -677,9 +687,6 @@ fn validate_leaders_in(ledger: &Mutex<Ledger>, listing: &mut ChildListing, stat_
         .flat_map(|g| g.children.iter_mut())
         .filter(|e| e.state == ChildState::Running && !leader_runs(&e.child, stat_of(e.child.pid)))
         .collect();
-    if gone.is_empty() {
-        return;
-    }
     let mut ledger = ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for entry in gone.iter_mut() {
         let (state, exit_code, signal) = ledger.observe_gone(&entry.child).unwrap_or((ChildState::Ended, None, None));
@@ -687,6 +694,9 @@ fn validate_leaders_in(ledger: &Mutex<Ledger>, listing: &mut ChildListing, stat_
         entry.exit_code = exit_code;
         entry.signal = signal;
     }
+    drop(gone);
+    listing.refused_records = ledger.refused;
+    listing.ledger_full = ledger.full();
 }
 
 /// The process-wide ledger.
@@ -768,7 +778,10 @@ type Scan = std::sync::Arc<Vec<(u32, StatFields)>>;
 
 /// One `/proc` walk for concurrent member queries: a query reuses a walk
 /// that began after it asked, else runs one itself (on the blocking pool).
-/// One walk at a time; queries waiting meanwhile hold no thread.
+/// One walk at a time among queries that run to completion; queries waiting
+/// meanwhile hold no thread. A cancelled query can't stop a walk already
+/// started on the blocking pool, so a query after it may start another
+/// while that one still runs. Sweeps never use this cache.
 pub async fn shared_scan() -> Scan {
     static CACHE: OnceLock<tokio::sync::Mutex<Option<(Instant, Scan)>>> = OnceLock::new();
     shared_scan_in(CACHE.get_or_init(Default::default), scan_proc).await
@@ -1239,6 +1252,39 @@ mod tests {
             vec![ChildState::Ended, ChildState::Running, ChildState::Ended, ChildState::Ended, ChildState::Ended],
             "the ledger holds what the reply said"
         );
+    }
+
+    /// The global flags come from the ledger as the fresh check left it: a
+    /// full ledger whose leaders are all gone is no longer full once the
+    /// reply has ended them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_checked_reply_at_the_cap_reads_its_flags_after_the_check() {
+        let Some(boot) = boot_id() else { return };
+        let ledger = Mutex::new(Ledger::new());
+        {
+            let mut l = ledger.lock().unwrap();
+            let mut i = 0u32;
+            for s in 0..(MAX_TOTAL / MAX_PER_SESSION) {
+                for _ in 0..MAX_PER_SESSION {
+                    let pid = u32::MAX - 1 - i; // above any pid_max: never exists
+                    let child = ChildIdentity { pid, start_ticks: 1, boot_id: boot.to_string(), sid: pid, pgid: pid };
+                    assert!(l.insert(&format!("cap{s}"), spawn("t", child)));
+                    i += 1;
+                }
+            }
+            assert_eq!(l.len(), MAX_TOTAL);
+            assert!(l.list(None, None).ledger_full, "full before the check");
+        }
+        let mut listing = ledger.lock().unwrap().list(None, None);
+        validate_leaders_in(&ledger, &mut listing, read_stat);
+        assert!(listing.sessions.iter().flat_map(|g| &g.children).all(|c| c.state == ChildState::Ended));
+        assert_eq!(listing.sessions.iter().map(|g| g.children.len()).sum::<usize>(), MAX_TOTAL);
+        assert!(!listing.ledger_full, "the reply reads the flag after the check");
+        assert_eq!(listing.refused_records, 0);
+        let stored = ledger.lock().unwrap().list(None, None);
+        assert!(stored.sessions.iter().flat_map(|g| &g.children).all(|c| c.state == ChildState::Ended));
+        assert!(!stored.ledger_full, "and so does the ledger");
     }
 
     /// The fresh check never overrides what the tool recorded meanwhile, and
