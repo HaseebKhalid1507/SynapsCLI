@@ -60,13 +60,18 @@ Opt-in. `live` / `on` / `true` / `1` / `yes` attaches OpenAI's hosted
   client attaching on a later turn does not.
 - **Which requests.** Foreground turns. Subagent workers also need
   `SYNAPS_CODEX_WEB_SEARCH_WORKERS=1`; internal turns never get it.
-- **Which models.** Following upstream codex-rs (`spec_plan.rs`
-  `hosted_model_tool_specs`, openai/codex 8c076942), a model whose catalog row
-  has `use_responses_lite: true` gets no hosted tools. The live
-  `/codex/models` row wins; offline, the upstream bundled values are used
-  (every gpt-6.x and gpt-5.6 row is Responses Lite; gpt-5.5 is not).
-  `gpt-5.3-codex-spark` never gets it. `supports_search_tool` is upstream's
-  tool_search flag and is not consulted.
+- **Which models.** Every Codex model except `gpt-5.3-codex-spark`
+  (text-only; the built-in table excludes it). Synaps sends full Responses
+  requests, so upstream's `use_responses_lite` (a request-format switch in
+  codex-rs) and `supports_search_tool` (tool_search) are not consulted. If
+  the backend answers a request carrying the hosted tool with a 400 that
+  rejects a tool (`param: tools…`, or a tool-rejection code), Synaps
+  remembers that for the model for the rest of the process, shows
+  `🔎 Codex web_search was rejected by <model>; continuing without it.`
+  once, and resends that request once without the tool. A 400 is returned
+  before inference, so the resend isn't double-billed; a second rejection
+  is returned as the error. Pending: a live check of gpt-5.6-sol with
+  `SYNAPS_CODEX_WEB_SEARCH=live`.
 - **Visibility.** Each completed `web_search_call` item becomes a notice
   showing what left the machine: `🔎 Codex web_search (<action>, <status>):
   <target>`, where the target is every query (`a | b | …`, first five, then
@@ -90,7 +95,8 @@ passed to a parent agent (spec §5.1). The error carries identifier-shaped
 explanation for known shapes: a rejected reasoning setting (`param`
 `reasoning.*`), a rejected tool (`param` `tools…`), an unsupported
 parameter, `model_not_found`, and "not supported when using Codex with a
-ChatGPT account" (detected as a boolean; the text is dropped). Anything else
+ChatGPT account" (detected as a boolean; the text is dropped). The tool
+explanation names web_search only when it was attached. Anything else
 shows the identifiers alone. The trace terminal code carries only the
 identifiers (`http_400:invalid_request_error:unsupported_value`).
 
