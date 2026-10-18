@@ -293,6 +293,11 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         }
         Err(e) => return Err(cfg_err(format!("connect: {e}"))),
     };
+    if let Some(msg) =
+        agent_engine::daemon::profile_mismatch(conn.welcome.profile.as_deref(), opts.profile.as_deref())
+    {
+        return Err(cfg_err(msg));
+    }
     ladder(
         "connect",
         &format_args!("sessions={}", conn.welcome.sessions.len()),
