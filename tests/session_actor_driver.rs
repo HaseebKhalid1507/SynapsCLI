@@ -1788,6 +1788,7 @@ async fn driver_rejection(actor: &mut TestActor) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_driver_start_while_on_session_start_is_pending_is_rejected_before_any_request() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
     let mut actor = session(&host).await;
@@ -1820,6 +1821,7 @@ async fn a_driver_start_while_on_session_start_is_pending_is_rejected_before_any
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn an_armed_driver_finding_on_session_start_pending_is_revoked_before_its_next_request() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
     let mut actor = session(&host).await;
@@ -1860,6 +1862,7 @@ async fn an_armed_driver_finding_on_session_start_pending_is_revoked_before_its_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_turn_waiting_for_on_session_start_outlasts_a_rejected_driver_start() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
     let mut actor = session(&host).await;
