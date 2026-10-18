@@ -275,6 +275,7 @@ impl Tool for SubagentTool {
                                             let short = path.rsplit('/').next().unwrap_or(path);
                                             format!("editing {}", short)
                                         }
+                                        "multi_edit" => crate::tools::multi_edit_label(&input),
                                         "grep" => {
                                             let pat = input["pattern"].as_str().unwrap_or("?");
                                             let preview: String = pat.chars().take(30).collect();

@@ -228,7 +228,11 @@ pub fn render_compaction_input(
                                 let id = block["id"].as_str().unwrap_or("?");
                                 let name = block["name"].as_str().unwrap_or("");
                                 let input = &block["input"];
-                                if track_paths {
+                                if track_paths && name == "multi_edit" {
+                                    for path in crate::tools::multi_edit_paths(input) {
+                                        file_ops.edited.insert(path.to_string());
+                                    }
+                                } else if track_paths {
                                     if let Some(path) = input["path"].as_str() {
                                         match name {
                                             "read" => {

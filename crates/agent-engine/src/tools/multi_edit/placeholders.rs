@@ -9,18 +9,32 @@ use chrono::{DateTime, Local};
 use serde_json::Value;
 use std::collections::HashMap;
 
-pub(crate) fn iso(_t: &DateTime<Local>) -> String {
-    String::new()
+/// `date -Iseconds` shape: `2026-10-18T11:23:45-05:00`.
+pub(crate) fn iso(t: &DateTime<Local>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%S%:z").to_string()
 }
 
-pub(crate) fn format_checked(_t: &DateTime<Local>, _fmt: &str) -> Result<String, String> {
-    Err("not implemented".into())
+/// Format with a user strftime string without ever panicking: chrono's
+/// `format(...).to_string()` panics on an invalid specifier, so the items
+/// are validated first and the write error is mapped, not unwrapped.
+pub(crate) fn format_checked(t: &DateTime<Local>, fmt: &str) -> Result<String, String> {
+    use chrono::format::{Item, StrftimeItems};
+    use std::fmt::Write;
+    if fmt.is_empty() {
+        return Err("empty strftime format".into());
+    }
+    let items: Vec<Item<'_>> = StrftimeItems::new(fmt).collect();
+    if items.iter().any(|item| matches!(item, Item::Error)) {
+        return Err(format!("invalid strftime format {fmt:?}"));
+    }
+    let mut out = String::new();
+    write!(out, "{}", t.format_with_items(items.into_iter()))
+        .map_err(|_| format!("strftime format {fmt:?} cannot format this time"))?;
+    Ok(out)
 }
 
 pub(crate) struct Expander {
-    #[allow(dead_code)]
     now: DateTime<Local>,
-    #[allow(dead_code)]
     mtimes: HashMap<String, DateTime<Local>>,
 }
 
@@ -33,15 +47,92 @@ impl Expander {
     }
 
     pub(crate) fn now_iso(&self) -> String {
-        String::new()
+        iso(&self.now)
     }
 
-    pub(crate) fn expand(&mut self, _s: &str) -> Result<String, String> {
-        Err("not implemented".into())
+    /// Expand every `{{...}}` in `s`. `{{{{` is a literal `{{`; a `}}`
+    /// without an opener is ordinary text.
+    pub(crate) fn expand(&mut self, s: &str) -> Result<String, String> {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("{{") {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + 2..];
+            if let Some(tail) = after.strip_prefix("{{") {
+                out.push_str("{{");
+                rest = tail;
+                continue;
+            }
+            let Some(j) = after.find("}}") else {
+                return Err("unterminated placeholder: '{{' without a closing '}}' (write '{{{{' for a literal '{{')".into());
+            };
+            out.push_str(&self.resolve(&after[..j])?);
+            rest = &after[j + 2..];
+        }
+        out.push_str(rest);
+        Ok(out)
     }
 
-    pub(crate) fn expand_value(&mut self, _value: &mut Value) -> Result<(), String> {
-        Err("not implemented".into())
+    /// Expand the string leaves of a JSON value (keys are left alone). The
+    /// value is serialised afterwards, so escaping is always correct.
+    pub(crate) fn expand_value(&mut self, value: &mut Value) -> Result<(), String> {
+        match value {
+            Value::String(s) => *s = self.expand(s)?,
+            Value::Array(items) => {
+                for item in items {
+                    self.expand_value(item)?;
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values_mut() {
+                    self.expand_value(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, token: &str) -> Result<String, String> {
+        if token == "now_iso" {
+            return Ok(iso(&self.now));
+        }
+        if let Some(fmt) = token.strip_prefix("now:") {
+            return format_checked(&self.now, fmt).map_err(|e| format!("{{{{{token}}}}}: {e}"));
+        }
+        if let Some(path) = token.strip_prefix("mtime_iso:") {
+            let t = self.mtime(path).map_err(|e| format!("{{{{{token}}}}}: {e}"))?;
+            return Ok(iso(&t));
+        }
+        if let Some(rest) = token.strip_prefix("mtime:") {
+            // FMT runs up to the first ":/" (the path must be absolute).
+            let Some(k) = rest.find(":/") else {
+                return Err(format!(
+                    "{{{{{token}}}}}: expected mtime:FMT:/absolute/path"
+                ));
+            };
+            let (fmt, path) = (&rest[..k], &rest[k + 1..]);
+            let t = self.mtime(path).map_err(|e| format!("{{{{{token}}}}}: {e}"))?;
+            return format_checked(&t, fmt).map_err(|e| format!("{{{{{token}}}}}: {e}"));
+        }
+        Err(format!(
+            "unknown placeholder {{{{{token}}}}} (known: now:FMT, now_iso, mtime:FMT:/path, mtime_iso:/path)"
+        ))
+    }
+
+    fn mtime(&mut self, path: &str) -> Result<DateTime<Local>, String> {
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(format!("mtime path {path:?} must be absolute"));
+        }
+        if let Some(t) = self.mtimes.get(path) {
+            return Ok(*t);
+        }
+        let modified = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("cannot read the mtime of {path}: {e}"))?;
+        let t = DateTime::<Local>::from(modified);
+        self.mtimes.insert(path.to_string(), t);
+        Ok(t)
     }
 }
 

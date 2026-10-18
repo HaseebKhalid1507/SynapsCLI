@@ -34,33 +34,247 @@ pub(crate) enum Applied {
     Skipped { line: usize },
 }
 
-pub(crate) fn lines(_s: &str) -> Vec<(usize, usize, usize, bool)> {
-    Vec::new()
+/// Lines of `s` as `(start, content_end, next, terminated)`. The terminator
+/// (`\n` or `\r\n`) is not part of the line content. A trailing newline does
+/// not start an extra empty line.
+pub(crate) fn lines(s: &str) -> Vec<(usize, usize, usize, bool)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < s.len() {
+        match s[pos..].find('\n') {
+            Some(i) => {
+                let nl = pos + i;
+                let end = if nl > pos && bytes[nl - 1] == b'\r' {
+                    nl - 1
+                } else {
+                    nl
+                };
+                out.push((pos, end, nl + 1, true));
+                pos = nl + 1;
+            }
+            None => {
+                out.push((pos, s.len(), s.len(), false));
+                pos = s.len();
+            }
+        }
+    }
+    out
 }
 
-pub(crate) fn line_of(_s: &str, _offset: usize) -> usize {
-    0
+/// 1-based line number of byte `offset`.
+pub(crate) fn line_of(s: &str, offset: usize) -> usize {
+    s.as_bytes()[..offset.min(s.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
+/// Every match of `anchor` in `content` under `mode`, in byte order.
+///
+/// `exact` counts a match at every start position, so a self-overlapping
+/// anchor (`aa` in `aaa`) is ambiguous rather than silently first-wins.
+/// `line_regex` runs per line, so no match can cross a newline; with one
+/// capture group the span is that group (a stand-in for look-around).
 pub(crate) fn find_matches(
-    _content: &str,
-    _anchor: &str,
-    _mode: AnchorMode,
+    content: &str,
+    anchor: &str,
+    mode: AnchorMode,
 ) -> Result<Vec<Match>, String> {
-    Ok(Vec::new())
+    if anchor.is_empty() {
+        return Err("anchor is empty".into());
+    }
+    let mut out = Vec::new();
+    match mode {
+        AnchorMode::Exact => {
+            let mut i = 0;
+            while i <= content.len() {
+                let Some(p) = content[i..].find(anchor) else {
+                    break;
+                };
+                let start = i + p;
+                let end = start + anchor.len();
+                out.push(Match {
+                    start,
+                    end,
+                    line_next: end,
+                    terminated: false,
+                });
+                let step = content[start..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+                i = start + step;
+            }
+        }
+        AnchorMode::LinePrefix => {
+            for (start, end, next, terminated) in lines(content) {
+                if content[start..end].starts_with(anchor) {
+                    out.push(Match {
+                        start,
+                        end,
+                        line_next: next,
+                        terminated,
+                    });
+                }
+            }
+        }
+        AnchorMode::LineRegex => {
+            let re = regex::RegexBuilder::new(anchor)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| format!("invalid line_regex: {e}"))?;
+            let groups = re.captures_len();
+            if groups > 2 {
+                return Err(format!(
+                    "line_regex has {} capture groups; use at most one (write other groups as (?:...))",
+                    groups - 1
+                ));
+            }
+            for (start, end, _, _) in lines(content) {
+                let line = &content[start..end];
+                for caps in re.captures_iter(line) {
+                    let span = if groups == 2 { caps.get(1) } else { caps.get(0) };
+                    if let Some(m) = span {
+                        out.push(Match {
+                            start: start + m.start(),
+                            end: start + m.end(),
+                            line_next: start + m.end(),
+                            terminated: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
+fn match_lines(content: &str, matches: &[Match]) -> String {
+    const SHOWN: usize = 8;
+    let mut parts: Vec<String> = matches
+        .iter()
+        .take(SHOWN)
+        .map(|m| format!("L{}", line_of(content, m.start)))
+        .collect();
+    if matches.len() > SHOWN {
+        parts.push("…".into());
+    }
+    parts.join(", ")
+}
+
+/// Pick the one match the edit targets, or explain the count.
+fn select(content: &str, matches: &[Match], occurrence: Option<u64>) -> Result<Match, String> {
+    let n = matches.len();
+    match occurrence {
+        None if n == 1 => Ok(matches[0]),
+        None if n == 0 => Err("anchor not found (0 matches; needs exactly 1)".into()),
+        None => Err(format!(
+            "anchor matched {n} times (at {}); needs exactly 1: give occurrence 1-{n} or a longer anchor",
+            match_lines(content, matches)
+        )),
+        Some(k) if k >= 1 && (k as usize) <= n => Ok(matches[k as usize - 1]),
+        Some(k) => Err(format!(
+            "anchor matched {n} times{}; occurrence {k} does not exist",
+            if n == 0 {
+                String::new()
+            } else {
+                format!(" (at {})", match_lines(content, matches))
+            }
+        )),
+    }
+}
+
+/// Lines covered by `len` bytes inserted at `pos` (in the new content).
+fn span_lines(content: &str, pos: usize, len: usize) -> (usize, usize) {
+    let first = line_of(content, pos);
+    let last = if len == 0 {
+        first
+    } else {
+        line_of(content, pos + len - 1)
+    };
+    (first, last)
+}
+
+/// Apply one edit to `content` in place. `text` is already expanded; for
+/// `append_jsonl` it is the compact row without its newline.
 pub(crate) fn apply(
-    _content: &mut String,
-    _op: Op,
-    _mode: AnchorMode,
-    _anchor: Option<&str>,
-    _occurrence: Option<u64>,
-    _text: &str,
-    _unless_present: Option<&str>,
+    content: &mut String,
+    op: Op,
+    mode: AnchorMode,
+    anchor: Option<&str>,
+    occurrence: Option<u64>,
+    text: &str,
+    unless_present: Option<&str>,
 ) -> Result<Applied, String> {
-    Err("not implemented".into())
+    if let Some(guard) = unless_present {
+        if let Some(at) = content.find(guard) {
+            // Report the line of the guard's first visible character, so
+            // a guard written as "\n17. " points at the "17." line.
+            let lead = guard.len() - guard.trim_start_matches(['\n', '\r']).len();
+            return Ok(Applied::Skipped {
+                line: line_of(content, at + lead),
+            });
+        }
+    }
+    let mut note = None;
+    let (pos, removed, added) = match op {
+        Op::Replace | Op::InsertBefore | Op::InsertAfter => {
+            let anchor = anchor.ok_or("anchor is required")?;
+            let matches = find_matches(content, anchor, mode)?;
+            let m = select(content, &matches, occurrence)?;
+            match op {
+                Op::Replace => {
+                    content.replace_range(m.start..m.end, text);
+                    (m.start, m.end - m.start, text.len())
+                }
+                Op::InsertBefore => {
+                    content.insert_str(m.start, text);
+                    (m.start, 0, text.len())
+                }
+                _ => {
+                    let at = if mode == AnchorMode::LinePrefix {
+                        if !m.terminated {
+                            content.insert(m.line_next, '\n');
+                            note = Some("added newline after the last line");
+                            m.line_next + 1
+                        } else {
+                            m.line_next
+                        }
+                    } else {
+                        m.end
+                    };
+                    content.insert_str(at, text);
+                    (at, 0, text.len())
+                }
+            }
+        }
+        Op::Append => {
+            let at = content.len();
+            content.push_str(text);
+            (at, 0, text.len())
+        }
+        Op::AppendJsonl => {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+                note = Some("added missing newline before the row");
+            }
+            let at = content.len();
+            content.push_str(text);
+            content.push('\n');
+            (at, 0, text.len() + 1)
+        }
+    };
+    let (first_line, last_line) = span_lines(content, pos, added);
+    Ok(Applied::Edit {
+        first_line,
+        last_line,
+        removed,
+        added,
+        note,
+    })
 }
 
 #[cfg(test)]
