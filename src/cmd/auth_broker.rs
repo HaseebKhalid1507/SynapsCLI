@@ -1815,6 +1815,97 @@ mod tests {
         assert!(!other.exists(), "never auto-generated for a network bind");
     }
 
+    // ── /usage/snapshot and /accounts/cooldown machine auth (#147 I5) ───────
+    //
+    // With the right bearer the request reaches the handler's own validation
+    // (400 for a bad provider / account), which needs no credential store;
+    // without it, or with a wrong one, it is 401 before anything else runs.
+
+    async fn snapshot_status(base: &str, bearer: Option<&str>, query: &[(&str, &str)]) -> (u16, String) {
+        let mut req = reqwest::Client::new()
+            .get(format!("{base}/usage/snapshot"))
+            .query(query);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    async fn cooldown_status(base: &str, bearer: Option<&str>, body: serde_json::Value) -> (u16, String) {
+        let mut req = reqwest::Client::new()
+            .post(format!("{base}/accounts/cooldown"))
+            .json(&body);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_requires_machine_auth() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let q = [("provider", "anthropic"), ("account", "../bad")];
+        for bearer in [None, Some("wrong-token"), Some("machine-secret-but-longer")] {
+            let (status, body) = snapshot_status(&base, bearer, &q).await;
+            assert_eq!(status, 401, "{bearer:?}");
+            assert!(!body.contains("machine-secret"), "{body}");
+        }
+        let (status, body) = snapshot_status(&base, Some("machine-secret"), &q).await;
+        assert_eq!(status, 400, "authorized request reaches validation: {body}");
+        assert!(body.contains("invalid account"), "{body}");
+        let (status, _) = snapshot_status(
+            &base,
+            Some("machine-secret"),
+            &[("provider", "groq"), ("account", "default")],
+        )
+        .await;
+        assert_eq!(status, 400, "static-key provider is not a snapshot target");
+    }
+
+    #[tokio::test]
+    async fn accounts_cooldown_requires_machine_auth() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let body = json!({"provider": "anthropic", "account": "../bad", "reason": "t"});
+        for bearer in [None, Some("wrong-token")] {
+            let (status, text) = cooldown_status(&base, bearer, body.clone()).await;
+            assert_eq!(status, 401, "{bearer:?}");
+            assert!(!text.contains("machine-secret"), "{text}");
+        }
+        let (status, text) = cooldown_status(&base, Some("machine-secret"), body).await;
+        assert_eq!(status, 400, "authorized request reaches validation: {text}");
+        assert!(text.contains("invalid account"), "{text}");
+        let (status, text) = cooldown_status(
+            &base,
+            Some("machine-secret"),
+            json!({"provider": "groq", "account": "default"}),
+        )
+        .await;
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("unknown provider"), "{text}");
+    }
+
+    /// Malformed `account` on `/token` is 400 from the real handler before
+    /// any credential lookup (unknown → 404 and auto → 503 need a store;
+    /// see tests/multi_account_cli.rs, which runs the production binary).
+    #[tokio::test]
+    async fn token_malformed_account_is_400() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        for account in ["../bad", "Bad Label", "", "a/b"] {
+            let resp = reqwest::Client::new()
+                .get(format!("{base}/token"))
+                .query(&[("provider", "anthropic"), ("account", account)])
+                .bearer_auth("machine-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{account:?}");
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("invalid account") && !body.contains("access_token"), "{body}");
+        }
+    }
+
     // ── Muse is proxy-only (#216 I2) ────────────────────────────────────────
 
     /// The minted Muse Model API key never expires on its own and Muse is
