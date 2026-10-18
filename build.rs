@@ -17,10 +17,11 @@
 //! repo's hash (as in `agent-tui`'s build script). Otherwise empty: unknown,
 //! and clients compare versions only.
 //!
-//! `-dirty` is computed whenever the script runs, which is when HEAD or its
-//! ref moves (commit, checkout, reset). It deliberately does NOT watch
-//! `.git/index`, so it reflects the tree at the last HEAD move, not edits
-//! made since. Two builds of one dirty commit look the same either way.
+//! `-dirty` is computed whenever the script runs, which is when HEAD moves
+//! (commit, checkout, reset; see the watch list in `repo_build_id`). It
+//! deliberately does NOT watch `.git/index`, so it reflects the tree at the
+//! last HEAD move, not edits made since. Two builds of one dirty commit look
+//! the same either way.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,21 +66,45 @@ fn repo_build_id() -> Option<String> {
     if toplevel != ws_root {
         return None;
     }
-    // Rerun when the commit moves: HEAD (branch switch, detached moves), the
-    // branch's ref file (a commit), and packed-refs (a ref packed by gc). In a
-    // worktree `.git` is a file, so ask git for the directories. Only paths
-    // that exist: cargo treats a missing one as always changed.
+    // Rerun when the commit moves. In a worktree `.git` is a file, so ask git
+    // for the directories. Only paths that exist: cargo treats a missing one
+    // as always changed.
+    //
+    // - `<git-dir>/HEAD`: branch switch, detached moves.
+    // - `<git-dir>/logs/HEAD`, HEAD's reflog: git appends to it on every HEAD
+    //   move (commit, amend, reset, checkout), including a commit to a
+    //   branch that lives only in packed-refs after `git gc`. That commit
+    //   creates a loose ref file that didn't exist when this script ran, so
+    //   watching the ref file alone misses it. Per worktree, so another
+    //   worktree's commits don't trigger it.
+    // - The branch's ref file and packed-refs: for repos without a reflog
+    //   (`core.logAllRefUpdates = false`). There, with no loose ref yet, the
+    //   ref file's parent directory stands in (cargo scans a directory for
+    //   changes), so the first loose write is still seen.
+    // - `<common>/reftable`: the reftable backend keeps refs and reflogs
+    //   there, with no ref files at all. Any ref update reruns the script.
     let git_dir = abs_git_path(&ws_root, &["rev-parse", "--git-dir"]);
     let common_dir = abs_git_path(&ws_root, &["rev-parse", "--git-common-dir"]);
     let head_ref = git(&ws_root, &["rev-parse", "--symbolic-full-name", "HEAD"]);
     let mut watched: Vec<PathBuf> = Vec::new();
+    let mut has_reflog = false;
     if let Some(d) = &git_dir {
         watched.push(d.join("HEAD"));
+        let reflog = d.join("logs").join("HEAD");
+        has_reflog = reflog.exists();
+        watched.push(reflog);
     }
     if let Some(d) = &common_dir {
+        watched.push(d.join("reftable"));
         watched.push(d.join("packed-refs"));
         if let Some(r) = head_ref.as_deref().filter(|r| r.starts_with("refs/")) {
-            watched.push(d.join(r));
+            let loose = d.join(r);
+            if !has_reflog && !loose.exists() {
+                if let Some(parent) = loose.parent() {
+                    watched.push(parent.to_path_buf());
+                }
+            }
+            watched.push(loose);
         }
     }
     for p in watched.iter().filter(|p| p.exists()) {
