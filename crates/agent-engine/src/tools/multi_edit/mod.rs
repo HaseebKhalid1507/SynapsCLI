@@ -266,12 +266,18 @@ struct Loaded {
 /// Reads `name` through its parent's handle: never by a path that could
 /// lead elsewhere. The open never waits (a FIFO with no writer, a device)
 /// and the type is checked on the descriptor before anything is read.
+///
+/// `budget` is what is left of the call's input limit. Both limits are
+/// checked from the descriptor's size before reading, and at most
+/// limit + 1 bytes are read, so a file that grew in between is caught too.
 #[cfg_attr(not(test), allow(unused_variables))]
 fn load_existing(
     dir: &dir::Dir,
     name: &std::ffi::OsStr,
+    budget: usize,
     hooks: &mut dyn commit::Hooks,
 ) -> std::result::Result<Loaded, String> {
+    let over_budget = || format!("the files this call reads would exceed {MAX_TOTAL_BYTES} bytes");
     use std::io::Read;
     let (file, meta) = dir.open_regular(name).map_err(|e| match e {
         dir::OpenError::NotRegular => "not a regular file".to_string(),
@@ -287,14 +293,20 @@ fn load_existing(
     if meta.size > MAX_FILE_BYTES as u64 {
         return Err(format!("larger than {MAX_FILE_BYTES} bytes"));
     }
+    if meta.size > budget as u64 {
+        return Err(over_budget());
+    }
     #[cfg(test)]
     hooks.before_read();
     let mut bytes = Vec::with_capacity(meta.size as usize);
-    file.take(MAX_FILE_BYTES as u64 + 1)
+    file.take(MAX_FILE_BYTES.min(budget) as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read: {e}"))?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(format!("larger than {MAX_FILE_BYTES} bytes"));
+    }
+    if bytes.len() > budget {
+        return Err(over_budget());
     }
     let text = String::from_utf8(bytes).map_err(|_| "not UTF-8 text".to_string())?;
     Ok(Loaded {
@@ -319,6 +331,8 @@ fn run(
     let mut index_of: std::collections::HashMap<PathBuf, usize> = Default::default();
     let mut lines: Vec<String> = Vec::with_capacity(req.edits.len());
     let (mut applied, mut skipped) = (0usize, 0usize);
+    // Bytes of existing files read so far (the call's input limit).
+    let mut read_bytes = 0usize;
 
     for (i, spec) in req.edits.iter().enumerate() {
         let op = spec.op.as_str();
@@ -347,7 +361,9 @@ fn run(
                         content,
                         identity,
                         mode,
-                    } = load_existing(&dir, &name, hooks).map_err(at)?;
+                    } = load_existing(&dir, &name, MAX_TOTAL_BYTES - read_bytes, hooks)
+                        .map_err(at)?;
+                    read_bytes += content.len();
                     FileEntry {
                         display: spec.path.clone(),
                         target: target.clone(),
