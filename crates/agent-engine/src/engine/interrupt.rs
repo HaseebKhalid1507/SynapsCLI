@@ -102,56 +102,28 @@ pub fn interruption_label(text: &str) -> Option<&str> {
     is_interruption_marker(text).then(|| &text[1..text.len() - 1])
 }
 
-/// `_synaps_context.schema` of the host note a cancel records when the
-/// engine never reported a tool call the interrupted response made
-/// (`session::actor` `keep_streamed_partial`). Host-authored: never a user
-/// request to continuation (`is_user_request`), stripped from provider
-/// wires with every `_synaps_context`, shown as a system line on replay.
-pub const TOOL_NOTE_SCHEMA: &str = "synaps-tool-in-flight-note/1";
-
-/// The note's text: the engine's canceled-`tool_result` wording
-/// (`canceled_tool_result_content`), hedged to "may have already started"
-/// because the actor can't tell whether the call began.
+/// The note a cancel records when the engine never reported back on a tool
+/// call the interrupted response made (`session::actor`
+/// `keep_streamed_partial`): the engine's canceled-`tool_result` wording,
+/// hedged to "may have already started" because the actor can't tell
+/// whether the call began. A plain user-role message, recognised by its
+/// exact text like the interruption marker (never by a host key a
+/// rolled-back 0.10.2 would take for an archive marker); the generator and
+/// the matcher live in `agent_core::core::host_note`, which archive
+/// projection (agent-core) uses too.
 pub fn tool_in_flight_note(reason: InterruptReason, tools: &[String]) -> String {
     let phrase = reason.cancel_cause().map_or("Canceled", |c| c.phrase());
-    let names = tools.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
-    let (call, was, it, its) = if tools.len() == 1 {
-        ("tool call", "was", "It", "its")
-    } else {
-        ("tool calls", "were", "They", "their")
-    };
-    format!(
-        "[{phrase} while the {call} {names} {was} running. {it} may have already started and \
-         partially applied {its} effects.]"
-    )
+    agent_core::core::host_note::tool_in_flight_note_text(phrase, tools)
 }
 
-/// The note as a history message, tagged host-authored.
+/// The note as a history message.
 pub fn tool_in_flight_note_message(reason: InterruptReason, tools: &[String]) -> SharedMessage {
-    std::sync::Arc::new(json!({
-        "role": "user",
-        "_synaps_context": {"schema": TOOL_NOTE_SCHEMA},
-        "content": tool_in_flight_note(reason, tools)
-    }))
+    std::sync::Arc::new(json!({"role": "user", "content": tool_in_flight_note(reason, tools)}))
 }
 
-/// [`tool_in_flight_note`] text → the text without its brackets, for
-/// display (the display tail carries text only, like the marker). `None`
-/// for anything else.
-pub fn tool_in_flight_note_label(text: &str) -> Option<&str> {
-    let inner = text.strip_prefix('[')?.strip_suffix(']')?;
-    let mut phrases = InterruptReason::ALL
-        .iter()
-        .filter_map(|r| r.cancel_cause().map(|c| c.phrase()))
-        .chain(["Canceled"]);
-    (inner.ends_with(" effects.")
-        && phrases.any(|p| {
-            inner
-                .strip_prefix(p)
-                .is_some_and(|rest| rest.starts_with(" while the tool call"))
-        }))
-    .then_some(inner)
-}
+/// Exactly a generated note (text / message): never a user request, never
+/// archived or captured as the user's words, a system line on replay.
+pub use agent_core::core::host_note::{is_tool_in_flight_note, tool_in_flight_note_label};
 
 fn marker_of(message: &Value) -> bool {
     message["role"] == "user"
@@ -254,12 +226,46 @@ mod tests {
             assert_eq!(tool_in_flight_note_label(note), Some(&note[1..note.len() - 1]));
             assert!(!is_interruption_marker(note), "never mistaken for a marker");
         }
+        // Every reason's note is recognised (the phrase lists agree).
+        for reason in InterruptReason::ALL {
+            let note = tool_in_flight_note(reason, &["x".into()]);
+            assert!(tool_in_flight_note_label(&note).is_some(), "{reason:?}: {note}");
+        }
+        // A plain message, untagged: recognised by its text alone.
         let msg = tool_in_flight_note_message(InterruptReason::User, &["bash".into()]);
-        assert_eq!(msg["role"], "user");
-        assert_eq!(msg["_synaps_context"]["schema"], TOOL_NOTE_SCHEMA);
-        assert_eq!(msg["content"], one.as_str());
-        for other in ["[Request interrupted by user]", "[Canceled by user]", "hello", "[x effects.]"] {
-            assert_eq!(tool_in_flight_note_label(other), None, "{other}");
+        assert_eq!(*msg, json!({"role": "user", "content": one}));
+        assert!(is_tool_in_flight_note(&msg));
+        assert!(!is_tool_in_flight_note(&json!({"role": "assistant", "content": one})));
+        assert!(!is_tool_in_flight_note(&json!({"role": "user", "content": [{"type": "text", "text": one}]})));
+    }
+
+    /// Only the exact generated sentence is the note: nothing free-form in
+    /// the middle, a single line, a known cancel phrase.
+    #[test]
+    fn tool_note_matcher_is_exact() {
+        let one = tool_in_flight_note(InterruptReason::User, &["bash".into()]);
+        let not_notes = [
+            "[Request interrupted by user]".to_string(),
+            "[Canceled by user]".into(),
+            "hello".into(),
+            "[x effects.]".into(),
+            // Multi-line, or anything inserted, removed or reworded.
+            one.replace(" was running.", " was\nrunning."),
+            format!("{one}\n"),
+            format!("{one} please"),
+            one.replace("`bash`", "`bash` and also rm -rf /"),
+            one.replace("`bash`", "`bash`, `ls`"),
+            one.replace("It may", "They may"),
+            one.replace("Canceled by user", "Canceled by someone"),
+            one.replace("tool call `bash` was", "tool calls `bash` were"),
+            one.replace("`bash`", "``"),
+            one.replace("`bash`", "`ba\nsh`"),
+            "[Canceled by user while the tool call `a` was running. Anything at all goes here \
+             effects.]"
+                .into(),
+        ];
+        for text in &not_notes {
+            assert_eq!(tool_in_flight_note_label(text), None, "{text:?}");
         }
     }
 

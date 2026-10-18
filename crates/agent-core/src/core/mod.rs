@@ -8,6 +8,7 @@ pub mod context_head;
 pub mod context_policy;
 pub mod disclosure;
 pub mod error;
+pub mod host_note;
 pub mod logging;
 pub mod memstat;
 pub mod models;

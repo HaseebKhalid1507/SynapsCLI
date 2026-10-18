@@ -946,11 +946,10 @@ async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
         )),
         "clients get the same note: {seen:#?}"
     );
-    // Host-authored, not a user request.
-    assert_eq!(
-        msgs[2]["_synaps_context"]["schema"],
-        agent_engine::engine::interrupt::TOOL_NOTE_SCHEMA
-    );
+    // A plain message, recognised by its exact text (no host key a
+    // rolled-back 0.10.2 would take for an archive marker).
+    assert!(msgs.iter().all(|m| m.get("_synaps_context").is_none()), "{msgs:#?}");
+    assert!(agent_engine::engine::interrupt::is_tool_in_flight_note(&msgs[2]));
     gate.release.notify_one();
 
     // An event wakes the next turn (no new user prompt): its turn start is
@@ -987,8 +986,9 @@ async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
         .map(|m| text_of(m))
         .collect();
     assert_eq!(starts, vec!["check the file".to_string()], "turn start stays the real prompt");
+    assert!(msgs.iter().all(|m| m.get("_synaps_context").is_none()), "{msgs:#?}");
     let body = serde_json::to_string(&seen_bodies.lock().unwrap()[1]).unwrap();
-    assert!(!body.contains("_synaps_context"), "host key never on the wire: {body}");
+    assert!(!body.contains("_synaps_context"), "no host key anywhere: {body}");
     assert!(body.contains("may have already started"), "the note's text is sent");
     end(&mut a).await;
 }

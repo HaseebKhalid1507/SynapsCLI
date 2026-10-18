@@ -890,9 +890,12 @@ fn eligible_class(value: &Value) -> Option<DisclosureClass> {
 }
 
 /// Shared message-envelope selection for preflight and projection. Host
-/// continuation notes are derived working context, never source evidence.
+/// continuation notes and the host's tool-in-flight note are derived
+/// working context, never source evidence (nor the user's words).
 fn projection_content(message: &Value) -> Option<(DisclosureClass, &str, &Value)> {
-    if message.get("_synaps_context").is_some() {
+    if message.get("_synaps_context").is_some()
+        || crate::core::host_note::is_tool_in_flight_note(message)
+    {
         return None;
     }
     let class = eligible_class(message)?;
@@ -1767,6 +1770,11 @@ mod projection_tests {
             ),
             Arc::new(json!({"role":"user","sensitivity":"secret","content":"OMITTED"})),
             Arc::new(json!({"role":"user","_synaps_context":{},"content":"NOTE_ONLY"})),
+            // The host's tool-in-flight note: never archived as user evidence.
+            Arc::new(json!({"role":"user","content":crate::core::host_note::tool_in_flight_note_text(
+                "Canceled by user",
+                &["bash".into()],
+            )})),
         ];
         let projected =
             project_archive("session", &messages, "classified-value", Some(redactor)).unwrap();
@@ -1774,6 +1782,7 @@ mod projection_tests {
         let json = serde_json::to_string(&projected.messages).unwrap();
         assert!(!json.contains("classified-value"));
         assert!(!json.contains("NOTE_ONLY"));
+        assert!(!json.contains("partially applied"), "the tool note is not archived");
         assert!(!json.contains("OMITTED"));
         assert!(json.contains("src/lib.rs"));
         assert_eq!(projected.messages.len(), 2);
