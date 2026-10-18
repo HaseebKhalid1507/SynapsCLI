@@ -543,3 +543,72 @@ async fn graceful_round_renewal_is_logged() {
         "exhausted renewals must still log a hard stop; got:\n{log}"
     );
 }
+
+/// Text plus a tool call, in a round billed at 1M uncached input tokens
+/// ($3 on Sonnet): over any small turn cost budget.
+const SSE_EXPENSIVE_TEXT_AND_TOOL: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c1\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":1000000,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"paid-for findings\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":1,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_paid\",\"name\":\"budget_fixture_tool\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":1000000,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// A cost stop keeps the round it already paid for: the assistant's text and
+/// tool call stay in history, the call is NOT executed and gets a paired
+/// "not executed" result, and the turn ends as CostUsd-exhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cost_stop_keeps_the_paid_for_response_with_unexecuted_calls_paired() {
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::SeqSse(&[SSE_EXPENSIVE_TEXT_AND_TOOL])).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let budget = TurnBudget {
+        max_cost_usd: Some(0.50),
+        ..TurnBudget::for_role(TurnRole::Foreground)
+    };
+    let (rt, executions) = runtime_with_fixture(budget, 8).await;
+    let events = drive_runtime_turn(&rt, "spend", false).await;
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "no further provider round");
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "the call is not executed"
+    );
+    assert_eq!(
+        budget_outcome(&events),
+        Some(TurnOutcome::BudgetExceeded {
+            dimension: BudgetDimension::CostUsd
+        })
+    );
+    let history = final_history(&events);
+    let assistant = history
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("the paid-for response stays in history");
+    assert!(assistant.to_string().contains("paid-for findings"));
+    assert_history_pairing(&history);
+    let results = tool_result_contents(&history);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "toolu_paid");
+    assert!(
+        results[0]
+            .1
+            .starts_with(synaps_cli::runtime::budget::TOOL_CALL_NOT_EXECUTED),
+        "{}",
+        results[0].1
+    );
+}

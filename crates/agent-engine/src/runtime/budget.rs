@@ -15,9 +15,13 @@ use std::time::{Duration, Instant};
 
 use agent_core::BudgetDimension;
 
-/// Content of the synthetic tool_result for a call the engine refused
-/// because the turn's tool-call allowance was used up. Hosts that count
-/// executed calls (the watcher agent) skip results with this content.
+/// Start of every synthetic tool_result for a call the engine did not run
+/// because a turn budget was used up. Hosts that count executed calls (the
+/// watcher agent) skip results that start with it.
+pub const TOOL_CALL_NOT_EXECUTED: &str = "Tool call not executed";
+
+/// The synthetic tool_result for a call refused by the turn's tool-call
+/// allowance.
 pub const TOOL_CALL_BUDGET_REFUSAL: &str =
     "Tool call not executed: turn tool-call budget exhausted";
 

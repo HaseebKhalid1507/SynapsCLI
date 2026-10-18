@@ -2462,12 +2462,21 @@ where
             result = &mut routed => break result,
         }
     };
-    // Everything sent before the route returned belongs to this request.
-    while let Ok(event) = route_rx.try_recv() {
-        forward(&counters, model, tx, event);
+    // Drain what this request sent before returning, so its usage is booked
+    // before the stream loop checks the turn budget. Normally the route's
+    // sender is gone and this ends at once; a sender clone still held by a
+    // provider task winding down gets a short, bounded wait.
+    let drained = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = route_rx.recv().await {
+            forward(&counters, model, tx, event);
+        }
+    })
+    .await
+    .is_ok();
+    if drained {
+        return result;
     }
-    // A sender clone that outlives the route (a provider task still
-    // winding down) must not lose its events.
+    // A sender that outlives even that must not lose its events.
     let tx = tx.clone();
     let model = model.to_string();
     tokio::spawn(async move {

@@ -1415,9 +1415,10 @@ impl StreamMethods {
                         );
                 }
             }
-            if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
-                finish_budget_exceeded!(dimension);
-            }
+            // A usage stop (cost, total tokens, context tokens) lands AFTER the
+            // round was paid for: its response is kept in history below (tool
+            // calls paired with "not executed" results) before the turn ends.
+            let usage_exhausted = budget_meter.check_usage(&usage_counters).err();
 
             // Check if Claude wants to use tools
             if let Some(content) = response["content"].as_array() {
@@ -1438,6 +1439,9 @@ impl StreamMethods {
                 // emitted text before the tool_use. Commit history cleanly
                 // instead of dropping the entire turn as an error.
                 if content.is_empty() {
+                    if let Some(dimension) = usage_exhausted {
+                        finish_budget_exceeded!(dimension);
+                    }
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
@@ -1480,6 +1484,35 @@ impl StreamMethods {
                     "role": "assistant",
                     "content": content
                 })));
+
+                if let Some(dimension) = usage_exhausted {
+                    // Keep the paid-for response; none of its calls run.
+                    if !tool_uses.is_empty() {
+                        let content = format!(
+                            "{}: turn {} budget exhausted",
+                            crate::runtime::budget::TOOL_CALL_NOT_EXECUTED,
+                            dimension.as_str().replace('_', " ")
+                        );
+                        let results: Vec<Value> = tool_uses
+                            .iter()
+                            .filter_map(|tool_use| tool_use["id"].as_str())
+                            .map(|tool_id| {
+                                let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                    tool_id: tool_id.to_string(),
+                                    result: content.clone(),
+                                }));
+                                json!({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": content,
+                                    "is_error": true
+                                })
+                            })
+                            .collect();
+                        messages.push(Arc::new(json!({"role": "user", "content": results})));
+                    }
+                    finish_budget_exceeded!(dimension);
+                }
 
                 // Batched context_checkpoint rejection: if the model called
                 // context_checkpoint alongside other tools, reject the batch
