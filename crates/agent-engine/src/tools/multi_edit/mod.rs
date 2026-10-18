@@ -11,6 +11,7 @@
 //! and one concurrency key cannot name several files.
 
 mod commit;
+mod dir;
 mod placeholders;
 mod plan;
 
@@ -18,6 +19,7 @@ use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_EDITS: usize = 64;
@@ -195,6 +197,11 @@ pub(crate) type ScopeCheck<'a> = &'a dyn Fn(&str) -> bool;
 struct FileEntry {
     display: String,
     target: PathBuf,
+    /// The verified parent directory of `target`, opened right after the
+    /// scope check from the same canonical path.
+    dir: dir::Dir,
+    /// The file name of `target` in `dir`.
+    name: OsString,
     original: Option<String>,
     identity: Option<(u64, u64)>,
     mode: Option<u32>,
@@ -239,6 +246,16 @@ fn resolve_target(raw: &str, cwd: Option<&Path>) -> std::result::Result<(PathBuf
     }
 }
 
+/// The verified parent directory of a resolved target, and the target's
+/// file name in it. Opened from the canonical path the scope check saw.
+fn open_parent(target: &Path) -> std::result::Result<(dir::Dir, OsString), String> {
+    let name = target.file_name().ok_or("path has no file name")?.to_os_string();
+    let parent = target.parent().ok_or("path has no parent directory")?;
+    let dir = dir::Dir::open(parent)
+        .map_err(|e| format!("parent directory {} is not usable: {e}", parent.display()))?;
+    Ok((dir, name))
+}
+
 /// An existing file as read during planning.
 struct Loaded {
     content: String,
@@ -246,49 +263,45 @@ struct Loaded {
     mode: Option<u32>,
 }
 
+/// Reads `name` through its parent's handle: never by a path that could
+/// lead elsewhere.
 #[cfg_attr(not(test), allow(unused_variables))]
-fn load_existing(target: &Path, hooks: &mut dyn commit::Hooks) -> std::result::Result<Loaded, String> {
+fn load_existing(
+    dir: &dir::Dir,
+    name: &std::ffi::OsStr,
+    hooks: &mut dyn commit::Hooks,
+) -> std::result::Result<Loaded, String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(target).map_err(|e| format!("cannot open: {e}"))?;
-    let meta = file.metadata().map_err(|e| format!("cannot stat: {e}"))?;
-    if !meta.is_file() {
+    let (file, meta) = dir.open_read(name).map_err(|e| match e {
+        dir::OpenError::Symlink => "was replaced by a symlink since it was resolved".to_string(),
+        dir::OpenError::Io(e) => format!("cannot open: {e}"),
+    })?;
+    if meta.kind != dir::Kind::File {
         return Err("not a regular file".into());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.nlink() > 1 {
-            return Err(format!(
-                "has {} hard links; replacing it would split them",
-                meta.nlink()
-            ));
-        }
+    if meta.nlink > 1 {
+        return Err(format!(
+            "has {} hard links; replacing it would split them",
+            meta.nlink
+        ));
     }
-    if meta.len() > MAX_FILE_BYTES as u64 {
+    if meta.size > MAX_FILE_BYTES as u64 {
         return Err(format!("larger than {MAX_FILE_BYTES} bytes"));
     }
     #[cfg(test)]
     hooks.before_read();
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.by_ref()
-        .take(MAX_FILE_BYTES as u64 + 1)
+    let mut bytes = Vec::with_capacity(meta.size as usize);
+    file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read: {e}"))?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(format!("larger than {MAX_FILE_BYTES} bytes"));
     }
     let text = String::from_utf8(bytes).map_err(|_| "not UTF-8 text".to_string())?;
-    #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        Some(meta.permissions().mode() & 0o7777)
-    };
-    #[cfg(not(unix))]
-    let mode = None;
     Ok(Loaded {
         content: text,
-        identity: commit::identity_of(&meta),
-        mode,
+        identity: meta.identity,
+        mode: meta.mode,
     })
 }
 
@@ -329,15 +342,18 @@ fn run(
                 if files.len() == MAX_FILES {
                     return Err(at(format!("more than {MAX_FILES} files in one call")));
                 }
+                let (dir, name) = open_parent(&target).map_err(at)?;
                 let entry = if exists {
                     let Loaded {
                         content,
                         identity,
                         mode,
-                    } = load_existing(&target, hooks).map_err(at)?;
+                    } = load_existing(&dir, &name, hooks).map_err(at)?;
                     FileEntry {
                         display: spec.path.clone(),
                         target: target.clone(),
+                        dir,
+                        name,
                         original: Some(content.clone()),
                         identity,
                         mode,
@@ -355,6 +371,8 @@ fn run(
                     FileEntry {
                         display: spec.path.clone(),
                         target: target.clone(),
+                        dir,
+                        name,
                         original: None,
                         identity: None,
                         mode: None,
@@ -456,15 +474,17 @@ fn run(
         ));
     }
     let pending: Vec<commit::Pending> = files
-        .iter()
+        .into_iter()
         .filter(|f| f.original.as_deref() != Some(f.content.as_str()))
         .map(|f| commit::Pending {
-            display: f.display.clone(),
-            target: f.target.clone(),
-            original: f.original.as_ref().map(|s| s.as_bytes().to_vec()),
+            display: f.display,
+            target: f.target,
+            dir: f.dir,
+            name: f.name,
+            original: f.original.map(String::into_bytes),
             identity: f.identity,
             mode: f.mode,
-            new: f.content.as_bytes().to_vec(),
+            new: f.content.into_bytes(),
         })
         .collect();
     if !pending.is_empty() {

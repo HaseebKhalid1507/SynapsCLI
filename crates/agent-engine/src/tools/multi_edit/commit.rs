@@ -1,5 +1,9 @@
 //! Staged, re-checked, all-or-nothing commit of the planned file contents.
 //!
+//! Every step goes through a handle on each target's parent directory,
+//! opened during planning from the canonical path the write-scope check saw
+//! ([`super::dir`]); no step traverses a parent path again.
+//!
 //! 1. Stage: every new content goes into a sibling temp file created with
 //!    `O_EXCL`. The temp of an existing file (or of a restore) is created
 //!    owner-only (`0600`) and gets the file's mode on its descriptor only
@@ -7,9 +11,12 @@
 //!    under broader permissions. A new file's temp is created `0666` (the
 //!    kernel applies the umask, so `umask()` is never called in this
 //!    multi-threaded process): the mode it is published with.
-//! 2. Re-check: every existing target must still be the same inode with the
-//!    same bytes we planned against, and every new target must still be
-//!    absent. A mismatch removes the temps; nothing was changed.
+//! 2. Re-check, before anything is published: every parent path must still
+//!    lead to the directory its handle holds; every temp must still be the
+//!    file this call created; every existing target must still be the same
+//!    inode with the same bytes we planned against, and every new target
+//!    must still be absent. A mismatch removes the temps; nothing was
+//!    changed.
 //! 3. Finalize: rename each temp onto its target (a new file is linked in
 //!    with `link(2)`, which never clobbers). If file k fails, files 1..k-1
 //!    are restored from their in-memory originals and the error names
@@ -18,6 +25,8 @@
 //! No fsync, matching `edit`/`write`: a crash can lose the latest edit but
 //! never leaves a torn file. The re-check-to-rename window is not locked.
 
+use super::dir::{self, Dir, Kind, OpenError};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +36,10 @@ pub(crate) struct Pending {
     pub display: String,
     /// The real file written (symlinks resolved).
     pub target: PathBuf,
+    /// The verified parent directory of `target`.
+    pub dir: Dir,
+    /// The file name of `target` in `dir`.
+    pub name: OsString,
     /// Bytes read during planning; `None` means the file is being created.
     pub original: Option<Vec<u8>>,
     /// `(dev, ino)` read during planning (Unix).
@@ -36,9 +49,11 @@ pub(crate) struct Pending {
     pub new: Vec<u8>,
 }
 
-/// A staged temp file.
+/// A temp file this call created in a target's directory.
 pub(crate) struct Staged {
-    path: PathBuf,
+    name: OsString,
+    /// `(dev, ino)` of the file created (Unix).
+    identity: Option<(u64, u64)>,
 }
 
 /// A filesystem primitive a test can declare unsupported.
@@ -83,68 +98,61 @@ pub(crate) fn finalize(
     pending: &Pending,
     unsupported: &mut dyn FnMut(Primitive) -> bool,
 ) -> std::io::Result<()> {
-    let tmp = staged.path.as_path();
+    let dir = &pending.dir;
     if pending.original.is_some() {
-        return std::fs::rename(tmp, &pending.target);
+        return dir.rename(&staged.name, &pending.name);
     }
     let linked = if unsupported(Primitive::Link) {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     } else {
-        std::fs::hard_link(tmp, &pending.target)
+        dir.link(&staged.name, &pending.name)
     };
     match linked {
         Ok(()) => {
-            let _ = std::fs::remove_file(tmp);
+            let _ = dir.unlink(&staged.name);
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
         // A filesystem without hard links: fall back to check-then-rename.
         Err(_) => {
-            if std::fs::symlink_metadata(&pending.target).is_ok() {
+            if dir.lstat(&pending.name).is_ok() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "target appeared before it could be created",
                 ));
             }
-            std::fs::rename(tmp, &pending.target)
+            dir.rename(&staged.name, &pending.name)
         }
     }
 }
 
-/// Create a sibling temp file of `target` holding `bytes`, with `mode`
+/// A fresh temp name next to `p`'s target.
+fn temp_name(p: &Pending) -> OsString {
+    super::super::util::unique_tmp_path(Path::new(&p.name)).into_os_string()
+}
+
+/// Stage `bytes` in a new temp next to `p`'s target, keeping `p`'s mode
 /// (or `0666 & ~umask` for a new file).
-fn stage(
-    target: &Path,
+fn stage(p: &Pending, bytes: &[u8], hooks: &mut dyn Hooks) -> std::io::Result<Staged> {
+    write_new(&p.dir, &temp_name(p), bytes, p.mode, hooks)
+}
+
+/// Write `bytes` to `name` in `dir`, created exclusively: an existing
+/// name, a symlink included, is never followed, reused or removed. With
+/// `mode` (an existing file's bits) the file is owner-only until the bytes
+/// are written, then gets `mode`; without, it is `0666 & ~umask`
+/// throughout. A file this call did create is removed again if writing it
+/// fails.
+#[cfg_attr(not(test), allow(unused_variables))]
+pub(crate) fn write_new(
+    dir: &Dir,
+    name: &OsStr,
     bytes: &[u8],
     mode: Option<u32>,
     hooks: &mut dyn Hooks,
 ) -> std::io::Result<Staged> {
-    let tmp = super::super::util::unique_tmp_path(target);
-    write_new(&tmp, bytes, mode, hooks)?;
-    Ok(Staged { path: tmp })
-}
-
-/// Write `bytes` to a file created at `tmp` exclusively: an existing path,
-/// a symlink included, is never followed, reused or removed. With `mode`
-/// (an existing file's bits) the file is owner-only until the bytes are
-/// written, then gets `mode`; without, it is `0666 & ~umask` throughout.
-/// A file this call did create is removed again if writing it fails.
-#[cfg_attr(not(test), allow(unused_variables))]
-pub(crate) fn write_new(
-    tmp: &Path,
-    bytes: &[u8],
-    mode: Option<u32>,
-    hooks: &mut dyn Hooks,
-) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(if mode.is_some() { 0o600 } else { 0o666 });
-    }
-    let mut file = options.open(tmp)?;
-    let written: std::io::Result<()> = (|| {
+    let mut file = dir.create_new(name, if mode.is_some() { 0o600 } else { 0o666 })?;
+    let written: std::io::Result<Option<(u64, u64)>> = (|| {
         file.write_all(bytes)?;
         #[cfg(test)]
         hooks.temp_written(&file);
@@ -153,42 +161,62 @@ pub(crate) fn write_new(
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
-        #[cfg(not(unix))]
-        let _ = mode;
-        Ok(())
+        Ok(dir::meta_of_file(&file)?.identity)
     })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(tmp);
+    match written {
+        Ok(identity) => Ok(Staged {
+            name: name.to_os_string(),
+            identity,
+        }),
+        Err(e) => {
+            let _ = dir.unlink(name);
+            Err(e)
+        }
     }
-    written
 }
 
-#[cfg(unix)]
-pub(crate) fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
+/// A target read back: its bytes and identity, or `None` when it is not a
+/// regular file any more.
+type ReadBack = Option<(Vec<u8>, Option<(u64, u64)>)>;
+
+/// Read `p`'s target back through its directory handle, at most `cap`
+/// bytes.
+fn read_target(p: &Pending, cap: usize) -> Result<ReadBack, OpenError> {
+    let (file, meta) = p.dir.open_read(&p.name)?;
+    if meta.kind != Kind::File {
+        return Ok(None);
+    }
+    let bytes = dir::read_capped(file, cap).map_err(OpenError::Io)?;
+    Ok(Some((bytes, meta.identity)))
 }
 
-#[cfg(not(unix))]
-pub(crate) fn identity_of(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    None
-}
-
-/// Whether the target still holds what planning read (or is still absent).
-fn unchanged(p: &Pending) -> Result<(), String> {
+/// Whether everything is still as staged: the parent path still leads to
+/// the directory held, the temp is still the file created, and the target
+/// still holds what planning read (or is still absent).
+fn unchanged(p: &Pending, staged: &Staged) -> Result<(), String> {
+    if !p.dir.still_there() {
+        return Err(format!("the parent directory of {} was replaced", p.display));
+    }
+    match p.dir.lstat(&staged.name) {
+        Ok(meta) if meta.kind == Kind::File && meta.identity == staged.identity => {}
+        _ => return Err(format!("the staged temp of {} was replaced", p.display)),
+    }
     match &p.original {
-        None => match std::fs::symlink_metadata(&p.target) {
+        None => match p.dir.lstat(&p.name) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             _ => Err(format!("{} was created by something else during the call", p.display)),
         },
         Some(original) => {
-            let meta = std::fs::metadata(&p.target)
-                .map_err(|e| format!("{} can no longer be read: {e}", p.display))?;
-            if identity_of(&meta) != p.identity {
+            let replaced = || format!("{} was replaced since it was read", p.display);
+            let (now, identity) = read_target(p, original.len() + 1)
+                .map_err(|e| match e {
+                    OpenError::Symlink => replaced(),
+                    OpenError::Io(e) => format!("{} can no longer be read: {e}", p.display),
+                })?
+                .ok_or_else(replaced)?;
+            if identity != p.identity {
                 return Err(format!("{} was replaced since it was read", p.display));
             }
-            let now = std::fs::read(&p.target)
-                .map_err(|e| format!("{} can no longer be read: {e}", p.display))?;
             if &now != original {
                 return Err(format!("{} changed since it was read", p.display));
             }
@@ -200,56 +228,69 @@ fn unchanged(p: &Pending) -> Result<(), String> {
 /// Put back a file this call already committed. Only if it still holds the
 /// bytes we wrote (otherwise someone else changed it after us: leave it).
 fn restore(p: &Pending, hooks: &mut dyn Hooks) -> Result<(), String> {
-    let current = std::fs::read(&p.target).map_err(|e| format!("cannot read it back: {e}"))?;
+    let (current, _) = read_target(p, p.new.len() + 1)
+        .map_err(|e| format!("cannot read it back: {e}"))?
+        .ok_or("it is not a regular file any more; left as is")?;
     if current != p.new {
         return Err("it changed again after this call wrote it; left as is".into());
     }
     match &p.original {
-        None => std::fs::remove_file(&p.target).map_err(|e| format!("cannot remove it: {e}")),
+        None => p.dir.unlink(&p.name).map_err(|e| format!("cannot remove it: {e}")),
         Some(original) => {
-            let tmp = stage(&p.target, original, p.mode, hooks)
-                .map_err(|e| format!("staging: {e}"))?;
-            std::fs::rename(&tmp.path, &p.target).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp.path);
+            let tmp = stage(p, original, hooks).map_err(|e| format!("staging: {e}"))?;
+            p.dir.rename(&tmp.name, &p.name).map_err(|e| {
+                remove_temp(p, &tmp);
                 format!("rename: {e}")
             })
         }
     }
 }
 
-fn remove_all(temps: &[Staged]) {
-    for tmp in temps {
-        let _ = std::fs::remove_file(&tmp.path);
+/// Remove a temp, but only the file this call created: a name taken over
+/// by someone else is left alone.
+fn remove_temp(p: &Pending, staged: &Staged) {
+    if p.dir
+        .lstat(&staged.name)
+        .is_ok_and(|meta| meta.kind == Kind::File && meta.identity == staged.identity)
+    {
+        let _ = p.dir.unlink(&staged.name);
+    }
+}
+
+fn remove_all(files: &[Pending], temps: &[Staged]) {
+    for (p, staged) in files.iter().zip(temps) {
+        remove_temp(p, staged);
     }
 }
 
 /// Creates `name` in `parent` the way staging creates a temp (tests only).
 #[cfg(test)]
 pub(crate) fn create_temp_for_test(parent: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    write_new(&parent.join(name), bytes, None, &mut RealHooks)
+    let dir = Dir::open(&std::fs::canonicalize(parent)?)?;
+    write_new(&dir, OsStr::new(name), bytes, None, &mut RealHooks).map(drop)
 }
 
 pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<(), String> {
     let mut temps: Vec<Staged> = Vec::with_capacity(files.len());
     for p in files {
-        match stage(&p.target, &p.new, p.mode, hooks) {
-            Ok(tmp) => temps.push(tmp),
+        match stage(p, &p.new, hooks) {
+            Ok(staged) => temps.push(staged),
             Err(e) => {
-                remove_all(&temps);
+                remove_all(files, &temps);
                 return Err(format!("staging {}: {e}; no file was changed", p.display));
             }
         }
     }
     hooks.after_stage();
-    for p in files {
-        if let Err(e) = unchanged(p) {
-            remove_all(&temps);
+    for (p, staged) in files.iter().zip(&temps) {
+        if let Err(e) = unchanged(p, staged) {
+            remove_all(files, &temps);
             return Err(format!("{e}; no file was changed"));
         }
     }
-    for (k, (p, tmp)) in files.iter().zip(&temps).enumerate() {
-        if let Err(e) = hooks.finalize(k, tmp, p) {
-            remove_all(&temps[k..]);
+    for (k, (p, staged)) in files.iter().zip(&temps).enumerate() {
+        if let Err(e) = hooks.finalize(k, staged, p) {
+            remove_all(&files[k..], &temps[k..]);
             let mut restored = Vec::new();
             let mut failed = Vec::new();
             for done in &files[..k] {
