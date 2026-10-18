@@ -201,6 +201,10 @@ pub enum BrokerError {
     InvalidAccount(String),
     /// Automatic selection found no account with proven capacity.
     NoAccountAvailable { provider: String, reason: String },
+    /// A locked token refresh failed; the kind tells a per-account cooldown,
+    /// a busy refresh lock or a transient network/provider failure apart
+    /// from an unusable login. Message is secret-free.
+    Refresh(super::token::RefreshFailure),
 }
 
 impl std::fmt::Display for BrokerError {
@@ -229,6 +233,7 @@ impl std::fmt::Display for BrokerError {
             ),
             Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
+            Self::Refresh(failure) => write!(f, "credential refresh failed: {failure}"),
             Self::UnknownAccount { provider, label } => write!(
                 f,
                 "unknown account '{label}' for provider '{provider}' (no fallback; run \
@@ -2411,20 +2416,37 @@ impl LocalBroker {
         // from the stored OAuth login (under the credential's refresh locks;
         // a peer's fresh key is adopted instead) and the request is retried
         // once. An env-supplied key is never re-minted.
+        //
+        // If the re-mint is refused (forced-refresh cooldown) or fails, the
+        // caller gets the ORIGINAL upstream 401 — status and body untouched,
+        // exactly like the env-key path — not a broker error (the
+        // authenticator-gives-up convention). Only the status has been read,
+        // so `response` is still unconsumed here. This covers `proxy` and
+        // `proxy_stream`, which both go through `send`.
         if provider_key == "muse" && response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(rejected) = pinned.as_ref() {
                 tracing::info!(credential = %rejected.credential, "muse key rejected (401); re-minting once");
-                let fresh = self
-                    .recover_rejected_token(&rejected.credential, &key)
-                    .await?;
-                let pinned = Some(PinnedToken {
-                    credential: rejected.credential.clone(),
-                    token: fresh,
-                });
-                let key = bearer(&pinned)?;
-                return self
-                    .dispatch(request, provider_key, &key, &base, &pinned)
-                    .await;
+                match self.recover_rejected_token(&rejected.credential, &key).await {
+                    Ok(fresh) => {
+                        let pinned = Some(PinnedToken {
+                            credential: rejected.credential.clone(),
+                            token: fresh,
+                        });
+                        let key = bearer(&pinned)?;
+                        return self
+                            .dispatch(request, provider_key, &key, &base, &pinned)
+                            .await;
+                    }
+                    Err(e) => {
+                        // Token-free: recovery errors carry sanitized reasons
+                        // (cooldown, MuseAuthError labels, lock timeouts).
+                        tracing::warn!(
+                            credential = %rejected.credential,
+                            reason = %e,
+                            "muse key re-mint refused or failed; returning the upstream 401"
+                        );
+                    }
+                }
             }
         }
         Ok(response)
@@ -2865,7 +2887,7 @@ impl CredentialBroker for LocalBroker {
         self.check_slot_exists(cred)?;
         let creds = super::token::recover_rejected_credential(&self.http, cred, rejected)
             .await
-            .map_err(BrokerError::Credential)?;
+            .map_err(BrokerError::Refresh)?;
         Ok(AccessToken {
             token: creds.access,
             expires: creds.expires,

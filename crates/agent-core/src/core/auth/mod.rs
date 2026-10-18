@@ -95,7 +95,7 @@ pub use storage::{
 };
 pub use token::{
     ensure_fresh_credential, ensure_fresh_provider_token, ensure_fresh_token,
-    exchange_code_for_tokens, refresh_token,
+    exchange_code_for_tokens, refresh_token, RefreshFailure, RefreshFailureKind,
 };
 pub use usage::{fetch_usage, UsageError, UsageSnapshot};
 pub use xai::login as login_xai;

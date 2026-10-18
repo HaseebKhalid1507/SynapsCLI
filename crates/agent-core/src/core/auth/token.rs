@@ -243,6 +243,87 @@ impl std::fmt::Display for SeatVendError {
 
 const SEAT_CHANGED: &str = "credential changed since its capacity was read; nothing vended";
 
+/// Why a locked refresh produced no token, so callers can tell the user
+/// the right thing: only [`RefreshFailureKind::Credential`] means the login
+/// itself is unusable ("run `synaps login`").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailureKind {
+    /// A forced (401-driven) refresh was refused by the per-account
+    /// [`FORCED_REFRESH_COOLDOWN`].
+    Cooldown { retry_in_secs: u64 },
+    /// Another refresh of this account (this process or another) did not
+    /// finish within the lock wait.
+    LockBusy,
+    /// The provider exchange failed for a transient reason: network, a
+    /// timeout, or a 5xx / 429 from the token endpoint.
+    Transient,
+    /// The stored credential is missing, removed or rejected by the provider.
+    Credential,
+    /// Local failure (lock file I/O, the refresh task itself).
+    Other,
+}
+
+/// A refresh failure: its kind plus a log-safe message (our own texts, or
+/// provider errors that went through the provider's sanitizer). Never
+/// carries token material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshFailure {
+    pub kind: RefreshFailureKind,
+    message: String,
+}
+
+impl RefreshFailure {
+    pub fn new(kind: RefreshFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Storage / load / CAS errors (strings from the storage layer and our own
+/// slot checks) are credential problems.
+impl From<String> for RefreshFailure {
+    fn from(message: String) -> Self {
+        Self::new(RefreshFailureKind::Credential, message)
+    }
+}
+
+impl From<RefreshFailure> for String {
+    fn from(f: RefreshFailure) -> Self {
+        f.message
+    }
+}
+
+/// Classify a provider `refresh` error string. Transport failures (the
+/// request never got a status: "... request failed: <reqwest error>", Muse's
+/// "transport error"), timeouts and 5xx / 429 statuses are transient;
+/// everything else (e.g. `invalid_grant`) is a credential failure.
+fn classify_provider_refresh_error(message: String) -> RefreshFailure {
+    let transient = message.contains("request failed:")
+        || message.contains("transport error")
+        || message.contains("timed out")
+        || [" (5", " (429", "HTTP error 5", "HTTP error 429"]
+            .iter()
+            .any(|p| message.contains(p));
+    let kind = if transient {
+        RefreshFailureKind::Transient
+    } else {
+        RefreshFailureKind::Credential
+    };
+    RefreshFailure::new(kind, message)
+}
+
 /// [`ensure_fresh_credential`] for a slot whose stored credential the caller
 /// already inspected (e.g. read its usage): the slot must still hold the same
 /// [`SeatIdentity`], checked under the same locks as the refresh, so the
@@ -280,15 +361,19 @@ pub(crate) async fn ensure_fresh_credential_checked_at(
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
 ) -> std::result::Result<OAuthCredentials, String> {
-    ensure_credential_checked_at(client, cred, path, expected_seat, None).await
+    ensure_credential_checked_at(client, cred, path, expected_seat, None)
+        .await
+        .map_err(String::from)
 }
 
 /// Recovery is broker-owned: no refresh credentials cross into the runtime.
+/// Typed so the caller can tell a cooldown / busy lock / network failure
+/// from an unusable login.
 pub(super) async fn recover_rejected_credential(
     client: &Client,
     cred: &CredentialRef,
     rejected: &str,
-) -> std::result::Result<OAuthCredentials, String> {
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     ensure_credential_checked_at(client, cred, &auth_file_path(), None, Some(rejected)).await
 }
 
@@ -298,7 +383,7 @@ async fn ensure_credential_checked_at(
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
-) -> std::result::Result<OAuthCredentials, String> {
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     // Cheap pre-check without gate, file lock or task: the common
     // fresh-token path stays a single file read. The locked core re-loads
     // and re-decides under both locks.
@@ -330,14 +415,18 @@ async fn ensure_credential_checked_at(
 /// (Esc mid-request, a dropped turn) after the provider has rotated the
 /// refresh token but before the CAS save, the task still persists it —
 /// dropping a rotated refresh token would log the user out.
-async fn run_detached<T, F>(fut: F) -> std::result::Result<T, String>
+async fn run_detached<T, E, F>(fut: F) -> std::result::Result<T, E>
 where
-    F: std::future::Future<Output = std::result::Result<T, String>> + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<T, E>> + Send + 'static,
     T: Send + 'static,
+    E: From<RefreshFailure> + Send + 'static,
 {
-    tokio::spawn(fut)
-        .await
-        .map_err(|e| format!("credential refresh task failed: {e}"))?
+    tokio::spawn(fut).await.map_err(|e| {
+        E::from(RefreshFailure::new(
+            RefreshFailureKind::Other,
+            format!("credential refresh task failed: {e}"),
+        ))
+    })?
 }
 
 fn load_checked(
@@ -374,7 +463,7 @@ async fn refresh_credential_locked<Refresh, RFut>(
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
     refresh: Refresh,
-) -> std::result::Result<OAuthCredentials, String>
+) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
     Refresh: Fn(String) -> RFut,
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
@@ -422,19 +511,22 @@ fn forced_refresh_allowed(
     cred: &CredentialRef,
     last_refresh_ms: Option<u64>,
     now_ms: u64,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), RefreshFailure> {
     let cooldown_ms = FORCED_REFRESH_COOLDOWN.as_millis() as u64;
     match last_refresh_ms.filter(|t| *t <= now_ms).map(|t| now_ms - t) {
-        Some(age_ms) if age_ms < cooldown_ms => Err(format!(
-            "{} rejected a token refreshed {}s ago; not refreshing again for {}s \
-             (likely an account/permission issue, not a stale token). \
-             Run `synaps login --provider {} --account {}` if this persists",
-            cred,
-            age_ms / 1000,
-            (cooldown_ms - age_ms).div_ceil(1000),
-            cred.provider,
-            cred.account
-        )),
+        Some(age_ms) if age_ms < cooldown_ms => {
+            let retry_in_secs = (cooldown_ms - age_ms).div_ceil(1000);
+            Err(RefreshFailure::new(
+                RefreshFailureKind::Cooldown { retry_in_secs },
+                format!(
+                    "{} rejected a token refreshed {}s ago; not refreshing again for {}s \
+                     (likely an account or permission issue, not a stale token)",
+                    cred,
+                    age_ms / 1000,
+                    retry_in_secs
+                ),
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -499,12 +591,13 @@ impl RefreshFileLock {
 /// Acquire the per-credential refresh lock off the async runtime (flock
 /// blocks). Polls `try_lock_exclusive` so a wedged peer cannot hang this
 /// process forever.
-async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileLock, String> {
+async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileLock, RefreshFailure> {
     tokio::task::spawn_blocking(move || {
         use fs4::fs_std::FileExt;
+        let other = |m: String| RefreshFailure::new(RefreshFailureKind::Other, m);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+                .map_err(|e| other(format!("Failed to create {}: {}", parent.display(), e)))?;
         }
         let mut open = std::fs::OpenOptions::new();
         // Never truncate on open: the content is the refresh stamp, and
@@ -517,31 +610,34 @@ async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileL
         }
         let file = open
             .open(&path)
-            .map_err(|e| format!("Failed to open refresh lock {}: {}", path.display(), e))?;
+            .map_err(|e| other(format!("Failed to open refresh lock {}: {}", path.display(), e)))?;
         let deadline = std::time::Instant::now() + REFRESH_LOCK_WAIT;
         loop {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(true) => return Ok(RefreshFileLock { file }),
                 Ok(false) => {}
                 Err(e) => {
-                    return Err(format!(
+                    return Err(other(format!(
                         "Failed to lock refresh lock {}: {}",
                         path.display(),
                         e
-                    ))
+                    )))
                 }
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for another process to finish refreshing ({})",
-                    path.display()
+                return Err(RefreshFailure::new(
+                    RefreshFailureKind::LockBusy,
+                    format!(
+                        "timed out waiting for another process to finish refreshing ({})",
+                        path.display()
+                    ),
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
     })
     .await
-    .map_err(|e| format!("refresh lock task failed: {e}"))?
+    .map_err(|e| RefreshFailure::new(RefreshFailureKind::Other, format!("refresh lock task failed: {e}")))?
 }
 
 /// Generic single-flight refresh core. Separated from network/storage so the
@@ -610,7 +706,9 @@ where
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
 {
-    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, |_| Ok(())).await
+    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, |_| Ok(()))
+        .await
+        .map_err(String::from)
 }
 
 /// `rejected` is an access token the provider just refused (HTTP 401). If
@@ -629,18 +727,23 @@ async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save, MayForce>(
     save: Save,
     rejected: Option<&str>,
     may_force: MayForce,
-) -> std::result::Result<OAuthCredentials, String>
+) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
     Load: Fn() -> std::result::Result<OAuthCredentials, String>,
     Refresh: Fn(String) -> RFut,
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
-    MayForce: Fn(Option<u64>) -> std::result::Result<(), String>,
+    MayForce: Fn(Option<u64>) -> std::result::Result<(), RefreshFailure>,
 {
     // In-process waiters are bounded like cross-process ones.
     let _gate = tokio::time::timeout(REFRESH_LOCK_WAIT, gate.lock_owned())
         .await
-        .map_err(|_| "timed out waiting for an in-flight token refresh".to_string())?;
+        .map_err(|_| {
+            RefreshFailure::new(
+                RefreshFailureKind::LockBusy,
+                "timed out waiting for an in-flight token refresh",
+            )
+        })?;
     let file_lock = match lock_path {
         Some(path) => Some(acquire_refresh_lock(path).await?),
         None => None,
@@ -665,7 +768,8 @@ where
         // bounded too (a slow-drip response cannot block every other process).
         let mut fresh = tokio::time::timeout(REFRESH_HTTP_DEADLINE, refresh(old_refresh.clone()))
             .await
-            .map_err(|_| "token refresh timed out".to_string())??;
+            .map_err(|_| RefreshFailure::new(RefreshFailureKind::Transient, "token refresh timed out"))?
+            .map_err(classify_provider_refresh_error)?;
         if fresh.account_id.is_none() {
             fresh.account_id = creds.account_id.clone();
         }
@@ -679,7 +783,8 @@ where
             CasOutcome::Removed => {
                 return Err(
                     "credential was removed while its token was being refreshed; run `synaps login`"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 )
             }
             CasOutcome::Replaced => {
@@ -690,7 +795,10 @@ where
             }
         }
     }
-    Err("credential kept changing during refresh; retry".to_string())
+    Err(RefreshFailure::new(
+        RefreshFailureKind::Other,
+        "credential kept changing during refresh; retry",
+    ))
 }
 
 #[cfg(test)]
@@ -1410,6 +1518,7 @@ mod rejected_token_tests {
             |_| Ok(()),
         )
         .await
+        .map_err(String::from)
     }
     #[tokio::test]
     async fn changed_token_is_adopted_without_refresh() {
@@ -1472,7 +1581,7 @@ mod rejected_token_tests {
             |_| Ok(()),
         )
         .await;
-        assert!(result.unwrap_err().contains("removed"));
+        assert!(result.unwrap_err().to_string().contains("removed"));
     }
 
     // ── Forced-refresh rate limit (ported from #237/#238, now per account) ──
@@ -1522,6 +1631,7 @@ mod rejected_token_tests {
                 |_| Ok(()),
             )
             .await
+            .map_err(String::from)
         }
     }
 
@@ -1583,11 +1693,11 @@ mod rejected_token_tests {
             },
             |_, _| Ok(CasOutcome::Saved),
             Some("rejected"),
-            |_| Err("cooldown".to_string()),
+            |_| Err("cooldown".to_string().into()),
         )
         .await
         .unwrap_err();
-        assert_eq!(err, "cooldown");
+        assert_eq!(err.to_string(), "cooldown");
         assert_eq!(refreshes.load(Ordering::SeqCst), 0);
     }
 
@@ -1608,7 +1718,7 @@ mod rejected_token_tests {
                 |_| async { Ok(credential("new")) },
                 |_, _| Ok(CasOutcome::Saved),
                 Some(rejected),
-                |_| Err("cooldown".to_string()),
+                |_| Err("cooldown".to_string().into()),
             )
             .await
             .unwrap();
@@ -1658,6 +1768,7 @@ mod rejected_token_tests {
             })
         })
         .await
+        .map_err(String::from)
     }
 
     /// A permanent 401 stops spending refresh tokens: the first rejection
@@ -1822,5 +1933,31 @@ mod rejected_token_tests {
         let err = forced(&path, &a, &first.access, &calls).await.unwrap_err();
         assert!(err.contains("not refreshing again"), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Typed failures: callers can tell a cooldown and a transient provider
+    /// failure from an unusable login without parsing text.
+    #[test]
+    fn refresh_failures_are_typed() {
+        let a = account("a");
+        let now = 1_000_000_000;
+        let f = forced_refresh_allowed(&a, Some(now - 12_000), now).unwrap_err();
+        assert_eq!(f.kind, RefreshFailureKind::Cooldown { retry_in_secs: 48 });
+        assert!(f.message().contains("not refreshing again for 48s"), "{f}");
+        assert!(forced_refresh_allowed(&a, Some(now - 60_000), now).is_ok());
+
+        let kind = |m: &str| classify_provider_refresh_error(m.to_string()).kind;
+        use RefreshFailureKind::{Credential, Transient};
+        assert_eq!(kind("Token refresh request failed: error sending request"), Transient);
+        assert_eq!(kind("Token refresh failed (503 Service Unavailable): <error body omitted>"), Transient);
+        assert_eq!(kind("Token refresh failed (429 Too Many Requests): rate_limited"), Transient);
+        assert_eq!(kind("transport error"), Transient);
+        assert_eq!(kind("Token refresh failed (400 Bad Request): invalid_grant: revoked"), Credential);
+        assert_eq!(
+            kind("your saved Meta login is no longer valid (HTTP 401); run `synaps login --provider muse` again"),
+            Credential
+        );
+        // Storage/slot strings are credential failures.
+        assert_eq!(RefreshFailure::from("No credentials".to_string()).kind, Credential);
     }
 }

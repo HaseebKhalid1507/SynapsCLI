@@ -37,7 +37,7 @@ impl AuthMethods {
     ) -> Result<()> {
         let mtime = local_mtime_for(source);
         let token = broker.recover_rejected_token(&credential, rejected).await
-            .map_err(|_| RuntimeError::Auth("OAuth recovery failed for the rejected account. Run `synaps login` to re-authenticate.".into()))?;
+            .map_err(|e| recovery_error(&credential, &e))?;
         Self::bind_pinned_at(auth, source, PinnedToken { credential, token }, mtime).await;
         Ok(())
     }
@@ -517,6 +517,56 @@ impl AuthMethods {
             })
     }
 }
+/// Terminal auth error for a failed 401 recovery that says WHY. Only an
+/// unusable login tells the user to run `synaps login`; a cooldown, a busy
+/// refresh lock or a network/provider failure says so instead. Safe to
+/// show: broker errors never echo token values or raw upstream bodies —
+/// Anthropic refresh failures go through `sanitize_oauth_error_body`,
+/// remote broker errors omit the broker's body, and the rest are our own
+/// fixed texts (cooldown, lock timeouts, missing slot with its path).
+fn recovery_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> RuntimeError {
+    use crate::auth::{BrokerError, RefreshFailureKind};
+    let text = match e {
+        BrokerError::Refresh(f) => match f.kind {
+            RefreshFailureKind::Cooldown { .. } => format!(
+                "Anthropic rejected the token for '{}' again right after it was refreshed: {}. \
+                 If this persists, check the account's access.",
+                credential.account,
+                f.message()
+            ),
+            RefreshFailureKind::LockBusy => format!(
+                "Another synaps process is still refreshing '{}' ({}); retry shortly.",
+                credential.account,
+                f.message()
+            ),
+            RefreshFailureKind::Transient => format!(
+                "Token refresh failed for '{}' (network or provider error, not a login \
+                 problem): {}. Retry shortly.",
+                credential.account,
+                f.message()
+            ),
+            RefreshFailureKind::Other => format!(
+                "Token refresh failed for '{}': {}. Retry shortly.",
+                credential.account,
+                f.message()
+            ),
+            RefreshFailureKind::Credential => format!(
+                "OAuth recovery failed for '{}': {}. Run `synaps login --account {}` to \
+                 re-authenticate.",
+                credential.account,
+                f.message(),
+                credential.account
+            ),
+        },
+        other => format!(
+            "OAuth recovery failed for '{}': {}. Run `synaps login --account {}` to \
+             re-authenticate, or check auth.remote_endpoint / broker reachability.",
+            credential.account, other, credential.account
+        ),
+    };
+    RuntimeError::Auth(text)
+}
+
 /// Current mtime of the local auth.json, if it can be stat'ed.
 fn auth_file_mtime_now() -> Option<std::time::SystemTime> {
     std::fs::metadata(crate::auth::auth_file_path())
@@ -1755,7 +1805,11 @@ mod tests {
         .await
         .expect_err("forced refresh must be attempted (and fail offline)");
         let msg = err.to_string();
-        assert!(msg.contains("OAuth recovery failed"), "{msg}");
+        assert!(msg.contains("Token refresh failed"), "{msg}");
+        // Attempted (and failed offline), not refused by the cooldown and not
+        // blamed on the login.
+        assert!(!msg.contains("not refreshing again"), "{msg}");
+        assert!(!msg.contains("synaps login"), "{msg}");
         for secret in ["sk-revoked", "rt-local"] {
             assert!(!msg.contains(secret), "error leaked a credential: {msg}");
         }
@@ -1768,6 +1822,72 @@ mod tests {
         // Failed refresh persists nothing.
         let disk = std::fs::read_to_string(base.path().join("auth.json")).unwrap();
         assert!(disk.contains("sk-revoked"));
+    }
+
+    /// Only an unusable login says "run `synaps login`"; cooldown, busy lock
+    /// and network/provider failures each say what actually happened.
+    #[test]
+    fn recovery_error_only_blames_the_login_for_credential_failures() {
+        use crate::auth::{BrokerError, RefreshFailure, RefreshFailureKind as K};
+        let cred = work_cred();
+        let msg = |kind, text: &str| {
+            recovery_error(&cred, &BrokerError::Refresh(RefreshFailure::new(kind, text))).to_string()
+        };
+        let cooldown = msg(K::Cooldown { retry_in_secs: 30 }, "not refreshing again for 30s");
+        assert!(cooldown.contains("not refreshing again for 30s"), "{cooldown}");
+        let busy = msg(K::LockBusy, "timed out waiting for another process");
+        assert!(busy.contains("still refreshing"), "{busy}");
+        let net = msg(K::Transient, "Token refresh request failed: connect");
+        assert!(net.contains("network or provider error"), "{net}");
+        for m in [&cooldown, &busy, &net] {
+            assert!(!m.contains("synaps login"), "{m}");
+        }
+        let cred_fail = msg(K::Credential, "invalid_grant: revoked");
+        assert!(cred_fail.contains("synaps login --account work"), "{cred_fail}");
+        assert!(cred_fail.contains("invalid_grant"), "{cred_fail}");
+    }
+
+    /// A refused recovery is still a terminal auth error, but it says WHY:
+    /// another process refreshed this account seconds ago (stamp in its
+    /// lock file), so the cooldown's "not refreshing again" reason is shown
+    /// — with no token values.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn recovery_error_carries_the_cooldown_reason() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_creds_with_mtime(base.path(), "sk-revoked", 1_000_000);
+        std::fs::write(
+            base.path().join("auth.json.anthropic.refresh.lock"),
+            crate::epoch_millis().to_string(),
+        )
+        .unwrap();
+        let auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "sk-revoked".into(),
+            auth_type: "oauth".into(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
+            bound_credential: Some(anthropic_binding(
+                &CredentialSource::Local,
+                &CredentialRef::default_for(OAuthProviderId::Anthropic),
+            )),
+        }));
+        let err = AuthMethods::recover_local_rejection(
+            &auth,
+            &offline_client(),
+            &CredentialSource::Local,
+            &TokenCache::new(),
+            auth.read().await.bound_credential.clone().as_deref(),
+            "sk-revoked",
+        )
+        .await
+        .expect_err("cooldown refuses the forced refresh");
+        let msg = err.to_string();
+        assert!(msg.contains("not refreshing again"), "{msg}");
+        assert!(!msg.contains("synaps login"), "a cooldown is not a login problem: {msg}");
+        for secret in ["sk-revoked", "rt-local"] {
+            assert!(!msg.contains(secret), "error leaked a credential: {msg}");
+        }
     }
 
     #[tokio::test]

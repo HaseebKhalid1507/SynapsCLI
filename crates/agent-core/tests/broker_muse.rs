@@ -160,11 +160,7 @@ fn always_401_upstream(seen: Seen) -> Router {
             let seen = seen.clone();
             async move {
                 seen.push(&headers);
-                (
-                    StatusCode::UNAUTHORIZED,
-                    r#"{"error":{"code":"invalid_api_key","type":"authentication_error"}}"#,
-                )
-                    .into_response()
+                (StatusCode::UNAUTHORIZED, UPSTREAM_401_BODY).into_response()
             }
         }),
     )
@@ -184,12 +180,15 @@ fn stamp_recent_refresh(home: &std::path::Path, storage_key: &str) {
     .unwrap();
 }
 
+const UPSTREAM_401_BODY: &str = r#"{"error":{"code":"invalid_api_key","type":"authentication_error"}}"#;
+
 /// The Muse 401 re-mint runs through the single locked refresh path and its
 /// per-account forced-refresh cooldown: this account was just re-minted by
 /// another process (stamp in `auth.json.muse.refresh.lock`), so no request
-/// mints a new key — none reaches the network mint (which would fail here)
-/// and every request makes exactly one upstream call. A permanent 401
-/// therefore never mints on every request.
+/// mints a new key — none reaches the network mint (which would fail here).
+/// The caller gets the ORIGINAL upstream 401 (status and body), like the
+/// env-key path, and every request makes exactly one upstream call. A
+/// permanent 401 therefore never mints on every request.
 #[tokio::test]
 #[serial_test::serial]
 async fn muse_permanent_401_does_not_mint_inside_the_cooldown() {
@@ -203,15 +202,94 @@ async fn muse_permanent_401_does_not_mint_inside_the_cooldown() {
         .with_muse_base_url_for_tests(upstream);
 
     for n in 1..=3 {
-        let err = broker
+        let resp = broker
             .proxy(responses_request("muse"))
             .await
-            .expect_err("recovery is refused by the cooldown");
-        let msg = err.to_string();
-        assert!(msg.contains("not refreshing again"), "{msg}");
-        assert!(!msg.contains("KEY-1") && !msg.contains("META-OAUTH"), "{msg}");
+            .expect("refused re-mint returns the upstream 401, not a broker error");
+        assert_eq!(resp.status, 401);
+        assert_eq!(resp.body, UPSTREAM_401_BODY);
         assert_eq!(seen.auths().len(), n, "one upstream call, no retry, per request");
     }
+    assert!(seen.auths().iter().all(|a| a == "Bearer KEY-1"), "no new key was minted");
+}
+
+/// Restores proxy-related env vars on drop.
+struct EnvRestore(Vec<(&'static str, Option<String>)>);
+
+impl EnvRestore {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(k, v)| {
+                let old = std::env::var(k).ok();
+                std::env::set_var(k, v);
+                (*k, old)
+            })
+            .collect();
+        Self(saved)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (k, old) in &self.0 {
+            match old {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// Re-mint is allowed (no recent refresh stamp) but the mint itself fails
+/// at the transport (all non-loopback HTTPS goes to a dead proxy, so nothing
+/// leaves the machine): the caller still gets the original upstream 401,
+/// after exactly one upstream call.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_remint_transport_failure_returns_the_original_401() {
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let _env = EnvRestore::set(&[
+        ("HTTPS_PROXY", "http://127.0.0.1:9"),
+        ("https_proxy", "http://127.0.0.1:9"),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_account_policy(AccountPolicy::new())
+        .with_muse_base_url_for_tests(upstream);
+
+    let resp = broker.proxy(responses_request("muse")).await.unwrap();
+    assert_eq!(resp.status, 401);
+    assert_eq!(resp.body, UPSTREAM_401_BODY);
+    assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no retry without a fresh key");
+}
+
+/// `proxy_stream` goes through the same `send`: a refused re-mint surfaces
+/// as the upstream 401 status (the stream path's status-only error), not a
+/// credential error.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_stream_refused_remint_surfaces_the_upstream_401() {
+    std::env::remove_var("META_API_KEY");
+    let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    stamp_recent_refresh(home.path(), "muse");
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_account_policy(AccountPolicy::new())
+        .with_muse_base_url_for_tests(upstream);
+
+    let err = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(_) => panic!("401 must not stream"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, BrokerError::Transport(_)), "{err:?}");
+    assert!(err.to_string().contains("401"), "{err}");
+    assert_eq!(seen.auths().len(), 1);
 }
 
 #[tokio::test]
