@@ -30,6 +30,7 @@
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
 | `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
 | `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does. |
+| `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
 | `synaps daemon reload` / `stop` / `purge` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs. `Checkpoint` over the wire is owner-only. |
 
@@ -43,7 +44,7 @@ synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
-synaps --attach [ID]                 # thin TUI client over the socket (phase 4); starts the daemon if none is running
+synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
 ```
 
 ### How to use

@@ -1,4 +1,5 @@
-//! `synaps --attach [ID] [--observe|--takeover] [--keep-warm]` — the TUI
+//! `synaps --attach [ID] [--observe|--takeover] [--keep-warm]
+//! [--no-confirm-answers]` — the TUI
 //! over `SocketTransport` (PLAN-phase3 A4). Client diet: no `EngineHost`,
 //! no `Runtime`, no `ExtensionManager`, no MCP, no skills index — config,
 //! builtin commands, keybinds, the render thread and the event stream only.
@@ -37,6 +38,11 @@ pub struct AttachOpts {
     pub system: Option<String>,
     pub prompt_manifest: Option<PathBuf>,
     pub mode: AttachMode,
+    /// `--no-confirm-answers`: never answer confirm prompts (tool-call and
+    /// tool-activation approvals) from this TUI, whatever keys reach it;
+    /// they are only listed as waiting for another client. Secret prompts
+    /// are still typed here.
+    pub no_confirm_answers: bool,
     pub keep_warm: bool,
     /// `--new`/`--create`: always create a fresh session even if one is
     /// live. Rejected together with an explicit `id`.
@@ -436,6 +442,11 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     .await?;
     // No extension host in this process: the loader arm never runs.
     ctx.app.extension_loader_running = false;
+    // Before any prompt is fed: the replay and the pending prompts below.
+    if opts.no_confirm_answers {
+        ctx.prompt_bridge
+            .set_confirm_policy(super::session_link::ConfirmPolicy::ViewOnly);
+    }
     for env in replay {
         // Presentation only; a render handle is not needed for correctness.
         let _ = super::stream_handler::handle_session_event_arm(
@@ -452,6 +463,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for pr in pending {
         ctx.prompt_bridge.on_prompt(pr);
     }
+    super::stream_handler::sync_waiting_confirms(&mut ctx.app, &ctx.prompt_bridge);
     ladder("replay", &"");
     if opts.keep_warm {
         let _ = ctx.link.send(SessionCommand::KeepWarm { on: true }).await;
@@ -551,6 +563,7 @@ mod tests {
             system: None,
             prompt_manifest: None,
             mode: AttachMode::Mirror,
+            no_confirm_answers: false,
             keep_warm: false,
             new_session,
             name: None,

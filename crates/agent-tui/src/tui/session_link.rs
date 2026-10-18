@@ -10,15 +10,17 @@
 //!
 //! [`PromptBridge`] turns `Prompt(req)` envelopes into the
 //! `SecretPromptRequest`s the (untouched) secret-prompt pane consumes, and
-//! routes the pane's answer back as `Answer{prompt_id}`.
+//! routes the pane's answer back as `Answer{prompt_id}`. With
+//! [`ConfirmPolicy::ViewOnly`] (`--no-confirm-answers`) it never opens the
+//! pane for a confirm prompt and never answers one: it only lists them as
+//! waiting.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use agent_engine::session::{
-    AttachMode, ClientId, ClientTransport, Envelope, PromptRequest, RuntimeView,
-    SessionCommand, SessionEventWire, SessionQuery, SessionSetting, SettingApplied,
-    TransportError,
+    AttachMode, ClientId, ClientTransport, Envelope, PromptKind, PromptRequest, RuntimeView,
+    SessionCommand, SessionEventWire, SessionQuery, SessionSetting, SettingApplied, TransportError,
 };
 
 /// Bound on any single command round-trip. The in-process actor answers in
@@ -322,6 +324,21 @@ impl SessionLink {
 
 // ── PromptBridge ─────────────────────────────────────────────────────────
 
+/// Whether this client answers confirm prompts (tool-call and tool-activation
+/// approvals). `--no-confirm-answers` sets [`ConfirmPolicy::ViewOnly`]: the
+/// TUI then never opens the approval pane and never sends an `Answer` for a
+/// confirm, whatever keys reach it, so approvals stay with another client
+/// (e.g. an app embedding the TUI in a terminal pane answers them in its own
+/// UI). Secret prompts are unchanged: they are still typed in the pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ConfirmPolicy {
+    /// Confirms open the pane and are answered here (the default).
+    #[default]
+    Answer,
+    /// Confirms are only listed as waiting; another client answers them.
+    ViewOnly,
+}
+
 /// `Prompt(req)` → local `SecretPromptRequest` on the SAME channel the
 /// secret-prompt pane polls; the pane's oneshot answer comes back through
 /// `answers_rx` and the loop sends `Answer{prompt_id, value}`.
@@ -334,6 +351,13 @@ pub(crate) struct PromptBridge {
     /// Prompt ids this client answered (its own `PromptResolved` is not a
     /// dismissal).
     answered: HashSet<u64>,
+    confirms: ConfirmPolicy,
+    /// The kind of every prompt fed to the pane and not yet answered or
+    /// resolved: under `ViewOnly` only a `Secret` fed here may be answered.
+    kinds: HashMap<u64, PromptKind>,
+    /// Confirm prompts shown view-only (`ViewOnly`), in arrival order:
+    /// id and title, until a `PromptResolved` clears them.
+    waiting: Vec<(u64, String)>,
 }
 
 impl PromptBridge {
@@ -349,11 +373,27 @@ impl PromptBridge {
             answers_rx,
             order: VecDeque::new(),
             answered: HashSet::new(),
+            confirms: ConfirmPolicy::Answer,
+            kinds: HashMap::new(),
+            waiting: Vec::new(),
         }
     }
 
+    /// Set before the first prompt is fed (attach replays pending prompts).
+    pub(crate) fn set_confirm_policy(&mut self, policy: ConfirmPolicy) {
+        self.confirms = policy;
+    }
+
     pub(crate) fn on_prompt(&mut self, req: PromptRequest) {
+        if self.confirms == ConfirmPolicy::ViewOnly && req.kind == PromptKind::Confirm {
+            // Never the pane, never an answer: list it until it resolves.
+            if !self.waiting.iter().any(|(id, _)| *id == req.id) {
+                self.waiting.push((req.id, req.title));
+            }
+            return;
+        }
         let (response_tx, response_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        self.kinds.insert(req.id, req.kind);
         let _ = self
             .secret_prompt_tx
             .send(synaps_cli::tools::SecretPromptRequest {
@@ -375,15 +415,29 @@ impl PromptBridge {
     }
 
     /// The pane answered `id` locally: remember it so the echoed
-    /// `PromptResolved` is not treated as a foreign resolution.
-    pub(crate) fn on_local_answer(&mut self, id: u64) {
-        self.answered.insert(id);
+    /// `PromptResolved` is not treated as a foreign resolution. Returns
+    /// whether the answer may be sent: always under `Answer`; under
+    /// `ViewOnly` only for a `Secret` prompt fed to the pane (defence in
+    /// depth: a confirm answer is dropped even if one ever reached here).
+    pub(crate) fn on_local_answer(&mut self, id: u64) -> bool {
+        let kind = self.kinds.remove(&id);
         self.order.retain(|x| *x != id);
+        let send = match self.confirms {
+            ConfirmPolicy::Answer => true,
+            ConfirmPolicy::ViewOnly => kind == Some(PromptKind::Secret),
+        };
+        if send {
+            self.answered.insert(id);
+        }
+        send
     }
 
     /// `PromptResolved{id}`: returns `true` when the ACTIVE pane prompt must
-    /// be dismissed (resolved by someone else).
+    /// be dismissed (resolved by someone else). A view-only confirm is just
+    /// removed from the waiting list.
     pub(crate) fn on_resolved(&mut self, id: u64) -> bool {
+        self.waiting.retain(|(w, _)| *w != id);
+        self.kinds.remove(&id);
         if self.answered.remove(&id) {
             return false;
         }
@@ -394,6 +448,12 @@ impl PromptBridge {
         self.order.retain(|x| *x != id);
         false
     }
+
+    /// Confirm prompts waiting for another client (`ViewOnly` only), oldest
+    /// first: id and title.
+    pub(crate) fn waiting_confirms(&self) -> &[(u64, String)] {
+        &self.waiting
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +461,98 @@ mod tests {
     use super::*;
     use crate::tui::testing::scripted::ScriptedTransport;
     use synaps_cli::Runtime;
+
+    fn prompt(id: u64, kind: PromptKind) -> PromptRequest {
+        PromptRequest {
+            id,
+            kind,
+            title: match kind {
+                PromptKind::Confirm => agent_engine::session::CONFIRM_PROMPT_TITLE.into(),
+                PromptKind::Secret => "API key".into(),
+            },
+            prompt: "details".into(),
+            raised_at: chrono::Utc::now(),
+        }
+    }
+
+    fn bridge(
+        policy: ConfirmPolicy,
+    ) -> (
+        PromptBridge,
+        tokio::sync::mpsc::UnboundedReceiver<synaps_cli::tools::SecretPromptRequest>,
+    ) {
+        let (tx, pane) = tokio::sync::mpsc::unbounded_channel();
+        let mut b = PromptBridge::new(tx);
+        b.set_confirm_policy(policy);
+        (b, pane)
+    }
+
+    /// With `--no-confirm-answers` a confirm never reaches the pane and
+    /// is only listed as waiting (once, even when replayed on attach), and
+    /// an answer for it is never sent even if one reached the loop.
+    #[tokio::test]
+    async fn view_only_confirm_never_reaches_the_pane_or_an_answer() {
+        let (mut b, mut pane) = bridge(ConfirmPolicy::ViewOnly);
+        b.on_prompt(prompt(3, PromptKind::Confirm));
+        b.on_prompt(prompt(3, PromptKind::Confirm));
+        assert!(pane.try_recv().is_err(), "no pane request for a confirm");
+        assert_eq!(
+            b.waiting_confirms(),
+            &[(3, agent_engine::session::CONFIRM_PROMPT_TITLE.to_string())]
+        );
+        assert!(!b.on_local_answer(3), "a confirm answer is never sent");
+        assert!(!b.on_local_answer(99), "nor one for a prompt never fed");
+        assert!(b.answers_rx.try_recv().is_err(), "nothing queued to send");
+    }
+
+    /// Secret prompts are unchanged under `--no-confirm-answers`: the
+    /// pane gets them and their answer is sent.
+    #[tokio::test]
+    async fn view_only_secret_still_goes_through() {
+        let (mut b, mut pane) = bridge(ConfirmPolicy::ViewOnly);
+        b.on_prompt(prompt(5, PromptKind::Secret));
+        let req = pane.try_recv().expect("the pane gets the secret prompt");
+        assert_eq!(req.kind, PromptKind::Secret);
+        assert!(b.waiting_confirms().is_empty());
+        req.response_tx.send(Some("k".into())).unwrap();
+        let (id, value) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), b.answers_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!((id, value.as_deref()), (5, Some("k")));
+        assert!(b.on_local_answer(5), "a secret answer is sent");
+        assert!(!b.on_resolved(5), "its own resolution is not a dismissal");
+    }
+
+    /// Another client's `PromptResolved` clears a waiting confirm and
+    /// does not dismiss the secret prompt the pane is showing.
+    #[tokio::test]
+    async fn foreign_resolution_clears_a_waiting_confirm() {
+        let (mut b, mut pane) = bridge(ConfirmPolicy::ViewOnly);
+        b.on_prompt(prompt(5, PromptKind::Secret));
+        b.on_prompt(prompt(6, PromptKind::Confirm));
+        b.on_prompt(prompt(7, PromptKind::Confirm));
+        assert!(pane.try_recv().is_ok() && pane.try_recv().is_err());
+        assert!(!b.on_resolved(6), "the pane's secret stays");
+        assert_eq!(b.waiting_confirms().len(), 1);
+        assert_eq!(b.waiting_confirms()[0].0, 7);
+        assert!(!b.on_resolved(7));
+        assert!(b.waiting_confirms().is_empty());
+        assert!(b.on_resolved(5), "the secret itself, resolved elsewhere");
+    }
+
+    /// The default policy is today's behaviour: a confirm opens the pane and
+    /// its answer is sent.
+    #[tokio::test]
+    async fn default_policy_answers_confirms_here() {
+        let (mut b, mut pane) = bridge(ConfirmPolicy::default());
+        b.on_prompt(prompt(4, PromptKind::Confirm));
+        assert_eq!(pane.try_recv().unwrap().kind, PromptKind::Confirm);
+        assert!(b.waiting_confirms().is_empty());
+        assert!(b.on_local_answer(4));
+        assert!(!b.on_resolved(4));
+    }
 
     fn refusing_link() -> SessionLink {
         let mut t = ScriptedTransport::new(Runtime::new_headless());

@@ -111,6 +111,14 @@ struct Cli {
     #[arg(long = "keep-warm", global = true)]
     keep_warm: bool,
 
+    /// With --attach: never answer confirm prompts (tool-call and
+    /// tool-activation approvals) from this TUI, whatever keys reach it;
+    /// they are listed as waiting for another client to answer. Secret
+    /// prompts are still typed here. For a TUI embedded where keystrokes may
+    /// come from somewhere other than the person approving.
+    #[arg(long = "no-confirm-answers", requires = "attach")]
+    no_confirm_answers: bool,
+
     /// With --attach: always create a fresh session even if one is live
     /// (cannot be combined with an explicit session ID). Not global: the
     /// `attach` subcommand has its own `--create`/`--new`.
@@ -705,6 +713,7 @@ async fn async_main() -> anyhow::Result<()> {
                     system: cli.system,
                     prompt_manifest: cli.prompt_manifest,
                     mode: tui::attach::attach_mode(cli.observe, cli.takeover),
+                    no_confirm_answers: cli.no_confirm_answers,
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
                     name: cli.session_name,
@@ -939,6 +948,7 @@ mod worker_threads_tests {
             &["--system", "x", "--no-extensions"],
             &["--observe"],
             &["--keep-warm"],
+            &["--no-confirm-answers"],
             &["--new"],
             &["--name", "n"],
             &["--bogus"],
@@ -971,6 +981,38 @@ mod worker_threads_tests {
         let named = super::Cli::try_parse_from(["synaps", "--attach", "--new", "--name", "ambient"]).unwrap();
         assert_eq!(named.session_name.as_deref(), Some("ambient"));
         assert!(super::Cli::try_parse_from(["synaps", "--name", "ambient"]).is_err());
+    }
+
+    /// `--no-confirm-answers` rides on `--attach` (any mode) and is a
+    /// clap error without it, so a binary that lacks it fails loudly.
+    #[test]
+    fn no_confirm_answers_flag_requires_attach() {
+        use clap::Parser;
+        let ok = super::Cli::try_parse_from([
+            "synaps",
+            "--attach",
+            "abc",
+            "--observe",
+            "--no-confirm-answers",
+        ])
+        .unwrap();
+        assert!(ok.no_confirm_answers && ok.observe);
+        let take = super::Cli::try_parse_from([
+            "synaps",
+            "--no-confirm-answers",
+            "--attach",
+            "abc",
+            "--takeover",
+        ])
+        .unwrap();
+        assert!(take.no_confirm_answers && take.takeover);
+        let plain = super::Cli::try_parse_from(["synaps", "--attach", "abc"]).unwrap();
+        assert!(!plain.no_confirm_answers, "off by default");
+        assert!(super::Cli::try_parse_from(["synaps", "--no-confirm-answers"]).is_err());
+        assert_eq!(
+            super::thin_client_from(v(&["--attach", "abc", "--no-confirm-answers"]), true, true),
+            Some(super::ThinClient::Tui { profile: None })
+        );
     }
 
     #[test]
