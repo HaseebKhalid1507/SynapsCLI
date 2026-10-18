@@ -17,6 +17,17 @@ All notable changes to this project will be documented in this file.
   workers at 64 rounds x (1 + 2 renewals) = 192 rounds (their tool-call and
   tool-result-byte limits are off). Override per role under
   `turn_budget.autonomous.*` / `turn_budget.worker.*`.
+- **Turns a session starts by itself when events arrive are bounded.**
+  Inbox messages and subagent completions start "event" turns; these now
+  stop at 24 rounds / 96 tool calls / 8 MiB of tool results per turn, with
+  no renewals, combined with the session's own budget (the stricter limit
+  wins). Configure them under the new `turn_budget.event.*` role, e.g.
+  `turn_budget.event.max_provider_rounds = unlimited`. This applies to the
+  TUI, daemon sessions, `synaps chat` and `synaps rpc`. Turns you type or
+  queue, plugin commands and session-driver turns stay on the interactive
+  (foreground) budget, and so do headless `synaps chat`, `synaps rpc`,
+  detached daemon sessions and resumed sessions: they are unlimited unless
+  `turn_budget.foreground.*` is set.
 - **`turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
   `max_accumulated_tool_result_bytes` take a number or `unlimited`.**
   `unlimited` is the way to say "no limit". `0` keeps its 0.10.2 meaning,

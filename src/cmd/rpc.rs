@@ -87,6 +87,9 @@ struct RpcState {
     events_auto_turn: bool,
     /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
     auto_turn_cap: u32,
+    /// `config.turn_budgets` at boot: auto (event-triggered) turns run under
+    /// the event turn budget.
+    turn_budgets: synaps_cli::config::TurnBudgetsConfig,
     /// A round-checkpoint save timed out (bounded: it holds this state's
     /// lock): `terminal_flush` saves at the turn's end instead.
     save_owed: bool,
@@ -327,6 +330,7 @@ async fn spawn_prompt(
     let turn_completion = agent_engine::runtime::TurnCompletion::new();
     let pid = prompt_id.clone();
     let wtx = writer_tx.clone();
+    let is_auto_turn = prompt_id.starts_with("auto:");
 
     // Snapshot messages under the lock.
     // For auto: IDs we also re-validate the reservation atomically — same lock
@@ -378,8 +382,17 @@ async fn spawn_prompt(
 
         // Acquire lock only long enough to start the stream future.
         let mut stream = {
-            let st = state.lock().await;
-            st.runtime
+            let mut st = state.lock().await;
+            // Auto turns were started by events, not the client: they run
+            // under the event turn budget for this turn only.
+            let session_budget = is_auto_turn.then(|| {
+                let event_budget = st.runtime.turn_budget().for_event_turn(&st.turn_budgets);
+                let session_budget = st.runtime.turn_budget().clone();
+                st.runtime.set_turn_budget(event_budget);
+                session_budget
+            });
+            let stream = st
+                .runtime
                 .run_stream_tracked(
                     messages,
                     cancel_clone,
@@ -388,7 +401,11 @@ async fn spawn_prompt(
                     false,
                     turn_completion.clone(),
                 )
-                .await
+                .await;
+            if let Some(session_budget) = session_budget {
+                st.runtime.set_turn_budget(session_budget);
+            }
+            stream
         };
 
         let mut usage_acc = TurnUsage {
@@ -1204,6 +1221,7 @@ pub async fn run(
         auto_turn_pending: false,
         events_auto_turn,
         auto_turn_cap,
+        turn_budgets: boot_config.turn_budgets.clone(),
         save_owed: false,
         session_lock,
     }));
@@ -1621,6 +1639,7 @@ mod context_head_tests {
             auto_turn_pending: false,
             events_auto_turn: true,
             auto_turn_cap: 5,
+            turn_budgets: Default::default(),
             save_owed: false,
             session_lock: None,
         };

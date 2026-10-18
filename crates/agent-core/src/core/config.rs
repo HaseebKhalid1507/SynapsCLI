@@ -840,6 +840,8 @@ pub struct TurnBudgetOverrides {
 pub struct TurnBudgetsConfig {
     pub foreground: TurnBudgetOverrides,
     pub autonomous: TurnBudgetOverrides,
+    /// Turns a session starts by itself because events arrived.
+    pub event: TurnBudgetOverrides,
     pub worker: TurnBudgetOverrides,
 }
 
@@ -864,10 +866,11 @@ fn parse_turn_budget_config_key(
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
         "autonomous" => &mut budgets.autonomous,
+        "event" => &mut budgets.event,
         "worker" => &mut budgets.worker,
         other => {
             return Err(format!(
-                "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|worker)"
+                "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|event|worker)"
             ));
         }
     };
@@ -1345,6 +1348,13 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "turn_budget.autonomous.max_context_tokens",
     "turn_budget.autonomous.max_cost_usd",
     "turn_budget.autonomous.max_round_renewals",
+    "turn_budget.event.max_provider_rounds",
+    "turn_budget.event.max_tool_calls",
+    "turn_budget.event.max_elapsed_secs",
+    "turn_budget.event.max_accumulated_tool_result_bytes",
+    "turn_budget.event.max_context_tokens",
+    "turn_budget.event.max_cost_usd",
+    "turn_budget.event.max_round_renewals",
     "turn_budget.worker.max_provider_rounds",
     "turn_budget.worker.max_tool_calls",
     "turn_budget.worker.max_elapsed_secs",
@@ -2882,7 +2892,7 @@ mod tests {
         // 0.10.2 read `0` as "none allowed". For one release it keeps that
         // meaning in every role (also where the default is unlimited), and
         // says it will be rejected later.
-        for role in ["foreground", "autonomous", "worker"] {
+        for role in ["foreground", "autonomous", "event", "worker"] {
             for field in [
                 "max_provider_rounds",
                 "max_tool_calls",
@@ -2894,6 +2904,7 @@ mod tests {
                 let overrides = match role {
                     "foreground" => &config.turn_budgets.foreground,
                     "autonomous" => &config.turn_budgets.autonomous,
+                    "event" => &config.turn_budgets.event,
                     _ => &config.turn_budgets.worker,
                 };
                 let parsed = match field {

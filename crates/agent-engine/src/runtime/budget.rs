@@ -38,6 +38,11 @@ pub struct TurnBudget {
     pub max_accumulated_tool_result_bytes: Option<usize>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
+    /// Uncached input + output tokens summed over the turn's requests (cache
+    /// reads and writes are priced into `max_cost_usd`, not counted here).
+    /// No role sets it by default; the watcher agent uses it to carry its
+    /// remaining `max_session_tokens` into the turn.
+    pub max_total_tokens: Option<u64>,
     /// Bounded auto-renewals of the provider-round allowance (spec §8.1).
     /// On exhaustion the stream loop may reset the round counter this many
     /// times so a long, legitimate task continues instead of hard-failing.
@@ -52,8 +57,11 @@ pub struct TurnBudget {
 pub enum TurnRole {
     /// Interactive foreground session.
     Foreground,
-    /// Autonomous/watcher sessions (no human in the loop per turn).
+    /// Watcher agent sessions (`synaps agent`; no human in the loop).
     Autonomous,
+    /// Turns a session starts by itself because events arrived (inbox
+    /// messages, subagent completions). Nobody typed them.
+    Event,
     /// Delegated worker/subagent sessions.
     Worker,
 }
@@ -62,10 +70,10 @@ impl TurnBudget {
     /// Compiled per-role defaults. No role has a wall-clock limit unless
     /// configured. Foreground (a human is watching and can interrupt) has no
     /// round, tool-call or tool-result-byte limit either. Unattended roles
-    /// stay bounded: an autonomous/watcher turn hard-stops at 24 rounds / 96
-    /// tool calls / 8 MiB (its session cost/token limits are only checked
-    /// between turns), and a worker stops after 64 rounds x (1 + 2 renewals)
-    /// = 192 rounds (a `timeout: 0` worker has no other bound).
+    /// stay bounded: autonomous (watcher) and event-started turns hard-stop
+    /// at 24 rounds / 96 tool calls / 8 MiB (nobody is watching), and a
+    /// worker stops after 64 rounds x (1 + 2 renewals) = 192 rounds per run
+    /// (a `timeout: 0` worker has no other bound).
     pub fn for_role(role: TurnRole) -> Self {
         match role {
             TurnRole::Foreground => Self {
@@ -75,17 +83,20 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: None,
                 max_context_tokens: None,
                 max_cost_usd: None,
+                max_total_tokens: None,
                 // A human is watching and can interrupt; let long agentic
                 // tasks continue through several checkpoints.
                 max_round_renewals: 8,
             },
-            TurnRole::Autonomous => Self {
+            // Same numbers as the watcher; configured separately.
+            TurnRole::Autonomous | TurnRole::Event => Self {
                 max_provider_rounds: Some(24),
                 max_tool_calls: Some(96),
                 max_elapsed: None,
                 max_accumulated_tool_result_bytes: Some(8 * 1024 * 1024),
                 max_context_tokens: None,
                 max_cost_usd: None,
+                max_total_tokens: None,
                 // Nobody is watching: no graceful extension — the round cap
                 // is a hard stop.
                 max_round_renewals: 0,
@@ -97,11 +108,46 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: None,
                 max_context_tokens: None,
                 max_cost_usd: None,
+                max_total_tokens: None,
                 // Bounded delegation under a supervising turn: 64 x (1 + 2)
                 // = 192 rounds.
                 max_round_renewals: 2,
             },
         }
+    }
+
+    /// The stricter of two budgets, dimension by dimension (`None` = no
+    /// limit loses to any limit). Used to narrow a role budget to what a
+    /// session has left, or to combine a session's budget with the event
+    /// role's.
+    pub fn tighter(&self, other: &TurnBudget) -> TurnBudget {
+        fn min<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(if b < a { b } else { a }),
+                (a, None) => a,
+                (None, b) => b,
+            }
+        }
+        TurnBudget {
+            max_provider_rounds: min(self.max_provider_rounds, other.max_provider_rounds),
+            max_tool_calls: min(self.max_tool_calls, other.max_tool_calls),
+            max_elapsed: min(self.max_elapsed, other.max_elapsed),
+            max_accumulated_tool_result_bytes: min(
+                self.max_accumulated_tool_result_bytes,
+                other.max_accumulated_tool_result_bytes,
+            ),
+            max_context_tokens: min(self.max_context_tokens, other.max_context_tokens),
+            max_cost_usd: min(self.max_cost_usd, other.max_cost_usd),
+            max_total_tokens: min(self.max_total_tokens, other.max_total_tokens),
+            max_round_renewals: self.max_round_renewals.min(other.max_round_renewals),
+        }
+    }
+
+    /// The budget for a turn the session starts by itself because events
+    /// arrived: this (session) budget narrowed by the event role's
+    /// (`turn_budget.event.*`), so a `/budget` the user set still applies.
+    pub fn for_event_turn(&self, config: &agent_core::config::TurnBudgetsConfig) -> TurnBudget {
+        self.tighter(&TurnBudget::from_config(TurnRole::Event, config))
     }
 
     /// Whether a wall-clock limit can end (or checkpoint) a turn. A zero
@@ -123,6 +169,7 @@ impl TurnBudget {
         let overrides = match role {
             TurnRole::Foreground => &config.foreground,
             TurnRole::Autonomous => &config.autonomous,
+            TurnRole::Event => &config.event,
             TurnRole::Worker => &config.worker,
         };
         let mut budget = Self::for_role(role);
@@ -410,6 +457,12 @@ impl TurnBudgetMeter {
                 return Err(BudgetDimension::CostUsd);
             }
         }
+        if let Some(max_tokens) = self.budget.max_total_tokens {
+            let (input, output, _, _) = usage.totals();
+            if input.saturating_add(output) > max_tokens {
+                return Err(BudgetDimension::TotalTokens);
+            }
+        }
         Ok(())
     }
 }
@@ -566,6 +619,76 @@ mod tests {
     }
 
     #[test]
+    fn event_role_uses_the_watcher_numbers_and_its_own_config() {
+        // Turns started by events have nobody typing; they get the watcher's
+        // per-turn numbers by default, configurable under turn_budget.event.
+        let event = TurnBudget::for_role(TurnRole::Event);
+        assert_eq!(event, TurnBudget::for_role(TurnRole::Autonomous));
+
+        let cfg = agent_core::config::load_config_from_str(
+            "turn_budget.event.max_provider_rounds = unlimited\n\
+             turn_budget.event.max_tool_calls = 300\n\
+             turn_budget.autonomous.max_tool_calls = 5\n",
+        )
+        .turn_budgets;
+        let event = TurnBudget::from_config(TurnRole::Event, &cfg);
+        assert_eq!(event.max_provider_rounds, None);
+        assert_eq!(event.max_tool_calls, Some(300));
+        assert_eq!(
+            event.max_accumulated_tool_result_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        // The watcher role is configured separately.
+        assert_eq!(
+            TurnBudget::from_config(TurnRole::Autonomous, &cfg).max_tool_calls,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn tighter_takes_the_smaller_limit_per_dimension() {
+        let session = TurnBudget {
+            max_elapsed: Some(Duration::from_secs(600)),
+            max_cost_usd: Some(2.0),
+            max_tool_calls: Some(500),
+            ..TurnBudget::for_role(TurnRole::Foreground)
+        };
+        let event = TurnBudget {
+            max_cost_usd: Some(5.0),
+            max_total_tokens: Some(1_000),
+            ..TurnBudget::for_role(TurnRole::Event)
+        };
+        let combined = session.tighter(&event);
+        assert_eq!(combined.max_provider_rounds, Some(24));
+        assert_eq!(combined.max_tool_calls, Some(96));
+        assert_eq!(
+            combined.max_accumulated_tool_result_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(combined.max_elapsed, Some(Duration::from_secs(600)));
+        assert_eq!(combined.max_cost_usd, Some(2.0));
+        assert_eq!(combined.max_total_tokens, Some(1_000));
+        assert_eq!(combined.max_context_tokens, None);
+        assert_eq!(combined.max_round_renewals, 0);
+        assert_eq!(combined, event.tighter(&session));
+    }
+
+    #[test]
+    fn total_tokens_limit_counts_uncached_input_and_output() {
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            max_total_tokens: Some(100),
+            ..TurnBudget::for_role(TurnRole::Autonomous)
+        });
+        let usage = UsageCounters::default();
+        // Cache traffic does not count toward the token limit.
+        usage.record_priced("claude-sonnet-4-5", 40, 60, 50_000, 50_000, None, None);
+        assert_eq!(meter.check_usage(&usage), Ok(()));
+        usage.record_priced("claude-sonnet-4-5", 1, 0, 0, 0, None, None);
+        assert_eq!(meter.check_usage(&usage), Err(BudgetDimension::TotalTokens));
+        meter.charge_tool_calls(0);
+    }
+
+    #[test]
     fn worker_role_keeps_a_finite_round_cap_of_192() {
         // 64 rounds per allowance x (1 + 2 renewals) = the pre-#219 cap.
         let worker = TurnBudget::for_role(TurnRole::Worker);
@@ -614,11 +737,17 @@ mod tests {
 
     #[test]
     fn config_sets_round_tool_call_and_byte_limits_and_unlimited_clears_them() {
-        for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+        for role in [
+            TurnRole::Foreground,
+            TurnRole::Autonomous,
+            TurnRole::Event,
+            TurnRole::Worker,
+        ] {
             let mut cfg = agent_core::config::TurnBudgetsConfig::default();
             let overrides = match role {
                 TurnRole::Foreground => &mut cfg.foreground,
                 TurnRole::Autonomous => &mut cfg.autonomous,
+                TurnRole::Event => &mut cfg.event,
                 TurnRole::Worker => &mut cfg.worker,
             };
             overrides.max_provider_rounds = Some(TurnLimit::Max(5));
@@ -632,6 +761,7 @@ mod tests {
             let overrides = match role {
                 TurnRole::Foreground => &mut cfg.foreground,
                 TurnRole::Autonomous => &mut cfg.autonomous,
+                TurnRole::Event => &mut cfg.event,
                 TurnRole::Worker => &mut cfg.worker,
             };
             overrides.max_provider_rounds = Some(TurnLimit::Unlimited);
@@ -685,14 +815,26 @@ mod tests {
              turn_budget.autonomous.max_accumulated_tool_result_bytes = 0\n\
              turn_budget.worker.max_provider_rounds = 0\n\
              turn_budget.worker.max_tool_calls = 0\n\
-             turn_budget.worker.max_accumulated_tool_result_bytes = 0\n",
+             turn_budget.worker.max_accumulated_tool_result_bytes = 0\n\
+             turn_budget.event.max_provider_rounds = 0\n\
+             turn_budget.event.max_tool_calls = 0\n\
+             turn_budget.event.max_accumulated_tool_result_bytes = 0\n",
         )
         .turn_budgets;
-        for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+        for role in [
+            TurnRole::Foreground,
+            TurnRole::Autonomous,
+            TurnRole::Event,
+            TurnRole::Worker,
+        ] {
             let budget = TurnBudget::from_config(role, &cfg);
             assert_eq!(budget.max_provider_rounds, Some(0), "{role:?}");
             assert_eq!(budget.max_tool_calls, Some(0), "{role:?}");
-            assert_eq!(budget.max_accumulated_tool_result_bytes, Some(0), "{role:?}");
+            assert_eq!(
+                budget.max_accumulated_tool_result_bytes,
+                Some(0),
+                "{role:?}"
+            );
             let mut meter = TurnBudgetMeter::new(budget);
             assert_eq!(meter.remaining_tool_calls(), 0);
             assert_eq!(
