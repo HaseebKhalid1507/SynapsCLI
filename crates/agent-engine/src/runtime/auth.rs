@@ -35,9 +35,10 @@ impl AuthMethods {
         credential: CredentialRef,
         rejected: &str,
     ) -> Result<()> {
+        let mtime = local_mtime_for(source);
         let token = broker.recover_rejected_token(&credential, rejected).await
             .map_err(|_| RuntimeError::Auth("OAuth recovery failed for the rejected account. Run `synaps login` to re-authenticate.".into()))?;
-        Self::bind_pinned(auth, source, PinnedToken { credential, token }).await;
+        Self::bind_pinned_at(auth, source, PinnedToken { credential, token }, mtime).await;
         Ok(())
     }
 
@@ -337,7 +338,8 @@ impl AuthMethods {
     ) -> Result<()> {
         let selector = broker.account_selector(OAuthProviderId::Anthropic);
         // Fast path: in-memory token still fresh AND still the selected account?
-        let bound: Option<String> = {
+        // Local: also unchanged on disk (`recorded_mtime`, checked below).
+        let recorded_mtime = {
             let auth_guard = auth.read().await;
             let binding = check_binding(
                 source,
@@ -356,9 +358,38 @@ impl AuthMethods {
                     !auth_guard.auth_token.is_empty() && crate::epoch_millis() < exp
                 };
                 if still_fresh && binding == BindingCheck::Matches {
-                    return Ok(());
+                    if source.is_remote() {
+                        return Ok(());
+                    }
+                    // Fresh by expiry and binding; the mtime check decides.
+                    Some(auth_guard.auth_file_mtime)
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+        // Read lock dropped here — the stat(2) below never runs under it.
+        // Local only: auth.json rewritten externally (`synaps login`, cron,
+        // sync, another process's rotation) since this token was vended?
+        // One stat per request; a change re-vends the SAME bound account
+        // through the broker below (explicit selector: that credential;
+        // Auto mid-turn: the pinned seat).
+        if let Some(recorded) = recorded_mtime {
+            if !auth_file_changed(recorded) {
+                return Ok(());
+            }
+            tracing::info!("auth.json changed on disk; reloading the bound Anthropic account");
+        }
+        let bound: Option<String> = {
+            let auth_guard = auth.read().await;
+            let binding = check_binding(
+                source,
+                &selector,
+                auth_guard.bound_credential.as_deref(),
+                point,
+            );
             match binding {
                 BindingCheck::Switched if auth_guard.bound_credential.is_some() => {
                     tracing::info!(
@@ -372,9 +403,9 @@ impl AuthMethods {
             }
             auth_guard.bound_credential.clone()
         };
-        // Read lock dropped here
 
         tracing::info!("Refreshing auth token via credential broker");
+        let mtime = local_mtime_for(source);
         let pinned: PinnedToken = match &selector {
             AccountSelector::Account(account) => {
                 // Explicit: exactly this credential, never a fallback.
@@ -401,7 +432,7 @@ impl AuthMethods {
         };
         // Update shared auth state so all clones (including spawned stream
         // tasks) immediately see the fresh token. Never a refresh token.
-        Self::bind_pinned(&auth, source, pinned).await;
+        Self::bind_pinned_at(&auth, source, pinned, mtime).await;
 
         Ok(())
     }
@@ -413,10 +444,25 @@ impl AuthMethods {
     /// window exhaustion under `Auto`, nothing streamed yet), so the rest of
     /// the turn keeps the new seat through the normal `WithinTurn` fast path
     /// and the next turn boundary re-selects as usual. Never a refresh token.
+    ///
+    /// The auth.json mtime is sampled here, after the caller's vend; a write
+    /// racing that vend is caught by 401 recovery instead.
     pub(super) async fn bind_pinned(
         auth: &Arc<RwLock<AuthState>>,
         source: &CredentialSource,
         pinned: PinnedToken,
+    ) {
+        Self::bind_pinned_at(auth, source, pinned, local_mtime_for(source)).await
+    }
+
+    /// [`Self::bind_pinned`] with the auth.json mtime the caller sampled
+    /// BEFORE its vend (so a write racing the vend causes one extra cheap
+    /// reload, never a missed one). Remote sources record `None`.
+    async fn bind_pinned_at(
+        auth: &Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        pinned: PinnedToken,
+        mtime: Option<std::time::SystemTime>,
     ) {
         let binding = anthropic_binding(source, &pinned.credential);
         let mut auth_guard = auth.write().await;
@@ -424,6 +470,7 @@ impl AuthMethods {
         auth_guard.auth_type = "oauth".to_string();
         auth_guard.refresh_token = None;
         auth_guard.token_expires = Some(pinned.token.expires);
+        auth_guard.auth_file_mtime = mtime;
         auth_guard.bound_credential = Some(binding);
     }
 
@@ -470,6 +517,33 @@ impl AuthMethods {
             })
     }
 }
+/// Current mtime of the local auth.json, if it can be stat'ed.
+fn auth_file_mtime_now() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::auth::auth_file_path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Local source: stat auth.json BEFORE vending, so a write racing the vend
+/// can only cause one extra (cheap) reload, never a missed one.
+fn local_mtime_for(source: &CredentialSource) -> Option<std::time::SystemTime> {
+    if source.is_remote() {
+        None
+    } else {
+        auth_file_mtime_now()
+    }
+}
+
+/// True when we recorded an mtime at vend time and the file's current mtime
+/// differs. An unreadable/missing file does NOT invalidate a working token.
+fn auth_file_changed(recorded: Option<std::time::SystemTime>) -> bool {
+    // `recorded.and_then` short-circuits: no stat when nothing was recorded.
+    match (recorded, recorded.and_then(|_| auth_file_mtime_now())) {
+        (Some(then), Some(now)) => then != now,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1510,6 +1584,83 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
+    async fn local_fast_path_reloads_when_auth_json_mtime_changes() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let (src, cache, client) = (CredentialSource::Local, TokenCache::new(), Client::new());
+        let auth = unloaded_local_oauth();
+
+        write_creds_with_mtime(base.path(), "sk-A", 1_000_000);
+        AuthMethods::refresh_if_needed(Arc::clone(&auth), &client, &src, &cache, None, RefreshPoint::TurnStart)
+            .await
+            .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-A");
+        assert!(auth.read().await.auth_file_mtime.is_some());
+
+        // Same mtime, different content: fast path trusts memory (no re-read).
+        write_creds_with_mtime(base.path(), "sk-B", 1_000_000);
+        AuthMethods::refresh_if_needed(Arc::clone(&auth), &client, &src, &cache, None, RefreshPoint::TurnStart)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.read().await.auth_token,
+            "sk-A",
+            "unchanged mtime must keep the one-stat fast path"
+        );
+
+        // External rotation bumps mtime → next request reloads.
+        write_creds_with_mtime(base.path(), "sk-C", 2_000_000);
+        AuthMethods::refresh_if_needed(Arc::clone(&auth), &client, &src, &cache, None, RefreshPoint::TurnStart)
+            .await
+            .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-C");
+    }
+
+    /// The mtime reload is for the BOUND account: a named seat bound by the
+    /// explicit selector is re-vended by that exact credential when
+    /// auth.json changes, and served from memory while it does not.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn auth_json_change_revends_the_bound_named_account() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_creds_with_mtime(base.path(), "unused", 1_000_000);
+        let source = CredentialSource::Local;
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        auth.write().await.auth_file_mtime = auth_file_mtime_now();
+        let broker = ScriptedBroker::new(AccountSelector::Account(
+            crate::auth::Account::parse("work").unwrap(),
+        ));
+        for _ in 0..2 {
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                None,
+                RefreshPoint::TurnStart,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(broker.explicit().is_empty(), "unchanged file: fast path");
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+
+        write_creds_with_mtime(base.path(), "unused", 2_000_000);
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            None,
+            RefreshPoint::TurnStart,
+        )
+        .await
+        .unwrap();
+        assert_eq!(broker.explicit(), vec!["anthropic@work"]);
+        let g = auth.read().await;
+        assert_eq!(g.auth_token, "tok-explicit-anthropic@work");
+        assert_eq!(g.auth_file_mtime, auth_file_mtime_now());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn local_fast_path_keeps_token_when_auth_json_disappears() {
         let base = crate::test_env::BaseDirGuard::new();
         let (src, cache, client) = (CredentialSource::Local, TokenCache::new(), Client::new());
@@ -1569,6 +1720,7 @@ mod tests {
         let g = auth.read().await;
         assert_eq!(g.auth_token, "sk-new");
         assert_eq!(g.refresh_token, None, "engine never holds a refresh token");
+        assert!(g.auth_file_mtime.is_some());
     }
 
     #[tokio::test]
@@ -1773,6 +1925,7 @@ mod tests {
         .unwrap();
         let g = auth.read().await;
         assert_eq!(g.auth_token, "sk-remote-new");
+        assert_eq!(g.auth_file_mtime, None, "remote never tracks a local mtime");
     }
 
     #[tokio::test]
