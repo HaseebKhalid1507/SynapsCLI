@@ -83,6 +83,11 @@ pub(crate) struct TurnStart {
     steer_rx: mpsc::UnboundedReceiver<String>,
     auto_approve: bool,
     completion: crate::runtime::TurnCompletion,
+    /// Events started this turn (nobody typed it): its stream runs under the
+    /// event turn budget (#251). Decided from the turn's trigger at
+    /// `start_turn`, applied when the stream opens (`open_turn_stream`),
+    /// which may be after `on_session_start` has run.
+    event_turn: bool,
 }
 
 /// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
@@ -2491,6 +2496,20 @@ impl SessionActor {
 
     /// Open the turn's stream: the request goes out.
     async fn open_turn_stream(&mut self, start: TurnStart) {
+        // A turn started by events (nobody typed it) runs under the event
+        // turn budget for this turn only; the stream copies the budget when
+        // it starts, so the session budget is restored right after. Here and
+        // not in `start_turn`: a turn whose request waited for
+        // `on_session_start` opens its stream later, under its own budget.
+        let session_budget = start.event_turn.then(|| {
+            let event_budget = self
+                .runtime
+                .turn_budget()
+                .for_event_turn(&self.host.config().turn_budgets);
+            let session_budget = self.runtime.turn_budget().clone();
+            self.runtime.set_turn_budget(event_budget);
+            session_budget
+        });
         let stream = self
             .runtime
             .run_stream_tracked(
@@ -2502,6 +2521,9 @@ impl SessionActor {
                 start.completion,
             )
             .await;
+        if let Some(session_budget) = session_budget {
+            self.runtime.set_turn_budget(session_budget);
+        }
         self.stream = Some(stream);
     }
 
@@ -2555,27 +2577,13 @@ impl SessionActor {
             steer_rx: s_rx,
             auto_approve,
             completion,
+            event_turn: trigger == TurnTrigger::EventAuto,
         };
-        // A turn started by events (nobody typed it) runs under the event
-        // turn budget for this turn only; the stream copies the budget when
-        // it starts, so the session budget is restored right after.
-        let session_budget = (trigger == TurnTrigger::EventAuto).then(|| {
-            let event_budget = self
-                .runtime
-                .turn_budget()
-                .for_event_turn(&self.host.config().turn_budgets);
-            let session_budget = self.runtime.turn_budget().clone();
-            self.runtime.set_turn_budget(event_budget);
-            session_budget
-        });
         if self.session_start_ready() {
             self.open_turn_stream(start).await;
         } else {
             tracing::debug!(session = %self.id, "turn waits for on_session_start");
             self.turn_awaiting_start = Some(start);
-        }
-        if let Some(session_budget) = session_budget {
-            self.runtime.set_turn_budget(session_budget);
         }
     }
 
