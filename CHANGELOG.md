@@ -17,6 +17,13 @@ All notable changes to this project will be documented in this file.
   workers at 64 rounds x (1 + 2 renewals) = 192 rounds (their tool-call and
   tool-result-byte limits are off). Override per role under
   `turn_budget.autonomous.*` / `turn_budget.worker.*`.
+- **`turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
+  `max_accumulated_tool_result_bytes` take a positive number or
+  `unlimited`; `0` is rejected.** `0` used to mean "none allowed". It is no
+  longer read as either meaning: the line is ignored, the role default
+  applies, and a startup warning names the key and says to use `unlimited`
+  for no limit. `/settings` refuses `0` for these rows. `max_elapsed_secs = 0`
+  still means no wall-clock limit.
 
 ### Fixed
 
@@ -32,7 +39,9 @@ All notable changes to this project will be documented in this file.
 
 - **`synaps-engine` crate users:** `TurnBudget::max_provider_rounds`,
   `max_tool_calls` and `max_accumulated_tool_result_bytes` are now `Option`s
-  (`None` = no limit). To keep the old bounds, set them in `config.toml`.
+  (`None` = no limit). `TurnBudgetOverrides` uses `Option<TurnLimit<_>>`
+  for the same three fields (`TurnLimit::Max(n)` or `TurnLimit::Unlimited`).
+  To keep the old foreground bounds, set them in `config.toml`.
 
 ## [0.10.2] — 2026-10-12
 

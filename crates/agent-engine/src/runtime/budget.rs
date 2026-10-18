@@ -115,9 +115,10 @@ impl TurnBudget {
         self.max_elapsed.map(|d| d.as_secs())
     }
 
-    /// Role defaults overlaid with the typed config (unset fields keep
-    /// the compiled defaults; `0` for rounds, tool calls, tool-result bytes
-    /// or seconds means no limit).
+    /// Role defaults overlaid with the typed config. Unset fields keep the
+    /// compiled defaults; `unlimited` clears a round, tool-call or
+    /// tool-result-byte limit (the parser rejects `0` for those); `0`
+    /// seconds means no wall-clock limit.
     pub fn from_config(role: TurnRole, config: &agent_core::config::TurnBudgetsConfig) -> Self {
         let overrides = match role {
             TurnRole::Foreground => &config.foreground,
@@ -125,18 +126,17 @@ impl TurnBudget {
             TurnRole::Worker => &config.worker,
         };
         let mut budget = Self::for_role(role);
-        // 0 = no limit for rounds, tool calls, tool-result bytes and time.
         if let Some(v) = overrides.max_provider_rounds {
-            budget.max_provider_rounds = (v > 0).then_some(v);
+            budget.max_provider_rounds = v.limit();
         }
         if let Some(v) = overrides.max_tool_calls {
-            budget.max_tool_calls = (v > 0).then_some(v);
+            budget.max_tool_calls = v.limit();
         }
         if let Some(v) = overrides.max_elapsed_secs {
             budget.max_elapsed = (v > 0).then(|| Duration::from_secs(v));
         }
         if let Some(v) = overrides.max_accumulated_tool_result_bytes {
-            budget.max_accumulated_tool_result_bytes = (v > 0).then_some(v);
+            budget.max_accumulated_tool_result_bytes = v.limit();
         }
         if overrides.max_context_tokens.is_some() {
             budget.max_context_tokens = overrides.max_context_tokens;
@@ -417,6 +417,7 @@ impl TurnBudgetMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::config::TurnLimit;
 
     #[test]
     fn partial_ttl_metadata_cannot_drop_cost_or_lower_tier() {
@@ -590,7 +591,7 @@ mod tests {
     #[test]
     fn config_overlays_only_set_fields() {
         let mut cfg = agent_core::config::TurnBudgetsConfig::default();
-        cfg.autonomous.max_provider_rounds = Some(2);
+        cfg.autonomous.max_provider_rounds = Some(TurnLimit::Max(2));
         cfg.autonomous.max_elapsed_secs = Some(9);
         cfg.autonomous.max_round_renewals = Some(3);
         let budget = TurnBudget::from_config(TurnRole::Autonomous, &cfg);
@@ -612,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn config_sets_round_tool_call_and_byte_limits_and_zero_means_none() {
+    fn config_sets_round_tool_call_and_byte_limits_and_unlimited_clears_them() {
         for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
             let mut cfg = agent_core::config::TurnBudgetsConfig::default();
             let overrides = match role {
@@ -620,9 +621,9 @@ mod tests {
                 TurnRole::Autonomous => &mut cfg.autonomous,
                 TurnRole::Worker => &mut cfg.worker,
             };
-            overrides.max_provider_rounds = Some(5);
-            overrides.max_tool_calls = Some(7);
-            overrides.max_accumulated_tool_result_bytes = Some(11);
+            overrides.max_provider_rounds = Some(TurnLimit::Max(5));
+            overrides.max_tool_calls = Some(TurnLimit::Max(7));
+            overrides.max_accumulated_tool_result_bytes = Some(TurnLimit::Max(11));
             let budget = TurnBudget::from_config(role, &cfg);
             assert_eq!(budget.max_provider_rounds, Some(5));
             assert_eq!(budget.max_tool_calls, Some(7));
@@ -633,9 +634,9 @@ mod tests {
                 TurnRole::Autonomous => &mut cfg.autonomous,
                 TurnRole::Worker => &mut cfg.worker,
             };
-            overrides.max_provider_rounds = Some(0);
-            overrides.max_tool_calls = Some(0);
-            overrides.max_accumulated_tool_result_bytes = Some(0);
+            overrides.max_provider_rounds = Some(TurnLimit::Unlimited);
+            overrides.max_tool_calls = Some(TurnLimit::Unlimited);
+            overrides.max_accumulated_tool_result_bytes = Some(TurnLimit::Unlimited);
             let budget = TurnBudget::from_config(role, &cfg);
             assert_eq!(budget.max_provider_rounds, None);
             assert_eq!(budget.max_tool_calls, None);
@@ -646,10 +647,10 @@ mod tests {
     #[test]
     fn configured_limits_are_enforced_exactly() {
         let mut cfg = agent_core::config::TurnBudgetsConfig::default();
-        cfg.worker.max_provider_rounds = Some(2);
+        cfg.worker.max_provider_rounds = Some(TurnLimit::Max(2));
         cfg.worker.max_round_renewals = Some(1);
-        cfg.worker.max_tool_calls = Some(3);
-        cfg.worker.max_accumulated_tool_result_bytes = Some(100);
+        cfg.worker.max_tool_calls = Some(TurnLimit::Max(3));
+        cfg.worker.max_accumulated_tool_result_bytes = Some(TurnLimit::Max(100));
         let mut meter = TurnBudgetMeter::new(TurnBudget::from_config(TurnRole::Worker, &cfg));
         for _ in 0..2 {
             assert_eq!(meter.begin_round(), Ok(()));
@@ -674,11 +675,30 @@ mod tests {
     }
 
     #[test]
-    fn configured_zero_limits_never_exhaust() {
+    fn zero_in_config_never_means_unlimited() {
+        let cfg = agent_core::config::load_config_from_str(
+            "turn_budget.autonomous.max_provider_rounds = 0\n\
+             turn_budget.autonomous.max_tool_calls = 0\n\
+             turn_budget.autonomous.max_accumulated_tool_result_bytes = 0\n\
+             turn_budget.worker.max_provider_rounds = 0\n",
+        )
+        .turn_budgets;
+        assert_eq!(
+            TurnBudget::from_config(TurnRole::Autonomous, &cfg),
+            TurnBudget::for_role(TurnRole::Autonomous)
+        );
+        assert_eq!(
+            TurnBudget::from_config(TurnRole::Worker, &cfg),
+            TurnBudget::for_role(TurnRole::Worker)
+        );
+    }
+
+    #[test]
+    fn configured_unlimited_never_exhausts() {
         let mut cfg = agent_core::config::TurnBudgetsConfig::default();
-        cfg.autonomous.max_provider_rounds = Some(0);
-        cfg.autonomous.max_tool_calls = Some(0);
-        cfg.autonomous.max_accumulated_tool_result_bytes = Some(0);
+        cfg.autonomous.max_provider_rounds = Some(TurnLimit::Unlimited);
+        cfg.autonomous.max_tool_calls = Some(TurnLimit::Unlimited);
+        cfg.autonomous.max_accumulated_tool_result_bytes = Some(TurnLimit::Unlimited);
         let mut meter = TurnBudgetMeter::new(TurnBudget::from_config(TurnRole::Autonomous, &cfg));
         for _ in 0..1_000 {
             assert_eq!(meter.begin_round(), Ok(()));
@@ -692,10 +712,10 @@ mod tests {
     #[test]
     fn an_unlimited_meter_never_exhausts_but_still_counts() {
         let mut unlimited = agent_core::config::TurnBudgetsConfig::default();
-        unlimited.autonomous.max_provider_rounds = Some(0);
-        unlimited.autonomous.max_tool_calls = Some(0);
-        unlimited.autonomous.max_accumulated_tool_result_bytes = Some(0);
-        unlimited.worker.max_provider_rounds = Some(0);
+        unlimited.autonomous.max_provider_rounds = Some(TurnLimit::Unlimited);
+        unlimited.autonomous.max_tool_calls = Some(TurnLimit::Unlimited);
+        unlimited.autonomous.max_accumulated_tool_result_bytes = Some(TurnLimit::Unlimited);
+        unlimited.worker.max_provider_rounds = Some(TurnLimit::Unlimited);
         for budget in [
             TurnBudget::for_role(TurnRole::Foreground),
             TurnBudget::from_config(TurnRole::Autonomous, &unlimited),

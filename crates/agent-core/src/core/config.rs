@@ -777,23 +777,46 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) -> Resu
     Ok(())
 }
 
+/// A configured per-turn count limit: a positive number, or `unlimited`.
+///
+/// Used for `turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
+/// `max_accumulated_tool_result_bytes`. `0` is rejected with a startup
+/// warning (the role default stays): it once meant "none allowed" and must
+/// never silently mean "no limit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnLimit<T> {
+    Max(T),
+    Unlimited,
+}
+
+impl<T> TurnLimit<T> {
+    /// The limit, or `None` for no limit.
+    pub fn limit(self) -> Option<T> {
+        match self {
+            TurnLimit::Max(v) => Some(v),
+            TurnLimit::Unlimited => None,
+        }
+    }
+}
+
 /// Typed per-role turn-budget overrides (Task 23, spec §8.1). Every field
 /// is optional: unset fields keep the role's compiled default. Values are
 /// parsed from `turn_budget.<role>.<field>` config keys.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnBudgetOverrides {
-    /// Provider rounds per turn. Unset = no limit (the default for every
-    /// role); `0` also means no limit.
-    pub max_provider_rounds: Option<u32>,
-    /// Tool calls per turn. Unset = no limit (the default for every role);
-    /// `0` also means no limit.
-    pub max_tool_calls: Option<u32>,
+    /// Provider rounds per turn: N or `unlimited`. Unset = the role default
+    /// (foreground unlimited, autonomous 24, worker 64 per allowance). `0` is
+    /// rejected.
+    pub max_provider_rounds: Option<TurnLimit<u32>>,
+    /// Tool calls per turn: N or `unlimited`. Unset = the role default
+    /// (autonomous 96, otherwise unlimited). `0` is rejected.
+    pub max_tool_calls: Option<TurnLimit<u32>>,
     /// Wall-clock limit for one turn, in seconds. Unset = no limit (the
     /// default for every role); `0` also means no limit.
     pub max_elapsed_secs: Option<u64>,
-    /// Accumulated tool-result bytes per turn. Unset = no limit (the default
-    /// for every role); `0` also means no limit.
-    pub max_accumulated_tool_result_bytes: Option<usize>,
+    /// Accumulated tool-result bytes per turn: N or `unlimited`. Unset = the
+    /// role default (autonomous 8 MiB, otherwise unlimited). `0` is rejected.
+    pub max_accumulated_tool_result_bytes: Option<TurnLimit<usize>>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
     /// Bounded auto-renewals of the provider-round allowance after it is
@@ -811,30 +834,39 @@ pub struct TurnBudgetsConfig {
     pub worker: TurnBudgetOverrides,
 }
 
+/// Why a `turn_budget.*` line was not applied.
+enum TurnBudgetKeyError {
+    /// Malformed key or value; printed to stderr like the other families.
+    Invalid(String),
+    /// A count limit set to `0`. Surfaced as a startup warning so nobody
+    /// who wrote `0` silently gets a different limit than they meant.
+    Zero(String),
+}
+
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing). `Err` carries the diagnostic
-/// the caller prints.
+/// the default (parity with shell.* parsing). `Err` carries the diagnostic.
 fn parse_turn_budget_config_key(
     budgets: &mut TurnBudgetsConfig,
     key: &str,
     val: &str,
-) -> Result<(), String> {
+) -> Result<(), TurnBudgetKeyError> {
+    use TurnBudgetKeyError::{Invalid, Zero};
     let Some(rest) = key.strip_prefix("turn_budget.") else {
         return Ok(());
     };
     let Some((role, field)) = rest.split_once('.') else {
-        return Err(format!(
+        return Err(Invalid(format!(
             "Warning: invalid turn_budget key '{key}' (expected turn_budget.<role>.<field>)"
-        ));
+        )));
     };
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
         "autonomous" => &mut budgets.autonomous,
         "worker" => &mut budgets.worker,
         other => {
-            return Err(format!(
+            return Err(Invalid(format!(
                 "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|worker)"
-            ));
+            )));
         }
     };
     macro_rules! set {
@@ -842,22 +874,51 @@ fn parse_turn_budget_config_key(
             match val.parse::<$ty>() {
                 Ok(parsed) => $slot = Some(parsed),
                 Err(_) => {
-                    return Err(format!("Warning: invalid value for {key}: '{val}', using default"))
+                    return Err(Invalid(format!(
+                        "Warning: invalid value for {key}: '{val}', using default"
+                    )))
+                }
+            }
+        };
+    }
+    // Count limits: a positive number or `unlimited`; `0` is rejected.
+    macro_rules! set_limit {
+        ($slot:expr, $ty:ty) => {
+            if val.trim_matches('"').eq_ignore_ascii_case("unlimited") {
+                $slot = Some(TurnLimit::Unlimited);
+            } else {
+                match val.parse::<$ty>() {
+                    Ok(0) => {
+                        return Err(Zero(format!(
+                            "{key} = 0 is not accepted (0 no longer means \"none allowed\" and \
+                             is not read as \"no limit\"); using the role default. Set \
+                             {key} = unlimited for no limit, or a positive number"
+                        )))
+                    }
+                    Ok(parsed) => $slot = Some(TurnLimit::Max(parsed)),
+                    Err(_) => {
+                        return Err(Invalid(format!(
+                            "Warning: invalid value for {key}: '{val}' (expected a positive \
+                             number or unlimited), using default"
+                        )))
+                    }
                 }
             }
         };
     }
     match field {
-        "max_provider_rounds" => set!(overrides.max_provider_rounds, u32),
-        "max_tool_calls" => set!(overrides.max_tool_calls, u32),
+        "max_provider_rounds" => set_limit!(overrides.max_provider_rounds, u32),
+        "max_tool_calls" => set_limit!(overrides.max_tool_calls, u32),
         "max_elapsed_secs" => set!(overrides.max_elapsed_secs, u64),
         "max_accumulated_tool_result_bytes" => {
-            set!(overrides.max_accumulated_tool_result_bytes, usize)
+            set_limit!(overrides.max_accumulated_tool_result_bytes, usize)
         }
         "max_context_tokens" => set!(overrides.max_context_tokens, u64),
         "max_cost_usd" => set!(overrides.max_cost_usd, f64),
         "max_round_renewals" => set!(overrides.max_round_renewals, u32),
-        other => return Err(format!("Warning: unknown turn_budget field '{other}'")),
+        other => {
+            return Err(Invalid(format!("Warning: unknown turn_budget field '{other}'")))
+        }
     }
     Ok(())
 }
@@ -1907,10 +1968,10 @@ fn apply_config_content_with(
                         family_diagnostic(diagnostic);
                     }
                 } else if key.starts_with("turn_budget.") {
-                    if let Err(diagnostic) =
-                        parse_turn_budget_config_key(&mut config.turn_budgets, key, val)
-                    {
-                        family_diagnostic(diagnostic);
+                    match parse_turn_budget_config_key(&mut config.turn_budgets, key, val) {
+                        Ok(()) => {}
+                        Err(TurnBudgetKeyError::Invalid(diagnostic)) => family_diagnostic(diagnostic),
+                        Err(TurnBudgetKeyError::Zero(warning)) => config.warnings.push(warning),
                     }
                 } else if key.starts_with("memory.") {
                     if let Err(diagnostic) = parse_memory_config_key(&mut config.memory, key, val)
@@ -2775,16 +2836,68 @@ mod tests {
              turn_budget.worker.max_provider_rounds_bogus = 1\n\
              turn_budget.nosuchrole.max_tool_calls = 1\n",
         );
-        assert_eq!(config.turn_budgets.worker.max_provider_rounds, Some(3));
+        assert_eq!(
+            config.turn_budgets.worker.max_provider_rounds,
+            Some(super::TurnLimit::Max(3))
+        );
         assert_eq!(config.turn_budgets.worker.max_cost_usd, Some(0.25));
         assert_eq!(config.turn_budgets.autonomous.max_elapsed_secs, Some(90));
-        assert_eq!(config.turn_budgets.foreground.max_tool_calls, Some(7));
+        assert_eq!(
+            config.turn_budgets.foreground.max_tool_calls,
+            Some(super::TurnLimit::Max(7))
+        );
         assert_eq!(config.turn_budgets.foreground.max_round_renewals, Some(12));
         // Unknown fields/roles warn and change nothing.
         assert_eq!(config.turn_budgets.worker.max_tool_calls, None);
         // Invalid values keep the default (None).
         let bad = super::load_config_from_str("turn_budget.worker.max_provider_rounds = nope\n");
         assert_eq!(bad.turn_budgets.worker.max_provider_rounds, None);
+    }
+
+    #[test]
+    fn turn_budget_count_limits_accept_unlimited() {
+        let config = super::load_config_from_str(
+            "turn_budget.autonomous.max_provider_rounds = unlimited\n\
+             turn_budget.autonomous.max_tool_calls = \"unlimited\"\n\
+             turn_budget.worker.max_accumulated_tool_result_bytes = Unlimited\n",
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let unlimited = Some(super::TurnLimit::Unlimited);
+        assert_eq!(config.turn_budgets.autonomous.max_provider_rounds, unlimited);
+        assert_eq!(config.turn_budgets.autonomous.max_tool_calls, unlimited);
+        assert_eq!(
+            config.turn_budgets.worker.max_accumulated_tool_result_bytes,
+            Some(super::TurnLimit::Unlimited)
+        );
+        let bad = super::load_config_from_str("turn_budget.worker.max_tool_calls = lots\n");
+        assert_eq!(bad.turn_budgets.worker.max_tool_calls, None);
+    }
+
+    #[test]
+    fn turn_budget_zero_count_limits_are_rejected_with_a_visible_warning() {
+        // `0` used to mean "none allowed" and briefly meant "no limit". It
+        // must never silently become unlimited: warn (startup-visible) and
+        // keep the role default.
+        for role in ["foreground", "autonomous", "worker"] {
+            for field in [
+                "max_provider_rounds",
+                "max_tool_calls",
+                "max_accumulated_tool_result_bytes",
+            ] {
+                let key = format!("turn_budget.{role}.{field}");
+                let config = super::load_config_from_str(&format!("{key} = 0\n"));
+                assert_eq!(config.turn_budgets, super::TurnBudgetsConfig::default(), "{key}");
+                assert!(
+                    config
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains(&key) && w.contains("unlimited")),
+                    "{key}: {:?}",
+                    config.warnings
+                );
+                assert!(!super::config_content_problems(&format!("{key} = 0\n")).is_empty());
+            }
+        }
     }
 
     #[test]

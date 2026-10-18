@@ -399,7 +399,7 @@ fn per_role_defaults_and_auto_turn_composition() {
 
     // Typed config overrides per role.
     let mut cfg = synaps_cli::config::TurnBudgetsConfig::default();
-    cfg.worker.max_provider_rounds = Some(3);
+    cfg.worker.max_provider_rounds = Some(synaps_cli::config::TurnLimit::Max(3));
     cfg.worker.max_cost_usd = Some(0.25);
     let from_cfg = TurnBudget::from_config(TurnRole::Worker, &cfg);
     assert_eq!(from_cfg.max_provider_rounds, Some(3));

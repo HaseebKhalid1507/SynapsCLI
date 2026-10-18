@@ -315,15 +315,19 @@ pub async fn run(config_path: String, trigger_context: String) {
         );
         std::process::exit(1);
     });
+    let synaps_config = synaps_cli::config::load_config();
+    for warning in &synaps_config.warnings {
+        log(agent_name, &format!("config warning: {warning}"));
+    }
     // Bind notes independently of worker settings and memory-context consent.
-    runtime.apply_memory_backend_config(&synaps_cli::config::load_config().memory_backend);
+    runtime.apply_memory_backend_config(&synaps_config.memory_backend);
     // Task 23: headless autonomous workers run under the AUTONOMOUS turn
     // budget (typed config overrides applied) — the tightest role, finite by
     // default (24 rounds / 96 tool calls / 8 MiB per turn). The session
     // limits below are also enforced mid-turn by cancelling the stream.
     runtime.set_turn_budget(synaps_cli::runtime::budget::TurnBudget::from_config(
         synaps_cli::runtime::budget::TurnRole::Autonomous,
-        &synaps_cli::config::load_config().turn_budgets,
+        &synaps_config.turn_budgets,
     ));
     runtime.set_model(config.agent.model.clone());
     let foreground = agent_engine::orchestration::canonical_foreground_identity(runtime.model())
