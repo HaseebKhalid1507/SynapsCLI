@@ -14,7 +14,7 @@ progressive_tool_disclosure = true
 When enabled, a new stream exposes only cataloged members of this deterministic
 local core:
 
-- local operations: `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`;
+- local operations: `bash`, `read`, `write`, `edit`, `multi_edit`, `grep`, `find`, `ls`;
 - tool discovery/authorization: `search_tools`, `activate_tools`;
 - skill discovery/loading when registered: `search_skills`, `load_skill`.
 

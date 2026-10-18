@@ -21,6 +21,10 @@ The `tool` filter is supported only for `before_tool_call` and
 `after_tool_call`. It matches either the API-safe tool name or the runtime tool
 name.
 
+A filter matches one tool name exactly. A hook that guards file changes
+through `write` and `edit` does not see `multi_edit`; list it as well
+(see [multi-edit.md](../multi-edit.md)).
+
 ## Hook catalog and action matrix
 
 | Hook | Required permission | Tool filter? | Allowed result actions | Purpose |
