@@ -681,8 +681,9 @@ mod tests {
 
     /// shell_start reports its PTY child with the shell session id; the end
     /// comes once, at shell_end (a kill) or at the child's own exit.
-    /// portable-pty's kill is SIGHUP, then SIGKILL after a short grace, so
-    /// an interactive bash reads signal 1 (9 only if it ignored SIGHUP).
+    /// shell_end's hang-up is portable-pty's SIGHUP: an interactive bash
+    /// dies of it and reads signal 1, or, if it isn't reaped within the
+    /// drop's bounded wait, ends with its status unknown.
     /// Serial with the PTY accounting tests: its unread prompt is retained
     /// output while it runs.
     #[cfg(target_os = "linux")]
@@ -709,7 +710,7 @@ mod tests {
             ChildProcessEvent::Ended { tool_id, child, exit_code, signal, .. } => {
                 assert_eq!((tool_id.as_str(), &child), ("toolu_shell", &spawned.child));
                 assert_eq!(exit_code, None);
-                assert!(matches!(signal, Some(1) | Some(9)), "the kill's signal, got {signal:?}");
+                assert!(matches!(signal, Some(1) | None), "the hang-up's signal, got {signal:?}");
             }
             other => panic!("{other:?}"),
         }
