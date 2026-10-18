@@ -422,18 +422,34 @@ fn glow(i: f32, len: f32, tick: u64) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The brightest point of the busy wordmark's shimmer: toward white on a
-/// dark header, toward black on a light one (mixing toward white on
-/// `paper` faded the letters to 1.47:1 instead of making them glow).
-fn shimmer_peak(t: &Theme) -> Color {
+/// Which extreme the busy shimmer moves toward: white on a dark header,
+/// black on a light one (mixing toward white on `paper` faded the letters
+/// to 1.47:1 instead of making them glow).
+fn shimmer_toward(t: &Theme) -> Color {
     let (white, black) = (Color::Rgb(255, 255, 255), Color::Rgb(0, 0, 0));
     let wcag = super::theme::wcag_contrast;
-    let toward = if wcag(white, t.bg) >= wcag(black, t.bg) {
+    if wcag(white, t.bg) >= wcag(black, t.bg) {
         white
     } else {
         black
-    };
-    mix(t.header_fg, toward, 0.65)
+    }
+}
+
+/// The busy wordmark's resting colour: `header_fg`, lifted toward
+/// [`shimmer_toward`] just until it reads at 4.5:1 (WCAG AA) on the header
+/// (`header_fg` itself is 4.30:1 on default).
+fn shimmer_base(t: &Theme) -> Color {
+    let toward = shimmer_toward(t);
+    (0..=40)
+        .map(|step| mix(t.header_fg, toward, step as f32 / 40.0))
+        .find(|c| super::theme::wcag_contrast(*c, t.bg) >= 4.5)
+        .unwrap_or(toward)
+}
+
+/// The brightest point of the busy wordmark's shimmer, further along the
+/// same line, so every step from the base to it reads at AA.
+fn shimmer_peak(t: &Theme) -> Color {
+    mix(shimmer_base(t), shimmer_toward(t), 0.65)
 }
 
 /// The idle build label's colour: the chrome's secondary text (≥ 4.5:1 on
@@ -446,7 +462,7 @@ fn wordmark(t: &Theme, state: &HeaderState, tick: u64) -> Vec<Span<'static>> {
     let base = match state {
         HeaderState::Idle => mix(t.muted, t.bg, 0.25),
         HeaderState::Failed(_) => t.error_color,
-        _ => t.header_fg,
+        _ => shimmer_base(t),
     };
     let hi = shimmer_peak(t);
     let n = WORDMARK.chars().count() as f32;
@@ -899,9 +915,10 @@ mod tests {
 
     /// 04-tui M4: the busy shimmer mixed toward white, which on `paper`
     /// faded the letters to 1.47:1, and the idle build label was 1.3–2.7:1
-    /// on every built-in theme. Both read at ≥ 3:1 (WCAG non-text/large).
+    /// on every built-in theme. Both read at ≥ 4.5:1 (WCAG AA) at every
+    /// step (prG review: the shimmer bottomed out at 4.30 on default).
     #[test]
-    fn shimmer_and_build_label_read_at_3_to_1_on_every_builtin() {
+    fn shimmer_and_build_label_read_at_aa_on_every_builtin() {
         for name in [
             "default", "night-city", "neon-rain", "amber", "phosphor", "solarized-dark",
             "blood", "ocean", "rose-pine", "nord", "dracula", "monokai", "myx", "gruvbox",
@@ -910,12 +927,20 @@ mod tests {
             let t = Theme::builtin_for_test(name);
             let hi = shimmer_peak(&t);
             for step in 0..=20 {
-                let c = mix(t.header_fg, hi, step as f32 / 20.0);
+                let c = mix(shimmer_base(&t), hi, step as f32 / 20.0);
                 let r = super::super::theme::wcag_contrast(c, t.bg);
-                assert!(r >= 3.0, "{name}: shimmer at {step}/20 is {r:.2}:1");
+                assert!(r >= 4.5, "{name}: shimmer at {step}/20 is {r:.2}:1");
+            }
+            // What the busy wordmark actually paints, frame by frame.
+            for tick in 0..60 {
+                for span in wordmark(&t, &HeaderState::Streaming, tick) {
+                    let c = span.style.fg.expect("wordmark letters are coloured");
+                    let r = super::super::theme::wcag_contrast(c, t.bg);
+                    assert!(r >= 4.5, "{name}: wordmark at tick {tick} is {r:.2}:1");
+                }
             }
             let r = super::super::theme::wcag_contrast(build_color(&t), t.bg);
-            assert!(r >= 3.0, "{name}: idle build label {r:.2}:1");
+            assert!(r >= 4.5, "{name}: idle build label {r:.2}:1");
         }
     }
 
