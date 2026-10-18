@@ -171,6 +171,32 @@ mod tests {
         assert_eq!(first_arg(&cmd), "src");
     }
 
+    /// GNU find also ends the start points at `!` and `(` (and `)`, `,`):
+    /// `path:"!"` would negate the `.git` exclusion. They must reach find as
+    /// paths.
+    #[test]
+    fn start_point_terminators_are_never_expressions() {
+        let ctx = create_tool_context();
+        for p in ["!", "(", ")", ",", "!foo", "(x"] {
+            let cmd = build_command(&json!({"pattern": "*", "path": p}), &ctx).unwrap();
+            assert_eq!(first_arg(&cmd), format!("./{p}"), "path {p:?}");
+        }
+    }
+
+    /// End to end in a temp dir: `path:"!"` must not list `.git` contents.
+    #[tokio::test]
+    async fn path_bang_does_not_expose_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/secret_obj"), "").unwrap();
+        let ctx = create_tool_context();
+        let mut cmd = build_command(&json!({"pattern": "*", "path": "!"}), &ctx).unwrap();
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("secret_obj"), "{stdout}");
+    }
+
     /// End to end, confined to a temp dir: `path:"-delete"` must not delete
     /// anything. Pre-fix this ran `find -delete …` and emptied the cwd.
     #[tokio::test]
