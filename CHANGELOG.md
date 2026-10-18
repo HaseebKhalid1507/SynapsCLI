@@ -18,6 +18,16 @@ All notable changes to this project will be documented in this file.
   tool-result-byte limits are off). Override per role under
   `turn_budget.autonomous.*` / `turn_budget.worker.*`.
 
+### Fixed
+
+- **Watcher agents stop mid-turn when a session limit is crossed.** The
+  agent's `max_session_cost_usd`, `max_session_tokens`,
+  `max_session_duration_mins` and `max_tool_calls` were only checked between
+  turns; crossing one mid-turn logged "will exit after this turn" and the
+  turn ran on. The turn is now cancelled as soon as usage, a new tool call or
+  the session clock crosses the limit, and the agent goes to its normal
+  handoff-and-exit path.
+
 ### Upgrade notes
 
 - **`synaps-engine` crate users:** `TurnBudget::max_provider_rounds`,

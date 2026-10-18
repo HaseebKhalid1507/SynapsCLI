@@ -15,7 +15,7 @@ use std::time::Instant;
 use synaps_cli::engine::reactor::{drain_event_queue, idle_should_wait};
 use synaps_cli::{
     watcher_types::{AgentStats, DailyStats},
-    AgentConfig, HandoffState, LlmEvent, Runtime, SessionEvent, StreamEvent,
+    AgentConfig, HandoffState, LlmEvent, Runtime, SessionEvent, SessionLimits, StreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -79,6 +79,78 @@ fn estimate_cost(input_tokens: u64, output_tokens: u64, model: &str) -> f64 {
         (3.0 / 1_000_000.0, 15.0 / 1_000_000.0)
     };
     input_tokens as f64 * input_rate + output_tokens as f64 * output_rate
+}
+
+/// A per-session limit from the agent's `[limits]` config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLimit {
+    Tokens,
+    Cost,
+    Time,
+    ToolCalls,
+}
+
+/// Session usage so far.
+#[derive(Debug, Clone, Copy)]
+struct SessionUsage {
+    tokens: u64,
+    cost_usd: f64,
+    tool_calls: u64,
+    elapsed: std::time::Duration,
+}
+
+/// The first session limit `usage` has reached, if any.
+fn session_limit_reached(limits: &SessionLimits, usage: SessionUsage) -> Option<SessionLimit> {
+    if usage.tokens >= limits.max_session_tokens {
+        Some(SessionLimit::Tokens)
+    } else if usage.cost_usd >= limits.max_session_cost_usd {
+        Some(SessionLimit::Cost)
+    } else if usage.elapsed >= std::time::Duration::from_secs(limits.max_session_duration_mins * 60)
+    {
+        Some(SessionLimit::Time)
+    } else if usage.tool_calls >= limits.max_tool_calls {
+        Some(SessionLimit::ToolCalls)
+    } else {
+        None
+    }
+}
+
+/// Mid-turn enforcement: when a session limit is reached, cancel the
+/// in-flight turn instead of letting it run on.
+fn cancel_turn_on_limit(
+    agent: &str,
+    limits: &SessionLimits,
+    usage: SessionUsage,
+    cancel: &CancellationToken,
+) -> Option<SessionLimit> {
+    let limit = session_limit_reached(limits, usage)?;
+    if !cancel.is_cancelled() {
+        log(
+            agent,
+            &format!("{limit:?} limit reached mid-turn — cancelling the turn"),
+        );
+        cancel.cancel();
+    }
+    Some(limit)
+}
+
+/// Watches one streaming turn: cancels it on SIGINT/SIGTERM or once the
+/// session time limit passes. Exits when the turn ends.
+async fn watch_turn(
+    cancel: CancellationToken,
+    interrupted: Arc<AtomicBool>,
+    turn_over: Arc<AtomicBool>,
+    session_start: Instant,
+    max_duration: std::time::Duration,
+    poll: std::time::Duration,
+) {
+    while !turn_over.load(Ordering::Acquire) && !cancel.is_cancelled() {
+        if interrupted.load(Ordering::Acquire) || session_start.elapsed() >= max_duration {
+            cancel.cancel();
+            break;
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 fn log(agent: &str, msg: &str) {
@@ -449,19 +521,23 @@ pub async fn run(config_path: String, trigger_context: String) {
 
         // Run one streaming turn
         let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        let int_check = interrupted.clone();
-
-        // Monitor for interrupt during streaming
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                if int_check.load(Ordering::Acquire) {
-                    cancel_clone.cancel();
-                    break;
-                }
-            }
-        });
+        // Cancel the turn on a signal or once the session time limit passes.
+        let turn_over = Arc::new(AtomicBool::new(false));
+        tokio::spawn(watch_turn(
+            cancel.clone(),
+            interrupted.clone(),
+            turn_over.clone(),
+            session_start,
+            max_duration,
+            std::time::Duration::from_secs(1),
+        ));
+        let turn_cancel = cancel.clone();
+        let usage_now = |tokens, cost_usd, tool_calls| SessionUsage {
+            tokens,
+            cost_usd,
+            tool_calls,
+            elapsed: session_start.elapsed(),
+        };
 
         // Vec<SharedMessage> clone = pointer bumps only.
         let msgs_in: Vec<synaps_cli::SharedMessage> = messages.clone();
@@ -496,6 +572,14 @@ pub async fn run(config_path: String, trigger_context: String) {
                 StreamEvent::Llm(LlmEvent::ToolUseStart {
                     tool_name: name, ..
                 }) => {
+                    // A call past the session's tool-call limit cancels the
+                    // turn (checked before counting it).
+                    cancel_turn_on_limit(
+                        agent_name,
+                        &config.limits,
+                        usage_now(total_tokens, total_cost, total_tool_calls),
+                        &turn_cancel,
+                    );
                     total_tool_calls += 1;
                     tool_call_num += 1;
                     log(agent_name, &format!("tool: {}", name));
@@ -561,15 +645,14 @@ pub async fn run(config_path: String, trigger_context: String) {
                         }),
                     );
 
-                    // Real-time limit check during streaming
-                    if total_tokens >= config.limits.max_session_tokens
-                        || total_cost >= config.limits.max_session_cost_usd
-                    {
-                        log(
-                            agent_name,
-                            "limit reached during streaming — will exit after this turn",
-                        );
-                    }
+                    // Session limits bind mid-turn: cancel the stream rather
+                    // than let one turn run on past them.
+                    cancel_turn_on_limit(
+                        agent_name,
+                        &config.limits,
+                        usage_now(total_tokens, total_cost, total_tool_calls),
+                        &turn_cancel,
+                    );
                 }
                 StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
                     messages = history;
@@ -593,6 +676,7 @@ pub async fn run(config_path: String, trigger_context: String) {
                 _ => {} // Thinking, SubagentStart/Update/Done, etc.
             }
         }
+        turn_over.store(true, Ordering::Release);
 
         // If watcher_exit was called, agent is done
         if watcher_exit_called {
@@ -805,4 +889,180 @@ pub async fn run(config_path: String, trigger_context: String) {
         .await;
 
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn limits() -> SessionLimits {
+        SessionLimits {
+            max_session_tokens: 1_000,
+            max_session_duration_mins: 60,
+            max_session_cost_usd: 0.50,
+            max_tool_calls: 10,
+            ..SessionLimits::default()
+        }
+    }
+
+    fn usage() -> SessionUsage {
+        SessionUsage {
+            tokens: 0,
+            cost_usd: 0.0,
+            tool_calls: 0,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn session_limits_are_reached_at_their_configured_values() {
+        let limits = limits();
+        assert_eq!(session_limit_reached(&limits, usage()), None);
+        let below = SessionUsage {
+            tokens: 999,
+            cost_usd: 0.49,
+            tool_calls: 9,
+            elapsed: Duration::from_secs(59 * 60),
+        };
+        assert_eq!(session_limit_reached(&limits, below), None);
+        for (hit, expected) in [
+            (
+                SessionUsage {
+                    tokens: 1_000,
+                    ..usage()
+                },
+                SessionLimit::Tokens,
+            ),
+            (
+                SessionUsage {
+                    cost_usd: 0.50,
+                    ..usage()
+                },
+                SessionLimit::Cost,
+            ),
+            (
+                SessionUsage {
+                    elapsed: Duration::from_secs(60 * 60),
+                    ..usage()
+                },
+                SessionLimit::Time,
+            ),
+            (
+                SessionUsage {
+                    tool_calls: 10,
+                    ..usage()
+                },
+                SessionLimit::ToolCalls,
+            ),
+        ] {
+            assert_eq!(session_limit_reached(&limits, hit), Some(expected));
+        }
+    }
+
+    #[test]
+    fn crossing_a_session_limit_mid_turn_cancels_the_stream() {
+        let limits = limits();
+        let cancel = CancellationToken::new();
+        let under = SessionUsage {
+            cost_usd: 0.20,
+            ..usage()
+        };
+        assert_eq!(cancel_turn_on_limit("t", &limits, under, &cancel), None);
+        assert!(
+            !cancel.is_cancelled(),
+            "under every limit: turn keeps going"
+        );
+
+        let over = SessionUsage {
+            cost_usd: 3.75,
+            ..usage()
+        };
+        assert_eq!(
+            cancel_turn_on_limit("t", &limits, over, &cancel),
+            Some(SessionLimit::Cost)
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "cost limit crossed: turn is cancelled"
+        );
+
+        for usage in [
+            SessionUsage {
+                tokens: 5_000,
+                ..usage()
+            },
+            SessionUsage {
+                tool_calls: 10,
+                ..usage()
+            },
+            SessionUsage {
+                elapsed: Duration::from_secs(61 * 60),
+                ..usage()
+            },
+        ] {
+            let cancel = CancellationToken::new();
+            assert!(cancel_turn_on_limit("t", &limits, usage, &cancel).is_some());
+            assert!(cancel.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_watcher_cancels_once_the_session_time_limit_passes() {
+        let cancel = CancellationToken::new();
+        let turn_over = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn(watch_turn(
+            cancel.clone(),
+            Arc::new(AtomicBool::new(false)),
+            turn_over.clone(),
+            Instant::now(),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("time limit passed mid-turn: the turn must be cancelled");
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("watcher exits after cancelling")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_watcher_exits_without_cancelling_when_the_turn_ends() {
+        let cancel = CancellationToken::new();
+        let turn_over = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn(watch_turn(
+            cancel.clone(),
+            Arc::new(AtomicBool::new(false)),
+            turn_over.clone(),
+            Instant::now(),
+            Duration::from_secs(3600),
+            Duration::from_millis(5),
+        ));
+        turn_over.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("watcher exits when the turn is over")
+            .unwrap();
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn turn_watcher_cancels_on_signal() {
+        let cancel = CancellationToken::new();
+        let interrupted = Arc::new(AtomicBool::new(true));
+        let watcher = tokio::spawn(watch_turn(
+            cancel.clone(),
+            interrupted,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+            Duration::from_secs(3600),
+            Duration::from_millis(5),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("signal: the turn must be cancelled");
+        watcher.await.unwrap();
+    }
 }
