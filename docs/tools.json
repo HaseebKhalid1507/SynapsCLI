@@ -78,7 +78,7 @@
           "type": "string"
         },
         "type": {
-          "description": "Filter by type: \"f\" for files, \"d\" for directories",
+          "description": "Filter by type: \"f\" for files, \"d\" for directories, \"l\" for symlinks",
           "type": "string"
         }
       },
