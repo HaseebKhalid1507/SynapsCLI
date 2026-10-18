@@ -94,6 +94,7 @@ async fn watch_pages_a_workers_journal_incrementally() {
     let page: WatchPage = serde_json::from_value(watch(&mut t, 1, "sa_1", 0).await).unwrap();
     assert_eq!(page.handle_id, "sa_1");
     assert_eq!((page.subagent_id, page.agent_name.as_str()), (1, "scout"));
+    assert_eq!(page.model, MODEL, "the page names the worker's model");
     assert_eq!(page.status, "running");
     assert!(page.steerable);
     assert_eq!(page.events.len(), 2, "{page:?}");

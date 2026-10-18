@@ -889,6 +889,7 @@ mod render_tests {
                 step: step.into(),
                 tools,
                 handle_id: "sa_37".into(),
+                model: String::new(),
             }])
         };
         h.feed_event(rows("$ date +%T; sleep 20; date +%T", 1));

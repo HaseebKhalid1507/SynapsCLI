@@ -248,6 +248,10 @@ pub struct SubagentDisplayRow {
     /// older peers.
     #[serde(default)]
     pub handle_id: String,
+    /// The model the worker runs on (`SubagentHandle::model`). Empty from
+    /// older peers.
+    #[serde(default)]
+    pub model: String,
 }
 
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
@@ -489,6 +493,7 @@ impl SubagentHandle {
         page.handle_id = self.id.clone();
         page.subagent_id = self.subagent_id;
         page.agent_name = self.agent_name.clone();
+        page.model = self.model.clone();
         page.steerable = status == SubagentStatus::Running && self.steer_tx.is_some();
         page.status = watch_status_label(&status).to_string();
         page
@@ -597,6 +602,7 @@ const RETAINED_WATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 struct RetainedWatch {
     subagent_id: u64,
     agent_name: String,
+    model: String,
     status: &'static str,
     finished_at: std::time::Instant,
     journal: super::subagent_watch::WatchJournal,
@@ -669,6 +675,7 @@ impl SubagentRegistry {
         page.handle_id = id.to_string();
         page.subagent_id = kept.subagent_id;
         page.agent_name = kept.agent_name.clone();
+        page.model = kept.model.clone();
         page.status = kept.status.to_string();
         page.steerable = false;
         Some(page)
@@ -683,6 +690,7 @@ impl SubagentRegistry {
         let kept = RetainedWatch {
             subagent_id: handle.subagent_id,
             agent_name: handle.agent_name.clone(),
+            model: handle.model.clone(),
             status: watch_status_label(&state.public_status()),
             finished_at: state.finished_at.unwrap_or_else(std::time::Instant::now),
             journal: std::mem::take(&mut state.watch),
@@ -861,6 +869,7 @@ impl SubagentRegistry {
                     step: s.step.clone(),
                     tools: s.tools,
                     handle_id: h.id.clone(),
+                    model: h.model.clone(),
                 }
             })
             .collect()
@@ -1190,6 +1199,10 @@ mod tests {
         let r = row(&registry);
         assert_eq!(r.subagent_id, 7);
         assert_eq!(r.handle_id, "sa_7", "rows carry the registry handle id");
+        assert_eq!(
+            r.model, "claude-sonnet-4-6",
+            "rows carry the worker's model"
+        );
         assert_eq!((r.step.as_str(), r.tools), ("$ sleep 20", 1));
     }
 
@@ -1201,6 +1214,7 @@ mod tests {
         let row: SubagentDisplayRow = serde_json::from_str(old).expect("old row");
         assert_eq!((row.step.as_str(), row.tools), ("", 0));
         assert_eq!(row.handle_id, "", "older peers send no handle id");
+        assert_eq!(row.model, "", "older peers send no model");
     }
 
     #[test]
@@ -1674,6 +1688,10 @@ mod tests {
 
         let page = reg.watch_page("sa_1", 0).expect("journal kept");
         assert_eq!(page.handle_id, "sa_1");
+        assert_eq!(
+            page.model, "claude-sonnet-4-6",
+            "a reaped worker's page keeps its model"
+        );
         assert_eq!(page.status, "completed");
         assert!(!page.steerable);
         assert_eq!(

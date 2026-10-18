@@ -35,6 +35,7 @@ fn page(
         handle_id: handle.into(),
         subagent_id: handle[3..].parse().unwrap(),
         agent_name: name.into(),
+        model: String::new(),
         status: status.into(),
         steerable: status == "running",
         next_seq,
