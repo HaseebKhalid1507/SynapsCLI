@@ -285,17 +285,18 @@ pub(crate) fn save_provider_auth_if_refresh_matches_at(
     expected_refresh: &str,
     creds: &OAuthCredentials,
 ) -> std::result::Result<CasOutcome, String> {
-    save_provider_auth_if_refresh_matches_typed_at(path, key, expected_refresh, creds)
+    save_provider_auth_if_refresh_matches_typed_at(path, key, expected_refresh, creds, STORE_LOCK_WAIT)
         .map_err(String::from)
 }
 
 /// [`save_provider_auth_if_refresh_matches_at`] that tells a busy store
-/// lock apart from other failures.
+/// lock apart from other failures. `wait` bounds the `auth.json.lock` wait.
 pub(crate) fn save_provider_auth_if_refresh_matches_typed_at(
     path: &Path,
     key: &str,
     expected_refresh: &str,
     creds: &OAuthCredentials,
+    wait: std::time::Duration,
 ) -> std::result::Result<CasOutcome, StoreError> {
     let encoded =
         serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
@@ -306,7 +307,7 @@ pub(crate) fn save_provider_auth_if_refresh_matches_typed_at(
     if !path.exists() {
         return Ok(CasOutcome::Removed);
     }
-    with_locked_root_typed(path, false, STORE_LOCK_WAIT, |root| {
+    with_locked_root_typed(path, false, wait, |root| {
         let Some(entry) = root.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
             return Ok((false, CasOutcome::Removed));
         };
