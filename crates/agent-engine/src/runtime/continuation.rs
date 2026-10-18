@@ -266,12 +266,13 @@ impl ContinuationState {
 /// valid phase is far shorter; anything longer is junk or abuse.
 pub(crate) const PHASE_LOG_MAX_BYTES: usize = 32;
 
-/// An extension-supplied `context_phase` string made safe to log: control
-/// characters dropped, capped at [`PHASE_LOG_MAX_BYTES`] on a char boundary,
-/// `…` appended when cut.
+/// An extension-supplied `context_phase` string made safe to log: only
+/// printable ASCII kept (every valid phase is ASCII; this drops control,
+/// bidi-override and other format characters), capped at
+/// [`PHASE_LOG_MAX_BYTES`], `…` appended when cut.
 pub(crate) fn phase_for_log(raw: &str) -> String {
     let mut out = String::new();
-    for c in raw.chars().filter(|c| !c.is_control()) {
+    for c in raw.chars().filter(|c| c.is_ascii_graphic() || *c == ' ') {
         if out.len() + c.len_utf8() > PHASE_LOG_MAX_BYTES {
             out.push('…');
             break;
@@ -2024,13 +2025,19 @@ mod command_tests {
         assert_eq!(phase_for_log("new_task"), "new_task");
         let long = "x".repeat(10_000);
         let shown = phase_for_log(&long);
-        assert!(shown.len() <= PHASE_LOG_MAX_BYTES + "…".len(), "{}", shown.len());
+        assert!(
+            shown.len() <= PHASE_LOG_MAX_BYTES + "…".len(),
+            "{}",
+            shown.len()
+        );
         assert!(shown.ends_with('…'));
         assert_eq!(phase_for_log("a\nb\x1b[31mc\r"), "ab[31mc");
-        // Never splits a multi-byte char.
-        let wide = "é".repeat(40);
-        let shown = phase_for_log(&wide);
-        assert!(shown.trim_end_matches('…').chars().all(|c| c == 'é'));
+        // Bidi overrides, zero-width and other format chars (and any
+        // non-ASCII: every valid phase is ASCII) are dropped.
+        assert_eq!(
+            phase_for_log("new\u{202E}_ta\u{200B}sk\u{2066}\u{FEFF}é"),
+            "new_task"
+        );
     }
 
     /// A `new_task` report arriving from the extension hook path must leave
