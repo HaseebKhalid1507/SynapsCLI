@@ -699,6 +699,8 @@ fn scrub_reexec_env() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before anything can report it (daemon `Welcome`, the client's skew check).
+    agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
     let mut thin = false;
     if let Some(mut kind) = thin_client() {
         // Before `ensure_daemon`: it reads config (idle-exit, process scopes).

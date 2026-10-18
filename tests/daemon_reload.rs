@@ -138,6 +138,17 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
 
     let (mut t, snap) = attach_create(&d.paths, guard.home.path()).await;
     assert_eq!(t.welcome.generation, 1);
+    // The real daemon reports the build id the root build script baked in
+    // (`main` hands it to the engine), and a client of the same build sees
+    // no version-skew notice.
+    assert_eq!(t.welcome.daemon_build, env!("SYNAPS_BUILD_ID"), "daemon reports its build id");
+    let same = agent_engine::session::transport::BinaryId { version: binary_version(), build: env!("SYNAPS_BUILD_ID").into() };
+    let daemon_id = agent_engine::session::transport::BinaryId::of(&t.welcome);
+    assert_eq!(agent_engine::session::transport::version_skew_notice(&same, &daemon_id, "s"), None);
+    if !daemon_id.build.is_empty() {
+        let other = agent_engine::session::transport::BinaryId { build: "0000000".into(), ..same };
+        assert!(agent_engine::session::transport::version_skew_notice(&other, &daemon_id, "s").is_some(), "another build of the same version is flagged");
+    }
     assert_eq!(snap.input_owner, Some(t.client_id()), "first mirror owns");
     let sid = t.session_id().clone();
     let before = one_turn(&mut t, "hello before reload").await;
