@@ -310,7 +310,18 @@ async fn ensure_credential_checked_at(
     let (client, cred, path) = (client.clone(), cred.clone(), path.to_path_buf());
     let (seat, rejected) = (expected_seat.cloned(), rejected.map(str::to_string));
     run_detached(async move {
-        refresh_credential_locked(&client, &cred, &path, seat.as_ref(), rejected.as_deref()).await
+        let provider = cred.provider;
+        let client = &client;
+        refresh_credential_locked(
+            &cred,
+            &path,
+            seat.as_ref(),
+            rejected.as_deref(),
+            |refresh: String| async move {
+                super::provider::refresh(client, provider, &refresh).await
+            },
+        )
+        .await
     })
     .await
 }
@@ -354,23 +365,30 @@ fn load_checked(
     Ok(creds)
 }
 
-async fn refresh_credential_locked(
-    client: &Client,
+/// Gate → per-credential cross-process lock → CAS save, plus the forced
+/// refresh rate limit. `refresh` is the provider exchange (injected so the
+/// whole production composition is testable without a network).
+async fn refresh_credential_locked<Refresh, RFut>(
     cred: &CredentialRef,
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
-) -> std::result::Result<OAuthCredentials, String> {
+    refresh: Refresh,
+) -> std::result::Result<OAuthCredentials, String>
+where
+    Refresh: Fn(String) -> RFut,
+    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
+{
     let key = cred.storage_key();
-    let provider = cred.provider;
     let gate_key = format!("{}|{}", path.display(), key);
     let lock_path = refresh_lock_path(path, &key);
     let load = || load_checked(path, cred, expected_seat);
-    let refresh = |refresh: String| async move {
-        super::provider::refresh(client, provider, &refresh).await
-    };
     let save = |old_refresh: &str, fresh: &OAuthCredentials| {
-        save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)
+        let outcome = save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)?;
+        if outcome == CasOutcome::Saved {
+            note_refreshed(&gate_key, path);
+        }
+        Ok(outcome)
     };
     ensure_gated_locked_policy(
         refresh_gate(&gate_key),
@@ -379,8 +397,87 @@ async fn refresh_credential_locked(
         refresh,
         save,
         rejected,
+        || forced_refresh_allowed(cred, &gate_key, path),
     )
     .await
+}
+
+/// Minimum interval between two *forced* (401-driven) refreshes of the same
+/// credential. If the provider rejects a token minted less than this long
+/// ago, a new token will not help (org / permission / header problem) and
+/// spending the refresh token again only widens the rotation race window.
+/// Keyed per credential (auth file + storage key): two accounts of one
+/// provider never share a cooldown.
+pub(crate) const FORCED_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+struct RefreshRecords {
+    /// When this process last saved a refreshed token, per gate key.
+    last_refresh: HashMap<String, std::time::Instant>,
+    /// Credential file mtime right after this process's own last save, per
+    /// file: lets the on-disk signal below ignore our own writes (which are
+    /// already accounted per credential) and count only other processes'.
+    own_write_mtime: HashMap<PathBuf, std::time::SystemTime>,
+}
+
+fn refresh_records() -> std::sync::MutexGuard<'static, RefreshRecords> {
+    static RECORDS: OnceLock<std::sync::Mutex<RefreshRecords>> = OnceLock::new();
+    RECORDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn note_refreshed(gate_key: &str, path: &Path) {
+    let mtime = file_mtime(path);
+    let mut records = refresh_records();
+    records
+        .last_refresh
+        .insert(gate_key.to_string(), std::time::Instant::now());
+    if let Some(mtime) = mtime {
+        records.own_write_mtime.insert(path.to_path_buf(), mtime);
+    }
+}
+
+/// Rate limit for forcing a refresh of a not-yet-expired token. Refused if
+/// THIS process refreshed this credential within [`FORCED_REFRESH_COOLDOWN`],
+/// or if the credential file was written that recently by another process
+/// (another synaps may have just rotated it). Only consulted while storage
+/// still holds the rejected token, so an external `synaps login` that
+/// changes the token never hits it.
+fn forced_refresh_allowed(
+    cred: &CredentialRef,
+    gate_key: &str,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    let mtime = file_mtime(path);
+    let (in_process, own_mtime) = {
+        let records = refresh_records();
+        (
+            records.last_refresh.get(gate_key).map(|t| t.elapsed()),
+            records.own_write_mtime.get(path).copied(),
+        )
+    };
+    let on_disk = mtime
+        .filter(|m| Some(*m) != own_mtime)
+        .and_then(|m| m.elapsed().ok());
+    match [in_process, on_disk].into_iter().flatten().min() {
+        Some(age) if age < FORCED_REFRESH_COOLDOWN => Err(format!(
+            "{} rejected a token refreshed {}s ago; not refreshing again for {}s \
+             (likely an account/permission issue, not a stale token). \
+             Run `synaps login --provider {} --account {}` if this persists",
+            cred,
+            age.as_secs(),
+            (FORCED_REFRESH_COOLDOWN - age).as_secs(),
+            cred.provider,
+            cred.account
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Per-credential cross-process lock file, beside the credential file.
@@ -521,22 +618,30 @@ where
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
 {
-    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None).await
+    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, || Ok(())).await
 }
 
-async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save>(
+/// `rejected` is an access token the provider just refused (HTTP 401). If
+/// the stored credential still carries it, a refresh is forced even though
+/// its expiry is in the future (revoked-but-unexpired) — provided
+/// `may_force` allows it (per-credential rate limit,
+/// [`FORCED_REFRESH_COOLDOWN`]). An expired credential always refreshes
+/// without consulting `may_force`.
+async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save, MayForce>(
     gate: Arc<Mutex<()>>,
     lock_path: Option<PathBuf>,
     load: Load,
     refresh: Refresh,
     save: Save,
     rejected: Option<&str>,
+    may_force: MayForce,
 ) -> std::result::Result<OAuthCredentials, String>
 where
     Load: Fn() -> std::result::Result<OAuthCredentials, String>,
     Refresh: Fn(String) -> RFut,
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
+    MayForce: Fn() -> std::result::Result<(), String>,
 {
     // In-process waiters are bounded like cross-process ones.
     let _gate = tokio::time::timeout(REFRESH_LOCK_WAIT, gate.lock_owned())
@@ -552,12 +657,14 @@ where
         let creds = load()?;
         // A peer already rotated/replaced the rejected token: adopt it, do
         // not force another rotation. Otherwise refresh even if unexpired.
-        let needs_refresh = match rejected {
-            Some(rejected) => creds.access == rejected,
-            None => is_token_expired(&creds),
-        };
-        if !needs_refresh {
+        let expired = is_token_expired(&creds);
+        let still_rejected = rejected.is_some_and(|r| !r.is_empty() && creds.access == r);
+        if !expired && !still_rejected {
             return Ok(creds);
+        }
+        if !expired {
+            // Forced (rejection-driven) refresh of an unexpired credential.
+            may_force()?;
         }
         let old_refresh = creds.refresh.clone();
         // The provider exchange is deadline-bounded so the lock hold time is
@@ -1296,6 +1403,7 @@ mod rejected_token_tests {
                 Ok(CasOutcome::Saved)
             },
             Some(rejected),
+            || Ok(()),
         )
         .await
     }
@@ -1357,8 +1465,233 @@ mod rejected_token_tests {
             |_| async { Ok(credential("new")) },
             |_, _| Ok(CasOutcome::Removed),
             Some("rejected"),
+            || Ok(()),
         )
         .await;
         assert!(result.unwrap_err().contains("removed"));
+    }
+
+    // ── Forced-refresh rate limit (ported from #237/#238, now per account) ──
+
+    /// Single-credential fake store driven through the production policy.
+    struct FakeStore {
+        creds: StdMutex<OAuthCredentials>,
+        refresh_calls: AtomicUsize,
+        save_calls: AtomicUsize,
+    }
+
+    impl FakeStore {
+        fn new(initial: OAuthCredentials) -> Self {
+            Self {
+                creds: StdMutex::new(initial),
+                refresh_calls: AtomicUsize::new(0),
+                save_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn ensure_rejecting(
+            &self,
+            gate: Arc<Mutex<()>>,
+            rejected: &str,
+        ) -> Result<OAuthCredentials, String> {
+            ensure_gated_locked_policy(
+                gate,
+                None,
+                || Ok(self.creds.lock().unwrap().clone()),
+                |old_refresh| async move {
+                    self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(OAuthCredentials {
+                        auth_type: "oauth".into(),
+                        refresh: format!("{old_refresh}-rotated"),
+                        access: "fresh-access".into(),
+                        expires: crate::epoch_millis() + 3_600_000,
+                        account_id: None,
+                    })
+                },
+                |_, c| {
+                    self.save_calls.fetch_add(1, Ordering::SeqCst);
+                    *self.creds.lock().unwrap() = c.clone();
+                    Ok(CasOutcome::Saved)
+                },
+                Some(rejected),
+                || Ok(()),
+            )
+            .await
+        }
+    }
+
+    /// Revoked-but-unexpired: the stored credential still holds the exact
+    /// access token the provider rejected -> refresh is forced.
+    #[tokio::test]
+    async fn rejected_unexpired_token_forces_refresh() {
+        let store = FakeStore::new(credential("rejected"));
+        let creds = store
+            .ensure_rejecting(Arc::new(Mutex::new(())), "rejected")
+            .await
+            .unwrap();
+        assert_eq!(creds.access, "fresh-access");
+        assert_eq!(creds.refresh, "r0-rotated");
+        assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.save_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Disk already rotated (external `synaps login` / cron / earlier waiter):
+    /// the rejected token no longer matches -> no refresh, disk creds returned.
+    #[tokio::test]
+    async fn rejected_token_differs_from_disk_uses_disk_without_refresh() {
+        let store = FakeStore::new(credential("keep"));
+        let creds = store
+            .ensure_rejecting(Arc::new(Mutex::new(())), "some-old-token")
+            .await
+            .unwrap();
+        assert_eq!(creds.access, "keep");
+        assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.save_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Concurrent 401s with the same rejected token: exactly one forced
+    /// refresh; later waiters see the rotated token and skip.
+    #[tokio::test]
+    async fn concurrent_rejections_single_flight() {
+        let store = FakeStore::new(credential("rejected"));
+        let gate = Arc::new(Mutex::new(()));
+        let waiters: Vec<_> = (0..8)
+            .map(|_| store.ensure_rejecting(gate.clone(), "rejected"))
+            .collect();
+        for got in futures::future::join_all(waiters).await {
+            assert_eq!(got.unwrap().access, "fresh-access");
+        }
+        assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Rate limit: a forced refresh denied by `may_force` spends nothing.
+    #[tokio::test]
+    async fn forced_refresh_denied_by_cooldown_spends_nothing() {
+        let refreshes = AtomicUsize::new(0);
+        let err = ensure_gated_locked_policy(
+            Arc::new(Mutex::new(())),
+            None,
+            || Ok(credential("rejected")),
+            |_| async {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(credential("never"))
+            },
+            |_, _| Ok(CasOutcome::Saved),
+            Some("rejected"),
+            || Err("cooldown".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "cooldown");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    }
+
+    /// An EXPIRED credential refreshes even inside the cooldown: the rate
+    /// limit applies only to forcing an unexpired token. It also refreshes
+    /// when the caller's rejected token is no longer the stored one.
+    #[tokio::test]
+    async fn expired_credential_ignores_force_cooldown() {
+        for rejected in ["stale", "some-other-token"] {
+            let creds = ensure_gated_locked_policy(
+                Arc::new(Mutex::new(())),
+                None,
+                || {
+                    let mut c = credential("stale");
+                    c.expires = 0;
+                    Ok(c)
+                },
+                |_| async { Ok(credential("new")) },
+                |_, _| Ok(CasOutcome::Saved),
+                Some(rejected),
+                || Err("cooldown".to_string()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(creds.access, "new", "rejected = {rejected}");
+        }
+    }
+
+    use super::super::account::Account;
+    use super::super::provider::OAuthProviderId;
+    use super::super::storage::save_provider_auth_at;
+
+    fn account(label: &str) -> CredentialRef {
+        CredentialRef::new(OAuthProviderId::Anthropic, Account::named(label).unwrap())
+    }
+
+    /// auth.json as left by a write long ago (not "another process just
+    /// rotated it").
+    fn seed_old(path: &Path, entries: &[(&CredentialRef, &str)]) {
+        for (cred, access) in entries {
+            save_provider_auth_at(path, &cred.storage_key(), &credential(access)).unwrap();
+        }
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// Production composition (gate + lock + CAS save + cooldown) with a
+    /// fake provider exchange that mints a distinct access token per call.
+    async fn forced(
+        path: &Path,
+        cred: &CredentialRef,
+        rejected: &str,
+        calls: &AtomicUsize,
+    ) -> Result<OAuthCredentials, String> {
+        refresh_credential_locked(cred, path, None, Some(rejected), |old| async move {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            Ok(OAuthCredentials {
+                auth_type: "oauth".into(),
+                refresh: format!("{old}-rotated"),
+                access: format!("minted-{n}"),
+                expires: crate::epoch_millis() + 3_600_000,
+                account_id: None,
+            })
+        })
+        .await
+    }
+
+    /// A permanent 401 stops spending refresh tokens: the first rejection
+    /// forces one refresh; when the provider rejects the freshly minted
+    /// token too, the cooldown refuses a second spend. A second account of
+    /// the same provider has its own cooldown and still recovers.
+    #[tokio::test]
+    async fn forced_refresh_cooldown_is_per_account_and_stops_a_persistent_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let (a, b) = (account("a"), account("b"));
+        seed_old(&path, &[(&a, "a-rejected"), (&b, "b-rejected")]);
+        let calls = AtomicUsize::new(0);
+
+        let first = forced(&path, &a, "a-rejected", &calls).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let err = forced(&path, &a, &first.access, &calls).await.unwrap_err();
+        assert!(err.contains("not refreshing again"), "{err}");
+        assert!(!err.contains(&first.access), "error must not carry tokens: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cooldown spends nothing");
+
+        // Account b: our own write of a's slot is not "another process".
+        forced(&path, &b, "b-rejected", &calls).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "b has its own cooldown");
+    }
+
+    /// Another process wrote the credential file within the cooldown (it may
+    /// just have rotated it): do not force a refresh on top of it.
+    #[tokio::test]
+    async fn foreign_auth_file_write_within_cooldown_blocks_forced_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let a = account("a");
+        // Written "now" by someone other than this process's refresh path.
+        save_provider_auth_at(&path, &a.storage_key(), &credential("a-rejected")).unwrap();
+        let calls = AtomicUsize::new(0);
+        let err = forced(&path, &a, "a-rejected", &calls).await.unwrap_err();
+        assert!(err.contains("not refreshing again"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
