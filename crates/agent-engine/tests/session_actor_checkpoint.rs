@@ -721,6 +721,13 @@ async fn stale_draft_of_a_completed_turn_is_just_removed() {
     a.send(submit("done quickly")).await.unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     end(&mut a).await;
+    // `Ended` precedes the actor's exit; a `--continue` in that window
+    // attaches to the dying actor (see `crash_mid_turn`).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while handle.is_alive() {
+        assert!(tokio::time::Instant::now() < deadline, "actor never exited");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let before = Session::load(&id).unwrap().api_messages;
     assert_eq!(before.last().unwrap()["role"], "assistant");
     agent_engine::core::session_draft::write_turn_draft(
