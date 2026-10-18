@@ -342,3 +342,92 @@ async fn codex_only_broker_serves_distinct_accounts_and_authenticates_metadata()
             && !text.contains("synthetic-static-secret")
     );
 }
+
+/// #147 C1 end to end: a loopback broker started with NO token configured
+/// generates `<base_dir>/auth-broker.token` (0600) and requires it; a local
+/// `synaps` pointed at the loopback endpoint with no token configured reads
+/// that file and works with zero config. A DNS-rebinding Host is refused.
+#[tokio::test]
+async fn zero_config_loopback_broker_requires_its_generated_token() {
+    let sandbox = Sandbox::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let child = sandbox
+        .command()
+        .args(["auth-broker", "--bind", &addr.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = BrokerProcess(child);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let base = format!("http://{addr}");
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "broker exited before ready"
+        );
+        if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "zero-config loopback broker did not become healthy");
+
+    let token_path = sandbox.dir.path().join("auth-broker.token");
+    let token = std::fs::read_to_string(&token_path)
+        .expect("token file generated next to auth.json")
+        .trim()
+        .to_string();
+    assert_eq!(token.len(), 64);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&token_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // No bearer: refused. Was open before (#147 C1).
+    let unauth = client
+        .get(format!("{base}/token"))
+        .query(&[("provider", "openai-codex")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401);
+    let rebinding = client
+        .get(format!("{base}/capabilities"))
+        .header(reqwest::header::HOST, format!("attacker.example:{}", addr.port()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebinding.status().as_u16(), 403);
+    let authed = client
+        .get(format!("{base}/capabilities"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(authed.status().is_success());
+
+    // A local client with only the endpoint configured picks up the token.
+    let listed = sandbox
+        .command()
+        .env("SYNAPS_AUTH_ENDPOINT", &base)
+        .args(["auth", "list", "--provider", "openai-codex", "--json"])
+        .output()
+        .unwrap();
+    assert_ok(&listed);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("second"), "{text}");
+    assert!(!text.contains(&token), "machine token never printed");
+}

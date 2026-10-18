@@ -20,6 +20,18 @@
 //!
 //! TLS is served via `axum-server` (tls-rustls feature, rustls 0.23).
 //!
+//! ## Machine auth (#147 C1)
+//!
+//! Every credential endpoint requires `Authorization: Bearer <machine token>`.
+//! The token comes from `--machine-token-file` or `SYNAPS_BROKER_TOKEN`. A
+//! loopback bind with neither generates one into `<base_dir>/auth-broker.token`
+//! (0600, next to `auth.json`; reused on restart), and a local client whose
+//! endpoint is a loopback URL reads that file when it has no
+//! `auth.machine_token` / `SYNAPS_MACHINE_TOKEN`. A loopback broker also
+//! refuses any `Host` other than `127.0.0.1:<port>`, `localhost:<port>` or
+//! `[::1]:<port>` (DNS rebinding). Only a non-loopback bind with
+//! `--insecure-no-auth` runs without a token.
+//!
 //! Clients run `synaps` with `auth.remote_endpoint` pointed here; they fetch a
 //! token per request and never store the credential on their own disk.
 //!
@@ -162,12 +174,94 @@ pub fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<()> 
 #[derive(Clone)]
 struct BrokerState {
     /// Token clients must present as `Authorization: Bearer <token>`. `None`
-    /// disables auth (only safe on loopback or with explicit `--insecure-no-auth`).
+    /// disables auth: only a non-loopback bind with explicit
+    /// `--insecure-no-auth`. A loopback broker always has one (#147 C1).
     machine_token: Option<String>,
+    /// Loopback binds only: the exact `Host` values accepted
+    /// (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`). Anything
+    /// else is refused before routing, so a DNS-rebinding page cannot
+    /// talk to the broker through the victim's browser.
+    allowed_hosts: Option<Arc<[String]>>,
     /// The in-process broker that owns every credential (all providers and
     /// account slots), refreshes them, and executes proxied requests. Raw
     /// keys and refresh tokens never leave this boundary.
     local: Arc<auth::LocalBroker>,
+}
+
+/// `Host` values a loopback broker on `port` accepts. A client may omit the
+/// port when it is the scheme default (80 for http, 443 for https).
+fn loopback_allowed_hosts(port: u16, tls: bool) -> Vec<String> {
+    let names = ["127.0.0.1", "localhost", "[::1]"];
+    let mut hosts: Vec<String> = names.iter().map(|n| format!("{n}:{port}")).collect();
+    if port == if tls { 443 } else { 80 } {
+        hosts.extend(names.iter().map(|n| n.to_string()));
+    }
+    hosts
+}
+
+/// Refuse any request whose `Host` (or HTTP/2 `:authority`) is not on the
+/// loopback allowlist. No-op for non-loopback binds.
+async fn host_guard(
+    State(st): State<BrokerState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(allowed) = st.allowed_hosts.as_deref() {
+        let host = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri().authority().map(|a| a.as_str()))
+            .unwrap_or("");
+        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+            eprintln!(
+                "[auth-broker] DENIED request with non-loopback Host ({} chars)",
+                host.len()
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "host not allowed" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// The machine token this broker will require. An explicit token (file or
+/// env) wins. A loopback bind with none uses (creating on first start) the
+/// 0600 token file at `token_path`, which local clients read automatically;
+/// `--insecure-no-auth` does not turn auth off on loopback. A non-loopback
+/// bind with none is refused unless `insecure_no_auth`.
+fn resolve_machine_token(
+    explicit: Option<String>,
+    is_loopback: bool,
+    insecure_no_auth: bool,
+    token_path: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if is_loopback {
+        let (token, created) = auth::load_or_create_broker_token(token_path).map_err(|e| {
+            anyhow::anyhow!("broker token file {}: {e}", token_path.display())
+        })?;
+        eprintln!(
+            "[auth-broker] loopback machine token {} {} (0600; local clients read it automatically)",
+            if created { "generated at" } else { "loaded from" },
+            token_path.display()
+        );
+        return Ok(Some(token));
+    }
+    if !insecure_no_auth {
+        anyhow::bail!(
+            "refusing to start: no machine token (set --machine-token-file / \
+             SYNAPS_BROKER_TOKEN) while bound to a non-loopback address. That would serve \
+             credentials unauthenticated to the network. Pass --insecure-no-auth to override, \
+             or bind 127.0.0.1."
+        );
+    }
+    Ok(None)
 }
 
 /// Constant-time machine-auth check shared by every credential endpoint.
@@ -303,15 +397,15 @@ pub async fn run(
         BindDecision::Http { warn: false } | BindDecision::Tls => {}
     }
 
-    // B2: refuse to start unauthenticated on a non-loopback bind unless the
-    // operator explicitly opts in.
-    if machine_token.is_none() && !addr.ip().is_loopback() && !insecure_no_auth {
-        anyhow::bail!(
-            "refusing to start: no machine token (set --machine-token-file / \
-             SYNAPS_BROKER_TOKEN) while bound to non-loopback {addr}. That would serve credentials \
-             unauthenticated to the network. Pass --insecure-no-auth to override, or bind 127.0.0.1."
-        );
-    }
+    // B2 + #147 C1: a loopback broker always requires a machine token
+    // (auto-generated next to auth.json when none is configured); a
+    // non-loopback bind without one is refused unless explicitly opted in.
+    let machine_token = resolve_machine_token(
+        machine_token,
+        addr.ip().is_loopback(),
+        insecure_no_auth,
+        &auth::local_broker_token_path(),
+    )?;
 
     // D1: fail fast if no OAuth credential of ANY provider/account is
     // present or the store is unreadable. Codex-only, Kimi-only, or
@@ -334,6 +428,10 @@ pub async fn run(
 
     let state = BrokerState {
         machine_token: machine_token.clone(),
+        allowed_hosts: addr
+            .ip()
+            .is_loopback()
+            .then(|| Arc::from(loopback_allowed_hosts(addr.port(), tls.is_some()))),
         local: Arc::new(auth::LocalBroker::new(client.clone())),
     };
 
@@ -379,7 +477,7 @@ pub async fn run(
                 if machine_token.is_some() {
                     "ON"
                 } else {
-                    "OFF — loopback/insecure only!"
+                    "OFF — --insecure-no-auth!"
                 }
             );
             let tls_cfg = tls.expect("Tls decision requires tls config");
@@ -412,7 +510,7 @@ pub async fn run(
                 if machine_token.is_some() {
                     "ON"
                 } else {
-                    "OFF — loopback/insecure only!"
+                    "OFF — --insecure-no-auth!"
                 }
             );
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -440,6 +538,7 @@ fn build_router_with_cloud_backend(
     let local = auth::LocalBroker::new(reqwest::Client::new()).with_cloud_backend(backend);
     build_router(BrokerState {
         machine_token,
+        allowed_hosts: None,
         local: Arc::new(local),
     })
 }
@@ -462,6 +561,8 @@ fn build_router(state: BrokerState) -> Router {
         ))
         // B7: cap concurrent in-flight requests.
         .layer(tower::limit::ConcurrencyLimitLayer::new(64))
+        // #147 C1: loopback Host allowlist runs before every route.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), host_guard))
         .with_state(state)
 }
 
@@ -1377,18 +1478,30 @@ mod tests {
         machine_token: Option<String>,
         local_upstream: Option<String>,
     ) -> String {
+        spawn_broker_service_with(machine_token, local_upstream, true).await
+    }
+
+    /// `loopback_host_check`: run the production loopback Host allowlist
+    /// for the bound port (what `run` installs for a loopback bind).
+    async fn spawn_broker_service_with(
+        machine_token: Option<String>,
+        local_upstream: Option<String>,
+        loopback_host_check: bool,
+    ) -> String {
         let client = reqwest::Client::new();
         let local = match local_upstream {
             Some(url) => auth::LocalBroker::with_local_base_url(client.clone(), url),
             None => auth::LocalBroker::new(client.clone()),
         };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let state = BrokerState {
             machine_token,
+            allowed_hosts: loopback_host_check
+                .then(|| Arc::from(loopback_allowed_hosts(addr.port(), false))),
             local: Arc::new(local),
         };
         let app = build_router(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1585,6 +1698,110 @@ mod tests {
                 "no token material for {provider}"
             );
         }
+    }
+
+    // ── Loopback Host allowlist (DNS rebinding, #147 C1) ─────────────────────
+
+    async fn capabilities_with_host(base: &str, host: &str) -> u16 {
+        reqwest::Client::new()
+            .get(format!("{base}/capabilities"))
+            .header(reqwest::header::HOST, host)
+            .bearer_auth("machine-secret")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn loopback_broker_rejects_foreign_host_headers() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let port = base.rsplit(':').next().unwrap().to_string();
+        for host in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("LOCALHOST:{port}"),
+            format!("[::1]:{port}"),
+        ] {
+            assert_eq!(capabilities_with_host(&base, &host).await, 200, "{host}");
+        }
+        for host in [
+            format!("evil.example:{port}"),
+            "evil.example".to_string(),
+            format!("127.0.0.1:{}", port.parse::<u16>().unwrap().wrapping_add(1)),
+            "127.0.0.1".to_string(),
+            format!("localhost.evil.example:{port}"),
+            String::new(),
+        ] {
+            assert_eq!(
+                capabilities_with_host(&base, &host).await,
+                403,
+                "rebinding Host {host:?} must be refused even with a valid token"
+            );
+        }
+        // Every route is covered, including the unauthenticated /healthz.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/healthz"))
+            .header(reqwest::header::HOST, "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body = resp.text().await.unwrap();
+        assert!(!body.contains("machine-secret"));
+    }
+
+    #[tokio::test]
+    async fn host_allowlist_is_only_applied_to_loopback_binds() {
+        let base = spawn_broker_service_with(Some("machine-secret".into()), None, false).await;
+        assert_eq!(capabilities_with_host(&base, "broker.example:8181").await, 200);
+    }
+
+    #[test]
+    fn loopback_allowed_hosts_cover_the_three_loopback_names() {
+        assert_eq!(
+            loopback_allowed_hosts(8181, false),
+            vec!["127.0.0.1:8181", "localhost:8181", "[::1]:8181"]
+        );
+        // Default ports may be sent without a port.
+        assert!(loopback_allowed_hosts(80, false).contains(&"localhost".to_string()));
+        assert!(loopback_allowed_hosts(443, true).contains(&"[::1]".to_string()));
+        assert!(!loopback_allowed_hosts(443, false).contains(&"localhost".to_string()));
+    }
+
+    // ── Loopback machine-token bootstrap (#147 C1) ───────────────────────────
+
+    #[test]
+    fn loopback_without_token_generates_one_and_remote_needs_explicit_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth-broker.token");
+        let tok = resolve_machine_token(None, true, false, &path).unwrap();
+        let tok = tok.expect("loopback always has a machine token");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), tok);
+        assert_eq!(
+            resolve_machine_token(None, true, false, &path).unwrap().as_deref(),
+            Some(tok.as_str()),
+            "restart reuses the token clients already read"
+        );
+        // --insecure-no-auth never turns auth off on loopback.
+        assert_eq!(
+            resolve_machine_token(None, true, true, &path).unwrap().as_deref(),
+            Some(tok.as_str())
+        );
+        // An explicit token wins and no file is consulted.
+        let other = dir.path().join("unused.token");
+        assert_eq!(
+            resolve_machine_token(Some("explicit".into()), true, false, &other)
+                .unwrap()
+                .as_deref(),
+            Some("explicit")
+        );
+        assert!(!other.exists());
+        // Non-loopback: unchanged — no token is refused unless opted out.
+        assert!(resolve_machine_token(None, false, false, &other).is_err());
+        assert_eq!(resolve_machine_token(None, false, true, &other).unwrap(), None);
+        assert!(!other.exists(), "never auto-generated for a network bind");
     }
 
     #[test]

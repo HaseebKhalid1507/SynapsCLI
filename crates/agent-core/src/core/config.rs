@@ -505,6 +505,9 @@ impl AuthConfig {
     /// Resolve the credential source. Environment variables take precedence over
     /// config-file values: `SYNAPS_AUTH_ENDPOINT` / `SYNAPS_MACHINE_TOKEN`.
     /// Returns `Remote` iff an endpoint is set (env or config), else `Local`.
+    /// A loopback endpoint with no configured token uses the local broker's
+    /// auto-generated `<base_dir>/auth-broker.token` (#147 C1); a
+    /// non-loopback endpoint never reads that file.
     pub fn credential_source(&self) -> crate::core::auth::CredentialSource {
         let endpoint = std::env::var("SYNAPS_AUTH_ENDPOINT")
             .ok()
@@ -513,7 +516,13 @@ impl AuthConfig {
         let machine_token = std::env::var("SYNAPS_MACHINE_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.machine_token.clone());
+            .or_else(|| self.machine_token.clone().filter(|s| !s.trim().is_empty()))
+            .or_else(|| {
+                endpoint
+                    .as_deref()
+                    .filter(|e| crate::core::auth::is_loopback_endpoint(e))
+                    .and_then(|_| crate::core::auth::read_local_broker_token())
+            });
         crate::core::auth::CredentialSource::from_parts(endpoint, machine_token)
     }
 }
@@ -4260,6 +4269,45 @@ api_retries = 5
             }
         );
     }
+    /// #147 C1: a loopback endpoint with no configured machine token picks
+    /// up the local broker's auto-generated token file; a remote endpoint
+    /// never does, and an explicit token always wins.
+    #[test]
+    #[serial]
+    fn test_credential_source_loopback_reads_local_broker_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SYNAPS_BASE_DIR");
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path());
+        std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
+        std::env::remove_var("SYNAPS_MACHINE_TOKEN");
+        std::fs::write(dir.path().join("auth-broker.token"), "local-file-tok\n").unwrap();
+        let source = |endpoint: &str, token: Option<&str>| {
+            AuthConfig {
+                remote_endpoint: Some(endpoint.into()),
+                machine_token: token.map(str::to_string),
+                accounts: BTreeMap::new(),
+                auto: BTreeMap::new(),
+            }
+            .credential_source()
+        };
+        let loopback = source("http://127.0.0.1:8181", None);
+        let localhost = source("http://localhost:8181", None);
+        let remote = source("https://jade.jade:8181", None);
+        let explicit = source("http://127.0.0.1:8181", Some("cfg-tok"));
+        match prev {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        let remote_tok = |s: crate::core::auth::CredentialSource| match s {
+            crate::core::auth::CredentialSource::Remote { machine_token, .. } => machine_token,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(remote_tok(loopback), "local-file-tok");
+        assert_eq!(remote_tok(localhost), "local-file-tok");
+        assert_eq!(remote_tok(remote), "", "never sent to a non-loopback broker");
+        assert_eq!(remote_tok(explicit), "cfg-tok");
+    }
+
     #[test]
     fn config_parses_ultracode_as_distinct_canonical_level() {
         let cfg = load_config_from_str("thinking = ultracode\n");
