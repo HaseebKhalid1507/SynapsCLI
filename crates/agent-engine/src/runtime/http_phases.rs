@@ -108,17 +108,22 @@ mod tests {
     async fn slow_headers_survive_idle_limit_then_stalled_body_times_out() {
         let slot = Arc::new(OnceLock::new());
         let client = client(&slot).unwrap();
-        let (url, task) = server(Duration::from_millis(150), 1, Duration::ZERO).await;
-        let response = send(client.post(url).body("body"), Duration::from_secs(2))
+        // Headers take longer than the body idle limit below; the header
+        // phase has its own (larger) deadline, so they still arrive. Only the
+        // stall assertion depends on a limit firing, and the server sleeps
+        // 10 s there, so a loaded machine can't make it pass or fail early.
+        let (url, task) = server(Duration::from_millis(600), 1, Duration::ZERO).await;
+        let response = send(client.post(url).body("body"), Duration::from_secs(10))
             .await
             .unwrap();
         let mut stream = response.bytes_stream();
-        assert!(next(&mut stream, Duration::from_millis(50))
+        // The chunk is written with the headers: generous, not a bound.
+        assert!(next(&mut stream, Duration::from_secs(5))
             .await
             .unwrap()
             .is_ok());
         assert!(matches!(
-            next(&mut stream, Duration::from_millis(50)).await,
+            next(&mut stream, Duration::from_millis(250)).await,
             Some(Err(RuntimeError::NetworkTimeout(_)))
         ));
         task.abort();
@@ -134,13 +139,16 @@ mod tests {
             Err(RuntimeError::NetworkTimeout(_))
         ));
         task.abort();
-        let (url, task) = server(Duration::ZERO, 8, Duration::from_millis(50)).await;
-        let mut stream = send(client.get(url), Duration::from_millis(200))
+        // 8 chunks 200 ms apart (1.6 s) outlast the 1 s header deadline: an
+        // active stream has no total deadline. The windows are generous so a
+        // loaded machine can't fail them.
+        let (url, task) = server(Duration::ZERO, 8, Duration::from_millis(200)).await;
+        let mut stream = send(client.get(url), Duration::from_secs(1))
             .await
             .unwrap()
             .bytes_stream();
         for _ in 0..8 {
-            assert!(next(&mut stream, Duration::from_millis(200))
+            assert!(next(&mut stream, Duration::from_secs(2))
                 .await
                 .unwrap()
                 .is_ok());

@@ -20,8 +20,8 @@ pub mod writer;
 
 pub use writer::{
     default_telemetry_log_path, default_trace_log_path, ShutdownOutcome, TelemetryWriter,
-    WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES, DEFAULT_QUEUE_CAPACITY,
-    DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+    WriteGate, WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_QUEUE_CAPACITY, DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
 };
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.

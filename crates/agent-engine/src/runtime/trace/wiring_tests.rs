@@ -595,23 +595,27 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
 // ─── Task 11: slow persistence must not delay the model turn ────────────────
 
 /// Loopback request through a `TraceContext` whose sink is the production
-/// bounded writer (`WriterTraceSink`) configured pathologically slow
-/// (500 ms/job, capacity 1). The model turn must complete at transport
-/// speed; queue overflow is counted, never propagated. (Spec §6.5.)
+/// bounded writer (`WriterTraceSink`) whose storage is stuck: its worker waits
+/// on a gate this test holds closed for the whole turn (capacity 1). The model
+/// turn must complete anyway; queue overflow is counted, never propagated.
+/// (Spec §6.5.) No wall clock: if the request path waited on the writer, the
+/// turn could never finish while the gate is closed, and the hang guard fires.
 #[tokio::test]
 async fn slow_writer_sink_does_not_delay_model_turn() {
-    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions, WriterTraceSink};
+    use crate::runtime::telemetry::{TelemetryWriter, WriteGate, WriterOptions, WriterTraceSink};
 
     let (url, _bodies, hits) = spawn_stub(vec![]).await;
     let tmp = tempfile::TempDir::new().unwrap();
+    let gate = WriteGate::closed();
     let writer = TelemetryWriter::new(WriterOptions {
         telemetry_path: Some(tmp.path().join("synaps/api-log.jsonl")),
         trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
         capacity: 1,
-        write_delay: Some(Duration::from_millis(500)),
+        write_gate: Some(gate.clone()),
         ..WriterOptions::default()
     });
-    // Pre-fill the queue so this request's records hit a saturated writer.
+    // Saturate: the worker takes one job and blocks on the gate, the queue
+    // holds one more, so this request's records hit a full writer.
     for _ in 0..4 {
         writer.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord::default());
     }
@@ -622,19 +626,20 @@ async fn slow_writer_sink_does_not_delay_model_turn() {
         ..Default::default()
     };
 
-    let start = std::time::Instant::now();
-    drive_stream(&options, 0, &CancellationToken::new())
-        .await
-        .expect("stream must succeed at transport speed");
-    let elapsed = start.elapsed();
+    // Hang guard only, not a performance bound.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        drive_stream(&options, 0, &CancellationToken::new()),
+    )
+    .await
+    .expect("the turn waited on the stuck writer")
+    .expect("stream must succeed while storage is stuck");
 
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    assert!(
-        elapsed < Duration::from_millis(450),
-        "a saturated 500ms/job writer must not delay the turn: {elapsed:?}"
-    );
-    // Bounded shutdown even while the worker is mid-sleep.
+    assert!(writer.stats().dropped > 0, "overflow was counted, not blocked");
+    // Bounded shutdown even while the worker is stuck: the gate is still
+    // closed, so nothing can have flushed.
     let out = writer.shutdown(Duration::from_millis(100));
     assert!(!out.is_flushed());
-    assert!(out.stats().dropped > 0, "overflow was counted, not blocked");
+    gate.open(); // release the worker thread
 }
