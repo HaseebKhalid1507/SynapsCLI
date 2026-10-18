@@ -643,11 +643,32 @@ const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(12
 /// the stamp survives them.
 struct RefreshFileLock {
     file: std::fs::File,
+    /// Lock file path: keys the in-process [`refresh_floor`].
+    path: PathBuf,
+}
+
+/// In-process last-refresh floor per refresh-lock path, recorded only when
+/// the on-disk stamp could not be written. Without it a failed stamp
+/// (ENOSPC, a read-only lock file) would silently switch the forced-refresh
+/// cooldown off and every 401 would rotate / re-mint again.
+fn refresh_floor() -> &'static std::sync::Mutex<HashMap<PathBuf, u64>> {
+    static FLOOR: OnceLock<std::sync::Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    FLOOR.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 impl RefreshFileLock {
-    /// Last successful refresh of this account by any process, if stamped.
+    /// Last successful refresh of this account: the on-disk stamp (any
+    /// process), or this process's floor if that is later.
     fn last_refresh_ms(&self) -> Option<u64> {
+        let floor = refresh_floor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.path)
+            .copied();
+        self.stamped_ms().max(floor)
+    }
+
+    fn stamped_ms(&self) -> Option<u64> {
         use std::io::{Read, Seek};
         let mut file = &self.file;
         file.rewind().ok()?;
@@ -656,18 +677,33 @@ impl RefreshFileLock {
         text.trim().parse().ok()
     }
 
-    /// Record a successful refresh. Best effort: a failed stamp only weakens
-    /// the rate limit, it never fails a refresh that is already persisted.
-    fn stamp_refreshed(&self, now_ms: u64) {
+    /// Record a successful refresh. Never fails a refresh that is already
+    /// persisted: if the stamp cannot be written, warn and keep the time
+    /// in the in-process floor instead.
+    fn record_refreshed(&self, now_ms: u64) {
+        let mut floor = refresh_floor().lock().unwrap_or_else(|e| e.into_inner());
+        match self.stamp_refreshed(now_ms) {
+            Ok(()) => {
+                floor.remove(&self.path);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lock = %self.path.display(),
+                    error = %e,
+                    "could not stamp the refresh lock file; keeping the forced-refresh \
+                     cooldown in this process only"
+                );
+                floor.insert(self.path.clone(), now_ms);
+            }
+        }
+    }
+
+    fn stamp_refreshed(&self, now_ms: u64) -> std::io::Result<()> {
         use std::io::{Seek, Write};
         let mut file = &self.file;
-        let res = file
-            .set_len(0)
-            .and_then(|()| file.rewind())
-            .and_then(|()| file.write_all(now_ms.to_string().as_bytes()));
-        if let Err(e) = res {
-            tracing::debug!(error = %e, "could not stamp the refresh lock file");
-        }
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(now_ms.to_string().as_bytes())
     }
 }
 
@@ -700,7 +736,7 @@ async fn acquire_refresh_lock(
         let deadline = std::time::Instant::now() + wait;
         loop {
             match FileExt::try_lock_exclusive(&file) {
-                Ok(true) => return Ok(RefreshFileLock { file }),
+                Ok(true) => return Ok(RefreshFileLock { file, path }),
                 Ok(false) => {}
                 Err(e) => {
                     return Err(other(format!(
@@ -864,7 +900,7 @@ where
         match save(&old_refresh, &fresh)? {
             CasOutcome::Saved => {
                 if let Some(lock) = &file_lock {
-                    lock.stamp_refreshed(crate::epoch_millis());
+                    lock.record_refreshed(crate::epoch_millis());
                 }
                 return Ok(fresh);
             }
@@ -1735,6 +1771,36 @@ mod rejected_token_tests {
         .await
         .map_err(String::from)
     }
+    /// m4: a stamp that cannot be written (ENOSPC, read-only lock file)
+    /// must not switch the cooldown off: the in-process floor keeps it.
+    #[test]
+    fn failed_stamp_write_keeps_an_in_process_cooldown_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json.muse.refresh.lock");
+        std::fs::write(&path, "").unwrap();
+        // Read-only handle: every stamp write fails.
+        let lock = RefreshFileLock {
+            file: std::fs::File::open(&path).unwrap(),
+            path: path.clone(),
+        };
+        let now = 5_000_000_000;
+        lock.record_refreshed(now);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "stamp write failed");
+        assert_eq!(lock.last_refresh_ms(), Some(now));
+        let cred = CredentialRef::default_for(super::super::provider::OAuthProviderId::Muse);
+        let refused = forced_refresh_allowed(&cred, lock.last_refresh_ms(), now + 5_000).unwrap_err();
+        assert!(matches!(refused.kind, RefreshFailureKind::Cooldown { .. }), "{refused}");
+
+        // Another account's lock never sees this floor.
+        let other_path = dir.path().join("auth.json.muse@work.refresh.lock");
+        std::fs::write(&other_path, "").unwrap();
+        let other = RefreshFileLock {
+            file: std::fs::File::open(&other_path).unwrap(),
+            path: other_path,
+        };
+        assert_eq!(other.last_refresh_ms(), None);
+    }
+
     /// m3: a refresh runtime that failed to start is a refresh error, not
     /// a process abort (release builds use `panic = "abort"`).
     #[tokio::test]
