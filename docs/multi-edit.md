@@ -86,11 +86,15 @@ opener is plain text.
 ## Writing
 
 Only files whose content changed are written. During planning, each
-target's parent directory is opened from the same canonical path the
-write-scope check saw, by walking it from `/` without following symlinks.
-Every later step (reading, staging, the re-check, publishing, restoring and
-cleanup) works relative to that directory handle and never traverses the
-parent path again.
+target's parent directory is opened by walking the canonical parent path
+that was scope-checked from `/`, one component at a time, without following
+symlinks. That walk captures the directory's identity (dev, ino); the scope
+check itself only compares path strings, since write scopes are defined by
+paths. Every later step (reading, staging, the re-check, publishing,
+restoring and cleanup) works relative to that directory handle and never
+traverses the parent path again; before anything is published, the same
+walk must still reach the same directory. Each target gets its own handle,
+even when several share a directory.
 
 Existing files are opened through the handle without following a symlink
 and without waiting: a FIFO with no writer, or a device, is never blocked
@@ -131,10 +135,16 @@ restored, which could not be, and which were never written.
   group, ACLs and extended attributes are not (they are those of a new file
   made by this process), the same as with `edit` and `write`. This holds for
   a file put back by a restore too.
-- No fsync, matching `edit` and `write`: a crash can lose the latest change but
-  does not leave a half-written file.
+- No fsync, matching `edit` and `write`. A successful call never publishes a
+  partial file, but after a crash or power loss the filesystem decides what
+  survives.
+- A new file published by a hard link (where the exclusive rename isn't
+  available) normally has its temp name removed. If that removal fails, the
+  file is still published and the call succeeds; the result ends with
+  `warning: PATH published; could not remove temp TEMP: why`, naming the
+  second link left in the directory.
 
-Best effort, not a transaction:
+Best-effort publication and residual windows:
 
 - The window between the re-check and the renames is not locked. A write by
   another process in that window can be overwritten. A parent directory

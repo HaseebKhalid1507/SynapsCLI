@@ -2,11 +2,14 @@
 //!
 //! On Unix, every file operation after planning goes relative to a handle on
 //! the target's parent directory. The handle is opened by walking the
-//! canonical parent path (the one the write-scope check saw) from `/`, one
-//! component at a time, without following any symlink, so it is the
-//! directory that path named. Staging, the re-check, publishing, restoring
-//! and cleanup never traverse the parent path again; before anything is
-//! published, the same walk must still reach the same directory.
+//! canonical parent path that was scope-checked from `/`, one component at
+//! a time, without following any symlink, so it is the directory that path
+//! named; the walk captures its identity (dev, ino). The scope check itself
+//! only compares path strings (write scopes are defined by paths): the walk
+//! and the re-walk before publishing are what tie the handle to the checked
+//! path. Staging, the re-check, publishing, restoring and cleanup never
+//! traverse the parent path again; before anything is published, the same
+//! walk must still reach the same directory.
 //!
 //! Elsewhere the handle is just the path, as before.
 

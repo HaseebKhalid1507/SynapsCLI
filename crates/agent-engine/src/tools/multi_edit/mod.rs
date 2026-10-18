@@ -197,8 +197,10 @@ pub(crate) type ScopeCheck<'a> = &'a dyn Fn(&str) -> bool;
 struct FileEntry {
     display: String,
     target: PathBuf,
-    /// The verified parent directory of `target`, opened right after the
-    /// scope check from the same canonical path.
+    /// The verified parent directory of `target`: opened right after the
+    /// scope check by a no-follow walk of the canonical parent path that was
+    /// checked. One handle per target entry; targets that share a directory
+    /// each get their own (they are not deduplicated).
     dir: dir::Dir,
     /// The file name of `target` in `dir`.
     name: OsString,
@@ -247,7 +249,8 @@ fn resolve_target(raw: &str, cwd: Option<&Path>) -> std::result::Result<(PathBuf
 }
 
 /// The verified parent directory of a resolved target, and the target's
-/// file name in it. Opened from the canonical path the scope check saw.
+/// file name in it. Opened by a no-follow walk of the canonical parent path
+/// that was scope-checked; the walk captures the directory's identity.
 fn open_parent(target: &Path) -> std::result::Result<(dir::Dir, OsString), String> {
     let name = target.file_name().ok_or("path has no file name")?.to_os_string();
     let parent = target.parent().ok_or("path has no parent directory")?;

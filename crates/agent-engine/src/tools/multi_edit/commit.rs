@@ -1,8 +1,9 @@
 //! Staged, re-checked, all-or-nothing commit of the planned file contents.
 //!
 //! Every step goes through a handle on each target's parent directory,
-//! opened during planning from the canonical path the write-scope check saw
-//! ([`super::dir`]); no step traverses a parent path again.
+//! opened during planning by a no-follow walk of the canonical parent path
+//! that was scope-checked ([`super::dir`]); no step traverses a parent path
+//! again.
 //!
 //! 1. Stage: every new content goes into a sibling temp file created with
 //!    `O_EXCL`. The temp of an existing file (or of a restore) is created
@@ -25,8 +26,9 @@
 //!    their in-memory originals and the error names exactly what happened
 //!    to each file.
 //!
-//! No fsync, matching `edit`/`write`: a crash can lose the latest edit but
-//! never leaves a torn file. The re-check-to-rename window is not locked.
+//! No fsync, matching `edit`/`write`: a successful call never publishes a
+//! partial file, but after a crash or power loss the filesystem decides what
+//! survives. The re-check-to-rename window is not locked.
 
 use super::dir::{self, Dir, Kind, OpenError};
 use std::ffi::{OsStr, OsString};
