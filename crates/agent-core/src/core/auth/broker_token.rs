@@ -111,6 +111,7 @@ pub fn load_or_create_broker_token(path: &Path) -> std::io::Result<(String, Brok
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
     }
+    sweep_stale_temp_files(path, STALE_TEMP_AGE);
     for _ in 0..3 {
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
@@ -218,12 +219,61 @@ fn write_temp(path: &Path, token: &str) -> std::io::Result<PathBuf> {
     Ok(tmp)
 }
 
-/// Create `path` only if absent (hard link of a complete temp file).
+/// A temp token file older than this was left by a crashed writer (a live
+/// writer holds one for milliseconds).
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Remove leftover `.<name>.tmp.*` files beside `path` older than `age`.
+/// They are 0600 but hold a token, so they should not linger. Best-effort.
+fn sweep_stale_temp_files(path: &Path, age: std::time::Duration) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!(".{}.tmp.", name.to_string_lossy());
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|e| e >= age);
+        if meta.is_file() && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Create `path` only if absent (hard link of a complete temp file). On a
+/// filesystem without hard links, fall back to an exclusive create.
 fn write_new_exclusive(path: &Path, token: &str) -> std::io::Result<()> {
     let tmp = write_temp(path, token)?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
-    linked
+    match linked {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(path)?;
+            f.write_all(token.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.sync_all()
+        }
+        other => other,
+    }
 }
 
 /// Atomically replace `path` (rename of a complete 0600 temp file).
@@ -474,6 +524,32 @@ mod tests {
         std::os::unix::fs::chown(&path, Some(65534), None).unwrap();
         let err = load_or_create_broker_token(&path).unwrap_err();
         assert!(err.to_string().contains("another user"), "{err}");
+    }
+
+    #[test]
+    fn stale_temp_files_are_swept_fresh_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOCAL_BROKER_TOKEN_FILE);
+        let stale = dir.path().join(".auth-broker.token.tmp.1.deadbeef");
+        let fresh = dir.path().join(".auth-broker.token.tmp.2.cafebabe");
+        let other = dir.path().join("unrelated.tmp.1");
+        for f in [&stale, &fresh, &other] {
+            std::fs::write(f, "token\n").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in [&stale, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let (_, origin) = load_or_create_broker_token(&path).unwrap();
+        assert_eq!(origin, BrokerTokenOrigin::Created);
+        assert!(!stale.exists(), "crashed writer's temp file is removed");
+        assert!(fresh.exists(), "a live writer's temp file is left alone");
+        assert!(other.exists(), "unrelated files untouched");
     }
 
     #[cfg(unix)]

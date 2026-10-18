@@ -320,22 +320,38 @@ fn resolve_machine_token(
 /// 401 for a request that failed machine auth, with an actionable log line
 /// (prA I2): old clients can't explain a bare 401, so the broker does. The
 /// token itself is never logged or echoed.
-fn deny_machine_auth(st: &BrokerState, headers: &HeaderMap, route: &str) -> axum::response::Response {
+fn deny_machine_auth(
+    st: &BrokerState,
+    headers: &HeaderMap,
+    route: &str,
+    peer: Option<std::net::IpAddr>,
+) -> axum::response::Response {
     let presented = headers.get("authorization").is_some();
-    if presented {
-        eprintln!(
-            "[auth-broker] DENIED {route} (wrong machine token). The expected token is {}; \
-             if it was regenerated, restart or reload the client.",
-            st.token_source
-        );
-    } else {
-        eprintln!(
-            "[auth-broker] DENIED {route} (no machine token presented). Clients must set \
-             auth.machine_token or SYNAPS_MACHINE_TOKEN to the token in {}. Clients older than \
-             this broker, or running as another user or base dir, do not pick it up \
-             automatically; restart or reload clients after it changes.",
-            st.token_source
-        );
+    let reason = if presented { "wrong" } else { "missing" };
+    let peer_label = peer.map_or_else(|| "a client".to_string(), |ip| ip.to_string());
+    // Rate-limited (prA R2-m6): a retrying old client can't flood the log.
+    let key = format!("{reason}|{peer_label}");
+    if let Some(suppressed) = denial_advisory_due(&DENIAL_LOG, &key, std::time::Instant::now(), DENIAL_LOG_EVERY) {
+        let also = if suppressed > 0 {
+            format!(" ({suppressed} similar denials suppressed in the last minute)")
+        } else {
+            String::new()
+        };
+        if presented {
+            eprintln!(
+                "[auth-broker] DENIED {route} from {peer_label} (wrong machine token){also}. The \
+                 expected token is {}; if it was regenerated, restart or reload the client.",
+                st.token_source
+            );
+        } else {
+            eprintln!(
+                "[auth-broker] DENIED {route} from {peer_label} (no machine token presented){also}. \
+                 Clients must set auth.machine_token or SYNAPS_MACHINE_TOKEN to the token in {}. \
+                 Clients older than this broker, or running as another user or base dir, do not \
+                 pick it up automatically; restart or reload clients after it changes.",
+                st.token_source
+            );
+        }
     }
     (
         StatusCode::UNAUTHORIZED,
@@ -347,6 +363,43 @@ fn deny_machine_auth(st: &BrokerState, headers: &HeaderMap, route: &str) -> axum
         })),
     )
         .into_response()
+}
+
+/// One advisory per (reason, peer) per this interval.
+const DENIAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+type DenialLog = std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>;
+
+static DENIAL_LOG: std::sync::LazyLock<DenialLog> = std::sync::LazyLock::new(Default::default);
+
+/// Whether the advisory for `key` should be logged now. `Some(n)`: log it,
+/// `n` similar denials were suppressed since the last one; `None`: suppress.
+fn denial_advisory_due(
+    log: &DenialLog,
+    key: &str,
+    now: std::time::Instant,
+    every: std::time::Duration,
+) -> Option<u64> {
+    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+    if log.len() > 1024 {
+        log.retain(|_, (at, _)| now.duration_since(*at) < every);
+    }
+    match log.get_mut(key) {
+        Some((at, suppressed)) if now.duration_since(*at) < every => {
+            *suppressed += 1;
+            None
+        }
+        Some((at, suppressed)) => {
+            let n = *suppressed;
+            *at = now;
+            *suppressed = 0;
+            Some(n)
+        }
+        None => {
+            log.insert(key.to_string(), (now, 0));
+            Some(0)
+        }
+    }
 }
 
 /// Constant-time machine-auth check shared by every credential endpoint.
@@ -708,8 +761,7 @@ async fn token(
 ) -> impl IntoResponse {
     // ── machine auth (constant-time) ──
     if !machine_auth_ok(&st, &headers) {
-        eprintln!("[auth-broker] DENIED /token from {}", peer.ip());
-        return deny_machine_auth(&st, &headers, "/token");
+        return deny_machine_auth(&st, &headers, "/token", Some(peer.ip()));
     }
 
     // ── provider allowlist ──
@@ -820,7 +872,7 @@ async fn proxy(
     Json(request): Json<auth::ProxyRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/proxy");
+        return deny_machine_auth(&st, &headers, "/proxy", None);
     }
     if let Err(e) = request.validate() {
         // BrokerError Display is secret-free by contract.
@@ -860,7 +912,7 @@ async fn proxy(
 /// endpoint — it is deliberately not a general OAuth proxy.
 async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/usage");
+        return deny_machine_auth(&st, &headers, "/usage", None);
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.anthropic_usage().await {
@@ -878,7 +930,7 @@ async fn usage_snapshot(
     Query(q): Query<UsageSnapshotQuery>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/usage/snapshot");
+        return deny_machine_auth(&st, &headers, "/usage/snapshot", None);
     }
     use synaps_cli::auth::CredentialBroker;
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
@@ -926,7 +978,7 @@ async fn accounts_cooldown(
     Json(report): Json<CooldownReport>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/accounts/cooldown");
+        return deny_machine_auth(&st, &headers, "/accounts/cooldown", None);
     }
     use synaps_cli::auth::CredentialBroker;
     let Some(provider_id) = broker_provider(&report.provider) else {
@@ -968,7 +1020,7 @@ async fn cloud_catalog(
     Json(request): Json<CloudCatalogRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/cloud/catalog");
+        return deny_machine_auth(&st, &headers, "/cloud/catalog", None);
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -995,7 +1047,7 @@ async fn cloud_invoke(
     Json(request): Json<CloudInvokeRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/cloud/invoke");
+        return deny_machine_auth(&st, &headers, "/cloud/invoke", None);
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -1039,7 +1091,7 @@ async fn capabilities(
     headers: HeaderMap,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/capabilities");
+        return deny_machine_auth(&st, &headers, "/capabilities", None);
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.capabilities().await {
@@ -1884,6 +1936,25 @@ mod tests {
         assert_eq!(host_header_hostname("[::1]:8181").as_deref(), Some("[::1]"));
         assert_eq!(host_header_hostname("LOCALHOST").as_deref(), Some("LOCALHOST"));
         assert_eq!(host_header_hostname(""), None);
+    }
+
+    #[test]
+    fn denial_advisory_is_rate_limited_per_reason_and_peer() {
+        let log = DenialLog::default();
+        let t0 = std::time::Instant::now();
+        let every = Duration::from_secs(60);
+        assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", t0, every), Some(0));
+        for i in 1..=50 {
+            let t = t0 + Duration::from_millis(i * 100);
+            assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", t, every), None);
+        }
+        // A different reason or peer is its own stream.
+        assert_eq!(denial_advisory_due(&log, "wrong|127.0.0.1", t0, every), Some(0));
+        assert_eq!(denial_advisory_due(&log, "missing|10.0.0.2", t0, every), Some(0));
+        // After the interval: logged again, with the suppressed count.
+        let later = t0 + Duration::from_secs(61);
+        assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", later, every), Some(50));
+        assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", later, every), None);
     }
 
     /// prA I2: a denied request gets an actionable hint and never the token.
