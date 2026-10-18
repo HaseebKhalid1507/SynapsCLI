@@ -50,11 +50,27 @@ fn synaps_env(cmd: &mut Command, guard: &HomeGuard, run: &Path) {
         .env_remove("SYNAPS_DAEMON_LOCK_FD");
 }
 
+/// A private copy of the daemon binary, mode 0755. `reload` refuses a
+/// group- or world-writable exe, and cargo links `bin()` under the runner's
+/// umask (0775 under 0002), so a daemon that reloads into its own binary
+/// starts from this copy: no test depends on the runner's umask.
+fn private_exe(guard: &HomeGuard) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = guard.home.path().join("synaps-under-test");
+    std::fs::copy(bin(), &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    exe
+}
+
 async fn spawn_daemon(guard: &HomeGuard, url: &str) -> DaemonProc {
+    spawn_daemon_from(guard, url, Path::new(bin())).await
+}
+
+async fn spawn_daemon_from(guard: &HomeGuard, url: &str, exe: &Path) -> DaemonProc {
     let run = guard.base_dir().join("run");
     std::fs::create_dir_all(&run).unwrap();
     let paths = registry::daemon_paths_in(&run, None);
-    let mut cmd = Command::new(bin());
+    let mut cmd = Command::new(exe);
     cmd.args(["daemon", "--foreground"]);
     synaps_env(&mut cmd, guard, &run);
     let child = cmd
@@ -179,7 +195,7 @@ async fn a_daemon_json_naming_another_pid_is_replaced_by_the_lock_holder() {
 async fn reload_reports_the_previous_version_with_daemon_json_deleted() {
     let guard = HomeGuard::new();
     let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
-    let d = spawn_daemon(&guard, &url).await;
+    let d = spawn_daemon_from(&guard, &url, &private_exe(&guard)).await;
     let recorded = registry::read_daemon_json(&d.paths).expect("daemon.json at start");
 
     std::fs::remove_file(&d.paths.json).unwrap();
