@@ -1364,7 +1364,7 @@ async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
     let h = Home::new();
     write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
     let _interval = fast_pings();
-    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(true).await;
+    let (t, handle, bodies, hold, calls) = period_with_a_pending_hook(true).await;
 
     t.send(SessionCommand::Detach {
         client: t.client_id(),
