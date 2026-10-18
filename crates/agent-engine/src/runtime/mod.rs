@@ -116,13 +116,15 @@ const MAX_REWRITE_PREVIEW_LINES: usize = 6;
 const MAX_REWRITE_PREVIEW_CHARS: usize = 400;
 
 /// Scrub credential shapes out of free text (a shell command, a header
-/// line, an extension's confirm message). Delegates to the SHARED
-/// trace-export scrubber (`trace::export::redact_text`), so the Confirm
-/// prompt and trace export apply the same rules (prA I-R3-1, I-R4-2). The
-/// prompt is broadcast to every attached client (observers included) and
-/// replayed on attach, so it must never show a secret.
+/// line, an extension's confirm message) for the Confirm prompt only. Uses
+/// the AGGRESSIVE `trace::export::redact_command_text` (the shared
+/// high-precision rules plus recall-first ones). Stored text the model or
+/// user reads back (context archive, memory, traces) keeps the precise
+/// shared scrub (prA I-R5-1). The prompt is broadcast to every attached
+/// client (observers included) and replayed on attach, so it must never
+/// show a secret.
 fn redact_secret_text(text: &str) -> String {
-    crate::runtime::trace::export::redact_text(text)
+    crate::runtime::trace::export::redact_command_text(text)
 }
 
 /// `redact_value` (secret-named keys, secret-shaped strings) plus
@@ -5934,14 +5936,34 @@ mod tests {
             ("STRIPE_KEY=rk_live_STRIPE-SECRET-19 node app", "STRIPE-SECRET-19"),
             ("OPENAI_KEY=OAIKEY-SECRET-20 node app", "OAIKEY-SECRET-20"),
         ];
+        // prA I-R5-1: rows whose shape is unmistakable are also caught by
+        // the SHARED high-precision scrub (trace export, memory, archive).
+        let precise = [
+            "QkFTSUMtU0VDUkVULTY=",
+            "USERINFO-SECRET-8",
+            "PGPW-SECRET-9",
+            "DBURL-SECRET-10",
+            "COOKIE-SECRET-11",
+            "SETCOOKIE-SECRET-12",
+            "CURLU-SECRET-13",
+            "MYSQL-SECRET-14",
+            "SSHPASS-SECRET-15",
+        ];
         for (text, secret) in rows {
+            // The Confirm prompt path catches every row.
             let out = redact_secret_text(text);
             assert!(!out.contains(secret), "{secret} leaked: {out}");
             assert!(out.contains("[REDACTED]"), "{out}");
-            // The trace export goes through the same shared rules.
-            let mut v = serde_json::Value::String(text.to_string());
-            crate::runtime::trace::export::redact_value(&mut v);
-            assert!(!v.as_str().unwrap().contains(secret), "trace export leaked {secret}: {v}");
+            let preview = final_input_preview(&serde_json::json!({ "command": text }));
+            assert!(!preview.contains(secret), "{secret} leaked in preview: {preview}");
+            if precise.contains(secret) {
+                let mut v = serde_json::Value::String(text.to_string());
+                crate::runtime::trace::export::redact_value(&mut v);
+                assert!(
+                    !v.as_str().unwrap().contains(secret),
+                    "shared scrub leaked {secret}: {v}"
+                );
+            }
         }
         // Over-redaction guards: ordinary commands and prose stay intact.
         for ok in [
@@ -5958,6 +5980,40 @@ mod tests {
         ] {
             assert_eq!(redact_secret_text(ok), ok, "over-redacted");
         }
+    }
+
+    /// prA I-R5-1: the shared scrub (`redact_value`) also runs over the
+    /// rollover context archive, memory captures and traces, so benign code
+    /// and prose must pass through it unchanged. Only the Confirm prompt
+    /// uses the aggressive rules.
+    #[test]
+    fn shared_scrub_leaves_benign_code_and_prose_alone() {
+        let benign = [
+            "max_tokens: 4096",
+            "password: String,",
+            "let token = load()?;",
+            "the password-reset flow",
+            "pub authorization: Option<String>,",
+            "cookie: HashMap<String, String>,",
+            "MY_KEY=value_in_docs",
+            "--token-file path/to/file",
+            "fn refresh_access_token(&self) -> Result<Token>",
+            "aws_secret_access_key is the field name",
+        ];
+        for text in benign {
+            let mut v = serde_json::Value::String(text.to_string());
+            crate::runtime::trace::export::redact_value(&mut v);
+            assert_eq!(v.as_str().unwrap(), text, "shared scrub mangled benign text");
+            assert_eq!(crate::runtime::trace::export::redact_text(text), text);
+        }
+        // Inside objects too (archive / memory records are JSON).
+        let mut record = serde_json::json!({
+            "text": "set max_tokens: 4096 and keep the password-reset flow",
+            "code": ["password: String,", "let token = load()?;"],
+        });
+        let before = record.clone();
+        crate::runtime::trace::export::redact_value(&mut record);
+        assert_eq!(record, before);
     }
 
     /// prA I-R4-1: the confirmer's message is redacted too — it routinely

@@ -523,34 +523,107 @@ fn scrub_url_query(s: &str) -> Option<String> {
     })
 }
 
-/// Pattern-based credential scrub for free text (shell commands, header
-/// lines, connection strings). Shared by the trace export (`scrub_string`)
-/// and the Confirm prompt preview/message, so both get every rule:
+type Rules = Vec<(regex::Regex, &'static str)>;
+
+fn compile_rules(rules: Vec<(String, &'static str)>) -> Rules {
+    rules
+        .into_iter()
+        .map(|(re, with)| (regex::Regex::new(&re).expect("static redaction pattern"), with))
+        .collect()
+}
+
+fn apply_rules(s: &str, rules: &Rules) -> Option<String> {
+    let mut out = std::borrow::Cow::Borrowed(s);
+    for (re, with) in rules.iter() {
+        if let std::borrow::Cow::Owned(next) = re.replace_all(&out, *with) {
+            out = std::borrow::Cow::Owned(next);
+        }
+    }
+    match out {
+        std::borrow::Cow::Owned(o) if o != s => Some(o),
+        _ => None,
+    }
+}
+
+/// HIGH-PRECISION pattern scrub, part of the shared [`redact_value`] used
+/// by trace export, memory capture and the rollover context archive the
+/// model recalls (prA I-R5-1). Every rule needs an unmistakable credential
+/// shape, so source code and prose pass through unchanged
+/// (`max_tokens: 4096`, `password: String,`, `let token = load()?;`,
+/// `authorization: Option<String>`):
 /// - URL userinfo `scheme://user:pass@host` → `scheme://[REDACTED]@host`;
-/// - `Authorization:` and `Cookie:` / `Set-Cookie:` header values;
-/// - `Bearer <tok>`;
-/// - `name=value` / `name: value` where the name contains api_key,
-///   access_key, token, secret, password/passwd or credential; for such a
-///   name that is a compound identifier (`aws_secret_access_key`) a
-///   whitespace separator counts too;
-/// - UPPER_SNAKE `*_KEY=value` env assignments (case-sensitive);
-/// - `--flag value` / `--flag=value` with the keyword anywhere in the flag;
+/// - an `Authorization:` header carrying an auth scheme (Basic, Bearer,
+///   Digest, Token, Negotiate, NTLM, AWS4-HMAC-SHA256);
+/// - a `Cookie:` / `Set-Cookie:` header carrying a `name=value` pair;
 /// - curl `-u user:pass` / `--user user:pass` (anchored to curl, colon
-///   required: `-u alice` and `docker -u 1000:1000` are left alone);
-/// - `mysql`/`mariadb` `-pSECRET` (attached value only, lower-case `-p`)
-///   and `sshpass -p X` — anchored to those commands so ordinary `-p`
-///   flags (`mkdir -p`, `ssh -p 2222`, `docker -p 8080:80`) are untouched;
-/// - `sk-…`/`sk_…` keys and JWTs.
+///   required: `-u alice`, `docker -u 1000:1000` are left alone);
+/// - `mysql`/`mariadb` `-pSECRET` (attached, lower-case `-p`) and
+///   `sshpass -p X`, anchored to those commands (`mkdir -p`,
+///   `ssh -p 2222`, `docker -p 8080:80` untouched).
 fn scrub_secret_patterns(s: &str) -> Option<String> {
     use std::sync::LazyLock;
-    const KW: &str = r"(?:api[_-]?key|access[_-]?key|token|secret|passw(?:or)?d|credential)";
-    const VAL: &str = r#"("[^"]*"|'[^']*'|[^\s&'"]+)"#;
-    static PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
-        let rules: Vec<(String, &'static str)> = vec![
+    static PRECISE: LazyLock<Rules> = LazyLock::new(|| {
+        compile_rules(vec![
             (
                 r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@'\x22]+:[^/\s@'\x22]+@".to_string(),
                 "${1}[REDACTED]@",
             ),
+            (
+                r"(?i)(authorization\s*:\s*)(?:basic|bearer|digest|token|negotiate|ntlm|aws4-hmac-sha256)\s+[^'\x22\r\n]+"
+                    .to_string(),
+                "${1}[REDACTED]",
+            ),
+            (
+                r"(?i)((?:set-)?cookie\s*:\s*)[^'\x22\r\n=]*=[^'\x22\r\n]*".to_string(),
+                "${1}[REDACTED]",
+            ),
+            (
+                r"((?i:\bcurl)[^\n|;&]*?\s(?:-u\s*|--user(?:=|\s+)))[^\s:'\x22]+:[^\s'\x22]+"
+                    .to_string(),
+                "${1}[REDACTED]",
+            ),
+            (
+                r"((?i:\bmysql\w*|\bmariadb\w*)[^\n|;&]*?\s-p)[^\s'\x22]+".to_string(),
+                "${1}[REDACTED]",
+            ),
+            (r"(\bsshpass\s+-p\s*)\S+".to_string(), "${1}[REDACTED]"),
+        ])
+    });
+    apply_rules(s, &PRECISE)
+}
+
+/// Free-text scrub through the shared, high-precision rules
+/// ([`scrub_secret_patterns`] plus the word-level known-prefix scrub).
+/// Returns the input unchanged when clean.
+pub fn redact_text(s: &str) -> String {
+    let mut v = Value::String(s.to_string());
+    redact_value(&mut v);
+    match v {
+        Value::String(out) => out,
+        other => other.to_string(),
+    }
+}
+
+/// AGGRESSIVE scrub for one-off display of a command the user is about to
+/// approve (the Confirm prompt preview and the confirmer's message). It
+/// trades false positives for recall, so it must NOT be used for stored
+/// text the model or user later reads back (context archive, memory,
+/// traces): those use [`redact_value`] / [`redact_text`] only. On top of
+/// [`redact_text`] it adds:
+/// - any `Authorization:` / `Cookie:` / `Set-Cookie:` header value;
+/// - `Bearer <tok>`;
+/// - `name=value` / `name: value` where the name contains api_key,
+///   access_key, token, secret, password/passwd or credential, and for a
+///   compound identifier (`aws_secret_access_key`) a whitespace separator;
+/// - UPPER_SNAKE `*_KEY=value` (case-sensitive);
+/// - `--flag value` / `--flag=value` with the keyword anywhere in the flag;
+/// - `sk-…` / `sk_…` keys and JWTs.
+pub fn redact_command_text(s: &str) -> String {
+    use std::sync::LazyLock;
+    const KW: &str = r"(?:api[_-]?key|access[_-]?key|token|secret|passw(?:or)?d|credential)";
+    const VAL: &str = r#"("[^"]*"|'[^']*'|[^\s&'"]+)"#;
+    static AGGRESSIVE: LazyLock<Rules> = LazyLock::new(|| {
+        compile_rules(vec![
             (r"(?i)(authorization\s*:\s*)[^'\x22\r\n]+".to_string(), "${1}[REDACTED]"),
             (r"(?i)((?:set-)?cookie\s*:\s*)[^'\x22\r\n]+".to_string(), "${1}[REDACTED]"),
             (r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+".to_string(), "${1}[REDACTED]"),
@@ -571,48 +644,19 @@ fn scrub_secret_patterns(s: &str) -> Option<String> {
                 ),
                 "${1}[REDACTED]",
             ),
-            (
-                r"((?i:\bcurl)[^\n|;&]*?\s(?:-u\s*|--user(?:=|\s+)))[^\s:'\x22]+:[^\s'\x22]+"
-                    .to_string(),
-                "${1}[REDACTED]",
-            ),
-            (
-                r"((?i:\bmysql\w*|\bmariadb\w*)[^\n|;&]*?\s-p)[^\s'\x22]+".to_string(),
-                "${1}[REDACTED]",
-            ),
-            (r"(\bsshpass\s+-p\s*)\S+".to_string(), "${1}[REDACTED]"),
             (r"\bsk[-_][A-Za-z0-9_-]{6,}".to_string(), "[REDACTED]"),
             (
                 r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+".to_string(),
                 "[REDACTED]",
             ),
-        ];
-        rules
-            .into_iter()
-            .map(|(re, with)| (regex::Regex::new(&re).expect("static redaction pattern"), with))
-            .collect()
+        ])
     });
-    let mut out = std::borrow::Cow::Borrowed(s);
-    for (re, with) in PATTERNS.iter() {
-        if let std::borrow::Cow::Owned(next) = re.replace_all(&out, *with) {
-            out = std::borrow::Cow::Owned(next);
-        }
-    }
-    match out {
-        std::borrow::Cow::Owned(o) if o != s => Some(o),
-        _ => None,
-    }
-}
-
-/// Free-text scrub for display: [`scrub_secret_patterns`] plus the
-/// word-level known-prefix scrub. Returns the input unchanged when clean.
-pub fn redact_text(s: &str) -> String {
-    let mut v = Value::String(s.to_string());
-    redact_value(&mut v);
-    match v {
-        Value::String(out) => out,
-        other => other.to_string(),
-    }
+    // Precise (shared) rules first, so e.g. URL userinfo is replaced before
+    // a broader rule can consume part of it; then the aggressive set; then
+    // the word-level prefix scrub again for anything newly exposed.
+    let shared = redact_text(s);
+    let aggressive = apply_rules(&shared, &AGGRESSIVE).unwrap_or(shared);
+    redact_text(&aggressive)
 }
 
 fn scrub_string(s: &str) -> Option<String> {
