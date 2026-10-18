@@ -1271,6 +1271,8 @@ mod tests {
         explicit_denied: Vec<String>,
         /// The seat the automatic selector picks.
         auto_pick: &'static str,
+        /// When set, the automatic selector fails with this error instead.
+        auto_error: Mutex<Option<BrokerError>>,
     }
 
     impl ScriptedBroker {
@@ -1281,6 +1283,7 @@ mod tests {
                 auto_calls: Mutex::new(Vec::new()),
                 explicit_denied: Vec::new(),
                 auto_pick: "auto-pick",
+                auto_error: Mutex::new(None),
             }
         }
         fn explicit(&self) -> Vec<String> {
@@ -1325,6 +1328,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(model.map(str::to_string));
+            if let Some(e) = self.auto_error.lock().unwrap().clone() {
+                return Err(e);
+            }
             let credential = CredentialRef::new(
                 provider,
                 crate::auth::Account::parse(self.auto_pick).unwrap(),
@@ -1620,6 +1626,245 @@ mod tests {
         .expect_err("invalid selector must not serve any token");
         assert!(err.to_string().contains("invalid"), "{err}");
         assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+    }
+
+    // ── Typed automatic-selection failures (user text + one WARN) ────────
+
+    use agent_core::auth::{
+        AccountFailure, AccountFailureKind as AK, SelectionFailure, SelectionFailureKind as SK,
+    };
+
+    /// In-process sink for formatted tracing output.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            let sink = self.0.clone();
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || LogWriter(sink.clone()))
+                .with_ansi(false)
+                .finish()
+        }
+        fn take(&self) -> String {
+            String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+        }
+    }
+
+    fn account(label: &str, kind: AK) -> AccountFailure {
+        AccountFailure {
+            account: label.into(),
+            kind,
+            http_status: None,
+            retry_after_s: None,
+            until_ms: None,
+        }
+    }
+
+    fn no_account(failure: SelectionFailure) -> BrokerError {
+        BrokerError::NoAccountAvailable {
+            provider: "anthropic".into(),
+            reason: "scripted".into(),
+            failure: Some(failure),
+        }
+    }
+
+    /// Run one turn-start Auto refresh against a selector failing with
+    /// `error`; returns the user text and the captured log.
+    async fn failed_turn_start(error: BrokerError) -> (String, String) {
+        let source = remote("principal-A");
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = ScriptedBroker::new(AccountSelector::Auto);
+        *broker.auto_error.lock().unwrap() = Some(error);
+        let capture = LogCapture::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("claude-opus-4-7"),
+                RefreshPoint::TurnStart,
+            )
+            .await
+            .expect_err("a failed selection ends the turn")
+        };
+        assert!(matches!(err, RuntimeError::Auth(_)), "{err:?}");
+        assert_eq!(
+            auth.read().await.auth_token,
+            "sk-HELD",
+            "no token may be bound"
+        );
+        (err.to_string(), capture.take())
+    }
+
+    /// The one `turn_auth_failed` WARN line in `log`.
+    fn turn_warn(log: &str) -> String {
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|l| l.contains("turn_auth_failed"))
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one turn_auth_failed WARN:\n{log}");
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        lines[0].to_string()
+    }
+
+    /// JR's incident: usage reads failed (endpoint 429/503) while one account
+    /// was cooling down. The text names the kind, each account and the
+    /// earliest reset, says what the user can do, and gives NO login advice:
+    /// a login would not have helped.
+    #[tokio::test]
+    async fn usage_read_failure_text_names_kind_accounts_and_reset_without_login_advice() {
+        let now = crate::epoch_millis();
+        let reset = now + 30 * 60 * 1000;
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        c2.retry_after_s = Some(120);
+        let mut c5 = account("claude5", AK::CoolingDown);
+        c5.until_ms = Some(reset);
+        let mut c6 = account("claude6", AK::UsageUpstream);
+        c6.http_status = Some(503);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2, c5, c6],
+            earliest_reset_ms: Some(reset),
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        let reset_text = super::super::anthropic_quota::describe_reset_utc(reset, now);
+        for needle in [
+            "usage_read_failed",
+            "claude2: usage_rate_limited (HTTP 429, retry after 120s)",
+            "claude5: cooling_down",
+            "claude6: usage_upstream (HTTP 503)",
+            reset_text.as_str(),
+            "Send again to retry; no login needed.",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        assert!(
+            !text.contains("synaps login"),
+            "no login advice for a read failure: {text}"
+        );
+        let warn = turn_warn(&log);
+        assert!(warn.contains("kind=usage_read_failed"), "{warn}");
+    }
+
+    /// Login advice names exactly the accounts with a credential kind, even
+    /// when the top-level kind is not a credential kind.
+    #[tokio::test]
+    async fn login_advice_names_exactly_the_accounts_whose_login_was_refused() {
+        let mut c2 = account("claude2", AK::UsageUnauthorized);
+        c2.http_status = Some(401);
+        let failure = SelectionFailure {
+            kind: SK::CredentialRejected,
+            accounts: vec![
+                c2,
+                account("claude3", AK::RefreshRejected),
+                account("default", AK::CredentialMissing),
+                account("claude5", AK::CoolingDown),
+            ],
+            earliest_reset_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        for needle in [
+            "credential_rejected",
+            "`synaps login --provider anthropic --account claude2`",
+            "`synaps login --provider anthropic --account claude3`",
+            "`synaps login --provider anthropic`",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.contains("--account claude5"), "{text}");
+        assert!(!text.contains("--account default"), "{text}");
+        assert!(!text.contains("no login needed"), "{text}");
+        assert!(turn_warn(&log).contains("kind=credential_rejected"));
+
+        // Mixed: a read failure elsewhere keeps "send again", and only the
+        // refused account gets login advice.
+        let mut c6 = account("claude6", AK::UsageTimeout);
+        c6.http_status = None;
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![account("claude3", AK::RefreshRejected), c6],
+            earliest_reset_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(text.contains("Send again to retry"), "{text}");
+        assert!(text.contains("--account claude3"), "{text}");
+        assert!(!text.contains("--account claude6"), "{text}");
+        assert!(!text.contains("no login needed"), "{text}");
+    }
+
+    /// Every account limited: the earliest reset, no login advice.
+    #[tokio::test]
+    async fn all_cooling_down_text_gives_the_earliest_reset_and_no_login_advice() {
+        let now = crate::epoch_millis();
+        let soon = now + 20 * 60 * 1000;
+        let mut c5 = account("claude5", AK::Exhausted);
+        c5.until_ms = Some(now + 3 * 60 * 60 * 1000);
+        let mut c6 = account("claude6", AK::CoolingDown);
+        c6.until_ms = Some(soon);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c5, c6],
+            earliest_reset_ms: Some(soon),
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
+        assert!(text.contains("all_cooling_down"), "{text}");
+        assert!(
+            text.contains(&format!("No login needed; send again after {soon_text}.")),
+            "{text}"
+        );
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+    }
+
+    /// A remote broker's 503 carries no per-account detail: the text points
+    /// at the broker host's log and makes no claim about logins.
+    #[tokio::test]
+    async fn remote_no_capacity_points_at_the_broker_log_without_login_claims() {
+        let (text, log) =
+            failed_turn_start(no_account(SelectionFailure::new(SK::RemoteNoCapacity))).await;
+        assert!(text.contains("remote_no_capacity"), "{text}");
+        assert!(text.contains("broker host"), "{text}");
+        assert!(
+            !text.contains("synaps login") && !text.contains("no login needed"),
+            "{text}"
+        );
+        assert!(turn_warn(&log).contains("kind=remote_no_capacity"));
+    }
+
+    /// The automatically chosen seat's refresh failed transiently: not a
+    /// login problem, and the text says so.
+    #[tokio::test]
+    async fn chosen_seat_transient_refresh_failure_is_not_login_advice() {
+        use agent_core::auth::{RefreshFailure, RefreshFailureKind};
+        let error = BrokerError::Refresh(RefreshFailure::new(
+            RefreshFailureKind::Transient,
+            "token endpoint returned HTTP 503",
+        ));
+        let (text, log) = failed_turn_start(error).await;
+        assert!(text.contains("not a login problem"), "{text}");
+        assert!(
+            text.contains("Send again to retry; no login needed."),
+            "{text}"
+        );
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=refresh_transient"));
     }
 
     #[test]
