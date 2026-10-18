@@ -40,6 +40,15 @@ jobs:
   # did exactly that after graceful round-renewal landed. Serial-marked tests
   # mutate process-global state (HOME, env, audit spool), so this must NOT be
   # sharded or the `#[serial]` guarantees stop holding.
+  #
+  # It runs under a seeded, realistic HOME (Claude Code identity line,
+  # memory.backend = axel, context_management.mode = auto, a dummy
+  # auth.json) instead of the runner's empty one, which could never see a
+  # test reading the developer's real ~/.synaps-cli. Any test that writes
+  # into that HOME fails the job. The whole workspace, so a new test binary
+  # needs no list entry. Same suite as before: the cost is seconds (seeding
+  # and two fingerprints). See scripts/dirty-home.sh. `--no-fail-fast` so
+  # the write check runs over every binary even after a failure.
   test:
     runs-on: ubuntu-24.04
     steps:
@@ -48,23 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.event_name == 'push' }}
-      - run: cargo test --workspace --locked
-
-  # The `test` job runs with the runner's empty HOME, so a test that reads
-  # the developer's real ~/.synaps-cli passes here and fails only on a
-  # maintainer's machine. This one runs the tests that used to do that under
-  # a seeded, realistic HOME (Claude Code identity line, memory.backend =
-  # axel, context_management.mode = auto, a dummy auth.json), and fails if
-  # any of them writes into it. See scripts/dirty-home.sh.
-  dirty-home:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.event_name == 'push' }}
-      - run: bash scripts/dirty-home.sh --locked
+      - run: bash scripts/dirty-home.sh --workspace --locked --no-fail-fast
 
   feature-gate:
     runs-on: ubuntu-24.04
@@ -79,9 +72,10 @@ jobs:
   # The `--no-default-features` build (no bash/shell_* tools). No other job
   # compiles it, so its cfg gates rot silently without this: build, lint and
   # run the whole suite in that configuration. The registry test is the
-  # direct check that the gated tools are really absent; it goes through
-  # cargo-test-nonzero.sh so a filter that stops matching fails instead of
-  # passing on "running 0 tests".
+  # direct check that the gated tools are really absent. It is named exactly
+  # and goes through cargo-test-nonzero.sh, so the step goes red if that one
+  # test is renamed or compiled out (a module filter would still match ~15
+  # ungated registry tests and stay green).
   hardened-build:
     runs-on: ubuntu-24.04
     steps:
@@ -95,7 +89,7 @@ jobs:
       - run: cargo build --no-default-features --locked
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --workspace --no-default-features --locked
-      - run: bash scripts/cargo-test-nonzero.sh -p synaps-engine --no-default-features --locked --lib tools::registry
+      - run: bash scripts/cargo-test-nonzero.sh -p synaps-engine --no-default-features --locked --lib tools::registry::tests::hardened_build_excludes_command_exec_tools -- --exact
 
   # Every other job runs on Linux, so macOS-only breakage (e.g. `libc::mode_t`
   # is u16 there, u32 on Linux) first surfaced in the v0.10.0 release build.
