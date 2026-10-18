@@ -85,32 +85,57 @@ async fn fixture() -> Fixture {
     Fixture { handle, client, registry, queue, hits, bodies }
 }
 
+/// A thread-less worker handle over `state` (a cancel only flags it).
+fn fake_worker(f: &Fixture, id: &str, agent: &str, state: &Arc<RwLock<SubagentState>>) {
+    f.registry.lock().unwrap().register(SubagentHandle::new(
+        id.into(),
+        id.trim_start_matches("sa_").parse().unwrap(),
+        agent.into(),
+        "work".into(),
+        MODEL.into(),
+        String::new(),
+        300,
+        Arc::clone(state),
+        None,
+        None,
+        None,
+    ));
+}
+
+/// Settle a fake worker's finalizer the way `finalize_subagent` does.
+fn settle(state: &Arc<RwLock<SubagentState>>) {
+    let mut s = state.write().unwrap();
+    if s.cancel_requested {
+        s.status = SubagentStatus::Cancelled;
+        s.archive_path = Some("/archives/fake.json".into());
+    }
+    s.finished_at.get_or_insert_with(std::time::Instant::now);
+    s.finalization_started = true;
+    s.finalization_ready = true;
+    s.completion_settled = true;
+}
+
 /// `sa_7` finished on its own, but its finalizer has not settled: the
 /// checkpoint waits for it, and it pushes its completion wake into the
-/// queue while the checkpoint runs.
+/// queue while the checkpoint runs. Deterministic: a running sentinel
+/// worker `sa_6` is stopped by the checkpoint's `stop_for_reload`, and only
+/// then does `sa_7`'s finalizer push (no sleep racing the dequeue).
 fn worker_finishing_during_the_checkpoint(f: &Fixture) {
+    let sentinel = Arc::new(RwLock::new(SubagentState::new()));
+    fake_worker(f, "sa_6", "sentinel", &sentinel);
     let state = Arc::new(RwLock::new(SubagentState::new()));
     {
         let mut s = state.write().unwrap();
         s.status = SubagentStatus::Completed;
         s.finished_at = Some(std::time::Instant::now());
     }
-    f.registry.lock().unwrap().register(SubagentHandle::new(
-        "sa_7".into(),
-        7,
-        "scout".into(),
-        "look around".into(),
-        MODEL.into(),
-        String::new(),
-        300,
-        Arc::clone(&state),
-        None,
-        None,
-        None,
-    ));
+    fake_worker(f, "sa_7", "scout", &state);
     let queue = Arc::clone(&f.queue);
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
+        while !sentinel.read().unwrap().cancel_requested {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        settle(&sentinel);
         let ev = build_completion_event(
             "sa_7",
             7,
@@ -121,10 +146,7 @@ fn worker_finishing_during_the_checkpoint(f: &Fixture) {
             None,
         );
         queue.push(ev).unwrap();
-        let mut s = state.write().unwrap();
-        s.finalization_started = true;
-        s.finalization_ready = true;
-        s.completion_settled = true;
+        settle(&state);
     });
 }
 
@@ -178,31 +200,12 @@ async fn a_wake_queued_by_the_reload_checkpoint_starts_no_turn_until_the_exec_fa
 /// as the stop reaches it, withholding its completion wake as a cancel does.
 fn worker_running_into_the_reload(f: &Fixture) {
     let state = Arc::new(RwLock::new(SubagentState::new()));
-    f.registry.lock().unwrap().register(SubagentHandle::new(
-        "sa_8".into(),
-        8,
-        "digger".into(),
-        "dig".into(),
-        MODEL.into(),
-        String::new(),
-        300,
-        Arc::clone(&state),
-        None,
-        None,
-        None,
-    ));
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(20));
-        let mut s = state.write().unwrap();
-        if s.cancel_requested {
-            s.status = SubagentStatus::Cancelled;
-            s.finished_at = Some(std::time::Instant::now());
-            s.archive_path = Some("/archives/sa_8.json".into());
-            s.finalization_started = true;
-            s.finalization_ready = true;
-            s.completion_settled = true;
-            return;
+    fake_worker(f, "sa_8", "digger", &state);
+    std::thread::spawn(move || {
+        while !state.read().unwrap().cancel_requested {
+            std::thread::sleep(Duration::from_millis(5));
         }
+        settle(&state);
     });
 }
 
