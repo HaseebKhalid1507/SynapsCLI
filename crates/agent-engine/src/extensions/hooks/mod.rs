@@ -186,6 +186,13 @@ impl HookBus {
     /// Returns the first `Block` result if any handler blocks, otherwise
     /// returns `Continue`. Handlers are called in registration order.
     ///
+    /// `Confirm` does not stop the chain (#148 I1): later handlers still
+    /// run, so a later `Block` wins even when the confirming extension is
+    /// already latched. Confirms are merged (all sources, all messages) and
+    /// returned last. A `Modify` after a pending `Confirm` is ignored — the
+    /// user is asked about the original input, as when Confirm stopped the
+    /// chain.
+    ///
     /// If no handlers are registered for this hook, returns immediately
     /// (the no-extensions fast path).
     pub async fn emit(&self, event: &HookEvent) -> HookResult {
@@ -206,6 +213,8 @@ impl HookBus {
         // First valid advisory context-phase report wins; the chain continues
         // so later observers still see the event.
         let mut context_phase: Option<String> = None;
+        // (source extension id, message) for every Confirm, in chain order.
+        let mut confirms: Vec<(String, String)> = Vec::new();
 
         for reg in &registrations {
             // Tool-specific filter: skip handlers that don't match.
@@ -304,6 +313,14 @@ impl HookBus {
                     injections.push(content);
                 }
                 Ok(HookResult::Modify { input }) => {
+                    if !confirms.is_empty() {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            "Extension Modify after a pending Confirm — ignoring (the original input is confirmed)"
+                        );
+                        continue;
+                    }
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
@@ -354,11 +371,8 @@ impl HookBus {
                     );
                     // Host-stamped attribution: the "Allow all" latch and
                     // the dialog key on the extension that actually asked.
-                    return HookResult::Confirm {
-                        message,
-                        sources: vec![reg.handler.id().to_string()],
-                        tool: event.tool_runtime_name.clone().or_else(|| event.tool_name.clone()),
-                    };
+                    // Keep going: a later Block must still win.
+                    confirms.push((reg.handler.id().to_string(), message));
                 }
                 Ok(HookResult::ContextPhase { phase }) => {
                     // Advisory only — never stops the chain. Two-key gated;
@@ -385,6 +399,34 @@ impl HookBus {
                     // Fail-open: timeout = continue
                 }
             }
+        }
+
+        // No Block anywhere in the chain: resolve the Confirm(s) last.
+        if !confirms.is_empty() {
+            let tool = event
+                .tool_runtime_name
+                .clone()
+                .or_else(|| event.tool_name.clone());
+            let message = if confirms.len() == 1 {
+                confirms[0].1.clone()
+            } else {
+                confirms
+                    .iter()
+                    .map(|(id, m)| format!("[{id}] {m}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            let mut sources: Vec<String> = Vec::new();
+            for (id, _) in confirms {
+                if !sources.contains(&id) {
+                    sources.push(id);
+                }
+            }
+            return HookResult::Confirm {
+                message,
+                sources,
+                tool,
+            };
         }
 
         // Merge accumulated injections from all handlers. An advisory phase
@@ -1117,35 +1159,116 @@ mod tests {
         assert_eq!(handler.calls(), 1);
     }
 
-    #[tokio::test]
-    async fn confirm_stops_chain_for_before_tool_call() {
+    async fn bus_with(handlers: Vec<Arc<TestHandler>>) -> HookBus {
         let bus = HookBus::new();
-        let confirmer = TestHandler::new(
-            "confirmer",
-            HookResult::confirm("Run this command?"),
-        );
-        let after = TestHandler::new("after", HookResult::Continue);
         let perms = perms_with(&[Permission::ToolsIntercept]);
+        for h in handlers {
+            bus.subscribe(HookKind::BeforeToolCall, h, None, None, perms.clone())
+                .await
+                .unwrap();
+        }
+        bus
+    }
 
-        bus.subscribe(
-            HookKind::BeforeToolCall,
-            confirmer.clone(),
-            None,
-            None,
-            perms.clone(),
-        )
-        .await
-        .unwrap();
-        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, None, perms)
-            .await
-            .unwrap();
+    /// #148 I1: a Confirm no longer stops the chain. Later handlers run, and
+    /// with nothing else to say the Confirm is returned (resolved last).
+    #[tokio::test]
+    async fn confirm_does_not_stop_chain_for_before_tool_call() {
+        let confirmer = TestHandler::new("confirmer", HookResult::confirm("Run this command?"));
+        let after = TestHandler::new("after", HookResult::Continue);
+        let bus = bus_with(vec![confirmer.clone(), after.clone()]).await;
 
         let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
         let result = bus.emit(&event).await;
 
         assert!(matches!(result, HookResult::Confirm { .. }));
         assert_eq!(confirmer.calls(), 1);
-        assert_eq!(after.calls(), 0);
+        assert_eq!(after.calls(), 1, "later handlers are still evaluated");
+    }
+
+    /// A later extension's Block wins over an earlier Confirm.
+    #[tokio::test]
+    async fn later_block_wins_over_earlier_confirm() {
+        let confirmer = TestHandler::new("confirmer", HookResult::confirm("Run?"));
+        let blocker = TestHandler::new(
+            "policy",
+            HookResult::Block {
+                reason: "policy veto".into(),
+            },
+        );
+        let bus = bus_with(vec![confirmer, blocker]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        assert!(matches!(
+            bus.emit(&event).await,
+            HookResult::Block { reason } if reason == "policy veto"
+        ));
+    }
+
+    /// Two extensions confirming the same call: one prompt carrying both
+    /// sources (so "Allow all" from one cannot silently skip the other).
+    #[tokio::test]
+    async fn confirms_from_several_extensions_merge_sources() {
+        let a = TestHandler::new("ext-a", HookResult::confirm("A asks"));
+        let b = TestHandler::new("ext-b", HookResult::confirm("B asks"));
+        let bus = bus_with(vec![a, b]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        match bus.emit(&event).await {
+            HookResult::Confirm {
+                message, sources, ..
+            } => {
+                assert_eq!(sources, vec!["ext-a".to_string(), "ext-b".to_string()]);
+                assert!(message.contains("A asks") && message.contains("B asks"), "{message}");
+                assert!(message.contains("[ext-a]") && message.contains("[ext-b]"), "{message}");
+            }
+            other => panic!("expected merged Confirm, got {other:?}"),
+        }
+    }
+
+    /// With the confirming extension latched ("Allow all"), a later
+    /// extension's Block is still evaluated and still blocks.
+    #[tokio::test]
+    async fn armed_latch_never_skips_a_later_block() {
+        let confirmer = TestHandler::new("jev", HookResult::confirm("Run?"));
+        let blocker = TestHandler::new(
+            "policy",
+            HookResult::Block {
+                reason: "policy veto".into(),
+            },
+        );
+        let bus = bus_with(vec![confirmer, blocker.clone()]).await;
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&["jev".to_string()]);
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        let decision = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({}),
+            bus.emit(&event).await,
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert_eq!(blocker.calls(), 1);
+        assert!(matches!(
+            decision,
+            crate::runtime::BeforeToolCallDecision::Block { reason } if reason == "policy veto"
+        ));
+    }
+
+    /// A Modify after a pending Confirm is not applied (the user is asked to
+    /// confirm the original call) — same outcome as before, when the chain
+    /// stopped at the Confirm.
+    #[tokio::test]
+    async fn modify_after_confirm_is_ignored() {
+        let confirmer = TestHandler::new("confirmer", HookResult::confirm("Run?"));
+        let modifier = TestHandler::new(
+            "modifier",
+            HookResult::Modify {
+                input: serde_json::json!({"command": "echo other"}),
+            },
+        );
+        let bus = bus_with(vec![confirmer, modifier]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        assert!(matches!(bus.emit(&event).await, HookResult::Confirm { .. }));
     }
 
     #[tokio::test]

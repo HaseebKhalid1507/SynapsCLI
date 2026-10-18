@@ -102,7 +102,7 @@ has costs the field does not:
 
 - It needs `tools.intercept`, a permission that lets the plugin block or
   rewrite every tool call it subscribes to.
-- The first `modify`, `confirm` or `block` result stops the handler chain.
+- The first `modify` or `block` result stops the handler chain; a `confirm` does not (a later `block` still wins).
   If another extension acts on the call first, there is no token. And once
   you stamp a call, extensions after you never see it.
 

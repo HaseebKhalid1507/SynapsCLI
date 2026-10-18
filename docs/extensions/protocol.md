@@ -454,7 +454,7 @@ The host shows your extension id and the tool name above `message`; an extension
 
 ### `modify`
 
-Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify`, `confirm`, or `block` result stops the handler chain. Trace logs record `action=modify` but do not log the replacement input.
+Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify` or `block` result stops the handler chain. A `confirm` does not: later handlers still run, a later `block` wins, a later `modify` is ignored, and confirms from several extensions are merged into one prompt that names all of them. Trace logs record `action=modify` but do not log the replacement input.
 
 ```json
 {

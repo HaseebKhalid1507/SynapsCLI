@@ -374,7 +374,9 @@ impl HookEvent {
 /// What an extension handler returns after processing a hook event.
 ///
 /// The runtime resolves multiple handlers by precedence:
-/// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
+/// - `Block` and `Modify` stop the handler chain for `before_tool_call`.
+/// - `Confirm` does not: later handlers still run so a later `Block` wins;
+///   confirms are merged and resolved after the whole chain.
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
