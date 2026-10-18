@@ -117,6 +117,12 @@ impl WorkerDrive {
             .unwrap_or_else(|p| p.into_inner())
             .watch
             .record(&event);
+        // Hosted web_search is egress: show worker searches in the parent.
+        crate::runtime::openai::codex_wire::forward_worker_web_search(
+            &self.label,
+            &event,
+            self.tx_events.as_ref(),
+        );
         match event {
             StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                 self.update("💭 thinking...".to_string(), *tool_count)
@@ -388,6 +394,33 @@ mod tests {
         let s = state.read().unwrap();
         assert_eq!(s.last_response_text(), "All done: plate renders.");
         assert_eq!(s.history.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[tokio::test]
+    async fn worker_web_search_notices_reach_the_parent() {
+        let (mut d, _state, _) = drive(60);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.tx_events = Some(tx);
+        let events = vec![
+            StreamEvent::Session(SessionEvent::Notice(
+                "🔎 Codex web_search (search, completed): rust tokio".into(),
+            )),
+            StreamEvent::Session(SessionEvent::Notice("retry: upstream body".into())),
+            StreamEvent::Session(SessionEvent::Done),
+        ];
+        d.run(Box::pin(futures::stream::iter(events)))
+            .await
+            .unwrap();
+        let mut notices = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(SessionEvent::Notice(t)) = ev {
+                notices.push(t);
+            }
+        }
+        assert_eq!(
+            notices,
+            vec!["🔎 [worker inline] Codex web_search (search, completed): rust tokio".to_string()]
+        );
     }
 
     #[tokio::test]

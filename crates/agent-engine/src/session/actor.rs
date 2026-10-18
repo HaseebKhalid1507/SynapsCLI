@@ -409,6 +409,9 @@ pub struct SessionActor {
     pub(crate) next_client_id: u64,
     pub(crate) seq: u64,
     pub(crate) turn_replay: VecDeque<Envelope>,
+    /// Last Codex hosted-web_search state line shown (once per session per
+    /// model/state; see `codex_wire::session_web_search_notice`).
+    pub(crate) web_search_notice: Option<String>,
     pub(crate) state: AttachState,
     pub(crate) background: BackgroundTasks,
     /// B2: spawned compaction in flight (`busy` while `Some`).
@@ -682,6 +685,7 @@ impl SessionActor {
             next_client_id: 1,
             seq: 0,
             turn_replay: VecDeque::new(),
+            web_search_notice: None,
             state: AttachState::Detached { running: false },
             background,
             compact: None,
@@ -1577,6 +1581,7 @@ impl SessionActor {
                                 trigger: TurnTrigger::DriverAuto,
                                 user_text: Some(proposal.prompt.clone()),
                             });
+                            self.announce_web_search_state();
 
                             // Set up the driver's awaiting_terminal.
                             if let Some(driver) = self.driver.as_mut() {
@@ -2132,6 +2137,25 @@ impl SessionActor {
             .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
     }
 
+    /// Codex hosted web_search is read from this (engine/daemon) process's
+    /// env, so say so in the session — once per session per model/state,
+    /// inside the turn so its replay ring carries it to clients attaching
+    /// mid-turn.
+    fn announce_web_search_state(&mut self) {
+        let notice = crate::runtime::openai::codex_wire::session_web_search_notice(
+            self.runtime.model(),
+            |k| std::env::var(k).ok(),
+        );
+        if notice.is_some() && notice != self.web_search_notice {
+            self.web_search_notice = notice.clone();
+            if let Some(text) = notice {
+                self.emit(SessionEventWire::Stream(StreamEvent::Session(
+                    SessionEvent::Notice(text),
+                )));
+            }
+        }
+    }
+
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
@@ -2149,6 +2173,7 @@ impl SessionActor {
             trigger,
             user_text,
         });
+        self.announce_web_search_state();
         // Blocks command processing during setup exactly like the TUI loop.
         // (E-P7, §S9) An armed driver MUST NOT auto-approve tool activation —
         // the session-driver contract keeps ordinary tool-approval gates in

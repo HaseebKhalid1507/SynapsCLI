@@ -209,8 +209,9 @@ async fn send_with_retries(
                     }
                 } else if quota_probe && !retryable && status.is_client_error() {
                     // Codex only: a terminal 4xx is undiagnosable without its
-                    // body. Read a bounded slice and keep only sanitized
-                    // identifiers plus a capped, redacted message (codex_wire).
+                    // body. Read a bounded slice for classification; keep only
+                    // identifier-shaped type/code/param plus Synaps-authored
+                    // text (codex_wire). Provider prose is never kept (§5.1).
                     let body = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
@@ -221,7 +222,7 @@ async fn send_with_retries(
                     };
                     let detail = super::codex_wire::CodexHttpErrorDetail::from_body(&body);
                     let message = detail.user_message(label, status);
-                    tracing::warn!(error = %message, "{label} request rejected (sanitized provider detail)");
+                    tracing::warn!(error = %message, "{label} request rejected (identifiers only)");
                     trace_attempt.finish_failed(
                         &detail.trace_code(status.as_u16()),
                         Some(status.as_u16()),
@@ -233,7 +234,8 @@ async fn send_with_retries(
                     // and may echo the full request (prompts, system text, tool
                     // schemas, credentials). Drop it unread — it must never be
                     // stored, surfaced, or logged at any level. `status` Display
-                    // uses the canonical reason phrase, never server bytes.
+                    // uses the canonical reason phrase, never server bytes. (The
+                    // Codex 4xx arm above reads it for identifiers only.)
                     drop(resp);
                 }
                 let code = format!("http_{}", status.as_u16());
@@ -812,18 +814,14 @@ pub(crate) async fn call_codex_stream_with_router(
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
     // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH, read from THIS
     // process's env — the daemon's when attached). Runs server-side, so hooks
-    // can't gate it; gated by role and model, and announced (codex_wire).
+    // can't gate it; gated by role and model (codex_wire). The session actor
+    // announces the state; each call is announced by the decoder.
     let mut tools = tools;
     if let Some(web_search) =
         super::codex_wire::codex_web_search_for_request(&cfg.model, codex_request_role, |k| {
             std::env::var(k).ok()
         })
     {
-        super::codex_wire::announce_web_search_enabled(
-            trace.session_id().as_str(),
-            &web_search,
-            tx,
-        );
         tools.push(web_search);
     }
     // Codex already receives the effective system prompt in `instructions`.
@@ -6704,6 +6702,90 @@ mod send_retry_tests {
         assert_no_banned(&msg, "the surfaced error");
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_no_banned(&logs, "tracing output");
+    }
+
+    /// Answer every request with `status` and a fixed body.
+    async fn spawn_fixed_body_provider(status: StatusCode, body: String) -> String {
+        let app = Router::new().fallback(move || {
+            let body = body.clone();
+            async move { (status, [("content-type", "application/json")], body).into_response() }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Codex 4xx: identifiers and Synaps-authored text only. Every probe is
+    /// plain prose that a quote/length/charset sanitizer lets through; none
+    /// of it may reach the error string, the net.rs classification log, or
+    /// any captured tracing output.
+    #[tokio::test]
+    async fn codex_4xx_never_surfaces_provider_prose_in_error_or_logs() {
+        const PROSE: &str = "ZZPROSE";
+        let probes = [
+            // Apostrophe flips naive quote parsing; the echo follows it.
+            format!("The model can't accept 'ZZPROSE echo of the user prompt, it's long' here"),
+            // Short quoted span with a secret.
+            format!("Invalid 'input[0]': '{PROSE} AKIAIOSFODNN7EXAMPLE pls'"),
+            // Unquoted prose echo.
+            format!("Your request about {PROSE} my private quarterly notes was rejected"),
+            // Curly / guillemet quotes.
+            format!("Bad value \u{2018}{PROSE} one\u{2019} and \u{201c}{PROSE} two\u{201d} \u{ab}x\u{bb}"),
+            // Secret glued to punctuation.
+            format!("{PROSE} key:sk-proj-abc123 password=hunter2 https://h/x?token=abc"),
+            // Bidi override and zero-width characters.
+            format!("{PROSE}\u{202e}gnirts\u{202c} s\u{200b}k-\u{2066}live\u{2069}"),
+        ];
+        for prose in probes {
+            let body = serde_json::json!({"error": {
+                "message": prose,
+                "type": "invalid_request_error",
+                "code": "unsupported_value",
+                "param": "reasoning.effort",
+            }})
+            .to_string();
+            let url = spawn_fixed_body_provider(StatusCode::BAD_REQUEST, body).await;
+            let client = reqwest::Client::new();
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+            let err = send_with_retries(
+                SendTarget {
+                    label: "codex",
+                    url: &url,
+                    quota_probe: true,
+                },
+                || client.post(&url).body("{}"),
+                &tokio_util::sync::CancellationToken::new(),
+                3,
+                &mut 0,
+                &mut tr::StreamAttempt::new(None),
+            )
+            .await
+            .expect_err("400 must fail fast");
+            // Run the error through the route classifier too: it logs.
+            let runtime =
+                super::super::net::provider_error_to_runtime_for("openai-codex/gpt-5.6-sol", err);
+            let msg = runtime.to_string();
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            for (where_, text) in [("error", &msg), ("logs", &logs)] {
+                for banned in [
+                    PROSE, "can't", "AKIA", "sk-", "hunter2", "token=", "private", "gnirts",
+                    "\u{202e}", "\u{200b}", "\u{2066}", "\u{2018}", "\u{201c}",
+                ] {
+                    assert!(
+                        !text.contains(banned),
+                        "provider prose `{banned}` leaked into {where_} for probe {prose:?}: {text}"
+                    );
+                }
+            }
+            // Identifiers and our own explanation do surface.
+            assert!(
+                msg.contains("[invalid_request_error/unsupported_value, param reasoning.effort]"),
+                "{msg}"
+            );
+            assert!(msg.contains("/effort"), "static explanation missing: {msg}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

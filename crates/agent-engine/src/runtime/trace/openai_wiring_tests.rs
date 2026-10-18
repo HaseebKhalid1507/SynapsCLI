@@ -1259,25 +1259,25 @@ async fn codex_400_surfaces_sanitized_provider_error_in_message_and_trace() {
         (
             // Unsupported reasoning effort.
             r#"{"error":{"message":"Unsupported value: 'reasoning.effort' does not support 'max' with this model.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}"#.to_string(),
-            "[invalid_request_error/unsupported_value, param reasoning.effort]: Unsupported value: 'reasoning.effort' does not support 'max' with this model.",
+            "[invalid_request_error/unsupported_value, param reasoning.effort] — this model rejected the requested reasoning setting",
             "http_400:invalid_request_error:unsupported_value",
         ),
         (
             // Model not entitled on this ChatGPT seat (FastAPI `detail`).
             r#"{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}"#.to_string(),
-            ": The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account. — this model isn't available",
+            "400 Bad Request — this model isn't available on the selected ChatGPT account",
             "http_400",
         ),
         (
             // Hosted tool not allowed for the model.
             r#"{"error":{"message":"Tool 'web_search' is not supported with gpt-5.6-sol.","type":"invalid_request_error","param":"tools","code":null}}"#.to_string(),
-            "[invalid_request_error, param tools]: Tool 'web_search' is not supported with gpt-5.6-sol.",
+            "[invalid_request_error, param tools] — the model rejected a request tool",
             "http_400:invalid_request_error",
         ),
         (
             // A body that echoes request content: the echo never surfaces.
             format!(r#"{{"error":{{"message":"Invalid 'input[0].content': '{SENTINEL} hello and a lot more prompt text here'","type":"invalid_request_error","code":"invalid_value"}}}}"#),
-            "[invalid_request_error/invalid_value]: Invalid 'input[0].content': '[redacted]'",
+            "400 Bad Request [invalid_request_error/invalid_value]",
             "http_400:invalid_request_error:invalid_value",
         ),
     ];
@@ -1296,6 +1296,18 @@ async fn codex_400_surfaces_sanitized_provider_error_in_message_and_trace() {
         );
         assert!(!err.contains(SENTINEL), "body leak: {err}");
         assert!(!err.contains("acct_test"), "account id leak: {err}");
+        // Identifiers and Synaps text only: no provider prose at all.
+        for prose in [
+            "Unsupported value",
+            "is not supported",
+            "Invalid '",
+            "hello",
+        ] {
+            assert!(
+                !err.contains(prose),
+                "provider prose {prose:?} leaked: {err}"
+            );
+        }
         assert_eq!(hits.load(Ordering::SeqCst), 1, "400 is not retried");
         let records = h.sink.records();
         assert_eq!(records.len(), 1);

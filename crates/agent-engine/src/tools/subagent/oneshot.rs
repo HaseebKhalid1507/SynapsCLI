@@ -213,6 +213,11 @@ impl Tool for SubagentTool {
                     tokio::select! {
                         event = stream.next() => {
                             let Some(event) = event else { break };
+                            crate::runtime::openai::codex_wire::forward_worker_web_search(
+                                &label_inner,
+                                &event,
+                                tx_events_inner.as_ref(),
+                            );
                             match event {
                                 crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                                     if let Some(ref tx) = tx_events_inner {

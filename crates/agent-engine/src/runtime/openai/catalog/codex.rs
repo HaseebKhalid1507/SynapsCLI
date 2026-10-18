@@ -181,9 +181,11 @@ struct CodexModelItem {
     multi_agent_version: Option<String>,
     #[serde(default)]
     multi_agent_reasoning_effort: Option<String>,
-    /// Hosted `web_search` support. Explicit `false` keeps the opt-in tool off.
+    /// Upstream `ModelInfo::use_responses_lite`: when true, codex-rs sends no
+    /// hosted tools (`spec_plan.rs` `hosted_model_tool_specs`), so hosted
+    /// web_search isn't attached. (`supports_search_tool` is tool_search.)
     #[serde(default)]
-    supports_search_tool: Option<bool>,
+    use_responses_lite: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,10 +292,8 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
         .into_iter()
         .filter(|item| codex_model_is_selectable(item.visibility.as_deref(), item.supported_in_api))
         .filter_map(|item| {
-            if let Some(supported) = item.supports_search_tool {
-                crate::runtime::openai::codex_wire::record_live_search_tool_support(
-                    &item.slug, supported,
-                );
+            if let Some(lite) = item.use_responses_lite {
+                crate::runtime::openai::codex_wire::record_live_responses_lite(&item.slug, lite);
             }
             let reasoning = codex_reasoning_support(&item);
             let mut m = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, item.slug)?;
@@ -750,17 +750,21 @@ mod tests {
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
 
     #[test]
-    fn live_supports_search_tool_gates_hosted_web_search() {
-        use crate::runtime::openai::codex_wire::codex_model_supports_web_search;
+    fn live_use_responses_lite_gates_hosted_web_search() {
+        use crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason as reason;
+        // Real row shape (2026-10 live cache): `use_responses_lite` decides
+        // hosted tools; `supports_search_tool` (tool_search) must not.
         let body = r#"{"models":[
-            {"slug":"gpt-zz-live-nosearch","visibility":"list","supports_search_tool":false},
-            {"slug":"gpt-zz-live-search","visibility":"list","supports_search_tool":true},
+            {"slug":"gpt-zz-live-lite","visibility":"list","use_responses_lite":true,
+             "supports_search_tool":true,"web_search_tool_type":"text_and_image"},
+            {"slug":"gpt-zz-live-full","visibility":"list","use_responses_lite":false,
+             "supports_search_tool":false,"web_search_tool_type":"text"},
             {"slug":"gpt-zz-live-silent","visibility":"list"}
         ]}"#;
         assert_eq!(parse_codex_catalog_models(body).unwrap().len(), 3);
-        assert!(!codex_model_supports_web_search("gpt-zz-live-nosearch"));
-        assert!(codex_model_supports_web_search("gpt-zz-live-search"));
-        assert!(codex_model_supports_web_search("gpt-zz-live-silent"));
+        assert!(reason("gpt-zz-live-lite").is_some());
+        assert_eq!(reason("gpt-zz-live-full"), None);
+        assert_eq!(reason("gpt-zz-live-silent"), None);
     }
 
     #[test]
