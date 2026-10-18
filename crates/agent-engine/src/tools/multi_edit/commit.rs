@@ -17,10 +17,13 @@
 //!    inode with the same bytes we planned against, and every new target
 //!    must still be absent. A mismatch removes the temps; nothing was
 //!    changed.
-//! 3. Finalize: rename each temp onto its target (a new file is linked in
-//!    with `link(2)`, which never clobbers). If file k fails, files 1..k-1
-//!    are restored from their in-memory originals and the error names
-//!    exactly what happened to each file.
+//! 3. Finalize: rename each temp onto its target. A new file is published
+//!    only by a primitive that never replaces an existing name: an
+//!    exclusive rename (`renameat2(RENAME_NOREPLACE)`, Linux) or else a
+//!    hard link. With neither, the create is refused; there is no
+//!    check-then-rename. If file k fails, files 1..k-1 are restored from
+//!    their in-memory originals and the error names exactly what happened
+//!    to each file.
 //!
 //! No fsync, matching `edit`/`write`: a crash can lose the latest edit but
 //! never leaves a torn file. The re-check-to-rename window is not locked.
@@ -58,7 +61,6 @@ pub(crate) struct Staged {
 
 /// A filesystem primitive a test can declare unsupported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Primitive {
     RenameNoReplace,
     Link,
@@ -98,12 +100,34 @@ pub(crate) fn finalize(
     pending: &Pending,
     unsupported: &mut dyn FnMut(Primitive) -> bool,
 ) -> std::io::Result<()> {
-    let dir = &pending.dir;
     if pending.original.is_some() {
-        return dir.rename(&staged.name, &pending.name);
+        return pending.dir.rename(&staged.name, &pending.name);
+    }
+    create(staged, pending, unsupported)
+}
+
+/// Publish a new file without ever replacing a name that appeared in the
+/// meantime: an exclusive rename where the system has one, else a hard
+/// link (the temp name is then removed). With neither, refuse.
+fn create(
+    staged: &Staged,
+    pending: &Pending,
+    unsupported: &mut dyn FnMut(Primitive) -> bool,
+) -> std::io::Result<()> {
+    let dir = &pending.dir;
+    let not_here = || std::io::Error::from(std::io::ErrorKind::Unsupported);
+    let renamed = if unsupported(Primitive::RenameNoReplace) {
+        Err(not_here())
+    } else {
+        dir.rename_noreplace(&staged.name, &pending.name)
+    };
+    match renamed {
+        Ok(()) => return Ok(()),
+        Err(e) if !dir::rename_unsupported(&e) => return Err(e),
+        Err(_) => {}
     }
     let linked = if unsupported(Primitive::Link) {
-        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        Err(not_here())
     } else {
         dir.link(&staged.name, &pending.name)
     };
@@ -112,17 +136,11 @@ pub(crate) fn finalize(
             let _ = dir.unlink(&staged.name);
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        // A filesystem without hard links: fall back to check-then-rename.
-        Err(_) => {
-            if dir.lstat(&pending.name).is_ok() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "target appeared before it could be created",
-                ));
-            }
-            dir.rename(&staged.name, &pending.name)
-        }
+        Err(e) if dir::link_unsupported(&e) => Err(std::io::Error::other(format!(
+            "cannot create {} without risking an overwrite on this filesystem",
+            pending.display
+        ))),
+        Err(e) => Err(e),
     }
 }
 

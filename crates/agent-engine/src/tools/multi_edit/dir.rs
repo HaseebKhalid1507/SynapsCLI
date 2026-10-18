@@ -229,6 +229,38 @@ mod imp {
             cvt(unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) }).map(drop)
         }
 
+        /// Renames `from` to `to` only if `to` does not exist (Linux
+        /// `renameat2(RENAME_NOREPLACE)`); `Unsupported` elsewhere.
+        pub(crate) fn rename_noreplace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                let (from, to) = (cstr(from)?, cstr(to)?);
+                let fd = self.fd.as_raw_fd();
+                // SAFETY: renameat2(int, const char *, int, const char *,
+                // unsigned) with NUL-terminated names and an open descriptor.
+                let r = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        fd,
+                        from.as_ptr(),
+                        fd,
+                        to.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                };
+                if r < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (from, to);
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            }
+        }
+
         /// `linkat(from, to)` within this directory; never replaces `to`.
         pub(crate) fn link(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
             let (from, to) = (cstr(from)?, cstr(to)?);
@@ -248,6 +280,18 @@ mod imp {
     /// The permission bits and identity of an open file.
     pub(crate) fn meta_of_file(file: &File) -> io::Result<Meta> {
         fstat(file.as_raw_fd())
+    }
+
+    /// Whether a failed exclusive rename means "not supported here".
+    pub(crate) fn rename_unsupported(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::Unsupported
+            || matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP))
+    }
+
+    /// Whether a failed hard link means "not supported here".
+    pub(crate) fn link_unsupported(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::Unsupported
+            || matches!(e.raw_os_error(), Some(libc::EPERM | libc::ENOSYS | libc::EOPNOTSUPP))
     }
 }
 
@@ -322,6 +366,10 @@ mod imp {
             std::fs::rename(self.path.join(from), self.path.join(to))
         }
 
+        pub(crate) fn rename_noreplace(&self, _from: &OsStr, _to: &OsStr) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+
         pub(crate) fn link(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
             std::fs::hard_link(self.path.join(from), self.path.join(to))
         }
@@ -334,9 +382,17 @@ mod imp {
     pub(crate) fn meta_of_file(file: &File) -> io::Result<Meta> {
         file.metadata().map(|m| meta_of(&m))
     }
+
+    pub(crate) fn rename_unsupported(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::Unsupported
+    }
+
+    pub(crate) fn link_unsupported(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::Unsupported
+    }
 }
 
-pub(crate) use imp::{meta_of_file, Dir};
+pub(crate) use imp::{link_unsupported, meta_of_file, rename_unsupported, Dir};
 
 /// Reads at most `cap` bytes of `file`.
 pub(crate) fn read_capped(file: File, cap: usize) -> io::Result<Vec<u8>> {
