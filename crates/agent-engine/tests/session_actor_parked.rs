@@ -733,3 +733,42 @@ async fn a_park_held_by_workers_is_rechecked() {
     );
     handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
 }
+
+/// A worker re-check that finds the session parkable does not park it on
+/// the spot: the reconnect grace still runs first, from the re-check. (The
+/// re-check used to park at once, seconds after a detach or a collecting
+/// wake turn, well inside the grace.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_worker_recheck_still_honours_the_reconnect_grace() {
+    use agent_engine::session::actor::testing::WorkerParkRecheck;
+    let _h = Home::new();
+    let _g = Grace::set("2");
+    let _r = WorkerParkRecheck::set(Duration::from_millis(300));
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
+    fake_worker(&registry, "sa_3", &state);
+    finish(&state);
+    detach(&mut a).await;
+    // Collected right away: the next re-check (300 ms) finds it parkable.
+    registry.lock().unwrap().get_mut("sa_3").unwrap().mark_collected();
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await,
+        "parked inside the 2 s reconnect grace"
+    );
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(4)).await,
+        "parks once the grace has run"
+    );
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}

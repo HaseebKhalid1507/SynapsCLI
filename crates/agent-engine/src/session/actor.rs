@@ -450,6 +450,10 @@ pub struct SessionActor {
     pub(crate) cache_keepwarm: super::cache_keepwarm::KeepWarmState,
     /// Armed on last-detach-while-idle / idle-while-detached.
     pub(crate) park_deadline: Option<tokio::time::Instant>,
+    /// `park_deadline` when it was armed as a worker re-check (workers held
+    /// the park), not as the reconnect grace: a re-check that finds the
+    /// session parkable arms the grace instead of parking.
+    pub(crate) park_recheck_at: Option<tokio::time::Instant>,
     /// (P11) Armed when the last client detaches while a pending host prompt is
     /// held on a NON-driver session; a re-attach cancels it, expiry denies the
     /// prompt(s) so `can_park()` can proceed. `None` = no abandoned prompt (or
@@ -782,6 +786,7 @@ impl SessionActor {
                 cache_keepwarm,
             ),
             park_deadline: None,
+            park_recheck_at: None,
             prompt_abandon_deadline: None,
             stream: None,
             cancel: None,
@@ -1983,8 +1988,11 @@ impl SessionActor {
                 && !self.cache_keepwarm.active()
                 && park_grace().is_some();
             self.park_deadline = if workers_only {
-                self.park_deadline
-                    .or_else(|| Some(tokio::time::Instant::now() + worker_park_recheck()))
+                self.park_deadline.or_else(|| {
+                    let at = tokio::time::Instant::now() + worker_park_recheck();
+                    self.park_recheck_at = Some(at);
+                    Some(at)
+                })
             } else {
                 None
             };
@@ -1996,6 +2004,8 @@ impl SessionActor {
                 // grace armed at detach keeps counting, while a far-off
                 // worker re-check gives way once the workers let go.
                 let due = tokio::time::Instant::now() + grace;
+                // A re-check due before the grace stays a re-check: when it
+                // fires it arms the grace rather than parking early.
                 self.park_deadline = Some(self.park_deadline.map_or(due, |d| d.min(due)));
             }
             None => self.park_deadline = None,
@@ -2062,6 +2072,9 @@ impl SessionActor {
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
+        // Fired by a worker re-check (not the grace, not an explicit Park)?
+        let recheck = self.park_deadline.is_some() && self.park_deadline == self.park_recheck_at;
+        self.park_recheck_at = None;
         self.park_deadline = None;
         if self.is_parked() {
             if self.attached.is_empty() {
@@ -2083,6 +2096,14 @@ impl SessionActor {
             // Re-arms a re-check while only workers hold the park.
             self.rearm_park();
             return std::ops::ControlFlow::Continue(());
+        }
+        if recheck {
+            // The workers let go: now the reconnect grace runs, from here.
+            // A re-check is not the user's grace having elapsed.
+            if let Some(grace) = park_grace() {
+                self.park_deadline = Some(tokio::time::Instant::now() + grace);
+                return std::ops::ControlFlow::Continue(());
+            }
         }
         self.state = AttachState::Parking;
         self.set_lifecycle(SessionLifecycle::Parking);
