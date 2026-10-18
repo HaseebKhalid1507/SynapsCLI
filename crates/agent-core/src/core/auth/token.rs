@@ -471,7 +471,19 @@ where
     T: Send + 'static,
     E: From<RefreshFailure> + Send + 'static,
 {
-    refresh_runtime().spawn(fut).await.map_err(|e| {
+    run_detached_on(refresh_runtime(), fut).await
+}
+
+async fn run_detached_on<T, E, F>(
+    runtime: std::result::Result<&'static tokio::runtime::Runtime, RefreshFailure>,
+    fut: F,
+) -> std::result::Result<T, E>
+where
+    F: std::future::Future<Output = std::result::Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: From<RefreshFailure> + Send + 'static,
+{
+    runtime.map_err(E::from)?.spawn(fut).await.map_err(|e| {
         E::from(RefreshFailure::new(
             RefreshFailureKind::Other,
             format!("credential refresh task failed: {e}"),
@@ -481,17 +493,21 @@ where
 
 /// Small multi-thread runtime that lives for the whole process and runs
 /// every locked refresh (gate, flock poller, provider exchange, CAS save).
-/// Callers on any runtime just await the `JoinHandle`.
-fn refresh_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+/// Callers on any runtime just await the `JoinHandle`. If it cannot be
+/// started (thread spawn failure under resource exhaustion) every refresh
+/// fails with [`RefreshFailureKind::Other`] instead of aborting the process.
+fn refresh_runtime() -> std::result::Result<&'static tokio::runtime::Runtime, RefreshFailure> {
+    static RT: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("synaps-auth-refresh")
             .enable_all()
             .build()
-            .expect("failed to start the auth refresh runtime")
+            .map_err(|e| format!("could not start the auth refresh runtime: {e}"))
     })
+    .as_ref()
+    .map_err(|e| RefreshFailure::other(e.clone()))
 }
 
 fn load_checked(
@@ -1719,6 +1735,24 @@ mod rejected_token_tests {
         .await
         .map_err(String::from)
     }
+    /// m3: a refresh runtime that failed to start is a refresh error, not
+    /// a process abort (release builds use `panic = "abort"`).
+    #[tokio::test]
+    async fn refresh_runtime_start_failure_is_an_error() {
+        let err = run_detached_on(
+            Err(RefreshFailure::other("could not start the auth refresh runtime: boom")),
+            async { Ok::<u8, RefreshFailure>(1) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::Other);
+        assert!(err.message().contains("refresh runtime"), "{err}");
+        // A started runtime still runs the task.
+        let ok: Result<u8, RefreshFailure> =
+            run_detached_on(refresh_runtime(), async { Ok(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+    }
+
     /// m2: a CAS save that timed out on `auth.json.lock` is a busy lock
     /// ("retry shortly"), never a credential failure ("sign in again").
     #[tokio::test]
