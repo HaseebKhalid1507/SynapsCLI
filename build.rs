@@ -83,6 +83,9 @@ fn repo_build_id() -> Option<String> {
     //   changes), so the first loose write is still seen.
     // - `<common>/reftable`: the reftable backend keeps refs and reflogs
     //   there, with no ref files at all. Any ref update reruns the script.
+    //   In a linked worktree the worktree's own refs (its HEAD and HEAD
+    //   reflog) live in `<git-dir>/reftable` instead, so watch that too when
+    //   it is a different directory.
     let git_dir = abs_git_path(&ws_root, &["rev-parse", "--git-dir"]);
     let common_dir = abs_git_path(&ws_root, &["rev-parse", "--git-common-dir"]);
     let head_ref = git(&ws_root, &["rev-parse", "--symbolic-full-name", "HEAD"]);
@@ -93,6 +96,11 @@ fn repo_build_id() -> Option<String> {
         let reflog = d.join("logs").join("HEAD");
         has_reflog = reflog.exists();
         watched.push(reflog);
+    }
+    if let (Some(g), Some(c)) = (&git_dir, &common_dir) {
+        if g != c {
+            watched.push(g.join("reftable"));
+        }
     }
     if let Some(d) = &common_dir {
         watched.push(d.join("reftable"));
