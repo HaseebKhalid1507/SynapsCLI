@@ -90,6 +90,33 @@ pub(crate) struct TurnStart {
     event_turn: bool,
 }
 
+/// Why autonomous work may not start now
+/// ([`SessionActor::autonomous_work_blocked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkBlock {
+    /// A reload checkpointed this session: nothing may start work the reload
+    /// record does not carry until the exec, or until the daemon reports
+    /// that it failed (#255's reload fence).
+    Fenced,
+    /// This session's `on_session_start` has not run yet: a request sent
+    /// now would lack its injection.
+    SessionStartPending,
+}
+
+/// A source of autonomous work in the actor's loop: work nobody asked for
+/// with a command ([`SessionActor::holds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkSource {
+    /// Queued events (inbox, `synaps send`, worker completions).
+    QueueWake,
+    /// The park grace or a worker re-check.
+    ParkTimer,
+    /// A due prompt-cache keep-warm ping.
+    KeepWarmTimer,
+    /// The armed session driver's 200 ms tick.
+    DriverTick,
+}
+
 /// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
 /// turn's stream.
 #[derive(Default)]
@@ -528,18 +555,15 @@ pub struct SessionActor {
     /// `on_session_start` for this session. `await_extensions=false`: a
     /// task waits for process-level discovery and its turn at the host's
     /// gate (one hook at a time), then calls it, so boot never blocks on
-    /// it. A turn or a keep-warm ping that comes first moves it ahead of
-    /// background hooks and waits for it without blocking the loop
-    /// (`turn_awaiting_start`, `keepwarm_awaits_start`).
+    /// it. A turn that comes first moves it ahead of background hooks and
+    /// waits for it without blocking the loop (`turn_awaiting_start`); a
+    /// keep-warm ping waits with its timer off (`holds`).
     pub(crate) session_start: super::session_start::SessionStart,
     /// A started turn whose request waits for `on_session_start`: its
     /// stream opens when the hook has run. The turn is live meanwhile
     /// (`streaming`), so Cancel, End and a driver revocation end it as any
     /// turn, with nothing sent.
     pub(crate) turn_awaiting_start: Option<TurnStart>,
-    /// A due keep-warm ping waits for `on_session_start` (its timer is off
-    /// meanwhile); it is reconsidered once the hook has run.
-    pub(crate) keepwarm_awaits_start: bool,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
     /// Worker-registry generation of the current/last turn: a user
@@ -842,7 +866,6 @@ impl SessionActor {
             compact: None,
             session_start,
             turn_awaiting_start: None,
-            keepwarm_awaits_start: false,
             subagent_tick: None,
             turn_worker_generation: 0,
             lifecycle,
@@ -1431,6 +1454,51 @@ impl SessionActor {
         Ok(())
     }
 
+    // ── autonomous work: the reload fence and on_session_start ───────────
+
+    /// Whether autonomous work may start now, and if not, why. Two states
+    /// hold it back: a reload's fence (#255) until the exec or its abort, and
+    /// this session's `on_session_start` until it has run. `Fenced` wins when
+    /// both hold. Each source of autonomous work asks [`Self::holds`]; none
+    /// reads the fence or the hook's state itself.
+    ///
+    /// | source          | `Fenced`  | `SessionStartPending`                                         |
+    /// |-----------------|-----------|---------------------------------------------------------------|
+    /// | queue wake      | waits     | runs: the turn starts, and its request waits for the hook      |
+    /// | park timer      | waits     | runs: a park that happens takes a hook not called out of line  |
+    /// | keep-warm timer | waits     | waits (timer off): a due ping goes out once the hook has run   |
+    /// | driver tick     | waits     | runs: an armed driver is revoked (`driver_idle_conflict`)      |
+    /// | driver start    | refused * | rejected in the tick (`driver_idle_conflict`)                  |
+    ///
+    /// \* `DriverStart` is a command: under the fence the command fence
+    /// refuses it first ("daemon reloading"); the tick never sees it.
+    ///
+    /// The queue wake must not wait for the hook: a parked session's hook is
+    /// out of line (`SessionStart::Pending`) and joins it only at the unpark,
+    /// and the unpark is what the queue wake does. Waiting there would leave
+    /// an event for a parked session queued for good. The turn's own wait
+    /// (`open_turn_stream` after `session_start_ready`) holds its request
+    /// instead, without blocking the loop.
+    pub(crate) fn autonomous_work_blocked(&self) -> Option<WorkBlock> {
+        if self.reload_fence.is_some() {
+            Some(WorkBlock::Fenced)
+        } else if !self.session_start.is_done() {
+            Some(WorkBlock::SessionStartPending)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `source` waits now (the table on
+    /// [`Self::autonomous_work_blocked`]).
+    pub(crate) fn holds(&self, source: WorkSource) -> bool {
+        match self.autonomous_work_blocked() {
+            None => false,
+            Some(WorkBlock::Fenced) => true,
+            Some(WorkBlock::SessionStartPending) => matches!(source, WorkSource::KeepWarmTimer),
+        }
+    }
+
     // ── E-P4: driver_tick ────────────────────────────────────────────────
 
     /// Actor-equivalent of the TUI's `idle_conflict()` (TUI :437-463).
@@ -1442,8 +1510,10 @@ impl SessionActor {
         if self.compact.is_some() {
             return Some("compaction");
         }
-        if !self.session_start.is_done() {
-            return Some("extensions loading or reloading");
+        match self.autonomous_work_blocked() {
+            Some(WorkBlock::Fenced) => return Some("daemon reloading"),
+            Some(WorkBlock::SessionStartPending) => return Some("extensions loading or reloading"),
+            None => {}
         }
         if self.conv.context_head.is_blocked(&self.conv.session) {
             return Some("unverified context head");
@@ -1476,7 +1546,7 @@ impl SessionActor {
     /// spawned tasks. Mirrors the TUI's `tick()` (TUI :695-1027).
     pub(crate) async fn driver_tick(&mut self) {
         use crate::extensions::session_driver::Outcome;
-        if self.reload_fence.is_some() {
+        if self.holds(WorkSource::DriverTick) {
             return;
         }
 
@@ -2195,7 +2265,6 @@ impl SessionActor {
         self.session_lock = None;
         // A hook not called yet waits for the unpark, out of line.
         self.session_start.withdraw_for_park();
-        self.keepwarm_awaits_start = false;
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
@@ -2420,7 +2489,8 @@ impl SessionActor {
     /// This session's `on_session_start` task ended: the hook ran (or the
     /// task failed, which counts as done: fail-open like a hook timeout).
     /// Refresh the view, which shows the injection, then send what waited
-    /// for it: a started turn's request, a due keep-warm ping.
+    /// for it: a started turn's request. A due keep-warm ping waited with its
+    /// timer off (`holds`); the loop's next pass arms it again.
     async fn session_start_finished(
         &mut self,
         ran: std::result::Result<bool, tokio::task::JoinError>,
@@ -2432,7 +2502,7 @@ impl SessionActor {
             // waiting for it puts it back in line.
             Ok(false) => {
                 self.session_start = SessionStart::Pending;
-                if self.turn_awaiting_start.is_some() || self.keepwarm_awaits_start {
+                if self.turn_awaiting_start.is_some() || self.cache_keepwarm.deadline().is_some() {
                     self.session_start_ready();
                 }
                 return;
@@ -2449,9 +2519,6 @@ impl SessionActor {
             if !start.cancel.is_cancelled() {
                 self.open_turn_stream(start).await;
             }
-        }
-        if std::mem::take(&mut self.keepwarm_awaits_start) {
-            self.on_cache_keepwarm_due().await;
         }
     }
 
@@ -3367,7 +3434,7 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
-        if self.reload_fence.is_some() {
+        if self.holds(WorkSource::QueueWake) {
             // Fenced for a reload: the record carries what is queued.
             return;
         }
@@ -5125,8 +5192,6 @@ impl SessionTask {
         let queue = Arc::clone(&self.0.event_queue);
         let reason = loop {
             let actor = &mut self.0;
-            // Read before the select: its arms borrow fields of `actor`.
-            let keepwarm_at = actor.cache_keepwarm_timer();
             tokio::select! {
                 cmd = actor.cmd_rx.recv() => match cmd {
                     Some(cmd) => {
@@ -5138,13 +5203,13 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
-                // A reload fence keeps the wake (and its permit) queued.
-                _ = queue.notified(), if actor.reload_fence.is_none() => actor.on_queue_wake().await,
+                // A held wake (and its permit) stays queued.
+                _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
-                _ = park_timer(actor.park_deadline), if actor.reload_fence.is_none() => {
+                _ = park_timer(actor.park_deadline), if !actor.holds(WorkSource::ParkTimer) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
                     }
@@ -5152,7 +5217,7 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(keepwarm_at), if actor.reload_fence.is_none() => {
+                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if !actor.holds(WorkSource::KeepWarmTimer) => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
@@ -5162,7 +5227,7 @@ impl SessionTask {
                 ran = session_start_task(&mut actor.session_start) => {
                     actor.session_start_finished(ran).await;
                 },
-                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
+                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if !actor.holds(WorkSource::DriverTick) => {
                     actor.driver_tick().await;
                 }
                 _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {

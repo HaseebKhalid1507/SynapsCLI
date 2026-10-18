@@ -1218,23 +1218,15 @@ impl SessionActor {
         }
     }
 
-    /// The deadline of the actor's keep-warm timer arm (`keepwarm_timer`).
-    /// Off while a due ping waits for `on_session_start`: its deadline has
-    /// passed, so an armed timer would wake the loop again and again;
-    /// `session_start_finished` looks at the ping once the hook has run.
-    pub(crate) fn cache_keepwarm_timer(&self) -> Option<Instant> {
-        if self.keepwarm_awaits_start {
-            return None;
-        }
-        self.cache_keepwarm.deadline()
-    }
-
     /// `select!` arm: a ping may be due.
     pub(crate) async fn on_cache_keepwarm_due(&mut self) {
         #[cfg(any(test, feature = "testing"))]
         testing::note_due_check();
-        // Fenced for a reload: the exec would discard the ping's result.
-        if self.reload_fence.is_some()
+        // Fenced for a reload, the exec would discard the ping's result. The
+        // ping also repeats the next turn's prefix, session-start injection
+        // included, so it waits for that hook: the timer arm is off
+        // meanwhile (`holds`), and a due deadline fires once it has run.
+        if self.holds(super::actor::WorkSource::KeepWarmTimer)
             || self.cache_keepwarm.period.is_none()
             || self.cache_keepwarm.task.is_some()
         {
@@ -1249,13 +1241,6 @@ impl SessionActor {
             .and_then(|p| p.deadline(now, wall))
             .is_some_and(|d| d > now)
         {
-            return;
-        }
-        // The ping repeats the next turn's prefix, session-start injection
-        // included: it waits for that hook (timer off meanwhile) and is
-        // reconsidered once it has run (`session_start_finished`).
-        if !self.session_start_ready() {
-            self.keepwarm_awaits_start = true;
             return;
         }
         if let Some(why) = self.cache_keepwarm_blocker() {

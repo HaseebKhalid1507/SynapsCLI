@@ -11,8 +11,8 @@
 //! foreground hook in line goes next, and background hooks go in arrival
 //! order only while no foreground hook waits. So background hooks of idle
 //! sessions can wait as long as foreground hooks keep arriving; a background
-//! hook moves up as soon as its own session's turn or keep-warm ping needs
-//! it (`StartTicket::prefer`). A finite reload wave drains either way.
+//! hook moves up as soon as its own session's turn needs it
+//! (`StartTicket::prefer`). A finite reload wave drains either way.
 //!
 //! `startup.extensions_ready_timeout_secs` bounds the wait for extension
 //! discovery only, not the wait at this gate: a session created with
