@@ -537,3 +537,85 @@ async fn muse_catalog_get_is_allowed_and_mint_logout_are_denied() {
     }
     assert_eq!(seen.auths().len(), 1, "denied requests never reach upstream");
 }
+
+/// Upstream that sends `chunks` SSE frames `gap` apart, then (if `stall`)
+/// holds the connection open forever without another byte.
+fn dripping_upstream(chunks: usize, gap: std::time::Duration, stall: bool) -> Router {
+    Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            use futures::StreamExt;
+            let frames = futures::stream::iter(0..chunks).then(move |i| async move {
+                if i > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                Ok::<_, std::io::Error>(bytes::Bytes::from(format!("data: {{\"n\":{i}}}\n\n")))
+            });
+            let body = if stall {
+                axum::body::Body::from_stream(frames.chain(futures::stream::pending()))
+            } else {
+                axum::body::Body::from_stream(frames)
+            };
+            (StatusCode::OK, [("content-type", "text/event-stream")], body).into_response()
+        }),
+    )
+}
+
+/// 07-providers I1: a Muse stream that stalls after its headers (silent
+/// NAT drop, a hung edge) ends with a transport error once no byte has
+/// arrived for the idle timeout, instead of hanging the turn forever.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_stalled_stream_hits_the_idle_timeout() {
+    use futures::StreamExt;
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let upstream = spawn(dripping_upstream(1, std::time::Duration::ZERO, true)).await;
+    let broker = muse_broker(upstream, dead_mint().await)
+        .with_stream_idle_timeout_for_tests(std::time::Duration::from_millis(300));
+    let mut stream = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(s) => s,
+        Err(e) => panic!("{e:?}"),
+    };
+    assert!(stream.next().await.unwrap().is_ok(), "first frame arrives");
+    let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("the idle timeout ends the stall, not the test timeout");
+    match next {
+        Some(Err(BrokerError::Transport(_))) => {}
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+/// The idle timeout is between bytes, not a total budget: a stream that
+/// keeps sending runs well past it.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_long_but_live_stream_is_not_cut() {
+    use futures::StreamExt;
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let gap = std::time::Duration::from_millis(150);
+    let upstream = spawn(dripping_upstream(8, gap, false)).await;
+    let broker = muse_broker(upstream, dead_mint().await)
+        .with_stream_idle_timeout_for_tests(std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let mut stream = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(s) => s,
+        Err(e) => panic!("{e:?}"),
+    };
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        text.push_str(std::str::from_utf8(&chunk.expect("no idle timeout")).unwrap());
+    }
+    assert!(started.elapsed() > std::time::Duration::from_millis(900));
+    assert!(text.contains("\"n\":7"), "{text}");
+}
+
+#[test]
+fn broker_stream_idle_timeout_matches_the_runtime_client() {
+    assert_eq!(
+        agent_core::auth::broker::BROKER_STREAM_IDLE_TIMEOUT,
+        std::time::Duration::from_secs(90)
+    );
+}

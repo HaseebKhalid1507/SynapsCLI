@@ -1644,6 +1644,8 @@ pub struct LocalBroker {
     muse_base_url: Option<String>,
     /// Test seam: refresh endpoint overrides (the Muse key mint).
     refresh_endpoints: super::provider::RefreshEndpoints,
+    /// Idle (between-bytes) timeout for the per-request no-redirect client.
+    stream_idle_timeout: Duration,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
@@ -1703,6 +1705,11 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 /// selection is a spend decision and should rest on a fresh reading.
 pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
+/// Idle timeout between bytes on the broker's per-request no-redirect
+/// client (Muse, Kimi, Gemini, Codex/Anthropic catalog). Matches the runtime
+/// client's 90s read timeout that xAI streams already get.
+pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
         let cloud_backend = Arc::new(ProductionCloudBackend::new(http.clone()));
@@ -1714,6 +1721,7 @@ impl LocalBroker {
             openai_codex_base_url: None,
             muse_base_url: None,
             refresh_endpoints: Default::default(),
+            stream_idle_timeout: BROKER_STREAM_IDLE_TIMEOUT,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
@@ -1795,6 +1803,13 @@ impl LocalBroker {
     #[doc(hidden)]
     pub fn with_muse_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
         self.muse_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`].
+    #[doc(hidden)]
+    pub fn with_stream_idle_timeout_for_tests(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
         self
     }
 
@@ -2511,9 +2526,13 @@ impl LocalBroker {
             || provider_key == "kimi-code"
             || provider_key == "muse"
         {
+            // `read_timeout` is an IDLE timer (reset on every read), so a
+            // long SSE stream that keeps sending is never cut; a stalled one
+            // (silent NAT drop, hung edge) fails instead of hanging the turn.
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
+                .read_timeout(self.stream_idle_timeout)
                 .build()
                 .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
             match request.method {
