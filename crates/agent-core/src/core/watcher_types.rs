@@ -76,6 +76,16 @@ pub struct TriggerConfig {
     /// Seconds to wait for writes to settle before triggering
     #[serde(default = "default_debounce")]
     pub debounce_secs: u64,
+    /// Optional shell gate run before every session spawn (any trigger mode).
+    /// Exit 0 = wake the agent; non-zero = stay asleep and re-check after
+    /// `wake_poll_secs`. Lets an agent wait on external work (a render, a
+    /// training job) with zero LLM sessions while idle. Runs via `sh -c` in
+    /// the agent dir with a 30s timeout.
+    #[serde(default)]
+    pub wake_if: Option<String>,
+    /// Seconds between `wake_if` checks while asleep.
+    #[serde(default = "default_wake_poll")]
+    pub wake_poll_secs: u64,
 }
 
 impl Default for TriggerConfig {
@@ -84,8 +94,14 @@ impl Default for TriggerConfig {
             paths: Vec::new(),
             patterns: Vec::new(),
             debounce_secs: default_debounce(),
+            wake_if: None,
+            wake_poll_secs: default_wake_poll(),
         }
     }
+}
+
+fn default_wake_poll() -> u64 {
+    60
 }
 
 fn default_debounce() -> u64 {
@@ -108,6 +124,16 @@ pub struct SessionLimits {
     pub cooldown_secs: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    /// cgroup memory ceiling for each agent session, e.g. "1.5G" (systemd
+    /// MemoryMax syntax). Applied via `systemd-run --user --scope`.
+    #[serde(default)]
+    pub memory_max: Option<String>,
+    /// CPU ceiling in percent of one core, e.g. 200 = two cores.
+    #[serde(default)]
+    pub cpu_quota_pct: Option<u32>,
+    /// Scheduling niceness for the agent process (0..=19).
+    #[serde(default)]
+    pub nice: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,9 +154,16 @@ pub struct HeartbeatConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HooksConfig {
     /// Drop a JSON event into ~/.synaps-cli/inbox/ when the agent completes.
-    /// Picked up by the event bus in any running TUI session.
+    /// The shared inbox is consumed by whichever interactive session reads it
+    /// first, so prefer `notify_session` for targeted delivery.
     #[serde(default)]
     pub notify_inbox: bool,
+    /// Deliver completion events to exactly one running session (id or name
+    /// prefix, as accepted by `synaps send --session`). Takes precedence over
+    /// `notify_inbox`. If the session is not running the event is dropped
+    /// (logged), never broadcast.
+    #[serde(default)]
+    pub notify_session: Option<String>,
 }
 
 /// What the agent writes for its next self
@@ -275,6 +308,9 @@ impl Default for SessionLimits {
             max_tool_calls: default_max_tool_calls(),
             cooldown_secs: default_cooldown(),
             max_retries: default_max_retries(),
+            memory_max: None,
+            cpu_quota_pct: None,
+            nice: None,
         }
     }
 }
@@ -299,6 +335,45 @@ impl Default for HeartbeatConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_light_watcher_fields_default_off() {
+        let config: AgentConfig = toml::from_str("[agent]\nname = \"x\"\n").unwrap();
+        assert!(config.trigger.wake_if.is_none());
+        assert_eq!(config.trigger.wake_poll_secs, 60);
+        assert!(config.limits.memory_max.is_none());
+        assert!(config.limits.cpu_quota_pct.is_none());
+        assert!(config.limits.nice.is_none());
+        assert!(!config.hooks.notify_inbox);
+        assert!(config.hooks.notify_session.is_none());
+    }
+
+    #[test]
+    fn test_light_watcher_fields_parse() {
+        let toml = r#"
+[agent]
+name = "x"
+trigger = "always"
+[trigger]
+wake_if = "test -f done"
+wake_poll_secs = 120
+[limits]
+memory_max = "1.5G"
+cpu_quota_pct = 200
+nice = 10
+[hooks]
+notify_session = "e331"
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.trigger.wake_if.as_deref(), Some("test -f done"));
+        assert_eq!(config.trigger.wake_poll_secs, 120);
+        assert_eq!(config.limits.memory_max.as_deref(), Some("1.5G"));
+        assert_eq!(config.limits.cpu_quota_pct, Some(200));
+        assert_eq!(config.limits.nice, Some(10));
+        assert_eq!(config.hooks.notify_session.as_deref(), Some("e331"));
+        // untouched defaults survive a partial [limits] table
+        assert_eq!(config.limits.cooldown_secs, 10);
+    }
 
     #[test]
     fn test_parse_minimal_config() {

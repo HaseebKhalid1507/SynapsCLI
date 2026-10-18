@@ -120,6 +120,17 @@ fn build_event(
     }
 }
 
+/// Deliver an event to exactly one running session (no inbox fallback, no
+/// broadcast). Used by the watcher for targeted completion notices so that a
+/// supervisor never injects turns into arbitrary interactive sessions.
+pub(crate) async fn send_event_to_session(query: &str, event: &Event) -> anyhow::Result<String> {
+    let reg = find_session_registration(query)
+        .ok_or_else(|| anyhow::anyhow!("no running session matches {:?}", query))?;
+    let json = serde_json::to_string(event)?;
+    send_via_socket(&reg.socket_path, &json).await?;
+    Ok(reg.session_id)
+}
+
 async fn send_to_socket_or_inbox(reg: &SessionRegistration, json: &str, event: &Event) {
     match send_via_socket(&reg.socket_path, json).await {
         Ok(()) => eprintln!("Event sent to session {} via socket.", reg.session_id),
