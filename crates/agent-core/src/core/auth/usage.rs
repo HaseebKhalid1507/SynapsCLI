@@ -230,7 +230,9 @@ pub enum UsedPercent {
 }
 
 /// Largest reported percentage still read as "window overrun" (exhausted)
-/// rather than garbage. Shared with `quota_policy::WindowLimit::verdict`.
+/// rather than garbage. Above 10x the value is more likely a unit error
+/// (basis points, a raw counter) than a real overrun, so it stays unknown;
+/// both fail closed. Shared with `quota_policy::WindowLimit::verdict`.
 pub const OVERRUN_PERCENT_MAX: f64 = 1000.0;
 
 impl UsedPercent {

@@ -162,6 +162,11 @@ impl WindowLimit {
         if !valid_threshold(exhausted_at_percent) {
             return WindowVerdict::Unknown;
         }
+        if self.limit_reached == Some(true) {
+            return WindowVerdict::Exhausted {
+                resets_at_ms: self.resets_at_ms,
+            };
+        }
         let used = match self.used_percent {
             // An overrun (> 100, bounded) is a spent window, not unknown.
             Some(p) if p > 100.0 && p <= super::usage::OVERRUN_PERCENT_MAX => Some(100.0),
@@ -170,11 +175,6 @@ impl WindowLimit {
             }
             other => other,
         };
-        if self.limit_reached == Some(true) {
-            return WindowVerdict::Exhausted {
-                resets_at_ms: self.resets_at_ms,
-            };
-        }
         match used {
             Some(p) if p >= exhausted_at_percent => WindowVerdict::Exhausted {
                 resets_at_ms: self.resets_at_ms,
@@ -1001,6 +1001,17 @@ mod tests {
         assert!(matches!(w.verdict(100.0), WindowVerdict::Exhausted { .. }));
         w.used_percent = Some(1000.5);
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
+        // A provider `limit_reached: true` wins over any malformed percent.
+        let saved = w.limit_reached;
+        w.limit_reached = Some(true);
+        for p in [1500.0, f64::NAN, -3.0] {
+            w.used_percent = Some(p);
+            assert!(
+                matches!(w.verdict(100.0), WindowVerdict::Exhausted { .. }),
+                "{p}"
+            );
+        }
+        w.limit_reached = saved;
         w.used_percent = Some(-1.0);
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
         // invalid thresholds fail closed
