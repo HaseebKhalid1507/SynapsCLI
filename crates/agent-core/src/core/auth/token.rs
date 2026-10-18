@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use reqwest::Client;
 
 use super::account::{CredentialRef, SeatIdentity};
+use super::provider::RefreshEndpoints;
 use super::storage::{
     auth_file_path, load_provider_auth_at, save_provider_auth_if_refresh_matches_typed_at,
     CasOutcome, StoreError,
@@ -407,9 +408,16 @@ pub(crate) async fn ensure_fresh_credential_checked_at(
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
 ) -> std::result::Result<OAuthCredentials, String> {
-    ensure_credential_checked_at(client, cred, path, expected_seat, None)
-        .await
-        .map_err(String::from)
+    ensure_credential_checked_at(
+        client,
+        cred,
+        path,
+        expected_seat,
+        None,
+        &RefreshEndpoints::default(),
+    )
+    .await
+    .map_err(String::from)
 }
 
 /// Recovery is broker-owned: no refresh credentials cross into the runtime.
@@ -419,8 +427,22 @@ pub(super) async fn recover_rejected_credential(
     client: &Client,
     cred: &CredentialRef,
     rejected: &str,
+    endpoints: &RefreshEndpoints,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure> {
-    ensure_credential_checked_at(client, cred, &auth_file_path(), None, Some(rejected)).await
+    ensure_credential_checked_at(client, cred, &auth_file_path(), None, Some(rejected), endpoints)
+        .await
+}
+
+/// [`ensure_fresh_credential`] through `endpoints` (the broker's test
+/// seams).
+pub(super) async fn ensure_fresh_credential_via(
+    client: &Client,
+    cred: &CredentialRef,
+    endpoints: &RefreshEndpoints,
+) -> std::result::Result<OAuthCredentials, String> {
+    ensure_credential_checked_at(client, cred, &auth_file_path(), None, None, endpoints)
+        .await
+        .map_err(String::from)
 }
 
 async fn ensure_credential_checked_at(
@@ -429,6 +451,7 @@ async fn ensure_credential_checked_at(
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
+    endpoints: &RefreshEndpoints,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     // Cheap pre-check without gate, file lock or task: the common
     // fresh-token path stays a single file read. The locked core re-loads
@@ -440,16 +463,17 @@ async fn ensure_credential_checked_at(
     }
     let (client, cred, path) = (client.clone(), cred.clone(), path.to_path_buf());
     let (seat, rejected) = (expected_seat.cloned(), rejected.map(str::to_string));
+    let endpoints = endpoints.clone();
     run_detached(async move {
         let provider = cred.provider;
-        let client = &client;
+        let (client, endpoints) = (&client, &endpoints);
         refresh_credential_locked(
             &cred,
             &path,
             seat.as_ref(),
             rejected.as_deref(),
             |refresh: String| async move {
-                super::provider::refresh(client, provider, &refresh).await
+                super::provider::refresh_via(client, provider, &refresh, endpoints).await
             },
         )
         .await

@@ -1633,6 +1633,8 @@ pub struct LocalBroker {
     openai_codex_base_url: Option<String>,
     /// Test seam: overrides the pinned Meta Muse API origin.
     muse_base_url: Option<String>,
+    /// Test seam: refresh endpoint overrides (the Muse key mint).
+    refresh_endpoints: super::provider::RefreshEndpoints,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
@@ -1702,6 +1704,7 @@ impl LocalBroker {
             google_gemini_base_url: None,
             openai_codex_base_url: None,
             muse_base_url: None,
+            refresh_endpoints: Default::default(),
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
@@ -1783,6 +1786,17 @@ impl LocalBroker {
     #[doc(hidden)]
     pub fn with_muse_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
         self.muse_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Test seam: send Muse key re-mints to a loopback fake mint
+    /// (`http://127.0.0.1:<port>/...`) instead of the pinned
+    /// `https://api.meta.ai/muse-code/key`. The request itself (headers,
+    /// body, OAuth bearer) is built exactly as in production.
+    #[doc(hidden)]
+    pub fn with_muse_mint_url_for_tests(mut self, mint_url: impl Into<String>) -> Self {
+        self.refresh_endpoints =
+            std::mem::take(&mut self.refresh_endpoints).with_muse_mint_url_for_tests(mint_url);
         self
     }
 
@@ -2885,9 +2899,14 @@ impl CredentialBroker for LocalBroker {
         rejected: &str,
     ) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        let creds = super::token::recover_rejected_credential(&self.http, cred, rejected)
-            .await
-            .map_err(BrokerError::Refresh)?;
+        let creds = super::token::recover_rejected_credential(
+            &self.http,
+            cred,
+            rejected,
+            &self.refresh_endpoints,
+        )
+        .await
+        .map_err(BrokerError::Refresh)?;
         Ok(AccessToken {
             token: creds.access,
             expires: creds.expires,
@@ -2904,7 +2923,7 @@ impl CredentialBroker for LocalBroker {
 
     async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        let creds = super::ensure_fresh_credential(&self.http, cred)
+        let creds = super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
             .await
             .map_err(BrokerError::Credential)?;
         // Strip to token + expiry: the refresh token stays behind the boundary.

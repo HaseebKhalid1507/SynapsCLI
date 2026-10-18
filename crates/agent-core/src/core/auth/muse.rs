@@ -793,6 +793,69 @@ pub async fn refresh_token(
         .map_err(|e| e.refresh_failure())
 }
 
+/// Test seam behind [`super::provider::RefreshEndpoints`]: re-mint against
+/// a loopback fake. The mint request is built exactly as in production
+/// (pinned `MINT_URL` validated, same headers and body); only the socket it
+/// is sent to differs, and only a plain-HTTP loopback URL is accepted.
+pub(crate) async fn refresh_token_via_test_mint(
+    mint_url: &str,
+    oauth_access_token: &str,
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let parsed = Url::parse(mint_url)
+        .map_err(|_| MuseAuthError::UntrustedEndpoint.refresh_failure())?;
+    let loopback = matches!(parsed.host_str(), Some("127.0.0.1") | Some("localhost"));
+    if parsed.scheme() != "http" || !loopback {
+        return Err(MuseAuthError::UntrustedEndpoint.refresh_failure());
+    }
+    let http = LoopbackMintHttp {
+        inner: ProductionHttp::new().map_err(|e| e.refresh_failure())?,
+        mint_url: mint_url.to_string(),
+    };
+    mint_credentials(&http, &ProductionClock, oauth_access_token)
+        .await
+        .map(|(creds, _)| creds)
+        .map_err(|e| e.refresh_failure())
+}
+
+struct LoopbackMintHttp {
+    inner: ProductionHttp,
+    mint_url: String,
+}
+
+#[async_trait]
+impl MuseHttp for LoopbackMintHttp {
+    async fn post_form(&self, _: &str, _: &[(&str, &str)]) -> Result<MuseHttpResponse, MuseAuthError> {
+        Err(MuseAuthError::UntrustedEndpoint)
+    }
+
+    async fn post_json_bearer(
+        &self,
+        url: &str,
+        bearer: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<MuseHttpResponse, MuseAuthError> {
+        validate_mint_endpoint(url)?;
+        let mut req = self
+            .inner
+            .client
+            .post(&self.mint_url)
+            .header("Authorization", format!("Bearer {bearer}"));
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            req = req.header(*name, *value);
+        }
+        let response = req
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|_| MuseAuthError::Transport)?;
+        ProductionHttp::finish(response).await
+    }
+}
+
 // ── Production adapters ──────────────────────────────────────────────────────
 
 struct ProductionHttp {
@@ -916,6 +979,21 @@ impl MuseBrowser for ProductionBrowser {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The mint test seam only ever sends to plain-HTTP loopback.
+    #[tokio::test]
+    async fn test_mint_seam_refuses_non_loopback_urls() {
+        for url in [
+            "https://api.meta.ai/muse-code/key",
+            "http://10.0.0.1/muse-code/key",
+            "https://127.0.0.1/muse-code/key",
+            "http://evil.example/muse-code/key",
+            "not a url",
+        ] {
+            let err = refresh_token_via_test_mint(url, "OAUTH").await.unwrap_err();
+            assert_eq!(err.message(), "untrusted endpoint", "{url}");
+        }
+    }
 
     #[derive(Default)]
     struct FakeClock {
