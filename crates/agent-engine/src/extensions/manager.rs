@@ -958,20 +958,13 @@ impl ExtensionManager {
     /// `own_keys` are this manifest's declared config keys: inside `SYNAPS_*`
     /// only their exact override names are allowed, so extension `foo`
     /// cannot read `foo-bar`'s `SYNAPS_EXTENSION_FOO_BAR_TOKEN`.
-    fn denied_secret_env(var: &str, id: &str, own_keys: &[&str]) -> Option<&'static str> {
-        if var.trim().is_empty() {
-            return Some("secret_env must not be empty");
-        }
-        let mut chars = var.chars();
-        let valid_name = chars
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
-            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        if !valid_name {
-            return Some(
-                "secret_env must be an upper-case variable name matching [A-Z_][A-Z0-9_]*",
-            );
-        }
+    ///
+    /// `var` must already have passed [`Self::secret_env_name`].
+    pub(crate) fn denied_secret_env(
+        var: &str,
+        id: &str,
+        own_keys: &[&str],
+    ) -> Option<&'static str> {
         if var.starts_with("SYNAPS_")
             && !own_keys
                 .iter()
@@ -987,6 +980,19 @@ impl ExtensionManager {
             );
         }
         None
+    }
+
+    /// The usable `secret_env` name: `raw` trimmed, if it matches
+    /// `[A-Z_][A-Z0-9_]*`. `None` means a malformed name; the caller warns and
+    /// ignores the `secret_env` (it is never read) instead of failing the load.
+    pub(crate) fn secret_env_name(raw: &str) -> Option<&str> {
+        let name = raw.trim();
+        let mut chars = name.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        valid.then_some(name)
     }
 
     /// The per-extension env override name for config `key`
@@ -1100,21 +1106,39 @@ impl ExtensionManager {
             }
             let config_key = format!("extension.{}.{}", id, key);
             // Security (#207 MED-2): validate the declared env var name BEFORE
-            // any resolution path can read it. Fails at load, loudly, rather
-            // than silently handing a host credential to the extension.
-            if let Some(secret_env) = &entry.secret_env {
-                if let Some(reason) = Self::denied_secret_env(secret_env, id, &own_keys) {
-                    return Err(format!(
-                        "Extension '{}' config key '{}' declares secret_env '{}': {}",
-                        id, key, secret_env, reason
-                    ));
-                }
-            }
+            // any resolution path can read it. A denied name (host credential,
+            // SYNAPS_*) fails the load loudly. A malformed name is ignored with
+            // a warning: it is never read, and the value resolves as if no
+            // secret_env had been declared.
+            let secret_env: Option<&str> = match entry.secret_env.as_deref() {
+                None => None,
+                Some(raw) => match Self::secret_env_name(raw) {
+                    None => {
+                        let shown: String = raw.chars().take(64).collect();
+                        tracing::warn!(
+                            extension = %id,
+                            key = %key,
+                            secret_env = ?shown,
+                            "ignoring secret_env: not an upper-case variable name matching [A-Z_][A-Z0-9_]*"
+                        );
+                        None
+                    }
+                    Some(name) => {
+                        if let Some(reason) = Self::denied_secret_env(name, id, &own_keys) {
+                            return Err(format!(
+                                "Extension '{}' config key '{}' declares secret_env '{}': {}",
+                                id, key, name, reason
+                            ));
+                        }
+                        Some(name)
+                    }
+                },
+            };
             if let Ok(value) = std::env::var(Self::extension_override_var(id, key)) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
             }
-            if let Some(secret_env) = &entry.secret_env {
+            if let Some(secret_env) = secret_env {
                 if let Ok(value) = std::env::var(secret_env) {
                     out.insert(key.to_string(), Value::String(value));
                     continue;
@@ -1133,7 +1157,7 @@ impl ExtensionManager {
                 continue;
             }
             if entry.required {
-                let hint = if let Some(secret_env) = &entry.secret_env {
+                let hint = if let Some(secret_env) = secret_env {
                     format!(
                         "set environment variable '{}' or config key '{}'",
                         secret_env, config_key
@@ -2957,11 +2981,16 @@ mod secret_env_allowlist_tests {
                 .expect_err(&format!("{var} must be rejected"));
             assert!(err.contains("host credential"), "unexpected error: {err}");
         }
-        // lower case is refused by the name rule before the denylist
-        let entries = [entry("k", "anthropic_api_key")];
+        // Padding is trimmed before the denylist check, as before.
+        let entries = [entry("k", "  ANTHROPIC_API_KEY ")];
         let err = ExtensionManager::resolve_config("evil", &entries, None)
-            .expect_err("anthropic_api_key must be rejected");
-        assert!(err.contains("[A-Z_][A-Z0-9_]*"), "unexpected error: {err}");
+            .expect_err("padded host credential must be rejected");
+        assert!(err.contains("host credential"), "unexpected error: {err}");
+        // A lower-case name is malformed: ignored (never read), not fatal.
+        let entries = [entry("k", "anthropic_api_key")];
+        let out = ExtensionManager::resolve_config("evil", &entries, None)
+            .expect("malformed name is dropped, not fatal");
+        assert!(out.get("k").is_none(), "{out}");
     }
 
     /// The whole SYNAPS_* namespace is the host's, except this extension's
@@ -3100,7 +3129,8 @@ mod secret_env_allowlist_tests {
                 }
                 seen += 1;
                 assert!(
-                    ExtensionManager::denied_secret_env(&name, "some-ext", &[]).is_some(),
+                    ExtensionManager::secret_env_name(&name).is_none()
+                        || ExtensionManager::denied_secret_env(&name, "some-ext", &[]).is_some(),
                     "{} reads credential env var {name}, which extensions may still request via secret_env",
                     f.display()
                 );
@@ -3128,11 +3158,13 @@ mod secret_env_allowlist_tests {
                 ExtensionManager::denied_secret_env(var, "some-ext", &[]).is_some(),
                 "{var} must be denied"
             );
-            // lower case is refused too (by the name rule)
+            // Lower case (which reqwest also reads) is malformed, so it is
+            // ignored and never read. If the name rule is ever relaxed, this
+            // check must become case-insensitive.
             let lower = var.to_ascii_lowercase();
             assert!(
-                ExtensionManager::denied_secret_env(&lower, "some-ext", &[]).is_some(),
-                "{lower} must be denied"
+                ExtensionManager::secret_env_name(&lower).is_none(),
+                "{lower} must never be read"
             );
         }
     }
@@ -3187,28 +3219,58 @@ mod secret_env_allowlist_tests {
     }
 
     #[test]
-    fn secret_env_name_charset_is_enforced() {
+    fn secret_env_name_format() {
         for bad in [
+            "",
+            "   ",
             "lower_case",
             "HAS SPACE",
-            " PADDED",
             "A=B",
             "A-B",
             "1ABC",
             "A\0B",
             "ÄPI_KEY",
         ] {
-            let reason = ExtensionManager::denied_secret_env(bad, "some-ext", &[])
-                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
-            assert!(reason.contains("[A-Z_][A-Z0-9_]*"), "{bad:?}: {reason}");
+            assert_eq!(ExtensionManager::secret_env_name(bad), None, "{bad:?}");
         }
         for good in ["GITHUB_TOKEN", "_X", "A1"] {
+            assert_eq!(ExtensionManager::secret_env_name(good), Some(good));
             assert!(ExtensionManager::denied_secret_env(good, "some-ext", &[]).is_none());
         }
+        // Padding is trimmed, as before.
+        assert_eq!(
+            ExtensionManager::secret_env_name("  PADDED "),
+            Some("PADDED")
+        );
     }
 
+    /// A malformed `secret_env` is warned about and dropped: the plugin still
+    /// loads and the value resolves from the other sources as usual. A
+    /// `required` entry with nothing else set fails with the normal error.
     #[test]
-    fn empty_secret_env_is_rejected() {
-        assert!(ExtensionManager::denied_secret_env("   ", "x", &[]).is_some());
+    fn malformed_secret_env_is_dropped_not_fatal() {
+        let with_default: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "my-token",
+            "default": "fallback",
+        }))
+        .unwrap();
+        let out = ExtensionManager::resolve_config("ext", &[with_default], None)
+            .expect("malformed secret_env must not fail the load");
+        assert_eq!(out["k"], "fallback");
+
+        let required: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "lower_case",
+            "required": true,
+        }))
+        .unwrap();
+        let err = ExtensionManager::resolve_config("ext", &[required], None)
+            .expect_err("required entry with no value still fails");
+        assert!(err.contains("missing required config"), "{err}");
+        assert!(
+            !err.contains("lower_case"),
+            "dropped name is not suggested: {err}"
+        );
     }
 }

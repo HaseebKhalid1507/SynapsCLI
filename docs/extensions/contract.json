@@ -110,7 +110,8 @@
     "validation": [
       "key must be non-empty and must not contain dots, slashes, or spaces",
       "required must be boolean when present",
-      "secret_env must be an environment variable name when present",
+      "secret_env, when present, should be an upper-case environment variable name matching [A-Z_][A-Z0-9_]* (surrounding whitespace is trimmed); any other name is ignored with a warning and never read",
+      "secret_env must not name a host credential (any provider-registry env var, META_API_KEY, LOCAL_API_KEY, OPENAI_CODEX_ACCESS_TOKEN, the AWS key trio, HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY) or a SYNAPS_* variable other than the extension's own SYNAPS_EXTENSION_<ID>_<KEY> for a declared key; such a manifest fails to load (see docs/extensions/secrets.md)",
       "host_context, when present, must be a known host-context key and must not be combined with secret_env"
     ]
   },

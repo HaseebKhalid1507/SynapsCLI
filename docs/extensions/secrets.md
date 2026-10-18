@@ -5,15 +5,20 @@ A config entry in a plugin manifest can name an environment variable with
 and passes its value to the extension in `initialize`. See
 [protocol.md](./protocol.md) for the full config resolution order.
 
-Synaps refuses some names. An extension that asks for one **fails to load**,
-with an error that names the config key, the variable and the reason. Nothing
-is read and nothing is passed to the extension.
+Synaps refuses some names. An extension that asks for a host credential or a
+`SYNAPS_*` variable **fails to load**, with an error that names the config
+key, the variable and the reason. Nothing is read and nothing is passed to the
+extension.
 
 ## Name rules
 
 `secret_env` must be a plain upper-case environment variable name matching
-`[A-Z_][A-Z0-9_]*`. Lower-case names, names with spaces, `=`, `-` or other
-characters, and empty names are rejected.
+`[A-Z_][A-Z0-9_]*`, after surrounding whitespace is trimmed. Any other name
+(lower case, inner spaces, `=`, `-`, non-ASCII, empty) is **ignored with a
+warning**: the plugin still loads, the variable is never read, and the value
+resolves from plugin config or `default` as if no `secret_env` were declared.
+A `required` entry with no other value then fails with the usual "missing
+required config" error.
 
 ## Host credentials are never handed out
 
@@ -46,8 +51,18 @@ the config keys it declares, `SYNAPS_EXTENSION_<PLUGIN_ID>_<KEY>` (upper case,
 declare, so extension `foo` cannot read `SYNAPS_EXTENSION_FOO_BAR_TOKEN`,
 which belongs to extension `foo-bar`'s `token` key.
 
-Two plugin ids that differ only in `-` versus `_` (`foo-bar` and `foo_bar`)
-would share override variables, so the second one to load is refused.
+Two plugin ids that differ only in `-` versus `_` or in letter case
+(`foo-bar`, `foo_bar`, `Foo-Bar`) would share override variables, so only
+one of them is loaded and the others are refused:
+
+- At startup, plugins load in order of their directory names (byte order),
+  so the one whose directory name sorts first wins (`Foo-Bar` before
+  `foo-bar` before `foo_bar`). If it fails to load for another reason, the
+  next one in that order loads instead.
+- An install or reload during a session is checked against what is loaded
+  at that moment. If you install `foo-bar` while `foo_bar` is loaded,
+  `foo-bar` is refused now, but after a restart the startup order applies
+  and `foo-bar` wins while `foo_bar` is refused.
 
 One overlap remains, because of how override names are built: extension
 `foo` with a config key `bar-token` and extension `foo-bar` with a key
