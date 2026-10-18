@@ -182,6 +182,49 @@ pub struct SessionConfig {
     /// host-owned circuit breaker for an actor-resident autonomous driver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_cost: Option<f64>,
+    /// The session's explicit `/memory` choice, recorded by the actor so a
+    /// rebuilt runtime (unpark, daemon reload) restores it instead of
+    /// re-applying the operator's `memory.default_mode`. `None` = no choice
+    /// yet: the default applies. Host-recorded: the daemon drops a value a
+    /// client sends at create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<SessionMemoryMode>,
+}
+
+/// A durable `/memory` mode the user chose for a session
+/// (`SessionConfig::memory_mode`). `/memory once` is a one-shot lease, not
+/// a mode, and is not recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryMode {
+    Off,
+    RecallEachPrompt,
+    CaptureOnly,
+    CaptureAndRecall,
+}
+
+impl SessionMemoryMode {
+    /// The mode `/memory <arg>` sets, if it sets one.
+    pub fn from_command_arg(arg: &str) -> Option<Self> {
+        match arg.trim() {
+            "off" => Some(Self::Off),
+            "recall" => Some(Self::RecallEachPrompt),
+            "capture" => Some(Self::CaptureOnly),
+            "on" => Some(Self::CaptureAndRecall),
+            _ => None,
+        }
+    }
+
+    /// The lease mode to grant; `None` for `Off`.
+    pub fn lease_mode(self) -> Option<crate::runtime::memory_context::MemoryContextMode> {
+        use crate::runtime::memory_context::MemoryContextMode as M;
+        match self {
+            Self::Off => None,
+            Self::RecallEachPrompt => Some(M::RecallEachPrompt),
+            Self::CaptureOnly => Some(M::CaptureOnly),
+            Self::CaptureAndRecall => Some(M::CaptureAndRecall),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -224,6 +267,7 @@ impl Default for SessionConfig {
             keep_warm: false,
             name: None,
             max_session_cost: None,
+            memory_mode: None,
         }
     }
 }

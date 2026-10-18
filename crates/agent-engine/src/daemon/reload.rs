@@ -338,6 +338,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         None => (
             SessionConfig {
                 cwd: meta.cwd.clone(),
+                // Like `/keepwarm`: the user's `/memory` choice survives a
+                // reload whose checkpoint did not confirm.
+                memory_mode: handle.memory_mode(),
                 env: None,
             env_stripped: Vec::new(),
                 ..SessionConfig::default()

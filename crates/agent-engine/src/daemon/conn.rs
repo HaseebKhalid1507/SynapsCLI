@@ -299,6 +299,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
         },
         Attach::Create { mut config, mode } => {
+            // Recorded by the actor from `/memory` (and carried by reload's
+            // rehydrate, which does not come through here); a client turns
+            // memory on or off with `/memory`, not by create config.
+            config.memory_mode = None;
             if config.cwd.is_none() {
                 config.cwd = Some(hello.cwd.clone());
             }

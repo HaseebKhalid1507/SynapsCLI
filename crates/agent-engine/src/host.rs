@@ -343,6 +343,18 @@ impl EngineHost {
     /// session's project, not the daemon's — A-engine-merge §4. `None` =
     /// process cwd, byte-identical to `foreground_runtime()`.
     pub async fn foreground_runtime_for(&self, cwd: Option<std::path::PathBuf>) -> Result<Runtime> {
+        self.foreground_runtime_with(cwd, true).await
+    }
+
+    /// `foreground_runtime_for`, applying the operator's `memory.default_mode`
+    /// only when `memory_default` — a session runtime rebuilt for a session
+    /// that made its own `/memory` choice passes `false` and restores that
+    /// choice instead (`SessionConfig::memory_mode`).
+    pub(crate) async fn foreground_runtime_with(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        memory_default: bool,
+    ) -> Result<Runtime> {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(self.parts.clone()));
         runtime.set_cwd(cwd);
         let config = self.config();
@@ -350,7 +362,9 @@ impl EngineHost {
         // Every interactive session starts in the operator's confirmed
         // `memory.default_mode` (after the backend binding above). A failed
         // grant is logged and leaves memory off; it never fails the session.
-        let _ = runtime.apply_memory_default_mode(&config.memory);
+        if memory_default {
+            let _ = runtime.apply_memory_default_mode(&config.memory);
+        }
         Ok(runtime)
     }
 

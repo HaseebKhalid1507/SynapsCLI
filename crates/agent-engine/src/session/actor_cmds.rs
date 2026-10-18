@@ -128,6 +128,9 @@ impl SessionActor {
         crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
+        if cmd == "memory" {
+            self.note_memory_choice(&arg);
+        }
         if view_changed {
             self.publish_view().await;
         }
@@ -138,6 +141,29 @@ impl SessionActor {
             self.compact(custom_instructions, "manual").await;
         }
         self.emit(SessionEventWire::QueryResult { id, value });
+    }
+
+    /// `/memory on|recall|capture|off` that took effect becomes the
+    /// session's own choice (`SessionConfig::memory_mode`): a rebuilt
+    /// runtime restores it rather than the operator default. A failed grant
+    /// leaves the previous choice in place.
+    fn note_memory_choice(&mut self, arg: &str) {
+        use crate::runtime::memory_context::DurableStatus;
+        let Some(choice) = super::SessionMemoryMode::from_command_arg(arg) else {
+            return;
+        };
+        let took = match (self.runtime.memory_context_status().durable, choice.lease_mode()) {
+            (DurableStatus::Off, None) => true,
+            (DurableStatus::Active { mode, .. }, Some(want)) => mode == want,
+            _ => false,
+        };
+        if took {
+            self.config.memory_mode = Some(choice);
+            *self
+                .memory_mode_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(choice);
+        }
     }
 
     /// `/saveas <name>` | `/saveas` (clear). Force-saves even with no

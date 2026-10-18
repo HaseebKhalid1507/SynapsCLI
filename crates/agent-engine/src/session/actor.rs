@@ -459,6 +459,9 @@ pub struct SessionActor {
     /// Set by a reload checkpoint until the `execv` (or until the daemon
     /// reports it failed): see [`ReloadFence`].
     pub(crate) reload_fence: Option<ReloadFence>,
+    /// Shared with the handle: `config.memory_mode`, readable by a reload
+    /// that gets no checkpoint reply.
+    pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -484,7 +487,14 @@ impl SessionActor {
     ) -> Result<(SessionHandle, SessionTask)> {
         // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
         // one-shot memory binding scopes to the session's project (§4).
-        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
+        // A session that made its own `/memory` choice (carried by a reload)
+        // gets that, not the operator default.
+        let mut runtime = host
+            .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
+            .await?;
+        if let Some(mode) = cfg.memory_mode {
+            runtime.restore_session_memory_mode(mode);
+        }
         let config: crate::SynapsConfig = (**host.config()).clone();
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
@@ -667,8 +677,10 @@ impl SessionActor {
                 presence,
                 name,
                 cache_keepwarm,
+                memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
 
         let actor = SessionActor {
@@ -735,6 +747,7 @@ impl SessionActor {
                 interval
             },
             reload_fence: None,
+            memory_mode_slot: memory_mode,
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -2066,8 +2079,14 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            // §4: cwd before apply_config — see `create`.
-            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
+            // §4: cwd before apply_config — see `create`. The session's own
+            // `/memory` choice, if it made one, instead of the default.
+            let mut runtime = host
+                .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
+                .await?;
+            if let Some(mode) = cfg.memory_mode {
+                runtime.restore_session_memory_mode(mode);
+            }
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
