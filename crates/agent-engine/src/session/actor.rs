@@ -69,6 +69,9 @@ pub(crate) struct TurnDraftState {
     base_len: usize,
     /// Text streamed in the in-flight response so far.
     text: String,
+    /// Tools the in-flight response has called (complete `ToolUse`s), which
+    /// may be running. Not persisted.
+    tools: Vec<String>,
     /// Changed since the last flush.
     dirty: bool,
 }
@@ -868,6 +871,7 @@ impl SessionActor {
         messages: Vec<crate::SharedMessage>,
         receipt: agent_core::core::context_head::ContextHeadReceipt,
     ) {
+        self.turn_draft_rolled_over();
         // Stale session id guard (compaction may have changed it).
         if session_id != self.conv.session.id {
             tracing::warn!(
@@ -2232,6 +2236,7 @@ impl SessionActor {
             open: persist.then(|| self.conv.session.id.clone()),
             base_len: self.conv.api_messages.len(),
             text: String::new(),
+            tools: Vec::new(),
             dirty: true,
         };
         self.flush_turn_draft();
@@ -2247,6 +2252,7 @@ impl SessionActor {
 
     fn turn_draft_reset_text(&mut self) {
         let d = &mut self.turn_draft;
+        d.tools.clear();
         if !d.text.is_empty() {
             d.text.clear();
             d.dirty = true;
@@ -2257,8 +2263,39 @@ impl SessionActor {
     fn turn_draft_committed(&mut self) {
         self.turn_draft.base_len = self.conv.api_messages.len();
         self.turn_draft.text.clear();
+        self.turn_draft.tools.clear();
         self.turn_draft.dirty = true;
         self.flush_turn_draft();
+    }
+
+    /// A context rollover replaced the history head, and `base_len` no
+    /// longer refers to it. Until the engine's next round checkpoint
+    /// re-bases the draft, nothing streamed can be placed: an impossible
+    /// length makes the cancel fallback (`keep_streamed_partial`) and crash
+    /// recovery (`recover_crashed_turn`) both skip the text.
+    fn turn_draft_rolled_over(&mut self) {
+        self.turn_draft.base_len = usize::MAX;
+        self.turn_draft.text.clear();
+        self.turn_draft.tools.clear();
+        self.turn_draft.dirty = true;
+        self.flush_turn_draft();
+    }
+
+    /// Follow the in-flight response for the draft: its text, a new
+    /// response or retry starting over, the tools it calls. Shared by the
+    /// stream handler and the cancel drain, so text the actor only receives
+    /// while draining (already shown to clients) is tracked too.
+    fn observe_turn_draft(&mut self, event: &crate::LlmEvent) {
+        match event {
+            crate::LlmEvent::Text(text) => self.turn_draft_text(text),
+            crate::LlmEvent::ResponseStart | crate::LlmEvent::ResponseReset => {
+                self.turn_draft_reset_text()
+            }
+            crate::LlmEvent::ToolUse { tool_name, .. } => {
+                self.turn_draft.tools.push(tool_name.clone())
+            }
+            _ => {}
+        }
     }
 
     /// Write the draft if it changed (1 Hz turn tick; round checkpoints).
@@ -2568,7 +2605,7 @@ impl SessionActor {
                          keeping the last adopted history plus the streamed partial reply"
                     );
                 }
-                self.keep_streamed_partial();
+                self.keep_streamed_partial(reason);
             }
         }
         // Complete only if the drain consumed the whole stream: the final
@@ -2586,19 +2623,33 @@ impl SessionActor {
     /// still exactly where that text began (`base_len`), never a stale one,
     /// and right after a user message. Text only, so it can't leave a
     /// `tool_use` without its result: an in-flight tool call and unsigned
-    /// thinking are dropped, as the engine's own cancel path drops them. The
+    /// thinking are dropped. (Rebuilding the call isn't safe: with extended
+    /// thinking a `tool_use` turn needs its signed thinking block.) A tool
+    /// the response called instead gets a note after it, worded like the
+    /// engine's canceled `tool_result`, so the next turn doesn't blindly
+    /// repeat a non-idempotent action; clients get the same note. The
     /// engine's late publication is not applied: its stream is gone with the
     /// drain.
-    fn keep_streamed_partial(&mut self) {
+    fn keep_streamed_partial(&mut self, reason: crate::engine::interrupt::InterruptReason) {
         let d = &self.turn_draft;
         let follows_user = self.conv.api_messages.last().is_some_and(|m| m["role"] == "user");
-        if d.base_len == self.conv.api_messages.len() && follows_user && !d.text.trim().is_empty()
-        {
-            let partial = std::sync::Arc::new(serde_json::json!({
+        if d.base_len != self.conv.api_messages.len() || !follows_user {
+            return;
+        }
+        let (text, tools) = (d.text.clone(), d.tools.clone());
+        if !text.trim().is_empty() {
+            self.conv.api_messages.push(std::sync::Arc::new(serde_json::json!({
                 "role": "assistant",
-                "content": [{"type": "text", "text": d.text}]
-            }));
-            self.conv.api_messages.push(partial);
+                "content": [{"type": "text", "text": text}]
+            })));
+        }
+        if !tools.is_empty() {
+            let note = tools_in_flight_note(reason, &tools);
+            self.conv.api_messages.push(std::sync::Arc::new(serde_json::json!({
+                "role": "user",
+                "content": note
+            })));
+            self.emit(SessionEventWire::SystemNotice(note));
         }
     }
 
@@ -2736,7 +2787,7 @@ impl SessionActor {
         let completed = stream_closed && self.turn_completed();
         self.stream = None;
         if !completed {
-            self.keep_streamed_partial();
+            self.keep_streamed_partial(crate::engine::interrupt::InterruptReason::Driver);
         }
         self.finish_interrupted_turn(crate::engine::interrupt::InterruptReason::Driver, completed)
             .await;
@@ -2841,6 +2892,10 @@ impl SessionActor {
                 }
                 StreamEvent::Session(SessionEvent::Usage { .. }) => {
                     self.record_usage(&event);
+                    self.emit(SessionEventWire::Stream(event));
+                }
+                StreamEvent::Llm(ref llm) => {
+                    self.observe_turn_draft(llm);
                     self.emit(SessionEventWire::Stream(event));
                 }
                 other => self.emit(SessionEventWire::Stream(other)),
@@ -3069,13 +3124,9 @@ impl SessionActor {
         let mut after = After::Continue;
 
         match event {
-            StreamEvent::Llm(crate::LlmEvent::Text(text)) => self.turn_draft_text(&text),
-            // A new provider response (or a retry's reset): the in-flight
-            // text starts over.
-            StreamEvent::Llm(crate::LlmEvent::ResponseStart | crate::LlmEvent::ResponseReset) => {
-                self.turn_draft_reset_text()
-            }
-            StreamEvent::Llm(_) => {}
+            // Text, a new provider response (or a retry's reset: the
+            // in-flight text starts over), tool calls.
+            StreamEvent::Llm(ref llm) => self.observe_turn_draft(llm),
             StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
                 // Published at every round boundary as well as at the end of
                 // the turn (`runtime/stream.rs` ROUND CHECKPOINT): the session
@@ -4564,6 +4615,44 @@ async fn await_stopped_workers(
         .filter(|(_, s)| s.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload)
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+/// The note `keep_streamed_partial` records for tool calls that may have
+/// run: the engine's canceled-`tool_result` wording
+/// (`canceled_tool_result_content`), hedged to "may have already started"
+/// because the actor can't tell whether the call began.
+fn tools_in_flight_note(reason: crate::engine::interrupt::InterruptReason, tools: &[String]) -> String {
+    let phrase = reason.cancel_cause().map_or("Canceled", |c| c.phrase());
+    let names = tools.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
+    let (call, was, it, its) = if tools.len() == 1 {
+        ("tool call", "was", "It", "its")
+    } else {
+        ("tool calls", "were", "They", "their")
+    };
+    format!(
+        "[{phrase} while the {call} {names} {was} running. {it} may have already started and \
+         partially applied {its} effects.]"
+    )
+}
+
+#[cfg(test)]
+mod tools_in_flight_note_tests {
+    use super::tools_in_flight_note;
+    use crate::engine::interrupt::InterruptReason;
+
+    #[test]
+    fn names_the_tools_and_hedges_like_the_engine() {
+        assert_eq!(
+            tools_in_flight_note(InterruptReason::User, &["bash".into()]),
+            "[Canceled by user while the tool call `bash` was running. It may have already \
+             started and partially applied its effects.]"
+        );
+        assert_eq!(
+            tools_in_flight_note(InterruptReason::Driver, &["read".into(), "bash".into()]),
+            "[Canceled (session driver revoked) while the tool calls `read`, `bash` were \
+             running. They may have already started and partially applied their effects.]"
+        );
+    }
 }
 
 #[cfg(test)]

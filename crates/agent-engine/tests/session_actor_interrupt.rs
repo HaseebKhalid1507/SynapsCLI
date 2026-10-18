@@ -55,6 +55,65 @@ fn sse_tool(id: &str, name: &str, input: &str) -> &'static str {
     )
 }
 
+/// One complete assistant round: a text block, then a call to `name` with
+/// `input` (JSON text) — the model narrating what it is about to run.
+fn sse_text_then_tool(text: &str, id: &str, name: &str, input: &str) -> &'static str {
+    let text = serde_json::to_string(text).unwrap();
+    let escaped = serde_json::to_string(input).unwrap();
+    Box::leak(
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{id}\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+                "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":1,",
+                "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":1,",
+                "\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{escaped}}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",",
+                "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            id = id,
+            name = name,
+            text = text,
+            escaped = escaped,
+        )
+        .into_boxed_str(),
+    )
+}
+
+/// A started reply whose usage (`message_delta`) arrives between its text
+/// deltas: "A", then usage, then "B" and "C", and no terminal event. With a
+/// tiny `max_session_cost` the actor cancels on that usage from INSIDE its
+/// stream handler, so "B" and "C" can only reach it through the cancel's
+/// drain — deterministically, whether they are already queued or not.
+const SSE_TEXT_USAGE_TEXT: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_utu\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"A\"}}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null,",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"C\"}}\n\n",
+);
+
 fn sse_read_missing() -> &'static str {
     sse_tool(
         "toolu_read",
@@ -637,12 +696,42 @@ async fn legacy_abort_context_session_is_migrated_on_continue() {
     end(&mut a).await;
 }
 
-/// `on_message_complete` handler that holds the engine between "the final
-/// response came back" and "the turn ended" until released: the exact
-/// window in which Esc lands a moment too late.
+/// Hook handler that holds the engine at its hook point until released —
+/// for `on_message_complete`, between "the final response came back" and
+/// "the turn ended": the exact window in which Esc lands a moment too late.
+/// One-shot: only the first call is held, so a later turn passes straight
+/// through instead of waiting out the hook bus's 5 s `HANDLER_TIMEOUT`.
+/// (That timeout also bounds the held call: tests that need the actor's 1 s
+/// cancel drain to expire first rely on 1 s < 5 s.)
 struct GateHook {
+    armed: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+impl GateHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Subscribe to `kind` on `host`'s hook bus.
+    async fn install(
+        self: &Arc<Self>,
+        host: &agent_engine::EngineHost,
+        kind: agent_engine::extensions::hooks::events::HookKind,
+    ) {
+        let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
+        perms.grant(kind.required_permission());
+        host.parts()
+            .hook_bus
+            .subscribe(kind, self.clone(), None, None, perms)
+            .await
+            .unwrap();
+    }
 }
 
 #[async_trait::async_trait]
@@ -654,8 +743,10 @@ impl agent_engine::extensions::runtime::ExtensionHandler for GateHook {
         &self,
         _event: &agent_engine::extensions::hooks::events::HookEvent,
     ) -> agent_engine::extensions::hooks::events::HookResult {
-        self.entered.notify_one();
-        self.release.notified().await;
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         agent_engine::extensions::hooks::events::HookResult::Continue
     }
     async fn shutdown(&self) {}
@@ -674,17 +765,8 @@ async fn cancel_that_races_a_finished_answer_marks_nothing() {
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let gate = Arc::new(GateHook {
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
-    let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
-    perms.grant(HookKind::OnMessageComplete.required_permission());
-    host.parts()
-        .hook_bus
-        .subscribe(HookKind::OnMessageComplete, gate.clone(), None, None, perms)
-        .await
-        .unwrap();
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::OnMessageComplete).await;
     let handle = host.create_session(cfg()).await.unwrap();
     let mut a = attach(&handle).await;
 
@@ -733,17 +815,8 @@ async fn slow_engine_finalize_keeps_the_streamed_partial(persist: bool) {
     let (url, hits, seen_bodies) = capture_stub(bodies, Some(0)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let gate = Arc::new(GateHook {
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
-    let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
-    perms.grant(HookKind::OnMessageComplete.required_permission());
-    host.parts()
-        .hook_bus
-        .subscribe(HookKind::OnMessageComplete, gate.clone(), None, None, perms)
-        .await
-        .unwrap();
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::OnMessageComplete).await;
     let handle = host
         .create_session(SessionConfig { persist, ..cfg() })
         .await
@@ -754,7 +827,8 @@ async fn slow_engine_finalize_keeps_the_streamed_partial(persist: bool) {
     until(&mut a, is_text).await;
     let seen = cancel(&mut a).await;
     // Idle came without the engine: it is parked in on_message_complete
-    // with the partial reply, and the gate is still closed (no clock).
+    // with the partial reply and the gate is still closed. The only clock is
+    // the hook bus's 5 s HANDLER_TIMEOUT, which the 1 s drain beats.
     tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
         .await
         .expect("the cancelled turn reached on_message_complete");
@@ -807,6 +881,116 @@ async fn slow_engine_finalize_keeps_the_streamed_partial_without_persistence() {
 #[serial]
 async fn slow_engine_finalize_keeps_the_streamed_partial_with_persistence() {
     slow_engine_finalize_keeps_the_streamed_partial(true).await;
+}
+
+/// Esc while a tool call is in flight and the engine is too slow to report
+/// back (the drain times out). The engine's own record would have carried
+/// the call and a canceled result saying it may have run; the fallback keeps
+/// only text, so it must at least say which tool was running and that it
+/// may have applied its effects, or the next turn may repeat a
+/// non-idempotent action. Same note to clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let _h = Home::new();
+    let round = sse_text_then_tool(
+        "Let me look",
+        "toolu_rd",
+        "read",
+        r#"{"path":"/nonexistent/synaps-interrupt-fixture"}"#,
+    );
+    let bodies: &'static [&'static str] = Box::leak(Box::new([round, SSE_HI]));
+    let (url, _, _) = capture_stub(bodies, None).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    // Parks the engine right before the tool runs: `ToolUse` has gone out.
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::BeforeToolCall).await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("check the file")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("the engine reached the tool call");
+    let seen = cancel(&mut a).await;
+
+    assert_eq!(aborted(&seen), vec![true], "{seen:#?}");
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(|m| text_of(m)).collect();
+    assert_eq!(msgs.len(), 4, "{texts:#?}");
+    assert_eq!(msgs[0]["content"], "check the file");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], json!([{"type": "text", "text": "Let me look"}]));
+    let note = text_of(&msgs[2]);
+    assert_eq!(msgs[2]["role"], "user");
+    assert!(note.contains("`read`"), "{note}");
+    assert!(
+        note.contains("may have already started and partially applied its effects"),
+        "{note}"
+    );
+    assert_eq!(msgs[3]["content"], InterruptReason::User.marker());
+    assert_tools_paired(&msgs);
+    assert!(
+        seen.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n == &note
+        )),
+        "clients get the same note: {seen:#?}"
+    );
+    gate.release.notify_one();
+    end(&mut a).await;
+}
+
+/// Text the actor only receives during the cancel's drain (queued behind
+/// the event that cancelled) reached clients; when the engine is too slow
+/// to publish, the kept partial must include it too — history matches the
+/// screen, tail included. The cost cap cancels on the usage that arrives
+/// between "A" and "B C" (see `SSE_TEXT_USAGE_TEXT`), so "B" and "C" go
+/// through the drain by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_keeps_text_received_during_the_drain() {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let _h = Home::new();
+    let bodies: &'static [&'static str] = Box::leak(Box::new([SSE_TEXT_USAGE_TEXT]));
+    let (url, _, _) = capture_stub(bodies, Some(0)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::OnMessageComplete).await;
+    let handle = host
+        .create_session(SessionConfig {
+            max_session_cost: Some(1e-9),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("spend")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let shown: String = seen
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(t))) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, "ABC", "clients saw the whole reply");
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(|m| text_of(m)).collect();
+    assert_eq!(msgs.len(), 3, "{texts:#?}");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(
+        msgs[1]["content"],
+        json!([{"type": "text", "text": "ABC"}]),
+        "history matches the screen"
+    );
+    assert_eq!(msgs[2]["content"], InterruptReason::CostCap.marker());
+    gate.release.notify_one();
+    end(&mut a).await;
 }
 
 /// A cancel that was not the user's says so in the canceled tool result:
