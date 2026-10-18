@@ -203,18 +203,11 @@ pub struct DaemonState {
     /// `old id → new id` for one generation (ids differ only if a
     /// LinkedSuccessor compaction happened since boot).
     pub reload_aliases: Mutex<HashMap<String, String>>,
-    /// The `daemon.json` record this image wrote. A Ping that finds the
-    /// file missing or naming another pid puts this back
+    /// The `daemon.json` record this image wrote, and its writes. A Ping
+    /// that finds the file missing or naming another pid puts it back
     /// ([`Self::heal_daemon_json`]); reload takes its recorded exe from here.
-    pub info: Mutex<DaemonInfo>,
-    /// Rate limit for the heal's INFO line: when it was last logged, and the
-    /// heals since then.
-    pub json_heals: Mutex<(Option<Instant>, u64)>,
+    pub meta: registry::Metadata,
 }
-
-/// At most one `daemon.json rewritten` line per this interval; heals in
-/// between are counted in the next line.
-const JSON_HEAL_LOG_EVERY: Duration = Duration::from_secs(600);
 
 impl DaemonState {
     pub fn uptime_s(&self) -> u64 {
@@ -241,13 +234,7 @@ impl DaemonState {
 
     /// The `daemon.json` record this image holds (a copy).
     pub fn daemon_info(&self) -> DaemonInfo {
-        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// Replace the in-memory record (reload: the generation and exe it
-    /// writes; put back when the exec fails).
-    pub fn set_daemon_info(&self, info: DaemonInfo) {
-        *self.info.lock().unwrap_or_else(|e| e.into_inner()) = info;
+        self.meta.info()
     }
 
     /// Ping: if `daemon.json` is missing or names another pid, write this
@@ -268,24 +255,15 @@ impl DaemonState {
         if self.shutdown.is_cancelled() {
             return;
         }
-        let info = self.daemon_info();
-        match registry::heal_daemon_json(&self.paths, &info, lock) {
-            Ok(false) => {}
-            Ok(true) => {
-                let mut heals = self.json_heals.lock().unwrap_or_else(|e| e.into_inner());
-                heals.1 += 1;
-                // `map_or`, not `is_none_or`: the crate's MSRV is 1.80.
-                if heals.0.map_or(true, |at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
-                    tracing::info!(
-                        path = %self.paths.json.display(),
-                        pid = info.pid,
-                        generation = info.generation,
-                        heals = heals.1,
-                        "daemon: daemon.json rewritten (it was missing or named another pid)"
-                    );
-                    *heals = (Some(Instant::now()), 0);
-                }
-            }
+        match self.meta.heal(lock) {
+            Ok(registry::Healed::Yes { info, log: Some(heals) }) => tracing::info!(
+                path = %self.paths.json.display(),
+                pid = info.pid,
+                generation = info.generation,
+                heals,
+                "daemon: daemon.json rewritten (it was missing or named another pid)"
+            ),
+            Ok(_) => {}
             Err(e) => tracing::debug!(error = %e, "daemon: daemon.json heal failed"),
         }
     }
@@ -428,7 +406,7 @@ impl Daemon {
             exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
             generation,
         };
-        registry::write_daemon_json(&paths, &info)?;
+        let meta = registry::Metadata::start(paths.clone(), info.clone())?;
 
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
         let state = Arc::new(DaemonState {
@@ -446,8 +424,7 @@ impl Daemon {
             reload_announce: Mutex::new(CancellationToken::new()),
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
-            info: Mutex::new(info.clone()),
-            json_heals: Mutex::new((None, 0)),
+            meta,
         });
 
         // Before any session of this image registers: drop registrations no
@@ -493,7 +470,7 @@ impl Daemon {
         {
             let lock = self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(lock) = lock.as_ref() {
-                registry::cleanup_metadata(&self.paths, lock);
+                self.state.meta.cleanup(lock);
             }
         }
         tracing::info!("daemon: stopped");

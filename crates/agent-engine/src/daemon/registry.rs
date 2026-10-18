@@ -86,6 +86,88 @@ pub fn heal_daemon_json(paths: &DaemonPaths, info: &DaemonInfo, _lock: &DaemonLo
     Ok(true)
 }
 
+/// At most one `daemon.json rewritten` line per this interval; heals in
+/// between are counted in the next line.
+pub const JSON_HEAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The daemon's `daemon.json` record as this image holds it, and the writes
+/// of it: the start write, [`Self::publish`] (reload), [`Self::heal`]
+/// (Ping) and [`Self::cleanup`] (shutdown).
+pub struct Metadata {
+    paths: DaemonPaths,
+    inner: std::sync::Mutex<MetaInner>,
+}
+
+struct MetaInner {
+    info: DaemonInfo,
+    /// The heal's INFO-line rate limit: when it was last logged, and the
+    /// heals since then.
+    heals_logged_at: Option<std::time::Instant>,
+    heals_since_log: u64,
+}
+
+/// What [`Metadata::heal`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Healed {
+    /// The file was in place (or is not a regular file): nothing written.
+    No,
+    /// The record was written back. `log` is `Some(heals)` when this heal
+    /// is due its INFO line (`heals` counted since the last line).
+    Yes { info: DaemonInfo, log: Option<u64> },
+}
+
+impl Metadata {
+    /// Write `info` (the start write) and hold it.
+    pub fn start(paths: DaemonPaths, info: DaemonInfo) -> io::Result<Self> {
+        write_daemon_json(&paths, &info)?;
+        Ok(Self {
+            paths,
+            inner: std::sync::Mutex::new(MetaInner { info, heals_logged_at: None, heals_since_log: 0 }),
+        })
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, MetaInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The record this image holds (a copy).
+    pub fn info(&self) -> DaemonInfo {
+        self.inner().info.clone()
+    }
+
+    /// Hold `info` and write it.
+    pub fn publish(&self, info: DaemonInfo) -> io::Result<()> {
+        self.inner().info = info.clone();
+        write_daemon_json(&self.paths, &info)
+    }
+
+    /// [`heal_daemon_json`] with the held record; counts the heal for the
+    /// INFO line's rate limit.
+    pub fn heal(&self, lock: &DaemonLock) -> io::Result<Healed> {
+        let info = self.info();
+        if !heal_daemon_json(&self.paths, &info, lock)? {
+            return Ok(Healed::No);
+        }
+        let mut inner = self.inner();
+        inner.heals_since_log += 1;
+        // `map_or`, not `is_none_or`: the crate's MSRV is 1.80.
+        let log = if inner.heals_logged_at.map_or(true, |at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
+            let heals = inner.heals_since_log;
+            inner.heals_logged_at = Some(std::time::Instant::now());
+            inner.heals_since_log = 0;
+            Some(heals)
+        } else {
+            None
+        };
+        Ok(Healed::Yes { info, log })
+    }
+
+    /// [`cleanup_metadata`] (shutdown).
+    pub fn cleanup(&self, lock: &DaemonLock) -> bool {
+        cleanup_metadata(&self.paths, lock)
+    }
+}
+
 /// Held for the daemon's lifetime; dropping releases the flock.
 pub struct DaemonLock {
     file: File,

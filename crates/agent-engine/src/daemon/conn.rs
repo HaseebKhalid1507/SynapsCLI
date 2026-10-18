@@ -276,7 +276,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                             writer,
                         )
                         .await;
-                        let e = super::reload::exec(&state, &state.paths, prepared).await;
+                        let e = super::reload::exec(&state, prepared).await;
                         tracing::error!(error = %e, "daemon: reload did not exec");
                         return;
                     }
