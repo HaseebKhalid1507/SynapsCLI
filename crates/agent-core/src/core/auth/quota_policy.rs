@@ -163,6 +163,8 @@ impl WindowLimit {
             return WindowVerdict::Unknown;
         }
         let used = match self.used_percent {
+            // An overrun (> 100, bounded) is a spent window, not unknown.
+            Some(p) if p > 100.0 && p <= super::usage::OVERRUN_PERCENT_MAX => Some(100.0),
             Some(p) if !p.is_finite() || !(0.0..=100.0).contains(&p) => {
                 return WindowVerdict::Unknown
             }
@@ -994,7 +996,10 @@ mod tests {
         );
         w.used_percent = Some(f64::NAN);
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
+        // An overrun window is exhausted, not unknown.
         w.used_percent = Some(140.0);
+        assert!(matches!(w.verdict(100.0), WindowVerdict::Exhausted { .. }));
+        w.used_percent = Some(1000.5);
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
         w.used_percent = Some(-1.0);
         assert_eq!(w.verdict(100.0), WindowVerdict::Unknown);
