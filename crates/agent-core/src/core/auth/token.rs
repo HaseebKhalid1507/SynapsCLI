@@ -533,20 +533,37 @@ where
 /// Small multi-thread runtime that lives for the whole process and runs
 /// every locked refresh (gate, flock poller, provider exchange, CAS save).
 /// Callers on any runtime just await the `JoinHandle`. If it cannot be
-/// started (thread spawn failure under resource exhaustion) every refresh
-/// fails with [`RefreshFailureKind::Other`] instead of aborting the process.
+/// started (thread spawn failure under resource exhaustion) the refresh
+/// fails with [`RefreshFailureKind::Other`] instead of aborting the process,
+/// and the next refresh tries to build it again (only success is kept, so a
+/// long-lived daemon recovers once resources free up).
 fn refresh_runtime() -> std::result::Result<&'static tokio::runtime::Runtime, RefreshFailure> {
-    static RT: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-    RT.get_or_init(|| {
+    static RT: std::sync::Mutex<Option<&'static tokio::runtime::Runtime>> =
+        std::sync::Mutex::new(None);
+    runtime_from(&RT, || {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("synaps-auth-refresh")
             .enable_all()
             .build()
-            .map_err(|e| format!("could not start the auth refresh runtime: {e}"))
     })
-    .as_ref()
-    .map_err(|e| RefreshFailure::other(e.clone()))
+}
+
+fn runtime_from(
+    slot: &std::sync::Mutex<Option<&'static tokio::runtime::Runtime>>,
+    build: impl FnOnce() -> std::io::Result<tokio::runtime::Runtime>,
+) -> std::result::Result<&'static tokio::runtime::Runtime, RefreshFailure> {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(runtime) = *slot {
+        return Ok(runtime);
+    }
+    let runtime = build().map_err(|e| {
+        RefreshFailure::other(format!("could not start the auth refresh runtime: {e}"))
+    })?;
+    // Lives for the process, like the OnceLock it replaces.
+    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+    *slot = Some(runtime);
+    Ok(runtime)
 }
 
 fn load_checked(
@@ -1932,6 +1949,22 @@ mod rejected_token_tests {
         .await
         .map_err(String::from)
     }
+    /// Round-2 m-g: a failed runtime build is not cached; the next call
+    /// builds again, and a success is kept.
+    #[test]
+    fn refresh_runtime_build_is_retried_after_a_failure() {
+        let slot = std::sync::Mutex::new(None);
+        let err = runtime_from(&slot, || Err(std::io::Error::other("EAGAIN"))).unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::Other);
+        assert!(err.message().contains("EAGAIN"), "{err}");
+        let built = runtime_from(&slot, || {
+            tokio::runtime::Builder::new_current_thread().build()
+        })
+        .expect("second attempt builds");
+        let again = runtime_from(&slot, || panic!("must reuse the built runtime")).unwrap();
+        assert!(std::ptr::eq(built, again));
+    }
+
     /// m4: a stamp that cannot be written (ENOSPC, read-only lock file)
     /// must not switch the cooldown off: the in-process floor keeps it.
     #[test]
