@@ -39,6 +39,43 @@ const LOCK: &str = "synaps-memory-identity.lock";
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_ROOTS: usize = 4096;
 
+#[cfg(test)]
+thread_local! {
+    /// Git processes spawned by `git()` on this thread (tests only).
+    static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Force the one-option-per-process `rev-parse` path (tests only).
+    static FORCE_SINGLE_REV_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Wait operations performed by `git()` on this thread (tests only).
+    static GIT_WAITS: std::cell::RefCell<Vec<GitWait>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reads of Git's stdout to report as WouldBlock before reading (tests only).
+    static FORCE_WOULD_BLOCK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How `git()` waited (tests only): polling for output, or sleeping before
+/// or after stdout EOF.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitWait {
+    PollOutput,
+    Sleep { after_eof: bool, duration: Duration },
+}
+
+#[cfg(test)]
+fn record_wait(wait: GitWait) {
+    GIT_WAITS.with(|w| w.borrow_mut().push(wait));
+}
+
+/// Read Git's nonblocking stdout. Tests can force the next reads to report
+/// WouldBlock, so the not-yet-ready path runs regardless of scheduling.
+#[cfg(unix)]
+fn read_pipe(pipe: &mut impl std::io::Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(test)]
+    if FORCE_WOULD_BLOCK.with(|n| n.replace(n.get().saturating_sub(1))) > 0 {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    pipe.read(buffer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryIdentity {
     /// Canonical repository key, with the currently verified repository root.
@@ -100,16 +137,22 @@ fn invalid(message: impl Into<String>) -> MemoryError {
 // Only read-only Git plumbing, no shell/hooks/network. Ignore inherited Git
 // routing/config injection and user/system config. Local repository config is
 // needed for real worktree layouts; Git's own safe.directory check still applies.
+fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, MemoryError> {
+    git_output(root, args)?.ok_or_else(|| invalid("Git repository verification failed"))
+}
+
+/// `Ok(None)`: Git exited unsuccessfully (the direct child is already reaped).
 #[cfg(not(unix))]
-fn git(_: &Path, _: &[&str]) -> Result<Vec<u8>, MemoryError> {
+fn git_output(_: &Path, _: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
     Err(invalid(
         "bounded Git discovery requires Unix nonblocking pipes",
     ))
 }
 
+/// `Ok(None)`: Git exited unsuccessfully (the direct child is already reaped).
 #[cfg(unix)]
-fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, MemoryError> {
-    use std::io::{ErrorKind, Read};
+fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
+    use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     let mut cmd = Command::new("git");
     for (name, _) in std::env::vars_os() {
@@ -128,10 +171,19 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, MemoryError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let deadline = Instant::now() + WAIT_TIMEOUT;
+    #[cfg(test)]
+    GIT_SPAWNS.with(|n| n.set(n.get() + 1));
     let mut child = cmd.spawn()?;
     let mut stdout = child.stdout.take().unwrap();
+    let timed_out = || invalid("Git discovery timed out after 5 seconds");
     // A reader thread or blocking read_to_end can outlive the timeout when a
-    // descendant retains stdout. Poll the nonblocking pipe and child together.
+    // descendant retains stdout. Read the nonblocking pipe, waiting for it with
+    // poll(2) in slices of at most POLL_INTERVAL (no sleep before EOF), and
+    // check the direct child after each slice. A child that fails while a
+    // descendant still holds the pipe is reported at once; one that succeeds
+    // but leaves a descendant holding stdout still waits for EOF until the
+    // deadline and then times out, as before. After EOF the child is reaped
+    // with a bounded sleep backoff (20 us doubling, capped at POLL_INTERVAL).
     let result = (|| {
         let fd = stdout.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -140,40 +192,66 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, MemoryError> {
         }
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
-        let mut eof = false;
         loop {
             if Instant::now() >= deadline {
-                return Err(invalid("Git discovery timed out after 5 seconds"));
+                return Err(timed_out());
             }
-            let mut received = false;
-            if !eof {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => eof = true,
-                    Ok(n) => {
-                        if bytes.len() + n > MAX_BYTES as usize {
-                            return Err(invalid("Git discovery output too large"));
-                        }
-                        bytes.extend_from_slice(&buffer[..n]);
-                        received = true;
+            match read_pipe(&mut stdout, &mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if bytes.len() + n > MAX_BYTES as usize {
+                        return Err(invalid("Git discovery output too large"));
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e.into()),
+                    bytes.extend_from_slice(&buffer[..n]);
+                    continue;
                 }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+            let slice = POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
+            // Round up so a sub-millisecond remainder does not spin.
+            let timeout_ms = slice.as_micros().div_ceil(1000) as libc::c_int;
+            #[cfg(test)]
+            record_wait(GitWait::PollOutput);
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // POLLIN/POLLHUP/POLLERR all mean the next read makes progress or
+            // reports EOF/error; either way re-check the child and deadline.
+            if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != ErrorKind::Interrupted {
+                    return Err(e.into());
+                }
+                continue;
             }
             if let Some(status) = child.try_wait()? {
                 if !status.success() {
-                    return Err(invalid("Git repository verification failed"));
-                }
-                if eof {
-                    return Ok(bytes);
+                    return Ok(None);
                 }
             }
-            if !received {
-                std::thread::sleep(
-                    POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
-                );
+        }
+        // EOF: Git normally exits immediately after closing stdout. Reap it
+        // with a short exponential backoff, bounded by the same deadline.
+        let mut backoff = Duration::from_micros(20);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status.success().then_some(bytes));
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(timed_out());
+            }
+            #[cfg(test)]
+            record_wait(GitWait::Sleep {
+                after_eof: true,
+                duration: backoff.min(remaining),
+            });
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(POLL_INTERVAL);
         }
     })();
     if result.is_err() {
@@ -197,16 +275,47 @@ fn path_bytes(bytes: &[u8]) -> Result<PathBuf, MemoryError> {
     ))
 }
 
-fn git_path(root: &Path, arg: &str) -> Result<PathBuf, MemoryError> {
-    let bytes = git(root, &["rev-parse", "--path-format=absolute", arg])?;
-    let bytes = bytes
-        .strip_suffix(b"\n")
-        .ok_or_else(|| invalid("invalid Git path output"))?;
+fn absolute_path(bytes: &[u8]) -> Result<PathBuf, MemoryError> {
     let path = path_bytes(bytes)?;
     if !path.is_absolute() {
         return Err(invalid("Git returned a relative path"));
     }
     Ok(path.canonicalize()?)
+}
+
+fn git_path(root: &Path, arg: &str) -> Result<PathBuf, MemoryError> {
+    let bytes = git(root, &["rev-parse", "--path-format=absolute", arg])?;
+    let bytes = bytes
+        .strip_suffix(b"\n")
+        .ok_or_else(|| invalid("invalid Git path output"))?;
+    absolute_path(bytes)
+}
+
+const CHECKOUT_PATHS: [&str; 3] = ["--show-toplevel", "--absolute-git-dir", "--git-common-dir"];
+
+/// Exactly three newline-terminated lines, else `None`. A successful
+/// rev-parse prints one line per option, so any other count means a path
+/// contains a newline and the lines cannot be attributed unambiguously.
+fn three_lines(bytes: &[u8]) -> Option<[&[u8]; 3]> {
+    let body = bytes.strip_suffix(b"\n")?;
+    let lines: Vec<&[u8]> = body.split(|b| *b == b'\n').collect();
+    lines.try_into().ok()
+}
+
+/// The `CHECKOUT_PATHS` of `root` in one rev-parse. Unsuccessful Git or an
+/// ambiguous (newline-containing) output repeats the per-option calls, which
+/// keeps their exact results, errors and checking order.
+fn checkout_paths(root: &Path) -> Result<Option<[Vec<u8>; 3]>, MemoryError> {
+    #[cfg(test)]
+    if FORCE_SINGLE_REV_PARSE.with(|f| f.get()) {
+        return Ok(None);
+    }
+    let mut args = vec!["rev-parse", "--path-format=absolute"];
+    args.extend(CHECKOUT_PATHS);
+    let Some(bytes) = git_output(root, &args)? else {
+        return Ok(None);
+    };
+    Ok(three_lines(&bytes).map(|lines| lines.map(<[u8]>::to_vec)))
 }
 
 #[derive(PartialEq, Eq)]
@@ -221,12 +330,17 @@ fn checkout(root: &Path) -> Result<Checkout, MemoryError> {
     if entry.file_type().is_symlink() || !(entry.is_file() || entry.is_dir()) {
         return Err(invalid("unsafe .git entry"));
     }
-    let top = git_path(root, "--show-toplevel")?;
+    let batched = checkout_paths(root)?;
+    let path = |i: usize| match &batched {
+        Some(lines) => absolute_path(&lines[i]),
+        None => git_path(root, CHECKOUT_PATHS[i]),
+    };
+    let top = path(0)?;
     if top != root {
         return Err(invalid("Git checkout root mismatch"));
     }
-    let git_dir = git_path(root, "--absolute-git-dir")?;
-    let common = git_path(root, "--git-common-dir")?;
+    let git_dir = path(1)?;
+    let common = path(2)?;
     if git_dir != common {
         if git_dir.parent() != Some(common.join("worktrees").as_path()) {
             return Err(invalid("unregistered Git worktree directory"));
@@ -614,5 +728,225 @@ mod private {
             }
             self.sync_all()
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    // Fixture tests create directories (racing the crate's umask-mutating
+    // tests) and spawn Git. A forked child briefly inherits other threads'
+    // descriptors, including held advisory locks, until it executes Git; tests
+    // that require uncontended try-locks join `process_spawn` as `parallel`.
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    fn fixture_git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", root)
+            .args([
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args([
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A synthetic repository with `extra` plain worktrees plus the given
+    /// specially named ones. Returns (main, all worktree roots).
+    fn fixture(tmp: &TempDir, extra: usize, named: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let main = tmp.path().join("main");
+        fs::create_dir(&main).unwrap();
+        fixture_git(&main, &["init", "-q"]);
+        fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "synthetic"]);
+        let main = main.canonicalize().unwrap();
+        let names = (0..extra)
+            .map(|i| format!("wt{i}"))
+            .chain(named.iter().map(|s| s.to_string()));
+        let mut roots = Vec::new();
+        for (i, name) in names.enumerate() {
+            let path = tmp.path().join(name);
+            let branch = format!("b{i}");
+            fixture_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+            roots.push(path.canonicalize().unwrap());
+        }
+        (main, roots)
+    }
+
+    fn spawns<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = GIT_SPAWNS.with(|n| n.get());
+        let value = f();
+        (value, GIT_SPAWNS.with(|n| n.get()) - before)
+    }
+
+    fn single<T>(f: impl FnOnce() -> T) -> T {
+        FORCE_SINGLE_REV_PARSE.with(|f| f.set(true));
+        let value = f();
+        FORCE_SINGLE_REV_PARSE.with(|f| f.set(false));
+        value
+    }
+
+    fn discover(root: &Path) -> RepositoryIdentity {
+        ProjectScope::discover_repository_with_override(root, None).unwrap()
+    }
+
+    #[test]
+    #[serial(umask, process_spawn)]
+    fn discovery_spawns_one_git_per_registered_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 40, &[]);
+        // N+1 checkouts, one worktree listing, one current-checkout re-check.
+        let budget = roots.len() + 1 + 4;
+        for start in [&main, &roots[7]] {
+            let (identity, count) = spawns(|| discover(start));
+            assert_eq!(identity.aliases.len(), roots.len() + 2);
+            assert!(count <= budget, "{count} Git spawns > {budget}");
+        }
+    }
+
+    #[test]
+    #[serial(umask, process_spawn)]
+    fn checkout_batches_rev_parse_and_newline_paths_fall_back() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 1, &["worker a", "worker\n\"b"]);
+        for root in [&main, &roots[0], &roots[1]] {
+            let (batched, count) = spawns(|| checkout(root).unwrap());
+            assert_eq!(count, 1, "{root:?}");
+            assert!(batched == single(|| checkout(root).unwrap()));
+        }
+        // Four output lines: identical result via the per-option fallback.
+        let newline = &roots[2];
+        let (batched, count) = spawns(|| checkout(newline).unwrap());
+        assert_eq!(count, 4);
+        assert!(batched == single(|| checkout(newline).unwrap()));
+        assert_eq!(&batched.root, newline);
+    }
+
+    #[test]
+    #[serial(umask, process_spawn)]
+    fn batched_and_single_rev_parse_resolve_identical_identity() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 3, &["worker a", "worker\n\"b"]);
+        for start in std::iter::once(&main).chain(&roots) {
+            let slow = single(|| discover(start));
+            let fast = discover(start);
+            assert_eq!(fast, slow);
+            assert_eq!(fast.aliases.len(), roots.len() + 2);
+        }
+        assert!(single(|| checkout(&main)).unwrap() == checkout(&main).unwrap());
+    }
+
+    #[test]
+    fn rev_parse_output_needs_exactly_three_terminated_lines() {
+        let ok: [&[u8]; 3] = [b"/a", b"/a/.git", b"/a/.git"];
+        assert_eq!(three_lines(b"/a\n/a/.git\n/a/.git\n"), Some(ok));
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"/a\n/a/.git\n/a/.git",
+            b"/a\n/a/.git\n",
+            b"/x\ny\n/x\ny/.git\n/x\ny/.git\n",
+            b"/a\n/a/.git\n/a/.git\n\n",
+        ] {
+            assert_eq!(three_lines(bad), None, "{bad:?}");
+        }
+    }
+
+    // Checks the kind and order of waits, not elapsed time: before EOF git()
+    // must wait for its output with poll(2), never with a fixed sleep (the
+    // old loop slept 10 ms). Only the bounded post-EOF reaping backoff may
+    // sleep, starting far below that. The first read of every call is forced
+    // to report WouldBlock, so the not-yet-ready path runs even when Git's
+    // output is already available. Elapsed time is measured only by the
+    // ignored benchmark.
+    #[test]
+    #[serial(umask, process_spawn)]
+    fn git_waits_for_output_by_poll_not_fixed_sleep() {
+        let tmp = TempDir::new().unwrap();
+        let (main, _) = fixture(&tmp, 0, &[]);
+        for _ in 0..10 {
+            GIT_WAITS.with(|w| w.borrow_mut().clear());
+            FORCE_WOULD_BLOCK.with(|n| n.set(1));
+            let output = git(&main, &["rev-parse", "--git-common-dir"]).unwrap();
+            assert_eq!(output, b".git\n");
+            assert_eq!(FORCE_WOULD_BLOCK.with(|n| n.get()), 0);
+            let waits = GIT_WAITS.with(|w| w.take());
+            // At least one pre-EOF wait, all polls; then only reaping sleeps.
+            assert_eq!(waits.first(), Some(&GitWait::PollOutput), "{waits:?}");
+            let reaping = waits
+                .iter()
+                .position(|w| matches!(w, GitWait::Sleep { .. }))
+                .unwrap_or(waits.len());
+            for (i, wait) in waits.iter().enumerate() {
+                match *wait {
+                    GitWait::PollOutput => assert!(i < reaping, "{waits:?}"),
+                    GitWait::Sleep {
+                        after_eof,
+                        duration,
+                    } => {
+                        assert!(after_eof, "fixed sleep before EOF: {waits:?}");
+                        if i == reaping {
+                            assert!(duration < Duration::from_millis(1), "{waits:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `cargo test -p synaps-core --lib -- --ignored --nocapture discovery_bench`
+    #[test]
+    #[serial(umask, process_spawn)]
+    #[ignore]
+    fn discovery_bench_132_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let (main, roots) = fixture(&tmp, 132, &[]);
+        discover(&main);
+        let mut times = Vec::new();
+        let mut count = 0;
+        for _ in 0..5 {
+            let started = Instant::now();
+            count = spawns(|| discover(&roots[50])).1;
+            times.push(started.elapsed());
+        }
+        times.sort();
+        println!(
+            "discovery 132 worktrees: median {:?} min {:?} max {:?}, {count} Git spawns",
+            times[2], times[0], times[4]
+        );
     }
 }
