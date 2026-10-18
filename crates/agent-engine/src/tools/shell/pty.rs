@@ -142,6 +142,8 @@ pub struct PtyHandle {
     alive: Arc<AtomicBool>,
     /// Separate killer handle so Drop can kill even if child is borrowed.
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's report to its session (`session::child_events`).
+    watch: crate::session::child_events::ChildWatch,
 }
 
 type PreparedScope = (
@@ -318,7 +320,14 @@ impl PtyHandle {
             child,
             alive,
             killer,
+            watch: Default::default(),
         })
+    }
+
+    /// Report this shell's child to the session behind `sink` (`tool_child`
+    /// with the shell session id); its end is reported once, at the reap.
+    pub(crate) fn watch_child(&mut self, sink: Option<&crate::session::child_events::ChildSink>, shell_session_id: &str) {
+        self.watch = crate::session::child_events::ChildWatch::start(sink, self.child.process_id(), Some(shell_session_id));
     }
 
     /// Write raw bytes to the PTY (reaches the child's stdin).
@@ -392,15 +401,17 @@ impl PtyHandle {
             return false;
         }
         match self.child.try_wait() {
-            Ok(Some(_status)) => {
+            Ok(Some(status)) => {
                 // Child exited.
                 self.alive.store(false, Ordering::SeqCst);
+                report_exit(&mut self.watch, &status);
                 false
             }
             Ok(None) => true,
             Err(_) => {
                 // If we can't query, assume dead.
                 self.alive.store(false, Ordering::SeqCst);
+                self.watch.end(None, None);
                 false
             }
         }
@@ -424,11 +435,42 @@ impl Drop for PtyHandle {
             // so Drop can never hang on a pathological child.
             for _ in 0..5 {
                 match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break, // reaped (or unreapable)
+                    Ok(Some(status)) => {
+                        // Reaped: its own exit if it ended before the kill.
+                        report_exit(&mut self.watch, &status);
+                        break;
+                    }
+                    Err(_) => break, // unreapable
                     Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 }
             }
+        } else if self.watch.identity().is_some() {
+            // The reader saw EOF first: reap the watched child for its status.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                report_exit(&mut self.watch, &status);
+            }
         }
+        // Still unreported (not reaped yet): the watch reports the kill.
+    }
+}
+
+/// Report a PTY child's exit. portable-pty keeps only a signal's
+/// strsignal(3) name; the ones a shell usually dies of map back to their
+/// numbers, any other is an unknown signal.
+fn report_exit(watch: &mut crate::session::child_events::ChildWatch, status: &portable_pty::ExitStatus) {
+    match status.signal() {
+        None => watch.end(i32::try_from(status.exit_code()).ok(), None),
+        Some(name) => watch.end(None, signal_number(name)),
+    }
+}
+
+fn signal_number(name: &str) -> Option<i32> {
+    match name {
+        "Hangup" => Some(1),
+        "Interrupt" => Some(2),
+        "Killed" => Some(9),
+        "Terminated" => Some(15),
+        _ => name.strip_prefix("Signal ").and_then(|n| n.parse().ok()),
     }
 }
 
