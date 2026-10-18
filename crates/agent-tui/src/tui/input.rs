@@ -368,6 +368,21 @@ fn handle_key(
                 KeybindAction::LoadSkill(skill) => {
                     InputAction::SlashCommand("load".to_string(), skill.clone())
                 }
+                // In a worker view the prompt goes to that worker, or is
+                // refused there; never submitted to main (prG R2).
+                KeybindAction::InjectPrompt(text) if super::watch::focused(app).is_some() => {
+                    match super::watch::steer_target(app) {
+                        Some(Ok(handle_id)) => InputAction::SubagentSteer {
+                            handle_id,
+                            text: text.clone(),
+                        },
+                        Some(Err(reason)) => {
+                            super::watch::steer_unavailable(app, reason);
+                            InputAction::None
+                        }
+                        None => InputAction::None,
+                    }
+                }
                 KeybindAction::InjectPrompt(text) => InputAction::Submit(text.clone()),
                 KeybindAction::Disabled => InputAction::None,
                 KeybindAction::RunScript { .. } => {
@@ -1378,6 +1393,57 @@ mod tests {
     }
 
     /// Shift-Enter inserts a newline into the buffer instead of submitting.
+    /// A plugin keybind that injects `prompt`, pressed with Ctrl-Shift-P.
+    fn press_inject(app: &mut App, prompt: &str) -> InputAction {
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let mut keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        keybinds.register_plugin(
+            "p",
+            &[synaps_cli::skills::keybinds::ManifestKeybind {
+                key: "C-S-p".into(),
+                action: "inject_prompt".into(),
+                command: None,
+                skill: None,
+                prompt: Some(prompt.into()),
+                script: None,
+                description: None,
+            }],
+            std::path::Path::new("/tmp"),
+        );
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        handle_key(crossterm::event::KeyEvent::new(KeyCode::Char('p'), mods), app, false, &registry, &keybinds)
+    }
+
+    /// prG R2: plugin keybinds are checked before the worker-view handling,
+    /// so an inject-prompt bind pressed in a worker view submitted to MAIN.
+    /// It steers the watched worker instead, or is refused in its view.
+    #[test]
+    fn an_inject_prompt_keybind_in_a_worker_view_never_submits_to_main() {
+        let mut app = make_app();
+        assert!(
+            matches!(press_inject(&mut app, "run the tests"), InputAction::Submit(t) if t == "run the tests"),
+            "on main it submits, as before"
+        );
+        let clock = app.clock.clone();
+        let w = app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        w.status = "running".into();
+        w.steerable = true;
+        app.threads.focus_worker("sa_1");
+        assert!(matches!(
+            press_inject(&mut app, "run the tests"),
+            InputAction::SubagentSteer { handle_id, text } if handle_id == "sa_1" && text == "run the tests"
+        ));
+        let w = app.threads.worker_mut("sa_1").unwrap();
+        w.status = "completed".into();
+        w.steerable = false;
+        assert!(matches!(press_inject(&mut app, "run the tests"), InputAction::None));
+        let note = app.threads.worker("sa_1").unwrap().store.messages().last().map(|m| match &m.msg {
+            ChatMessage::System(t) => t.clone(),
+            _ => String::new(),
+        });
+        assert!(note.unwrap_or_default().contains("read-only"), "refused in the view");
+    }
+
     /// 04-tui I1: in a worker view, Enter on an empty box with staged
     /// attachments fell through to the attachment-only submit, to MAIN.
     #[test]
