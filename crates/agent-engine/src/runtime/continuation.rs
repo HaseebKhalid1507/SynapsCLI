@@ -744,6 +744,7 @@ pub(crate) fn unproductive_rollover_error() -> RuntimeError {
 
 /// A time boundary may have little history to shrink. It still must fit and
 /// commit an archive plus durable head, but unlike pressure it need not shrink.
+#[allow(clippy::too_many_arguments)] // #241 successor target + #222 worker manifest
 pub(crate) async fn rollover_for_boundary(
     messages: &[SharedMessage],
     state: &SharedContinuation,
