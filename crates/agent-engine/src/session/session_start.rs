@@ -50,6 +50,10 @@ pub(crate) struct StartTicket {
     phase: AtomicU8,
     /// The session has ended: nothing reads its injection any more.
     ended: AtomicBool,
+    /// Whose ticket this is, for [`testing::in_line`] (the journal id at
+    /// queue time; empty for tickets no session queued).
+    #[cfg(any(test, feature = "testing"))]
+    label: std::sync::OnceLock<String>,
 }
 
 impl StartTicket {
@@ -58,7 +62,14 @@ impl StartTicket {
             foreground: AtomicBool::new(foreground),
             phase: AtomicU8::new(WAITING),
             ended: AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            label: std::sync::OnceLock::new(),
         })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn label(&self) -> String {
+        self.label.get().cloned().unwrap_or_default()
     }
 
     /// The session is ending (see [`SessionStart::end`]).
@@ -205,6 +216,8 @@ impl SessionStart {
         discovery: Duration,
     ) -> Self {
         let ticket = StartTicket::new(false);
+        #[cfg(any(test, feature = "testing"))]
+        let _ = ticket.label.set((**journal_id.load()).clone());
         let task = tokio::spawn(run_queued(
             Arc::clone(host),
             bus,
@@ -366,7 +379,9 @@ pub mod testing {
     }
 
     /// The sessions whose `on_session_start` calls went through the gate,
-    /// in call order (every session of the process: filter by journal id).
+    /// in the order the calls were made (every session of the process:
+    /// filter by journal id). An entry is noted as its call starts, before
+    /// the extensions answer: it records call initiation, not completion.
     pub fn call_order() -> Vec<String> {
         lock(&ORDER).clone()
     }
@@ -385,6 +400,24 @@ pub mod testing {
     pub async fn hold_gate(host: &crate::host::EngineHost) -> GateHold {
         let ticket = super::StartTicket::new(true);
         GateHold(host.session_start_gate().acquire(&ticket).await)
+    }
+
+    /// The sessions whose hooks wait in line at `host`'s gate, in line
+    /// order, by journal id: a session is listed from the moment its
+    /// ticket's `acquire` registered the waiter (the enqueue a test can
+    /// wait for) until its turn comes or it leaves the line (withdrawn, or
+    /// its wait dropped). The holder is not in line.
+    pub fn in_line(host: &crate::host::EngineHost) -> Vec<String> {
+        line(host.session_start_gate())
+    }
+
+    pub(super) fn line(gate: &super::SessionStartGate) -> Vec<String> {
+        super::lock(&gate.state)
+            .waiters
+            .iter()
+            .filter(|w| !w.tx.is_closed() && w.ticket.phase.load(super::Ordering::Acquire) == super::WAITING)
+            .map(|w| w.ticket.label())
+            .collect()
     }
 }
 
@@ -745,5 +778,39 @@ mod tests {
         let t = StartTicket::new(false);
         assert!(t.begin());
         assert!(!t.withdraw(), "running: a park cannot take it back");
+    }
+
+    /// The enqueue the tests wait for: a waiter is in line once `acquire`
+    /// registered it, in line order, and leaves it when withdrawn or when
+    /// its wait is dropped; its turn takes it out too.
+    #[tokio::test]
+    async fn the_line_lists_registered_waiters_in_order() {
+        let gate = Arc::new(SessionStartGate::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let held = gate.acquire(&StartTicket::new(false)).await;
+        assert!(testing::line(&gate).is_empty(), "the holder is not in line");
+        let labelled = |name: &str| {
+            let t = StartTicket::new(false);
+            t.label.set(name.to_string()).unwrap();
+            t
+        };
+        let (a, b, c) = (labelled("a"), labelled("b"), labelled("c"));
+        let _wa = waiter(&gate, Arc::clone(&a), "a", &order);
+        until_queued(&gate, 1).await;
+        let wb = waiter(&gate, Arc::clone(&b), "b", &order);
+        until_queued(&gate, 2).await;
+        let _wc = waiter(&gate, Arc::clone(&c), "c", &order);
+        until_queued(&gate, 3).await;
+        assert_eq!(testing::line(&gate), ["a", "b", "c"]);
+        assert!(a.withdraw());
+        assert_eq!(testing::line(&gate), ["b", "c"], "a withdrawn ticket is out of line");
+        wb.abort();
+        let _ = wb.await;
+        assert_eq!(testing::line(&gate), ["c"], "a dropped wait is out of line");
+        // `waiter` has no phase check (call_in_line has): a's turn still comes.
+        drop(held);
+        settle().await;
+        assert!(testing::line(&gate).is_empty(), "c's turn came");
+        assert_eq!(*order.lock().unwrap(), ["a", "c"], "b's dropped wait was passed over");
     }
 }

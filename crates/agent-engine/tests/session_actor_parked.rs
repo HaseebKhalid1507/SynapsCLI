@@ -781,7 +781,14 @@ async fn a_worker_recheck_still_honours_the_reconnect_grace() {
 // takes nothing out: the hook keeps its place in line and runs while the
 // session is live. Two test seams make the hook pending after a turn: the
 // host's session-start gate is held, and that turn puts a fresh hook back in
-// line at its end.
+// line at its end. A third, `in_line`, shows the gate's line itself: the
+// tests wait for a hook to be registered there instead of assuming the
+// turn's `Idle` means it is (the hook joins the line from its own task).
+//
+// What the timed waits show: "not parked within 1500 ms" and "no hook within
+// 800 ms" are negative observations over that window, not barriers; the
+// counts read later check that the work did happen, and a later window that
+// it did not happen again. `call_order` records when each call started.
 
 use agent_engine::session::session_start_testing as start_seam;
 
@@ -790,6 +797,21 @@ async fn turn_leaving_the_hook_in_line(t: &mut LocalTransport, sid: &str) {
     start_seam::requeue_after_next_turn(sid);
     t.send(submit("hello")).await.unwrap();
     until(t, |e| matches!(e, SessionEventWire::Idle)).await;
+}
+
+/// Wait (bounded) until the hooks in line at `host`'s gate are exactly
+/// `want`, in line order (journal ids).
+async fn line_is(host: &agent_engine::EngineHost, want: &[&str]) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if start_seam::in_line(host) == want {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Wait (bounded) until `n` hooks of `sid` have run since `base`.
@@ -833,7 +855,13 @@ async fn a_park_held_by_workers_leaves_the_hook_in_line() {
     let hold = start_seam::hold_gate(&host).await;
     let (ca, cb) = (start_seam::calls(&sa), start_seam::calls(&sb));
     turn_leaving_the_hook_in_line(&mut a, &sa).await;
+    assert!(line_is(&host, &[sa.as_str()]).await, "A's hook is in line: {:?}", start_seam::in_line(&host));
     turn_leaving_the_hook_in_line(&mut b, &sb).await;
+    assert!(
+        line_is(&host, &[sa.as_str(), sb.as_str()]).await,
+        "B's hook is in line behind A's: {:?}",
+        start_seam::in_line(&host)
+    );
 
     // A's worker finished; its result is not collected: the park is held.
     let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
@@ -845,6 +873,7 @@ async fn a_park_held_by_workers_leaves_the_hook_in_line() {
         "held while the result waits"
     );
     assert_eq!(start_seam::calls(&sa), ca, "A's hook still waits");
+    assert_eq!(start_seam::in_line(&host), [sa.as_str(), sb.as_str()], "the held park left A's hook in line");
 
     let before = start_seam::call_order().len();
     drop(hold);
@@ -902,6 +931,7 @@ async fn a_park_that_happens_takes_the_hook_out_of_line_and_the_unpark_runs_it_o
     let hold = start_seam::hold_gate(&host).await;
     let calls = start_seam::calls(&sid);
     turn_leaving_the_hook_in_line(&mut a, &sid).await;
+    assert!(line_is(&host, &[sid.as_str()]).await, "the hook is in line: {:?}", start_seam::in_line(&host));
 
     let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
     fake_worker(&registry, "sa_2", &state);
@@ -911,11 +941,13 @@ async fn a_park_that_happens_takes_the_hook_out_of_line_and_the_unpark_runs_it_o
         !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await,
         "held while the result waits"
     );
+    assert_eq!(start_seam::in_line(&host), [sid.as_str()], "the held park left the hook in line");
     registry.lock().unwrap().get_mut("sa_2").unwrap().mark_collected();
     assert!(
         wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(3)).await,
         "the re-check parked it"
     );
+    assert!(line_is(&host, &[]).await, "the park took the hook out of line: {:?}", start_seam::in_line(&host));
 
     drop(hold);
     tokio::time::sleep(Duration::from_millis(800)).await;
