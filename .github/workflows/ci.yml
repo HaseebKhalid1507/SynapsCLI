@@ -7,15 +7,33 @@ on:
       - dev
   pull_request:
 
+# Runner images are pinned: `ubuntu-latest` moves to a new Ubuntu on its own
+# schedule, and a CI break should come from a commit, not a calendar date.
+#
+# Every cargo invocation passes `--locked`: CI must build the dependency
+# graph that's committed, never a freshly resolved one.
+#
+# rust-cache saves only from main/dev pushes, so PR runs restore a warm
+# cache without churning the repo's cache quota.
+#
+# No `cargo fmt --check` job: the tree doesn't pass it today (164 files).
+# Add one in the same PR that formats the tree.
+
 jobs:
+  # `--workspace`: without it only the root `synaps` package is selected, so
+  # the member crates' test modules and `crates/*/tests` were never linted
+  # here (they were only linted as dependency libs).
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
-      - run: cargo clippy --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # The suite was previously never run in CI, so a failing test could sit on a
   # green PR indefinitely — `infinite_tool_loop_stops_at_exact_round_budget`
@@ -23,30 +41,61 @@ jobs:
   # mutate process-global state (HOME, env, audit spool), so this must NOT be
   # sharded or the `#[serial]` guarantees stop holding.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --workspace --locked
 
-  feature-gate:
-    runs-on: ubuntu-latest
+  # The `test` job runs with the runner's empty HOME, so a test that reads
+  # the developer's real ~/.synaps-cli passes here and fails only on a
+  # maintainer's machine. This one runs the tests that used to do that under
+  # a seeded, realistic HOME (Claude Code identity line, memory.backend =
+  # axel, context_management.mode = auto, a dummy auth.json), and fails if
+  # any of them writes into it. See scripts/dirty-home.sh.
+  dirty-home:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
-      - run: cargo build --features testing
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - run: bash scripts/dirty-home.sh --locked
+
+  feature-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo build --features testing --locked
 
   # The `--no-default-features` build (no bash/shell_* tools). No other job
-  # compiles it, so its cfg gates rot silently without this. The registry test
-  # is the only check that the gated tools are really absent.
+  # compiles it, so its cfg gates rot silently without this: build, lint and
+  # run the whole suite in that configuration. The registry test is the
+  # direct check that the gated tools are really absent; it goes through
+  # cargo-test-nonzero.sh so a filter that stops matching fails instead of
+  # passing on "running 0 tests".
   hardened-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo build --no-default-features --locked
-      - run: cargo test --workspace --no-default-features --locked --no-run
-      - run: cargo test -p synaps-engine --no-default-features --locked --lib tools::registry
+      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo test --workspace --no-default-features --locked
+      - run: bash scripts/cargo-test-nonzero.sh -p synaps-engine --no-default-features --locked --lib tools::registry
 
   # Every other job runs on Linux, so macOS-only breakage (e.g. `libc::mode_t`
   # is u16 there, u32 on Linux) first surfaced in the v0.10.0 release build.
@@ -56,16 +105,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo check --workspace --locked
 
+  # The Axel memory sidecar is its own workspace (its own Cargo.lock and
+  # dependency graph), so nothing above builds it. Its `axel` dependency is
+  # a public git repo pinned by rev; no credentials needed.
+  sidecar:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sidecars/axel-memory-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecars/axel-memory-service
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo build --locked
+      - run: cargo test --locked
+
+  # The sidecar's macOS-only code (`private_path` volfs, unsafe libc calls)
+  # is compiled by nothing else. Check it, tests included.
+  sidecar-macos-check:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: sidecars/axel-memory-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecars/axel-memory-service
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo check --all-targets --locked
+
   ignore-ratchet:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/ignore-ratchet.sh
 
   loc-ratchet:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/loc-ratchet.sh
