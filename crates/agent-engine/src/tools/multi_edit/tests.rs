@@ -538,10 +538,11 @@ struct TempModes {
 
 #[cfg(unix)]
 impl commit::Hooks for TempModes {
-    fn temp_written(&mut self, file: &std::fs::File) {
+    fn temp_written(&mut self, file: &std::fs::File) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let meta = file.metadata().unwrap();
         self.seen.push((meta.permissions().mode() & 0o7777, meta.len()));
+        Ok(())
     }
     fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
         if self.fail_finalize_at == Some(index) {
@@ -724,6 +725,59 @@ fn a_replaced_staged_temp_is_refused_and_left_alone() {
     assert_eq!(std::fs::read_to_string(d.path().join(&left[0])).unwrap(), "planted");
 }
 
+/// Fails each temp's write once its bytes are in. With `replace`, another
+/// file is first renamed over the temp's name.
+#[cfg(unix)]
+struct FailWrite {
+    dir: PathBuf,
+    replace: bool,
+}
+
+#[cfg(unix)]
+impl commit::Hooks for FailWrite {
+    fn temp_written(&mut self, _file: &std::fs::File) -> std::io::Result<()> {
+        if self.replace {
+            let temp = self.dir.join(leftovers(&self.dir).pop().expect("the temp being written"));
+            // Created first, then renamed over: a new inode, never a reused one.
+            let other = self.dir.join("other");
+            std::fs::write(&other, "planted").unwrap();
+            std::fs::rename(&other, &temp).unwrap();
+        }
+        Err(std::io::Error::other("injected write failure"))
+    }
+}
+
+// A temp whose write fails is removed again, but only while its name still
+// holds the file this call created: a file renamed over it is left alone.
+#[cfg(unix)]
+#[test]
+fn a_temp_whose_write_fails_is_removed_only_while_it_is_ours() {
+    for replace in [false, true] {
+        let d = tmpdir();
+        let f = d.path().join("a.md");
+        std::fs::write(&f, "orig\n").unwrap();
+        let mut hooks = FailWrite {
+            dir: d.path().to_path_buf(),
+            replace,
+        };
+        let err = run_with(
+            json!({"edits": [{"path": p(&f), "op": "append", "text": "new\n"}]}),
+            &mut hooks,
+        )
+        .unwrap_err();
+        assert!(err.contains("injected write failure"), "{err}");
+        assert!(err.contains("no file was changed"), "{err}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "orig\n");
+        let left = leftovers(d.path());
+        if replace {
+            assert_eq!(left.len(), 1, "the file renamed over the temp is kept: {left:?}");
+            assert_eq!(std::fs::read_to_string(d.path().join(&left[0])).unwrap(), "planted");
+        } else {
+            assert!(left.is_empty(), "the failed temp is removed: {left:?}");
+        }
+    }
+}
+
 // A FIFO with no writer is refused at once: opening it never waits.
 #[cfg(unix)]
 #[test]
@@ -816,6 +870,32 @@ fn creating_fails_closed_without_a_no_replace_primitive() {
     );
     assert!(!f.exists());
     assert!(leftovers(d.path()).is_empty(), "{:?}", leftovers(d.path()));
+}
+
+// A new file published by a hard link is published even when its temp name
+// then can't be removed (a second link to the new file): the call succeeds
+// and its result names the temp left behind.
+#[cfg(unix)]
+#[test]
+fn a_temp_left_after_a_hard_link_publish_is_named_in_the_result() {
+    use std::os::unix::fs::MetadataExt;
+    let d = tmpdir();
+    let f = d.path().join("new.md");
+    let out = run_with(
+        json!({"edits": [{"path": p(&f), "op": "append", "create": true, "text": "x\n"}]}),
+        &mut NoPrimitive(vec![commit::Primitive::RenameNoReplace, commit::Primitive::UnlinkTemp]),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "x\n");
+    let left = leftovers(d.path());
+    assert_eq!(left.len(), 1, "the temp name is still there: {left:?}");
+    let temp = std::fs::canonicalize(d.path()).unwrap().join(&left[0]);
+    let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+    assert_eq!(ino(&temp), ino(&f), "the leftover is a link to the new file");
+    assert!(
+        out.contains(&format!("{} published; could not remove temp {}:", p(&f), p(&temp))),
+        "{out}"
+    );
 }
 
 // Without the exclusive rename, a hard link still creates the file without

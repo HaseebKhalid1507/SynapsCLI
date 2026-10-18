@@ -64,6 +64,9 @@ pub(crate) struct Staged {
 pub(crate) enum Primitive {
     RenameNoReplace,
     Link,
+    /// Removing the temp name after a new file was published by a hard
+    /// link (declared unsupported, the removal fails).
+    UnlinkTemp,
 }
 
 /// Test seams. Production uses [`RealHooks`]; the `cfg(test)` methods do not
@@ -79,9 +82,12 @@ pub(crate) trait Hooks {
         let mut unsupported = |_: Primitive| false;
         finalize(staged, pending, &mut unsupported)
     }
-    /// Sees each temp after its bytes are written, before its final mode.
+    /// Sees each temp after its bytes are written, before its final mode;
+    /// an error fails the write.
     #[cfg(test)]
-    fn temp_written(&mut self, _file: &std::fs::File) {}
+    fn temp_written(&mut self, _file: &std::fs::File) -> std::io::Result<()> {
+        Ok(())
+    }
     /// Pretends `primitive` is not supported by the filesystem.
     #[cfg(test)]
     fn unsupported(&mut self, _primitive: Primitive) -> bool {
@@ -173,7 +179,7 @@ pub(crate) fn write_new(
     let written: std::io::Result<Option<(u64, u64)>> = (|| {
         file.write_all(bytes)?;
         #[cfg(test)]
-        hooks.temp_written(&file);
+        hooks.temp_written(&file)?;
         #[cfg(unix)]
         if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
