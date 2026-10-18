@@ -398,7 +398,8 @@ impl PromptBridge {
         if self.confirms == ConfirmPolicy::ViewOnly && req.kind == PromptKind::Confirm {
             // Never the pane, never an answer: list it until it resolves.
             if !self.waiting.iter().any(|(id, _)| *id == req.id) {
-                self.waiting.push((req.id, req.title));
+                let label = waiting_label(&req);
+                self.waiting.push((req.id, label));
             }
             return;
         }
@@ -467,6 +468,32 @@ impl PromptBridge {
     }
 }
 
+/// What the `--no-confirm-answers` toast lists for a waiting confirm: its
+/// title plus the tool and extension when known, from the scope or the
+/// body's `Extension:` / `Tool:` lines (04-tui M7: every entry used to read
+/// "Confirm tool call").
+fn waiting_label(req: &PromptRequest) -> String {
+    let field = |key: &str| {
+        req.prompt
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && *v != "(unknown)")
+            .map(str::to_string)
+    };
+    let scope = req.confirm_scope.as_ref();
+    let tool = scope.and_then(|s| s.tool.clone()).or_else(|| field("Tool:"));
+    let ext = scope
+        .filter(|s| !s.extensions.is_empty())
+        .map(|s| s.extensions_label())
+        .or_else(|| field("Extension:"));
+    match (tool, ext) {
+        (Some(t), Some(e)) => format!("{}: {t} ({e})", req.title),
+        (Some(t), None) => format!("{}: {t}", req.title),
+        _ => req.title.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +542,31 @@ mod tests {
         assert!(!b.on_local_answer(3), "a confirm answer is never sent");
         assert!(!b.on_local_answer(99), "nor one for a prompt never fed");
         assert!(b.answers_rx.try_recv().is_err(), "nothing queued to send");
+    }
+
+    /// 04-tui M7: every waiting entry read "Confirm tool call", so the user
+    /// couldn't tell which approval to look for in the other client. It
+    /// names the tool (and its extension) from the scope or the body.
+    #[tokio::test]
+    async fn a_waiting_confirm_names_its_tool() {
+        let (mut b, _pane) = bridge(ConfirmPolicy::ViewOnly);
+        let mut from_body = prompt(4, PromptKind::Confirm);
+        from_body.prompt = "Extension: jev\nTool: bash\n\nrm -rf build\n\nAllow this tool call?".into();
+        b.on_prompt(from_body);
+        let mut from_scope = prompt(5, PromptKind::Confirm);
+        from_scope.confirm_scope = Some(agent_engine::session::ConfirmScope {
+            extensions: vec!["guard".into()],
+            tool: Some("write".into()),
+            rewritten_by: vec![],
+        });
+        b.on_prompt(from_scope);
+        assert_eq!(
+            b.waiting_confirms(),
+            &[
+                (4, "Confirm tool call: bash (jev)".to_string()),
+                (5, "Confirm tool call: write (guard)".to_string()),
+            ]
+        );
     }
 
     /// prA m3: only the input owner can arm "Allow all", so a non-owner's

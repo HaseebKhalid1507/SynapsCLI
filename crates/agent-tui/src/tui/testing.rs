@@ -145,6 +145,13 @@ fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
     })
 }
 
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        // `set_build_id` is per harness, not per thread.
+        super::header::set_build_id_for_thread(None);
+    }
+}
+
 impl TestHarness {
     /// Boot a headless App at the default 80x24 geometry.
     pub fn boot() -> Self {
@@ -819,6 +826,22 @@ impl TestHarness {
     /// streaming-input command refusal path without a live engine stream.
     pub fn set_streaming(&mut self, streaming: bool) -> &mut Self {
         self.app.streaming = streaming;
+        self
+    }
+
+    /// Pin the build id the header shows (`""` = no id: `v<version>` alone),
+    /// so header layout tests don't depend on the id the binary was built
+    /// with (a baked git hash, or none). For this harness only; cleared on
+    /// drop.
+    pub fn set_build_id(&mut self, id: &str) -> &mut Self {
+        super::header::set_build_id_for_thread(Some(id));
+        self
+    }
+
+    /// Force the transient status line (`connecting…`, `reconnecting… (…)`,
+    /// …) the run loop sets around daemon reconnects.
+    pub fn set_status_text(&mut self, text: Option<&str>) -> &mut Self {
+        self.app.status_text = text.map(str::to_string);
         self
     }
 

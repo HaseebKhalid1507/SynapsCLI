@@ -222,6 +222,8 @@ fn a_finished_worker_view_is_read_only() {
     assert_eq!(h.input_contents(), "one more thing", "the text stays");
     let worker = h.worker_transcript_text("sa_5");
     assert!(worker.contains("its view is read-only"), "{worker}");
+    // 04-tui M5: the opening line no longer promises "Enter steers it".
+    assert!(!worker.contains("Enter steers"), "{worker}");
     assert!(h.snapshot().lines().next().unwrap().contains("read-only"));
 }
 
@@ -289,4 +291,201 @@ fn clicking_a_tray_row_opens_that_workers_view() {
     assert_eq!(h.watched().as_deref(), Some("sa_1"));
     let header = h.snapshot().lines().next().unwrap().to_string();
     assert!(header.contains("scout"), "{header}");
+}
+
+/// 04-tui I1: with the main turn streaming, Shift/Alt+Enter in a worker view
+/// used to fall through to the main thread's streaming submit and steer the
+/// MAIN agent. In a worker view they only ever add a line; nothing goes to
+/// main.
+#[test]
+fn shift_or_alt_enter_in_a_worker_view_never_steers_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 8, "scout");
+    h.set_streaming(true);
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_8", "scout", "running", vec![], 0));
+
+    h.type_str("check the tests first");
+    h.key(KeyCode::Enter, KeyModifiers::ALT);
+    h.type_str("then the docs");
+    h.key(KeyCode::Enter, KeyModifiers::SHIFT);
+    assert!(h.take_actions().is_empty(), "nothing is sent anywhere");
+    assert_eq!(
+        h.input_contents(),
+        "check the tests first\nthen the docs\n",
+        "both add a line"
+    );
+
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = h.take_actions();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert!(
+        actions[0].starts_with("subagent-steer:sa_8:check the tests first"),
+        "Enter steers the worker: {actions:?}"
+    );
+}
+
+/// 04-tui I1: an unknown `/word` typed in a worker view while main streams
+/// used to reach the main thread's streaming path, which steers main with
+/// it. It is refused in the worker view instead and the text stays.
+#[test]
+fn an_unknown_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 9, "scout");
+    h.set_streaming(true);
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_9", "scout", "running", vec![], 0));
+
+    h.type_str("/zzz-not-a-command please");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.take_actions().is_empty(), "nothing is sent");
+    assert_eq!(h.input_contents(), "/zzz-not-a-command please");
+    let worker = h.worker_transcript_text("sa_9");
+    assert!(worker.contains("unknown command: /zzz-not-a-command"), "{worker}");
+    assert!(!h.main_transcript_text().contains("zzz"));
+}
+
+/// 04-tui I2: a slash command typed in a worker view printed its output into
+/// the hidden main transcript and snapped main to the bottom. Its output now
+/// shows in the worker view, and main is exactly where it was left.
+#[test]
+fn a_slash_command_in_a_worker_view_answers_there_and_main_never_moves() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    for i in 0..60 {
+        h.push_text_message(&format!("main-{i:02} the conversation so far"));
+    }
+    start(&mut h, 10, "scout");
+    h.render();
+    for _ in 0..5 {
+        h.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+    let main_frame = h.snapshot();
+    let main_rows: Vec<String> = main_frame
+        .lines()
+        .filter(|l| l.contains("main-"))
+        .map(str::to_string)
+        .collect();
+    assert!(!h.scroll_pinned(), "precondition: main scrolled up");
+    let main_before = h.main_transcript_text();
+
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_10", "scout", "running", vec![], 0));
+    h.type_str("/zzz-no-such-command");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    h.drive_slash_commands();
+    let worker = h.worker_transcript_text("sa_10");
+    assert!(
+        worker.contains("unknown command: /zzz-no-such-command"),
+        "the answer is in the view it was typed in: {worker}"
+    );
+    assert_eq!(h.main_transcript_text(), main_before, "main gets nothing");
+
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    let frame = h.snapshot();
+    let rows: Vec<String> = frame
+        .lines()
+        .filter(|l| l.contains("main-"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(rows, main_rows, "main view unmoved:\n{frame}");
+    assert!(!h.scroll_pinned(), "main was not snapped to the bottom");
+}
+
+fn alt(h: &mut TestHarness, code: KeyCode) {
+    h.key(code, KeyModifiers::ALT);
+}
+
+/// 04-tui I7: macOS takes Ctrl-↑/↓ for Mission Control before the terminal
+/// sees them. Alt-↑/↓ switch views the same way.
+#[test]
+fn alt_arrows_walk_the_workers_and_back_to_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 1, "scout");
+    start(&mut h, 2, "fixer");
+    alt(&mut h, KeyCode::Up);
+    assert_eq!(h.watched().as_deref(), Some("sa_2"), "newest first");
+    alt(&mut h, KeyCode::Up);
+    assert_eq!(h.watched().as_deref(), Some("sa_1"));
+    alt(&mut h, KeyCode::Down);
+    assert_eq!(h.watched().as_deref(), Some("sa_2"));
+    alt(&mut h, KeyCode::Down);
+    assert_eq!(h.watched(), None, "past the newest: main");
+    assert!(h.take_actions().is_empty(), "switching views sends nothing");
+}
+
+/// 04-tui M10: at either end there was no feedback — Up on the oldest
+/// re-focused it silently, Down on main did nothing.
+#[test]
+fn switching_past_either_end_says_so() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 1, "scout");
+    alt(&mut h, KeyCode::Up);
+    alt(&mut h, KeyCode::Up);
+    assert_eq!(h.watched().as_deref(), Some("sa_1"));
+    let frame = h.snapshot();
+    assert!(frame.contains("oldest subagent"), "{frame}");
+
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    alt(&mut h, KeyCode::Down);
+    assert_eq!(h.watched(), None);
+    let frame = h.snapshot();
+    assert!(frame.contains("already on the main thread"), "{frame}");
+}
+
+/// 04-tui I7: the footer advertises a binding macOS doesn't swallow.
+#[test]
+fn the_footer_advertises_alt_arrows_for_agents() {
+    let mut h = TestHarness::boot_with_size(160, 30);
+    start(&mut h, 1, "scout");
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("alt+\u{2191}\u{2193} agents"), "{footer:?}");
+    alt(&mut h, KeyCode::Up);
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("alt+\u{2191}\u{2193} agents"), "{footer:?}");
+}
+
+/// prG R1: with main idle, a bare `/` (no command word) in a worker view
+/// fell through to process_submit, which only treats `/x` (len > 1) as a
+/// command, and was sent to MAIN as a prompt. It is refused in the view.
+#[test]
+fn a_bare_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 11, "scout");
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_11", "scout", "running", vec![], 0));
+    let main_before = h.main_transcript_text();
+    for typed in ["/", "/   "] {
+        h.type_str(typed);
+        h.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(h.take_actions().is_empty(), "{typed:?}: nothing is sent");
+        assert_eq!(h.input_contents(), typed, "the text stays");
+        h.key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+    }
+    let worker = h.worker_transcript_text("sa_11");
+    assert!(worker.contains("unknown command: /"), "{worker}");
+    assert_eq!(h.main_transcript_text(), main_before, "main gets nothing");
+}
+
+/// prG review: the footer names `/watch` too, the keyless way in (no
+/// arrow chord at all) when the terminal swallows both chords.
+#[test]
+fn the_footer_names_slash_watch_when_there_are_workers() {
+    let mut h = TestHarness::boot_with_size(160, 30);
+    let frame = h.snapshot();
+    assert!(!frame.lines().last().unwrap_or("").contains("/watch"), "no workers: no hint");
+    start(&mut h, 1, "scout");
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("/watch list"), "{footer:?}");
+    alt(&mut h, KeyCode::Up);
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("/watch list"), "{footer:?}");
 }

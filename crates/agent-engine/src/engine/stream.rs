@@ -369,7 +369,7 @@ pub fn process_stream_event_with_terminal_capture(
                 (EngineStreamEvent::Done, StreamCompletion::Done)
             }
         }
-        StreamEvent::Session(SessionEvent::Notice(text)) => {
+        StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
             // Display-only status (e.g. retry notice) — surface as a system
             // line, never recorded into message history.
             (EngineStreamEvent::Notice(text), StreamCompletion::Continue)

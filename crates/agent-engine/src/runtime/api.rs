@@ -1935,7 +1935,7 @@ impl ApiMethods {
                                 notice,
                                 last_err
                             );
-                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(notice)));
 
                             if let Some(t) = tracer.as_mut() {
                                 t.attempt_failed(
@@ -1984,7 +1984,7 @@ impl ApiMethods {
                                 delay,
                                 last_err
                             );
-                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                                 "⏳ API error, retrying ({}/{})…",
                                 non_429_attempts, max_retries
                             ))));
@@ -2317,7 +2317,7 @@ impl ApiMethods {
                         delay,
                         msg
                     );
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                         "⏳ API stream error — retrying ({}/{})…",
                         retry_index, retry_budget
                     ))));
@@ -2381,7 +2381,7 @@ impl ApiMethods {
                         refusal_retries,
                         delay
                     );
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                         "⏳ model refusal — retrying ({}/{})…",
                         refusal_attempts, refusal_retries
                     ))));
@@ -4914,7 +4914,10 @@ mod on401_tests {
 
         // 2) User-visible notices (retry banners) must not leak.
         while let Ok(ev) = rx.try_recv() {
-            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+            if let StreamEvent::Session(
+                crate::SessionEvent::Notice(n) | crate::SessionEvent::Retry(n),
+            ) = ev
+            {
                 assert_no_hostile_leak(&n, "notice");
             }
         }
@@ -5188,6 +5191,8 @@ mod anthropic_failover_tests {
     struct Outcome {
         result: crate::error::Result<serde_json::Value>,
         notices: Vec<String>,
+        /// The subset that came as typed retries (`SessionEvent::Retry`).
+        retries: Vec<String>,
     }
 
     async fn drive(
@@ -5225,13 +5230,18 @@ mod anthropic_failover_tests {
             router,
         )
         .await;
-        let mut notices = Vec::new();
+        let (mut notices, mut retries) = (Vec::new(), Vec::new());
         while let Ok(ev) = rx.try_recv() {
-            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
-                notices.push(n);
+            match ev {
+                StreamEvent::Session(crate::SessionEvent::Notice(n)) => notices.push(n),
+                StreamEvent::Session(crate::SessionEvent::Retry(n)) => {
+                    notices.push(n.clone());
+                    retries.push(n);
+                }
+                _ => {}
             }
         }
-        Outcome { result, notices }
+        Outcome { result, notices, retries }
     }
 
     fn assert_no_body_leak(text: &str, ctx: &str) {
@@ -5414,10 +5424,12 @@ mod anthropic_failover_tests {
         );
         assert!(router.reports().is_empty());
         assert!(router.failovers().is_empty());
-        assert!(out
-            .notices
-            .iter()
-            .any(|n| n.starts_with("⚠ Rate limited — resuming in ")));
+        // 04-tui I4: a typed retry (the header's "retrying"), not just text.
+        assert!(
+            out.retries.iter().any(|n| n.starts_with("⚠ Rate limited — resuming in ")),
+            "{:?}",
+            out.notices
+        );
     }
 
     #[tokio::test]
@@ -5825,7 +5837,7 @@ mod cancellation_tests {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             let (result, ()) = tokio::join!(call(&auth, &cancel, tx, &options), async {
                 while let Some(event) = rx.recv().await {
-                    if matches!(event, StreamEvent::Session(SessionEvent::Notice(_))) {
+                    if matches!(event, StreamEvent::Session(SessionEvent::Retry(_))) {
                         cancel.cancel();
                         return;
                     }

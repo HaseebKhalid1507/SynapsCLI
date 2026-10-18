@@ -307,10 +307,34 @@ fn build_label(version: &str, hash: &str) -> String {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    /// Test seam: the build label headers rendered on this thread show,
+    /// whatever id the binary has (`TestHarness::set_build_id`). Headless
+    /// tests render on their own thread, so this never leaks between them.
+    static BUILD_OVERRIDE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin (or with `None`, clear) the build id this thread's headers show.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn set_build_id_for_thread(id: Option<&str>) {
+    let label = id.map(|id| &*Box::leak(build_label(env!("CARGO_PKG_VERSION"), id).into_boxed_str()));
+    BUILD_OVERRIDE.with(|o| o.set(label));
+}
+
 /// This build, as the idle header shows it (see [`build_label`]).
 pub(crate) fn build() -> &'static str {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(label) = BUILD_OVERRIDE.with(std::cell::Cell::get) {
+        return label;
+    }
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BUILD.get_or_init(|| build_label(env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
+    // The same identity the version-skew check compares (04-tui M8): the
+    // engine's `SYNAPS_BUILD_ID`, which packagers can set.
+    BUILD.get_or_init(|| {
+        let this = agent_engine::session::transport::BinaryId::this();
+        build_label(&this.version, &this.build)
+    })
 }
 
 /// This build, as `/status` reports it (the header drops it when the row
@@ -422,13 +446,49 @@ fn glow(i: f32, len: f32, tick: u64) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Which extreme the busy shimmer moves toward: white on a dark header,
+/// black on a light one (mixing toward white on `paper` faded the letters
+/// to 1.47:1 instead of making them glow).
+fn shimmer_toward(t: &Theme) -> Color {
+    let (white, black) = (Color::Rgb(255, 255, 255), Color::Rgb(0, 0, 0));
+    let wcag = super::theme::wcag_contrast;
+    if wcag(white, t.bg) >= wcag(black, t.bg) {
+        white
+    } else {
+        black
+    }
+}
+
+/// The busy wordmark's resting colour: `header_fg`, lifted toward
+/// [`shimmer_toward`] just until it reads at 4.5:1 (WCAG AA) on the header
+/// (`header_fg` itself is 4.30:1 on default).
+fn shimmer_base(t: &Theme) -> Color {
+    let toward = shimmer_toward(t);
+    (0..=40)
+        .map(|step| mix(t.header_fg, toward, step as f32 / 40.0))
+        .find(|c| super::theme::wcag_contrast(*c, t.bg) >= 4.5)
+        .unwrap_or(toward)
+}
+
+/// The brightest point of the busy wordmark's shimmer, further along the
+/// same line, so every step from the base to it reads at AA.
+fn shimmer_peak(t: &Theme) -> Color {
+    mix(shimmer_base(t), shimmer_toward(t), 0.65)
+}
+
+/// The idle build label's colour: the chrome's secondary text (≥ 4.5:1 on
+/// every built-in theme; `muted` faded toward `bg` was 1.3–2.7:1).
+fn build_color(t: &Theme) -> Color {
+    t.chrome_dim()
+}
+
 fn wordmark(t: &Theme, state: &HeaderState, tick: u64) -> Vec<Span<'static>> {
     let base = match state {
         HeaderState::Idle => mix(t.muted, t.bg, 0.25),
         HeaderState::Failed(_) => t.error_color,
-        _ => t.header_fg,
+        _ => shimmer_base(t),
     };
-    let hi = mix(t.header_fg, Color::Rgb(255, 255, 255), 0.65);
+    let hi = shimmer_peak(t);
     let n = WORDMARK.chars().count() as f32;
     WORDMARK
         .chars()
@@ -485,7 +545,7 @@ fn right_cluster(
 /// hide the session label (the label matters more).
 fn idle_right(t: &Theme, label: &str, width: usize, left_w: usize) -> Vec<Span<'static>> {
     let build = vec![
-        Span::styled(build(), fg(mix(t.muted, t.bg, 0.3))),
+        Span::styled(build(), fg(build_color(t))),
         Span::raw("  "),
     ];
     let label_whole = match place_centre(label, width, left_w, spans_width(&build)) {
@@ -497,6 +557,34 @@ fn idle_right(t: &Theme, label: &str, width: usize, left_w: usize) -> Vec<Span<'
     } else {
         Vec::new()
     }
+}
+
+/// The detail after a status word: `reconnecting… (4s left, attempt 2)`
+/// gives `4s left, attempt 2`.
+fn busy_detail(status_text: Option<&str>) -> Option<&str> {
+    let rest = status_text?.split_once('\u{2026}')?.1.trim();
+    let rest = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(rest)
+        .trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// The worker banner in at most `room` cells: the agent name is cut with
+/// `…` first; anything still too wide is clipped by the caller.
+fn fit_banner(b: &super::watch::Banner, room: usize) -> Vec<Span<'static>> {
+    let full = super::draw::watch_banner_spans(b);
+    let over = spans_width(&full).saturating_sub(room);
+    if over == 0 {
+        return full;
+    }
+    let name_room = display_width(&b.agent_name).saturating_sub(over).max(2);
+    let cut = super::watch::Banner {
+        agent_name: truncate(&b.agent_name, name_room),
+        ..b.clone()
+    };
+    super::draw::watch_banner_spans(&cut)
 }
 
 /// Draw the header row.
@@ -513,30 +601,50 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, model: &RenderModel) {
 
     frame.render_widget(Block::default().style(Style::default().bg(t.bg)), area);
 
+    let width = area.width as usize;
     let mut left = vec![Span::raw("  ")];
     left.extend(wordmark(&t, &state, tick));
     for pill in &model.sidecar_pills {
         left.push(Span::raw(" "));
         left.push(super::draw::sidecar_pill_span(pill, model.spinner_frame));
     }
-    // Worker view: say whose thread this is and how to get back.
-    if let Some(b) = &model.watch_banner {
-        left.push(Span::raw(" "));
-        left.extend(super::draw::watch_banner_spans(b));
-    }
+    let base_w = spans_width(&left);
+    let banner_w = model
+        .watch_banner
+        .as_ref()
+        .map_or(0, |b| 1 + spans_width(&super::draw::watch_banner_spans(b)));
 
     let mut right = right_cluster(&t, &state, snap.turn_elapsed_secs, tick);
+    // The reconnect countdown ("4s left, attempt 2"), when it fits (M2).
+    if let (HeaderState::Busy(word), Some(detail)) =
+        (&state, busy_detail(model.status_text.as_deref()))
+    {
+        let busy = HeaderState::Busy(format!("{word} \u{b7} {detail}"));
+        let wide = right_cluster(&t, &busy, snap.turn_elapsed_secs, tick);
+        if base_w + spans_width(&wide) + 3 <= width {
+            right = wide;
+        }
+    }
     if right.is_empty() {
-        right = idle_right(
-            &t,
-            &snap.session_label,
-            area.width as usize,
-            spans_width(&left),
-        );
+        right = idle_right(&t, &snap.session_label, width, base_w + banner_w);
+    }
+    let right_w = spans_width(&right);
+
+    // Worker view: say whose thread this is and how to get back. The name
+    // gives way so the right-hand cluster never draws over it (M1).
+    if let Some(b) = &model.watch_banner {
+        left.push(Span::raw(" "));
+        let room = width.saturating_sub(base_w + 1 + right_w + 1);
+        left.extend(fit_banner(b, room));
     }
 
-    let (left_w, right_w) = (spans_width(&left), spans_width(&right));
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    let left_w = spans_width(&left);
+    // Clip the left side to its share: the two never overlap.
+    let left_area = Rect {
+        width: area.width.saturating_sub(right_w as u16),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(Line::from(left)), left_area);
     if !right.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
@@ -829,6 +937,37 @@ mod tests {
         assert!(right_cluster(&t, &HeaderState::Idle, None, 0).is_empty());
     }
 
+    /// 04-tui M4: the busy shimmer mixed toward white, which on `paper`
+    /// faded the letters to 1.47:1, and the idle build label was 1.3–2.7:1
+    /// on every built-in theme. Both read at ≥ 4.5:1 (WCAG AA) at every
+    /// step (prG review: the shimmer bottomed out at 4.30 on default).
+    #[test]
+    fn shimmer_and_build_label_read_at_aa_on_every_builtin() {
+        for name in [
+            "default", "night-city", "neon-rain", "amber", "phosphor", "solarized-dark",
+            "blood", "ocean", "rose-pine", "nord", "dracula", "monokai", "myx", "gruvbox",
+            "catppuccin", "tokyo-night", "sunset", "ice", "forest", "lavender", "paper",
+        ] {
+            let t = Theme::builtin_for_test(name);
+            let hi = shimmer_peak(&t);
+            for step in 0..=20 {
+                let c = mix(shimmer_base(&t), hi, step as f32 / 20.0);
+                let r = super::super::theme::wcag_contrast(c, t.bg);
+                assert!(r >= 4.5, "{name}: shimmer at {step}/20 is {r:.2}:1");
+            }
+            // What the busy wordmark actually paints, frame by frame.
+            for tick in 0..60 {
+                for span in wordmark(&t, &HeaderState::Streaming, tick) {
+                    let c = span.style.fg.expect("wordmark letters are coloured");
+                    let r = super::super::theme::wcag_contrast(c, t.bg);
+                    assert!(r >= 4.5, "{name}: wordmark at tick {tick} is {r:.2}:1");
+                }
+            }
+            let r = super::super::theme::wcag_contrast(build_color(&t), t.bg);
+            assert!(r >= 4.5, "{name}: idle build label {r:.2}:1");
+        }
+    }
+
     #[test]
     fn idle_shows_the_build_unless_it_would_cut_the_label() {
         let t = THEME.load();
@@ -862,8 +1001,18 @@ mod tests {
         assert!(build().starts_with(concat!("v", env!("CARGO_PKG_VERSION"))));
     }
 
-    /// Packaged builds (`GIT_HASH=release`, see build.rs) show the version
-    /// alone; checkouts show the hash, `-dirty` included.
+    /// 04-tui M8: the header baked its own `GIT_HASH` (agent-tui build.rs,
+    /// which ignores `SYNAPS_BUILD_ID` and watches `../../.git/HEAD`, stale
+    /// in a worktree) while the skew check used the engine's
+    /// `SYNAPS_BUILD_ID`; the two could disagree. One source now.
+    #[test]
+    fn the_header_shows_the_build_the_skew_check_compares() {
+        let this = agent_engine::session::transport::BinaryId::this();
+        assert_eq!(build(), build_label(&this.version, &this.build));
+    }
+
+    /// Builds with no known id (and the old `release` placeholder) show
+    /// the version alone; checkouts show the hash, `-dirty` included.
     #[test]
     fn build_label_drops_the_placeholder_hash() {
         assert_eq!(build_label("0.10.2", "release"), "v0.10.2");

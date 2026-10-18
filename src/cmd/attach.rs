@@ -96,7 +96,7 @@ impl Client {
                 let label = if matches!(e.outcome, TurnOutcome::Canceled) { "canceled" } else { "error" };
                 self.out(&format!("\n[{label}] {} ({})\n", e.message, e.category_label()));
             }
-            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Notice(n))) => self.out(&format!("[notice] {n}\n")),
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n))) => self.out(&format!("[notice] {n}\n")),
             SessionEventWire::Stream(StreamEvent::Agent(a)) => self.out(&format!("[agent] {a:?}\n")),
             SessionEventWire::Stream(_) => {}
             SessionEventWire::TurnStarted { .. } => self.streaming = true,

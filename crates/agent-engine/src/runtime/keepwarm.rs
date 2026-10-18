@@ -670,7 +670,7 @@ impl Runtime {
         // arrives, so an aborted ping can still be booked.
         let mut notices = Vec::new();
         let mut on_event = |event: StreamEvent| {
-            if let StreamEvent::Session(SessionEvent::Notice(n)) = &event {
+            if let StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) = &event {
                 notices.push(n.clone());
             }
             tap.usage

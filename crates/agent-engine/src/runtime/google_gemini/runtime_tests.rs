@@ -545,7 +545,8 @@ async fn retries_429_after_reported_reset_and_succeeds() {
     // The wait is honored and user-visible.
     let mut saw_notice = false;
     while let Ok(ev) = rx.try_recv() {
-        if let StreamEvent::Session(crate::runtime::types::SessionEvent::Notice(n)) = ev {
+        // 04-tui I4: a typed retry (the header's "retrying").
+        if let StreamEvent::Session(crate::runtime::types::SessionEvent::Retry(n)) = ev {
             assert!(n.to_lowercase().contains("rate limit"), "{n}");
             saw_notice = true;
         }

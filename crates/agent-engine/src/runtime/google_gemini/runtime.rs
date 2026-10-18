@@ -355,7 +355,7 @@ pub(crate) async fn call_google_gemini_stream_inner(
                         attempt = attempt_no,
                         "google-gemini 429 rate limited; honoring reported reset"
                     );
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(notice)));
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
                         _ = cancel.cancelled() => {

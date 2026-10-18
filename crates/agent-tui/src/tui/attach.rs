@@ -250,6 +250,23 @@ pub fn attach_mode(observe: bool, takeover: bool) -> AttachMode {
     }
 }
 
+/// The version-skew notice for this daemon, once per daemon build: a
+/// reconnect to the same daemon binary (a crash restart, a `daemon reload`
+/// onto the same build) does not post it again (04-tui M8).
+pub(super) fn skew_notice_once(
+    app: &mut super::app::App,
+    daemon: agent_engine::session::transport::BinaryId,
+    session: &str,
+) -> Option<String> {
+    use agent_engine::session::transport::{version_skew_notice, BinaryId};
+    if app.skew_noticed.as_ref() == Some(&daemon) {
+        return None;
+    }
+    let notice = version_skew_notice(&BinaryId::this(), &daemon, session)?;
+    app.skew_noticed = Some(daemon);
+    Some(notice)
+}
+
 fn cfg_err(e: impl std::fmt::Display) -> synaps_cli::RuntimeError {
     synaps_cli::RuntimeError::Config(e.to_string())
 }
@@ -406,9 +423,9 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None
         },
         config_warnings: &config.warnings,
-        version_skew: agent_engine::session::transport::version_skew_notice(
-            &agent_engine::session::transport::BinaryId::this(),
-            &agent_engine::session::transport::BinaryId::of(&transport.welcome),
+        version_skew: skew_notice_once(
+            &mut app,
+            agent_engine::session::transport::BinaryId::of(&transport.welcome),
             snapshot.meta.id.as_str(),
         ),
     });
@@ -546,6 +563,24 @@ mod tests {
         let same = version_skew_notice(&bin("0.10.2"), &bin("0.10.2"), id.as_str());
         let n = attach_notices(AttachNoticeInputs { version_skew: same, ..notice_inputs(&id, &[]) });
         assert!(n.transcript.is_empty(), "{n:?}");
+    }
+
+    /// 04-tui M8: the skew line was posted again on every reconnect, crash
+    /// reconnects included. It shows once per daemon build.
+    #[test]
+    fn the_skew_notice_shows_once_per_daemon_build() {
+        use agent_engine::session::transport::BinaryId;
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test-model", "low", None));
+        let daemon = |build: &str| BinaryId { version: "0.0.1".into(), build: build.into() };
+        assert!(skew_notice_once(&mut app, daemon("aaaa1111"), "s").is_some());
+        assert!(
+            skew_notice_once(&mut app, daemon("aaaa1111"), "s").is_none(),
+            "a reconnect to the same daemon build says nothing again"
+        );
+        assert!(
+            skew_notice_once(&mut app, daemon("bbbb2222"), "s").is_some(),
+            "a reload onto another daemon build warns again"
+        );
     }
 
     #[test]

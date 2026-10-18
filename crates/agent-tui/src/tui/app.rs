@@ -226,6 +226,9 @@ pub(crate) struct App {
     /// F9: set when the daemon died and reconnection failed — `run_loop` uses
     /// this to exit non-zero with a stderr explanation.
     pub(crate) daemon_lost: Option<DaemonLostInfo>,
+    /// The daemon binary the version-skew notice was last shown for
+    /// (`attach::skew_notice_once`: once per daemon build, not per reconnect).
+    pub(crate) skew_noticed: Option<agent_engine::session::transport::BinaryId>,
     /// F27: quit-while-streaming guard (socket only). First Ctrl+C shows a
     /// notice; second within 3 s detaches.
     pub(crate) quit_guard: super::quit_guard::QuitGuard,
@@ -472,6 +475,7 @@ impl App {
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compacting: false,
             daemon_lost: None,
+            skew_noticed: None,
             quit_guard: super::quit_guard::QuitGuard::new(),
             pending_events_len: 0,
             subagent_rows: Vec::new(),
@@ -689,6 +693,9 @@ impl App {
     // signaling (`needs_redraw`) stays here on App.
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
+        let Some(msg) = super::watch::command_output(self, msg) else {
+            return;
+        };
         self.transcript.push_msg(msg);
         self.needs_redraw = true;
     }

@@ -1490,15 +1490,16 @@ pub(crate) fn render_frame_into(
     let key_style = Style::default().fg(theme.claude_text);
     let label_style = Style::default().fg(dim);
     // Hints drop whole from the end when narrow, so order is priority. In
-    // a worker view Esc goes back and Enter steers; Ctrl-↑↓ shows up
+    // a worker view Esc goes back and Enter steers; Alt-↑↓ shows up
     // whenever there is a subagent view to switch to (last on main, so it
-    // never pushes the long-standing hints out).
+    // never pushes the long-standing hints out). It advertises Alt, not
+    // Ctrl: macOS takes Ctrl-↑/↓ for Mission Control; both work.
     let compact = if model.show_full_output {
         "full"
     } else {
         "compact"
     };
-    let arrows = "ctrl+\u{2191}\u{2193}";
+    let arrows = "alt+\u{2191}\u{2193}";
     let scroll = "shift+\u{2191}\u{2193}";
     let hints: Vec<(&str, &str)> = match model.watch_banner.as_ref() {
         Some(b) => {
@@ -1507,6 +1508,7 @@ pub(crate) fn render_frame_into(
                 h.push(("enter", "steer"));
             }
             h.extend([(arrows, "agents"), (scroll, "scroll"), ("ctrl+o", compact)]);
+            h.push(("/watch", "list"));
             h
         }
         None => {
@@ -1518,7 +1520,8 @@ pub(crate) fn render_frame_into(
                 ("enter", "send"),
             ];
             if !model.subagents.is_empty() {
-                h.push((arrows, "agents"));
+                // `/watch` too: the way in when the terminal eats both chords.
+                h.extend([(arrows, "agents"), ("/watch", "list")]);
             }
             h
         }

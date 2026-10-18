@@ -119,19 +119,47 @@ impl BinaryId {
 /// until it is restarted. Builds count, not just versions: a reload onto a
 /// newer build of the same release is the common case. An unknown build
 /// (empty: older daemon, packaged build) compares by version only.
+///
+/// The remedy depends on which side is behind. A client older than the
+/// daemon restarts to match it. A client newer than the daemon (a new
+/// install with the old daemon still running, the usual upgrade path) must
+/// not be told to restart, which relaunches the same binary: the daemon is
+/// moved onto this build with `synaps daemon reload`. Same version on
+/// another build: which one is newer is unknown, so both remedies.
 pub fn version_skew_notice(client: &BinaryId, daemon: &BinaryId, session: &str) -> Option<String> {
     let builds_differ = !client.build.is_empty() && !daemon.build.is_empty() && client.build != daemon.build;
     if client.version == daemon.version && !builds_differ {
         return None;
     }
     let show_build = client.version == daemon.version;
-    Some(format!(
-        "this client is synaps {} but the daemon is {} — different builds, so some commands \
-         and fixes are unavailable here. Restart the client to match the daemon: \
-         synaps --attach {session}",
-        client.label(show_build),
-        daemon.label(show_build),
-    ))
+    let (c, d) = (client.label(show_build), daemon.label(show_build));
+    Some(match compare_versions(&client.version, &daemon.version) {
+        Some(std::cmp::Ordering::Less) => format!(
+            "this client is synaps {c} but the daemon is {d} — this client is older, so some \
+             commands and fixes are unavailable here. Restart the client to match the daemon: \
+             synaps --attach {session}"
+        ),
+        Some(std::cmp::Ordering::Greater) => format!(
+            "this client is synaps {c} but the daemon is {d} — the daemon is older than this \
+             client, so some commands and fixes are unavailable. To move it onto this build, \
+             run `synaps daemon reload`"
+        ),
+        _ => format!(
+            "this client is synaps {c} but the daemon is {d} — different builds, so some commands \
+             and fixes may be unavailable. If this client is the newer one, run `synaps daemon \
+             reload`; otherwise restart the client to match the daemon: synaps --attach {session}"
+        ),
+    })
+}
+
+/// Compare dotted numeric versions (`0.10.2`, a `-pre`/`+build` suffix
+/// ignored); `None` when either doesn't parse.
+fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        let core = v.trim().trim_start_matches('v').split(['-', '+']).next()?;
+        core.split('.').map(|p| p.parse().ok()).collect()
+    }
+    Some(parts(a)?.cmp(&parts(b)?))
 }
 
 /// Attach handshake budget.
@@ -329,6 +357,32 @@ mod tests {
         // versions only.
         assert_eq!(version_skew_notice(&bin("0.10.2", "ae490b32"), &bin("0.10.2", ""), "s"), None);
         assert_eq!(version_skew_notice(&bin("0.10.2", ""), &bin("0.10.2", "cd1fbf50"), "s"), None);
+    }
+
+    /// 04-tui I3: a client NEWER than the daemon was told to restart itself,
+    /// which relaunches the same new binary. It must say to reload the daemon.
+    #[test]
+    fn skew_notice_names_the_side_that_is_behind() {
+        use super::{version_skew_notice, BinaryId};
+        let bin = |version: &str, build: &str| BinaryId { version: version.into(), build: build.into() };
+        // Client newer (the usual upgrade path): reload the daemon.
+        let n = version_skew_notice(&bin("0.10.3", "be670c09"), &bin("0.10.2", "cd1fbf50"), "s").unwrap();
+        assert!(n.starts_with("this client is synaps 0.10.3 but the daemon is 0.10.2 —"), "{n}");
+        assert!(n.contains("run `synaps daemon reload`"), "{n}");
+        assert!(!n.to_lowercase().contains("restart the client"), "{n}");
+        assert!(!n.contains("synaps --attach"), "{n}");
+        // Numeric, not lexical: 0.10.0 is newer than 0.9.9.
+        let n = version_skew_notice(&bin("0.10.0", ""), &bin("0.9.9", ""), "s").unwrap();
+        assert!(n.contains("run `synaps daemon reload`"), "{n}");
+        // Client older: restart the client, as before.
+        let n = version_skew_notice(&bin("0.9.9", ""), &bin("0.10.0", ""), "s").unwrap();
+        assert!(n.contains("Restart the client"), "{n}");
+        assert!(!n.contains("daemon reload"), "{n}");
+        // Same version, another build: which is newer is unknown; both remedies.
+        let n = version_skew_notice(&bin("0.10.2", "ae490b32"), &bin("0.10.2", "cd1fbf50"), "s").unwrap();
+        assert!(n.contains("run `synaps daemon reload`"), "{n}");
+        assert!(n.contains("restart the client"), "{n}");
+        assert!(n.contains("synaps --attach s"), "{n}");
     }
 
     /// An older daemon's `Welcome` has no build: it parses, build unknown.

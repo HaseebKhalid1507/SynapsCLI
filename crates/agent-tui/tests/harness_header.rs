@@ -72,24 +72,17 @@ fn idle_session_shows_the_wordmark_label_and_build() {
         "Ghost drops the 'ready' text: {line:?}"
     );
 
-    // Right side: the build and nothing else. `v<version> · <hash>` in a
-    // checkout, `v<version>` alone in a packaged build (no hash to show).
-    let r = right(&mut h);
+    // Right side: the build and nothing else: `v<version> · <id>` with a
+    // build id, `v<version>` alone without one. Pinned, so it doesn't
+    // depend on the id this test binary was built with.
     let ver = concat!("v", env!("CARGO_PKG_VERSION"));
-    assert!(
-        r.starts_with(ver),
-        "idle right side should be the build: {r:?}"
-    );
-    if let Some(hash) = r[ver.len()..].strip_prefix(" · ") {
-        assert!(
-            !hash.is_empty()
-                && hash != "release"
-                && hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-            "hash: {r:?}"
-        );
-    } else {
-        assert_eq!(r, ver, "build: {r:?}");
-    }
+    h.set_build_id("ae490b32");
+    let r = right(&mut h);
+    assert_eq!(r, format!("{ver} \u{b7} ae490b32"), "idle right side should be the build");
+    h.set_build_id("");
+    let r = right(&mut h);
+    assert_eq!(r, ver, "no build id: the version alone");
+    let line = header(&mut h);
 
     // No indicator anywhere between the wordmark and the build.
     let start = line.find("synaps").unwrap() + "synaps".len();
@@ -103,6 +96,9 @@ fn idle_session_shows_the_wordmark_label_and_build() {
 #[test]
 fn a_narrow_idle_header_drops_the_build_before_the_label() {
     let mut h = TestHarness::boot_with_size(40, 20);
+    // A build id pinned long enough not to fit next to the label at 40
+    // columns, whatever id (or none) the binary was built with.
+    h.set_build_id("ae490b32-dirty");
     let line = header(&mut h);
     assert!(
         line.contains("test-session"),
@@ -111,6 +107,14 @@ fn a_narrow_idle_header_drops_the_build_before_the_label() {
     assert!(
         !line.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
         "build should give way: {line:?}"
+    );
+    // The bare version (no build id) does fit at 40: shown.
+    h.set_build_id("");
+    let line = header(&mut h);
+    assert!(line.contains("test-session"), "{line:?}");
+    assert!(
+        line.trim_end().ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
+        "the version alone fits: {line:?}"
     );
 }
 
@@ -203,6 +207,7 @@ fn each_phase_of_a_turn_has_its_own_indicator() {
     // The provider pushed back: retrying + ripple.
     h.feed_event(session(WireSessionStreamEvent::Notice {
         text: "⏳ API error, retrying (1/3)…".into(),
+        retry: true,
     }));
     let r = right(&mut h);
     assert!(r.starts_with("retrying"), "retry label missing: {r:?}");
@@ -218,6 +223,39 @@ fn each_phase_of_a_turn_has_its_own_indicator() {
         !line.contains("retrying"),
         "retry label after done: {line:?}"
     );
+}
+
+/// 04-tui I4: `retrying` showed only for notices that began with ⏳, so a
+/// 429 ("⚠ Rate limited — …"), the most common retry, and the OpenAI
+/// incomplete-response retry never showed it. The state now comes from the
+/// typed retry flag the engine sets where it retries, not from the text.
+#[test]
+fn retrying_follows_the_typed_retry_signal_not_the_text() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.feed_event(turn());
+    for text in [
+        "⚠ Rate limited — resuming in 42s (1/10)",
+        "⚠ Rate limited — retrying (2/10)",
+        "Response incomplete — retrying response (1/3); incomplete output discarded, no tools replayed.",
+        "⚠ Gemini rate limited — resuming in 7s (1/5)",
+    ] {
+        h.feed_event(session(WireSessionStreamEvent::Notice {
+            text: text.into(),
+            retry: true,
+        }));
+        let r = right(&mut h);
+        assert!(r.starts_with("retrying"), "{text:?}: {r:?}");
+        assert!(h.main_transcript_text().contains(text), "it still prints as a notice");
+        h.feed_event(llm(WireLlmEvent::ResponseStart));
+        assert!(!right(&mut h).starts_with("retrying"), "the retry went out");
+    }
+    // A status notice is not a retry, whatever its text looks like.
+    h.feed_event(session(WireSessionStreamEvent::Notice {
+        text: "⏳ looks like a retry".into(),
+        retry: false,
+    }));
+    let r = right(&mut h);
+    assert!(!r.starts_with("retrying"), "{r:?}");
 }
 
 #[test]
@@ -263,4 +301,69 @@ fn running_workers_show_done_over_total_and_one_bar_each() {
         .collect();
     assert_eq!(bars.len(), 3, "one bar per worker: {r:?}");
     assert_eq!(bars[0], '▁', "the finished worker's bar lies flat: {r:?}");
+}
+
+/// 04-tui M3: a failed turn's label ("✗ 401") survived `/new`, so the new
+/// session showed the old session's failure until its first turn.
+#[test]
+fn a_new_session_drops_the_failed_turn_label() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.feed_event(turn());
+    h.feed_event(session(WireSessionStreamEvent::Error {
+        message: "unauthorized".into(),
+        outcome: TurnOutcome::ProviderFailed {
+            code: "401".into(),
+            correlation_id: "c1".into(),
+        },
+    }));
+    assert_eq!(right(&mut h), "✗ 401");
+    h.feed_event(W::Cleared { session_id: "next".into() }.into());
+    let line = header(&mut h);
+    assert!(!line.contains('✗'), "/new clears the failure: {line:?}");
+}
+
+/// 04-tui M2: the header cut the reconnect status at "…", so the countdown
+/// ("4s left, attempt 2") was shown nowhere. It shows when there is room.
+#[test]
+fn the_reconnect_countdown_shows_when_there_is_room() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.set_status_text(Some("reconnecting… (4s left, attempt 2)"));
+    let line = header(&mut h);
+    assert!(
+        line.contains("reconnecting \u{b7} 4s left, attempt 2"),
+        "{line:?}"
+    );
+    // Too narrow for it: the word alone, as before.
+    h.resize(40, 20);
+    let line = header(&mut h);
+    assert!(line.contains("reconnecting"), "{line:?}");
+    assert!(!line.contains("attempt"), "{line:?}");
+    assert!(line.contains("synaps"), "the wordmark stays: {line:?}");
+}
+
+/// 04-tui M1: at 80 columns a long worker name in the banner ran under the
+/// right-hand clock, which overwrote it. The name is cut with `…` so the
+/// banner and the clock both read.
+#[test]
+fn a_long_worker_name_is_cut_not_overwritten_at_80_columns() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut h = TestHarness::boot_with_size(80, 24);
+    h.feed_event(turn());
+    h.feed_event(agent(WireAgentEvent::SubagentStart {
+        subagent_id: 1,
+        agent_name: "code-reviewer-specialist".into(),
+        task_preview: "review".into(),
+    }));
+    h.key(KeyCode::Up, KeyModifiers::ALT);
+    let line = header(&mut h);
+    assert!(line.contains("\u{25c9} code-rev"), "{line:?}");
+    assert!(!line.contains("code-reviewer-specialist"), "cut: {line:?}");
+    assert!(line.contains('\u{2026}'), "with an ellipsis: {line:?}");
+    assert!(line.contains("sa_1"), "{line:?}");
+    assert!(line.contains("Esc back"), "the hint is intact: {line:?}");
+    let (hint, clock) = (line.find("Esc back"), line.find("0:00"));
+    assert!(
+        matches!((hint, clock), (Some(a), Some(b)) if a < b),
+        "the clock is intact, after the banner: {line:?}"
+    );
 }

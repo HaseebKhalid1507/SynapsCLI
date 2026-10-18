@@ -345,8 +345,24 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
-/// Handle a slash command when NOT streaming.
+/// Handle a slash command when NOT streaming. Its notices show in the view
+/// it was typed in ([`super::watch::begin_command`]).
 pub(super) async fn handle_command(
+    cmd: &str,
+    arg: &str,
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+    system_prompt_path: &Path,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
+) -> CommandAction {
+    let prev = super::watch::begin_command(app);
+    let action = run_command(cmd, arg, app, link, system_prompt_path, registry, keybind_registry).await;
+    super::watch::end_command(app, prev);
+    action
+}
+
+async fn run_command(
     cmd: &str,
     arg: &str,
     app: &mut App,

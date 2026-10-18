@@ -368,6 +368,21 @@ fn handle_key(
                 KeybindAction::LoadSkill(skill) => {
                     InputAction::SlashCommand("load".to_string(), skill.clone())
                 }
+                // In a worker view the prompt goes to that worker, or is
+                // refused there; never submitted to main (prG R2).
+                KeybindAction::InjectPrompt(text) if super::watch::focused(app).is_some() => {
+                    match super::watch::steer_target(app) {
+                        Some(Ok(handle_id)) => InputAction::SubagentSteer {
+                            handle_id,
+                            text: text.clone(),
+                        },
+                        Some(Err(reason)) => {
+                            super::watch::steer_unavailable(app, reason);
+                            InputAction::None
+                        }
+                        None => InputAction::None,
+                    }
+                }
                 KeybindAction::InjectPrompt(text) => InputAction::Submit(text.clone()),
                 KeybindAction::Disabled => InputAction::None,
                 KeybindAction::RunScript { .. } => {
@@ -377,22 +392,19 @@ fn handle_key(
             };
         }
     }
-    // Subagent thread views (super::watch). Ctrl-↑/↓ are reserved core keys
-    // (never plugin-bindable); they must precede the history arms below,
-    // which match Up/Down with any modifier.
+    // Subagent thread views (super::watch). Ctrl-↑/↓ and Alt-↑/↓ (macOS
+    // takes Ctrl-↑/↓ for Mission Control) are reserved core keys (never
+    // plugin-bindable); they must precede the history arms below, which
+    // match Up/Down with any modifier.
     let watching = super::watch::focused(app).is_some();
     match (code, modifiers) {
-        (KeyCode::Up, KeyModifiers::CONTROL) => {
-            if !super::watch::cycle(app, super::watch::Step::Up, std::time::Instant::now()) {
-                app.toasts.upsert(
-                    super::toast::Toast::new("watch", "no subagents to watch").titled("Subagents"),
-                );
-                app.request_redraw();
-            }
-            return InputAction::None;
-        }
-        (KeyCode::Down, KeyModifiers::CONTROL) => {
-            super::watch::cycle(app, super::watch::Step::Down, std::time::Instant::now());
+        (KeyCode::Up | KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            let step = if code == KeyCode::Up {
+                super::watch::Step::Up
+            } else {
+                super::watch::Step::Down
+            };
+            super::watch::switch(app, step, std::time::Instant::now());
             return InputAction::None;
         }
         // Esc in a worker view returns to main — it never aborts main's turn.
@@ -406,22 +418,47 @@ fn handle_key(
         {
             return InputAction::None;
         }
+        // Shift/Alt-Enter in a worker view only ever add a line: while main
+        // streams, the arms below would send the text to MAIN (04-tui I1).
+        (KeyCode::Enter, m) if watching && m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            app.editor.insert_newline();
+            return InputAction::None;
+        }
         // Enter with text in a worker view steers that worker; slash
         // commands still run as usual.
-        (KeyCode::Enter, m)
-            if watching
-                && !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                && !app.input_is_empty()
-                && !app.input_first_line().starts_with('/') =>
+        (KeyCode::Enter, _)
+            if watching && !app.input_is_empty() && !app.input_first_line().starts_with('/') =>
         {
             match super::watch::steer_target(app) {
                 Some(Ok(handle_id)) => return process_subagent_steer(app, handle_id),
-                Some(Err(reason)) => {
-                    super::watch::steer_unavailable(app, reason);
-                    return InputAction::None;
-                }
-                None => {}
+                Some(Err(reason)) => super::watch::steer_unavailable(app, reason),
+                None => super::watch::steer_unavailable(app, "this view has no subagent to steer".into()),
             }
+            return InputAction::None;
+        }
+        // While main streams, an unknown `/word` would be sent to main as a
+        // steer; idle, a `/` with no command word would be sent to main as a
+        // prompt (prG R1). In a worker view both are refused there instead.
+        // Idle, a non-empty unknown `/word` still goes to the session (a
+        // newer daemon's command), and its answer lands in this view.
+        (KeyCode::Enter, _)
+            if watching
+                && !slash_is_known(app, registry)
+                && (streaming || slash_word(app).is_empty()) =>
+        {
+            let word = app.input_first_line().split_whitespace().next().unwrap_or("/").to_string();
+            super::watch::notice(app, format!("unknown command: {word}"));
+            return InputAction::None;
+        }
+        // Staged attachments are main's; an empty Enter here never sends them.
+        (KeyCode::Enter, _) if watching && app.input_is_empty() => {
+            if !app.pending_attachments.is_empty() {
+                super::watch::notice(
+                    app,
+                    "attachments go to the main thread \u{2014} Esc, then Enter sends them".into(),
+                );
+            }
+            return InputAction::None;
         }
         _ => {}
     }
@@ -536,6 +573,35 @@ fn handle_key(
     InputAction::None
 }
 
+/// Whether the input is a `/command` the streaming dispatch would run or
+/// refuse, rather than send to the main agent as a steer (the same
+/// resolution as `dispatch`'s `StreamingInput` arm). Non-slash input: true.
+fn slash_is_known(app: &App, registry: &Arc<CommandRegistry>) -> bool {
+    if !app.input_first_line().starts_with('/') {
+        return true;
+    }
+    let raw = slash_word(app);
+    if raw.is_empty() {
+        return false;
+    }
+    let streaming = super::commands::to_owned_commands(super::commands::STREAMING_COMMANDS);
+    if super::commands::is_streaming_command(&super::commands::resolve_prefix(raw, &streaming)) {
+        return true;
+    }
+    let all = super::commands::all_commands_with_skills(registry);
+    let resolved = super::commands::resolve_prefix(raw, &all);
+    all.contains(&resolved)
+}
+
+/// The command word of `/word args` (empty for a bare `/`).
+fn slash_word(app: &App) -> &str {
+    let rest = app.input_first_line().strip_prefix('/').unwrap_or("");
+    if rest.starts_with(char::is_whitespace) {
+        return "";
+    }
+    rest.split_whitespace().next().unwrap_or("")
+}
+
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
     let now = app.clock.now();
@@ -548,7 +614,10 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.history_index = None;
     app.input_stash.clear();
     app.clear_input();
-    app.transcript.scroll_to_bottom();
+    // Typed in a worker view, it is a command: main keeps its place (I2).
+    if super::watch::focused(app).is_none() {
+        app.transcript.scroll_to_bottom();
+    }
 
     if input.starts_with('/') && input.len() > 1 {
         let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
@@ -1324,6 +1393,77 @@ mod tests {
     }
 
     /// Shift-Enter inserts a newline into the buffer instead of submitting.
+    /// A plugin keybind that injects `prompt`, pressed with Ctrl-Shift-P.
+    fn press_inject(app: &mut App, prompt: &str) -> InputAction {
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let mut keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        keybinds.register_plugin(
+            "p",
+            &[synaps_cli::skills::keybinds::ManifestKeybind {
+                key: "C-S-p".into(),
+                action: "inject_prompt".into(),
+                command: None,
+                skill: None,
+                prompt: Some(prompt.into()),
+                script: None,
+                description: None,
+            }],
+            std::path::Path::new("/tmp"),
+        );
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        handle_key(crossterm::event::KeyEvent::new(KeyCode::Char('p'), mods), app, false, &registry, &keybinds)
+    }
+
+    /// prG R2: plugin keybinds are checked before the worker-view handling,
+    /// so an inject-prompt bind pressed in a worker view submitted to MAIN.
+    /// It steers the watched worker instead, or is refused in its view.
+    #[test]
+    fn an_inject_prompt_keybind_in_a_worker_view_never_submits_to_main() {
+        let mut app = make_app();
+        assert!(
+            matches!(press_inject(&mut app, "run the tests"), InputAction::Submit(t) if t == "run the tests"),
+            "on main it submits, as before"
+        );
+        let clock = app.clock.clone();
+        let w = app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        w.status = "running".into();
+        w.steerable = true;
+        app.threads.focus_worker("sa_1");
+        assert!(matches!(
+            press_inject(&mut app, "run the tests"),
+            InputAction::SubagentSteer { handle_id, text } if handle_id == "sa_1" && text == "run the tests"
+        ));
+        let w = app.threads.worker_mut("sa_1").unwrap();
+        w.status = "completed".into();
+        w.steerable = false;
+        assert!(matches!(press_inject(&mut app, "run the tests"), InputAction::None));
+        let note = app.threads.worker("sa_1").unwrap().store.messages().last().map(|m| match &m.msg {
+            ChatMessage::System(t) => t.clone(),
+            _ => String::new(),
+        });
+        assert!(note.unwrap_or_default().contains("read-only"), "refused in the view");
+    }
+
+    /// 04-tui I1: in a worker view, Enter on an empty box with staged
+    /// attachments fell through to the attachment-only submit, to MAIN.
+    #[test]
+    fn enter_with_only_attachments_in_a_worker_view_sends_nothing_to_main() {
+        let mut app = make_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "hi").unwrap();
+        let file = agent_engine::attachments::load_attachment_sync(&path).unwrap();
+        app.pending_attachments.add(file).unwrap();
+        let clock = app.clock.clone();
+        app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        app.threads.focus_worker("sa_1");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        assert_eq!(app.pending_attachments.len(), 1, "still staged for main");
+    }
+
     #[test]
     fn shift_enter_inserts_newline() {
         let mut app = make_app();
