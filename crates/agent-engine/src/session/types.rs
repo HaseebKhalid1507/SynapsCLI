@@ -618,6 +618,12 @@ pub enum SessionCommand {
     /// against their archives and wakes the parent once per worker.
     #[serde(skip)]
     AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): the reload this session checkpointed for
+    /// did not exec (the exec failed, or the reload stopped after the
+    /// checkpoints). The checkpoint's reload fence lifts, and the workers
+    /// the reload stopped are announced to this same image.
+    #[serde(skip)]
+    ReloadAborted,
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -705,6 +711,7 @@ impl std::fmt::Debug for SessionCommand {
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
                 .finish(),
+            Self::ReloadAborted => f.write_str("ReloadAborted"),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }

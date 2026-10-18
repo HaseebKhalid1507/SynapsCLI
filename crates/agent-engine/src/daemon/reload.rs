@@ -383,9 +383,6 @@ pub struct Prepared {
     pub exe: PathBuf,
     pub rs_path: PathBuf,
     pub generation: u64,
-    /// What was recorded: on a failed exec the old image keeps serving, and
-    /// the workers its checkpoint stopped are re-announced from here.
-    pub state: ReloadState,
 }
 
 pub async fn prepare(
@@ -455,14 +452,16 @@ pub async fn prepare(
     // only other place `reloading` is cleared), so reset the drain flag here —
     // otherwise a failed reload-state write bricks the daemon (it refuses every
     // new Create/Submit/Compact until restart).
-    let body = serde_json::to_vec_pretty(&rs).map_err(|e| {
+    let written = serde_json::to_vec_pretty(&rs)
+        .map_err(|e| e.to_string())
+        .and_then(|body| registry::write_private_atomic(&rs_path, &body).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        // No exec will follow: every checkpointed session lifts its fence
+        // and hears about the workers its checkpoint stopped.
+        abort_checkpoints(state).await;
         state.reloading.store(false, Ordering::SeqCst);
-        ReloadError::ExecFailed(e.to_string())
-    })?;
-    registry::write_private_atomic(&rs_path, &body).map_err(|e| {
-        state.reloading.store(false, Ordering::SeqCst);
-        ReloadError::ExecFailed(e.to_string())
-    })?;
+        return Err(ReloadError::ExecFailed(e));
+    }
 
     // 4. announce — every OTHER conn selects on `reload_announce` and sends
     //    Event(Reloading) + Bye{Reloading}; give their writers ≤ 1 s.
@@ -472,7 +471,7 @@ pub async fn prepare(
     while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(1) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Ok(Prepared { exe, rs_path, generation, state: rs })
+    Ok(Prepared { exe, rs_path, generation })
 }
 
 /// Step 5: rewrite `daemon.json` (generation+1, same pid), stop sidecars,
@@ -531,9 +530,10 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
     if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
         tracing::warn!("daemon: extension re-discovery still running after 10 s");
     }
-    // The checkpoint stopped every worker for an exec that did not happen:
-    // their parents are still here and still waiting — tell them.
-    readopt_workers(state, &p.state).await;
+    // The checkpoint fenced every session and stopped its workers for an
+    // exec that did not happen: their parents are still here and still
+    // waiting — lift the fences and tell them.
+    abort_checkpoints(state).await;
     state.reloading.store(false, Ordering::SeqCst);
     ReloadError::ExecFailed(err)
 }
@@ -633,15 +633,14 @@ fn parse_holder_from_error(e: &str) -> String {
     "unknown holder".to_string()
 }
 
-/// Failed exec: hand each still-live session back the workers its
-/// checkpoint stopped, exactly as the next image would have.
-async fn readopt_workers(state: &Arc<DaemonState>, rs: &ReloadState) {
-    for s in rs.sessions.iter().filter(|s| !s.workers.is_empty()) {
-        if let Some(h) = state.live_sessions().into_iter().find(|h| h.id.as_str() == s.id) {
-            let _ = h
-                .send(SessionCommand::AdoptWorkers { workers: s.workers.clone() })
-                .await;
-        }
+/// No exec after the checkpoints (it failed, or the reload stopped before
+/// it): every live session lifts its reload fence and is handed back the
+/// workers its checkpoint stopped (`ReloadAborted`, a no-op for a session
+/// that never checkpointed). The actor re-announces from its own record,
+/// so a checkpoint that answered too late for the reload record is covered.
+async fn abort_checkpoints(state: &Arc<DaemonState>) {
+    for h in state.live_sessions() {
+        let _ = h.send(SessionCommand::ReloadAborted).await;
     }
 }
 

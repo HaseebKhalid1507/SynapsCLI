@@ -41,6 +41,13 @@ pub const WORKER_RELOAD_STOP_TIMEOUT_SECS: u64 = 10;
 pub const WORKER_RELOAD_STOP_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(WORKER_RELOAD_STOP_TIMEOUT_SECS);
 
+/// Longest a reload checkpoint fences its session (no queue-wake turns,
+/// keep-warm pings, driver ticks or parking) waiting for the `execv` or for
+/// the daemon to report it failed (`ReloadAborted`). Both normally come
+/// within seconds; this only bounds a reload that never reports back (or a
+/// client-sent reload checkpoint, which no exec follows).
+pub const RELOAD_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Session end's bounded observability flush (`finish` STEP 3).
 pub const OBSERVABILITY_FLUSH_TIMEOUT_SECS: u64 =
     crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs();

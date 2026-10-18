@@ -1207,7 +1207,11 @@ impl SessionActor {
 
     /// `select!` arm: a ping may be due.
     pub(crate) async fn on_cache_keepwarm_due(&mut self) {
-        if self.cache_keepwarm.period.is_none() || self.cache_keepwarm.task.is_some() {
+        // Fenced for a reload: the exec would discard the ping's result.
+        if self.reload_fence.is_some()
+            || self.cache_keepwarm.period.is_none()
+            || self.cache_keepwarm.task.is_some()
+        {
             return;
         }
         let (now, wall) = (Instant::now(), SystemTime::now());

@@ -60,6 +60,7 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::Resync { .. } => Err("resync: not a client command"),
         C::Park => Err("park: not a client command"),
         C::AdoptWorkers { .. } => Err("adopt_workers: not a client command"),
+        C::ReloadAborted => Err("reload_aborted: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
         C::DriverStart { .. } => Ok(()),
     }

@@ -624,6 +624,11 @@ pub struct SubagentRegistry {
     // are cancelled before their thread can start inference.
     spawn_cancellation: Option<crate::CancellationToken>,
     spawn_epoch: u64,
+    /// `Some(fence before)` from a daemon reload's
+    /// [`Self::stop_for_reload`] until [`Self::lift_reload_fence`] (a failed
+    /// exec): every registration in between is stopped at birth, flagged as
+    /// the reload's (carried and announced like the workers it stopped).
+    reload_fence: Option<Option<crate::CancellationToken>>,
     /// Foreground turn generation, advanced by the session at every turn
     /// start and stamped on each handle at registration. `0` until a
     /// frontend opts in by calling [`Self::begin_turn`].
@@ -656,6 +661,7 @@ impl SubagentRegistry {
             reload_woken: HashMap::new(),
             spawn_cancellation: None,
             spawn_epoch: 0,
+            reload_fence: None,
             turn_generation: 0,
             archived: HashMap::new(),
             retained_watch: HashMap::new(),
@@ -788,7 +794,17 @@ impl SubagentRegistry {
         mut handle: SubagentHandle,
         origin: Option<&crate::CancellationToken>,
     ) -> String {
-        if origin.is_some_and(|c| c.is_cancelled())
+        if self.reload_fence.is_some() {
+            // Launched while a reload stops this session's workers: the
+            // reload stops it too (not the user, whatever cancelled the
+            // launching turn), so it is carried and its parent woken.
+            handle
+                .state
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .stopped_by_reload = true;
+            handle.cancel();
+        } else if origin.is_some_and(|c| c.is_cancelled())
             || self
                 .spawn_cancellation
                 .as_ref()

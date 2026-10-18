@@ -339,6 +339,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::KeepWarm { .. } => "keep_warm",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
+        SessionCommand::ReloadAborted => "reload_aborted",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -451,6 +452,21 @@ pub struct SessionActor {
     pub(crate) driver_interrupted_owner: Option<String>,
     /// 200 ms cadence for `driver_tick()`, always present.
     pub(crate) driver_tick_interval: tokio::time::Interval,
+    /// Set by a reload checkpoint until the `execv` (or until the daemon
+    /// reports it failed): see [`ReloadFence`].
+    pub(crate) reload_fence: Option<ReloadFence>,
+}
+
+/// A reload checkpoint wrote this session's reload record; until the
+/// `execv` replaces the process nothing may start new work the record does
+/// not know about. Queue wakes stay queued (the record carries the wakes it
+/// owes), and keep-warm pings, driver ticks and parking wait. Lifted by
+/// `ReloadAborted` (the exec failed) or, as a backstop, at `deadline`.
+pub(crate) struct ReloadFence {
+    pub(crate) deadline: tokio::time::Instant,
+    /// What the checkpoint recorded: re-announced to this image when the
+    /// exec does not happen.
+    pub(crate) workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
 impl SessionActor {
@@ -714,6 +730,7 @@ impl SessionActor {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval
             },
+            reload_fence: None,
         };
         Ok((handle, SessionTask(actor)))
     }
@@ -1296,6 +1313,9 @@ impl SessionActor {
     /// spawned tasks. Mirrors the TUI's `tick()` (TUI :695-1027).
     pub(crate) async fn driver_tick(&mut self) {
         use crate::extensions::session_driver::Outcome;
+        if self.reload_fence.is_some() {
+            return;
+        }
 
         // ── 1. Cleanup cancelled stream setup ────────────────────────────
         // (e.g. the grant's deadline cancelled the driver token before the
@@ -3003,6 +3023,10 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
+        if self.reload_fence.is_some() {
+            // Fenced for a reload: the record carries what is queued.
+            return;
+        }
         if self.is_parked() {
             if self.event_queue.is_empty() {
                 return;
@@ -4032,19 +4056,19 @@ impl SessionActor {
         }
         // Workers cannot survive the exec either (they are threads of this
         // process). Flag + cancel them BEFORE `cancel_turn` (whose own
-        // cancel would otherwise label them user-cancelled).
-        let stopping = match reason {
-            CheckpointReason::Reload => self
-                .runtime
-                .subagent_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .stop_for_reload(),
-            CheckpointReason::HostRequest => Vec::new(),
-        };
+        // cancel would otherwise label them user-cancelled). This also
+        // fences new launches: a worker the turn registers before its
+        // cancel lands is stopped at birth as the reload's.
+        let reload = matches!(reason, CheckpointReason::Reload);
+        if reload {
+            self.stop_workers_for_reload();
+        }
         if self.streaming {
             self.cancel_turn(interrupt).await;
         }
+        // Again after the turn cancel: every worker to await, including
+        // any the cancelled turn registered meanwhile.
+        let stopping = if reload { self.stop_workers_for_reload() } else { Vec::new() };
         let stopped_workers = await_stopped_workers(self.id.as_str(), stopping).await;
         self.abort_compaction();
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
@@ -4074,8 +4098,14 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         let mut record = self.reload_record();
-        if matches!(reason, CheckpointReason::Reload) {
+        if reload {
             record.workers = self.reload_carried_workers();
+            // Recorded: from here to the exec, nothing may start work the
+            // record does not carry (a queued wake must stay queued).
+            self.reload_fence = Some(ReloadFence {
+                deadline: tokio::time::Instant::now() + budgets::RELOAD_FENCE_TIMEOUT,
+                workers: record.workers.clone(),
+            });
         }
         let record = serde_json::to_value(record).unwrap_or_default();
         self.emit(SessionEventWire::QueryResult {
@@ -4164,6 +4194,50 @@ impl SessionActor {
         }
     }
 
+    /// `stop_for_reload` on this session's registry (fences new launches).
+    fn stop_workers_for_reload(
+        &self,
+    ) -> Vec<(String, Arc<std::sync::RwLock<crate::runtime::subagent::SubagentState>>)> {
+        self.runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stop_for_reload()
+    }
+
+    /// Host-only (`SessionCommand::ReloadAborted`): the reload this session
+    /// checkpointed for did not exec, so the old image keeps serving it.
+    /// Lift the reload fence, hand the workers the checkpoint stopped back
+    /// to the parent, and deliver what queued up meanwhile.
+    pub(crate) async fn reload_aborted(&mut self) {
+        let Some(fence) = self.reload_fence.take() else {
+            return;
+        };
+        if self.runtime.is_live() {
+            self.runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lift_reload_fence();
+        }
+        tracing::info!(session = %self.id, "reload did not exec: fence lifted");
+        self.adopt_workers(fence.workers);
+        self.rearm_park();
+        if !self.event_queue.is_empty() {
+            self.on_queue_wake().await;
+        }
+    }
+
+    /// Backstop: no exec and no `ReloadAborted` within
+    /// [`budgets::RELOAD_FENCE_TIMEOUT`] of the checkpoint.
+    async fn reload_fence_expired(&mut self) {
+        tracing::warn!(
+            session = %self.id,
+            "reload fence expired with no exec and no abort from the daemon; lifting it"
+        );
+        self.reload_aborted().await;
+    }
+
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.
     pub(crate) fn abort_compaction(&mut self) {
         if let Some(job) = self.compact.take() {
@@ -4206,6 +4280,7 @@ impl SessionActor {
                     | SessionCommand::Cancel
                     | SessionCommand::Checkpoint { .. }
                     | SessionCommand::Park
+                    | SessionCommand::ReloadAborted
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
             );
@@ -4338,6 +4413,7 @@ impl SessionActor {
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
+            SessionCommand::ReloadAborted => self.reload_aborted().await,
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();
@@ -4558,6 +4634,14 @@ async fn prompt_abandon_timer(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// The reload fence's backstop deadline; pends forever when unfenced.
+async fn reload_fence_timer(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 200 ms cadence, gated on driver state — `None` driver+pending → pending forever.
 async fn driver_tick_timer(
     has_driver: bool,
@@ -4594,6 +4678,13 @@ impl SessionTask {
         Arc::clone(self.0.runtime.subagent_registry())
     }
 
+    /// Test seam: this session's event queue (what a worker's finalizer
+    /// pushes its completion wake into).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn event_queue(&self) -> Arc<crate::events::EventQueue> {
+        Arc::clone(&self.0.event_queue)
+    }
+
     /// Unbiased select (the TUI loop is unbiased too).
     pub async fn run(mut self) {
         let queue = Arc::clone(&self.0.event_queue);
@@ -4610,12 +4701,13 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
-                _ = queue.notified() => actor.on_queue_wake().await,
+                // A reload fence keeps the wake (and its permit) queued.
+                _ = queue.notified(), if actor.reload_fence.is_none() => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
-                _ = park_timer(actor.park_deadline) => {
+                _ = park_timer(actor.park_deadline), if actor.reload_fence.is_none() => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
                     }
@@ -4623,7 +4715,7 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()) => {
+                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if actor.reload_fence.is_none() => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
@@ -4639,8 +4731,11 @@ impl SessionTask {
                         actor.publish_view().await;
                     }
                 },
-                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval) => {
+                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
                     actor.driver_tick().await;
+                }
+                _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {
+                    actor.reload_fence_expired().await;
                 }
                 _ = revoked_turn_timer(actor.revoked_turn_deadline) => {
                     actor.finish_revoked_turn(false).await;
