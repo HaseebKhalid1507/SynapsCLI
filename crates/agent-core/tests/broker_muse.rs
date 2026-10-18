@@ -170,17 +170,32 @@ fn always_401_upstream(seen: Seen) -> Router {
     )
 }
 
+/// Another process re-minted the Muse key moments ago: it left its refresh
+/// time in the account's lock file, exactly as the refresh path does.
+fn stamp_recent_refresh(home: &std::path::Path, storage_key: &str) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    std::fs::write(
+        home.join(format!("auth.json.{storage_key}.refresh.lock")),
+        now_ms.to_string(),
+    )
+    .unwrap();
+}
+
 /// The Muse 401 re-mint runs through the single locked refresh path and its
-/// per-credential forced-refresh cooldown: auth.json was just written
-/// (`install_store`, i.e. "another process rotated it"), so no request mints
-/// a new key — none reaches the network mint (which would fail here) and
-/// every request makes exactly one upstream call. A permanent 401 therefore
-/// never mints on every request.
+/// per-account forced-refresh cooldown: this account was just re-minted by
+/// another process (stamp in `auth.json.muse.refresh.lock`), so no request
+/// mints a new key — none reaches the network mint (which would fail here)
+/// and every request makes exactly one upstream call. A permanent 401
+/// therefore never mints on every request.
 #[tokio::test]
 #[serial_test::serial]
 async fn muse_permanent_401_does_not_mint_inside_the_cooldown() {
     std::env::remove_var("META_API_KEY");
-    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    stamp_recent_refresh(home.path(), "muse");
     let seen = Seen::default();
     let upstream = spawn(always_401_upstream(seen.clone())).await;
     let broker = LocalBroker::new(reqwest::Client::new())

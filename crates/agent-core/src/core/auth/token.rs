@@ -384,11 +384,7 @@ where
     let lock_path = refresh_lock_path(path, &key);
     let load = || load_checked(path, cred, expected_seat);
     let save = |old_refresh: &str, fresh: &OAuthCredentials| {
-        let outcome = save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)?;
-        if outcome == CasOutcome::Saved {
-            note_refreshed(&gate_key, path);
-        }
-        Ok(outcome)
+        save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)
     };
     ensure_gated_locked_policy(
         refresh_gate(&gate_key),
@@ -397,7 +393,7 @@ where
         refresh,
         save,
         rejected,
-        || forced_refresh_allowed(cred, &gate_key, path),
+        |last_refresh_ms| forced_refresh_allowed(cred, last_refresh_ms, crate::epoch_millis()),
     )
     .await
 }
@@ -406,73 +402,36 @@ where
 /// credential. If the provider rejects a token minted less than this long
 /// ago, a new token will not help (org / permission / header problem) and
 /// spending the refresh token again only widens the rotation race window.
-/// Keyed per credential (auth file + storage key): two accounts of one
-/// provider never share a cooldown.
+///
+/// Per account, across processes: every successful refresh stamps its time
+/// into that account's own lock file (`auth.json.<storage_key>.refresh.lock`)
+/// while holding the lock, and the check reads it under the same lock. A
+/// refresh or `synaps login` of account A therefore never cools down
+/// account B, in this process or any other. This is a rate limit only; the
+/// flock + CAS save are what prevent a double spend.
 pub(crate) const FORCED_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
-#[derive(Default)]
-struct RefreshRecords {
-    /// When this process last saved a refreshed token, per gate key.
-    last_refresh: HashMap<String, std::time::Instant>,
-    /// Credential file mtime right after this process's own last save, per
-    /// file: lets the on-disk signal below ignore our own writes (which are
-    /// already accounted per credential) and count only other processes'.
-    own_write_mtime: HashMap<PathBuf, std::time::SystemTime>,
-}
-
-fn refresh_records() -> std::sync::MutexGuard<'static, RefreshRecords> {
-    static RECORDS: OnceLock<std::sync::Mutex<RefreshRecords>> = OnceLock::new();
-    RECORDS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-fn note_refreshed(gate_key: &str, path: &Path) {
-    let mtime = file_mtime(path);
-    let mut records = refresh_records();
-    records
-        .last_refresh
-        .insert(gate_key.to_string(), std::time::Instant::now());
-    if let Some(mtime) = mtime {
-        records.own_write_mtime.insert(path.to_path_buf(), mtime);
-    }
-}
-
-/// Rate limit for forcing a refresh of a not-yet-expired token. Refused if
-/// THIS process refreshed this credential within [`FORCED_REFRESH_COOLDOWN`],
-/// or if the credential file was written that recently by another process
-/// (another synaps may have just rotated it). Only consulted while storage
+/// Rate limit for forcing a refresh of a not-yet-expired token.
+/// `last_refresh_ms` is the epoch-ms stamp read from this account's lock
+/// file (any process's last successful refresh of THIS account). Refused
+/// only if that is less than [`FORCED_REFRESH_COOLDOWN`] ago; a missing,
+/// unparsable or future-dated stamp allows. Only consulted while storage
 /// still holds the rejected token, so an external `synaps login` that
 /// changes the token never hits it.
 fn forced_refresh_allowed(
     cred: &CredentialRef,
-    gate_key: &str,
-    path: &Path,
+    last_refresh_ms: Option<u64>,
+    now_ms: u64,
 ) -> std::result::Result<(), String> {
-    let mtime = file_mtime(path);
-    let (in_process, own_mtime) = {
-        let records = refresh_records();
-        (
-            records.last_refresh.get(gate_key).map(|t| t.elapsed()),
-            records.own_write_mtime.get(path).copied(),
-        )
-    };
-    let on_disk = mtime
-        .filter(|m| Some(*m) != own_mtime)
-        .and_then(|m| m.elapsed().ok());
-    match [in_process, on_disk].into_iter().flatten().min() {
-        Some(age) if age < FORCED_REFRESH_COOLDOWN => Err(format!(
+    let cooldown_ms = FORCED_REFRESH_COOLDOWN.as_millis() as u64;
+    match last_refresh_ms.filter(|t| *t <= now_ms).map(|t| now_ms - t) {
+        Some(age_ms) if age_ms < cooldown_ms => Err(format!(
             "{} rejected a token refreshed {}s ago; not refreshing again for {}s \
              (likely an account/permission issue, not a stale token). \
              Run `synaps login --provider {} --account {}` if this persists",
             cred,
-            age.as_secs(),
-            (FORCED_REFRESH_COOLDOWN - age).as_secs(),
+            age_ms / 1000,
+            (cooldown_ms - age_ms).div_ceil(1000),
             cred.provider,
             cred.account
         )),
@@ -502,8 +461,39 @@ const REFRESH_HTTP_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Guard holding the exclusive `flock`; dropping it releases the lock.
+///
+/// The lock file's content is this account's last-refresh stamp (epoch ms,
+/// plain ASCII), read and written only while the lock is held. Older
+/// clients open the same file with `truncate(false)` and never write it, so
+/// the stamp survives them.
 struct RefreshFileLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl RefreshFileLock {
+    /// Last successful refresh of this account by any process, if stamped.
+    fn last_refresh_ms(&self) -> Option<u64> {
+        use std::io::{Read, Seek};
+        let mut file = &self.file;
+        file.rewind().ok()?;
+        let mut text = String::new();
+        file.take(32).read_to_string(&mut text).ok()?;
+        text.trim().parse().ok()
+    }
+
+    /// Record a successful refresh. Best effort: a failed stamp only weakens
+    /// the rate limit, it never fails a refresh that is already persisted.
+    fn stamp_refreshed(&self, now_ms: u64) {
+        use std::io::{Seek, Write};
+        let mut file = &self.file;
+        let res = file
+            .set_len(0)
+            .and_then(|()| file.rewind())
+            .and_then(|()| file.write_all(now_ms.to_string().as_bytes()));
+        if let Err(e) = res {
+            tracing::debug!(error = %e, "could not stamp the refresh lock file");
+        }
+    }
 }
 
 /// Acquire the per-credential refresh lock off the async runtime (flock
@@ -517,7 +507,9 @@ async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileL
                 .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
         }
         let mut open = std::fs::OpenOptions::new();
-        open.create(true).write(true).truncate(false);
+        // Never truncate on open: the content is the refresh stamp, and
+        // must also survive older clients' opens of the same lock.
+        open.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -529,7 +521,7 @@ async fn acquire_refresh_lock(path: PathBuf) -> std::result::Result<RefreshFileL
         let deadline = std::time::Instant::now() + REFRESH_LOCK_WAIT;
         loop {
             match FileExt::try_lock_exclusive(&file) {
-                Ok(true) => return Ok(RefreshFileLock { _file: file }),
+                Ok(true) => return Ok(RefreshFileLock { file }),
                 Ok(false) => {}
                 Err(e) => {
                     return Err(format!(
@@ -618,15 +610,17 @@ where
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
 {
-    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, || Ok(())).await
+    ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, |_| Ok(())).await
 }
 
 /// `rejected` is an access token the provider just refused (HTTP 401). If
 /// the stored credential still carries it, a refresh is forced even though
 /// its expiry is in the future (revoked-but-unexpired) — provided
 /// `may_force` allows it (per-credential rate limit,
-/// [`FORCED_REFRESH_COOLDOWN`]). An expired credential always refreshes
-/// without consulting `may_force`.
+/// [`FORCED_REFRESH_COOLDOWN`]; it receives the last-refresh stamp read from
+/// the held lock file, `None` without a lock or stamp). An expired
+/// credential always refreshes without consulting `may_force`. Every
+/// successful save stamps the lock file before the lock is released.
 async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save, MayForce>(
     gate: Arc<Mutex<()>>,
     lock_path: Option<PathBuf>,
@@ -641,13 +635,13 @@ where
     Refresh: Fn(String) -> RFut,
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
-    MayForce: Fn() -> std::result::Result<(), String>,
+    MayForce: Fn(Option<u64>) -> std::result::Result<(), String>,
 {
     // In-process waiters are bounded like cross-process ones.
     let _gate = tokio::time::timeout(REFRESH_LOCK_WAIT, gate.lock_owned())
         .await
         .map_err(|_| "timed out waiting for an in-flight token refresh".to_string())?;
-    let _file_lock = match lock_path {
+    let file_lock = match lock_path {
         Some(path) => Some(acquire_refresh_lock(path).await?),
         None => None,
     };
@@ -664,7 +658,7 @@ where
         }
         if !expired {
             // Forced (rejection-driven) refresh of an unexpired credential.
-            may_force()?;
+            may_force(file_lock.as_ref().and_then(RefreshFileLock::last_refresh_ms))?;
         }
         let old_refresh = creds.refresh.clone();
         // The provider exchange is deadline-bounded so the lock hold time is
@@ -676,7 +670,12 @@ where
             fresh.account_id = creds.account_id.clone();
         }
         match save(&old_refresh, &fresh)? {
-            CasOutcome::Saved => return Ok(fresh),
+            CasOutcome::Saved => {
+                if let Some(lock) = &file_lock {
+                    lock.stamp_refreshed(crate::epoch_millis());
+                }
+                return Ok(fresh);
+            }
             CasOutcome::Removed => {
                 return Err(
                     "credential was removed while its token was being refreshed; run `synaps login`"
@@ -1408,7 +1407,7 @@ mod rejected_token_tests {
                 Ok(CasOutcome::Saved)
             },
             Some(rejected),
-            || Ok(()),
+            |_| Ok(()),
         )
         .await
     }
@@ -1470,7 +1469,7 @@ mod rejected_token_tests {
             |_| async { Ok(credential("new")) },
             |_, _| Ok(CasOutcome::Removed),
             Some("rejected"),
-            || Ok(()),
+            |_| Ok(()),
         )
         .await;
         assert!(result.unwrap_err().contains("removed"));
@@ -1520,7 +1519,7 @@ mod rejected_token_tests {
                     Ok(CasOutcome::Saved)
                 },
                 Some(rejected),
-                || Ok(()),
+                |_| Ok(()),
             )
             .await
         }
@@ -1584,7 +1583,7 @@ mod rejected_token_tests {
             },
             |_, _| Ok(CasOutcome::Saved),
             Some("rejected"),
-            || Err("cooldown".to_string()),
+            |_| Err("cooldown".to_string()),
         )
         .await
         .unwrap_err();
@@ -1609,7 +1608,7 @@ mod rejected_token_tests {
                 |_| async { Ok(credential("new")) },
                 |_, _| Ok(CasOutcome::Saved),
                 Some(rejected),
-                || Err("cooldown".to_string()),
+                |_| Err("cooldown".to_string()),
             )
             .await
             .unwrap();
@@ -1625,8 +1624,8 @@ mod rejected_token_tests {
         CredentialRef::new(OAuthProviderId::Anthropic, Account::named(label).unwrap())
     }
 
-    /// auth.json as left by a write long ago (not "another process just
-    /// rotated it").
+    /// auth.json seeded long ago. (The mtime no longer matters to the
+    /// cooldown; the old timestamp keeps these fixtures neutral.)
     fn seed_old(path: &Path, entries: &[(&CredentialRef, &str)]) {
         for (cred, access) in entries {
             save_provider_auth_at(path, &cred.storage_key(), &credential(access)).unwrap();
@@ -1680,23 +1679,148 @@ mod rejected_token_tests {
         assert!(!err.contains(&first.access), "error must not carry tokens: {err}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cooldown spends nothing");
 
-        // Account b: our own write of a's slot is not "another process".
+        // Account b: a's refresh stamped only a's lock file.
         forced(&path, &b, "b-rejected", &calls).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "b has its own cooldown");
     }
 
-    /// Another process wrote the credential file within the cooldown (it may
-    /// just have rotated it): do not force a refresh on top of it.
+    /// What another synaps process leaves behind after refreshing `cred`:
+    /// the refresh time stamped into that account's lock file.
+    fn stamp_as_other_process(path: &Path, cred: &CredentialRef, stamp: &str) {
+        std::fs::write(refresh_lock_path(path, &cred.storage_key()), stamp).unwrap();
+    }
+
+    fn now_stamp() -> String {
+        crate::epoch_millis().to_string()
+    }
+
+    /// Another process refreshed account A seconds ago (stamp in A's lock
+    /// file): a forced refresh of A is refused and spends nothing.
     #[tokio::test]
-    async fn foreign_auth_file_write_within_cooldown_blocks_forced_refresh() {
+    async fn other_process_refresh_stamp_blocks_forced_refresh_of_that_account() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let a = account("a");
-        // Written "now" by someone other than this process's refresh path.
-        save_provider_auth_at(&path, &a.storage_key(), &credential("a-rejected")).unwrap();
+        seed_old(&path, &[(&a, "a-rejected")]);
+        stamp_as_other_process(&path, &a, &now_stamp());
         let calls = AtomicUsize::new(0);
         let err = forced(&path, &a, "a-rejected", &calls).await.unwrap_err();
         assert!(err.contains("not refreshing again"), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A's stamp never cools down B in the same auth.json.
+    #[tokio::test]
+    async fn refresh_stamp_of_one_account_does_not_block_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let (a, b) = (account("a"), account("b"));
+        seed_old(&path, &[(&a, "a-rejected"), (&b, "b-rejected")]);
+        stamp_as_other_process(&path, &a, &now_stamp());
+        let calls = AtomicUsize::new(0);
+        forced(&path, &b, "b-rejected", &calls).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A fresh auth.json write (e.g. `synaps login` of any account) with no
+    /// refresh stamp no longer blocks a forced refresh.
+    #[tokio::test]
+    async fn foreign_auth_file_write_without_a_stamp_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let a = account("a");
+        // Written "now", by something other than a refresh.
+        save_provider_auth_at(&path, &a.storage_key(), &credential("a-rejected")).unwrap();
+        let calls = AtomicUsize::new(0);
+        forced(&path, &a, "a-rejected", &calls).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Review I3's leak: another process force-refreshed A, then THIS process
+    /// refreshed B (so the last auth.json write is ours). A 401 on A's new
+    /// token must still be refused — the cooldown is A's own stamp, not a
+    /// file-level "who wrote last" signal.
+    #[tokio::test]
+    async fn own_write_after_another_process_refreshed_a_does_not_hide_a_s_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let (a, b) = (account("a"), account("b"));
+        seed_old(&path, &[(&a, "a-new-from-peer"), (&b, "b-rejected")]);
+        stamp_as_other_process(&path, &a, &now_stamp());
+        let calls = AtomicUsize::new(0);
+        forced(&path, &b, "b-rejected", &calls).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "b refreshed and wrote auth.json");
+        let err = forced(&path, &a, "a-new-from-peer", &calls).await.unwrap_err();
+        assert!(err.contains("not refreshing again"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a's refresh token not spent again");
+    }
+
+    /// The cooldown only gates FORCING an unexpired token: an expired one
+    /// refreshes even right after another process stamped it.
+    #[tokio::test]
+    async fn expired_token_refreshes_inside_the_stamp_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let a = account("a");
+        let mut expired = credential("a-old");
+        expired.expires = 0;
+        save_provider_auth_at(&path, &a.storage_key(), &expired).unwrap();
+        stamp_as_other_process(&path, &a, &now_stamp());
+        let calls = AtomicUsize::new(0);
+        let got = forced(&path, &a, "a-old", &calls).await.unwrap();
+        assert_eq!(got.access, "minted-0");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The stamp is advisory: unreadable or future-dated values allow.
+    #[tokio::test]
+    async fn garbage_or_future_stamps_allow_a_forced_refresh() {
+        let future = (crate::epoch_millis() + 3_600_000).to_string();
+        for stamp in ["", "not-a-number", "-5", "12abc", future.as_str()] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.json");
+            let a = account("a");
+            seed_old(&path, &[(&a, "a-rejected")]);
+            stamp_as_other_process(&path, &a, stamp);
+            let calls = AtomicUsize::new(0);
+            forced(&path, &a, "a-rejected", &calls)
+                .await
+                .unwrap_or_else(|e| panic!("stamp {stamp:?}: {e}"));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "stamp {stamp:?}");
+        }
+    }
+
+    /// Our refresh writes the stamp, and an older client that opens and
+    /// flocks the same lock file the pre-#215 way (`create`, `write`,
+    /// `truncate(false)`, never writing it) leaves it intact.
+    #[tokio::test]
+    async fn refresh_stamp_survives_an_old_client_style_lock_open() {
+        use fs4::fs_std::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let a = account("a");
+        seed_old(&path, &[(&a, "a-rejected")]);
+        let calls = AtomicUsize::new(0);
+        let first = forced(&path, &a, "a-rejected", &calls).await.unwrap();
+        let lock = refresh_lock_path(&path, &a.storage_key());
+        let stamp = std::fs::read_to_string(&lock).unwrap();
+        let ms: u64 = stamp.parse().expect("plain ASCII epoch ms");
+        assert!(crate::epoch_millis().saturating_sub(ms) < 60_000, "{stamp}");
+
+        // Old client (origin/dev `lock_file_at`): open + flock + unlock.
+        let old = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        FileExt::lock_exclusive(&old).unwrap();
+        drop(old);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), stamp);
+
+        // ...so the cooldown it records still holds.
+        let err = forced(&path, &a, &first.access, &calls).await.unwrap_err();
+        assert!(err.contains("not refreshing again"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
