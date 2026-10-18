@@ -6774,7 +6774,7 @@ mod send_retry_tests {
         const PROSE: &str = "ZZPROSE";
         let probes = [
             // Apostrophe flips naive quote parsing; the echo follows it.
-            format!("The model can't accept 'ZZPROSE echo of the user prompt, it's long' here"),
+            "The model can't accept 'ZZPROSE echo of the user prompt, it's long' here".to_string(),
             // Short quoted span with a secret.
             format!("Invalid 'input[0]': '{PROSE} AKIAIOSFODNN7EXAMPLE pls'"),
             // Unquoted prose echo.
