@@ -3248,11 +3248,13 @@ impl RemoteBroker {
     /// 400 before touching any credential.
     async fn predates_usage_snapshot(&self) -> Result<bool, BrokerError> {
         let resp = self
-            .http
-            .get(format!("{}/usage/snapshot", self.endpoint))
-            .query(&[("provider", "anthropic"), ("account", "")])
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                    .get(format!("{}/usage/snapshot", self.endpoint))
+                    .query(&[("provider", "anthropic"), ("account", "")])
+                    .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
