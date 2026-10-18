@@ -175,19 +175,16 @@ pub(crate) fn write_new(
     }
 }
 
-/// A target read back: its bytes and identity, or `None` when it is not a
-/// regular file any more.
-type ReadBack = Option<(Vec<u8>, Option<(u64, u64)>)>;
+/// A target read back: its bytes and its identity.
+type ReadBack = (Vec<u8>, Option<(u64, u64)>);
 
-/// Read `p`'s target back through its directory handle, at most `cap`
-/// bytes.
+/// Read `p`'s target back through its directory handle (a regular file
+/// only, never waiting on the open), at most `cap` bytes, with its
+/// identity.
 fn read_target(p: &Pending, cap: usize) -> Result<ReadBack, OpenError> {
-    let (file, meta) = p.dir.open_read(&p.name)?;
-    if meta.kind != Kind::File {
-        return Ok(None);
-    }
+    let (file, meta) = p.dir.open_regular(&p.name)?;
     let bytes = dir::read_capped(file, cap).map_err(OpenError::Io)?;
-    Ok(Some((bytes, meta.identity)))
+    Ok((bytes, meta.identity))
 }
 
 /// Whether everything is still as staged: the parent path still leads to
@@ -207,13 +204,12 @@ fn unchanged(p: &Pending, staged: &Staged) -> Result<(), String> {
             _ => Err(format!("{} was created by something else during the call", p.display)),
         },
         Some(original) => {
-            let replaced = || format!("{} was replaced since it was read", p.display);
-            let (now, identity) = read_target(p, original.len() + 1)
-                .map_err(|e| match e {
-                    OpenError::Symlink => replaced(),
-                    OpenError::Io(e) => format!("{} can no longer be read: {e}", p.display),
-                })?
-                .ok_or_else(replaced)?;
+            let (now, identity) = read_target(p, original.len() + 1).map_err(|e| match e {
+                OpenError::NotRegular | OpenError::Symlink => {
+                    format!("{} was replaced since it was read", p.display)
+                }
+                OpenError::Io(e) => format!("{} can no longer be read: {e}", p.display),
+            })?;
             if identity != p.identity {
                 return Err(format!("{} was replaced since it was read", p.display));
             }
@@ -228,9 +224,8 @@ fn unchanged(p: &Pending, staged: &Staged) -> Result<(), String> {
 /// Put back a file this call already committed. Only if it still holds the
 /// bytes we wrote (otherwise someone else changed it after us: leave it).
 fn restore(p: &Pending, hooks: &mut dyn Hooks) -> Result<(), String> {
-    let (current, _) = read_target(p, p.new.len() + 1)
-        .map_err(|e| format!("cannot read it back: {e}"))?
-        .ok_or("it is not a regular file any more; left as is")?;
+    let (current, _) =
+        read_target(p, p.new.len() + 1).map_err(|e| format!("cannot read it back: {e}"))?;
     if current != p.new {
         return Err("it changed again after this call wrote it; left as is".into());
     }

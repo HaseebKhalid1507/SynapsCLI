@@ -33,9 +33,11 @@ pub(crate) struct Meta {
     pub identity: Option<(u64, u64)>,
 }
 
-/// Why [`Dir::open_read`] refused.
+/// Why [`Dir::open_regular`] refused.
 #[derive(Debug)]
 pub(crate) enum OpenError {
+    /// A FIFO, device, socket or directory.
+    NotRegular,
     /// The name is a symlink now.
     Symlink,
     Io(io::Error),
@@ -44,6 +46,7 @@ pub(crate) enum OpenError {
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OpenError::NotRegular => f.write_str("not a regular file"),
             OpenError::Symlink => f.write_str("it is a symlink now"),
             OpenError::Io(e) => e.fmt(f),
         }
@@ -186,10 +189,12 @@ mod imp {
             Ok(meta_of(unsafe { &st.assume_init() }))
         }
 
-        /// Opens `name` for reading without following a symlink, with what
-        /// `fstat` says about the descriptor.
-        pub(crate) fn open_read(&self, name: &OsStr) -> Result<(File, Meta), OpenError> {
-            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        /// Opens `name` for reading. The open never waits (a FIFO or device
+        /// is never blocked on) and never follows a symlink; the type is
+        /// checked on the descriptor itself, and only a regular file is
+        /// returned, switched back to blocking reads.
+        pub(crate) fn open_regular(&self, name: &OsStr) -> Result<(File, Meta), OpenError> {
+            let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY;
             let fd = openat(self.fd.as_raw_fd(), name, flags, 0).map_err(|e| {
                 if e.raw_os_error() == Some(libc::ELOOP) {
                     OpenError::Symlink
@@ -198,6 +203,14 @@ mod imp {
                 }
             })?;
             let meta = fstat(fd.as_raw_fd()).map_err(OpenError::Io)?;
+            if meta.kind != Kind::File {
+                return Err(OpenError::NotRegular);
+            }
+            // SAFETY: plain fcntl calls on a descriptor we own.
+            let flags = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }).map_err(OpenError::Io)?;
+            // SAFETY: as above.
+            cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) })
+                .map_err(OpenError::Io)?;
             Ok((File::from(fd), meta))
         }
 
@@ -289,9 +302,12 @@ mod imp {
             std::fs::symlink_metadata(self.path.join(name)).map(|m| meta_of(&m))
         }
 
-        pub(crate) fn open_read(&self, name: &OsStr) -> Result<(File, Meta), OpenError> {
+        pub(crate) fn open_regular(&self, name: &OsStr) -> Result<(File, Meta), OpenError> {
             let file = File::open(self.path.join(name)).map_err(OpenError::Io)?;
             let meta = meta_of(&file.metadata().map_err(OpenError::Io)?);
+            if meta.kind != Kind::File {
+                return Err(OpenError::NotRegular);
+            }
             Ok((file, meta))
         }
 
@@ -366,12 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn open_read_never_follows_a_symlink() {
+    fn open_regular_takes_only_a_regular_file() {
         let (_d, root) = canonical_tmp();
         std::fs::write(root.join("f"), "x").unwrap();
         std::os::unix::fs::symlink(root.join("f"), root.join("l")).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
         let dir = Dir::open(&root).unwrap();
-        assert!(dir.open_read(OsStr::new("f")).is_ok());
-        assert!(matches!(dir.open_read(OsStr::new("l")), Err(OpenError::Symlink)));
+        assert!(dir.open_regular(OsStr::new("f")).is_ok());
+        assert!(matches!(dir.open_regular(OsStr::new("l")), Err(OpenError::Symlink)));
+        assert!(matches!(dir.open_regular(OsStr::new("sub")), Err(OpenError::NotRegular)));
     }
 }

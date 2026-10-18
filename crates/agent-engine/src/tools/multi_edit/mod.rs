@@ -264,7 +264,8 @@ struct Loaded {
 }
 
 /// Reads `name` through its parent's handle: never by a path that could
-/// lead elsewhere.
+/// lead elsewhere. The open never waits (a FIFO with no writer, a device)
+/// and the type is checked on the descriptor before anything is read.
 #[cfg_attr(not(test), allow(unused_variables))]
 fn load_existing(
     dir: &dir::Dir,
@@ -272,13 +273,11 @@ fn load_existing(
     hooks: &mut dyn commit::Hooks,
 ) -> std::result::Result<Loaded, String> {
     use std::io::Read;
-    let (file, meta) = dir.open_read(name).map_err(|e| match e {
+    let (file, meta) = dir.open_regular(name).map_err(|e| match e {
+        dir::OpenError::NotRegular => "not a regular file".to_string(),
         dir::OpenError::Symlink => "was replaced by a symlink since it was resolved".to_string(),
         dir::OpenError::Io(e) => format!("cannot open: {e}"),
     })?;
-    if meta.kind != dir::Kind::File {
-        return Err("not a regular file".into());
-    }
     if meta.nlink > 1 {
         return Err(format!(
             "has {} hard links; replacing it would split them",
