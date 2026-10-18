@@ -425,6 +425,14 @@ pub struct ChildListReply {
     pub sessions: Vec<super::children::SessionChildren>,
     #[serde(default)]
     pub host: Vec<super::children::HostChild>,
+    /// Records refused at a cap since this daemon image started (live spawns
+    /// and records carried across a reload).
+    #[serde(default)]
+    pub refused_records: u64,
+    /// At reply time the total cap is reached with no ended record left to
+    /// evict: the next spawn's record will be refused.
+    #[serde(default)]
+    pub ledger_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1347,6 +1355,8 @@ mod tests {
                 }],
             }],
             host: vec![HostChild { owner_kind: HostOwnerKind::McpServer, owner_id: "figma".into(), child }],
+            refused_records: 3,
+            ledger_full: true,
         }
     }
 
@@ -2122,9 +2132,19 @@ mod tests {
                     "tool_id":"toolu_1","tool_name":"bash","handle_id":"sa_12","shell_session_id":null,
                     "child":child,"state":"running","exit_code":null,"signal":null,
                     "members":[{"pid":3646201,"start_ticks":26981702}]}]}],
-                "host":[{"owner_kind":"mcp_server","owner_id":"figma","child":child}]
+                "host":[{"owner_kind":"mcp_server","owner_id":"figma","child":child}],
+                "refused_records":3,"ledger_full":true
             })
         );
+        // Always written, and an older reply without them decodes as 0/false.
+        let mut quiet = child_list_sample();
+        quiet.refused_records = 0;
+        quiet.ledger_full = false;
+        let q = serde_json::to_value(DaemonFrame::ChildList(quiet)).unwrap();
+        assert_eq!((q["refused_records"].clone(), q["ledger_full"].clone()), (serde_json::json!(0), serde_json::json!(false)));
+        let old: DaemonFrame =
+            decode_line(r#"{"type":"child_list","supported":true,"clk_tck":100,"sessions":[],"host":[]}"#).unwrap();
+        assert!(matches!(old, DaemonFrame::ChildList(ChildListReply { refused_records: 0, ledger_full: false, .. })));
         let w = serde_json::to_value(&Welcome {
             protocol_version: PROTOCOL_VERSION,
             daemon_version: "v".into(),

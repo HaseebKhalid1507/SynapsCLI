@@ -44,6 +44,8 @@ pub async fn children_reply(
             clk_tck: children::clk_tck(),
             sessions: Vec::new(),
             host: Vec::new(),
+            refused_records: 0,
+            ledger_full: false,
         });
     }
     children::maybe_sweep();
@@ -63,6 +65,8 @@ pub async fn children_reply(
         clk_tck: children::clk_tck(),
         sessions: listing.sessions,
         host: listing.host,
+        refused_records: listing.refused_records,
+        ledger_full: listing.ledger_full,
     })
 }
 
@@ -203,4 +207,43 @@ mod tests {
         }
     }
 
+    /// The reply reads every listed leader now, and carries the ledger's
+    /// refusal count. The records name pids that never exist, in this
+    /// process's own (live) sid, so a sweep may end them but never drops them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reply_checks_each_leader_now_and_counts_refusals() {
+        let Some(boot) = children::boot_id() else { return };
+        let sid = children::read_stat(std::process::id()).expect("own stat").sid;
+        let session = format!("cq-fresh-{}", std::process::id());
+        let before = {
+            let mut ledger = children::ledger().lock().unwrap();
+            let before = ledger.list(None, None).refused_records;
+            for i in 0..children::MAX_PER_SESSION as u32 + 1 {
+                let pid = u32::MAX - 1 - i; // above any pid_max
+                let child = children::ChildIdentity { pid, start_ticks: 1, boot_id: boot.to_string(), sid, pgid: sid };
+                let spawn = children::ChildSpawn {
+                    tool_id: format!("t{i}"),
+                    tool_name: "bash".into(),
+                    handle_id: None,
+                    shell_session_id: None,
+                    child,
+                };
+                assert_eq!(ledger.insert(&session, spawn), i < children::MAX_PER_SESSION as u32);
+            }
+            before
+        };
+        let DaemonFrame::ChildList(reply) = children_reply(Some(3), Some(SessionId::from(session.as_str())), None, false).await
+        else {
+            panic!("not a child_list")
+        };
+        assert!(reply.refused_records > before, "{} > {before}", reply.refused_records);
+        assert!(!reply.ledger_full);
+        let group = &reply.sessions[0];
+        assert!(group.truncated);
+        assert_eq!(group.children.len(), children::MAX_PER_SESSION);
+        assert!(group.children.iter().all(|c| c.state == children::ChildState::Ended), "no leader runs");
+        let stored = children::list(Some(&session), None);
+        assert!(stored.sessions[0].children.iter().all(|c| c.state == children::ChildState::Ended), "the ledger agrees");
+    }
 }
