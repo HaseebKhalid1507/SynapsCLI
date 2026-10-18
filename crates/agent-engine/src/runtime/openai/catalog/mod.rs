@@ -725,6 +725,9 @@ pub async fn ensure_muse_catalog_for(
         // concurrent callers don't stampede. A failure shortens it below.
         *next = Some(now + MUSE_WARMUP_BACKOFF);
     }
+    // Anything but a successful load (including this future being dropped
+    // mid-fetch when the turn is aborted) leaves only the short backoff.
+    let mut failure = WarmupFailureGuard(true);
     let fetch = broker_proxy_catalog_body_via(broker, MUSE_PROVIDER_KEY, MUSE_MODELS_PATH);
     let loaded = match tokio::time::timeout(MUSE_WARMUP_TIMEOUT, fetch).await {
         Ok(Ok(body)) => match parse_muse_catalog_models(&body) {
@@ -757,8 +760,18 @@ pub async fn ensure_muse_catalog_for(
             false
         }
     };
-    if !loaded {
-        set_muse_warmup_backoff(MUSE_WARMUP_FAILURE_BACKOFF);
+    failure.0 = !loaded;
+}
+
+/// Shortens the in-flight warm-up claim to the failure backoff on drop,
+/// unless the warm-up loaded the catalog.
+struct WarmupFailureGuard(bool);
+
+impl Drop for WarmupFailureGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            set_muse_warmup_backoff(MUSE_WARMUP_FAILURE_BACKOFF);
+        }
     }
 }
 
@@ -1937,6 +1950,56 @@ mod muse_warmup_tests {
             assert_eq!(failing.seen.lock().unwrap().len(), 1);
             assert_eq!(muse_supported_levels("muse-warmup-probe-zz7"), None);
         }
+        fresh();
+    }
+
+    /// Broker whose catalog GET never answers.
+    struct HangingBroker;
+
+    #[async_trait::async_trait]
+    impl CredentialBroker for HangingBroker {
+        async fn access_token(
+            &self,
+            _: crate::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            unreachable!()
+        }
+        async fn proxy(&self, _: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            std::future::pending().await
+        }
+        async fn proxy_stream(&self, _: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+            unreachable!()
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            unreachable!()
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Round-2 m-e: a warm-up dropped mid-fetch (turn aborted) must not keep
+    /// the 300s in-flight claim; it falls back to the short backoff.
+    #[test]
+    fn cancelled_warmup_falls_back_to_the_short_backoff() {
+        let _guard = muse::test_cache_guard();
+        fresh();
+        let dyn_broker: Arc<dyn CredentialBroker> = Arc::new(HangingBroker);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let warm = ensure_muse_catalog_for("muse/muse-warmup-probe-zz7", &dyn_broker);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), warm)
+                        .await
+                        .is_err(),
+                    "the fetch hangs and is dropped"
+                );
+            });
+        let wait = muse_warmup_retry_in().expect("backed off");
+        assert!(wait <= std::time::Duration::from_secs(30), "{wait:?}");
         fresh();
     }
 
