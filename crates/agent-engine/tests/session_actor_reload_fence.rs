@@ -395,10 +395,16 @@ async fn a_client_cannot_send_a_reload_checkpoint() {
 //
 // Both hold back autonomous work: the fence until the exec (or the daemon's
 // report that it failed), the hook until it has run. A session that is
-// fenced AND waits for its hook starts nothing until both have cleared, in
-// either order, and then does the work once. Two test seams make the hook
-// pending after the fixture's turn: the host's session-start gate is held,
-// and that turn puts a fresh hook back in line at its end.
+// fenced AND waits for its hook starts no turn for an event until both have
+// cleared, in either order; the hook itself may run under the fence. Two
+// test seams make the hook pending after the fixture's turn: the host's
+// session-start gate is held, and that turn puts a fresh hook back in line
+// at its end.
+//
+// What the timed drains show: "nothing started within 800 ms" (and the
+// 500 ms drain after the work) are negative observations over that window,
+// not barriers. The counts read after `Idle` check that the work ran, once
+// within what the test saw; they do not prove a second turn can never come.
 
 use agent_engine::session::session_start_testing as start_seam;
 

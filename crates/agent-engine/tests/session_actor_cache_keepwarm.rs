@@ -1405,6 +1405,11 @@ async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
 // report that it failed): the exec would discard the ping's result. The
 // ping also waits for `on_session_start`. Fenced and waiting, the due ping
 // goes out only once both have cleared, in either order.
+//
+// What the waits show: the 900 ms sleeps are negative observations (no ping
+// went out within them), not barriers, and `wait_pings(.., 1, ..)` waits
+// for at least one ping: these tests check that the ping is held and then
+// goes out, not that exactly one ever does.
 
 /// Fence `handle` as a reload's checkpoint does (host-sent).
 async fn fence_for_reload(t: &mut LocalTransport, handle: &SessionHandle) {
