@@ -2048,7 +2048,7 @@ impl LocalBroker {
                         kind = %refresh_failure(&f).kind,
                         "automatic choice could not be vended: token refresh failed"
                     );
-                    return Err(BrokerError::Refresh(f));
+                    return Err(BrokerError::Refresh(auto_vend_failure(&credential, f)));
                 }
             }
         }
@@ -2836,6 +2836,30 @@ fn refresh_failure(f: &super::token::RefreshFailure) -> super::quota_policy::Obs
         R::Credential => ObservationFailure::new(K::RefreshRejected),
         R::ActionRequired => ObservationFailure::new(K::RefreshActionRequired),
     }
+}
+
+/// The refresh failure of the automatically chosen account, with that
+/// account named: the caller never learns which seat was picked. A refused
+/// login also gets the exact command that fixes it (unless the message
+/// already has one). Same kind, so retry hints are unchanged.
+fn auto_vend_failure(
+    credential: &CredentialRef,
+    f: super::token::RefreshFailure,
+) -> super::token::RefreshFailure {
+    let label = credential.account.label_str();
+    let mut message = format!("account '{label}': {}", f.message());
+    if f.kind == super::token::RefreshFailureKind::Credential && !message.contains("synaps login") {
+        let account = if credential.account.is_default() {
+            String::new()
+        } else {
+            format!(" --account {label}")
+        };
+        message.push_str(&format!(
+            "; log it in again with `synaps login --provider {}{account}`",
+            credential.provider
+        ));
+    }
+    super::token::RefreshFailure::new(f.kind, message)
 }
 
 /// A failed automatic selection: ONE WARN naming the top-level kind and
@@ -5430,6 +5454,48 @@ mod tests {
         }
         assert!(!json.contains("refresh"));
         assert!(!json.contains("access"));
+    }
+
+    /// The caller of an automatic vend never learns which seat was picked:
+    /// the refresh failure names it, and a refused login carries the exact
+    /// command for that slot.
+    #[test]
+    fn auto_vend_failure_names_the_chosen_account_and_its_login_command() {
+        use super::super::token::{RefreshFailure, RefreshFailureKind as R};
+        let named = CredentialRef::new(
+            OAuthProviderId::Anthropic,
+            Account::named("claude3").unwrap(),
+        );
+        let refused =
+            auto_vend_failure(&named, RefreshFailure::new(R::Credential, "invalid_grant"));
+        assert_eq!(refused.kind, R::Credential);
+        assert_eq!(
+            refused.message(),
+            "account 'claude3': invalid_grant; log it in again with \
+             `synaps login --provider anthropic --account claude3`"
+        );
+        let default = CredentialRef::new(OAuthProviderId::Anthropic, Account::Default);
+        let refused = auto_vend_failure(&default, RefreshFailure::new(R::Credential, "revoked"));
+        assert_eq!(
+            refused.message(),
+            "account 'default': revoked; log it in again with \
+             `synaps login --provider anthropic`"
+        );
+        // A message that already says which login to run gets no second one.
+        let advised = auto_vend_failure(
+            &named,
+            RefreshFailure::new(
+                R::Credential,
+                "slot removed; run `synaps login --account claude3`",
+            ),
+        );
+        assert_eq!(advised.message().matches("synaps login").count(), 1);
+        // Other kinds are named, keep their kind and get no login advice.
+        for kind in [R::Transient, R::LockBusy, R::Other, R::ActionRequired] {
+            let f = auto_vend_failure(&named, RefreshFailure::new(kind, "HTTP 503"));
+            assert_eq!(f.kind, kind);
+            assert_eq!(f.message(), "account 'claude3': HTTP 503");
+        }
     }
 
     /// No Anthropic refresh seam exists, so the refresh-failure → kind map

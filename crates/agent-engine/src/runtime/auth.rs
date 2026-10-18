@@ -37,7 +37,13 @@ impl AuthMethods {
     ) -> Result<()> {
         let mtime = local_mtime_for(source);
         let token = broker.recover_rejected_token(&credential, rejected).await
-            .map_err(|e| recovery_error(&credential, &e))?;
+            .map_err(|e| {
+                turn_auth_failed(
+                    broker_error_kind(&e),
+                    Some(&credential),
+                    recovery_error(&credential, &e),
+                )
+            })?;
         Self::bind_pinned_at(auth, source, PinnedToken { credential, token }, mtime).await;
         Ok(())
     }
@@ -410,10 +416,9 @@ impl AuthMethods {
             AccountSelector::Account(account) => {
                 // Explicit: exactly this credential, never a fallback.
                 let cred = CredentialRef::new(OAuthProviderId::Anthropic, account.clone());
-                let token = broker
-                    .access_token_for(&cred)
-                    .await
-                    .map_err(|e| vend_error(&cred, &e))?;
+                let token = broker.access_token_for(&cred).await.map_err(|e| {
+                    turn_auth_failed(broker_error_kind(&e), Some(&cred), vend_error(&cred, &e))
+                })?;
                 PinnedToken {
                     credential: cred,
                     token,
@@ -423,9 +428,9 @@ impl AuthMethods {
                 Self::vend_auto(broker, source, bound.as_deref(), model, point).await?
             }
             AccountSelector::Invalid { source, reason } => {
-                return Err(RuntimeError::Auth(format!(
+                return Err(turn_auth_failed("invalid_selector", None, RuntimeError::Auth(format!(
                     "Anthropic account selector from {source} is invalid ({reason}); refusing to fall back to another account. Fix it or run `synaps auth use --provider anthropic --account <label|default>`."
-                )));
+                ))));
             }
         };
         // Update shared auth state so all clones (including spawned stream
@@ -509,10 +514,212 @@ impl AuthMethods {
             .access_token_pinned_for(OAuthProviderId::Anthropic, model.map(quota_model_key))
             .await
             .map_err(|e| {
-                RuntimeError::Auth(format!(
-                    "Automatic account selection failed: {e}. Run `synaps login`, pick an account with `synaps auth use --provider anthropic --account <label>`, or check auth.remote_endpoint / broker reachability."
-                ))
+                turn_auth_failed(
+                    broker_error_kind(&e),
+                    None,
+                    RuntimeError::Auth(auto_selection_text(&e, crate::epoch_millis())),
+                )
             })
+    }
+}
+
+/// Log ONE WARN `turn_auth_failed` with a fixed kind (and the account
+/// label when one is known; never a token or identity) for an Anthropic
+/// auth error that ends the turn, and return it unchanged.
+fn turn_auth_failed(
+    kind: &str,
+    account: Option<&CredentialRef>,
+    err: RuntimeError,
+) -> RuntimeError {
+    tracing::warn!(
+        provider = %"anthropic",
+        kind = %kind,
+        account = %account.map_or("-", |c| c.account.label_str()),
+        "turn_auth_failed"
+    );
+    err
+}
+
+/// Fixed kind of a broker error for the `turn_auth_failed` WARN.
+fn broker_error_kind(e: &crate::auth::BrokerError) -> &'static str {
+    use crate::auth::{BrokerError, RefreshFailureKind as R};
+    match e {
+        BrokerError::NoAccountAvailable {
+            failure: Some(f), ..
+        } => f.kind.as_str(),
+        BrokerError::NoAccountAvailable { .. } => "no_account_available",
+        BrokerError::Refresh(f) => match f.kind {
+            R::Transient => "refresh_transient",
+            R::LockBusy => "refresh_lock_busy",
+            R::Other => "refresh_other",
+            R::Cooldown { .. } => "refresh_cooldown",
+            R::Credential => "refresh_rejected",
+            R::ActionRequired => "refresh_action_required",
+        },
+        BrokerError::NotConfigured(_) => "no_credentials",
+        BrokerError::UnknownAccount { .. } => "unknown_account",
+        BrokerError::InvalidAccount(_) => "invalid_account",
+        BrokerError::Credential(_) => "credential_error",
+        BrokerError::Unauthorized => "broker_unauthorized",
+        BrokerError::Transport(_) => "broker_transport",
+        _ => "broker_error",
+    }
+}
+
+/// User text for a failed automatic selection. Every clause is something
+/// the broker reported; login advice appears only for accounts whose
+/// failure a login fixes.
+fn auto_selection_text(e: &crate::auth::BrokerError, now_ms: u64) -> String {
+    use crate::auth::BrokerError;
+    match e {
+        BrokerError::NoAccountAvailable {
+            failure: Some(f), ..
+        } => selection_failure_text(f, now_ms),
+        BrokerError::Refresh(f) => chosen_seat_refresh_text(f),
+        // The broker itself is unreachable, or refused this client's
+        // machine auth (its text says what to set): a login fixes neither.
+        BrokerError::Transport(_) => format!(
+            "Automatic account selection failed: {e}. Check auth.remote_endpoint / broker \
+             reachability, then send again; no login needed."
+        ),
+        BrokerError::Unauthorized => {
+            format!("Automatic account selection failed: {}", sentence(&e.to_string()))
+        }
+        other => format!(
+            "Automatic account selection failed: {other}. Run `synaps login`, pick an account with `synaps auth use --provider anthropic --account <label>`, or check auth.remote_endpoint / broker reachability."
+        ),
+    }
+}
+
+/// `synaps login` for exactly one Anthropic slot.
+fn login_command(label: &str) -> String {
+    if label == "default" {
+        "`synaps login --provider anthropic`".to_string()
+    } else {
+        format!("`synaps login --provider anthropic --account {label}`")
+    }
+}
+
+/// `label: kind (HTTP s, retry after Ns, until HH:MM UTC)`.
+fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String {
+    let mut extra = Vec::new();
+    if let Some(status) = a.http_status {
+        extra.push(format!("HTTP {status}"));
+    }
+    if let Some(secs) = a.retry_after_s {
+        extra.push(format!("retry after {secs}s"));
+    }
+    if let Some(until) = a.until_ms.filter(|t| *t > now_ms) {
+        extra.push(format!(
+            "until {}",
+            super::anthropic_quota::describe_reset_utc(until, now_ms)
+        ));
+    }
+    if extra.is_empty() {
+        format!("{}: {}", a.account, a.kind)
+    } else {
+        format!("{}: {} ({})", a.account, a.kind, extra.join(", "))
+    }
+}
+
+fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> String {
+    use crate::auth::SelectionFailureKind as K;
+    let what = match f.kind {
+        K::NoCredentials => "no Anthropic account is logged in",
+        K::UsageReadFailed => "reading account usage failed, so capacity is unproven (not used up)",
+        K::CredentialRejected => {
+            "every Anthropic account that is not cooling down had its login refused"
+        }
+        K::AllCoolingDown => "every Anthropic account is cooling down or at a usage limit",
+        K::QuotaUnknown => "no account's usage reading proved capacity",
+        K::SeatChurn => {
+            "the chosen account's stored login kept changing while its capacity was being read"
+        }
+        K::RemoteNoCapacity => "the credential broker found no account with proven capacity",
+    };
+    let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
+    if !f.accounts.is_empty() {
+        let parts: Vec<_> = f
+            .accounts
+            .iter()
+            .map(|a| account_failure_part(a, now_ms))
+            .collect();
+        text.push_str(&format!(" [{}]", parts.join("; ")));
+    }
+    let earliest = f
+        .earliest_reset_ms
+        .filter(|t| *t > now_ms)
+        .map(|t| super::anthropic_quota::describe_reset_utc(t, now_ms));
+    if let Some(at) = &earliest {
+        text.push_str(&format!("; earliest reset {at}"));
+    }
+    text.push('.');
+    if f.kind == K::NoCredentials {
+        text.push_str(
+            " Run `synaps login --provider anthropic` (add `--account <label>` for a named slot).",
+        );
+        return text;
+    }
+    let login = f.login_labels();
+    if !login.is_empty() {
+        let commands: Vec<_> = login.iter().map(|l| login_command(l)).collect();
+        text.push_str(&format!(
+            " {} need{} a new login: {}.",
+            login.join(", "),
+            if login.len() == 1 { "s" } else { "" },
+            commands.join(", ")
+        ));
+    }
+    match f.kind {
+        K::NoCredentials | K::CredentialRejected => {}
+        K::RemoteNoCapacity => text.push_str(
+            " The broker host's log has each account's reason (`auth_selection_failed`); send again to retry.",
+        ),
+        K::AllCoolingDown => match &earliest {
+            Some(at) => text.push_str(&format!(" No login needed; send again after {at}.")),
+            None => text.push_str(" No login needed; send again later."),
+        },
+        _ if login.is_empty() => text.push_str(" Send again to retry; no login needed."),
+        _ => text.push_str(" Send again to retry."),
+    }
+    text
+}
+
+/// The account the broker chose could not be vended because its token
+/// refresh failed. Only a refused login gets login advice.
+fn chosen_seat_refresh_text(f: &crate::auth::RefreshFailure) -> String {
+    use crate::auth::RefreshFailureKind as R;
+    let msg = sentence(f.message());
+    match f.kind {
+        R::Transient => format!(
+            "Token refresh failed for the automatically chosen Anthropic account (network or \
+             provider error, not a login problem): {msg} Send again to retry; no login needed."
+        ),
+        R::LockBusy => format!(
+            "Another synaps process is still refreshing the automatically chosen Anthropic \
+             account: {msg} Send again to retry; no login needed."
+        ),
+        R::Other => format!(
+            "Token refresh failed for the automatically chosen Anthropic account: {msg} Send \
+             again to retry."
+        ),
+        R::Cooldown { retry_in_secs } => format!(
+            "Token refresh of the automatically chosen Anthropic account is paused after a \
+             rejected token: {msg} Send again in {retry_in_secs}s."
+        ),
+        R::ActionRequired => {
+            format!("Can't refresh the token for the automatically chosen Anthropic account: {msg}")
+        }
+        // The broker names the account and, for a local slot, the exact
+        // login command (`auto_vend_failure`).
+        R::Credential if has_login_advice(f.message()) => {
+            format!("Anthropic refused the login of the automatically chosen account: {msg}")
+        }
+        R::Credential => format!(
+            "Anthropic refused the login of the automatically chosen account: {msg} Find it with \
+             `synaps auth list` and log it in again with `synaps login --provider anthropic \
+             --account <label>`."
+        ),
     }
 }
 /// A failed explicit-account vend.
@@ -1865,6 +2072,42 @@ mod tests {
         );
         assert!(!text.contains("synaps login"), "{text}");
         assert!(turn_warn(&log).contains("kind=refresh_transient"));
+    }
+
+    /// The chosen seat's login was refused: the text keeps the broker's
+    /// account name and exact login command, once, and never says "no
+    /// login needed".
+    #[tokio::test]
+    async fn chosen_seat_refused_login_keeps_the_brokers_exact_login_command() {
+        use agent_core::auth::{RefreshFailure, RefreshFailureKind};
+        let error = BrokerError::Refresh(RefreshFailure::new(
+            RefreshFailureKind::Credential,
+            "account 'claude3': invalid_grant; log it in again with \
+             `synaps login --provider anthropic --account claude3`",
+        ));
+        let (text, log) = failed_turn_start(error).await;
+        assert!(text.contains("account 'claude3'"), "{text}");
+        assert_eq!(text.matches("synaps login").count(), 1, "{text}");
+        assert!(
+            text.contains("`synaps login --provider anthropic --account claude3`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("no login needed") && !text.contains("<label>"),
+            "{text}"
+        );
+        assert!(turn_warn(&log).contains("kind=refresh_rejected"));
+    }
+
+    /// An unreachable broker is not a login problem.
+    #[tokio::test]
+    async fn unreachable_broker_gives_no_login_advice() {
+        let (text, log) =
+            failed_turn_start(BrokerError::Transport("connection refused".into())).await;
+        assert!(text.contains("broker reachability"), "{text}");
+        assert!(text.contains("no login needed"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=broker_transport"));
     }
 
     #[test]
