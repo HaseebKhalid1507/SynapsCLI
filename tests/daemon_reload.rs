@@ -801,3 +801,147 @@ async fn the_session_start_wait_yields_to_cancel_and_end() {
 
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }
+
+/// One assistant response calling `bash` with `command` as `tool_id`.
+fn bash_round(tool_id: &str, command: &str) -> &'static str {
+    let usage = serde_json::json!({"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0});
+    let events = [
+        serde_json::json!({"type": "message_start", "message": {"id": format!("msg_{tool_id}"), "type": "message",
+            "role": "assistant", "content": [], "model": "claude-sonnet-4-5", "stop_reason": null,
+            "stop_sequence": null, "usage": usage}}),
+        serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": tool_id, "name": "bash"}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": serde_json::json!({"command": command}).to_string()}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": usage}),
+        serde_json::json!({"type": "message_stop"}),
+    ];
+    Box::leak(events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>().into_boxed_str())
+}
+
+/// Everything up to the next `Idle` (a turn's events on any attached client).
+async fn until_idle(t: &mut SocketTransport) -> Vec<SessionEventWire> {
+    let mut out = Vec::new();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.expect("turn hung").expect("alive");
+        if let SessionEventWire::Refused { reason, .. } = &env.event {
+            panic!("refused: {reason}");
+        }
+        let idle = matches!(env.event, SessionEventWire::Idle);
+        out.push(env.event);
+        if idle {
+            return out;
+        }
+    }
+}
+
+/// The child events seen for `tool_id`: ("tool_child" | "tool_child_ended", exit code).
+fn child_events(events: &[SessionEventWire], tool_id: &str) -> Vec<(&'static str, Option<i32>)> {
+    use agent_engine::session::child_events::ChildProcessEvent;
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(s)) if s.tool_id == tool_id => Some(("tool_child", None)),
+            SessionEventWire::ChildProcess(ChildProcessEvent::Ended { tool_id: t, exit_code, .. }) if t == tool_id => {
+                Some(("tool_child_ended", *exit_code))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `children` for one session, on a fresh control connection.
+async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildListReply {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (r, mut w) = tokio::net::UnixStream::connect(&paths.sock).await.unwrap().into_split();
+    let mut r = BufReader::new(r);
+    let mut line = String::new();
+    w.write_all(encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Test))).unwrap().as_bytes()).await.unwrap();
+    r.read_line(&mut line).await.unwrap();
+    line.clear();
+    let query = ClientFrame::Children { id: Some(1), session_id: Some(sid.clone()), sid: None, members: false };
+    w.write_all(encode_line(&query).unwrap().as_bytes()).await.unwrap();
+    r.read_line(&mut line).await.unwrap();
+    match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+        DaemonFrame::ChildList(reply) => reply,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 4/4b across a reload: the child ledger is carried in the reload state,
+/// `features` is on the new image's Welcome, and each connection's optional
+/// events come from its own (new) Hello, never from state kept across the
+/// exec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_carries_the_child_ledger_and_takes_the_opt_in_from_each_new_hello() {
+    if !agent_engine::session::children::supported() {
+        return;
+    }
+    let guard = HomeGuard::new();
+    let bodies: &'static [&'static str] = Box::leak(Box::new([
+        // The background sleep keeps the record's sid alive, so no sweep
+        // drops the ended record before the reload carries it.
+        bash_round("toolu_r1", "sleep 20 >/dev/null 2>&1 & exit 6"),
+        ANTHROPIC_SSE,
+        bash_round("toolu_r2", "exit 7"),
+        ANTHROPIC_SSE,
+    ]));
+    let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let features = |w: &Welcome| ["children", "thinking_options"].iter().all(|f| w.features.iter().any(|g| g == f));
+
+    let hello = Hello::new(ClientKind::Test).with_accepted_events(["tool_child_ended"]);
+    let conn = SocketTransport::connect(&d.paths.sock, hello).await.unwrap();
+    let config = SessionConfig {
+        cwd: Some(guard.home.path().to_path_buf()),
+        model_override: Some("claude-sonnet-4-5".into()),
+        ..Default::default()
+    };
+    let (mut t, _) = SocketTransport::attach(conn, Attach::Create { config, mode: AttachMode::Mirror }).await.unwrap();
+    assert!(features(&t.welcome), "{:?}", t.welcome.features);
+    assert_eq!(t.welcome.accepted_events, ["tool_child_ended"]);
+    let sid = t.session_id().clone();
+    t.send_from_self(SessionCommand::Submit { text: "run".into(), attachments: vec![] }).await.unwrap();
+    assert_eq!(child_events(&until_idle(&mut t).await, "toolu_r1"), [("tool_child_ended", Some(6))], "only what it asked for");
+    let before = children_of(&d.paths, &sid).await;
+    let carried = before.sessions[0].children.iter().find(|c| c.tool_id == "toolu_r1").expect("recorded").clone();
+
+    assert_eq!(SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted"), 2);
+    while tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce").is_some() {}
+    tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror)).await.expect("budget").expect("reconnected");
+    assert_eq!(t.welcome.generation, 2);
+    assert!(features(&t.welcome), "features after the reload: {:?}", t.welcome.features);
+    assert_eq!(t.welcome.accepted_events, ["tool_child_ended"], "from the re-sent Hello");
+
+    // The ledger came across.
+    let after = children_of(&d.paths, &sid).await;
+    let entry = after.sessions[0].children.iter().find(|c| c.tool_id == "toolu_r1").expect("carried across the reload");
+    assert_eq!((&entry.child, entry.state, entry.exit_code), (&carried.child, carried.state, Some(6)));
+
+    // New connections on the new image: the list each one names, nothing kept.
+    let mut joined = Vec::new();
+    for names in [&[][..], &["tool_child", "tool_child_ended"][..]] {
+        let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test).with_accepted_events(names.iter().copied()))
+            .await
+            .unwrap();
+        assert!(features(&conn.welcome));
+        assert_eq!(conn.welcome.accepted_events, names);
+        let (c, _) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
+        joined.push(c);
+    }
+    t.send_from_self(SessionCommand::Submit { text: "again".into(), attachments: vec![] }).await.unwrap();
+    assert_eq!(child_events(&until_idle(&mut t).await, "toolu_r2"), [("tool_child_ended", Some(7))]);
+    assert!(child_events(&until_idle(&mut joined[0]).await, "toolu_r2").is_empty(), "asked for none");
+    assert_eq!(
+        child_events(&until_idle(&mut joined[1]).await, "toolu_r2"),
+        [("tool_child", None), ("tool_child_ended", Some(7))]
+    );
+
+    for c in &joined {
+        c.detach().await;
+    }
+    t.detach().await;
+    SocketTransport::shutdown(&d.paths.sock, false).await.unwrap();
+}
