@@ -390,11 +390,9 @@ pub async fn prepare(
     req: ReloadRequest,
 ) -> Result<Prepared, ReloadError> {
     // 1. version gate — before anything is disturbed.
-    let exe = req.exe.clone().unwrap_or_else(|| {
-        registry::read_daemon_json(paths)
-            .and_then(|i| i.exe)
-            .unwrap_or_else(resolve_exe)
-    });
+    // The recorded exe from this image's own record (not daemon.json, which
+    // can be lost while the daemon runs).
+    let exe = req.exe.clone().unwrap_or_else(|| state.daemon_info().exe.unwrap_or_else(resolve_exe));
     let exe = validate_exe(&exe).map_err(ReloadError::Refused)?;
     let new = probe_version(&exe).await.map_err(ReloadError::Refused)?;
     version_gate(&PrintVersion::current(), &new).map_err(ReloadError::Refused)?;
@@ -481,22 +479,22 @@ pub async fn prepare(
 /// checkpointed but alive; clients that got `Bye` reconnect to THIS image
 /// — a `reconnect_of.generation` mismatch is tolerated, the daemon answers
 /// with its own generation).
-pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) -> ReloadError {
-    let mut info = registry::read_daemon_json(paths).unwrap_or_else(|| registry::DaemonInfo {
-        pid: std::process::id(),
-        protocol_version: PROTOCOL_VERSION,
-        daemon_version: crate::session::wire::binary_version(),
-        profile: state.profile.clone(),
+pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
+    // From this image's own record, not daemon.json (which can be lost while
+    // the daemon runs). The record is held and written under the metadata
+    // lock, so a heal in the hand-off window writes the same.
+    // `previous` stays untouched: a failed exec puts it back whole.
+    let previous = state.daemon_info();
+    let prev_generation = previous.generation;
+    let info = registry::DaemonInfo {
+        generation: p.generation,
         started_at: chrono::Utc::now(),
-        socket: paths.sock.to_string_lossy().into_owned(),
-        exe: None,
-        generation: 1,
-    });
-    let prev_generation = info.generation;
-    info.generation = p.generation;
-    info.started_at = chrono::Utc::now();
-    info.exe = Some(p.exe.clone());
-    let _ = registry::write_daemon_json(paths, &info);
+        exe: Some(p.exe.clone()),
+        ..previous.clone()
+    };
+    if let Err(e) = state.meta.publish(info) {
+        tracing::warn!(path = %state.paths.json.display(), error = %e, "daemon: daemon.json write failed at reload");
+    }
     let _ = tokio::time::timeout(
         Duration::from_secs(crate::session::budgets::RELOAD_EXT_SHUTDOWN_SECS),
         async { state.host.ext_manager().write().await.shutdown_all().await },
@@ -505,8 +503,15 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
 
     let err = exec_self(&p.exe, &p.rs_path, state);
     tracing::error!(error = %err, "daemon: reload exec failed; continuing on the old image");
-    info.generation = prev_generation;
-    let _ = registry::write_daemon_json(paths, &info);
+    // The record before this attempt, whole: exe and started_at too, so the
+    // next default reload uses the old exe, not the one that failed.
+    if let Err(e) = state.meta.publish(previous) {
+        tracing::warn!(
+            path = %state.paths.json.display(),
+            error = %e,
+            "daemon: daemon.json write failed after the failed reload exec"
+        );
+    }
     let _ = std::fs::remove_file(&p.rs_path);
     state.reload_generation.store(prev_generation, Ordering::SeqCst);
     state.reset_announce();
