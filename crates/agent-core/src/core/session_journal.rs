@@ -350,7 +350,8 @@ enum JournalRecord {
         i: usize,
         m: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        t: Option<String>,
+        /// Any JSON on read: a malformed id is dropped, it never ends replay.
+        t: Option<serde_json::Value>,
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
@@ -535,9 +536,32 @@ impl SessionMeta {
 struct SnapshotBinding {
     #[serde(default, rename = "_journal_generation")]
     generation: Option<String>,
-    /// After `api_messages`, so header-only reads leave it empty.
+    /// After `api_messages`, so header-only reads leave it empty. Parsed
+    /// leniently by [`stored_turn_ids`]: it is best-effort metadata.
     #[serde(default, rename = "_turn_ids")]
-    turn_ids: Vec<(usize, String)>,
+    turn_ids: serde_json::Value,
+}
+
+/// Well-formed `[index, id]` entries of a snapshot's `_turn_ids`. Anything
+/// else is dropped with a warning; the turn start is then re-derived.
+fn stored_turn_ids(value: serde_json::Value) -> Vec<(usize, String)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _turn_ids; turn ids dropped");
+            return Vec::new();
+        }
+    };
+    let total = entries.len();
+    let ids: Vec<(usize, String)> = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect();
+    if ids.len() != total {
+        tracing::warn!(dropped = total - ids.len(), "malformed _turn_ids entries dropped");
+    }
+    ids
 }
 
 fn snapshot_binding(file: std::fs::File) -> std::io::Result<SnapshotBinding> {
@@ -755,7 +779,7 @@ fn save_journal_mode(
             v: JOURNAL_SCHEMA_VERSION,
             i: state.durable_len + offset,
             m: stored_value(msg),
-            t: message_turn_id(msg).map(str::to_owned),
+            t: message_turn_id(msg).map(serde_json::Value::from),
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
         buf.push(b'\n');
@@ -990,7 +1014,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
         serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     session.clamp_keepwarm_to_totals();
-    for (i, id) in binding.turn_ids {
+    for (i, id) in stored_turn_ids(binding.turn_ids) {
         if let Some(message) = session.api_messages.get_mut(i) {
             set_turn_id(std::sync::Arc::make_mut(message), id);
         }
@@ -1019,7 +1043,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             }
             Ok(JournalRecord::Msg { i, mut m, t, .. }) => {
                 if i == session.api_messages.len() {
-                    if let Some(id) = t {
+                    if let Some(serde_json::Value::String(id)) = t {
                         set_turn_id(&mut m, id);
                     }
                     session.api_messages.push(std::sync::Arc::new(m));
@@ -2042,6 +2066,12 @@ mod snapshot_only_fields {
         }
     }
 
+    /// The pre-fix `history_hash`: over the messages with the tag inline.
+    fn dev_build_hash(messages: &[SharedMessage]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(serde_json::to_vec(messages).unwrap()))
+    }
+
     #[test]
     fn inline_turn_ids_from_earlier_dev_builds_still_load_and_migrate() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2055,14 +2085,14 @@ mod snapshot_only_fields {
         snap["_journal_generation"] = generation.into();
         snap["message_count"] = 1.into();
         write_json_snapshot(&dir, &id, snap.to_string().as_bytes()).unwrap();
-        let inline_hash = history_hash(&s.api_messages).unwrap();
+        let inline_hash = dev_build_hash(&s.api_messages);
         s.api_messages.push(tagged("second", "t-2"));
         let mut journal = String::new();
         for record in [
             serde_json::json!({"k":"open","v":2,"base":1,"generation":generation,"history_hash":inline_hash}),
             serde_json::json!({"k":"msg","v":2,"i":1,"m":&*s.api_messages[1]}),
             serde_json::json!({"k":"meta","v":2,"meta":SessionMeta::of(&s),
-                "history_hash":history_hash(&s.api_messages).unwrap()}),
+                "history_hash":dev_build_hash(&s.api_messages)}),
         ] {
             journal.push_str(&record.to_string());
             journal.push('\n');
@@ -2098,5 +2128,109 @@ mod snapshot_only_fields {
         assert!(matches!(receipt.mode, SaveMode::FullSnapshot));
         let loaded = load_session_in_dir(&dir, &s.id).unwrap();
         assert_eq!(loaded.api_messages[1][MESSAGE_TURN_KEY]["id"], "late");
+    }
+
+    /// The rollback this layout exists for: this build saves, 0.10.2 opens
+    /// the session and appends a turn, then this build reads it back.
+    #[test]
+    fn rollback_round_trip_through_a_0_10_2_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", None);
+        s.api_messages.push(tagged("first", "t-1"));
+        push_message(&mut s, "reply");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(tagged("second", "t-2"));
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+
+        // 0.10.2: loads the stored form, checks its prefix hash (equal, so
+        // it appends rather than rewriting), and appends one turn with no
+        // `t` and no `turns_hash`.
+        let (old, hash) = old_reader_view(&dir, &s.id);
+        let mut old: Vec<SharedMessage> = old.into_iter().map(std::sync::Arc::new).collect();
+        assert_eq!(hash, Some(history_hash(&old).unwrap()));
+        old.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "asked on 0.10.2"}),
+        ));
+        let mut old_session = s.clone();
+        old_session.api_messages = old.clone();
+        old_session.updated_at += chrono::Duration::minutes(1);
+        let mut journal = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap();
+        for record in [
+            serde_json::json!({"k":"msg","v":2,"i":3,"m":&*old[3]}),
+            serde_json::json!({"k":"meta","v":2,"meta":SessionMeta::of(&old_session),
+                "history_hash":history_hash(&old).unwrap()}),
+        ] {
+            journal.push_str(&record.to_string());
+            journal.push('\n');
+        }
+        std::fs::write(journal_path(&dir, &s.id), journal).unwrap();
+
+        // This build: ids back on the same indices, the 0.10.2 turn untagged.
+        let mut loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 4);
+        let ids: Vec<_> = loaded.api_messages.iter().map(|m| message_turn_id(m)).collect();
+        assert_eq!(ids, vec![Some("t-1"), None, Some("t-2"), None]);
+        assert_eq!(loaded.api_messages[3]["content"], "asked on 0.10.2");
+        // One full snapshot (the old meta has no turns hash), then appends.
+        let receipt = save_session_in_dir(&dir, &loaded, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::FullSnapshot), "{:?}", receipt.mode);
+        loaded.api_messages.push(tagged("third", "t-3"));
+        let receipt = save_session_in_dir(&dir, &loaded, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }), "{:?}", receipt.mode);
+        let again = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again.api_messages).unwrap(),
+            serde_json::to_value(&loaded.api_messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_malformed_journal_turn_id_does_not_end_replay() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(1);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(tagged("second", "t-2"));
+        push_message(&mut s, "third");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let path = journal_path(&dir, &s.id);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""t":"t-2""#));
+        std::fs::write(&path, raw.replace(r#""t":"t-2""#, r#""t":{"bad":1}"#)).unwrap();
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 3, "replay continued past the bad id");
+        assert_eq!(message_turn_id(&loaded.api_messages[1]), None);
+    }
+
+    /// `_turn_ids` is best-effort metadata: a malformed value drops the ids,
+    /// never the session.
+    #[test]
+    fn malformed_turn_ids_are_dropped_not_fatal() {
+        for bad in [
+            serde_json::json!("garbage"),
+            serde_json::json!([[0, "t-1"], ["x", 1], [99, "past-the-end"], 7]),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(tagged("first", "t-1"));
+            push_message(&mut s, "reply");
+            save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+            let path = dir.join(format!("{}.json", s.id));
+            let mut snap: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            snap["_turn_ids"] = bad.clone();
+            std::fs::write(&path, snap.to_string()).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id)
+                .unwrap_or_else(|e| panic!("{bad}: session not loadable: {e}"));
+            assert_eq!(loaded.api_messages.len(), 2, "{bad}");
+            let well_formed = bad.as_array().is_some();
+            assert_eq!(
+                message_turn_id(&loaded.api_messages[0]),
+                well_formed.then_some("t-1"),
+                "{bad}: valid entries survive"
+            );
+        }
     }
 }
