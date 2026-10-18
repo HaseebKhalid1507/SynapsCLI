@@ -783,4 +783,38 @@ mod tests {
         task.await.unwrap().expect("adopts the rotated token");
         assert_eq!(auth.read().await.auth_token, "sk-rotated");
     }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn expiry_refresh_waits_on_cross_process_lock_and_adopts_rotated_token() {
+        // Two processes whose token expires together: the other one holds
+        // the refresh lock and rotates auth.json. The normal expiry path must
+        // wait and adopt its token rather than spend the same refresh token.
+        // Offline client: success proves no network refresh happened here.
+        let base = crate::test_env::BaseDirGuard::new();
+        write_creds_expiring(base.path(), "sk-expired", 1_000);
+        let lock = hold_foreign_refresh_lock(base.path());
+        let auth = unloaded_local_oauth();
+        let task = {
+            let auth = Arc::clone(&auth);
+            tokio::spawn(async move {
+                AuthMethods::refresh_if_needed(
+                    auth,
+                    &offline_client(),
+                    &CredentialSource::Local,
+                    &TokenCache::new(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "expiry refresh must wait for the foreign refresh lock"
+        );
+        write_creds_expiring(base.path(), "sk-rotated", 9_999_999_999_999);
+        drop(lock);
+        task.await.unwrap().expect("adopts the rotated token");
+        assert_eq!(auth.read().await.auth_token, "sk-rotated");
+    }
 }

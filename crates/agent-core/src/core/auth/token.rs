@@ -190,26 +190,7 @@ where
     P::Error: std::fmt::Display,
 {
     let provider = provider.try_into().map_err(|e| e.to_string())?;
-    let key = provider.as_str();
-    ensure_fresh_gated(
-        refresh_gate(key),
-        || {
-            load_provider_auth(key)?.ok_or_else(|| {
-                format!(
-                    "No credentials for {} at {}. Run `synaps login`.",
-                    provider,
-                    auth_file_path().display()
-                )
-            })
-        },
-        |refresh| async move { super::provider::refresh(client, provider, &refresh).await },
-        |creds| {
-            save_provider_auth(key, creds)?;
-            note_refreshed(key);
-            Ok(())
-        },
-    )
-    .await
+    refresh_provider_detached(client.clone(), provider, None).await
 }
 
 /// Minimum interval between two *forced* (401-driven) refreshes of the same
@@ -232,9 +213,9 @@ fn note_refreshed(provider: &str) {
         .insert(provider.to_string(), std::time::Instant::now());
 }
 
-/// Cross-process exclusive lock for the forced-refresh critical section
-/// (load → compare → refresh → save). A revocation hits every running synaps
-/// process at once; without this they would all spend
+/// Cross-process exclusive lock for the refresh critical section
+/// (load → compare → refresh → save). A revocation (or a shared expiry) hits
+/// every running synaps process at once; without this they would all spend
 /// the same rotating refresh token. Uses a SEPARATE lock file from the save path's
 /// `auth.json.lock`, so `save_provider_auth` can still take that lock inside.
 /// Released when the returned file is dropped.
@@ -301,7 +282,7 @@ where
     refresh_provider_detached(client.clone(), provider, Some(rejected_access.to_string())).await
 }
 
-/// Forced (401-driven) refresh body, run on a DETACHED task: if the
+/// Shared body of both provider entry points, run on a DETACHED task: if the
 /// caller is cancelled (Esc mid-request) after the provider has rotated the
 /// refresh token but before `save`, the task still persists it — dropping
 /// the rotated refresh token would log the user out.
@@ -320,8 +301,7 @@ async fn refresh_provider_detached(
 /// Lock order, fixed everywhere: in-process gate → per-provider
 /// `auth.json.<p>.refresh.lock` (cross-process) → save's `auth.json.lock`.
 /// The file lock is only taken when a refresh looks necessary, so the common
-/// fresh-token path stays a single file read. The normal expiry refresh
-/// (`ensure_fresh_provider_token`) still uses only the in-process gate.
+/// fresh-token path stays a single file read.
 async fn refresh_provider_locked(
     client: &Client,
     provider: super::provider::OAuthProviderId,
@@ -404,6 +384,11 @@ fn forced_refresh_allowed(
 ///    gate and observe the rotated credential without a second refresh.
 /// 2. `save` runs only after a successful refresh (failures persist nothing).
 /// 3. The refreshed credential is persisted before the gate is released.
+///
+/// Production goes through [`ensure_fresh_gated_rejecting`] (via
+/// `refresh_provider_locked`); this `rejected = None` form is kept as the
+/// directly-tested contract.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn ensure_fresh_gated<Load, Refresh, RFut, Save>(
     gate: Arc<Mutex<()>>,
     load: Load,
