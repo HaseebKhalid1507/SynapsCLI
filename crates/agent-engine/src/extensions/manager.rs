@@ -336,6 +336,23 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
+        let deferred: Vec<String> = self
+            .deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        let loaded = self
+            .extensions
+            .keys()
+            .map(String::as_str)
+            .chain(deferred.iter().map(String::as_str));
+        if let Some(other) = Self::folded_id_collision(id, loaded) {
+            return Err(format!(
+                "Extension '{id}' collides with loaded extension '{other}': ids that differ only in '-'/'_' or case share SYNAPS_EXTENSION_* override variables"
+            ));
+        }
         let config = Self::resolve_config(id, &manifest.config, self.host_project_root())?;
         self.load_with_cwd_and_config(id, manifest, cwd, config)
             .await
@@ -937,21 +954,34 @@ impl ExtensionManager {
     /// plus the credential sources read outside those tables, with the
     /// original hand-written list kept as a floor. Drift tests below fail if a
     /// registered or hand-read credential env var is not covered.
-    fn denied_secret_env(var: &str, id: &str) -> Option<&'static str> {
-        let up = var.trim().to_ascii_uppercase();
-        if up.is_empty() {
+    ///
+    /// `own_keys` are this manifest's declared config keys: inside `SYNAPS_*`
+    /// only their exact override names are allowed, so extension `foo`
+    /// cannot read `foo-bar`'s `SYNAPS_EXTENSION_FOO_BAR_TOKEN`.
+    fn denied_secret_env(var: &str, id: &str, own_keys: &[&str]) -> Option<&'static str> {
+        if var.trim().is_empty() {
             return Some("secret_env must not be empty");
         }
-        let own_prefix = format!(
-            "SYNAPS_EXTENSION_{}_",
-            id.replace('-', "_").to_ascii_uppercase()
-        );
-        if up.starts_with("SYNAPS_") && !up.starts_with(&own_prefix) {
+        let mut chars = var.chars();
+        let valid_name = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if !valid_name {
             return Some(
-                "SYNAPS_* is the host namespace; declare your own SYNAPS_EXTENSION_<ID>_<KEY> variable instead",
+                "secret_env must be an upper-case variable name matching [A-Z_][A-Z0-9_]*",
             );
         }
-        if Self::is_host_credential_env(&up) {
+        if var.starts_with("SYNAPS_")
+            && !own_keys
+                .iter()
+                .any(|k| Self::extension_override_var(id, k) == var)
+        {
+            return Some(
+                "SYNAPS_* is the host namespace; only this extension's own SYNAPS_EXTENSION_<ID>_<KEY> for a declared key is allowed",
+            );
+        }
+        if Self::is_host_credential_env(var) {
             return Some(
                 "that variable holds a host credential; extensions are never handed the host's own provider keys",
             );
@@ -959,7 +989,27 @@ impl ExtensionManager {
         None
     }
 
-    /// `up` must already be trimmed and upper-cased.
+    /// The per-extension env override name for config `key`
+    /// (`SYNAPS_EXTENSION_<ID>_<KEY>`, upper-cased, `-` folded to `_`).
+    fn extension_override_var(id: &str, key: &str) -> String {
+        format!(
+            "SYNAPS_EXTENSION_{}_{}",
+            id.replace('-', "_").to_ascii_uppercase(),
+            key.replace('-', "_").to_ascii_uppercase()
+        )
+    }
+
+    /// Another loaded id that differs from `id` only in `-`/`_` or case. The
+    /// two would share every `SYNAPS_EXTENSION_<ID>_*` override variable.
+    fn folded_id_collision<'a>(id: &str, loaded: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+        let fold = |s: &str| s.replace('-', "_").to_ascii_uppercase();
+        let mine = fold(id);
+        loaded
+            .filter(|other| *other != id)
+            .find(|other| fold(other) == mine)
+    }
+
+    /// `up` must already be upper-cased.
     fn is_host_credential_env(up: &str) -> bool {
         // Floor: the original #207 list. Never shrink it.
         const FLOOR: &[&str] = &[
@@ -985,6 +1035,12 @@ impl ExtensionManager {
             "AWS_ACCESS_KEY_ID",
             "SYNAPS_MACHINE_TOKEN",
             "SYNAPS_BROKER_TOKEN",
+            // reqwest reads these by default; a proxy URL can embed
+            // `user:pass@`.
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
         ];
         FLOOR.contains(&up)
             || OTHER_SOURCES.contains(&up)
@@ -1002,6 +1058,7 @@ impl ExtensionManager {
         host_project_root: Option<&str>,
     ) -> Result<Value, String> {
         let mut out = Map::new();
+        let own_keys: Vec<&str> = entries.iter().map(|e| e.key.trim()).collect();
         for entry in entries {
             let key = entry.key.trim();
             if key.is_empty() {
@@ -1046,18 +1103,14 @@ impl ExtensionManager {
             // any resolution path can read it. Fails at load, loudly, rather
             // than silently handing a host credential to the extension.
             if let Some(secret_env) = &entry.secret_env {
-                if let Some(reason) = Self::denied_secret_env(secret_env, id) {
+                if let Some(reason) = Self::denied_secret_env(secret_env, id, &own_keys) {
                     return Err(format!(
                         "Extension '{}' config key '{}' declares secret_env '{}': {}",
                         id, key, secret_env, reason
                     ));
                 }
             }
-            if let Ok(value) = std::env::var(format!(
-                "SYNAPS_EXTENSION_{}_{}",
-                id.replace('-', "_").to_ascii_uppercase(),
-                key.replace('-', "_").to_ascii_uppercase()
-            )) {
+            if let Ok(value) = std::env::var(Self::extension_override_var(id, key)) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
             }
@@ -2899,12 +2952,16 @@ mod secret_env_allowlist_tests {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "AWS_SECRET_ACCESS_KEY",
-            "anthropic_api_key", // case-insensitive
         ] {
             let err = ExtensionManager::resolve_config("evil", &[entry("k", var)], None)
                 .expect_err(&format!("{var} must be rejected"));
             assert!(err.contains("host credential"), "unexpected error: {err}");
         }
+        // lower case is refused by the name rule before the denylist
+        let entries = [entry("k", "anthropic_api_key")];
+        let err = ExtensionManager::resolve_config("evil", &entries, None)
+            .expect_err("anthropic_api_key must be rejected");
+        assert!(err.contains("[A-Z_][A-Z0-9_]*"), "unexpected error: {err}");
     }
 
     /// The whole SYNAPS_* namespace is the host's, except this extension's
@@ -2919,7 +2976,8 @@ mod secret_env_allowlist_tests {
         // an extension's own scoped var is fine
         assert!(ExtensionManager::denied_secret_env(
             "SYNAPS_EXTENSION_MY_PLUGIN_TOKEN",
-            "my-plugin"
+            "my-plugin",
+            &["token"]
         )
         .is_none());
     }
@@ -2929,7 +2987,7 @@ mod secret_env_allowlist_tests {
     fn third_party_secrets_are_still_allowed() {
         for var in ["GITHUB_TOKEN", "STRIPE_KEY", "MY_SERVICE_TOKEN"] {
             assert!(
-                ExtensionManager::denied_secret_env(var, "some-ext").is_none(),
+                ExtensionManager::denied_secret_env(var, "some-ext", &[]).is_none(),
                 "{var} should be allowed"
             );
         }
@@ -2959,75 +3017,198 @@ mod secret_env_allowlist_tests {
         ]);
         assert!(vars.len() > 20, "registry walk found too few vars");
         for var in vars {
-            let reason = ExtensionManager::denied_secret_env(var, "some-ext")
+            let reason = ExtensionManager::denied_secret_env(var, "some-ext", &[])
                 .unwrap_or_else(|| panic!("{var} must be denied as secret_env"));
             assert!(reason.contains("host credential"), "{var}: {reason}");
         }
     }
 
-    /// Drift guard for credential env vars read by hand rather than through
-    /// a registry: scan the auth/config sources for `env::var("…")` literals
-    /// and `*_ENV: &str = "…"` consts whose names look like secrets, and
-    /// require every one to be refused. `SYNAPS_*` names are refused by the
-    /// namespace rule, which is fine.
-    #[test]
-    fn credential_env_reads_in_auth_sources_are_denied() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        for dir in [
-            "crates/agent-core/src/core/auth",
-            "crates/agent-engine/src/runtime",
-            "crates/agent-engine/src/runtime/openai",
-        ] {
-            for e in std::fs::read_dir(root.join(dir)).unwrap() {
-                let p = e.unwrap().path();
-                if p.extension().is_some_and(|x| x == "rs") {
-                    files.push(p);
+    /// Literal names passed to `pat` (e.g. `env::var(`), skipping any
+    /// whitespace between the open paren and the opening quote.
+    fn literal_args(src: &str, pat: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(pat) {
+            rest = &rest[i + pat.len()..];
+            let arg = rest.trim_start();
+            if let Some(lit) = arg.strip_prefix('"') {
+                if let Some(end) = lit.find('"') {
+                    out.push(lit[..end].to_string());
                 }
             }
         }
-        files.push(root.join("crates/agent-core/src/core/config.rs"));
-        files.push(root.join("src/cmd/auth_broker.rs"));
+        out
+    }
 
-        fn quoted_after<'a>(s: &'a str, pat: &str) -> Vec<&'a str> {
-            let mut out = Vec::new();
-            let mut rest = s;
-            while let Some(i) = rest.find(pat) {
-                rest = &rest[i + pat.len()..];
-                if let Some(end) = rest.find('"') {
-                    out.push(&rest[..end]);
+    /// Drift guard for credential env vars read by hand rather than through
+    /// a registry: walk every workspace source file (recursively: all crates
+    /// plus the root `src/`) for `env::var(…"NAME"…)` / `env::var_os(…)`
+    /// literals (whitespace and rustfmt line breaks allowed inside the call)
+    /// and `*_ENV: &str = "…"` consts whose names look like secrets, and
+    /// require every one to be refused.
+    #[test]
+    fn credential_env_reads_in_workspace_sources_are_denied() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
                 }
             }
-            out
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        for e in std::fs::read_dir(root.join("crates")).unwrap() {
+            let src = e.unwrap().path().join("src");
+            if src.is_dir() {
+                walk(&src, &mut files);
+            }
+        }
+        // The scan must reach the places the review listed, or it rotted.
+        for must in [
+            "crates/agent-core/src/core/auth/muse.rs",
+            "crates/agent-core/src/core/config.rs",
+            "crates/agent-engine/src/runtime/google_gemini/runtime.rs",
+            "crates/agent-engine/src/session/types.rs",
+            "crates/agent-engine/src/daemon/mod.rs",
+            "crates/agent-tui/src/lib.rs",
+            "src/cmd/auth_broker.rs",
+            "src/cmd/login.rs",
+        ] {
+            assert!(
+                files.iter().any(|f| f.ends_with(must)),
+                "scan does not cover {must}"
+            );
         }
 
         let mut seen = 0;
-        for f in files {
-            let src = std::fs::read_to_string(&f).unwrap();
-            let mut names = quoted_after(&src, "env::var(\"");
-            names.extend(quoted_after(&src, "env::var_os(\""));
-            names.extend(quoted_after(&src, "_ENV: &str = \""));
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            let mut names = literal_args(&src, "env::var(");
+            names.extend(literal_args(&src, "env::var_os("));
+            names.extend(literal_args(&src, "_ENV: &str ="));
             for name in names {
                 let up = name.to_ascii_uppercase();
                 let looks_secret = ["KEY", "TOKEN", "SECRET", "PASSWORD"]
                     .iter()
                     .any(|w| up.contains(w));
-                if !looks_secret || up.is_empty() {
+                if !looks_secret {
                     continue;
                 }
                 seen += 1;
                 assert!(
-                    ExtensionManager::denied_secret_env(name, "some-ext").is_some(),
+                    ExtensionManager::denied_secret_env(&name, "some-ext", &[]).is_some(),
                     "{} reads credential env var {name}, which extensions may still request via secret_env",
                     f.display()
                 );
             }
         }
-        assert!(seen > 0, "source scan matched nothing; the patterns rotted");
+        assert!(
+            seen > 3,
+            "source scan matched almost nothing; the patterns rotted"
+        );
+    }
+
+    #[test]
+    fn literal_scan_handles_rustfmt_split_calls() {
+        // Guard the scanner itself against the rustfmt shape that the old
+        // version missed: `env::var(\n    "X",\n)`.
+        let src = "let a = std::env::var(\n        \"SPLIT_TOKEN\",\n    );\nenv::var(\"ONE\")";
+        assert_eq!(literal_args(src, "env::var("), ["SPLIT_TOKEN", "ONE"]);
+    }
+
+    /// reqwest honours these and a proxy URL can carry `user:pass@`.
+    #[test]
+    fn proxy_variables_are_denied() {
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"] {
+            assert!(
+                ExtensionManager::denied_secret_env(var, "some-ext", &[]).is_some(),
+                "{var} must be denied"
+            );
+            // lower case is refused too (by the name rule)
+            let lower = var.to_ascii_lowercase();
+            assert!(
+                ExtensionManager::denied_secret_env(&lower, "some-ext", &[]).is_some(),
+                "{lower} must be denied"
+            );
+        }
+    }
+
+    /// `foo` must not read `foo-bar`'s override var; only its own declared
+    /// keys' override names are allowed in the SYNAPS_ namespace.
+    #[test]
+    fn own_scope_is_limited_to_declared_keys() {
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_FOO_BAR_TOKEN",
+            "foo",
+            &["api_key"]
+        )
+        .is_some());
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_FOO_API_KEY",
+            "foo",
+            &["api_key"]
+        )
+        .is_none());
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_FOO_BAR_API_KEY",
+            "foo-bar",
+            &["api-key"]
+        )
+        .is_none());
+        // through resolve_config, with the manifest's own keys
+        let err = ExtensionManager::resolve_config(
+            "foo",
+            &[entry("k", "SYNAPS_EXTENSION_FOO_BAR_TOKEN")],
+            None,
+        )
+        .expect_err("cross-extension override must be rejected");
+        assert!(err.contains("host namespace"), "{err}");
+    }
+
+    #[test]
+    fn ids_differing_only_in_separators_collide() {
+        assert_eq!(
+            ExtensionManager::folded_id_collision("foo_bar", ["foo-bar", "x"].into_iter()),
+            Some("foo-bar")
+        );
+        assert_eq!(
+            ExtensionManager::folded_id_collision("Foo-Bar", ["foo-bar"].into_iter()),
+            Some("foo-bar")
+        );
+        // the same id (a reload) and unrelated ids are not collisions
+        assert_eq!(
+            ExtensionManager::folded_id_collision("foo-bar", ["foo-bar", "foo"].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn secret_env_name_charset_is_enforced() {
+        for bad in [
+            "lower_case",
+            "HAS SPACE",
+            " PADDED",
+            "A=B",
+            "A-B",
+            "1ABC",
+            "A\0B",
+            "ÄPI_KEY",
+        ] {
+            let reason = ExtensionManager::denied_secret_env(bad, "some-ext", &[])
+                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+            assert!(reason.contains("[A-Z_][A-Z0-9_]*"), "{bad:?}: {reason}");
+        }
+        for good in ["GITHUB_TOKEN", "_X", "A1"] {
+            assert!(ExtensionManager::denied_secret_env(good, "some-ext", &[]).is_none());
+        }
     }
 
     #[test]
     fn empty_secret_env_is_rejected() {
-        assert!(ExtensionManager::denied_secret_env("   ", "x").is_some());
+        assert!(ExtensionManager::denied_secret_env("   ", "x", &[]).is_some());
     }
 }
