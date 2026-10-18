@@ -408,6 +408,14 @@ pub(crate) async fn run_shell_command(
         // the output cap or an abandoned password prompt kills the whole
         // process group, not just the shell.
         let mut group = KillGroupUnlessFinished::new(child.id());
+        // Report the child to its session (ledger first, then `tool_child`)
+        // before any output; its end is reported once at the reap, or as a
+        // kill when this future is dropped (timeout, cancel).
+        let mut watch = crate::session::child_events::ChildWatch::start(
+            ctx.channels.tx_delta.as_ref().and_then(|delta| delta.child_sink()),
+            child.id(),
+            None,
+        );
 
         let stdout = child
             .stdout
@@ -488,6 +496,7 @@ pub(crate) async fn run_shell_command(
                             None => {
                                 group.kill_now();
                                 let _ = child.kill().await;
+                                watch.killed();
                                 return Err(RuntimeError::Tool(
                                     "Command canceled while waiting for password".to_string(),
                                 ));
@@ -544,6 +553,10 @@ pub(crate) async fn run_shell_command(
             // wait errors may mean the leader was already reaped externally;
             // never signal a potentially recycled process-group ID afterwards.
             group.finished();
+            match &status {
+                Ok(status) => watch.exited(status),
+                Err(_) => watch.end(None, None),
+            }
             let status = status.map_err(|e| RuntimeError::Tool(e.to_string()))?;
             // Finished on its own: leave anything it deliberately started in
             // the background (`server &`) running, as before.

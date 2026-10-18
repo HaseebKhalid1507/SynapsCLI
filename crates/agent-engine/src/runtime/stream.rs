@@ -195,6 +195,8 @@ pub(super) struct StreamSession {
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
+    /// The session route spawned children are reported to (per-call sinks).
+    pub(super) child_route: Option<crate::session::child_events::ChildRoute>,
     /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
@@ -658,6 +660,7 @@ impl StreamMethods {
             telemetry_level,
             orchestration,
             delegation_parent,
+            child_route,
             turn_correlation_id,
             progressive_tool_disclosure,
             deferred_tool_loading,
@@ -1889,7 +1892,10 @@ impl StreamMethods {
                                         ));
                                     },
                                 );
-                                let tx_d = delta_channel.sender;
+                                let mut tx_d = delta_channel.sender;
+                                if let Some(route) = &child_route {
+                                    tx_d.set_child_sink(route.sink(&tool_id, &tool_name));
+                                }
                                 production_output = Some(output_handle.clone());
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
@@ -2211,6 +2217,7 @@ impl StreamMethods {
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
                         let delegation_parent_inner = delegation_parent.clone();
+                        let child_route_inner = child_route.clone();
                         let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
                         let turn_completion_inner = turn_completion.clone();
@@ -2312,7 +2319,10 @@ impl StreamMethods {
                                             }));
                                         },
                                     );
-                                    let tx_d = delta_channel.sender;
+                                    let mut tx_d = delta_channel.sender;
+                                    if let Some(route) = &child_route_inner {
+                                        tx_d.set_child_sink(route.sink(&tool_id, &tool_name));
+                                    }
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
@@ -3751,6 +3761,7 @@ mod rich_output_tests {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            child_route: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
             deferred_tool_loading: true,
@@ -5351,6 +5362,7 @@ mod rich_output_tests {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            child_route: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
             deferred_tool_loading: true,

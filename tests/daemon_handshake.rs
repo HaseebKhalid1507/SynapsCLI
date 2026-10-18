@@ -521,6 +521,67 @@ async fn thinking_options_query_is_answered_before_and_after_attach() {
 /// C4a: `Welcome.accepted_events` is computed per connection, from that
 /// connection's own Hello: unknown names never appear in it, and a second
 /// connection's opt-in is its own.
+/// Optional events reach only the connections that listed them, one kind
+/// per name: three connections on one session, asking for nothing, for
+/// `tool_child_ended` only (plus an unknown name), and for both.
+#[tokio::test]
+#[serial]
+async fn optional_events_reach_only_the_connections_that_listed_them() {
+    use agent_engine::session::handle::echo::CHILD_EVENTS_PROMPT;
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let hello = |names: &[&str]| ClientFrame::Hello(Hello::new(ClientKind::Test).with_accepted_events(names.iter().copied()));
+
+    let mut owner = Raw::connect(&sock).await;
+    owner.send(&hello(&[])).await;
+    assert!(matches!(owner.recv().await, Some(DaemonFrame::Welcome(_))));
+    owner.send(&ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Mirror })).await;
+    let session_id = match owner.recv().await {
+        Some(DaemonFrame::Attached(a)) => a.meta.id,
+        other => panic!("{other:?}"),
+    };
+    let mut joined = Vec::new();
+    for names in [&["tool_child_ended", "bogus"][..], OPTIONAL_EVENTS] {
+        let mut c = Raw::connect(&sock).await;
+        c.send(&hello(names)).await;
+        assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))));
+        c.send(&ClientFrame::Attach(Attach::Existing { session_id: session_id.clone(), mode: AttachMode::Mirror })).await;
+        assert!(matches!(c.recv().await, Some(DaemonFrame::Attached(_))));
+        joined.push(c);
+    }
+    owner
+        .send(&ClientFrame::Cmd {
+            session_id: session_id.clone(),
+            cmd: SessionCommand::Submit { text: CHILD_EVENTS_PROMPT.into(), attachments: vec![] },
+        })
+        .await;
+    async fn child_events_until_done(c: &mut Raw) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        loop {
+            match c.recv().await {
+                Some(DaemonFrame::Event(env)) => match env.event {
+                    WireSessionEvent::ToolChild { .. } => out.push("tool_child"),
+                    WireSessionEvent::ToolChildEnded { .. } => out.push("tool_child_ended"),
+                    WireSessionEvent::Stream { event: WireStreamEvent::Session(WireSessionStreamEvent::Done) } => {
+                        return out
+                    }
+                    _ => {}
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert!(child_events_until_done(&mut owner).await.is_empty(), "not asked for: none");
+    assert_eq!(child_events_until_done(&mut joined[0]).await, ["tool_child_ended"], "only the kind it named");
+    assert_eq!(child_events_until_done(&mut joined[1]).await, ["tool_child", "tool_child_ended"]);
+    for c in std::iter::once(&mut owner).chain(joined.iter_mut()) {
+        c.send(&ClientFrame::Bye).await;
+    }
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn accepted_events_echo_is_per_connection_and_drops_unknown_names() {

@@ -10,6 +10,7 @@ pub mod actor;
 pub mod actor_cmds;
 pub mod budgets;
 pub mod cache_keepwarm;
+pub mod child_events;
 pub mod children;
 pub mod client_args;
 pub mod display;

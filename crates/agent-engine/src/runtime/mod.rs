@@ -716,6 +716,10 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
+    /// Where tool calls report the processes they spawn: the owning daemon
+    /// session's route (a worker's carries its handle id). `None` outside a
+    /// session actor.
+    child_route: Option<crate::session::child_events::ChildRoute>,
     /// Session-scoped, per-extension "Allow all" latch for extension
     /// `Confirm` gates (`before_tool_call`). An extension id is added when
     /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
@@ -1300,6 +1304,7 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
+            child_route: None,
             session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
             mcp_runtime: None,
             mcp_session_scope: None,
@@ -1661,6 +1666,16 @@ impl Runtime {
 
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
+    }
+
+    /// Route spawned-child reports to a daemon session (see
+    /// `session::child_events`). Clones share it.
+    pub fn set_child_route(&mut self, route: Option<crate::session::child_events::ChildRoute>) {
+        self.child_route = route;
+    }
+
+    pub fn child_route(&self) -> Option<&crate::session::child_events::ChildRoute> {
+        self.child_route.as_ref()
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
@@ -4749,6 +4764,7 @@ impl Runtime {
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
+            child_route: self.child_route.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             deferred_tool_loading: self.deferred_tool_loading,
@@ -4885,6 +4901,7 @@ impl Clone for Runtime {
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
+            child_route: self.child_route.clone(),
             session_allow_all: self.session_allow_all.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or

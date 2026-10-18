@@ -863,6 +863,8 @@ pub(super) async fn handle_session_event_arm(
             )));
             app.request_redraw();
         }
+        // Spawned-child reports are for process inspectors, not the transcript.
+        SessionEventWire::ChildProcess(_) => {}
     }
     ArmFlow::Continue
 }

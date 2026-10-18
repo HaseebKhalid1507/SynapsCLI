@@ -483,12 +483,21 @@ pub struct Welcome {
 /// `Hello.accepted_events`: one name per kind, no groups. Every other event
 /// goes to every attached client as before, so an old client (which shows
 /// an unknown event as "unknown event from a newer daemon") never sees one.
-pub const OPTIONAL_EVENTS: &[&str] = &[];
+pub const OPTIONAL_EVENTS: &[&str] = &[EVENT_TOOL_CHILD, EVENT_TOOL_CHILD_ENDED];
+
+/// A tool spawned a child process.
+pub const EVENT_TOOL_CHILD: &str = "tool_child";
+/// A tool's spawned child was reaped.
+pub const EVENT_TOOL_CHILD_ENDED: &str = "tool_child_ended";
 
 /// The opt-in name of an optional event kind; `None` = always sent.
 pub fn optional_event_name(event: &SessionEventWire) -> Option<&'static str> {
-    let _ = event;
-    None
+    use super::child_events::ChildProcessEvent;
+    match event {
+        SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(_)) => Some(EVENT_TOOL_CHILD),
+        SessionEventWire::ChildProcess(ChildProcessEvent::Ended { .. }) => Some(EVENT_TOOL_CHILD_ENDED),
+        _ => None,
+    }
 }
 
 /// The optional events one connection gets, negotiated from its Hello.
@@ -772,6 +781,27 @@ pub enum WireSessionEvent {
         scope: String,
         cost: f64,
         cap: f64,
+    },
+    /// A tool call spawned a child process (opt-in: `tool_child`).
+    ToolChild {
+        tool_id: String,
+        tool_name: String,
+        #[serde(default)]
+        handle_id: Option<String>,
+        #[serde(default)]
+        shell_session_id: Option<String>,
+        child: super::children::ChildIdentity,
+    },
+    /// A tool call's spawned child was reaped (opt-in: `tool_child_ended`).
+    ToolChildEnded {
+        tool_id: String,
+        #[serde(default)]
+        handle_id: Option<String>,
+        child: super::children::ChildIdentity,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        signal: Option<i32>,
     },
     /// Forward-compat: an additive variant from a newer daemon.
     #[serde(other)]
@@ -1072,6 +1102,20 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::CostCapReached { scope, cost, cap } => {
                 Self::CostCapReached { scope, cost, cap }
             }
+            S::ChildProcess(super::child_events::ChildProcessEvent::Spawned(spawn)) => Self::ToolChild {
+                tool_id: spawn.tool_id,
+                tool_name: spawn.tool_name,
+                handle_id: spawn.handle_id,
+                shell_session_id: spawn.shell_session_id,
+                child: spawn.child,
+            },
+            S::ChildProcess(super::child_events::ChildProcessEvent::Ended {
+                tool_id,
+                handle_id,
+                child,
+                exit_code,
+                signal,
+            }) => Self::ToolChildEnded { tool_id, handle_id, child, exit_code, signal },
         }
     }
 }
@@ -1136,6 +1180,24 @@ impl From<WireSessionEvent> for SessionEventWire {
             }
             W::CostCapReached { scope, cost, cap } => {
                 Self::CostCapReached { scope, cost, cap }
+            }
+            W::ToolChild { tool_id, tool_name, handle_id, shell_session_id, child } => {
+                Self::ChildProcess(super::child_events::ChildProcessEvent::Spawned(super::children::ChildSpawn {
+                    tool_id,
+                    tool_name,
+                    handle_id,
+                    shell_session_id,
+                    child,
+                }))
+            }
+            W::ToolChildEnded { tool_id, handle_id, child, exit_code, signal } => {
+                Self::ChildProcess(super::child_events::ChildProcessEvent::Ended {
+                    tool_id,
+                    handle_id,
+                    child,
+                    exit_code,
+                    signal,
+                })
             }
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }
@@ -2177,6 +2239,73 @@ mod tests {
 
     /// C4a: `accepted_events` (the names PD vendors), the negotiation rule
     /// and old peers.
+    /// The frozen `tool_child` / `tool_child_ended` shapes, their opt-in
+    /// names, and an old client's decode (`Unknown`, then the usual notice).
+    #[test]
+    fn tool_child_events_keep_the_agreed_names_and_old_clients_skip_them() {
+        use super::super::child_events::ChildProcessEvent;
+        use super::super::children::{ChildIdentity, ChildSpawn};
+        let child = ChildIdentity { pid: 3646158, start_ticks: 26981644, boot_id: "680bd989".into(), sid: 3646158, pgid: 3646158 };
+        let spawned = SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(ChildSpawn {
+            tool_id: "toolu_01ABC".into(),
+            tool_name: "bash".into(),
+            handle_id: None,
+            shell_session_id: None,
+            child: child.clone(),
+        }));
+        let ended = SessionEventWire::ChildProcess(ChildProcessEvent::Ended {
+            tool_id: "toolu_01ABC".into(),
+            handle_id: Some("sa_3".into()),
+            child: child.clone(),
+            exit_code: None,
+            signal: Some(9),
+        });
+        assert_eq!(OPTIONAL_EVENTS, &["tool_child", "tool_child_ended"]);
+        assert_eq!(optional_event_name(&spawned), Some("tool_child"));
+        assert_eq!(optional_event_name(&ended), Some("tool_child_ended"));
+        assert_eq!(optional_event_name(&SessionEventWire::Idle), None);
+
+        let inner = |e: SessionEventWire| match e {
+            SessionEventWire::ChildProcess(event) => event,
+            other => panic!("not a child event: {other:?}"),
+        };
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let v = serde_json::to_value(WireSessionEvent::from(spawned.clone())).unwrap();
+        assert_eq!(v["ev"], "tool_child");
+        assert_eq!(keys(&v), ["child", "ev", "handle_id", "shell_session_id", "tool_id", "tool_name"]);
+        assert!(v["handle_id"].is_null() && v["shell_session_id"].is_null(), "nulls are sent: {v}");
+        assert_eq!(keys(&v["child"]), ["boot_id", "pgid", "pid", "sid", "start_ticks"]);
+        assert_eq!(v["child"]["start_ticks"], 26981644);
+        let back: WireSessionEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(inner(SessionEventWire::from(back)), inner(spawned.clone()), "round trip");
+
+        let v = serde_json::to_value(WireSessionEvent::from(ended.clone())).unwrap();
+        assert_eq!(v["ev"], "tool_child_ended");
+        assert_eq!(keys(&v), ["child", "ev", "exit_code", "handle_id", "signal", "tool_id"]);
+        assert_eq!((v["handle_id"].as_str(), v["signal"].as_i64(), v["exit_code"].is_null()), (Some("sa_3"), Some(9), true));
+        let back: WireSessionEvent = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(inner(SessionEventWire::from(back)), inner(ended), "round trip");
+
+        // An old client: a v0.10.2-shaped event enum with `#[serde(other)]`.
+        #[derive(Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldEvent {
+            Idle,
+            SystemNotice { text: String },
+            CostCapReached { scope: String, cost: f64, cap: f64 },
+            #[serde(other)]
+            Unknown,
+        }
+        for json in [serde_json::to_value(WireSessionEvent::from(spawned)).unwrap(), v] {
+            assert!(matches!(serde_json::from_value::<OldEvent>(json).unwrap(), OldEvent::Unknown));
+        }
+    }
+
     #[test]
     fn accepted_events_are_exact_names_and_compatible_with_old_peers() {
         let known: &[&'static str] = &["tool_child", "tool_child_ended"];

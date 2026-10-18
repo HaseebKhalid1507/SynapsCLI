@@ -139,6 +139,7 @@ impl Tool for SubagentTool {
         let label_inner = label.clone();
         let model_inner = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
+        let child_route = crate::session::child_events::worker_route(ctx.channels.tx_delta.as_ref(), &orchestration_id);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
@@ -178,6 +179,7 @@ impl Tool for SubagentTool {
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
+                    runtime.set_child_route(child_route);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

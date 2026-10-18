@@ -151,6 +151,8 @@ impl Client {
             SessionEventWire::CostCapReached { scope, cost, cap } => self.out(&format!(
                 "[{scope} cost cap reached: ${cost:.4} ≥ ${cap:.4} — turn cancelled, driver revoked]\n"
             )),
+            // Optional (`accepted_events`); this client does not ask for it.
+            SessionEventWire::ChildProcess(_) => {}
         }
     }
 
