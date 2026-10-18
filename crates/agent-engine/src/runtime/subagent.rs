@@ -600,6 +600,21 @@ impl SubagentHandle {
     }
 }
 
+/// A handle dropped while its worker still runs (a registry dropped with
+/// its runtime, a collect abandoned mid-wait) takes the shutdown channel
+/// with it, which kills the worker; its stream then ends quietly and the
+/// run would read as a truncated "completed". Flag the cancel first, under
+/// the lock the worker records its completion with, so the finalizer labels
+/// it cancelled. A finished or finalizing worker is left alone.
+impl Drop for SubagentHandle {
+    fn drop(&mut self) {
+        let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+        if matches!(s.status, SubagentStatus::Running) && !s.finalization_started {
+            s.cancel_requested = true;
+        }
+    }
+}
+
 // ── SubagentRegistry ─────────────────────────────────────────────────────────────
 
 /// Finished-but-uncollected handles are retained this long before GC.
@@ -1231,6 +1246,33 @@ mod tests {
         if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
             s.status = SubagentStatus::Completed;
         }
+    }
+
+    /// Dropping a running worker's handle drops its shutdown channel, which
+    /// kills the worker; its stream then ends quietly and it would read as a
+    /// truncated "completed". The drop flags the cancel first, so the
+    /// finalizer labels it cancelled. A finished (or finalizing) worker's
+    /// drop changes nothing.
+    #[test]
+    fn dropping_a_running_handle_flags_its_cancel() {
+        let mut registry = SubagentRegistry::new();
+        let running = make_handle("sa_1");
+        let running_state = Arc::clone(&running.state);
+        let finished = make_finished_handle("sa_2");
+        let finished_state = Arc::clone(&finished.state);
+        let finalizing = make_handle("sa_3");
+        let finalizing_state = Arc::clone(&finalizing.state);
+        finalizing_state.write().unwrap().finalization_started = true;
+        for h in [running, finished, finalizing] {
+            registry.register(h);
+        }
+        drop(registry);
+        assert!(running_state.read().unwrap().cancel_requested, "a killed run is a cancel");
+        assert!(!finished_state.read().unwrap().cancel_requested, "its completion stands");
+        assert!(!finalizing_state.read().unwrap().cancel_requested, "already deciding");
+        // The worker thread, finishing after the kill, cannot claim Completed.
+        complete_like_the_worker_thread(&running_state);
+        assert_eq!(running_state.read().unwrap().status, SubagentStatus::Running);
     }
 
     /// A cancel racing the worker's own completion must decide under the
