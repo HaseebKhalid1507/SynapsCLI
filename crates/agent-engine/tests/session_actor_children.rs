@@ -48,6 +48,14 @@ fn tool_round(msg_id: &str, calls: &[(&str, &str, Value)]) -> &'static str {
     sse(events)
 }
 
+/// A sweep drops an ended record whose sid has no live process left, at
+/// most once a minute, judging only records that existed when it began.
+/// Claiming the window before a test spawns anything keeps the next sweep
+/// a minute away, so ended records stay listable for the test's length.
+fn claim_the_sweep_window() {
+    let _ = children::list(None, None);
+}
+
 fn position(seen: &[Envelope], pred: impl Fn(&SessionEventWire) -> bool) -> Vec<usize> {
     seen.iter().enumerate().filter(|(_, env)| pred(&env.event)).map(|(i, _)| i).collect()
 }
@@ -102,6 +110,7 @@ async fn bash_children_are_reported_after_their_tool_use_and_before_their_result
     if !children::supported() {
         return;
     }
+    claim_the_sweep_window();
     let bodies: &'static [&'static str] = Box::leak(Box::new([
         tool_round("msg_c1", &[("toolu_c1", "bash", json!({"command": "echo hi"}))]),
         tool_round("msg_c2", &[("toolu_c2", "bash", json!({"command": "exit 3"}))]),
@@ -167,7 +176,9 @@ async fn a_worker_bash_call_is_reported_on_the_parent_with_its_handle() {
             "msg_p1",
             &[("toolu_p1", "subagent", json!({"task": "run it", "system_prompt": "You run one command."}))],
         ),
-        tool_round("msg_w1", &[("toolu_w1", "bash", json!({"command": "exit 4"}))]),
+        // The background sleep keeps the sid live, so the ended record is
+        // retained by any sweep, not just by timing.
+        tool_round("msg_w1", &[("toolu_w1", "bash", json!({"command": "sleep 20 >/dev/null 2>&1 & exit 4"}))]),
         SSE_HI, // the worker's answer
         SSE_HI, // the parent's answer
     ]));
@@ -190,8 +201,18 @@ async fn a_worker_bash_call_is_reported_on_the_parent_with_its_handle() {
     let spawn_at = position(&seen, |e| matches!(child_event(e), Some(ChildProcessEvent::Spawned(s)) if s.tool_id == "toolu_w1"))[0];
     assert!(spawn_at < position(&seen, |e| is_result(e, "toolu_p1"))[0]);
     let listing = children::list(Some(handle.id.as_str()), None);
-    let record = listing.sessions[0].children.iter().find(|r| r.tool_id == "toolu_w1").expect("under the parent session");
+    // The sleep was left in the leader's group; it goes before any assert.
+    // SAFETY: kill(2) on the spawned child's own process group.
+    unsafe {
+        libc::kill(-(spawn.child.pgid as i32), libc::SIGKILL);
+    }
+    let record = listing
+        .sessions
+        .first()
+        .and_then(|g| g.children.iter().find(|r| r.tool_id == "toolu_w1"))
+        .expect("under the parent session");
     assert_eq!(record.handle_id.as_deref(), Some(worker.as_str()));
+    assert_eq!((record.state, record.exit_code), (ChildState::Ended, Some(4)));
     end(&mut t).await;
 }
 
