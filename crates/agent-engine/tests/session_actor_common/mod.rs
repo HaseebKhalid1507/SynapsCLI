@@ -322,6 +322,63 @@ pub async fn prompt_host() -> Arc<EngineHost> {
     host
 }
 
+/// Same tool name as [`PromptFixtureTool`], but it raises an extension
+/// tool-call Confirm attributed to extension `jev` through the real runtime
+/// resolver (and the session's shared Allow-all latch).
+pub struct ConfirmFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for ConfirmFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "raises an extension confirm"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        use agent_engine::extensions::hooks::events::HookResult;
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        let result = agent_engine::runtime::resolve_before_tool_call_result(
+            HookResult::Confirm {
+                message: "run it?".into(),
+                sources: vec!["jev".into()],
+                tool: Some("bash".into()),
+            },
+            Some(&handle),
+            false,
+            ctx.capabilities.session_allow_all.as_deref(),
+        )
+        .await;
+        Ok(match result {
+            HookResult::Continue => "allowed".to_string(),
+            _ => "blocked".to_string(),
+        })
+    }
+}
+
+pub async fn confirm_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts()
+        .tools
+        .write()
+        .await
+        .register(Arc::new(ConfirmFixtureTool));
+    host
+}
+
 pub fn prompt_id(env: &Envelope) -> Option<u64> {
     match &env.event {
         SessionEventWire::Prompt(p) => Some(p.id),

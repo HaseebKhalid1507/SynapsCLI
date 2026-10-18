@@ -133,6 +133,136 @@ async fn observer_never_owns_and_answer_allowed_from_any_client() {
     end(&mut a).await;
 }
 
+/// #148 C2: an observer may not answer a tool-call Confirm at all; a
+/// non-owner Mirror may answer it but may not arm "Allow all"; the input
+/// owner can, and arming it is announced to EVERY attached client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn confirm_answers_are_owner_gated_and_allow_all_is_announced() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = confirm_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, snap_a) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    assert_eq!(snap_a.input_owner, Some(a.client_id()));
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+
+    a.send_from_self(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let SessionEventWire::Prompt(pr) = &seen.last().unwrap().event else {
+        unreachable!()
+    };
+    let pid = pr.id;
+    assert_eq!(
+        pr.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+        Some(vec!["jev".to_string()]),
+        "the wire prompt names the source extension"
+    );
+    until(&mut b, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    until(&mut o, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+
+    // Observer: any answer to a Confirm is refused, and the prompt stays.
+    o.send_from_self(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("y".into()),
+    })
+    .await
+    .unwrap();
+    let o_id = o.client_id();
+    let seen = until(&mut o, |e| {
+        matches!(e, SessionEventWire::Refused { client, .. } if *client == o_id)
+    })
+    .await;
+    assert!(matches!(
+        &seen.last().unwrap().event,
+        SessionEventWire::Refused { client, command, reason }
+            if *client == o.client_id() && command == "answer" && reason.contains("observe")
+    ), "{seen:#?}");
+    assert!(!seen
+        .iter()
+        .any(|e| matches!(e.event, SessionEventWire::PromptResolved { .. })));
+
+    // Non-owner Mirror: "always" is refused (cannot arm the latch).
+    b.send_from_self(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("always".into()),
+    })
+    .await
+    .unwrap();
+    let b_id = b.client_id();
+    let seen = until(&mut b, |e| {
+        matches!(e, SessionEventWire::Refused { client, .. } if *client == b_id)
+    })
+    .await;
+    assert!(matches!(
+        &seen.last().unwrap().event,
+        SessionEventWire::Refused { client, command, reason }
+            if *client == b.client_id() && command == "answer" && reason.contains("input owner")
+    ), "{seen:#?}");
+    assert!(!seen
+        .iter()
+        .any(|e| matches!(e.event, SessionEventWire::PromptResolved { .. })));
+
+    // Owner: "always" is accepted, the call runs, and every client — the
+    // observer included — is told the latch is armed and for whom.
+    a.send_from_self(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("always".into()),
+    })
+    .await
+    .unwrap();
+    let armed = |e: &SessionEventWire| {
+        matches!(e, SessionEventWire::SystemNotice(n)
+            if n.contains("Allow all") && n.contains("jev") && n.contains("subagents"))
+    };
+    until(&mut o, armed).await;
+    until(&mut b, armed).await;
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| armed(&e.event)), "{seen:#?}");
+    assert_eq!(
+        tool_results(&last_conversation(&seen)),
+        vec!["allowed".to_string()]
+    );
+    end(&mut a).await;
+}
+
+/// A plain (non-always) answer from a non-owner Mirror is still accepted:
+/// only arming the latch is owner-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_owner_mirror_may_answer_a_confirm_once() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = confirm_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+    a.send_from_self(submit("go")).await.unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let pid = prompt_id(seen.last().unwrap()).unwrap();
+    b.send_from_self(SessionCommand::Answer {
+        prompt_id: pid,
+        value: Some("y".into()),
+    })
+    .await
+    .unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(!seen.iter().any(|e| matches!(
+        &e.event,
+        SessionEventWire::SystemNotice(n) if n.contains("Allow all")
+    )));
+    assert_eq!(
+        tool_results(&last_conversation(&seen)),
+        vec!["allowed".to_string()]
+    );
+    end(&mut a).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn takeover_steals_and_notifies_previous_owner() {

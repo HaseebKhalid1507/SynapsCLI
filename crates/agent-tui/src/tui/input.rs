@@ -1002,10 +1002,6 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         // accidentally form an allow.
         use synaps_cli::tools::ConfirmChoice;
         if let Event::Key(key) = event {
-            let scope = app
-                .secret_prompts
-                .active()
-                .and_then(|p| p.confirm_scope.clone());
             let answered = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Allow)
@@ -1027,15 +1023,11 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
                 }
                 _ => None,
             };
-            if let Some(choice) = answered {
+            // Arming "Allow all" is announced by the session actor as a
+            // SystemNotice to every attached client (this one included), so
+            // nothing is printed locally.
+            if answered.is_some() {
                 reconcile_secret_prompt(app);
-                if let (ConfirmChoice::AllowAll, Some(scope)) = (choice, scope) {
-                    app.push_msg(ChatMessage::System(format!(
-                        "Allow all from {}: its tool-call confirms are auto-approved for the rest \
-                         of this session (subagents included). Other extensions still ask.",
-                        scope.extensions_label()
-                    )));
-                }
             }
         }
         return InputAction::None;

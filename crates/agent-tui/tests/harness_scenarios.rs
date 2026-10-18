@@ -2102,11 +2102,22 @@ fn scenario_confirm_tool_call_focus_cycles_three_buttons() {
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(!h.secret_prompt_active());
     assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
+}
+
+/// Arming "Allow all" is announced by the session (a SystemNotice every
+/// attached client receives), not by a local line in the answering TUI.
+#[test]
+fn scenario_allow_all_announcement_comes_from_the_session() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
+    h.key(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
+    assert!(!h.snapshot().contains("Allow all armed"), "no local duplicate");
+    h.feed_events(&[agent_engine::session::SessionEventWire::SystemNotice(
+        "Allow all armed by client #1: tool-call confirms from jev are auto-approved".into(),
+    )]);
     let frame = h.snapshot();
-    assert!(
-        frame.contains("Allow all from jev: its tool-call confirms are auto-approved"),
-        "system line announces the scoped latch:\n{frame}"
-    );
+    assert!(frame.contains("Allow all armed by client #1"), "{frame}");
 }
 
 #[test]

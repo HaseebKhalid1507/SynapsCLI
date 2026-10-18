@@ -261,7 +261,9 @@ pub(crate) struct CompactionJob {
 
 /// Commands that only the input owner may send (B1). Everything else
 /// (`Answer`, `Query`, `Save`, `Detach`, `Attach`, `Resync`, `HostEvent`)
-/// is open to every attached client. `Checkpoint` cancels the owner's turn
+/// is open to every attached client — except that `answer` refuses an
+/// observer's answer to a Confirm prompt and accepts "Allow all" only from
+/// the owner (#148 C2). `Checkpoint` cancels the owner's turn
 /// and kills its PTYs, so it is owner-only from a client (M1); the daemon
 /// sends it `from: None`.
 fn is_input_command(cmd: &SessionCommand) -> bool {
@@ -3565,14 +3567,66 @@ impl SessionActor {
         self.rearm_prompt_abandon();
     }
 
-    fn answer(&mut self, prompt_id: u64, value: Option<String>) {
+    /// Why `from` may not give this answer to `prompt`, if it may not.
+    /// Confirm prompts gate tool execution, so an `Observe` client cannot
+    /// answer them at all, and only the input owner (or the host, `from:
+    /// None`) can choose "Allow all", which arms a session-wide latch.
+    fn confirm_answer_refusal(
+        &self,
+        from: Option<ClientId>,
+        prompt: &PromptRequest,
+        allow_all: bool,
+    ) -> Option<&'static str> {
+        let c = from?;
+        if prompt.kind != PromptKind::Confirm {
+            return None;
+        }
+        if self.attached.get(&c).map(|a| a.mode) == Some(AttachMode::Observe) {
+            return Some("observe-mode clients cannot answer confirm prompts");
+        }
+        if allow_all && self.input_owner != Some(c) {
+            return Some("only the input owner can choose Allow all");
+        }
+        None
+    }
+
+    fn answer(&mut self, from: Option<ClientId>, prompt_id: u64, value: Option<String>) {
         let Some(pos) = self.pending_prompts.iter().position(|(p, _)| p.id == prompt_id) else {
             return; // unknown or already answered — dedup on id
         };
-        let (_, tx) = self.pending_prompts.remove(pos).expect("position");
+        let allow_all = value.as_deref().is_some_and(|v| {
+            v.trim()
+                .eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL)
+        });
+        if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].0, allow_all) {
+            if let Some(c) = from {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: "answer".to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+            return; // the prompt stays pending for an eligible client
+        }
+        let (prompt, tx) = self.pending_prompts.remove(pos).expect("position");
         let _ = tx.send(value);
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
+        // Arming the latch is announced to every attached client, not just
+        // the one that pressed the key.
+        if allow_all && prompt.title == CONFIRM_PROMPT_TITLE {
+            if let Some(scope) = prompt.confirm_scope.as_ref().filter(|s| !s.extensions.is_empty()) {
+                let by = match from {
+                    Some(c) => format!("client #{}", c.0),
+                    None => "the host".to_string(),
+                };
+                self.emit(SessionEventWire::SystemNotice(format!(
+                    "Allow all armed by {by}: tool-call confirms from {} are auto-approved for \
+                     the rest of this session (subagents included). Other extensions still ask.",
+                    scope.extensions_label()
+                )));
+            }
+        }
         // The last pending prompt may have just cleared — drop the deadline.
         self.rearm_prompt_abandon();
     }
@@ -4192,7 +4246,7 @@ impl SessionActor {
                 self.cancel_turn(crate::engine::interrupt::InterruptReason::User)
                     .await;
             }
-            SessionCommand::Answer { prompt_id, value } => self.answer(prompt_id, value),
+            SessionCommand::Answer { prompt_id, value } => self.answer(from, prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
             // `CompactionStarted` is the contract; no notice before it.
             SessionCommand::Compact { instructions } => {

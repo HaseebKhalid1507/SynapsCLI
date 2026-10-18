@@ -443,7 +443,9 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     // No extension host in this process: the loader arm never runs.
     ctx.app.extension_loader_running = false;
     // Before any prompt is fed: the replay and the pending prompts below.
-    if opts.no_confirm_answers {
+    // An observer's confirm answers are refused by the session (#148 C2),
+    // so it never opens the approval pane either.
+    if opts.no_confirm_answers || opts.mode == AttachMode::Observe {
         ctx.prompt_bridge
             .set_confirm_policy(super::session_link::ConfirmPolicy::ViewOnly);
     }
