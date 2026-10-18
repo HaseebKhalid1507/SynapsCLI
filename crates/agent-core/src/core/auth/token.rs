@@ -8,7 +8,7 @@ use reqwest::Client;
 use super::account::{CredentialRef, SeatIdentity};
 use super::provider::RefreshEndpoints;
 use super::storage::{
-    auth_file_path, load_provider_auth_at, save_provider_auth_if_refresh_matches_typed_at,
+    auth_file_path, load_provider_auth_typed_at, save_provider_auth_if_refresh_matches_typed_at,
     CasOutcome, StoreError,
 };
 use super::{is_token_expired, now_millis, OAuthCredentials, TokenResponse, CLIENT_ID, TOKEN_URL};
@@ -278,6 +278,10 @@ pub enum RefreshFailureKind {
     Credential,
     /// Local failure (lock file I/O, the refresh task itself).
     Other,
+    /// The user must act outside synaps (a corrupt credential store, a
+    /// provider billing requirement); the message says exactly what. Not
+    /// retryable, and logging in again does not help.
+    ActionRequired,
 }
 
 /// A refresh failure: its kind plus a log-safe message (our own texts, or
@@ -325,6 +329,7 @@ impl From<StoreError> for RefreshFailure {
             // The credential store's own lock, not this account's refresh
             // lock: its message names `auth.json.lock`.
             StoreError::Busy(m) => Self::new(RefreshFailureKind::Other, m),
+            StoreError::Corrupt(m) => Self::new(RefreshFailureKind::ActionRequired, m),
             StoreError::Failed(m) => Self::new(RefreshFailureKind::Credential, m),
         }
     }
@@ -442,10 +447,8 @@ pub(super) async fn ensure_fresh_credential_via(
     client: &Client,
     cred: &CredentialRef,
     endpoints: &RefreshEndpoints,
-) -> std::result::Result<OAuthCredentials, String> {
-    ensure_credential_checked_at(client, cred, &auth_file_path(), None, None, endpoints)
-        .await
-        .map_err(String::from)
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
+    ensure_credential_checked_at(client, cred, &auth_file_path(), None, None, endpoints).await
 }
 
 async fn ensure_credential_checked_at(
@@ -541,22 +544,22 @@ fn load_checked(
     path: &Path,
     cred: &CredentialRef,
     expected_seat: Option<&SeatIdentity>,
-) -> std::result::Result<OAuthCredentials, String> {
-    let creds = load_provider_auth_at(path, &cred.storage_key())?.ok_or_else(|| {
-        format!(
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
+    let creds = load_provider_auth_typed_at(path, &cred.storage_key())?.ok_or_else(|| {
+        RefreshFailure::credential(format!(
             "No credentials for {} at {}. Run `synaps login --provider {} --account {}`.",
             cred,
             path.display(),
             cred.provider,
             cred.account
-        )
+        ))
     })?;
     // Seat pairing is re-checked on every load, including the re-load
     // after a CAS `Replaced` (re-login mid-refresh): the replacement is
     // a different seat and was never proven.
     if let Some(expected) = expected_seat {
         if SeatIdentity::of(cred.provider, &creds) != *expected {
-            return Err(SEAT_CHANGED.to_string());
+            return Err(RefreshFailure::credential(SEAT_CHANGED));
         }
     }
     Ok(creds)
@@ -967,6 +970,7 @@ where
     let save = |old: &str, fresh: &OAuthCredentials| {
         std::future::ready(save(old, fresh).map_err(RefreshFailure::from))
     };
+    let load = || load().map_err(RefreshFailure::from);
     ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, |_| Ok(()))
         .await
         .map_err(String::from)
@@ -990,7 +994,7 @@ async fn ensure_gated_locked_policy<Load, Refresh, RFut, RErr, Save, SFut, MayFo
     may_force: MayForce,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
-    Load: Fn() -> std::result::Result<OAuthCredentials, String>,
+    Load: Fn() -> std::result::Result<OAuthCredentials, RefreshFailure>,
     Refresh: Fn(String) -> RFut,
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, RErr>>,
     RErr: Into<RefreshFailure>,
@@ -1947,6 +1951,20 @@ mod rejected_token_tests {
             path: other_path,
         };
         assert_eq!(other.last_refresh_ms(), None);
+    }
+
+    /// Round-2 I2: a corrupt store is not a login problem (login would fail
+    /// on it too): the refresh says what to do, typed ActionRequired.
+    #[test]
+    fn corrupt_store_load_is_action_required_not_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{oops").unwrap();
+        let cred = CredentialRef::default_for(super::super::provider::OAuthProviderId::Anthropic);
+        let err = load_checked(&path, &cred, None).unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::ActionRequired, "{err}");
+        assert!(err.message().contains("mv '"), "{err}");
+        assert!(!err.message().contains("synaps login"), "{err}");
     }
 
     /// m3: a refresh runtime that failed to start is a refresh error, not

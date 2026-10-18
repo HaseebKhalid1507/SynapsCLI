@@ -34,13 +34,22 @@ pub(crate) fn load_provider_auth_at(
     path: &Path,
     provider: &str,
 ) -> std::result::Result<Option<OAuthCredentials>, String> {
+    load_provider_auth_typed_at(path, provider).map_err(String::from)
+}
+
+/// [`load_provider_auth_at`] that reports an unparseable store as
+/// [`StoreError::Corrupt`].
+pub(crate) fn load_provider_auth_typed_at(
+    path: &Path,
+    provider: &str,
+) -> std::result::Result<Option<OAuthCredentials>, StoreError> {
     if !path.exists() {
         return Ok(None);
     }
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| corrupt_store(path, &e))?;
     let Some(raw) = value.get(provider) else {
         return Ok(None);
     };
@@ -768,6 +777,32 @@ pub(crate) fn save_static_key_at(
 /// Path-explicit variant of `save_provider_auth`. Splits out the I/O so
 /// the corrupt-file fallback path can be unit-tested without touching the
 /// user's real `~/.synaps-cli/auth.json`.
+/// [`save_provider_auth`] that reports a corrupt store as
+/// [`StoreError::Corrupt`] (provider logins with typed errors).
+pub(crate) fn save_provider_auth_typed(
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), StoreError> {
+    let path = crate::config::resolve_write_path("auth.json");
+    save_provider_auth_typed_at(&path, provider, creds)
+}
+
+pub(crate) fn save_provider_auth_typed_at(
+    path: &std::path::Path,
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), StoreError> {
+    let encoded =
+        serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    let fields = encoded
+        .as_object()
+        .ok_or_else(|| "credential did not serialize to an object".to_string())?;
+    with_locked_root_typed(path, true, STORE_LOCK_WAIT, |root| {
+        merge_provider_fields(root, provider, fields);
+        Ok((true, ()))
+    })
+}
+
 pub(crate) fn save_provider_auth_at(
     path: &std::path::Path,
     provider: &str,
@@ -789,21 +824,29 @@ fn save_provider_fields_at(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
     with_locked_root(path, true, |root| {
-        // Merge known credential fields into an existing provider object rather
-        // than replacing it. Providers may add metadata (including nested objects)
-        // that must survive refresh/login writes.
-        let mut provider_value = root
-            .remove(provider)
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(target) = provider_value.as_object_mut() {
-            for (key, value) in fields {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-        root.insert(provider.to_string(), provider_value);
+        merge_provider_fields(root, provider, fields);
         Ok((true, ()))
     })
+}
+
+/// Merge known credential fields into an existing provider object rather
+/// than replacing it. Providers may add metadata (including nested objects)
+/// that must survive refresh/login writes.
+fn merge_provider_fields(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    provider: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) {
+    let mut provider_value = root
+        .remove(provider)
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(target) = provider_value.as_object_mut() {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    root.insert(provider.to_string(), provider_value);
 }
 
 /// Locked read-modify-write over the auth.json root object.
@@ -833,15 +876,40 @@ pub(crate) const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::fro
 #[derive(Debug)]
 pub(crate) enum StoreError {
     Busy(String),
+    /// auth.json exists but does not parse; the message names the file and
+    /// the exact command to move it aside (see [`corrupt_store`]).
+    Corrupt(String),
     Failed(String),
 }
 
 impl From<StoreError> for String {
     fn from(e: StoreError) -> Self {
         match e {
-            StoreError::Busy(m) | StoreError::Failed(m) => m,
+            StoreError::Busy(m) | StoreError::Corrupt(m) | StoreError::Failed(m) => m,
         }
     }
+}
+
+/// The corrupt-store error: names the file, says why it is not reset, and
+/// gives the exact command to move it aside. Never suggests `synaps login`
+/// on its own: login fails on the same file until it is moved.
+pub(crate) fn corrupt_store(path: &Path, err: &serde_json::Error) -> StoreError {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let p = path.display().to_string();
+    StoreError::Corrupt(format!(
+        "{p} is not valid JSON ({err}); synaps will not overwrite it because it may hold other \
+         accounts. Move it aside with `mv {} {}`, then log in again (or repair it by hand).",
+        shell_quote(&p),
+        shell_quote(&format!("{p}.broken-{ts}"))
+    ))
+}
+
+/// POSIX single-quote `s` for a copy-pasteable command.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 impl From<String> for StoreError {
@@ -919,17 +987,8 @@ fn with_locked_root_typed<T>(
         // of all of them, so it is an error for the user to repair.
         match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content) {
             Ok(map) => map,
-            Err(e) if !recover_corrupt => {
-                return Err(format!("Failed to parse {}: {}", path.display(), e).into());
-            }
-            Err(e) if !content.trim().is_empty() => {
-                return Err(format!(
-                    "{} is not valid JSON ({}); refusing to overwrite it because it may hold \
-                     other accounts. Repair it or move it aside, then retry.",
-                    path.display(),
-                    e
-                )
-                .into());
+            Err(e) if !recover_corrupt || !content.trim().is_empty() => {
+                return Err(corrupt_store(path, &e));
             }
             Err(e) => {
                 tracing::warn!(
@@ -1910,5 +1969,53 @@ mod store_lock_wait_tests {
     fn production_store_lock_wait_is_bounded() {
         assert!(STORE_LOCK_WAIT >= Duration::from_secs(5));
         assert!(STORE_LOCK_WAIT <= Duration::from_secs(30));
+    }
+}
+
+/// Round-2 I2: a corrupt store is a typed error that names the file and the
+/// exact command to move it aside, on the legacy, account and load paths.
+#[cfg(test)]
+mod corrupt_store_error_tests {
+    use super::*;
+
+    fn assert_actionable(msg: &str, path: &Path) {
+        let p = path.display().to_string();
+        assert!(msg.contains(&format!("mv '{p}' '{p}.broken-")), "{msg}");
+        assert!(msg.contains("not valid JSON"), "{msg}");
+        assert!(!msg.contains("synaps login"), "{msg}");
+    }
+
+    #[test]
+    fn corrupt_store_error_names_the_file_and_the_mv_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{\"anthropic\":{").unwrap();
+        let cred = CredentialRef::parse_storage_key("anthropic@work").unwrap();
+        let creds = OAuthCredentials {
+            auth_type: "oauth".into(),
+            refresh: "r".into(),
+            access: "a".into(),
+            expires: 1,
+            account_id: None,
+        };
+        // Legacy (login) save and account-scoped save: same text.
+        assert_actionable(&save_provider_auth_at(&path, "kimi-code", &creds).unwrap_err(), &path);
+        assert_actionable(&save_credential_at(&path, &cred, &creds).unwrap_err(), &path);
+        // Typed: both the login save and the load say Corrupt.
+        for err in [
+            save_provider_auth_typed_at(&path, "muse", &creds).unwrap_err(),
+            load_provider_auth_typed_at(&path, "anthropic").unwrap_err(),
+        ] {
+            let StoreError::Corrupt(msg) = err else {
+                panic!("expected Corrupt, got {err:?}");
+            };
+            assert_actionable(&msg, &path);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"anthropic\":{");
+    }
+
+    #[test]
+    fn shell_quoting_survives_a_quote_in_the_path() {
+        assert_eq!(shell_quote("/a/it's/auth.json"), r#"'/a/it'\''s/auth.json'"#);
     }
 }

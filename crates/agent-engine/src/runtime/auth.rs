@@ -517,6 +517,9 @@ impl AuthMethods {
 }
 /// A failed explicit-account vend.
 fn vend_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> RuntimeError {
+    if let Some(text) = action_required(credential, e) {
+        return RuntimeError::Auth(text);
+    }
     let reason = e.to_string();
     RuntimeError::Auth(if has_login_advice(&reason) {
         format!(
@@ -530,6 +533,24 @@ fn vend_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> Runti
             credential.account, reason, credential.account
         )
     })
+}
+
+/// A failure only the user can fix outside synaps (a corrupt credential
+/// store, a provider billing requirement): show its own instructions, with
+/// no login advice (login fails the same way) and no "retry".
+fn action_required(credential: &CredentialRef, e: &crate::auth::BrokerError) -> Option<String> {
+    match e {
+        crate::auth::BrokerError::Refresh(f)
+            if f.kind == crate::auth::RefreshFailureKind::ActionRequired =>
+        {
+            Some(format!(
+                "Can't refresh the token for '{}': {}",
+                credential.account,
+                sentence(f.message())
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// The reason already says which `synaps login` to run (core texts for a
@@ -557,6 +578,9 @@ fn sentence(text: &str) -> String {
 /// fixed texts (cooldown, lock timeouts, missing slot with its path).
 fn recovery_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> RuntimeError {
     use crate::auth::{BrokerError, RefreshFailureKind};
+    if let Some(text) = action_required(credential, e) {
+        return RuntimeError::Auth(text);
+    }
     let text = match e {
         BrokerError::Refresh(f) => match f.kind {
             RefreshFailureKind::Cooldown { .. } => format!(
@@ -581,6 +605,8 @@ fn recovery_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> R
                 credential.account,
                 f.message()
             ),
+            // Returned above by `action_required`; kept total for the match.
+            RefreshFailureKind::ActionRequired => sentence(f.message()),
             RefreshFailureKind::Credential if has_login_advice(f.message()) => format!(
                 "OAuth recovery failed for '{}': {}",
                 credential.account,
@@ -1920,6 +1946,22 @@ mod tests {
         let m = vend_error(&cred, &BrokerError::Credential("invalid_grant".into())).to_string();
         assert!(m.contains("synaps login --account work"), "{m}");
         assert!(m.contains("broker reachability"), "{m}");
+    }
+
+    /// Round-2 I2: when the store itself is unusable (corrupt), login would
+    /// fail too, so neither recovery nor vend tells the user to log in.
+    #[test]
+    fn action_required_failures_never_send_the_user_to_login() {
+        use crate::auth::{BrokerError, RefreshFailure, RefreshFailureKind as K};
+        let cred = work_cred();
+        let text = "/x/auth.json is not valid JSON (eof). Move it aside with \
+                    `mv '/x/auth.json' '/x/auth.json.broken-1'`, then log in again.";
+        let e = BrokerError::Refresh(RefreshFailure::new(K::ActionRequired, text));
+        for m in [recovery_error(&cred, &e).to_string(), vend_error(&cred, &e).to_string()] {
+            assert!(m.contains("mv '/x/auth.json'"), "{m}");
+            assert!(!m.contains("synaps login"), "{m}");
+            assert!(!m.contains("retry"), "{m}");
+        }
     }
 
     /// A refused recovery is still a terminal auth error, but it says WHY:

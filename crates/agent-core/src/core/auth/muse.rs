@@ -41,7 +41,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
-use super::{now_millis, open_browser, save_provider_auth, OAuthCredentials};
+use super::{now_millis, open_browser, OAuthCredentials};
 
 // ── Public constants (evidence: muse 1.4.6-R6000.1 binary + mock capture) ────
 
@@ -145,6 +145,9 @@ pub enum MuseAuthError {
     Transport,
     ResponseTooLarge,
     Persist,
+    /// The credential store is corrupt; carries our own repair text
+    /// (path + `mv` command, no secrets).
+    CorruptStore(String),
 }
 
 impl fmt::Display for MuseAuthError {
@@ -178,11 +181,20 @@ impl fmt::Display for MuseAuthError {
             Self::Transport => f.write_str("transport error"),
             Self::ResponseTooLarge => f.write_str("response body too large"),
             Self::Persist => f.write_str("credential persistence failed"),
+            Self::CorruptStore(msg) => f.write_str(msg),
         }
     }
 }
 
 impl MuseAuthError {
+    /// Login persistence failure: a corrupt store keeps its actionable text.
+    pub(crate) fn from_store(e: super::storage::StoreError) -> Self {
+        match e {
+            super::storage::StoreError::Corrupt(msg) => Self::CorruptStore(msg),
+            _ => Self::Persist,
+        }
+    }
+
     /// Typed re-mint failure: only a rejected or unfinished Meta login is a
     /// credential failure; transport, 5xx / 429 and unusable mint bodies are
     /// transient.
@@ -750,7 +762,7 @@ where
         }
     }
     if let Some(key) = persist_key {
-        save_provider_auth(key, &creds).map_err(|_| MuseAuthError::Persist)?;
+        super::storage::save_provider_auth_typed(key, &creds).map_err(MuseAuthError::from_store)?;
     }
     Ok(creds)
 }
@@ -978,6 +990,20 @@ impl MuseBrowser for ProductionBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-2 I2: a corrupt store at login is reported with its repair
+    /// command, not as "credential persistence failed".
+    #[test]
+    fn login_save_on_a_corrupt_store_says_how_to_fix_it() {
+        use super::super::storage::StoreError;
+        let msg = "/x/auth.json is not valid JSON; mv '/x/auth.json' '/x/auth.json.broken-1'";
+        let err = MuseAuthError::from_store(StoreError::Corrupt(msg.into()));
+        assert_eq!(err.to_string(), msg);
+        assert_eq!(
+            MuseAuthError::from_store(StoreError::Failed("disk full".into())).to_string(),
+            "credential persistence failed"
+        );
+    }
     use std::sync::Mutex;
 
     /// The mint test seam only ever sends to plain-HTTP loopback.

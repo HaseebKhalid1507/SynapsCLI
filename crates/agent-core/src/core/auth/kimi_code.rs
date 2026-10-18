@@ -36,7 +36,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
-use super::{auth_file_path, now_millis, open_browser, save_provider_auth, OAuthCredentials};
+use super::{auth_file_path, now_millis, open_browser, OAuthCredentials};
 
 // ── Public constants (evidence: Kimi Code CLI v0.31.1 embedded oauth pkg) ────
 
@@ -115,10 +115,21 @@ pub enum KimiAuthError {
     Transport,
     ResponseTooLarge,
     Persist,
+    /// The credential store is corrupt; carries our own repair text
+    /// (path + `mv` command, no secrets).
+    CorruptStore(String),
     Other(&'static str),
 }
 
 impl KimiAuthError {
+    /// Login persistence failure: a corrupt store keeps its actionable text.
+    pub(crate) fn from_store(e: super::storage::StoreError) -> Self {
+        match e {
+            super::storage::StoreError::Corrupt(msg) => Self::CorruptStore(msg),
+            _ => Self::Persist,
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::UntrustedEndpoint => "untrusted endpoint",
@@ -132,6 +143,7 @@ impl KimiAuthError {
             Self::Transport => "transport error",
             Self::ResponseTooLarge => "response body too large",
             Self::Persist => "credential persistence failed",
+            Self::CorruptStore(_) => "credential store is corrupt",
             Self::Other(msg) => msg,
         }
     }
@@ -141,6 +153,7 @@ impl fmt::Display for KimiAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpStatus(code) => write!(f, "HTTP error {code}"),
+            Self::CorruptStore(msg) => f.write_str(msg),
             other => f.write_str(other.label()),
         }
     }
@@ -789,7 +802,7 @@ where
     let token = wait_for_device_authorization(http, clock, &authz, cancel).await?;
     let creds = credentials_from_token(token, clock.now_millis());
     if let Some(key) = persist_key {
-        save_provider_auth(key, &creds).map_err(|_| KimiAuthError::Persist)?;
+        super::storage::save_provider_auth_typed(key, &creds).map_err(KimiAuthError::from_store)?;
     }
     Ok(creds)
 }
@@ -932,6 +945,20 @@ impl KimiBrowser for ProductionBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-2 I2: a corrupt store at login is reported with its repair
+    /// command, not as "credential persistence failed".
+    #[test]
+    fn login_save_on_a_corrupt_store_says_how_to_fix_it() {
+        use super::super::storage::StoreError;
+        let msg = "/x/auth.json is not valid JSON; mv '/x/auth.json' '/x/auth.json.broken-1'";
+        let err = KimiAuthError::from_store(StoreError::Corrupt(msg.into()));
+        assert_eq!(err.to_string(), msg);
+        assert_eq!(
+            KimiAuthError::from_store(StoreError::Failed("disk full".into())).to_string(),
+            "credential persistence failed"
+        );
+    }
     use std::sync::Mutex;
 
     // ── Test doubles ─────────────────────────────────────────────────────────

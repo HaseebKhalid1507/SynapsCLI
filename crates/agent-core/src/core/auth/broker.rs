@@ -239,7 +239,7 @@ impl std::fmt::Display for BrokerError {
                     K::Transient => " (network or provider error, not a login problem; retry shortly)",
                     K::LockBusy => " (another refresh of this account is still running; retry shortly)",
                     K::Other => " (retry shortly)",
-                    K::Credential | K::Cooldown { .. } => "",
+                    K::Credential | K::Cooldown { .. } | K::ActionRequired => "",
                 };
                 write!(f, "credential refresh failed{hint}: {failure}")
             }
@@ -2462,16 +2462,18 @@ impl LocalBroker {
                             .dispatch(request, provider_key, &key, &base, &pinned)
                             .await;
                     }
-                    // A transient mint failure, a busy refresh lock or a
-                    // local failure says nothing about the login: surface it
-                    // as a retryable refresh error, not as the upstream 401
-                    // (which the runtime shows as "sign in again").
+                    // A transient mint failure, a busy refresh lock, a local
+                    // failure or something the user must fix elsewhere (a
+                    // corrupt store) says nothing about the login: surface
+                    // the refresh error, not the upstream 401 (which the
+                    // runtime shows as "sign in again").
                     Err(BrokerError::Refresh(f))
                         if matches!(
                             f.kind,
                             super::token::RefreshFailureKind::Transient
                                 | super::token::RefreshFailureKind::LockBusy
                                 | super::token::RefreshFailureKind::Other
+                                | super::token::RefreshFailureKind::ActionRequired
                         ) =>
                     {
                         tracing::warn!(
@@ -2953,9 +2955,15 @@ impl CredentialBroker for LocalBroker {
 
     async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        let creds = super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
-            .await
-            .map_err(BrokerError::Credential)?;
+        let creds =
+            super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
+                .await
+                .map_err(|f| match f.kind {
+                    // Typed so the runtime doesn't send the user to a login
+                    // that would fail on the same store.
+                    super::token::RefreshFailureKind::ActionRequired => BrokerError::Refresh(f),
+                    _ => BrokerError::Credential(f.into()),
+                })?;
         // Strip to token + expiry: the refresh token stays behind the boundary.
         Ok(AccessToken {
             token: creds.access,
