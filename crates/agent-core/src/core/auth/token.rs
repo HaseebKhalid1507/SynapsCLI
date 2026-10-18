@@ -411,22 +411,41 @@ async fn ensure_credential_checked_at(
     .await
 }
 
-/// Run the locked refresh on a DETACHED task. If the caller is cancelled
-/// (Esc mid-request, a dropped turn) after the provider has rotated the
-/// refresh token but before the CAS save, the task still persists it —
-/// dropping a rotated refresh token would log the user out.
+/// Run the locked refresh DETACHED from the caller, on the process-lifetime
+/// [`refresh_runtime`]. If the caller is cancelled (Esc mid-request, a
+/// dropped turn) or its whole runtime is dropped (a subagent worker's
+/// throwaway `current_thread` runtime on timeout/cancel) after the provider
+/// has rotated the refresh token but before the CAS save, the refresh still
+/// completes and persists it — dropping a rotated refresh token would log
+/// the user out. The lock poller's `spawn_blocking` also lives on that
+/// runtime, so tearing down a caller's runtime never waits on it.
 async fn run_detached<T, E, F>(fut: F) -> std::result::Result<T, E>
 where
     F: std::future::Future<Output = std::result::Result<T, E>> + Send + 'static,
     T: Send + 'static,
     E: From<RefreshFailure> + Send + 'static,
 {
-    tokio::spawn(fut).await.map_err(|e| {
+    refresh_runtime().spawn(fut).await.map_err(|e| {
         E::from(RefreshFailure::new(
             RefreshFailureKind::Other,
             format!("credential refresh task failed: {e}"),
         ))
     })?
+}
+
+/// Small multi-thread runtime that lives for the whole process and runs
+/// every locked refresh (gate, flock poller, provider exchange, CAS save).
+/// Callers on any runtime just await the `JoinHandle`.
+fn refresh_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("synaps-auth-refresh")
+            .enable_all()
+            .build()
+            .expect("failed to start the auth refresh runtime")
+    })
 }
 
 fn load_checked(
@@ -1429,6 +1448,112 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A slow fake refresh of account `label` in `path`, as a 'static future
+    /// handed to `run_detached` (owned path and key, like production).
+    fn slow_refresh_future(
+        path: std::path::PathBuf,
+        label: &str,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<OAuthCredentials, String>> + Send + 'static {
+        let key = named(label).storage_key();
+        async move {
+            let gate = super::refresh_gate(&format!("{}|{}", path.display(), key));
+            let lock = refresh_lock_path(&path, &key);
+            ensure_fresh_gated_locked(
+                gate,
+                Some(lock),
+                || load_provider_auth_at(&path, &key)?.ok_or_else(|| "missing".to_string()),
+                |old| {
+                    let started = started.clone();
+                    async move {
+                        started.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        Ok(OAuthCredentials {
+                            auth_type: "oauth".into(),
+                            refresh: format!("{old}-rotated"),
+                            access: format!("{old}-access"),
+                            expires: crate::epoch_millis() + 3_600_000,
+                            account_id: None,
+                        })
+                    }
+                },
+                |old, fresh| save_provider_auth_if_refresh_matches_at(&path, &key, old, fresh),
+            )
+            .await
+        }
+    }
+
+    fn wait_for_rotation(path: &std::path::Path, label: &str, want: &str) {
+        let key = named(label).storage_key();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while load_provider_auth_at(path, &key).unwrap().unwrap().refresh != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rotated token was never persisted after the caller's runtime died"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Review I1: subagent workers run on throwaway `current_thread`
+    /// runtimes. Dropping one mid-exchange must neither kill the refresh
+    /// (the rotated token is still saved) nor block on it.
+    #[test]
+    fn refresh_survives_dropping_the_callers_runtime_mid_exchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        save_provider_auth_at(&path, &named("a").storage_key(), &expired_creds("a-r")).unwrap();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fut = slow_refresh_future(path.clone(), "a", started.clone());
+        worker.spawn(super::run_detached(fut));
+        worker.block_on(async {
+            while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let t = std::time::Instant::now();
+        drop(worker); // the worker timed out / was cancelled mid-exchange
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
+        wait_for_rotation(&path, "a", "a-r-rotated");
+    }
+
+    /// Same, while the refresh is still waiting in the flock poller behind a
+    /// peer process: dropping the worker returns promptly (the poller is not
+    /// on the worker's blocking pool), and the refresh completes once the
+    /// peer releases the lock.
+    #[test]
+    fn dropping_the_callers_runtime_while_waiting_on_the_lock_is_prompt() {
+        use fs4::fs_std::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let key = named("b").storage_key();
+        save_provider_auth_at(&path, &key, &expired_creds("b-r")).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(refresh_lock_path(&path, &key))
+            .unwrap();
+        FileExt::lock_exclusive(&holder).unwrap();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        worker.spawn(super::run_detached(slow_refresh_future(path.clone(), "b", started.clone())));
+        worker.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(100)).await });
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst), "must wait for the peer");
+        let t = std::time::Instant::now();
+        drop(worker);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
+        drop(holder);
+        wait_for_rotation(&path, "b", "b-r-rotated");
     }
 
     /// The fresh-token fast path never takes the cross-process lock: a
