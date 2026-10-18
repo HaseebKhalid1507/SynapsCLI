@@ -43,6 +43,40 @@ model's defaults; no cross-provider effort or authorization is inferred.
 Resume uses the invoking foreground's current mode; switching out of Ultra
 therefore restores the normal worker defaults on subsequent starts/resumes.
 
+## Hosted web search (`SYNAPS_CODEX_WEB_SEARCH`)
+
+Opt-in. `live` / `on` / `true` / `1` / `yes` attaches OpenAI's hosted
+`web_search` tool to Codex requests; `cached` attaches it with
+`external_web_access: false`; anything else leaves it off.
+
+- **Where it is read.** The variable is read from the environment of the
+  process that runs the turn. In daemon mode that is the **daemon's**
+  environment (inherited from the shell that first spawned it), not the
+  attaching client's. Setting or unsetting it in another shell does nothing
+  until `synaps daemon stop`. The first Codex request of each session prints a
+  one-line `🔎 Codex web_search is on` notice when it is attached.
+- **Which requests.** Foreground turns only. Subagent workers also need
+  `SYNAPS_CODEX_WEB_SEARCH_WORKERS=1`; internal turns never get it. Models
+  that can't use it are skipped: `gpt-5.3-codex-spark` (text-only), and any
+  live `/codex/models` row with `supports_search_tool: false`.
+- **Visibility.** Each completed `web_search_call` item in the Responses
+  stream is shown as a `🔎 Codex web_search (<action>, <status>): <query>`
+  notice and logged at info (`target: synaps::web_search`). The search runs
+  on OpenAI's servers, so `before_tool_call` / `after_tool_call` hooks never
+  see it and can't block it.
+
+## Codex HTTP 4xx errors
+
+A terminal 4xx from `/codex/responses` reads a bounded slice of the body
+(8 KiB). The error shows the sanitized `error.type` / `error.code`
+identifiers, the `param` path, and the provider message after redaction:
+one line, capped at 200 characters, quoted spans over 48 characters and
+token-shaped runs replaced with `[redacted]`, and the whole message dropped
+if it contains JSON or HTML structure. The trace terminal code carries only
+the identifiers (`http_400:invalid_request_error:unsupported_value`). "Not
+supported when using Codex with a ChatGPT account" adds a hint to switch
+account or model.
+
 ## Discovery and picker
 
 Discovery uses `/backend-api/codex/models?client_version=0.153.3`, not the

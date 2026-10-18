@@ -531,6 +531,9 @@ See `docs/multimodal.md` for full details.
 ### What is NOT yet covered (wave 2+)
 
 - **Extension protocol: per-call env/cwd** (T6) — sidecars still get the daemon's env.
+- **Provider switches read by the transport** — e.g. `SYNAPS_CODEX_WEB_SEARCH`
+  is read from the daemon's env, not the session env. See
+  [providers/codex-astra.md](providers/codex-astra.md#hosted-web-search-synaps_codex_web_search).
 - **`SO_PEERCRED` uid check** (T11) — no auth boundary on the socket yet.
 
 ### Path-like arg resolution — `--system` by content (T4, F26)
