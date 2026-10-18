@@ -126,8 +126,18 @@ impl SessionActor {
             return;
         }
         crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
+        // `/workers cancel`: which workers this command stops (a cancel
+        // already in flight is not this command's).
+        let cancelling = cmd == "workers" && arg.trim_start().starts_with("cancel");
+        let uncancelled = if cancelling { self.uncancelled_workers() } else { Vec::new() };
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
+        if cancelling {
+            let still = self.uncancelled_workers();
+            for (id, agent) in uncancelled.iter().filter(|w| !still.contains(w)) {
+                self.note_in_main_conversation(super::actor::subagent_user_cancel_event(id, agent));
+            }
+        }
         if cmd == "memory" {
             self.note_memory_choice(&arg);
         }
@@ -141,6 +151,22 @@ impl SessionActor {
             self.compact(custom_instructions, "manual").await;
         }
         self.emit(SessionEventWire::QueryResult { id, value });
+    }
+
+    /// `(id, agent)` of every worker with no cancel requested, sorted.
+    fn uncancelled_workers(&self) -> Vec<(String, String)> {
+        let mut workers: Vec<(String, String)> = self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows()
+            .into_iter()
+            .filter(|r| !r.cancel_requested)
+            .map(|r| (r.handle_id, r.agent_name))
+            .collect();
+        workers.sort();
+        workers
     }
 
     /// `/memory on|recall|capture|off` that took effect becomes the

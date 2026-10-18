@@ -319,6 +319,40 @@ fn subagent_steer_event(handle_id: &str, agent_name: &str, text: &str) -> crate:
     }
 }
 
+/// The MAIN-conversation note for a worker the user cancelled with
+/// `/workers cancel`: its completion wake is withheld, so without this the
+/// main agent would wait for it (or dispatch the work again).
+pub(crate) fn subagent_user_cancel_event(
+    handle_id: &str,
+    agent_name: &str,
+) -> crate::events::types::Event {
+    use crate::events::types::{Event, EventContent, EventSource, Severity};
+    Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        source: EventSource {
+            source_type: "user".to_string(),
+            name: "user".to_string(),
+            callback: None,
+        },
+        channel: None,
+        sender: None,
+        content: EventContent {
+            text: format!(
+                "User cancelled subagent '{agent_name}' ({handle_id}) with /workers cancel. It stops at \
+                 its next step and sends no completion wake; do not wait for it. Its partial output is \
+                 readable with subagent_collect (handle_id \"{handle_id}\")."
+            ),
+            content_type: "subagent_cancelled".to_string(),
+            severity: Some(Severity::Low),
+            data: Some(serde_json::json!({ "handle_id": handle_id, "agent_name": agent_name })),
+            disclosure: None,
+        },
+        expects_response: false,
+        reply_to: None,
+    }
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -2642,7 +2676,14 @@ impl SessionActor {
                 return;
             }
         };
-        let event = subagent_steer_event(handle_id, &agent_name, &text);
+        self.note_in_main_conversation(subagent_steer_event(handle_id, &agent_name, &text));
+    }
+
+    /// Tell the MAIN agent something the user did to its workers: the note
+    /// travels like a drained event (steered into a live turn, buffered while
+    /// busy, injected while idle) but never starts a turn on its own; clients
+    /// render it from `External`.
+    pub(crate) fn note_in_main_conversation(&mut self, event: crate::events::types::Event) {
         let formatted = crate::events::format_event_for_agent(&event);
         if self.busy() {
             let into_turn = self
@@ -2857,11 +2898,14 @@ impl SessionActor {
                 );
             }
             if let WorkerCancelScope::Turn(_) = scope {
+                // Still running and staying so: not the ones just cancelled
+                // (they read as running until their next step).
                 let spared = registry
-                    .list_active()
+                    .display_rows()
                     .iter()
-                    .filter(|(_, _, status)| {
-                        *status == crate::runtime::subagent::SubagentStatus::Running
+                    .filter(|r| {
+                        r.status == crate::runtime::subagent::SubagentStatus::Running
+                            && !r.cancel_requested
                     })
                     .count();
                 drop(registry);
