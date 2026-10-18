@@ -240,3 +240,49 @@ async fn start_detach_names_the_running_daemon_with_daemon_json_deleted() {
 
     shutdown(&d).await;
 }
+
+/// A script that answers `--print-version` with our version (it passes the
+/// gate) and then strips its own exec bit, so the `execv` that follows fails
+/// with EACCES: a deterministic exec failure after the gate.
+fn self_disarming_binary(dir: &Path) -> PathBuf {
+    let p = dir.join("synaps-disarm");
+    let pv = serde_json::to_string(&agent_engine::daemon::reload::PrintVersion::current()).unwrap();
+    std::fs::write(
+        &p,
+        format!("#!/bin/sh\nif [ \"$2\" = \"--print-version\" ]; then echo '{pv}'; chmod 644 \"$0\"; exit 0; fi\nexit 1\n"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// A reload whose exec fails leaves the old image's record exactly as it
+/// was, in memory and on disk, exe and started_at included (so the next
+/// default reload uses the old exe, not the failed one). Deleting the file
+/// afterwards heals it back to the same record, which shows memory too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_reload_exec_leaves_the_previous_record_in_memory_and_on_disk() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let recorded = registry::read_daemon_json(&d.paths).expect("daemon.json at start");
+
+    let disarm = self_disarming_binary(guard.home.path());
+    let r = SocketTransport::reload(&d.paths.sock, true, None, Some(disarm)).await;
+    assert!(matches!(r, Ok(2)), "{r:?}");
+    let rs_path = agent_engine::daemon::reload::reload_state_path(&d.paths);
+    let t0 = std::time::Instant::now();
+    while rs_path.exists() || SocketTransport::ping(&d.paths.sock).await.is_err() {
+        assert!(t0.elapsed() < Duration::from_secs(30), "the old image did not recover from the failed exec");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert_eq!(registry::read_daemon_json(&d.paths), Some(recorded.clone()), "on disk: the previous record");
+    std::fs::remove_file(&d.paths.json).unwrap();
+    SocketTransport::ping(&d.paths.sock).await.unwrap();
+    assert_eq!(registry::read_daemon_json(&d.paths), Some(recorded), "in memory: the healed record is the previous one");
+
+    shutdown(&d).await;
+}
