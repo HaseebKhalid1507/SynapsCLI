@@ -376,16 +376,47 @@ impl SuccessorBudget {
 /// the user sees — provider-reported when `calibration` is known) into a
 /// conservative-estimator budget for the retained messages.
 ///
-/// The estimate is capped at 2/3 of the (estimated) pressure threshold so a
-/// fresh successor can never start inside the pressure band and thrash.
+/// With a sample, the messages are sized by the MESSAGES-ONLY ratio
+/// `(estimated - overhead) / (provider - overhead)`: the fixed part (system
+/// prompt + tool schemas, `overhead_tokens`) is assumed to count about 1:1 in
+/// both units (a live fit gave 59,064 estimated vs ~57.1k provider tokens),
+/// so it takes `overhead_tokens` of the target as is and only the rest is
+/// converted, at the messages' own ratio. (The whole-request ratio blends a
+/// 1:1 fixed part into the messages' ratio, so a successor sized by it
+/// settled ~10% over a 100k target with a 59k fixed part.) If the fixed part
+/// counts somewhat lower on the provider side, as a conservative estimator
+/// does, the messages ratio reads slightly high, but the successor then
+/// also carries that much less fixed part; while the sample's messages
+/// outweigh the successor's (the usual case at a rollover), the net error is
+/// an undershoot, the safe direction. When no messages ratio exists
+/// (the provider count does not exceed the fixed part) or it falls outside
+/// [`TokenCalibration`]'s bounds, the whole-request ratio is used as before.
+///
+/// The fixed part plus messages is capped at 2/3 of the (estimated) pressure
+/// threshold so a fresh successor can never start inside the pressure band
+/// and thrash.
 pub fn successor_budget(
     target_tokens: u64,
     pressure_tokens: u64,
     overhead_tokens: u64,
     calibration: Option<TokenCalibration>,
 ) -> SuccessorBudget {
-    let estimated_target = match calibration {
-        Some(c) if c.plausible() => (u128::from(target_tokens) * u128::from(c.estimated_tokens)
+    let messages_sample = calibration
+        .filter(|c| c.provider_tokens > overhead_tokens)
+        .map(|c| TokenCalibration {
+            provider_tokens: c.provider_tokens - overhead_tokens,
+            estimated_tokens: c.estimated_tokens.saturating_sub(overhead_tokens),
+        })
+        .filter(TokenCalibration::plausible);
+    let estimated_target = match (messages_sample, calibration) {
+        (Some(m), _) => {
+            let messages = u128::from(target_tokens.saturating_sub(overhead_tokens))
+                * u128::from(m.estimated_tokens)
+                / u128::from(m.provider_tokens);
+            (u128::from(overhead_tokens) + messages).min(u128::from(u64::MAX)) as u64
+        }
+        (None, Some(c)) if c.plausible() => (u128::from(target_tokens)
+            * u128::from(c.estimated_tokens)
             / u128::from(c.provider_tokens))
         .min(u128::from(u64::MAX)) as u64,
         _ => target_tokens,
@@ -2686,6 +2717,9 @@ mod budget_tests {
         let plain = successor_budget(TARGET, PRESSURE, OVERHEAD, None);
         assert_eq!(plain.history_tokens, TARGET - OVERHEAD);
         // Estimator reads 1.5x the provider count: aim higher in estimator units.
+        // The provider count equals the target here, so the messages-only
+        // ratio (130,000 / 80,000) and the whole-request one give the same
+        // budget; the budget_tests below tell them apart.
         let cal = TokenCalibration {
             provider_tokens: 100_000,
             estimated_tokens: 150_000,
@@ -2695,6 +2729,7 @@ mod budget_tests {
             150_000 - OVERHEAD
         );
         // An implausible sample (ratio 9) is ignored: plain estimator target.
+        // (Its provider count is under the fixed part: no messages ratio.)
         let wild = TokenCalibration {
             provider_tokens: 10_000,
             estimated_tokens: 90_000,
@@ -2958,6 +2993,9 @@ mod budget_tests {
 
     #[test]
     fn implausible_calibration_falls_back_to_the_estimator() {
+        // Every sample here counts fewer provider tokens than the fixed part,
+        // so no messages-only ratio exists and the whole-request ratio
+        // applies, with its own bounds.
         let at = |provider_tokens, estimated_tokens| {
             successor_budget(
                 TARGET,
