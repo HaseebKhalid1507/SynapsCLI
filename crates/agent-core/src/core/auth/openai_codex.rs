@@ -173,7 +173,13 @@ pub(crate) async fn token_request_at(
         let text = resp.text().await.unwrap_or_default();
         return Err(RefreshFailure::status(
             status.as_u16(),
-            format!("Token request failed ({}): {}", status, text),
+            // Only the RFC 6749 error fields: a proxy may echo the request,
+            // which carries the refresh token / code verifier.
+            format!(
+                "Token request failed ({}): {}",
+                status,
+                super::token::sanitize_oauth_error_body(&text)
+            ),
         ));
     }
 

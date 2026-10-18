@@ -142,7 +142,7 @@ pub(crate) async fn refresh_token_at(
 /// `error_description` fields (each capped at 120 chars, char-boundary safe).
 /// Anything else — HTML from a captive portal, a proxy echoing the request
 /// (which carries the refresh token) — is dropped, never surfaced.
-fn sanitize_oauth_error_body(text: &str) -> String {
+pub(crate) fn sanitize_oauth_error_body(text: &str) -> String {
     fn cap(s: &str) -> String {
         s.chars().take(120).collect()
     }
@@ -2757,5 +2757,21 @@ mod source_classification_tests {
         assert_eq!(run(response("200 OK", "<html/>")).await.kind, Transient);
         let revoked = run(response("401 Unauthorized", r#"{"error":"invalid_grant"}"#)).await;
         assert_eq!(revoked.kind, Credential);
+        assert!(revoked.message().contains("invalid_grant"), "{revoked}");
+        // Round-2 m-i: a proxy echoing the request (refresh token included)
+        // never reaches the error text.
+        let echoed = run(response(
+            "400 Bad Request",
+            "grant_type=refresh_token&refresh_token=SECRET-RT-123",
+        ))
+        .await;
+        assert!(!echoed.message().contains("SECRET-RT-123"), "{echoed}");
+        let nested = run(response(
+            "400 Bad Request",
+            r#"{"error":"invalid_request","error_description":"bad","echo":"SECRET-RT-123"}"#,
+        ))
+        .await;
+        assert!(!nested.message().contains("SECRET-RT-123"), "{nested}");
+        assert!(nested.message().contains("invalid_request: bad"), "{nested}");
     }
 }
