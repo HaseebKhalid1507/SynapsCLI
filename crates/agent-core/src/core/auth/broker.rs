@@ -168,7 +168,9 @@ pub(crate) fn anthropic_oauth_catalog_request_headers() -> &'static [(&'static s
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Broker failures. Messages never contain credential values.
+/// Non-exhaustive: new failure kinds are added as brokers gain operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BrokerError {
     /// The named provider is not in any broker registry.
     UnknownProvider(String),
