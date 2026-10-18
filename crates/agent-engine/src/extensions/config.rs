@@ -67,6 +67,38 @@ pub fn classify_config_entry(
     plugin_config_lookup: &impl Fn(&str) -> Option<String>,
     legacy_config_lookup: &impl Fn(&str) -> Option<String>,
 ) -> ConfigEntryStatus {
+    classify_config_entry_with_keys(
+        extension_id,
+        entry,
+        &[entry.key.as_str()],
+        env_lookup,
+        plugin_config_lookup,
+        legacy_config_lookup,
+    )
+}
+
+/// [`classify_config_entry`] with the manifest's full key list, which
+/// `secret_env` validation needs (an extension may name its own override
+/// variable for any key it declares).
+fn classify_config_entry_with_keys(
+    extension_id: &str,
+    entry: &ExtensionConfigEntry,
+    own_keys: &[&str],
+    env_lookup: &impl Fn(&str) -> Option<String>,
+    plugin_config_lookup: &impl Fn(&str) -> Option<String>,
+    legacy_config_lookup: &impl Fn(&str) -> Option<String>,
+) -> ConfigEntryStatus {
+    // Mirror resolve_config: a malformed or denied secret_env is never read,
+    // so diagnostics must not look it up either (that would reveal whether,
+    // say, ANTHROPIC_API_KEY is set).
+    let secret_env = entry
+        .secret_env
+        .as_deref()
+        .and_then(super::manager::ExtensionManager::secret_env_name)
+        .filter(|name| {
+            super::manager::ExtensionManager::denied_secret_env(name, extension_id, own_keys)
+                .is_none()
+        });
     let env_var = extension_env_var(extension_id, &entry.key);
     let legacy_config_key = format!("extension.{}.{}", extension_id, entry.key);
 
@@ -78,9 +110,9 @@ pub fn classify_config_entry(
         }
     } else if env_lookup(&env_var).is_some() {
         ConfigSource::EnvOverride(env_var)
-    } else if let Some(secret_env) = entry.secret_env.as_ref() {
+    } else if let Some(secret_env) = secret_env {
         if env_lookup(secret_env).is_some() {
-            ConfigSource::SecretEnv(secret_env.clone())
+            ConfigSource::SecretEnv(secret_env.to_string())
         } else if plugin_config_lookup(&entry.key).is_some() {
             ConfigSource::PluginConfig
         } else if legacy_config_lookup(&legacy_config_key).is_some() {
@@ -132,12 +164,14 @@ pub fn diagnose_extension_config(
     plugin_config_lookup: &impl Fn(&str) -> Option<String>,
     legacy_config_lookup: &impl Fn(&str) -> Option<String>,
 ) -> ExtensionConfigDiagnostics {
+    let own_keys: Vec<&str> = manifest_config.iter().map(|e| e.key.trim()).collect();
     let entries: Vec<ConfigEntryStatus> = manifest_config
         .iter()
         .map(|entry| {
-            classify_config_entry(
+            classify_config_entry_with_keys(
                 extension_id,
                 entry,
+                &own_keys,
                 env_lookup,
                 plugin_config_lookup,
                 legacy_config_lookup,
@@ -236,6 +270,22 @@ mod tests {
             ConfigSource::EnvOverride("SYNAPS_EXTENSION_MY_EXT_API_KEY".to_string())
         );
         assert!(status.has_value);
+    }
+
+    /// Diagnostics must not reveal whether a denied (host credential) or
+    /// malformed secret_env variable is set.
+    #[test]
+    fn classify_never_looks_up_denied_or_malformed_secret_env() {
+        let env = |k: &str| match k {
+            "ANTHROPIC_API_KEY" | "lower_token" => Some("v".to_string()),
+            _ => None,
+        };
+        for name in ["ANTHROPIC_API_KEY", "lower_token"] {
+            let mut e = entry("api-key");
+            e.secret_env = Some(name.to_string());
+            let status = classify_config_entry("my-ext", &e, &env, &empty_lookup, &empty_lookup);
+            assert_eq!(status.source, ConfigSource::Missing, "{name}");
+        }
     }
 
     #[test]

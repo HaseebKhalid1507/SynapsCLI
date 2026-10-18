@@ -255,11 +255,31 @@ impl ContinuationState {
                 ),
             },
             None => tracing::warn!(
-                phase = %extension_phase,
+                phase = %phase_for_log(extension_phase),
                 "extension hook reported an unknown context phase — ignoring"
             ),
         }
     }
+}
+
+/// Longest extension-supplied phase string written to a log line. Every
+/// valid phase is far shorter; anything longer is junk or abuse.
+pub(crate) const PHASE_LOG_MAX_BYTES: usize = 32;
+
+/// An extension-supplied `context_phase` string made safe to log: only
+/// printable ASCII kept (every valid phase is ASCII; this drops control,
+/// bidi-override and other format characters), capped at
+/// [`PHASE_LOG_MAX_BYTES`], `…` appended when cut.
+pub(crate) fn phase_for_log(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars().filter(|c| c.is_ascii_graphic() || *c == ' ') {
+        if out.len() + c.len_utf8() > PHASE_LOG_MAX_BYTES {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Wire string for a context band in hook payloads.
@@ -1998,6 +2018,28 @@ mod command_tests {
             "Context pressure: ~350000 tokens."
         );
     }
+    /// 01 M6: an extension-supplied phase string is capped and stripped of
+    /// control characters before it reaches a log line.
+    #[test]
+    fn extension_phase_is_capped_for_logging() {
+        assert_eq!(phase_for_log("new_task"), "new_task");
+        let long = "x".repeat(10_000);
+        let shown = phase_for_log(&long);
+        assert!(
+            shown.len() <= PHASE_LOG_MAX_BYTES + "…".len(),
+            "{}",
+            shown.len()
+        );
+        assert!(shown.ends_with('…'));
+        assert_eq!(phase_for_log("a\nb\x1b[31mc\r"), "ab[31mc");
+        // Bidi overrides, zero-width and other format chars (and any
+        // non-ASCII: every valid phase is ASCII) are dropped.
+        assert_eq!(
+            phase_for_log("new\u{202E}_ta\u{200B}sk\u{2066}\u{FEFF}é"),
+            "new_task"
+        );
+    }
+
     /// A `new_task` report arriving from the extension hook path must leave
     /// the policy state exactly as the model's `context_checkpoint` tool
     /// would (boundary pending => rollover at pressure, not before), and
@@ -2221,6 +2263,7 @@ mod lifecycle_tests {
     /// keep the three context tools AND carry exact activations. The old
     /// rebuild (`rebuilt_for_catalog`, bare progressive core) dropped the
     /// context tools for the rest of the turn, so the next rollover failed.
+    #[cfg(feature = "command-exec")] // uses shell_start as the deferred builtin
     #[test]
     fn round_top_rebuild_after_generation_bump_keeps_context_tools() {
         use crate::tools::catalog::SessionActivationGrant;

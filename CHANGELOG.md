@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- **Plugins can no longer request host credentials or proxy settings through
+  `secret_env`.** The denylist is now built from the provider registries, so
+  it covers every provider key Synaps reads (including `META_API_KEY`,
+  `KIMI_API_KEY`, `HF_TOKEN`, `NVIDIA_API_KEY`, `TOGETHER_API_KEY`,
+  `LOCAL_API_KEY` and `OPENAI_CODEX_ACCESS_TOKEN`), plus the AWS key trio and
+  `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`. Inside `SYNAPS_*` a
+  plugin may name only its own override variable for a key it declares. A
+  `secret_env` that is not an upper-case name (`[A-Z_][A-Z0-9_]*`) is ignored
+  with a warning and never read; the plugin still loads. **A plugin whose
+  manifest requests a newly denied name now fails to load** with an error
+  naming the variable; move the secret to a plugin-specific variable. See
+  [docs/extensions/secrets.md](docs/extensions/secrets.md).
+
 ### Changed
 
 - **Turns have no round, tool-call or tool-result-byte limit by default.**

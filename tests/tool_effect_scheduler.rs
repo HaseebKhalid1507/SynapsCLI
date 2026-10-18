@@ -694,7 +694,9 @@ async fn result_order_matches_model_order_despite_completion_order() {
 /// Built-in classification + catalog recording + dynamic defaults.
 #[tokio::test]
 async fn builtin_classification_and_dynamic_defaults() {
-    use synaps_cli::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
+    #[cfg(feature = "command-exec")]
+    use synaps_cli::tools::BashTool;
+    use synaps_cli::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
     let write = WriteTool;
     let edit = EditTool;
     assert_eq!(ReadTool.effect(), ToolEffect::ReadOnly);
@@ -703,6 +705,7 @@ async fn builtin_classification_and_dynamic_defaults() {
     assert_eq!(LsTool.effect(), ToolEffect::ReadOnly);
     assert_eq!(write.effect(), ToolEffect::IdempotentWrite);
     assert_eq!(edit.effect(), ToolEffect::IdempotentWrite);
+    #[cfg(feature = "command-exec")]
     assert_eq!(BashTool.effect(), ToolEffect::NonIdempotent);
 
     // write/edit concurrency keys: canonical path — same target, same key,
@@ -714,6 +717,7 @@ async fn builtin_classification_and_dynamic_defaults() {
     let c = write.concurrency_key(&serde_json::json!({"path": "/tmp/t24/other.txt"}));
     assert_ne!(a, c);
     // bash exposes no key (serialized by effect).
+    #[cfg(feature = "command-exec")]
     assert_eq!(
         BashTool.concurrency_key(&serde_json::json!({"command": "ls"})),
         None

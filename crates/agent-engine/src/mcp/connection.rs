@@ -20,6 +20,7 @@ pub(super) struct McpConnection {
 impl McpConnection {
     /// Spawn and initialize an MCP server.
     pub(super) async fn start(
+        server: &str,
         config: &super::McpServerConfig,
     ) -> std::result::Result<Self, String> {
         let mut cmd = Command::new(&config.command);
@@ -38,9 +39,29 @@ impl McpConnection {
         // Apply user-configured env overrides from mcp.json. `${VAR}` /
         // `${VAR:-default}` expand against THIS process env at spawn time —
         // the explicit per-variable opt-in for forwarding a parent value
-        // through the cleared env (e.g. a per-run token-file path).
+        // through the cleared env (e.g. a per-run token-file path). In daemon
+        // mode that is the DAEMON's env (inherited from the shell that started
+        // it), not the attaching shell's, so an unset reference is warned
+        // about by name (never value) instead of silently becoming "".
         for (k, v) in &config.env {
-            cmd.env(k, super::expand_env_value(v, |name| std::env::var(name).ok()));
+            let expanded = super::expand_env_value_with(
+                v,
+                |name| std::env::var(name).ok(),
+                |name| {
+                    if !super::first_unset_warning(server, name) {
+                        return;
+                    }
+                    tracing::warn!(
+                        server = %server,
+                        command = %config.command,
+                        env_key = %k,
+                        unset_var = %name,
+                        "mcp.json env references an unset variable; it expands to an empty string \
+                         (daemon sessions use the daemon's environment)"
+                    )
+                },
+            );
+            cmd.env(k, expanded);
         }
 
         cmd.stdin(std::process::Stdio::piped())

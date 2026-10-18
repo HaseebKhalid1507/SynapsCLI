@@ -32,7 +32,7 @@ async fn disabled_tools_hits_builtins_only_and_never_skill_tools() {
     let reg = fg.tools_shared();
     let reg = reg.read().await;
     assert!(reg.get("ls").is_none(), "builtin disabled at boot");
-    assert!(reg.get("bash").is_some());
+    assert!(reg.get("read").is_some(), "other builtins survive");
     // Registered after the disable pass → untouched, as before.
     assert!(reg.get("load_skill").is_some(), "skill tools survive");
     assert!(reg.get("search_skills").is_some(), "skill tools survive");

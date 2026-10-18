@@ -11,11 +11,14 @@ name = "agent_engine"
 path = "src/lib.rs"
 
 [features]
-# Arbitrary local command execution surface: the `bash` tool and the
-# interactive `shell_*` PTY tools. ON by default so a normal build is unchanged.
-# Build a hardened binary with `--no-default-features` to compile `bash` out of
-# the binary entirely and never register the shell tools (defense-in-depth for
-# gated deployments that only expose read-only MCP tools).
+# The model's direct command tools: `bash`/`powershell` and the interactive
+# `shell_*` PTY tools. ON by default so a normal build is unchanged.
+# `--no-default-features` compiles `bash`/`powershell` out and never registers
+# `shell_*`. It removes those tools only and is NOT a sandbox: `write`/`edit`
+# (which can change shell rc files, `mcp.json`, plugin manifests and watcher
+# configs), watcher `wake_if` (`sh -c`), extensions, MCP servers and plugin
+# commands still start processes. `ShellStartTool` and friends stay exported,
+# so an embedder can still register them.
 default = ["command-exec"]
 command-exec = []
 # Test-support surface: offline Runtime construction for headless harnesses.

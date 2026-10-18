@@ -235,10 +235,22 @@ impl From<MuseAuthError> for String {
 // ── Injectable boundaries ────────────────────────────────────────────────────
 
 /// Minimal HTTP response used by the device-flow / mint state machine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MuseHttpResponse {
     pub status: u16,
     pub body: String,
+}
+
+impl fmt::Debug for MuseHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MuseHttpResponse")
+            .field("status", &self.status)
+            .field(
+                "body",
+                &format_args!("[REDACTED {} bytes]", self.body.len()),
+            )
+            .finish()
+    }
 }
 
 /// Injectable HTTP surface so tests never touch the network.
@@ -282,7 +294,7 @@ pub trait MuseBrowser: Send + Sync {
 
 // ── Device-flow types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceAuthorization {
     /// Opaque device code — never logged via public error types.
     pub(crate) device_code: String,
@@ -293,6 +305,20 @@ pub struct DeviceAuthorization {
     pub expires_in_secs: u64,
     pub interval_secs: u64,
     pub issued_at_ms: u64,
+}
+
+impl fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceAuthorization")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in_secs", &self.expires_in_secs)
+            .field("interval_secs", &self.interval_secs)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .finish()
+    }
 }
 
 impl DeviceAuthorization {
@@ -306,7 +332,7 @@ impl DeviceAuthorization {
 }
 
 /// Outcome of one device-token poll (secret-safe; token only on Authorized).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DevicePollOutcome {
     Pending,
     SlowDown,
@@ -314,6 +340,22 @@ pub enum DevicePollOutcome {
     Denied,
     Expired,
     OtherError,
+}
+
+impl fmt::Debug for DevicePollOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::SlowDown => f.write_str("SlowDown"),
+            Self::Authorized { .. } => f
+                .debug_struct("Authorized")
+                .field("access_token", &"[REDACTED]")
+                .finish(),
+            Self::Denied => f.write_str("Denied"),
+            Self::Expired => f.write_str("Expired"),
+            Self::OtherError => f.write_str("OtherError"),
+        }
+    }
 }
 
 /// A minted Model API key plus the non-secret account facts the mint echoes.
@@ -406,7 +448,7 @@ pub const MINT_BODY: &str = r#"{"onboard":false}"#;
 
 // ── Parsing (pure) ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceCodeJson {
     device_code: String,
     user_code: String,
@@ -419,12 +461,37 @@ struct DeviceCodeJson {
     interval: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+impl fmt::Debug for DeviceCodeJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceCodeJson")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 struct DeviceTokenJson {
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
     error: Option<String>,
+}
+
+impl fmt::Debug for DeviceTokenJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceTokenJson")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1502,5 +1569,68 @@ mod tests {
         assert!(ProductionHttp::new().is_ok());
         assert_eq!(MAX_RESPONSE_BODY_BYTES, 64 * 1024);
         assert!(USER_AGENT.starts_with("SynapsCLI/"));
+    }
+
+    #[test]
+    fn device_poll_outcome_debug_redacts_token() {
+        let o = DevicePollOutcome::Authorized {
+            access_token: "oauth-secret-123".into(),
+        };
+        let dbg = format!("{o:?}");
+        assert!(!dbg.contains("oauth-secret-123"), "{dbg}");
+        assert!(
+            dbg.contains("Authorized") && dbg.contains("REDACTED"),
+            "{dbg}"
+        );
+        assert_eq!(format!("{:?}", DevicePollOutcome::Pending), "Pending");
+    }
+
+    #[test]
+    fn device_flow_debug_redacts_secrets() {
+        let r = MuseHttpResponse {
+            status: 200,
+            body: "{\"access_token\":\"body-secret\"}".into(),
+        };
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains("body-secret") && dbg.contains("200"), "{dbg}");
+
+        let a = DeviceAuthorization {
+            device_code: "device-secret".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://example.invalid".into(),
+            verification_uri_complete: None,
+            expires_in_secs: 600,
+            interval_secs: 5,
+            issued_at_ms: 0,
+        };
+        let dbg = format!("{a:?}");
+        assert!(
+            !dbg.contains("device-secret") && dbg.contains("ABCD-EFGH"),
+            "{dbg}"
+        );
+
+        let c = DeviceCodeJson {
+            device_code: "code-json-secret".into(),
+            user_code: "WXYZ-1234".into(),
+            verification_uri: "https://example.invalid".into(),
+            verification_uri_complete: None,
+            expires_in: Some(600),
+            interval: Some(5),
+        };
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("code-json-secret") && dbg.contains("WXYZ-1234"),
+            "{dbg}"
+        );
+
+        let t = DeviceTokenJson {
+            access_token: Some("token-secret".into()),
+            error: Some("slow_down".into()),
+        };
+        let dbg = format!("{t:?}");
+        assert!(
+            !dbg.contains("token-secret") && dbg.contains("slow_down"),
+            "{dbg}"
+        );
     }
 }

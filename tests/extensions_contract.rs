@@ -322,7 +322,7 @@ async fn discovery_reports_malformed_extension_and_spawn_failures() {
     assert!(malformed
         .reason
         .contains("Failed to parse extension manifest"));
-    assert!(malformed.hint.contains("plugin validate"));
+    assert!(malformed.hint.contains("contract.json"));
 
     let spawn = failed.iter().find(|f| f.plugin == "spawn-fail").unwrap();
     assert_eq!(

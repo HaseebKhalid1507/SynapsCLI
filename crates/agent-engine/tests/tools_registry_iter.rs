@@ -107,6 +107,14 @@ fn iter_tools_sorted_is_deterministic_across_calls() {
 
 // ─── 3. Builtin registry (ToolRegistry::new) — 28 tools in sorted order ─────
 
+/// 28 builtins; the hardened build (`--no-default-features`) has no `bash`
+/// and no `shell_start`/`shell_send`/`shell_end`.
+const BUILTIN_COUNT: usize = if cfg!(feature = "command-exec") { 28 } else { 24 };
+
+fn is_command_exec_tool(name: &str) -> bool {
+    name == "bash" || name.starts_with("shell_")
+}
+
 #[test]
 fn iter_tools_sorted_on_default_registry_has_18_tools_in_order() {
     let registry = ToolRegistry::new();
@@ -114,14 +122,14 @@ fn iter_tools_sorted_on_default_registry_has_18_tools_in_order() {
 
     assert_eq!(
         tools.len(),
-        28,
-        "default registry must contain exactly 28 builtin tools"
+        BUILTIN_COUNT,
+        "default registry must contain exactly {BUILTIN_COUNT} builtin tools"
     );
 
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
     // These are the exact names in docs/tools.json (alphabetical order).
-    let expected = vec![
+    let mut expected = vec![
         "activate_tools",
         "bash",
         "edit",
@@ -152,8 +160,9 @@ fn iter_tools_sorted_on_default_registry_has_18_tools_in_order() {
         "write",
     ];
 
+    expected.retain(|n| cfg!(feature = "command-exec") || !is_command_exec_tool(n));
     assert_eq!(names, expected,
-        "iter_tools_sorted() on ToolRegistry::new() must yield the 28 builtin tools in alphabetical order");
+        "iter_tools_sorted() on ToolRegistry::new() must yield the builtin tools in alphabetical order");
 }
 
 // ─── 4. Each tool has non-empty name, description, well-formed parameters ────
@@ -308,7 +317,7 @@ fn export_shape_has_name_description_parameters_per_tool() {
     // Full manifest must contain all 28 tools.
     assert_eq!(
         manifest.len(),
-        28,
-        "export manifest must contain exactly 28 builtin tools"
+        BUILTIN_COUNT,
+        "export manifest must contain exactly {BUILTIN_COUNT} builtin tools"
     );
 }

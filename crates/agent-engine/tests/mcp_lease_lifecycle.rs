@@ -791,7 +791,7 @@ async fn fingerprint_drift_revokes_exact_grant_but_not_siblings_or_core() {
         "sibling grant untouched"
     );
     assert!(
-        set.is_core(&agent_engine::tools::catalog::ToolId::builtin("bash")),
+        set.is_core(&agent_engine::tools::catalog::ToolId::builtin("read")),
         "core untouched"
     );
     assert_eq!(
@@ -915,10 +915,10 @@ fn revoke_exact_is_typed_and_reap_scan_covers_full_cap() {
     let generation = set.schema_generation();
 
     // Core revocation refused typed, zero mutation.
-    let bash = agent_engine::tools::catalog::ToolId::builtin("bash");
+    let core = agent_engine::tools::catalog::ToolId::builtin("read");
     assert_eq!(
-        set.revoke_exact(&bash),
-        Err(ExactRevocationError::CoreTool(bash.clone()))
+        set.revoke_exact(&core),
+        Err(ExactRevocationError::CoreTool(core.clone()))
     );
     // Unknown/never-activated refused typed, zero mutation.
     let ghost = ToolId::mcp("srv", "ghost");

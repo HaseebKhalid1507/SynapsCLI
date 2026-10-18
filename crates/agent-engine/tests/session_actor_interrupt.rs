@@ -469,6 +469,7 @@ async fn pending_prompt_is_resolved_and_the_turn_unwinds() {
 
 /// A tool canceled mid-execution after streaming output: the partial output
 /// is kept but labelled — it must never read as a completed result.
+#[cfg(feature = "command-exec")] // drives the bash / shell_* tools
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn tool_canceled_mid_output_is_labelled_partial() {
@@ -720,6 +721,7 @@ async fn cancel_that_races_a_finished_answer_marks_nothing() {
 /// A cancel that was not the user's says so in the canceled tool result:
 /// a reload's checkpoint cuts a running tool and the result reads "Canceled
 /// (Synaps restarted)…", matching the marker — never "Canceled by user".
+#[cfg(feature = "command-exec")] // drives the bash / shell_* tools
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_tool_cut_by_a_reload_says_so_not_by_user() {

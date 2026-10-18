@@ -223,13 +223,13 @@ fn disable_advances_generation_and_noop_disable_does_not() {
     let mut registry = ToolRegistry::new();
     let g0 = registry.catalog().generation();
 
-    registry.disable(&["bash".to_string()]);
+    registry.disable(&["read".to_string()]);
     let g1 = registry.catalog().generation();
     assert!(
         g1 > g0,
         "disable must strictly advance past the prior generation"
     );
-    assert!(registry.catalog().get(&ToolId::builtin("bash")).is_none());
+    assert!(registry.catalog().get(&ToolId::builtin("read")).is_none());
 
     registry.disable(&["no_such_tool".to_string()]);
     assert_eq!(
@@ -451,12 +451,12 @@ fn failed_disable_at_generation_boundary_leaves_registry_unchanged() {
         registry.catalog().iter().map(|r| r.id().clone()).collect();
 
     let err = registry
-        .try_disable(&["bash".to_string()])
+        .try_disable(&["read".to_string()])
         .expect_err("disable without a new generation must fail closed");
     assert!(matches!(err, CatalogError::GenerationExhausted(_)));
 
     // Byte-for-byte / structurally unchanged: tools, schema, catalog, generation.
-    assert!(registry.get("bash").is_some(), "tool must not be removed");
+    assert!(registry.get("read").is_some(), "tool must not be removed");
     assert_eq!(*schema_before, *registry.tools_schema());
     let names_after: Vec<String> = registry
         .iter_tools_sorted()

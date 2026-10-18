@@ -26,7 +26,7 @@ async fn s7_context_report_is_content_free_and_names_every_section() {
     rt.tools_shared()
         .try_write()
         .expect("registry free between turns")
-        .disable(&["bash".to_string()]);
+        .disable(&["grep".to_string()]);
     let ev = drive_runtime_turn(&rt, "two", false).await;
     assert!(turn_completed(&ev));
 
