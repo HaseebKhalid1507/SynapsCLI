@@ -482,19 +482,24 @@ impl ConfirmScope {
     }
 }
 
-/// Make prompt text safe to print in any client (prA I-R4-3): drop C0/C1
-/// control characters except `\n` (a `\t` becomes a space), and bidi
-/// override / isolate and zero-width format characters (U+200B–U+200F,
-/// U+202A–U+202E, U+2066–U+2069). Prevents an extension's text from moving
-/// the cursor (`\x1b[3A`, `\r`) over the host-built header, or disguising
-/// text with direction overrides.
+/// Make prompt text safe to print in any client (prA I-R4-3, I-R5): drop
+/// C0/C1 control characters except `\n` (a `\t` becomes a space); the
+/// zero-width space and the LRM/RLM marks (U+200B, U+200E, U+200F); bidi
+/// embeddings/overrides/isolates (U+202A–U+202E, U+2066–U+2069) and the
+/// Arabic letter mark (U+061C); and the line/paragraph separators (U+2028,
+/// U+2029), which some terminals treat as line breaks. ZWNJ / ZWJ
+/// (U+200C, U+200D) are KEPT: emoji sequences and several scripts need
+/// them. Prevents an extension's text from moving the cursor (`\x1b[3A`,
+/// `\r`) over the host-built header, or disguising text with direction
+/// overrides.
 pub fn sanitize_prompt_text(text: &str) -> String {
     text.chars()
         .filter_map(|c| match c {
             '\n' => Some('\n'),
             '\t' => Some(' '),
             c if c.is_control() => None,
-            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
+            '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{2028}' | '\u{2029}' => None,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
             c => Some(c),
         })
         .collect()
@@ -1171,6 +1176,19 @@ pub mod reasoning_level_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// prA I-R5 minor: line/paragraph separators and the Arabic letter mark
+    /// are stripped with the other format characters; ZWNJ/ZWJ are kept so
+    /// emoji sequences and scripts that need them render intact.
+    #[test]
+    fn sanitize_prompt_text_strips_separators_keeps_zwj_zwnj() {
+        let input = "a\u{2028}b\u{2029}c\u{061C}d\u{200B}e\u{200E}f\u{200F}g\u{202E}h\u{2067}i\x1bj\tk\nl";
+        assert_eq!(sanitize_prompt_text(input), "abcdefghij k\nl");
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(sanitize_prompt_text(family), family, "ZWJ emoji intact");
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+        assert_eq!(sanitize_prompt_text(persian), persian, "ZWNJ intact");
+    }
 
     #[test]
     fn prompt_kind_from_title() {
