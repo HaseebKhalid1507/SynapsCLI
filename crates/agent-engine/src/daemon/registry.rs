@@ -95,8 +95,15 @@ pub fn heal_daemon_json(paths: &DaemonPaths, info: &DaemonInfo, _lock: &DaemonLo
 pub const JSON_HEAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The daemon's `daemon.json` record as this image holds it, and the writes
-/// of it: the start write, [`Self::publish`] (reload), [`Self::heal`]
-/// (Ping) and [`Self::cleanup`] (shutdown).
+/// of it: the start write, [`Self::publish`] (reload, and the restore after
+/// a failed exec), [`Self::heal`] (Ping) and [`Self::cleanup`] (shutdown).
+///
+/// One metadata lock serializes them all: each changes the held record and
+/// writes the files inside the same critical section, so a heal can never
+/// write a record older than the one held, and after the cleanup nothing
+/// writes the files back. Lock order: a caller that also holds the daemon's
+/// `lock_fd` mutex (heal, cleanup) takes that first. The lock is never held
+/// across an await.
 pub struct Metadata {
     paths: DaemonPaths,
     inner: std::sync::Mutex<MetaInner>,
@@ -108,12 +115,15 @@ struct MetaInner {
     /// heals since then.
     heals_logged_at: Option<std::time::Instant>,
     heals_since_log: u64,
+    /// Shutdown removed the files: no later write puts them back.
+    cleaned: bool,
 }
 
 /// What [`Metadata::heal`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Healed {
-    /// The file was in place (or is not a regular file): nothing written.
+    /// The file was in place (or is not a regular file), or the metadata
+    /// was cleaned up: nothing written.
     No,
     /// The record was written back. `log` is `Some(heals)` when this heal
     /// is due its INFO line (`heals` counted since the last line).
@@ -121,13 +131,22 @@ pub enum Healed {
 }
 
 impl Metadata {
-    /// Write `info` (the start write) and hold it.
+    /// Hold `info` and write it (the start write).
     pub fn start(paths: DaemonPaths, info: DaemonInfo) -> io::Result<Self> {
-        write_daemon_json(&paths, &info)?;
-        Ok(Self {
+        let meta = Self {
             paths,
-            inner: std::sync::Mutex::new(MetaInner { info, heals_logged_at: None, heals_since_log: 0 }),
-        })
+            inner: std::sync::Mutex::new(MetaInner {
+                info,
+                heals_logged_at: None,
+                heals_since_log: 0,
+                cleaned: false,
+            }),
+        };
+        {
+            let inner = meta.inner();
+            write_daemon_json(&meta.paths, &inner.info)?;
+        }
+        Ok(meta)
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, MetaInner> {
@@ -139,20 +158,24 @@ impl Metadata {
         self.inner().info.clone()
     }
 
-    /// Hold `info` and write it.
+    /// Hold `info` and write it, under the metadata lock. After the cleanup
+    /// it is only held.
     pub fn publish(&self, info: DaemonInfo) -> io::Result<()> {
-        self.inner().info = info.clone();
-        write_daemon_json(&self.paths, &info)
+        let mut inner = self.inner();
+        inner.info = info;
+        if inner.cleaned {
+            return Ok(());
+        }
+        write_daemon_json(&self.paths, &inner.info)
     }
 
-    /// [`heal_daemon_json`] with the held record; counts the heal for the
-    /// INFO line's rate limit.
+    /// [`heal_daemon_json`] with the held record, under the metadata lock;
+    /// counts the heal for the INFO line's rate limit.
     pub fn heal(&self, lock: &DaemonLock) -> io::Result<Healed> {
-        let info = self.info();
-        if !heal_daemon_json(&self.paths, &info, lock)? {
+        let mut inner = self.inner();
+        if inner.cleaned || !heal_daemon_json(&self.paths, &inner.info, lock)? {
             return Ok(Healed::No);
         }
-        let mut inner = self.inner();
         inner.heals_since_log += 1;
         // `map_or`, not `is_none_or`: the crate's MSRV is 1.80.
         let log = if inner.heals_logged_at.map_or(true, |at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
@@ -163,11 +186,14 @@ impl Metadata {
         } else {
             None
         };
-        Ok(Healed::Yes { info, log })
+        Ok(Healed::Yes { info: inner.info.clone(), log })
     }
 
-    /// [`cleanup_metadata`] (shutdown).
+    /// [`cleanup_metadata`] (shutdown), under the metadata lock; no later
+    /// publish or heal writes the files.
     pub fn cleanup(&self, lock: &DaemonLock) -> bool {
+        let mut inner = self.inner();
+        inner.cleaned = true;
         cleanup_metadata(&self.paths, lock)
     }
 }

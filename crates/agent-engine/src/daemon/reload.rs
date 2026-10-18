@@ -481,8 +481,8 @@ pub async fn prepare(
 /// with its own generation).
 pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
     // From this image's own record, not daemon.json (which can be lost while
-    // the daemon runs). The record follows what is written, so a heal in the
-    // hand-off window writes the same.
+    // the daemon runs). The record is held and written under the metadata
+    // lock, so a heal in the hand-off window writes the same.
     // `previous` stays untouched: a failed exec puts it back whole.
     let previous = state.daemon_info();
     let prev_generation = previous.generation;
@@ -492,7 +492,9 @@ pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
         exe: Some(p.exe.clone()),
         ..previous.clone()
     };
-    let _ = state.meta.publish(info);
+    if let Err(e) = state.meta.publish(info) {
+        tracing::warn!(path = %state.paths.json.display(), error = %e, "daemon: daemon.json write failed at reload");
+    }
     let _ = tokio::time::timeout(
         Duration::from_secs(crate::session::budgets::RELOAD_EXT_SHUTDOWN_SECS),
         async { state.host.ext_manager().write().await.shutdown_all().await },
@@ -503,7 +505,13 @@ pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
     tracing::error!(error = %err, "daemon: reload exec failed; continuing on the old image");
     // The record before this attempt, whole: exe and started_at too, so the
     // next default reload uses the old exe, not the one that failed.
-    let _ = state.meta.publish(previous);
+    if let Err(e) = state.meta.publish(previous) {
+        tracing::warn!(
+            path = %state.paths.json.display(),
+            error = %e,
+            "daemon: daemon.json write failed after the failed reload exec"
+        );
+    }
     let _ = std::fs::remove_file(&p.rs_path);
     state.reload_generation.store(prev_generation, Ordering::SeqCst);
     state.reset_announce();
