@@ -201,8 +201,14 @@ pub enum BrokerError {
     UnsupportedAccount { provider: String, label: String },
     /// An account label failed validation (CLI/env/config/HTTP boundary).
     InvalidAccount(String),
-    /// Automatic selection found no account with proven capacity.
-    NoAccountAvailable { provider: String, reason: String },
+    /// Automatic selection found no account with proven capacity. `failure`
+    /// is the typed explanation (top-level kind plus every account's kind
+    /// and HTTP status) when the broker knows it; `reason` its text.
+    NoAccountAvailable {
+        provider: String,
+        reason: String,
+        failure: Option<super::quota_policy::SelectionFailure>,
+    },
     /// The remote broker predates an operation this client needs; the
     /// payload names what is unavailable. Upgrade the broker host.
     BrokerTooOld(String),
@@ -258,8 +264,22 @@ impl std::fmt::Display for BrokerError {
                 "this credential broker cannot address account '{label}' for provider '{provider}'"
             ),
             Self::InvalidAccount(msg) => write!(f, "invalid account: {msg}"),
-            Self::NoAccountAvailable { provider, reason } => {
-                write!(f, "no account with proven capacity for '{provider}': {reason}")
+            Self::NoAccountAvailable {
+                provider,
+                reason,
+                failure: Some(failure),
+            } => write!(
+                f,
+                "no account with proven capacity for '{provider}' ({}): {reason}",
+                failure.kind
+            ),
+            Self::NoAccountAvailable {
+                provider, reason, ..
+            } => {
+                write!(
+                    f,
+                    "no account with proven capacity for '{provider}': {reason}"
+                )
             }
             Self::BrokerTooOld(what) => write!(
                 f,
@@ -1991,7 +2011,14 @@ impl LocalBroker {
         use super::token::{ensure_fresh_credential_for_seat, SeatVendError};
         for _ in 0..Self::MAX_AUTO_VEND_ROUNDS {
             let (credential, seat) = self.select_auto(provider, model).await?;
-            match ensure_fresh_credential_for_seat(&self.http, &credential, &seat).await {
+            match ensure_fresh_credential_for_seat(
+                &self.http,
+                &credential,
+                &seat,
+                &self.refresh_endpoints,
+            )
+            .await
+            {
                 Ok(creds) => {
                     self.current_accounts
                         .lock()
@@ -2013,13 +2040,26 @@ impl LocalBroker {
                     self.forget_snapshots(&credential);
                     continue;
                 }
-                Err(SeatVendError::Other(e)) => return Err(BrokerError::Credential(e)),
+                // Typed, so a transient refresh failure of the chosen seat
+                // is never reported as an unusable login.
+                Err(SeatVendError::Other(f)) => {
+                    tracing::warn!(
+                        credential = %credential,
+                        kind = %refresh_failure(&f).kind,
+                        "automatic choice could not be vended: token refresh failed"
+                    );
+                    return Err(BrokerError::Refresh(f));
+                }
             }
         }
-        Err(BrokerError::NoAccountAvailable {
-            provider: provider.as_str().to_string(),
-            reason: "selected credential kept changing while its capacity was being proven".into(),
-        })
+        Err(selection_failed(
+            provider,
+            model,
+            "selected credential kept changing while its capacity was being proven".into(),
+            super::quota_policy::SelectionFailure::new(
+                super::quota_policy::SelectionFailureKind::SeatChurn,
+            ),
+        ))
     }
 
     /// Cache key for one stored seat: credential file + slot + identity of
@@ -2086,8 +2126,8 @@ impl LocalBroker {
     async fn fresh_usage(
         &self,
         cred: &CredentialRef,
-    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), BrokerError> {
-        let seat = self.stored_seat(cred)?;
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
+        let seat = self.stored_seat(cred).map_err(UsageReadError::slot)?;
         let key = Self::seat_key(cred, &seat);
         if let Some(cached) = self.cached_snapshot(&key) {
             return Ok((cached, seat));
@@ -2112,24 +2152,24 @@ impl LocalBroker {
     /// Read-only usage for `cred`, reporting the seat whose token made the
     /// request. Token resolution happens HERE, behind the boundary, for
     /// exactly this credential; the usage helper pairs any account header
-    /// with the same token.
+    /// with the same token. A failure keeps its typed cause.
     async fn usage_with_seat(
         &self,
         cred: &CredentialRef,
-    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), BrokerError> {
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
         use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
         if !supports_usage(cred.provider) {
-            return Err(UsageError::UnsupportedProvider {
+            return Err(UsageReadError::usage(UsageError::UnsupportedProvider {
                 provider: cred.provider.as_str().to_string(),
-            }
-            .into_broker_error());
+            }));
         }
-        self.check_slot_exists(cred)?;
-        let creds = super::ensure_fresh_credential(&self.http, cred)
-            .await
-            .map_err(BrokerError::Credential)?;
+        self.check_slot_exists(cred).map_err(UsageReadError::slot)?;
+        let creds =
+            super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
+                .await
+                .map_err(UsageReadError::refresh)?;
         let seat = SeatIdentity::of(cred.provider, &creds);
-        let client = UsageClient::new().map_err(UsageError::into_broker_error)?;
+        let client = UsageClient::new().map_err(UsageReadError::usage)?;
         let opts = UsageFetchOptions {
             endpoint_override: self.usage_endpoint_override.clone(),
             ..UsageFetchOptions::default()
@@ -2142,13 +2182,13 @@ impl LocalBroker {
             &opts,
         )
         .await
-        .map_err(UsageError::into_broker_error)?;
+        .map_err(UsageReadError::usage)?;
         Ok((snapshot, seat))
     }
 
     /// Capacity view for one account from a fresh, read-only usage snapshot,
     /// with the seat it was read from. Anything that is not a well-formed,
-    /// fresh reading is NOT capacity.
+    /// fresh reading is NOT capacity; a failed read keeps its typed cause.
     async fn capacity_for(
         &self,
         cred: &CredentialRef,
@@ -2156,15 +2196,10 @@ impl LocalBroker {
         use super::quota_policy::AccountCapacity;
         match self.fresh_usage(cred).await {
             Ok((snapshot, seat)) => (capacity_from_snapshot(cred, &snapshot), Some(seat)),
-            Err(err) => (
-                AccountCapacity {
-                    credential: cred.clone(),
-                    observed_at_ms: None,
-                    observation: observation_from_error(&err),
-                    cooldown_until_ms: None,
-                },
-                None,
-            ),
+            Err(err) => {
+                tracing::debug!(credential = %cred, cause = %err.failure, "usage read failed");
+                (AccountCapacity::failed(cred.clone(), err.failure), None)
+            }
         }
     }
 
@@ -2274,6 +2309,7 @@ impl LocalBroker {
                     BrokerError::NoAccountAvailable {
                         provider: provider.to_string(),
                         reason: "selected account has no paired seat identity".into(),
+                        failure: None,
                     }
                 })?;
                 tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
@@ -2285,15 +2321,21 @@ impl LocalBroker {
             } => {
                 let detail: Vec<_> = rejections
                     .iter()
-                    .map(|r| format!("{}: {}", r.credential.account, r.reason))
+                    .map(|r| format!("{}: {}", r.credential.account, r.describe()))
                     .collect();
                 let reset = earliest_reset_ms
                     .map(|t| format!("; earliest reset at {t}"))
                     .unwrap_or_default();
-                Err(BrokerError::NoAccountAvailable {
-                    provider: provider.to_string(),
-                    reason: format!("{}{reset}", detail.join(", ")),
-                })
+                let failure = super::quota_policy::SelectionFailure::from_rejections(
+                    &rejections,
+                    plan.now_ms,
+                );
+                let reason = if detail.is_empty() {
+                    format!("no {provider} account is logged in")
+                } else {
+                    format!("{}{reset}", detail.join(", "))
+                };
+                Err(selection_failed(provider, model, reason, failure))
             }
         }
     }
@@ -2737,23 +2779,86 @@ pub fn capacity_from_snapshot(
         observed_at_ms: Some(snapshot.observed_at),
         observation: QuotaObservation::Ok { windows, models },
         cooldown_until_ms: None,
+        failure: None,
     }
 }
 
-/// A usage failure is never capacity; classify it for the policy's report.
-fn observation_from_error(err: &BrokerError) -> super::quota_policy::QuotaObservation {
-    use super::quota_policy::QuotaObservation;
-    match err {
-        BrokerError::UnsupportedCapability { .. } | BrokerError::UnsupportedAccount { .. } => {
-            QuotaObservation::Unsupported
+/// A failed usage read: the broker error `usage()` callers see (unchanged
+/// vocabulary) plus the typed cause the selection report keeps.
+#[derive(Debug)]
+struct UsageReadError {
+    error: BrokerError,
+    failure: super::quota_policy::ObservationFailure,
+}
+
+impl UsageReadError {
+    fn usage(e: super::usage::UsageError) -> Self {
+        Self {
+            failure: e.failure(),
+            error: e.into_broker_error(),
         }
-        BrokerError::Credential(_) | BrokerError::Unauthorized | BrokerError::UnknownAccount { .. } => {
-            QuotaObservation::AuthError
+    }
+
+    /// The `usage()` text stays the historical credential error; the cause
+    /// keeps the refresh kind (transient vs rejected login).
+    fn refresh(f: super::token::RefreshFailure) -> Self {
+        Self {
+            failure: refresh_failure(&f),
+            error: BrokerError::Credential(f.into()),
         }
-        BrokerError::Transport(msg) if msg.contains("malformed") || msg.contains("body_too_large") => {
-            QuotaObservation::Malformed
+    }
+
+    /// Slot checks: a slot that vanished vs a store that can't be read.
+    fn slot(error: BrokerError) -> Self {
+        use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
+        let kind = match &error {
+            BrokerError::UnknownAccount { .. } => K::CredentialMissing,
+            _ => K::CredentialStore,
+        };
+        Self {
+            failure: ObservationFailure::new(kind),
+            error,
         }
-        _ => QuotaObservation::Unknown,
+    }
+}
+
+/// The observation-failure kind of a token refresh failure.
+fn refresh_failure(f: &super::token::RefreshFailure) -> super::quota_policy::ObservationFailure {
+    use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
+    use super::token::RefreshFailureKind as R;
+    match f.kind {
+        R::Transient => ObservationFailure::new(K::RefreshTransient),
+        R::LockBusy => ObservationFailure::new(K::RefreshLockBusy),
+        R::Other => ObservationFailure::new(K::RefreshOther),
+        R::Cooldown { retry_in_secs } => {
+            ObservationFailure::new(K::RefreshOther).with_retry_after(Some(retry_in_secs))
+        }
+        R::Credential => ObservationFailure::new(K::RefreshRejected),
+        R::ActionRequired => ObservationFailure::new(K::RefreshActionRequired),
+    }
+}
+
+/// A failed automatic selection: ONE WARN naming the top-level kind and
+/// every account's `label:kind[:status]` (labels only, never identities or
+/// token material), then the typed error.
+fn selection_failed(
+    provider: OAuthProviderId,
+    model: Option<&str>,
+    reason: String,
+    failure: super::quota_policy::SelectionFailure,
+) -> BrokerError {
+    tracing::warn!(
+        provider = %provider,
+        model = model.unwrap_or("any"),
+        kind = %failure.kind,
+        accounts = %failure.accounts_field(),
+        earliest_reset_ms = ?failure.earliest_reset_ms,
+        "auth_selection_failed"
+    );
+    BrokerError::NoAccountAvailable {
+        provider: provider.to_string(),
+        reason,
+        failure: Some(failure),
     }
 }
 
@@ -3041,7 +3146,10 @@ impl CredentialBroker for LocalBroker {
     }
 
     async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
-        self.usage_with_seat(cred).await.map(|(snapshot, _seat)| snapshot)
+        self.usage_with_seat(cred)
+            .await
+            .map(|(snapshot, _seat)| snapshot)
+            .map_err(|e| e.error)
     }
 
     async fn report_cooldown(
@@ -3368,6 +3476,10 @@ impl RemoteBroker {
                 return Err(BrokerError::NoAccountAvailable {
                     provider: provider.as_str().to_string(),
                     reason: "broker reported no account with proven capacity".into(),
+                    // The broker host's own log has the per-account kinds.
+                    failure: Some(super::quota_policy::SelectionFailure::new(
+                        super::quota_policy::SelectionFailureKind::RemoteNoCapacity,
+                    )),
                 });
             }
             s if !(200..300).contains(&s) => {
@@ -5318,5 +5430,117 @@ mod tests {
         }
         assert!(!json.contains("refresh"));
         assert!(!json.contains("access"));
+    }
+
+    /// No Anthropic refresh seam exists, so the refresh-failure → kind map
+    /// is pinned here: only a rejected login is a login problem; transient,
+    /// lock-busy, local and cooldown failures are "retry", action-required
+    /// is neither.
+    #[test]
+    fn refresh_failure_kinds_map_to_observation_kinds() {
+        use super::super::quota_policy::{AccountFailureKind as K, QuotaObservation};
+        use super::super::token::{RefreshFailure, RefreshFailureKind as R};
+        for (kind, expected, transient, login) in [
+            (R::Transient, K::RefreshTransient, true, false),
+            (R::LockBusy, K::RefreshLockBusy, true, false),
+            (R::Other, K::RefreshOther, true, false),
+            (
+                R::Cooldown { retry_in_secs: 42 },
+                K::RefreshOther,
+                true,
+                false,
+            ),
+            (R::Credential, K::RefreshRejected, false, true),
+            (R::ActionRequired, K::RefreshActionRequired, false, false),
+        ] {
+            let read = UsageReadError::refresh(RefreshFailure::new(kind, "why"));
+            assert_eq!(read.failure.kind, expected, "{kind:?}");
+            assert_eq!(read.failure.kind.is_transient(), transient, "{kind:?}");
+            assert_eq!(read.failure.kind.needs_login(), login, "{kind:?}");
+            // `usage()` keeps its historical text for every refresh failure.
+            assert_eq!(
+                read.error,
+                BrokerError::Credential("why".into()),
+                "{kind:?}"
+            );
+            let observation = read.failure.observation();
+            if login {
+                assert_eq!(observation, QuotaObservation::AuthError);
+            } else {
+                assert_eq!(observation, QuotaObservation::Unknown);
+            }
+        }
+        let cooldown =
+            refresh_failure(&RefreshFailure::new(R::Cooldown { retry_in_secs: 42 }, "x"));
+        assert_eq!(cooldown.retry_after_s, Some(42));
+        // Slot errors: vanished vs unreadable store.
+        let gone = UsageReadError::slot(BrokerError::UnknownAccount {
+            provider: "anthropic".into(),
+            label: "x".into(),
+        });
+        assert_eq!(gone.failure.kind, K::CredentialMissing);
+        assert!(gone.failure.kind.needs_login());
+        let store = UsageReadError::slot(BrokerError::Credential("unreadable".into()));
+        assert_eq!(store.failure.kind, K::CredentialStore);
+        assert!(!store.failure.kind.needs_login() && !store.failure.kind.is_transient());
+    }
+
+    /// Every usage error keeps a kind; 429 keeps its Retry-After and the
+    /// status codes survive.
+    #[test]
+    fn usage_errors_map_to_observation_kinds_with_status() {
+        use super::super::quota_policy::AccountFailureKind as K;
+        use super::super::usage::UsageError as U;
+        for (err, kind, status) in [
+            (
+                U::RateLimited {
+                    retry_after_s: Some(9),
+                },
+                K::UsageRateLimited,
+                Some(429),
+            ),
+            (
+                U::Unauthorized { status: 403 },
+                K::UsageUnauthorized,
+                Some(403),
+            ),
+            (
+                U::UpstreamStatus { status: 503 },
+                K::UsageUpstream,
+                Some(503),
+            ),
+            (U::Redirected { status: 302 }, K::UsageUpstream, Some(302)),
+            (U::Timeout, K::UsageTimeout, None),
+            (
+                U::Transport {
+                    detail: "connect".into(),
+                },
+                K::UsageTransport,
+                None,
+            ),
+            (U::Malformed { detail: "x".into() }, K::UsageMalformed, None),
+            (U::BodyTooLarge { cap: 1 }, K::UsageMalformed, None),
+            (U::AccountIdUnavailable, K::UsageUnauthorized, None),
+            (
+                U::UnsupportedProvider {
+                    provider: "p".into(),
+                },
+                K::Unsupported,
+                None,
+            ),
+        ] {
+            let read = UsageReadError::usage(err.clone());
+            assert_eq!(read.failure.kind, kind, "{err:?}");
+            assert_eq!(read.failure.http_status, status, "{err:?}");
+            assert_eq!(read.error, err.clone().into_broker_error(), "{err:?}");
+        }
+        assert_eq!(
+            UsageReadError::usage(U::RateLimited {
+                retry_after_s: Some(9)
+            })
+            .failure
+            .retry_after_s,
+            Some(9)
+        );
     }
 }

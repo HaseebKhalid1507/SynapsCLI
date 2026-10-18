@@ -37,6 +37,9 @@ pub mod quota_policy;
 pub mod static_providers;
 pub mod auto_selection;
 pub use auto_selection::{AutoSelectionPolicy, PlanRow, SelectionPlan};
+pub use quota_policy::{
+    AccountFailure, AccountFailureKind, ObservationFailure, SelectionFailure, SelectionFailureKind,
+};
 mod storage;
 mod token;
 pub mod usage;

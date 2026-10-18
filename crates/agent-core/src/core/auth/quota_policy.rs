@@ -245,6 +245,11 @@ pub struct AccountCapacity {
     /// Client-side cooldown (e.g. after a provider limit response). Epoch ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_until_ms: Option<u64>,
+    /// Why there is no reading, when the read itself failed (a usage 429,
+    /// a refresh timeout, …). Never capacity; carried into the rejection
+    /// so the failure can be named instead of a bare "quota unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ObservationFailure>,
 }
 
 impl AccountCapacity {
@@ -255,7 +260,201 @@ impl AccountCapacity {
             observed_at_ms: None,
             observation: QuotaObservation::Unknown,
             cooldown_until_ms: None,
+            failure: None,
         }
+    }
+
+    /// An account whose observation failed with `failure`.
+    pub fn failed(credential: CredentialRef, failure: ObservationFailure) -> Self {
+        Self {
+            observation: failure.observation(),
+            failure: Some(failure),
+            ..Self::unobserved(credential)
+        }
+    }
+}
+
+// ── Typed failure kinds ──────────────────────────────────────────────────────
+
+/// Why one account could not serve a request, as a stable snake_case kind:
+/// a failed observation (usage read, token refresh, credential store) or
+/// the policy verdict on a good one. Secret-free; safe for logs and users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountFailureKind {
+    /// A provider limit was reported for the account (client cooldown).
+    CoolingDown,
+    /// A usage window is at its limit.
+    Exhausted,
+    /// The provider reports the requested model as used up.
+    ModelUnavailable,
+    /// The usage endpoint itself answered 429. Not proof of exhaustion.
+    UsageRateLimited,
+    UsageTimeout,
+    /// The usage endpoint answered another non-2xx status (or a redirect).
+    UsageUpstream,
+    UsageTransport,
+    /// The usage response could not be parsed (or was too large).
+    UsageMalformed,
+    /// The usage endpoint rejected the access token (401/403).
+    UsageUnauthorized,
+    /// The token refresh failed for a network/provider reason (5xx, 429,
+    /// timeout).
+    RefreshTransient,
+    /// Another refresh of the account was still running.
+    RefreshLockBusy,
+    /// A local refresh failure (lock file I/O, the refresh task, a forced-
+    /// refresh cooldown).
+    RefreshOther,
+    /// The token endpoint rejected the login (e.g. `invalid_grant`).
+    RefreshRejected,
+    /// The user must act outside synaps (corrupt store, billing).
+    RefreshActionRequired,
+    /// The slot disappeared between listing and reading.
+    CredentialMissing,
+    /// The credential store could not be read.
+    CredentialStore,
+    /// The credential was rejected; no finer cause recorded.
+    AuthError,
+    /// No usage adapter for the provider.
+    Unsupported,
+    /// No reading and no recorded cause.
+    QuotaUnknown,
+    StaleSnapshot,
+    WindowUnknown,
+    ModelUnknown,
+    NoLimitEvidence,
+    /// Excluded by the caller (e.g. a duplicate of another slot's seat).
+    Excluded,
+    NotPresent,
+    InvalidLabel,
+}
+
+impl AccountFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CoolingDown => "cooling_down",
+            Self::Exhausted => "exhausted",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::UsageRateLimited => "usage_rate_limited",
+            Self::UsageTimeout => "usage_timeout",
+            Self::UsageUpstream => "usage_upstream",
+            Self::UsageTransport => "usage_transport",
+            Self::UsageMalformed => "usage_malformed",
+            Self::UsageUnauthorized => "usage_unauthorized",
+            Self::RefreshTransient => "refresh_transient",
+            Self::RefreshLockBusy => "refresh_lock_busy",
+            Self::RefreshOther => "refresh_other",
+            Self::RefreshRejected => "refresh_rejected",
+            Self::RefreshActionRequired => "refresh_action_required",
+            Self::CredentialMissing => "credential_missing",
+            Self::CredentialStore => "credential_store",
+            Self::AuthError => "auth_error",
+            Self::Unsupported => "unsupported",
+            Self::QuotaUnknown => "quota_unknown",
+            Self::StaleSnapshot => "stale_snapshot",
+            Self::WindowUnknown => "window_unknown",
+            Self::ModelUnknown => "model_unknown",
+            Self::NoLimitEvidence => "no_limit_evidence",
+            Self::Excluded => "excluded",
+            Self::NotPresent => "not_present",
+            Self::InvalidLabel => "invalid_label",
+        }
+    }
+
+    /// Only a new login for the account can fix it.
+    pub fn needs_login(self) -> bool {
+        matches!(
+            self,
+            Self::UsageUnauthorized
+                | Self::RefreshRejected
+                | Self::CredentialMissing
+                | Self::AuthError
+        )
+    }
+
+    /// Capacity is unproven, not absent: the same request can succeed later
+    /// without the user doing anything.
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::UsageRateLimited
+                | Self::UsageTimeout
+                | Self::UsageUpstream
+                | Self::UsageTransport
+                | Self::RefreshTransient
+                | Self::RefreshLockBusy
+                | Self::RefreshOther
+        )
+    }
+
+    /// The account is at a provider limit (reported or measured).
+    pub fn is_limited(self) -> bool {
+        matches!(
+            self,
+            Self::CoolingDown | Self::Exhausted | Self::ModelUnavailable
+        )
+    }
+}
+
+impl std::fmt::Display for AccountFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A failed observation: its kind plus the HTTP status and `Retry-After`
+/// the provider sent, when there were any. Never token material or body
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationFailure {
+    pub kind: AccountFailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u64>,
+}
+
+impl ObservationFailure {
+    pub fn new(kind: AccountFailureKind) -> Self {
+        Self {
+            kind,
+            http_status: None,
+            retry_after_s: None,
+        }
+    }
+
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.http_status = Some(status);
+        self
+    }
+
+    pub fn with_retry_after(mut self, secs: Option<u64>) -> Self {
+        self.retry_after_s = secs;
+        self
+    }
+
+    /// The (never-capacity) observation this failure stands for.
+    pub fn observation(&self) -> QuotaObservation {
+        match self.kind {
+            k if k.needs_login() => QuotaObservation::AuthError,
+            AccountFailureKind::UsageMalformed => QuotaObservation::Malformed,
+            AccountFailureKind::Unsupported => QuotaObservation::Unsupported,
+            _ => QuotaObservation::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for ObservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if let Some(status) = self.http_status {
+            write!(f, ", HTTP {status}")?;
+        }
+        if let Some(secs) = self.retry_after_s {
+            write!(f, ", retry after {secs}s")?;
+        }
+        Ok(())
     }
 }
 
@@ -432,6 +631,206 @@ pub struct Rejection {
     #[serde(with = "cred_serde")]
     pub credential: CredentialRef,
     pub reason: RejectReason,
+    /// The failed observation behind an observation verdict (`unknown`,
+    /// `auth_error`, `malformed`, `unsupported`), when it is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<ObservationFailure>,
+}
+
+impl Rejection {
+    /// `reason`, plus the cause in parentheses when there is one.
+    pub fn describe(&self) -> String {
+        match &self.cause {
+            Some(cause) => format!("{} ({cause})", self.reason),
+            None => self.reason.to_string(),
+        }
+    }
+}
+
+/// One account's part in a failed selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountFailure {
+    /// Account label (`default` for the bare slot). Never an identity.
+    pub account: String,
+    pub kind: AccountFailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u64>,
+    /// Cooldown end or exhausted-window reset, epoch ms, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+}
+
+impl AccountFailure {
+    /// The account's failure for a rejection; `None` for an account that
+    /// was eligible but outranked (not a failure).
+    pub fn from_rejection(rejection: &Rejection) -> Option<Self> {
+        use AccountFailureKind as K;
+        let mut out = Self {
+            account: rejection.credential.account.label_str().to_string(),
+            kind: K::QuotaUnknown,
+            http_status: None,
+            retry_after_s: None,
+            until_ms: None,
+        };
+        if let Some(cause) = &rejection.cause {
+            out.kind = cause.kind;
+            out.http_status = cause.http_status;
+            out.retry_after_s = cause.retry_after_s;
+            return Some(out);
+        }
+        out.kind = match &rejection.reason {
+            RejectReason::Outranked { .. } => return None,
+            RejectReason::CoolingDown { until_ms } => {
+                out.until_ms = Some(*until_ms);
+                K::CoolingDown
+            }
+            RejectReason::Exhausted { resets_at_ms, .. } => {
+                out.until_ms = *resets_at_ms;
+                K::Exhausted
+            }
+            RejectReason::Stale { .. } => K::StaleSnapshot,
+            RejectReason::Malformed => K::UsageMalformed,
+            RejectReason::Unknown => K::QuotaUnknown,
+            RejectReason::Unsupported => K::Unsupported,
+            RejectReason::AuthError => K::AuthError,
+            RejectReason::WindowUnknown { .. } => K::WindowUnknown,
+            RejectReason::NoLimitEvidence => K::NoLimitEvidence,
+            RejectReason::ModelUnavailable { .. } => K::ModelUnavailable,
+            RejectReason::ModelUnknown { .. } => K::ModelUnknown,
+            RejectReason::Excluded => K::Excluded,
+            RejectReason::NotPresent => K::NotPresent,
+            RejectReason::InvalidLabel { .. } => K::InvalidLabel,
+        };
+        Some(out)
+    }
+
+    /// `label:kind[:status]`, the log form.
+    pub fn log_form(&self) -> String {
+        match self.http_status {
+            Some(status) => format!("{}:{}:{status}", self.account, self.kind),
+            None => format!("{}:{}", self.account, self.kind),
+        }
+    }
+}
+
+/// The one kind that explains a failed automatic selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionFailureKind {
+    /// No account is logged in for the provider.
+    NoCredentials,
+    /// At least one account's usage read or token refresh failed for a
+    /// transient reason: capacity is unproven, not absent.
+    UsageReadFailed,
+    /// Every account that is not cooling down needs a new login.
+    CredentialRejected,
+    /// Every account is cooling down or at a usage limit.
+    AllCoolingDown,
+    /// The readings succeeded but proved no capacity.
+    QuotaUnknown,
+    /// The chosen slot kept changing while its capacity was being proven.
+    SeatChurn,
+    /// A remote broker answered "no account available" (its own log has
+    /// the reason).
+    RemoteNoCapacity,
+}
+
+impl SelectionFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCredentials => "no_credentials",
+            Self::UsageReadFailed => "usage_read_failed",
+            Self::CredentialRejected => "credential_rejected",
+            Self::AllCoolingDown => "all_cooling_down",
+            Self::QuotaUnknown => "quota_unknown",
+            Self::SeatChurn => "seat_churn",
+            Self::RemoteNoCapacity => "remote_no_capacity",
+        }
+    }
+}
+
+impl std::fmt::Display for SelectionFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A failed automatic selection: the top-level kind, every account's part
+/// in it, and the earliest known reset among limited accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionFailure {
+    pub kind: SelectionFailureKind,
+    #[serde(default)]
+    pub accounts: Vec<AccountFailure>,
+    /// Earliest future cooldown end or exhausted-window reset, epoch ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_reset_ms: Option<u64>,
+}
+
+impl SelectionFailure {
+    /// A failure with no per-account detail.
+    pub fn new(kind: SelectionFailureKind) -> Self {
+        Self {
+            kind,
+            accounts: Vec::new(),
+            earliest_reset_ms: None,
+        }
+    }
+
+    /// Classify a `NoCapacity` result. First match wins: no accounts →
+    /// `no_credentials`; any transient failure → `usage_read_failed`; every
+    /// account limited → `all_cooling_down`; every account not limited
+    /// needs a login → `credential_rejected`; else `quota_unknown`.
+    pub fn from_rejections(rejections: &[Rejection], now_ms: u64) -> Self {
+        use SelectionFailureKind as K;
+        let accounts: Vec<_> = rejections
+            .iter()
+            .filter_map(AccountFailure::from_rejection)
+            .collect();
+        let live: Vec<_> = accounts.iter().filter(|a| !a.kind.is_limited()).collect();
+        let kind = if accounts.is_empty() {
+            K::NoCredentials
+        } else if accounts.iter().any(|a| a.kind.is_transient()) {
+            K::UsageReadFailed
+        } else if live.is_empty() {
+            K::AllCoolingDown
+        } else if live.iter().all(|a| a.kind.needs_login()) {
+            K::CredentialRejected
+        } else {
+            K::QuotaUnknown
+        };
+        let earliest_reset_ms = accounts
+            .iter()
+            .filter(|a| a.kind.is_limited())
+            .filter_map(|a| a.until_ms)
+            .filter(|t| *t > now_ms)
+            .min();
+        Self {
+            kind,
+            accounts,
+            earliest_reset_ms,
+        }
+    }
+
+    /// Labels whose failure only a new login fixes, in order.
+    pub fn login_labels(&self) -> Vec<&str> {
+        self.accounts
+            .iter()
+            .filter(|a| a.kind.needs_login())
+            .map(|a| a.account.as_str())
+            .collect()
+    }
+
+    /// `label:kind[:status],…` — one log field, secret-free.
+    pub fn accounts_field(&self) -> String {
+        self.accounts
+            .iter()
+            .map(AccountFailure::log_form)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Result of [`select`].
@@ -630,6 +1029,18 @@ fn preference_rank(req: &SelectionRequest<'_>, cred: &CredentialRef) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The recorded observation failure behind an observation verdict; the
+/// policy verdicts (cooling down, exhausted, …) need no cause.
+fn observation_cause(reason: &RejectReason, cap: &AccountCapacity) -> Option<ObservationFailure> {
+    match reason {
+        RejectReason::Unknown
+        | RejectReason::AuthError
+        | RejectReason::Malformed
+        | RejectReason::Unsupported => cap.failure.clone(),
+        _ => None,
+    }
+}
+
 /// Pick the best eligible account for `req` among `candidates`.
 ///
 /// Candidates for other providers are ignored. See module docs for the rules.
@@ -652,6 +1063,7 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
             Ok(e) => eligible.push((cap, e)),
             Err(reason) => rejections.push(Rejection {
                 credential: cap.credential.clone(),
+                cause: observation_cause(&reason, cap),
                 reason,
             }),
         }
@@ -674,7 +1086,11 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
             ),
         };
         return Selection::NoCapacity {
-            rejections: vec![Rejection { credential, reason }],
+            rejections: vec![Rejection {
+                credential,
+                reason,
+                cause: None,
+            }],
             earliest_reset_ms: None,
         };
     }
@@ -740,6 +1156,7 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
                     reason: RejectReason::Outranked {
                         rank: (i + 1) as u32,
                     },
+                    cause: None,
                 });
             }
             Selection::Selected {
@@ -964,6 +1381,7 @@ mod tests {
                 models: None,
             },
             cooldown_until_ms: None,
+            failure: None,
         }
     }
 
@@ -2180,5 +2598,150 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ── Typed selection failures ─────────────────────────────────────────
+
+    fn failed(label: &str, failure: ObservationFailure) -> AccountCapacity {
+        AccountCapacity::failed(cred(label), failure)
+    }
+
+    fn failure_of(candidates: &[AccountCapacity]) -> SelectionFailure {
+        match select(&req(), candidates) {
+            Selection::NoCapacity { rejections, .. } => {
+                SelectionFailure::from_rejections(&rejections, NOW)
+            }
+            other => panic!("expected no capacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observation_failure_maps_to_a_never_capacity_observation() {
+        use AccountFailureKind as K;
+        for (kind, obs) in [
+            (K::UsageRateLimited, QuotaObservation::Unknown),
+            (K::RefreshTransient, QuotaObservation::Unknown),
+            (K::UsageUnauthorized, QuotaObservation::AuthError),
+            (K::RefreshRejected, QuotaObservation::AuthError),
+            (K::CredentialMissing, QuotaObservation::AuthError),
+            (K::UsageMalformed, QuotaObservation::Malformed),
+            (K::Unsupported, QuotaObservation::Unsupported),
+            (K::RefreshActionRequired, QuotaObservation::Unknown),
+        ] {
+            assert_eq!(ObservationFailure::new(kind).observation(), obs, "{kind}");
+        }
+        let f = ObservationFailure::new(K::UsageRateLimited)
+            .with_status(429)
+            .with_retry_after(Some(120));
+        assert_eq!(
+            f.to_string(),
+            "usage_rate_limited, HTTP 429, retry after 120s"
+        );
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            serde_json::json!({"kind": "usage_rate_limited", "http_status": 429, "retry_after_s": 120})
+        );
+        // Records without a cause (older writers) still decode.
+        let old: Rejection = serde_json::from_str(
+            r#"{"credential":"openai-codex@a","reason":{"reason":"unknown"}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.cause, None);
+        assert_eq!(old.describe(), "quota unknown");
+    }
+
+    #[test]
+    fn rejection_carries_the_cause_only_for_observation_verdicts() {
+        use AccountFailureKind as K;
+        let limited = ObservationFailure::new(K::UsageRateLimited).with_status(429);
+        let mut cooling = failed("b", limited.clone());
+        cooling.cooldown_until_ms = Some(NOW + HOUR);
+        match select(&req(), &[failed("a", limited.clone()), cooling]) {
+            Selection::NoCapacity { rejections, .. } => {
+                assert_eq!(rejections[0].reason, RejectReason::Unknown);
+                assert_eq!(rejections[0].cause.as_ref(), Some(&limited));
+                assert_eq!(
+                    rejections[0].describe(),
+                    "quota unknown (usage_rate_limited, HTTP 429)"
+                );
+                // The cooldown verdict is the policy's, not the read's.
+                assert!(matches!(
+                    rejections[1].reason,
+                    RejectReason::CoolingDown { .. }
+                ));
+                assert_eq!(rejections[1].cause, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selection_failure_kind_priority_and_login_labels() {
+        use AccountFailureKind as K;
+        use SelectionFailureKind as S;
+        let transient = ObservationFailure::new(K::UsageUpstream).with_status(503);
+        let rejected = ObservationFailure::new(K::RefreshRejected);
+        let exhausted = ok("x", vec![win("primary", 5 * HOUR, 100.0, NOW + 2 * HOUR)]);
+        let mut cooling = ok("c", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        cooling.cooldown_until_ms = Some(NOW + HOUR);
+
+        assert_eq!(failure_of(&[]).kind, S::NoCredentials);
+
+        // Transient beats a rejected login: capacity unproven, not absent.
+        let f = failure_of(&[
+            failed("a", rejected.clone()),
+            failed("b", transient.clone()),
+        ]);
+        assert_eq!(f.kind, S::UsageReadFailed);
+        assert_eq!(f.login_labels(), vec!["a"]);
+        assert_eq!(
+            f.accounts_field(),
+            "a:refresh_rejected,b:usage_upstream:503"
+        );
+
+        // Every account not cooling down needs a login.
+        let f = failure_of(&[failed("a", rejected.clone()), cooling.clone()]);
+        assert_eq!(f.kind, S::CredentialRejected);
+        assert_eq!(f.login_labels(), vec!["a"]);
+        assert_eq!(f.earliest_reset_ms, Some(NOW + HOUR));
+
+        // Every account limited; the earliest reset over cooldowns and
+        // exhausted windows.
+        let f = failure_of(&[exhausted.clone(), cooling.clone()]);
+        assert_eq!(f.kind, S::AllCoolingDown);
+        assert_eq!(f.accounts_field(), "x:exhausted,c:cooling_down");
+        assert_eq!(f.earliest_reset_ms, Some(NOW + HOUR));
+        assert!(f.login_labels().is_empty());
+
+        // A login problem among accounts that proved nothing is not
+        // "every account needs a login".
+        let no_evidence = ok("n", vec![]);
+        let f = failure_of(&[failed("a", rejected), no_evidence]);
+        assert_eq!(f.kind, S::QuotaUnknown);
+        assert_eq!(f.login_labels(), vec!["a"]);
+
+        // Refresh lock contention and local refresh failures are transient.
+        for kind in [
+            K::RefreshLockBusy,
+            K::RefreshOther,
+            K::UsageTimeout,
+            K::UsageTransport,
+        ] {
+            let f = failure_of(&[failed("a", ObservationFailure::new(kind))]);
+            assert_eq!(f.kind, S::UsageReadFailed, "{kind}");
+        }
+        // Not transient and not a login problem.
+        for kind in [
+            K::UsageMalformed,
+            K::RefreshActionRequired,
+            K::CredentialStore,
+        ] {
+            let f = failure_of(&[failed("a", ObservationFailure::new(kind))]);
+            assert_eq!(f.kind, S::QuotaUnknown, "{kind}");
+            assert!(f.login_labels().is_empty(), "{kind}");
+        }
+        // A past reset is never reported.
+        let stale_exhausted = ok("y", vec![win("primary", 5 * HOUR, 100.0, NOW - 1)]);
+        assert_eq!(failure_of(&[stale_exhausted]).earliest_reset_ms, None);
     }
 }

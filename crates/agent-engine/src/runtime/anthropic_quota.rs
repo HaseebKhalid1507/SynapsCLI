@@ -978,6 +978,7 @@ mod tests {
                 return Err(BrokerError::NoAccountAvailable {
                     provider: provider.as_str().into(),
                     reason: "scripted".into(),
+                    failure: None,
                 });
             };
             Ok(PinnedToken {

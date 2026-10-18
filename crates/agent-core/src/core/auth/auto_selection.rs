@@ -92,6 +92,9 @@ pub struct PlanRow {
     pub budget_reset_ms: Option<u64>,
     pub utilization: Option<f64>,
     pub verdict: String,
+    /// The failed observation behind the verdict, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<quota::ObservationFailure>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SelectionPlan {
@@ -118,10 +121,8 @@ impl SelectionPlan {
             .filter(|c| c.credential.provider == req.provider)
             .map(|cap| {
                 let eligible = quota::evaluate(req, cap).ok();
-                let reason = rejections
-                    .iter()
-                    .find(|r| r.credential == cap.credential)
-                    .map(|r| &r.reason);
+                let rejection = rejections.iter().find(|r| r.credential == cap.credential);
+                let reason = rejection.map(|r| &r.reason);
                 let selected = selection.selected() == Some(&cap.credential);
                 let rank = if selected {
                     Some(1)
@@ -154,10 +155,11 @@ impl SelectionPlan {
                     verdict: if selected {
                         "selected".into()
                     } else {
-                        reason
-                            .map(ToString::to_string)
+                        rejection
+                            .map(quota::Rejection::describe)
                             .unwrap_or_else(|| "not considered".into())
                     },
+                    cause: rejection.and_then(|r| r.cause.clone()),
                 }
             })
             .collect();

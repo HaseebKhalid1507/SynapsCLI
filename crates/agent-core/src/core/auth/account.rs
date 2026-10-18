@@ -398,6 +398,7 @@ impl AccountPolicy {
             AccountSelector::Auto => Err(BrokerError::NoAccountAvailable {
                 provider: provider.as_str().to_string(),
                 reason: "automatic account selection requires a capacity selector".into(),
+                failure: None,
             }),
             AccountSelector::Invalid { source, reason } => Err(BrokerError::InvalidAccount(
                 format!("{source}: {reason}"),

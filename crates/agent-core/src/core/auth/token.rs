@@ -246,14 +246,16 @@ pub enum SeatVendError {
     /// The slot no longer holds the seat the caller's evidence was about
     /// (re-login, removal, or rotation by another party). Nothing was vended.
     SeatChanged,
-    Other(String),
+    /// The refresh failed; typed so a transient failure is never reported
+    /// as an unusable login.
+    Other(RefreshFailure),
 }
 
 impl std::fmt::Display for SeatVendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SeatChanged => f.write_str(SEAT_CHANGED),
-            Self::Other(e) => f.write_str(e),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }
@@ -392,20 +394,22 @@ impl RefreshFailure {
 /// already inspected (e.g. read its usage): the slot must still hold the same
 /// [`SeatIdentity`], checked under the same locks as the refresh, so the
 /// returned token is derived from exactly that seat — never from a
-/// credential that replaced it in between.
-pub async fn ensure_fresh_credential_for_seat(
+/// credential that replaced it in between. `endpoints` are the broker's
+/// refresh test seams. A failure stays typed ([`SeatVendError::Other`]).
+pub(super) async fn ensure_fresh_credential_for_seat(
     client: &Client,
     cred: &CredentialRef,
     expected: &SeatIdentity,
+    endpoints: &RefreshEndpoints,
 ) -> std::result::Result<OAuthCredentials, SeatVendError> {
     let path = auth_file_path();
-    ensure_fresh_credential_checked_at(client, cred, &path, Some(expected))
+    ensure_credential_checked_at(client, cred, &path, Some(expected), None, endpoints)
         .await
-        .map_err(|e| {
-            if e == SEAT_CHANGED {
+        .map_err(|f| {
+            if f.message() == SEAT_CHANGED {
                 SeatVendError::SeatChanged
             } else {
-                SeatVendError::Other(e)
+                SeatVendError::Other(f)
             }
         })
 }

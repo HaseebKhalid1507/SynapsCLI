@@ -939,6 +939,7 @@ mod chooser_tests {
                 credential: CredentialRef::new(provider, Account::named(label).unwrap()),
                 observed_at_ms: Some(now),
                 cooldown_until_ms: None,
+                failure: None,
                 observation: QuotaObservation::Ok {
                     windows: vec![WindowLimit {
                         id: "seven_day".into(),
