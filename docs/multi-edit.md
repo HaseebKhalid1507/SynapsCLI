@@ -135,9 +135,11 @@ restored, which could not be, and which were never written.
   group, ACLs and extended attributes are not (they are those of a new file
   made by this process), the same as with `edit` and `write`. This holds for
   a file put back by a restore too.
-- No fsync, matching `edit` and `write`. A successful call never publishes a
-  partial file, but after a crash or power loss the filesystem decides what
-  survives.
+- No fsync, matching `edit` and `write`. In normal operation a file is never
+  rewritten in place: its new content is published whole, by a rename (or a
+  link, for a new file), so a call never publishes a partial file. Nothing is
+  claimed about a crash or power loss: without fsync, the filesystem decides
+  what survives.
 - A new file published by a hard link (where the exclusive rename isn't
   available) normally has its temp name removed. If that removal fails, the
   file is still published and the call succeeds; the result ends with

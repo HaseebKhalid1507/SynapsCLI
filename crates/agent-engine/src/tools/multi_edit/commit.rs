@@ -26,9 +26,12 @@
 //!    their in-memory originals and the error names exactly what happened
 //!    to each file.
 //!
-//! No fsync, matching `edit`/`write`: a successful call never publishes a
-//! partial file, but after a crash or power loss the filesystem decides what
-//! survives. The re-check-to-rename window is not locked.
+//! No fsync, matching `edit`/`write`. In normal operation a file is never
+//! rewritten in place: its new content is published whole, by a rename (or
+//! a link, for a new file), so a call never publishes a partial file.
+//! Nothing is claimed about a crash or power loss: without fsync, the
+//! filesystem decides what survives. The re-check-to-rename window is not
+//! locked.
 
 use super::dir::{self, Dir, Kind, OpenError};
 use std::ffi::{OsStr, OsString};
