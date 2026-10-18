@@ -394,7 +394,18 @@ pub enum HookResult {
     Inject { content: String },
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
-    Confirm { message: String },
+    ///
+    /// `sources` / `tool` are host-stamped by `HookBus::emit` (the extension
+    /// id(s) that asked, and the tool name). They are never read from or
+    /// written to the extension wire format, so an extension cannot claim to
+    /// be another extension. The "Allow all" latch is keyed by `sources`.
+    Confirm {
+        message: String,
+        #[serde(skip)]
+        sources: Vec<String>,
+        #[serde(skip)]
+        tool: Option<String>,
+    },
     /// Replace the tool **input** before execution (structured JSON args).
     /// Only valid on before_tool_call hooks. The output-side counterpart is
     /// [`HookResult::Replace`]. The first modifier stops the handler chain.
@@ -417,6 +428,18 @@ pub enum HookResult {
     /// `phase` is parsed host-side with `WorkPhase::parse`; unknown strings
     /// are ignored with a warning.
     ContextPhase { phase: String },
+}
+
+impl HookResult {
+    /// An unattributed `Confirm` (as an extension returns it, before
+    /// `HookBus::emit` stamps the source).
+    pub fn confirm(message: impl Into<String>) -> Self {
+        Self::Confirm {
+            message: message.into(),
+            sources: Vec::new(),
+            tool: None,
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -744,6 +767,8 @@ mod tests {
     fn hook_result_confirm_serde() {
         let r = HookResult::Confirm {
             message: "Run this command?".to_string(),
+            sources: vec!["host-stamped".into()],
+            tool: Some("bash".into()),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -752,7 +777,17 @@ mod tests {
         );
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, HookResult::Confirm { message } if message == "Run this command?"));
+        assert!(matches!(back, HookResult::Confirm { message, .. } if message == "Run this command?"));
+
+        // An extension cannot name a source: wire fields are ignored.
+        let spoof: HookResult = serde_json::from_str(
+            r#"{"action":"confirm","message":"m","sources":["trusted"],"tool":"x"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&spoof, HookResult::Confirm { sources, tool: None, .. } if sources.is_empty()),
+            "{spoof:?}"
+        );
     }
 
     /// Modify carries replacement input through serialization.
@@ -837,6 +872,8 @@ mod tests {
                 "confirm",
                 HookResult::Confirm {
                     message: "m".into(),
+                    sources: vec![],
+                    tool: None,
                 },
             ),
             (

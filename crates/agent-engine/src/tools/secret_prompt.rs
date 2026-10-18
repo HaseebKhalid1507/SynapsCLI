@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-pub use crate::session::PromptKind;
+pub use crate::session::{ConfirmScope, PromptKind};
 
 /// UI-only secret prompt plumbing for interactive tools.
 ///
@@ -18,11 +18,24 @@ impl SecretPromptHandle {
     }
 
     pub async fn prompt(&self, title: String, prompt: String) -> Option<String> {
+        self.prompt_scoped(title, prompt, None).await
+    }
+
+    /// Like [`Self::prompt`], carrying the extension tool-call confirm scope
+    /// so the dialog can name the source extension(s) and the reach of
+    /// "Allow all" before the user answers.
+    pub async fn prompt_scoped(
+        &self,
+        title: String,
+        prompt: String,
+        confirm_scope: Option<ConfirmScope>,
+    ) -> Option<String> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = SecretPromptRequest {
             kind: PromptKind::from_title(&title),
             title,
             prompt,
+            confirm_scope,
             response_tx,
         };
         self.tx.send(request).ok()?;
@@ -37,6 +50,8 @@ pub struct SecretPromptRequest {
     pub kind: PromptKind,
     pub title: String,
     pub prompt: String,
+    /// Extension tool-call confirms only (see [`ConfirmScope`]).
+    pub confirm_scope: Option<ConfirmScope>,
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
@@ -46,8 +61,9 @@ pub enum ConfirmChoice {
     /// Answer "y": allow this one call.
     Allow,
     /// Answer [`CONFIRM_ANSWER_ALLOW_ALL`]: allow this call and latch the
-    /// session so later extension confirms are auto-approved. Only offered
-    /// for `Confirm tool call` prompts (not `activate_tools`).
+    /// source extension(s) so their later confirms are auto-approved. Only
+    /// offered for `Confirm tool call` prompts that carry a [`ConfirmScope`]
+    /// (not `activate_tools`).
     AllowAll,
     /// Answer `None`: deny (the default focus, so a bare Enter fails closed).
     Deny,
@@ -63,6 +79,7 @@ pub struct PendingSecretPrompt {
     pub kind: PromptKind,
     pub title: String,
     pub prompt: String,
+    pub confirm_scope: Option<ConfirmScope>,
     pub buffer: String,
     /// `Confirm` only: the focused button. Starts on `Deny`.
     pub confirm_focus: ConfirmChoice,
@@ -70,12 +87,17 @@ pub struct PendingSecretPrompt {
 }
 
 impl PendingSecretPrompt {
-    /// Whether the "Allow all (session)" button is offered: only the
-    /// runtime's per-tool-call gate (`Confirm tool call`), never the
-    /// `activate_tools` gate, whose runtime only accepts y/yes.
+    /// Whether the "Allow all" button is offered: only the runtime's
+    /// per-tool-call gate (`Confirm tool call`) with a known source scope,
+    /// never the `activate_tools` gate (its runtime only accepts y/yes) and
+    /// never an unattributed confirm (the latch could not be scoped).
     pub fn offers_allow_all(&self) -> bool {
         self.kind == PromptKind::Confirm
             && self.title == crate::session::types::CONFIRM_PROMPT_TITLE
+            && self
+                .confirm_scope
+                .as_ref()
+                .is_some_and(|s| !s.extensions.is_empty())
     }
 
     /// Buttons in display order.
@@ -128,6 +150,7 @@ impl SecretPromptQueue {
                 kind: req.kind,
                 title: req.title,
                 prompt: req.prompt,
+                confirm_scope: req.confirm_scope,
                 buffer: String::new(),
                 confirm_focus: ConfirmChoice::Deny,
                 response_tx: req.response_tx,
@@ -258,8 +281,8 @@ mod tests {
         let rx = Arc::new(Mutex::new(rx));
         let (tx1, mut rx1) = tokio::sync::oneshot::channel();
         let (tx2, mut rx2) = tokio::sync::oneshot::channel();
-        tx.send(SecretPromptRequest { kind: PromptKind::Secret, title: "a".into(), prompt: "p".into(), response_tx: tx1 }).unwrap();
-        tx.send(SecretPromptRequest { kind: PromptKind::Secret, title: "b".into(), prompt: "p".into(), response_tx: tx2 }).unwrap();
+        tx.send(SecretPromptRequest { kind: PromptKind::Secret, title: "a".into(), prompt: "p".into(), confirm_scope: None, response_tx: tx1 }).unwrap();
+        tx.send(SecretPromptRequest { kind: PromptKind::Secret, title: "b".into(), prompt: "p".into(), confirm_scope: None, response_tx: tx2 }).unwrap();
         let mut q = SecretPromptQueue::new();
         q.poll_requests(&rx);
         assert_eq!(q.active().unwrap().title, "a");
@@ -274,5 +297,43 @@ mod tests {
         q.submit();
         assert_eq!(rx2.try_recv().unwrap(), Some("x".to_string()));
         assert!(!q.is_active());
+    }
+
+    fn confirm(title: &str, scope: Option<ConfirmScope>) -> SecretPromptQueue {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let (response_tx, _rx) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest {
+            kind: PromptKind::Confirm,
+            title: title.into(),
+            prompt: "p".into(),
+            confirm_scope: scope,
+            response_tx,
+        })
+        .unwrap();
+        let mut q = SecretPromptQueue::new();
+        q.poll_requests(&rx);
+        q
+    }
+
+    #[test]
+    fn allow_all_requires_an_attributed_tool_call_confirm() {
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: Some("bash".into()) };
+        let title = crate::session::CONFIRM_PROMPT_TITLE;
+        assert!(confirm(title, Some(scope.clone())).confirm_offers_allow_all());
+        assert!(
+            !confirm(title, None).confirm_offers_allow_all(),
+            "an unattributed confirm cannot be latched, so no Allow all"
+        );
+        assert!(!confirm(
+            title,
+            Some(ConfirmScope { extensions: vec![], tool: None })
+        )
+        .confirm_offers_allow_all());
+        assert!(!confirm(crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE, Some(scope))
+            .confirm_offers_allow_all());
+        // Without a scope, `a` degrades to a single Allow.
+        let mut q = confirm(title, None);
+        assert_eq!(q.confirm_answer(ConfirmChoice::AllowAll), Some(ConfirmChoice::Allow));
     }
 }

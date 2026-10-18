@@ -3555,6 +3555,7 @@ impl SessionActor {
             title: req.title,
             prompt: req.prompt,
             raised_at: chrono::Utc::now(),
+            confirm_scope: req.confirm_scope,
         };
         self.pending_prompts.push_back((pr.clone(), req.response_tx));
         self.publish_presence();

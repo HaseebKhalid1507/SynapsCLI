@@ -450,6 +450,8 @@ Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on
 |-----------|--------|----------|--------------------------------------------------|
 | `message` | string | yes      | Human-readable confirmation prompt for the user  |
 
+The host shows your extension id and the tool name above `message`; an extension cannot set or spoof them. The dialog offers **Allow** (this call), **Allow all from `<your-extension>` this session**, and **Deny**. "Allow all" auto-approves later `confirm` results from *your extension only* (any tool) for the rest of the session, subagents included; confirms from other extensions still prompt, and `block` is never overridden. Assume any `confirm` you return may be auto-approved once the user has chosen "Allow all" for your extension.
+
 ### `modify`
 
 Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify`, `confirm`, or `block` result stops the handler chain. Trace logs record `action=modify` but do not log the replacement input.

@@ -937,6 +937,7 @@ mod tests {
             title: "sudo".into(),
             prompt: "password".into(),
             raised_at: chrono::Utc::now(),
+            confirm_scope: None,
         }
     }
 

@@ -400,6 +400,7 @@ impl PromptBridge {
                 kind: req.kind,
                 title: req.title,
                 prompt: req.prompt,
+                confirm_scope: req.confirm_scope,
                 response_tx,
             });
         self.order.push_back(req.id);
@@ -472,6 +473,7 @@ mod tests {
             },
             prompt: "details".into(),
             raised_at: chrono::Utc::now(),
+            confirm_scope: None,
         }
     }
 

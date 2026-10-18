@@ -107,7 +107,7 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime: &mut crate::Runtime,
     config: &crate::config::SynapsConfig,
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
-    session_allow_all: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    session_allow_all: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
 ) {
     runtime.inherit_session_allow_all(session_allow_all);
     runtime.apply_retry_config(config);
@@ -609,8 +609,14 @@ mod codex_ultra_worker_tests {
     #[tokio::test]
     async fn session_allow_all_worker_policy_shares_live_parent_latch() {
         use crate::extensions::hooks::events::HookResult;
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
 
+        let jev = vec!["jev".to_string()];
+        let confirm_from = |source: &str| HookResult::Confirm {
+            message: "worker action".into(),
+            sources: vec![source.to_string()],
+            tool: Some("bash".into()),
+        };
         let parent = crate::Runtime::new_headless();
         let mut independent = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(&mut independent, &Default::default(), None, None);
@@ -625,16 +631,15 @@ mod codex_ultra_worker_tests {
             parent.session_allow_all(),
             worker.session_allow_all()
         ));
-        assert!(!worker.session_allow_all().load(Ordering::Relaxed));
+        assert!(worker.session_allow_all().is_empty());
 
-        // Consent arriving AFTER worker creation must reach its headless hooks.
-        parent.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(!independent.session_allow_all().load(Ordering::Relaxed));
+        // Consent arriving AFTER worker creation must reach its headless hooks
+        // — but only for the extension the user allowed.
+        parent.session_allow_all().allow(&jev);
+        assert!(independent.session_allow_all().is_empty());
         let approved = crate::runtime::resolve_before_tool_call_decision(
             serde_json::json!({}),
-            HookResult::Confirm {
-                message: "worker action".into(),
-            },
+            confirm_from("jev"),
             None,
             false,
             Some(worker.session_allow_all()),
@@ -644,6 +649,18 @@ mod codex_ultra_worker_tests {
             approved,
             crate::runtime::BeforeToolCallDecision::Continue { .. }
         ));
+        let other = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({}),
+            confirm_from("other"),
+            None,
+            false,
+            Some(worker.session_allow_all()),
+        )
+        .await;
+        assert!(
+            matches!(other, crate::runtime::BeforeToolCallDecision::Block { .. }),
+            "a headless worker still fails closed for an extension the user did not allow"
+        );
         let blocked = crate::runtime::resolve_before_tool_call_decision(
             serde_json::json!({}),
             HookResult::Block {
@@ -658,7 +675,7 @@ mod codex_ultra_worker_tests {
             matches!(blocked, crate::runtime::BeforeToolCallDecision::Block { reason } if reason == "policy veto")
         );
 
-        // A worker spawned after consent inherits the same live latch too.
+        // A worker spawned after consent inherits the same live set too.
         let mut later = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(
             &mut later,
@@ -666,9 +683,9 @@ mod codex_ultra_worker_tests {
             None,
             Some(parent.session_allow_all()),
         );
-        assert!(later.session_allow_all().load(Ordering::Relaxed));
-        worker.session_allow_all().store(false, Ordering::Relaxed);
-        assert!(!later.session_allow_all().load(Ordering::Relaxed));
+        assert!(later.session_allow_all().allows_all(&jev));
+        worker.session_allow_all().clear();
+        assert!(later.session_allow_all().is_empty());
     }
 
     #[test]

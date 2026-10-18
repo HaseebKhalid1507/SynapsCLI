@@ -761,6 +761,7 @@ pub(crate) fn build_render_model(
         masked_buffer_chars: p.buffer.chars().count(),
         confirm_focus: p.confirm_focus,
         confirm_offers_allow_all: p.offers_allow_all(),
+        confirm_scope: p.confirm_scope.clone(),
     });
 
     // ── 13. Runtime strings ───────────────────────────────────────────────────
@@ -1640,17 +1641,49 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
     use synaps_cli::tools::PromptKind;
     let area = frame.area();
     let is_confirm = prompt.kind == PromptKind::Confirm;
+    let scoped_allow_all = is_confirm && prompt.confirm_offers_allow_all;
     // Cap to available width; prefer 30-62 (72 for confirm — tool ids are
-    // long) but never overflow (#tui-safety fix 3).
-    let width = area.width.min(if is_confirm { 72 } else { 62 });
+    // long; 88 when the extension-named "Allow all" button is shown) but
+    // never overflow (#tui-safety fix 3).
+    let width = area.width.min(if scoped_allow_all {
+        88
+    } else if is_confirm {
+        72
+    } else {
+        62
+    });
     let inner_w = width.saturating_sub(2);
     let body_lines = wrapped_line_count(&prompt.prompt, inner_w);
+    // Tool-call confirm with a known source: the "Allow all" button names
+    // the extension and a scope line states its reach BEFORE the answer.
+    let allow_all_scope = prompt
+        .confirm_scope
+        .as_ref()
+        .filter(|_| scoped_allow_all);
+    let allow_all_button = allow_all_scope.map(|s| format!("[ {} (a) ]", s.allow_all_label()));
+    let button_row_text = format!(
+        "   [ Allow (y) ]{}   [ Deny (n) ]",
+        allow_all_button
+            .as_deref()
+            .map(|b| format!("   {b}"))
+            .unwrap_or_default()
+    );
+    let text_w = inner_w.saturating_sub(1);
+    let scope_lines = allow_all_scope
+        .map(|s| wrapped_line_count(&s.allow_all_scope(), text_w) + 1)
+        .unwrap_or(0);
+    let button_lines = wrapped_line_count(&button_row_text, text_w);
     // body + blank + (field | nothing) + footer, plus 2 border rows. Floor
     // at the legacy fixed 7 so single-line secret prompts render exactly as
     // before (reference-binary differential); grow only for longer bodies.
-    // Confirm: blank + button row + blank + footer + auto-approve hint;
-    // Secret: blank + field + footer.
-    let content_rows = body_lines + if is_confirm { 5 } else { 3 };
+    // Confirm: blank + button row(s) + blank + [scope + blank] + footer +
+    // auto-approve hint; Secret: blank + field + footer.
+    let content_rows = body_lines
+        + if is_confirm {
+            4 + button_lines + scope_lines
+        } else {
+            3
+        };
     let height = (content_rows as u16 + 2).max(7).min(area.height).max(3);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
@@ -1706,17 +1739,21 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
             Span::raw("   "),
             Span::styled("[ Allow (y) ]", style_for(ConfirmChoice::Allow)),
         ];
-        if prompt.confirm_offers_allow_all {
+        if let Some(button) = allow_all_button.clone() {
             row.push(Span::raw("   "));
-            row.push(Span::styled(
-                "[ Allow all this session (a) ]",
-                style_for(ConfirmChoice::AllowAll),
-            ));
+            row.push(Span::styled(button, style_for(ConfirmChoice::AllowAll)));
         }
         row.push(Span::raw("   "));
         row.push(Span::styled("[ Deny (n) ]", style_for(ConfirmChoice::Deny)));
         text.push(ratatui::text::Line::from(row));
         text.push(ratatui::text::Line::from(""));
+        if let Some(scope) = allow_all_scope {
+            text.push(ratatui::text::Line::from(Span::styled(
+                scope.allow_all_scope(),
+                Style::default().fg(warn),
+            )));
+            text.push(ratatui::text::Line::from(""));
+        }
         text.push(ratatui::text::Line::from(Span::styled(
             if prompt.confirm_offers_allow_all {
                 "y allow · a allow all · n/esc deny · ←/→/Tab select · Enter confirm"

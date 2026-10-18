@@ -503,6 +503,36 @@ impl TestHarness {
         title: &str,
         prompt: &str,
     ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_scoped(kind, title, prompt, None)
+    }
+
+    /// Inject an extension tool-call confirm (`Confirm tool call`) raised by
+    /// `extension` for `tool`, exactly as the runtime builds it: the scope
+    /// is what makes "Allow all from <ext>" available.
+    pub fn activate_tool_call_confirm(
+        &mut self,
+        extension: &str,
+        tool: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_scoped(
+            synaps_cli::tools::PromptKind::Confirm,
+            agent_engine::session::CONFIRM_PROMPT_TITLE,
+            prompt,
+            Some(agent_engine::session::ConfirmScope {
+                extensions: vec![extension.to_string()],
+                tool: Some(tool.to_string()),
+            }),
+        )
+    }
+
+    fn activate_prompt_scoped(
+        &mut self,
+        kind: synaps_cli::tools::PromptKind,
+        title: &str,
+        prompt: &str,
+        confirm_scope: Option<agent_engine::session::ConfirmScope>,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         use synaps_cli::tools::SecretPromptRequest;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -510,6 +540,7 @@ impl TestHarness {
             kind,
             title: title.to_string(),
             prompt: prompt.to_string(),
+            confirm_scope,
             response_tx,
         })
         .expect("prompt request send is infallible on a fresh channel");

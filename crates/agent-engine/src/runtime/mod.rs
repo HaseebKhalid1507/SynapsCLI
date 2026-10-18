@@ -79,33 +79,55 @@ pub async fn emit_before_tool_call(
     hook_bus.emit(&event).await
 }
 
-/// Answer the Confirm dialog sends for its "Allow all (session)" button.
+/// Answer the Confirm dialog sends for its "Allow all from <ext>" button.
 /// `resolve_before_tool_call_result` treats it as an allow AND latches the
-/// session's [`Runtime::session_allow_all`] flag so later Confirm results
-/// are auto-approved without a prompt (until the session ends).
+/// confirm's source extension(s) in the session's
+/// [`Runtime::session_allow_all`] set, so later Confirm results from those
+/// extensions (only) are auto-approved without a prompt.
 pub use crate::tools::CONFIRM_ANSWER_ALLOW_ALL;
+
+/// Prompt body for an extension tool-call Confirm: the host-known source and
+/// tool lead, so an extension's own `message` cannot hide who is asking.
+fn confirm_prompt_body(message: &str, sources: &[String], tool: Option<&str>) -> String {
+    let source = if sources.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        sources.join(", ")
+    };
+    format!(
+        "Extension: {source}\nTool: {}\n\n{message}\n\nAllow this tool call?",
+        tool.unwrap_or("(unknown)")
+    )
+}
 
 /// Resolve a before_tool_call result that may request user confirmation.
 ///
-/// When `auto_approve_confirms` is true, or `session_allow_all` has been
-/// latched by an earlier "Allow all (session)" answer, `Confirm` is
+/// When `auto_approve_confirms` is true, or every source extension of the
+/// Confirm has been latched by an earlier "Allow all" answer, `Confirm` is
 /// short-circuited to `Continue`. Headless/non-interactive callers with
 /// neither fail closed.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
-    session_allow_all: Option<&std::sync::atomic::AtomicBool>,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> crate::extensions::hooks::events::HookResult {
-    use std::sync::atomic::Ordering;
     match hook_result {
-        crate::extensions::hooks::events::HookResult::Confirm { message } => {
+        crate::extensions::hooks::events::HookResult::Confirm {
+            message,
+            sources,
+            tool,
+        } => {
             if auto_approve_confirms {
                 tracing::info!(message = %message, "confirm auto-approved (auto_approve_confirms=true)");
                 return crate::extensions::hooks::events::HookResult::Continue;
             }
-            if session_allow_all.is_some_and(|f| f.load(Ordering::Relaxed)) {
-                tracing::info!(message = %message, "confirm auto-approved (session allow-all latched)");
+            if session_allow_all.is_some_and(|latch| latch.allows_all(&sources)) {
+                tracing::info!(
+                    message = %message,
+                    extensions = ?sources,
+                    "confirm auto-approved (extension allow-all latched)"
+                );
                 return crate::extensions::hooks::events::HookResult::Continue;
             }
 
@@ -118,10 +140,15 @@ pub async fn resolve_before_tool_call_result(
                 };
             };
 
+            let scope = (!sources.is_empty()).then(|| crate::session::ConfirmScope {
+                extensions: sources.clone(),
+                tool: tool.clone(),
+            });
             let response = prompt
-                .prompt(
-                    "Confirm tool call".to_string(),
-                    format!("{}\n\nAllow this tool call?", message),
+                .prompt_scoped(
+                    crate::session::CONFIRM_PROMPT_TITLE.to_string(),
+                    confirm_prompt_body(&message, &sources, tool.as_deref()),
+                    scope,
                 )
                 .await;
 
@@ -133,12 +160,13 @@ pub async fn resolve_before_tool_call_result(
                 }
                 Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
                     match session_allow_all {
-                        Some(flag) => {
-                            flag.store(true, Ordering::Relaxed);
-                            tracing::warn!(
-                                "user chose Allow all: tool-call confirms auto-approved for the rest of this session"
-                            );
-                        }
+                        Some(latch) if latch.allow(&sources) => tracing::warn!(
+                            extensions = ?sources,
+                            "user chose Allow all: confirms from these extensions are auto-approved for the rest of this session"
+                        ),
+                        Some(_) => tracing::warn!(
+                            "user chose Allow all on an unattributed confirm; approving this call only"
+                        ),
                         None => tracing::warn!(
                             "user chose Allow all but this path has no session latch; approving this call only"
                         ),
@@ -160,7 +188,7 @@ pub async fn resolve_before_tool_call_decision(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
-    session_allow_all: Option<&std::sync::atomic::AtomicBool>,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> BeforeToolCallDecision {
     match resolve_before_tool_call_result(
         hook_result,
@@ -552,11 +580,11 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
-    /// Session-scoped "Allow all" latch for extension `Confirm` gates
-    /// (`before_tool_call`). Set when the user picks "Allow all (session)"
-    /// in the Confirm dialog; shared by clones and delegated workers in the
-    /// same session. Never persisted.
-    session_allow_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped, per-extension "Allow all" latch for extension
+    /// `Confirm` gates (`before_tool_call`). An extension id is added when
+    /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
+    /// clones and delegated workers in the same session. Never persisted.
+    session_allow_all: std::sync::Arc<crate::tools::SessionConfirmLatch>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -1127,7 +1155,7 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
-            session_allow_all: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -1668,7 +1696,7 @@ impl Runtime {
     /// must not be able to grant consent to the next conversation. Ordinary
     /// turns and linked compaction successors must not call this method.
     pub fn begin_conversation(&mut self, id: Option<String>) {
-        self.session_allow_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
         self.set_session_id(id);
     }
 
@@ -4216,16 +4244,16 @@ impl Runtime {
         .await
     }
 
-    /// Session-scoped "Allow all" latch for extension Confirm gates. `true`
-    /// once the user picked "Allow all (session)" in a Confirm dialog.
-    pub fn session_allow_all(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+    /// Session-scoped "Allow all" latch for extension Confirm gates: the
+    /// extension ids the user picked "Allow all from <ext>" for.
+    pub fn session_allow_all(&self) -> &std::sync::Arc<crate::tools::SessionConfirmLatch> {
         &self.session_allow_all
     }
 
     /// Bind a worker to the calling session, not the process-wide host.
     pub(crate) fn inherit_session_allow_all(
         &mut self,
-        parent: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        parent: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
     ) {
         if let Some(parent) = parent {
             self.session_allow_all = parent.clone();
@@ -5346,9 +5374,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_without_prompt_fails_closed() {
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             None,
             false,
             None,
@@ -5396,9 +5422,7 @@ mod tests {
         });
 
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
             None,
@@ -5423,9 +5447,7 @@ mod tests {
         });
 
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
             None,
@@ -5440,9 +5462,25 @@ mod tests {
         ));
     }
 
+    fn ext(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn sourced_confirm(
+        message: &str,
+        source: &str,
+        tool: &str,
+    ) -> crate::extensions::hooks::events::HookResult {
+        crate::extensions::hooks::events::HookResult::Confirm {
+            message: message.into(),
+            sources: ext(&[source]),
+            tool: Some(tool.into()),
+        }
+    }
+
     #[test]
     fn session_allow_all_clones_share_but_independent_runtimes_do_not() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
         let parent = Runtime::new_headless();
         let cloned = parent.clone();
         let independent = Runtime::new_headless();
@@ -5454,36 +5492,35 @@ mod tests {
             parent.session_allow_all(),
             independent.session_allow_all()
         ));
-        cloned.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(parent.session_allow_all().load(Ordering::Relaxed));
-        assert!(!independent.session_allow_all().load(Ordering::Relaxed));
+        cloned.session_allow_all().allow(&ext(&["jev"]));
+        assert!(parent.session_allow_all().allows_all(&ext(&["jev"])));
+        assert!(!independent.session_allow_all().allows_all(&ext(&["jev"])));
     }
 
     #[test]
     fn session_allow_all_conversation_boundary_isolates_old_clones() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
         let mut runtime = Runtime::new_headless();
         let old_worker = runtime.clone();
-        old_worker.session_allow_all().store(true, Ordering::Relaxed);
+        old_worker.session_allow_all().allow(&ext(&["jev"]));
 
         runtime.begin_conversation(Some("next".into()));
         assert_eq!(runtime.session_id(), Some("next"));
-        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(runtime.session_allow_all().is_empty());
         assert!(!Arc::ptr_eq(
             runtime.session_allow_all(),
             old_worker.session_allow_all()
         ));
-        assert!(old_worker.session_allow_all().load(Ordering::Relaxed));
-        old_worker.session_allow_all().store(false, Ordering::Relaxed);
-        old_worker.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        // An old clone arming its latch cannot grant the new conversation.
+        old_worker.session_allow_all().allow(&ext(&["jev"]));
+        assert!(runtime.session_allow_all().is_empty());
 
         let new_worker = runtime.clone();
-        new_worker.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+        new_worker.session_allow_all().allow(&ext(&["jev"]));
+        assert!(runtime.session_allow_all().allows_all(&ext(&["jev"])));
         // Explicit resume of even the same ID starts fresh consent.
         runtime.begin_conversation(Some("next".into()));
-        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(runtime.session_allow_all().is_empty());
         assert!(!Arc::ptr_eq(
             runtime.session_allow_all(),
             new_worker.session_allow_all()
@@ -5492,40 +5529,54 @@ mod tests {
 
     #[test]
     fn session_allow_all_identity_change_preserves_compaction_consent() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
         let mut runtime = Runtime::new_headless();
         let worker = runtime.clone();
-        worker.session_allow_all().store(true, Ordering::Relaxed);
+        worker.session_allow_all().allow(&ext(&["jev"]));
         runtime.set_session_id(Some("linked-successor".into()));
         assert!(Arc::ptr_eq(
             runtime.session_allow_all(),
             worker.session_allow_all()
         ));
-        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(runtime.session_allow_all().allows_all(&ext(&["jev"])));
     }
 
-    /// "Allow all (session)": the answer continues THIS call and latches the
-    /// session flag, after which a Confirm resolves without any prompt.
+    /// "Allow all from <ext>": the answer continues THIS call and latches
+    /// that extension only. A later confirm from the same extension resolves
+    /// without a prompt; a confirm from another extension still prompts.
     #[tokio::test]
-    async fn confirm_prompt_always_latches_session_allow_all() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let latch = AtomicBool::new(false);
+    async fn confirm_prompt_always_latches_only_the_source_extension() {
+        let latch = crate::tools::SessionConfirmLatch::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = crate::tools::SecretPromptHandle::new(tx);
 
         let task = tokio::spawn(async move {
-            let request = rx.recv().await.expect("confirm prompt request");
-            let _ = request
+            let first = rx.recv().await.expect("first confirm prompt");
+            // The dialog is told who asks and for which tool BEFORE answering.
+            assert_eq!(
+                first.confirm_scope,
+                Some(crate::session::ConfirmScope {
+                    extensions: vec!["jev".into()],
+                    tool: Some("bash".into()),
+                })
+            );
+            assert!(first.prompt.starts_with("Extension: jev\nTool: bash\n"), "{}", first.prompt);
+            let _ = first
                 .response_tx
                 .send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
-            // A second prompt must NEVER arrive: the latch short-circuits it.
-            assert!(rx.recv().await.is_none(), "second confirm must not prompt");
+            // The next prompt must be the OTHER extension's confirm (jev's
+            // second confirm is latched and never prompts).
+            let other = rx.recv().await.expect("other extension still prompts");
+            assert_eq!(
+                other.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+                Some(vec!["other".to_string()])
+            );
+            let _ = other.response_tx.send(None);
+            assert!(rx.recv().await.is_none(), "no further prompts");
         });
 
         let first = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            sourced_confirm("Run deploy?", "jev", "bash"),
             Some(&handle),
             false,
             Some(&latch),
@@ -5535,12 +5586,10 @@ mod tests {
             first,
             crate::extensions::hooks::events::HookResult::Continue
         ));
-        assert!(latch.load(Ordering::Relaxed), "latch set by 'always'");
+        assert_eq!(latch.extensions(), ext(&["jev"]), "latch keyed by source");
 
         let second = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy again?".into(),
-            },
+            sourced_confirm("Run deploy again?", "jev", "write"),
             Some(&handle),
             false,
             Some(&latch),
@@ -5550,17 +5599,56 @@ mod tests {
             second,
             crate::extensions::hooks::events::HookResult::Continue
         ));
+
+        let other = resolve_before_tool_call_result(
+            sourced_confirm("Run ls?", "other", "bash"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(
+            matches!(other, crate::extensions::hooks::events::HookResult::Block { .. }),
+            "another extension's confirm is not covered by jev's latch"
+        );
         drop(handle);
         task.await.unwrap();
     }
 
+    /// An unattributed confirm (no host-stamped source) offers no scope and
+    /// an "always" answer approves only this call; nothing is latched.
+    #[tokio::test]
+    async fn unattributed_confirm_always_answer_does_not_latch() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.expect("prompt");
+            assert!(req.confirm_scope.is_none());
+            let _ = req.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        assert!(latch.is_empty());
+    }
+
     /// The latch only short-circuits Confirm; Block from an extension is
-    /// still a Block, and a headless path with the latch set continues
-    /// instead of failing closed.
+    /// still a Block, and a headless path with the source latched continues
+    /// instead of failing closed (an unlatched source still fails closed).
     #[tokio::test]
     async fn session_allow_all_does_not_override_block() {
-        use std::sync::atomic::AtomicBool;
-        let latch = AtomicBool::new(true);
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&ext(&["jev"]));
         let blocked = resolve_before_tool_call_result(
             crate::extensions::hooks::events::HookResult::Block {
                 reason: "nope".into(),
@@ -5575,9 +5663,7 @@ mod tests {
             crate::extensions::hooks::events::HookResult::Block { reason } if reason == "nope"
         ));
         let headless = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            sourced_confirm("Run deploy?", "jev", "bash"),
             None,
             false,
             Some(&latch),
@@ -5586,6 +5672,17 @@ mod tests {
         assert!(matches!(
             headless,
             crate::extensions::hooks::events::HookResult::Continue
+        ));
+        let other = resolve_before_tool_call_result(
+            sourced_confirm("Run deploy?", "other", "bash"),
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            other,
+            crate::extensions::hooks::events::HookResult::Block { .. }
         ));
     }
 

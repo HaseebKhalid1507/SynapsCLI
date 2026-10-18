@@ -418,9 +418,9 @@ async fn session_allow_all_does_not_authorize_activate_tools() {
         let set = shared(minimal_set(&registry));
         let before = set_fingerprint(&set.read().unwrap());
         let mut context = ctx(Some(capability_for_mode(&registry, &set, mode)));
-        context.capabilities.session_allow_all = Some(std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(true),
-        ));
+        let latch = agent_engine::tools::SessionConfirmLatch::new();
+        latch.allow(&["jev".to_string()]);
+        context.capabilities.session_allow_all = Some(std::sync::Arc::new(latch));
         let error = ActivateToolsTool
             .execute(
                 json!({"tools": ["builtin:beta_tool"], "confirmed": true}),

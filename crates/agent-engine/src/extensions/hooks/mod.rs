@@ -346,13 +346,19 @@ impl HookBus {
                     // First transform wins (mirrors Modify). Chaining is a future enhancement.
                     return HookResult::Replace { output };
                 }
-                Ok(HookResult::Confirm { message }) => {
+                Ok(HookResult::Confirm { message, .. }) => {
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
                         "Hook requested confirmation by extension"
                     );
-                    return HookResult::Confirm { message };
+                    // Host-stamped attribution: the "Allow all" latch and
+                    // the dialog key on the extension that actually asked.
+                    return HookResult::Confirm {
+                        message,
+                        sources: vec![reg.handler.id().to_string()],
+                        tool: event.tool_runtime_name.clone().or_else(|| event.tool_name.clone()),
+                    };
                 }
                 Ok(HookResult::ContextPhase { phase }) => {
                     // Advisory only — never stops the chain. Two-key gated;
@@ -492,8 +498,12 @@ impl HookBus {
                 Ok(HookResult::Replace { output }) => {
                     return HookResult::Replace { output };
                 }
-                Ok(HookResult::Confirm { message }) => {
-                    return HookResult::Confirm { message };
+                Ok(HookResult::Confirm { message, .. }) => {
+                    return HookResult::Confirm {
+                        message,
+                        sources: vec![reg.handler.id().to_string()],
+                        tool: event.tool_runtime_name.clone().or_else(|| event.tool_name.clone()),
+                    };
                 }
                 Ok(result @ HookResult::ContextPhase { .. }) => {
                     if !event.kind.allows_result(&result) {
@@ -1072,9 +1082,7 @@ mod tests {
             "inject"
         );
         assert_eq!(
-            hook_result_action(&HookResult::Confirm {
-                message: "Proceed?".into(),
-            }),
+            hook_result_action(&HookResult::confirm("Proceed?")),
             "confirm"
         );
         assert_eq!(
@@ -1114,9 +1122,7 @@ mod tests {
         let bus = HookBus::new();
         let confirmer = TestHandler::new(
             "confirmer",
-            HookResult::Confirm {
-                message: "Run this command?".into(),
-            },
+            HookResult::confirm("Run this command?"),
         );
         let after = TestHandler::new("after", HookResult::Continue);
         let perms = perms_with(&[Permission::ToolsIntercept]);
@@ -1143,13 +1149,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirm_is_stamped_with_source_extension_and_tool() {
+        let bus = HookBus::new();
+        let confirmer = TestHandler::new("jev", HookResult::confirm("Run ls?"));
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+        bus.subscribe(HookKind::BeforeToolCall, confirmer, None, None, perms)
+            .await
+            .unwrap();
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        match bus.emit(&event).await {
+            HookResult::Confirm {
+                message,
+                sources,
+                tool,
+            } => {
+                assert_eq!(message, "Run ls?");
+                assert_eq!(sources, vec!["jev".to_string()]);
+                assert_eq!(tool.as_deref(), Some("bash"));
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn confirm_is_ignored_for_non_tool_hooks() {
         let bus = HookBus::new();
         let confirmer = TestHandler::new(
             "confirmer",
-            HookResult::Confirm {
-                message: "Not allowed here".into(),
-            },
+            HookResult::confirm("Not allowed here"),
         );
         let perms = perms_with(&[Permission::LlmContent]);
 

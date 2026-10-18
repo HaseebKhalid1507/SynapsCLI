@@ -991,8 +991,9 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
     if is_confirm {
         // Confirm dialog: a button lightbox, no free-text field.
         //   y / Y                → Allow (answers "y")
-        //   a / A                → Allow all this session (answers "always";
-        //                          only when offered, else degrades to Allow)
+        //   a / A                → Allow all from <ext> this session (answers
+        //                          "always"; only when offered — a scoped
+        //                          tool-call confirm — else degrades to Allow)
         //   n / N / Esc          → Deny  (answers None)
         //   ← → Tab BackTab h l  → move focus between the buttons
         //   Enter                → activate the FOCUSED button; Deny is the
@@ -1001,6 +1002,10 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         // accidentally form an allow.
         use synaps_cli::tools::ConfirmChoice;
         if let Event::Key(key) = event {
+            let scope = app
+                .secret_prompts
+                .active()
+                .and_then(|p| p.confirm_scope.clone());
             let answered = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Allow)
@@ -1024,12 +1029,12 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
             };
             if let Some(choice) = answered {
                 reconcile_secret_prompt(app);
-                if choice == ConfirmChoice::AllowAll {
-                    app.push_msg(ChatMessage::System(
-                        "Allow all: extension tool-call confirms are auto-approved for the rest of \
-                         this session (subagents included). Restart the session to re-arm the gate."
-                            .to_string(),
-                    ));
+                if let (ConfirmChoice::AllowAll, Some(scope)) = (choice, scope) {
+                    app.push_msg(ChatMessage::System(format!(
+                        "Allow all from {}: its tool-call confirms are auto-approved for the rest \
+                         of this session (subagents included). Other extensions still ask.",
+                        scope.extensions_label()
+                    )));
                 }
             }
         }

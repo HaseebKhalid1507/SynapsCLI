@@ -136,6 +136,7 @@ fn session_prompt_activates_pane_and_resolution_by_other_dismisses() {
             title: "API key".into(),
             prompt: "paste it".into(),
             raised_at: chrono::Utc::now(),
+            confirm_scope: None,
         },
     )]);
     assert!(h.secret_prompt_active(), "Prompt must activate the pane");
@@ -158,6 +159,7 @@ fn no_confirm_answers_lists_a_confirm_and_never_opens_the_pane() {
             title: title.into(),
             prompt: "bash: rm -rf build".into(),
             raised_at: chrono::Utc::now(),
+            confirm_scope: None,
         })
     };
     let mut h = TestHarness::boot_with_size(100, 30);

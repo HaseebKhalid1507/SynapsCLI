@@ -2033,13 +2033,42 @@ fn scenario_confirm_prompt_renders_two_buttons_deny_focused_by_default() {
 #[test]
 fn scenario_confirm_tool_call_offers_allow_all_button() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let _rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8 — rm -rf build/");
+    let _rx = h.activate_tool_call_confirm(
+        "jev",
+        "bash",
+        "Extension: jev\nTool: bash\n\njev: risk=1.8 — rm -rf build/\n\nAllow this tool call?",
+    );
     let frame = h.snapshot();
+    assert!(frame.contains("Extension: jev"), "source shown before answering:\n{frame}");
+    assert!(frame.contains("Tool: bash"), "tool shown before answering:\n{frame}");
     assert!(frame.contains("[ Allow (y) ]"), "{frame}");
-    assert!(frame.contains("[ Allow all this session (a) ]"), "{frame}");
+    assert!(
+        frame.contains("[ Allow all from jev this session (a) ]"),
+        "button names the extension:\n{frame}"
+    );
     assert!(frame.contains("[ Deny (n) ]"), "{frame}");
+    // The scope is stated BEFORE the answer, not after.
+    let flat: String = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("every later confirm from jev (any tool) is auto-approved"),
+        "scope line:\n{frame}"
+    );
+    assert!(flat.contains("subagents included"), "scope covers subagents:\n{frame}");
+    assert!(flat.contains("Other extensions still ask"), "{frame}");
     assert!(frame.contains("y allow · a allow all · n/esc deny"), "footer:\n{frame}");
     assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
+}
+
+/// A `Confirm tool call` with no host-stamped source cannot be latched, so
+/// "Allow all" is not offered and `a` degrades to a single Allow.
+#[test]
+fn scenario_unattributed_tool_call_confirm_offers_no_allow_all() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
+    let frame = h.snapshot();
+    assert!(!frame.contains("Allow all"), "{frame}");
+    h.key(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()));
 }
 
 #[test]
@@ -2060,7 +2089,7 @@ fn scenario_confirm_prompt_arrow_then_enter_allows() {
 #[test]
 fn scenario_confirm_tool_call_focus_cycles_three_buttons() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
     // Deny → (Right) Allow → (Right) AllowAll → (Right) Deny → (Left) AllowAll
     h.key(KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(h.confirm_focus(), ConfirmChoice::Allow);
@@ -2075,15 +2104,15 @@ fn scenario_confirm_tool_call_focus_cycles_three_buttons() {
     assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
     let frame = h.snapshot();
     assert!(
-        frame.contains("Allow all: extension tool-call confirms are auto-approved"),
-        "system line announces the latch:\n{frame}"
+        frame.contains("Allow all from jev: its tool-call confirms are auto-approved"),
+        "system line announces the scoped latch:\n{frame}"
     );
 }
 
 #[test]
 fn scenario_confirm_tool_call_a_key_answers_always() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
     h.key(KeyCode::Char('a'), KeyModifiers::NONE);
     assert!(!h.secret_prompt_active());
     assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
@@ -2119,7 +2148,7 @@ fn scenario_confirm_prompt_toggle_twice_then_enter_denies() {
 #[test]
 fn scenario_confirm_prompt_typed_password_then_enter_denies() {
     let mut h = TestHarness::boot_with_size(100, 30);
-    let mut rx = h.activate_confirm_prompt(CONFIRM_TOOL_CALL_TITLE, "jev: risk=1.8");
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
     h.type_str("s3cret-pw!");
     assert!(h.secret_prompt_active(), "plain chars never resolve a confirm");
     assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);

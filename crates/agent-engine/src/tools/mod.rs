@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "command-exec")]
 mod bash;
+mod confirm_latch;
 pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
@@ -68,9 +69,11 @@ pub use registry::{
     DeferredToolSplit, DroppedSessionMember, SessionSchemaProjection, ToolRegistry,
 };
 pub use respond::RespondTool;
+pub use confirm_latch::SessionConfirmLatch;
 pub use secret_prompt::SecretPromptQueue;
 pub use secret_prompt::{
-    ConfirmChoice, PromptKind, SecretPromptHandle, SecretPromptRequest, CONFIRM_ANSWER_ALLOW_ALL,
+    ConfirmChoice, ConfirmScope, PromptKind, SecretPromptHandle, SecretPromptRequest,
+    CONFIRM_ANSWER_ALLOW_ALL,
 };
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
@@ -106,10 +109,12 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
-    /// Parent-session extension Confirm latch. Workers share the Arc (including
-    /// live updates), never a snapshot or host-global approval. This grants no
-    /// `activate_tools` authority. None is for contexts without a parent session.
-    pub session_allow_all: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Parent-session extension Confirm latch: the set of extension ids the
+    /// user chose "Allow all" for. Workers share the Arc (including live
+    /// updates and revokes), never a snapshot or host-global approval. This
+    /// grants no `activate_tools` authority. None is for contexts without a
+    /// parent session.
+    pub session_allow_all: Option<Arc<SessionConfirmLatch>>,
     /// Host-owned note storage binding. Runtime contexts always provide the
     /// same binding; `None` is reserved for manually constructed contexts.
     /// A present binding is exclusive: errors never permit legacy fallback.

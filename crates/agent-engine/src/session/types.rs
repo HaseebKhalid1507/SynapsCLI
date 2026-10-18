@@ -442,6 +442,42 @@ impl PromptKind {
     }
 }
 
+/// Who raised an extension tool-call Confirm and what "Allow all" would
+/// cover. Built host-side from the hook chain (`HookBus::emit` stamps the
+/// extension ids; an extension cannot name itself or another extension), so
+/// the dialog can show the exact scope BEFORE the user answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmScope {
+    /// Extension ids whose `Confirm` this prompt resolves; "Allow all"
+    /// latches exactly these.
+    pub extensions: Vec<String>,
+    /// Tool the call targets (display only; the latch is per extension).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+impl ConfirmScope {
+    /// `a` or `a, b`.
+    pub fn extensions_label(&self) -> String {
+        self.extensions.join(", ")
+    }
+
+    /// Text of the "Allow all" button (without the key hint).
+    pub fn allow_all_label(&self) -> String {
+        format!("Allow all from {} this session", self.extensions_label())
+    }
+
+    /// The exact reach of "Allow all", shown before the user answers.
+    pub fn allow_all_scope(&self) -> String {
+        format!(
+            "Allow all: every later confirm from {} (any tool) is auto-approved for this \
+             session, subagents included, until /new. Other extensions \
+             still ask.",
+            self.extensions_label()
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PromptRequest {
     /// Per-session monotonic; actor dedups answers on it.
@@ -450,6 +486,10 @@ pub struct PromptRequest {
     pub title: String,
     pub prompt: String,
     pub raised_at: chrono::DateTime<chrono::Utc>,
+    /// Extension tool-call confirms only: the source extension(s) and tool.
+    /// Absent → "Allow all" is not offered (it could not be scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_scope: Option<ConfirmScope>,
 }
 
 // ── commands, settings, queries ───────────────────────────────────────────────
