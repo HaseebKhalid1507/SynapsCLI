@@ -181,6 +181,9 @@ struct CodexModelItem {
     multi_agent_version: Option<String>,
     #[serde(default)]
     multi_agent_reasoning_effort: Option<String>,
+    /// Hosted `web_search` support. Explicit `false` keeps the opt-in tool off.
+    #[serde(default)]
+    supports_search_tool: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,6 +290,11 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
         .into_iter()
         .filter(|item| codex_model_is_selectable(item.visibility.as_deref(), item.supported_in_api))
         .filter_map(|item| {
+            if let Some(supported) = item.supports_search_tool {
+                crate::runtime::openai::codex_wire::record_live_search_tool_support(
+                    &item.slug, supported,
+                );
+            }
             let reasoning = codex_reasoning_support(&item);
             let mut m = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, item.slug)?;
             m.provider_kind = CatalogProviderKind::OpenAiCodex;
@@ -740,6 +748,20 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
+
+    #[test]
+    fn live_supports_search_tool_gates_hosted_web_search() {
+        use crate::runtime::openai::codex_wire::codex_model_supports_web_search;
+        let body = r#"{"models":[
+            {"slug":"gpt-zz-live-nosearch","visibility":"list","supports_search_tool":false},
+            {"slug":"gpt-zz-live-search","visibility":"list","supports_search_tool":true},
+            {"slug":"gpt-zz-live-silent","visibility":"list"}
+        ]}"#;
+        assert_eq!(parse_codex_catalog_models(body).unwrap().len(), 3);
+        assert!(!codex_model_supports_web_search("gpt-zz-live-nosearch"));
+        assert!(codex_model_supports_web_search("gpt-zz-live-search"));
+        assert!(codex_model_supports_web_search("gpt-zz-live-silent"));
+    }
 
     #[test]
     fn input_modalities_use_only_exact_observed_static_and_fixture_rows() {

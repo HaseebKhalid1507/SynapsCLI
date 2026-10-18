@@ -6,6 +6,7 @@
 
 pub(crate) mod account_routing;
 pub mod catalog;
+pub(crate) mod codex_wire;
 pub(crate) mod extension_route;
 pub mod net;
 pub mod ping;

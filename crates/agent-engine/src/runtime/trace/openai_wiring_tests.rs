@@ -1184,3 +1184,151 @@ async fn astra_ultra_live_smoke() {
         );
     }
 }
+
+// ═══ Codex 4xx diagnosis + hosted web_search visibility (07 I2 / M2, 01 I4) ═══
+
+/// Every POST answers `status` with `body`. Loopback only.
+async fn spawn_codex_body_stub(
+    status: u16,
+    content_type: &'static str,
+    body: String,
+) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = Arc::clone(&hits);
+    let app = Router::new().route(
+        "/codex/responses",
+        axum_post(move || {
+            let hits = Arc::clone(&hits_c);
+            let body = body.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [("content-type", content_type)],
+                    body,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    (serve(app).await, hits)
+}
+
+async fn drive_codex_collect(
+    base_url: &str,
+    trace: &TraceContext,
+) -> (
+    Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    Vec<StreamEvent>,
+) {
+    let cfg = ProviderConfig {
+        base_url: base_url.to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        provider: "openai-codex".to_string(),
+    };
+    let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let result = call_codex_stream_inner(
+        &cfg,
+        &reqwest::Client::new(),
+        &broker,
+        &[],
+        &Some(format!("system {SENTINEL}")),
+        &messages(),
+        &tx,
+        None,
+        None,
+        agent_core::reasoning::ReasoningLevel::Medium,
+        crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+        &CancellationToken::new(),
+        3,
+        trace,
+    )
+    .await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (result, events)
+}
+
+#[tokio::test]
+async fn codex_400_surfaces_sanitized_provider_error_in_message_and_trace() {
+    let cases = [
+        (
+            // Unsupported reasoning effort.
+            r#"{"error":{"message":"Unsupported value: 'reasoning.effort' does not support 'max' with this model.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}"#.to_string(),
+            "[invalid_request_error/unsupported_value, param reasoning.effort]: Unsupported value: 'reasoning.effort' does not support 'max' with this model.",
+            "http_400:invalid_request_error:unsupported_value",
+        ),
+        (
+            // Model not entitled on this ChatGPT seat (FastAPI `detail`).
+            r#"{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}"#.to_string(),
+            ": The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account. — this model isn't available",
+            "http_400",
+        ),
+        (
+            // Hosted tool not allowed for the model.
+            r#"{"error":{"message":"Tool 'web_search' is not supported with gpt-5.6-sol.","type":"invalid_request_error","param":"tools","code":null}}"#.to_string(),
+            "[invalid_request_error, param tools]: Tool 'web_search' is not supported with gpt-5.6-sol.",
+            "http_400:invalid_request_error",
+        ),
+        (
+            // A body that echoes request content: the echo never surfaces.
+            format!(r#"{{"error":{{"message":"Invalid 'input[0].content': '{SENTINEL} hello and a lot more prompt text here'","type":"invalid_request_error","code":"invalid_value"}}}}"#),
+            "[invalid_request_error/invalid_value]: Invalid 'input[0].content': '[redacted]'",
+            "http_400:invalid_request_error:invalid_value",
+        ),
+    ];
+    for (body, expected_detail, expected_code) in cases {
+        let (upstream, hits) = spawn_codex_body_stub(400, "application/json", body).await;
+        let h = harness();
+        let (result, _events) = drive_codex_collect(&upstream, &h.trace).await;
+        let err = result.expect_err("400 must fail").to_string();
+        assert!(
+            err.starts_with("codex request failed: 400 Bad Request"),
+            "{err}"
+        );
+        assert!(
+            err.contains(expected_detail),
+            "missing {expected_detail:?} in {err}"
+        );
+        assert!(!err.contains(SENTINEL), "body leak: {err}");
+        assert!(!err.contains("acct_test"), "account id leak: {err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "400 is not retried");
+        let records = h.sink.records();
+        assert_eq!(records.len(), 1);
+        assert_schema_valid_and_content_free(&records);
+        match &records[0].outcome.terminal {
+            TurnOutcome::ProviderFailed { code, .. } => assert_eq!(code, expected_code),
+            other => panic!("expected ProviderFailed, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_hosted_web_search_call_is_announced_with_query() {
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust reqwest read_timeout\"}}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"done\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+    );
+    let (upstream, _hits) = spawn_codex_body_stub(200, "text/event-stream", sse.to_string()).await;
+    let h = harness();
+    let (result, events) = drive_codex_collect(&upstream, &h.trace).await;
+    result.expect("stream completes");
+    let notices: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Session(crate::SessionEvent::Notice(t)) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        vec!["🔎 Codex web_search (search, completed): rust reqwest read_timeout"],
+        "exactly one notice, on the completed item"
+    );
+}

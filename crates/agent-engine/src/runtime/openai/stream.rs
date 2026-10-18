@@ -207,6 +207,27 @@ async fn send_with_retries(
                         }
                         Codex429::Generic => {}
                     }
+                } else if quota_probe && !retryable && status.is_client_error() {
+                    // Codex only: a terminal 4xx is undiagnosable without its
+                    // body. Read a bounded slice and keep only sanitized
+                    // identifiers plus a capped, redacted message (codex_wire).
+                    let body = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            trace_attempt.finish_canceled(Some(status.as_u16()), None);
+                            return Err("request canceled".into());
+                        }
+                        body = read_body_for_classification(resp, super::codex_wire::CODEX_ERROR_BODY_CAP) => body,
+                    };
+                    let detail = super::codex_wire::CodexHttpErrorDetail::from_body(&body);
+                    let message = detail.user_message(label, status);
+                    tracing::warn!(error = %message, "{label} request rejected (sanitized provider detail)");
+                    trace_attempt.finish_failed(
+                        &detail.trace_code(status.as_u16()),
+                        Some(status.as_u16()),
+                        trace_rid,
+                    );
+                    return Err(message.into());
                 } else {
                     // Privacy (spec §5.1): the response body is provider-controlled
                     // and may echo the full request (prompts, system text, tool
@@ -789,13 +810,20 @@ pub(crate) async fn call_codex_stream_with_router(
     let mut account_id = codex_account_id_for(&pinned)?;
 
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
-    // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH). OpenAI runs
-    // the search server-side; nothing executes locally, so the local tool
-    // guard / command-exec gate are not involved. Off unless configured.
+    // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH, read from THIS
+    // process's env — the daemon's when attached). Runs server-side, so hooks
+    // can't gate it; gated by role and model, and announced (codex_wire).
     let mut tools = tools;
     if let Some(web_search) =
-        codex_web_search_tool(std::env::var(CODEX_WEB_SEARCH_ENV).ok().as_deref())
+        super::codex_wire::codex_web_search_for_request(&cfg.model, codex_request_role, |k| {
+            std::env::var(k).ok()
+        })
     {
+        super::codex_wire::announce_web_search_enabled(
+            trace.session_id().as_str(),
+            &web_search,
+            tx,
+        );
         tools.push(web_search);
     }
     // Codex already receives the effective system prompt in `instructions`.
@@ -1206,8 +1234,8 @@ pub(crate) const CODEX_WEB_SEARCH_ENV: &str = "SYNAPS_CODEX_WEB_SEARCH";
 /// - anything else (unset, `off`, typos) → no hosted tool.
 ///
 /// The hosted tool's `web_search_call` output items are not function calls:
-/// the Responses stream parser already ignores them (only `function_call`
-/// items become tool uses), and the model's answer text carries the cited URLs.
+/// they never become tool uses; each completed one is announced as a notice
+/// with its query (`codex_wire::announce_web_search_call`).
 pub(crate) fn codex_web_search_tool(value: Option<&str>) -> Option<Value> {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("live" | "on" | "true" | "1" | "yes") => Some(json!({ "type": "web_search" })),
@@ -1536,7 +1564,7 @@ fn parse_tool_arguments(raw: &str) -> Value {
 /// uppercase, whitespace, or symbols outside the identifier charset — or
 /// longer than 64 bytes — is replaced so free-text (which can echo request
 /// content) and secret-shaped tokens can never leak into the log stream.
-fn sanitize_error_identifier(raw: Option<&str>) -> &str {
+pub(crate) fn sanitize_error_identifier(raw: Option<&str>) -> &str {
     match raw {
         None => "absent",
         Some(s) => {
@@ -1859,6 +1887,7 @@ impl CodexSseDecoder {
                         .unwrap_or(0) as usize;
                     self.observe_message_item(idx, item);
                     self.backfill_message_suffix(idx, item, tx, text_acc);
+                    super::codex_wire::announce_web_search_call(self.provider_label, item, tx);
                     self.complete_tool_from_item(idx, item, tx);
                 }
             }
