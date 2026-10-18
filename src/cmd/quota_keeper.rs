@@ -2696,14 +2696,15 @@ mod tests {
             qk::AttemptOutcome::Ambiguous { .. }
         ));
         server.await.unwrap();
-        // Nothing listening → connect failure → NotSent (refundable).
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}/codex/responses", listener.local_addr().unwrap());
-        drop(listener);
+        // Nothing listening → connect failure → NotSent (refundable). Port 0:
+        // nothing can ever listen there, so connect() fails every time. A
+        // bound-then-released port could be rebound by another process,
+        // which turns the outcome into Ambiguous.
+        let dead = "http://127.0.0.1:0/codex/responses".to_string();
         let act = CodexActivator::new(h.broker.clone(), dead).unwrap();
         assert!(matches!(
             act.activate(&cred, &seat, "gpt-5.4-mini", Duration::from_secs(2)).await,
-            qk::AttemptOutcome::NotSent { .. }
+            qk::AttemptOutcome::NotSent { stage: qk::NotSentStage::Connect, .. }
         ));
         // Unknown account → token vend fails → NotSent, no request.
         let ghost = parse_account_arg("openai-codex@ghost").unwrap();

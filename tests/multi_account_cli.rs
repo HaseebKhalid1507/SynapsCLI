@@ -261,38 +261,53 @@ impl Drop for BrokerProcess {
 #[tokio::test]
 async fn codex_only_broker_serves_distinct_accounts_and_authenticates_metadata() {
     let sandbox = Sandbox::new();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let child = sandbox
-        .command()
-        .env("SYNAPS_BROKER_TOKEN", "synthetic-machine-auth")
-        .args(["auth-broker", "--bind", &addr.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut process = BrokerProcess(child);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    let base = format!("http://{addr}");
-    let mut ready = false;
-    for _ in 0..100 {
-        assert!(
-            process.0.try_wait().unwrap().is_none(),
-            "broker exited before ready"
-        );
-        if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
-            if r.status().is_success() {
-                ready = true;
-                break;
+    // The port is found by binding :0 and releasing it, so another process
+    // can take it before the broker binds (the broker then exits on
+    // EADDRINUSE). Retry on a fresh port instead of failing. A fresh debug
+    // binary on a loaded machine can take a while to come up: 30 s per try.
+    let mut attempt = 0;
+    let (_broker, base) = loop {
+        attempt += 1;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let child = sandbox
+            .command()
+            .env("SYNAPS_BROKER_TOKEN", "synthetic-machine-auth")
+            .args(["auth-broker", "--bind", &addr.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut process = BrokerProcess(child);
+        let base = format!("http://{addr}");
+        let mut ready = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if process.0.try_wait().unwrap().is_some() {
+                break; // lost the port race (or failed): maybe retry
             }
+            if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
+                if r.status().is_success() {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(ready, "Codex/Kimi-only broker did not become healthy");
+        if ready {
+            break (process, base);
+        }
+        let exited = process.0.try_wait().unwrap().is_some();
+        assert!(
+            exited && attempt < 3,
+            "Codex/Kimi-only broker did not become healthy (attempt {attempt}, exited: {exited})"
+        );
+    };
     let unauth = client
         .get(format!("{base}/capabilities"))
         .send()
