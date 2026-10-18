@@ -18,6 +18,11 @@ pub(super) struct McpConnection {
 }
 
 impl McpConnection {
+    /// The server process id while it runs.
+    pub(super) fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Spawn and initialize an MCP server.
     pub(super) async fn start(
         server: &str,

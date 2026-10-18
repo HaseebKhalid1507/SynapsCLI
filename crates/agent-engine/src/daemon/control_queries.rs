@@ -45,6 +45,9 @@ pub async fn children_reply(
     }
     children::maybe_sweep();
     let mut listing = children::list(session_id.as_ref().map(SessionId::as_str), sid);
+    // Host processes leave the ledger at the next sweep; never list one
+    // that is already gone, a zombie, or whose pid names another process.
+    listing.host.retain(|h| children::read_stat(h.child.pid).is_some_and(|s| s.is_live() && s.start_ticks == h.child.start_ticks));
     if members && !listing.sessions.is_empty() {
         if let Ok(scan) = tokio::task::spawn_blocking(children::scan_proc).await {
             children::attach_members(&mut listing, &scan);
@@ -164,5 +167,33 @@ mod tests {
         assert_eq!(b.seen.lock().unwrap().len(), 1);
         capability_cache::replace_provider("muse", &[]);
         reset_muse_warmup_backoff();
+    }
+
+    /// An extension process is in the host list from its spawn, labelled
+    /// with its id, and leaves the reply as soon as it is gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_host_list_names_a_live_extension_process_only() {
+        use crate::extensions::runtime::ExtensionHandler;
+        const ID: &str = "host-list-fixture";
+        let host_of = |frame: DaemonFrame| match frame {
+            DaemonFrame::ChildList(reply) => reply.host.into_iter().filter(|h| h.owner_id == ID).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        let ext = crate::extensions::runtime::process::ProcessExtension::spawn(ID, "/bin/cat", &[]).await.expect("spawn /bin/cat");
+        let listed = host_of(children_reply(Some(1), None, None, false).await);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].owner_kind, children::HostOwnerKind::Extension);
+        let pid = listed[0].child.pid;
+        assert_eq!(children::identify(pid).as_ref(), Some(&listed[0].child), "the spawned process itself");
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(cmdline.starts_with(b"/bin/cat"), "{cmdline:?}");
+
+        ext.shutdown().await;
+        let t0 = std::time::Instant::now();
+        while !host_of(children_reply(Some(2), None, None, false).await).is_empty() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "still listed after shutdown");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }
