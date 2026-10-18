@@ -3225,7 +3225,41 @@ pub struct RemoteBroker {
     account_policy: Option<AccountPolicy>,
 }
 
+/// A 404 from a route the broker does not have: 0.10.2's axum router
+/// answers an empty, untyped body, while a current broker's errors are JSON.
+/// Only emptiness and the content type are inspected, never the content.
+async fn route_missing(resp: reqwest::Response) -> bool {
+    let json = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    !json
+        && read_body_capped(resp, 1024)
+            .await
+            .is_ok_and(|body| body.trim().is_empty())
+}
+
 impl RemoteBroker {
+    /// True if the broker has no `/usage/snapshot` (0.10.2 and older). The
+    /// probe sends an empty account, which a current broker rejects with a
+    /// 400 before touching any credential.
+    async fn predates_usage_snapshot(&self) -> Result<bool, BrokerError> {
+        let resp = self
+            .http
+            .get(format!("{}/usage/snapshot", self.endpoint))
+            .query(&[("provider", "anthropic"), ("account", "")])
+            .bearer_auth(&self.machine_token)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            404 => Ok(route_missing(resp).await),
+            _ => Ok(false),
+        }
+    }
+
     pub fn new(
         endpoint: impl Into<String>,
         machine_token: impl Into<String>,
@@ -3472,11 +3506,17 @@ impl CredentialBroker for RemoteBroker {
 
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
         let caps = self.capabilities().await?;
-        Ok(caps
+        let accounts = caps
             .into_iter()
             .find(|c| c.key == provider.as_str())
             .map(|c| c.accounts)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        // A 0.10.2 broker lists no accounts at all; don't report that as
+        // "nothing logged in".
+        if accounts.is_empty() && self.predates_usage_snapshot().await? {
+            return Err(BrokerError::BrokerTooOld("account listing".into()));
+        }
+        Ok(accounts)
     }
 
     async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
@@ -3496,13 +3536,7 @@ impl CredentialBroker for RemoteBroker {
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
             404 => {
-                // A current broker's 404 carries a JSON error; a broker that
-                // predates the route (0.10.2) answers an empty one. Only
-                // emptiness is inspected, never the content.
-                let route_missing = read_body_capped(resp, 1024)
-                    .await
-                    .is_ok_and(|body| body.trim().is_empty());
-                if !route_missing {
+                if !route_missing(resp).await {
                     return Err(BrokerError::UnknownAccount {
                         provider: cred.provider.as_str().to_string(),
                         label: cred.account.label_str().to_string(),
