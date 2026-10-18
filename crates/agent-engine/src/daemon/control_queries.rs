@@ -25,8 +25,11 @@ pub fn daemon_features() -> Vec<String> {
     features
 }
 
-/// Answer `Children`. With `members`, the `/proc` walk runs on a blocking
-/// thread. Any query may also start a lazy sweep (at most once per minute).
+/// Answer `Children`. Each listed running leader is checked now, on a
+/// blocking thread: one found gone, reused or a zombie is ended in the
+/// ledger before the reply says anything. With `members`, one shared
+/// `/proc` walk serves concurrent queries. Any query may also start a lazy
+/// sweep (at most once per minute).
 pub async fn children_reply(
     id: Option<u64>,
     session_id: Option<SessionId>,
@@ -44,15 +47,15 @@ pub async fn children_reply(
         });
     }
     children::maybe_sweep();
-    let mut listing = children::list(session_id.as_ref().map(SessionId::as_str), sid);
-    // Host processes leave the ledger at the next sweep; never list one
-    // that is already gone, a zombie, or whose pid names another process.
-    listing.host.retain(|h| children::read_stat(h.child.pid).is_some_and(|s| s.is_live() && s.start_ticks == h.child.start_ticks));
-    if members && !listing.sessions.is_empty() {
-        if let Ok(scan) = tokio::task::spawn_blocking(children::scan_proc).await {
-            children::attach_members(&mut listing, &scan);
-        }
-    }
+    let scan = if members { Some(children::shared_scan().await) } else { None };
+    let session = session_id.as_ref().map(|s| s.as_str().to_string());
+    let checked = tokio::task::spawn_blocking(move || {
+        children::list_checked(session.as_deref(), sid, scan.as_ref().map(|s| s.as_slice()))
+    })
+    .await;
+    // The check can only fail if the runtime is shutting down; then the
+    // reply holds nothing it could not vouch for.
+    let listing = checked.unwrap_or_default();
     DaemonFrame::ChildList(ChildListReply {
         id,
         supported: true,
@@ -199,4 +202,5 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
+
 }

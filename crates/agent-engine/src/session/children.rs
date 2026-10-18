@@ -11,28 +11,46 @@
 //!   it. Extension and MCP stdio processes go on the host list (labels only).
 //! - **The ledger is the authority** for the daemon's `children` control
 //!   frame. The `tool_child` event is sent only after the record is in the
-//!   ledger, so a client that queries on receipt of the event finds it.
+//!   ledger, so a client that queries on receipt of the event finds it
+//!   unless the record was refused at a cap (the event is still sent) or a
+//!   short child was swept before the query. Events are for display; the
+//!   query is the authority.
+//! - **Fresh check.** Every `children` reply reads each listed running
+//!   leader's stat now (on the blocking pool). A leader found gone, reused
+//!   or a zombie turns its record ended in the ledger, under the lock and
+//!   only if it is still that process, before the reply says anything. A
+//!   record never turns back to running. With a sid filter only the
+//!   matching records are read.
 //! - **Bounds.** At most [`MAX_PER_SESSION`] records per session and
-//!   [`MAX_TOTAL`] in all. Over a cap the oldest *ended* record goes first;
-//!   a running leader is never dropped. When only running records remain,
-//!   the new record is not kept. Either way the session reads
-//!   `truncated: true`.
+//!   [`MAX_TOTAL`] in all, for live spawns and restored records alike (one
+//!   bounded insertion). Over a cap the oldest *ended* record goes first; a
+//!   running leader is never dropped. When only running records remain, the
+//!   new record is refused and counted (`refused_records`). Either way the
+//!   session reads `truncated: true`, also when it has no record left (then
+//!   it lists as an empty group until the next sweep, at most
+//!   [`MAX_TRUNCATED_EMPTY`] such sessions). `ledger_full` says the total
+//!   cap is reached with no ended record left to evict. Members are listed
+//!   up to [`MAX_MEMBERS_PER_SID`] per sid and [`MAX_MEMBERS_PER_REPLY`] per
+//!   reply; a group with a list cut short reads truncated.
 //! - **States.** A record is `running` while its leader (the spawned
 //!   process itself) is alive with the same start ticks. It turns `ended`
-//!   when the tool reaps the leader (`tool_child_ended`), or when a sweep or
-//!   a restore finds the leader's pid gone, reused, or a zombie (stat state
-//!   `Z`/`X`: exited but never reaped; exit code and signal unknown). Other
-//!   processes left in its sid only keep an ended record; nothing turns a
-//!   record back to running.
+//!   when the tool reaps the leader (`tool_child_ended`), or when a sweep, a
+//!   reply's fresh check or a restore finds the leader's pid gone, reused,
+//!   or a zombie (stat state `Z`/`X`: exited but never reaped; exit code and
+//!   signal unknown until the tool reaps it). Other processes left in its
+//!   sid only keep an ended record; nothing turns a record back to running.
 //! - **Retention.** A record is kept while its leader runs. After it ends,
 //!   it is kept until a sweep finds no live (non-zombie) process left in its
-//!   session id (sid). A sweep is one `/proc` walk, run lazily on a spawn or a query at
-//!   most once per [`SWEEP_EVERY`], on a blocking thread. Records outlive
-//!   their daemon session.
+//!   session id (sid). A sweep is one `/proc` walk, run lazily on a spawn or
+//!   a query at most once per [`SWEEP_EVERY`], on a blocking thread. It
+//!   judges only records (and host entries) inserted before it began: each
+//!   carries an insert sequence, and a record added during or after the walk
+//!   is never ended or dropped by it. Records outlive their daemon session.
 //! - **Reload.** [`snapshot_for_reload`] / [`restore_after_reload`] carry the
 //!   records across the daemon's exec. On restore a record is dropped when
 //!   its boot id differs, or when its pid is alive with other start ticks
-//!   (reused); a record whose pid is gone or a zombie is kept as ended.
+//!   (reused); a record whose pid is gone or a zombie is kept as ended. Each
+//!   goes through the same bounded insertion as a live spawn.
 //!
 //! Linux only: elsewhere nothing is recorded and lists say
 //! `supported: false`.
@@ -245,6 +263,48 @@ pub struct HostChild {
 pub struct ChildListing {
     pub sessions: Vec<SessionChildren>,
     pub host: Vec<HostChild>,
+    /// Records refused at a cap since this daemon image started (live
+    /// inserts and restore).
+    pub refused_records: u64,
+    /// The total cap is reached and no ended record is left to evict: the
+    /// next spawn's record will be refused.
+    pub ledger_full: bool,
+}
+
+/// Sessions kept as `truncated` with no record left (a session refused its
+/// first record, or one whose records were all evicted). They expire at the
+/// next sweep; past this many, the oldest go first.
+pub const MAX_TRUNCATED_EMPTY: usize = 256;
+/// Members listed per sid in one reply; a sid with more reads truncated.
+pub const MAX_MEMBERS_PER_SID: usize = 256;
+/// Members listed in all in one reply; past it, entries read truncated.
+pub const MAX_MEMBERS_PER_REPLY: usize = 4096;
+
+/// A kept record and its insert sequence (this image only; not carried).
+#[derive(Debug, Clone)]
+struct Kept {
+    seq: u64,
+    record: ChildRecord,
+}
+
+impl std::ops::Deref for Kept {
+    type Target = ChildRecord;
+    fn deref(&self) -> &ChildRecord {
+        &self.record
+    }
+}
+
+impl std::ops::DerefMut for Kept {
+    fn deref_mut(&mut self) -> &mut ChildRecord {
+        &mut self.record
+    }
+}
+
+/// A host-list entry and its insert sequence.
+#[derive(Debug, Clone)]
+struct KeptHost {
+    seq: u64,
+    host: HostChild,
 }
 
 /// The ledger itself. The process-wide instance sits behind [`ledger`];
@@ -252,16 +312,29 @@ pub struct ChildListing {
 #[derive(Debug, Default)]
 pub struct Ledger {
     /// Oldest first, all sessions.
-    records: VecDeque<ChildRecord>,
-    /// Sessions that lost a record to a cap.
-    truncated: HashSet<String>,
-    host: Vec<HostChild>,
+    records: VecDeque<Kept>,
+    /// Sessions that lost a record to a cap, with the sequence at the time.
+    /// Bounded: a session with records keeps its entry while it has any;
+    /// one with none expires at the next sweep (see [`MAX_TRUNCATED_EMPTY`]).
+    truncated: HashMap<String, u64>,
+    host: Vec<KeptHost>,
+    /// Next insert sequence. A sweep applies its scan only to what was
+    /// inserted before the scan began.
+    next_seq: u64,
+    /// Records refused at a cap since this image started.
+    refused: u64,
     last_sweep: Option<Instant>,
     sweeping: bool,
 }
 
 fn same_process(a: &ChildIdentity, b: &ChildIdentity) -> bool {
     a.pid == b.pid && a.start_ticks == b.start_ticks && a.boot_id == b.boot_id
+}
+
+/// The leader of `child` runs: its pid is present with the same start
+/// ticks and it is not a zombie.
+fn leader_runs(child: &ChildIdentity, stat: Option<StatFields>) -> bool {
+    stat.is_some_and(|s| s.is_live() && s.start_ticks == child.start_ticks)
 }
 
 impl Ledger {
@@ -277,8 +350,38 @@ impl Ledger {
         self.records.is_empty()
     }
 
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        seq
+    }
+
     fn session_len(&self, session_id: &str) -> usize {
         self.records.iter().filter(|r| r.session_id == session_id).count()
+    }
+
+    /// Mark `session_id` truncated, keeping the set bounded: past
+    /// [`MAX_TRUNCATED_EMPTY`] sessions with no record, the oldest of those
+    /// goes.
+    fn mark_truncated(&mut self, session_id: &str) {
+        let seq = self.next_seq();
+        self.truncated.insert(session_id.to_string(), seq);
+        if self.truncated.len() <= MAX_TRUNCATED_EMPTY {
+            return;
+        }
+        let with_records: HashSet<&str> = self.records.iter().map(|r| r.session_id.as_str()).collect();
+        let mut empty: Vec<(u64, String)> = self
+            .truncated
+            .iter()
+            .filter(|(s, _)| !with_records.contains(s.as_str()))
+            .map(|(s, seq)| (*seq, s.clone()))
+            .collect();
+        if empty.len() > MAX_TRUNCATED_EMPTY {
+            empty.sort_unstable();
+            for (_, gone) in empty.iter().take(empty.len() - MAX_TRUNCATED_EMPTY) {
+                self.truncated.remove(gone);
+            }
+        }
     }
 
     /// Drop the oldest ended record (of `session_id` when given). The session
@@ -289,25 +392,34 @@ impl Ledger {
         });
         match found.and_then(|i| self.records.remove(i)) {
             Some(gone) => {
-                self.truncated.insert(gone.session_id);
+                self.mark_truncated(&gone.record.session_id);
                 true
             }
             None => false,
         }
     }
 
+    /// The one bounded way in, for live inserts and restore alike: over a
+    /// cap the oldest ended record goes first; with none to evict the
+    /// arrival is refused, counted, and its session reads truncated.
+    fn admit(&mut self, record: ChildRecord) -> bool {
+        let fits_session = self.session_len(&record.session_id) < MAX_PER_SESSION
+            || self.evict_oldest_ended(Some(&record.session_id));
+        let fits_total = fits_session && (self.records.len() < MAX_TOTAL || self.evict_oldest_ended(None));
+        if !fits_total {
+            self.refused = self.refused.saturating_add(1);
+            self.mark_truncated(&record.session_id);
+            return false;
+        }
+        let seq = self.next_seq();
+        self.records.push_back(Kept { seq, record });
+        true
+    }
+
     /// Record a spawn. False when the caps left no room (only running
     /// records remain); the session then reads truncated.
     pub fn insert(&mut self, session_id: &str, spawn: ChildSpawn) -> bool {
-        if self.session_len(session_id) >= MAX_PER_SESSION && !self.evict_oldest_ended(Some(session_id)) {
-            self.truncated.insert(session_id.to_string());
-            return false;
-        }
-        if self.records.len() >= MAX_TOTAL && !self.evict_oldest_ended(None) {
-            self.truncated.insert(session_id.to_string());
-            return false;
-        }
-        self.records.push_back(ChildRecord {
+        self.admit(ChildRecord {
             session_id: session_id.to_string(),
             tool_id: spawn.tool_id,
             tool_name: spawn.tool_name,
@@ -317,8 +429,7 @@ impl Ledger {
             state: ChildState::Running,
             exit_code: None,
             signal: None,
-        });
-        true
+        })
     }
 
     /// Mark the record of `child` ended. False when there is none.
@@ -334,16 +445,33 @@ impl Ledger {
         }
     }
 
-    /// Apply one `/proc` scan: a running record whose leader is gone, reused
-    /// or a zombie becomes ended, and an ended record with no live process
-    /// left in its sid is dropped. Zombies count as gone throughout.
-    pub fn apply_sweep(&mut self, scan: &[(u32, StatFields)]) {
+    /// A fresh check saw the leader of `child` gone, reused or a zombie: its
+    /// record, if still that process and running, turns ended (code and
+    /// signal unknown). Never the other way. Returns the record's state now.
+    fn observe_gone(&mut self, child: &ChildIdentity) -> Option<(ChildState, Option<i32>, Option<i32>)> {
+        let record = self.records.iter_mut().find(|r| same_process(&r.child, child))?;
+        if record.state == ChildState::Running {
+            record.state = ChildState::Ended;
+            record.exit_code = None;
+            record.signal = None;
+        }
+        Some((record.state, record.exit_code, record.signal))
+    }
+
+    /// Apply one `/proc` scan, begun when the next insert sequence was
+    /// `watermark`: only records (and host entries) inserted before that are
+    /// judged, so a child spawned during or after the walk is never ended or
+    /// dropped by a scan that could not see it. A running record whose
+    /// leader is gone, reused or a zombie becomes ended, and an ended record
+    /// with no live process left in its sid is dropped. Zombies count as gone
+    /// throughout. Sessions truncated with no record left expire.
+    pub fn apply_sweep(&mut self, scan: &[(u32, StatFields)], watermark: u64) {
         let live_sids: HashSet<u32> = scan.iter().filter(|(_, s)| s.is_live()).map(|(_, s)| s.sid).collect();
         let live: HashMap<u32, u64> =
             scan.iter().filter(|(_, s)| s.is_live()).map(|(pid, s)| (*pid, s.start_ticks)).collect();
         // Every pid in the scan, zombies included: for the reuse check.
         let present: HashMap<u32, u64> = scan.iter().map(|(pid, s)| (*pid, s.start_ticks)).collect();
-        for record in self.records.iter_mut() {
+        for record in self.records.iter_mut().filter(|r| r.seq < watermark) {
             if record.state == ChildState::Running && live.get(&record.child.pid) != Some(&record.child.start_ticks) {
                 record.state = ChildState::Ended;
             }
@@ -356,15 +484,21 @@ impl Ledger {
                 && present.get(&r.child.pid).is_some_and(|t| *t != r.child.start_ticks);
             !leader_reused && live_sids.contains(&r.child.sid)
         };
-        self.records.retain(|r| r.state == ChildState::Running || session_alive(r));
-        self.host.retain(|h| live.get(&h.child.pid) == Some(&h.child.start_ticks));
+        self.records
+            .retain(|r| r.seq >= watermark || r.state == ChildState::Running || session_alive(&r.record));
+        self.host
+            .retain(|h| h.seq >= watermark || live.get(&h.host.child.pid) == Some(&h.host.child.start_ticks));
+        let with_records: HashSet<&str> = self.records.iter().map(|r| r.session_id.as_str()).collect();
+        self.truncated.retain(|s, seq| *seq >= watermark || with_records.contains(s.as_str()));
     }
 
     /// The records of `session_id` (all when `None`), filtered to `sid` when
     /// given, grouped by session in order of first record, plus the host
-    /// list under the same sid filter.
+    /// list under the same sid filter. Without a sid filter, a session
+    /// truncated with no record left is a group with no children.
     pub fn list(&self, session_id: Option<&str>, sid: Option<u32>) -> ChildListing {
         let mut sessions: Vec<SessionChildren> = Vec::new();
+        let mut index: HashMap<&str, usize> = HashMap::new();
         for record in &self.records {
             if session_id.is_some_and(|s| s != record.session_id) || sid.is_some_and(|s| s != record.child.sid) {
                 continue;
@@ -380,45 +514,69 @@ impl Ledger {
                 signal: record.signal,
                 members: None,
             };
-            match sessions.iter_mut().find(|s| s.session_id == record.session_id) {
-                Some(group) => group.children.push(entry),
-                None => sessions.push(SessionChildren {
-                    session_id: record.session_id.clone(),
-                    truncated: self.truncated.contains(&record.session_id),
-                    children: vec![entry],
-                }),
+            match index.get(record.session_id.as_str()) {
+                Some(&at) => sessions[at].children.push(entry),
+                None => {
+                    index.insert(record.session_id.as_str(), sessions.len());
+                    sessions.push(SessionChildren {
+                        session_id: record.session_id.clone(),
+                        truncated: self.truncated.contains_key(&record.session_id),
+                        children: vec![entry],
+                    });
+                }
+            }
+        }
+        if sid.is_none() {
+            let mut empty: Vec<(u64, &String)> = self
+                .truncated
+                .iter()
+                // With no sid filter every session with records is in `index`.
+                .filter(|(s, _)| !index.contains_key(s.as_str()) && session_id.map_or(true, |want| want == s.as_str()))
+                .map(|(s, seq)| (*seq, s))
+                .collect();
+            empty.sort_unstable();
+            for (_, s) in empty {
+                sessions.push(SessionChildren { session_id: s.clone(), truncated: true, children: Vec::new() });
             }
         }
         let host = if session_id.is_some() {
             Vec::new()
         } else {
-            self.host.iter().filter(|h| sid.map_or(true, |s| s == h.child.sid)).cloned().collect()
+            self.host.iter().filter(|h| sid.map_or(true, |s| s == h.host.child.sid)).map(|h| h.host.clone()).collect()
         };
-        ChildListing { sessions, host }
+        ChildListing { sessions, host, refused_records: self.refused, ledger_full: self.full() }
+    }
+
+    /// The total cap is reached and no ended record is left to evict.
+    fn full(&self) -> bool {
+        self.records.len() >= MAX_TOTAL && !self.records.iter().any(|r| r.state == ChildState::Ended)
     }
 
     /// Add a host-wide process (bounded; the oldest goes first).
     pub fn add_host(&mut self, owner_kind: HostOwnerKind, owner_id: &str, child: ChildIdentity) {
-        self.host.retain(|h| !same_process(&h.child, &child));
+        self.host.retain(|h| !same_process(&h.host.child, &child));
         if self.host.len() >= MAX_HOST {
             self.host.remove(0);
         }
-        self.host.push(HostChild { owner_kind, owner_id: owner_id.to_string(), child });
+        let seq = self.next_seq();
+        self.host.push(KeptHost { seq, host: HostChild { owner_kind, owner_id: owner_id.to_string(), child } });
     }
 
     /// Remove a host-wide process.
     pub fn remove_host(&mut self, child: &ChildIdentity) {
-        self.host.retain(|h| !same_process(&h.child, child));
+        self.host.retain(|h| !same_process(&h.host.child, child));
     }
 
     /// The records to carry across a reload (already within the caps).
     pub fn snapshot(&self) -> Vec<ChildRecord> {
-        self.records.iter().cloned().collect()
+        self.records.iter().map(|r| r.record.clone()).collect()
     }
 
     /// Restore carried records: drop those from another boot or whose pid is
     /// alive with other start ticks (reused); keep the rest, ended when the
-    /// pid is gone; then apply the caps, oldest ended first.
+    /// pid is gone or a zombie. Each goes through the same bounded insertion
+    /// as a live spawn, oldest first: over a cap the oldest ended goes, and
+    /// with none to evict the arrival is refused and counted.
     pub fn restore(
         &mut self,
         carried: Vec<ChildRecord>,
@@ -439,38 +597,23 @@ impl Ledger {
             if self.records.iter().any(|r| same_process(&r.child, &record.child)) {
                 continue;
             }
-            self.records.push_back(record);
+            self.admit(record);
         }
-        self.enforce_caps();
     }
 
-    fn enforce_caps(&mut self) {
-        let mut per_session: HashMap<String, usize> = HashMap::new();
-        for record in &self.records {
-            *per_session.entry(record.session_id.clone()).or_default() += 1;
-        }
-        for (session, count) in per_session {
-            for _ in MAX_PER_SESSION..count {
-                if !self.evict_oldest_ended(Some(&session)) {
-                    break;
-                }
-            }
-        }
-        while self.records.len() > MAX_TOTAL && self.evict_oldest_ended(None) {}
-    }
-
-    /// Whether a sweep is due now (and claim it).
-    fn claim_sweep(&mut self, now: Instant) -> bool {
+    /// Whether a sweep is due now; when it is, claim it and return the
+    /// watermark its scan applies to (the next insert sequence).
+    fn claim_sweep(&mut self, now: Instant) -> Option<u64> {
         if self.sweeping || self.last_sweep.is_some_and(|t| now.duration_since(t) < SWEEP_EVERY) {
-            return false;
+            return None;
         }
         self.sweeping = true;
-        true
+        Some(self.next_seq)
     }
 
-    fn finish_sweep(&mut self, scan: Option<&[(u32, StatFields)]>, now: Instant) {
+    fn finish_sweep(&mut self, scan: Option<&[(u32, StatFields)]>, watermark: u64, now: Instant) {
         if let Some(scan) = scan {
-            self.apply_sweep(scan);
+            self.apply_sweep(scan, watermark);
         }
         self.sweeping = false;
         self.last_sweep = Some(now);
@@ -495,16 +638,54 @@ pub fn scan_proc() -> Vec<(u32, StatFields)> {
 }
 
 /// Fill `members` for every entry: the live (non-zombie) processes in its
-/// sid.
+/// sid, from one walk. Only the listed sids are expanded, each at most
+/// [`MAX_MEMBERS_PER_SID`], and at most [`MAX_MEMBERS_PER_REPLY`] in all; a
+/// group with a list cut short reads truncated.
 pub fn attach_members(listing: &mut ChildListing, scan: &[(u32, StatFields)]) {
-    let mut by_sid: HashMap<u32, Vec<ChildMember>> = HashMap::new();
-    for (pid, stat) in scan.iter().filter(|(_, s)| s.is_live()) {
-        by_sid.entry(stat.sid).or_default().push(ChildMember { pid: *pid, start_ticks: stat.start_ticks });
+    let wanted: HashSet<u32> = listing.sessions.iter().flat_map(|g| g.children.iter().map(|c| c.child.sid)).collect();
+    let mut by_sid: HashMap<u32, (Vec<ChildMember>, bool)> = HashMap::new();
+    for (pid, stat) in scan.iter().filter(|(_, s)| s.is_live() && wanted.contains(&s.sid)) {
+        let (members, cut) = by_sid.entry(stat.sid).or_default();
+        if members.len() < MAX_MEMBERS_PER_SID {
+            members.push(ChildMember { pid: *pid, start_ticks: stat.start_ticks });
+        } else {
+            *cut = true;
+        }
     }
+    let mut budget = MAX_MEMBERS_PER_REPLY;
     for group in &mut listing.sessions {
         for entry in &mut group.children {
-            entry.members = Some(by_sid.get(&entry.child.sid).cloned().unwrap_or_default());
+            let (members, cut) = by_sid.get(&entry.child.sid).map_or((&[][..], false), |(m, cut)| (m.as_slice(), *cut));
+            let take = members.len().min(budget);
+            budget -= take;
+            entry.members = Some(members[..take].to_vec());
+            if cut || take < members.len() {
+                group.truncated = true;
+            }
         }
+    }
+}
+
+/// Check each running entry's leader now (`stat_of` reads it fresh): when
+/// it is gone, reused or a zombie, its record turns ended in `ledger` (only
+/// if it is still that process and running), and the entry shows the record
+/// as it then is. Never ended to running.
+fn validate_leaders_in(ledger: &Mutex<Ledger>, listing: &mut ChildListing, stat_of: impl Fn(u32) -> Option<StatFields>) {
+    let mut gone: Vec<&mut ChildEntry> = listing
+        .sessions
+        .iter_mut()
+        .flat_map(|g| g.children.iter_mut())
+        .filter(|e| e.state == ChildState::Running && !leader_runs(&e.child, stat_of(e.child.pid)))
+        .collect();
+    if gone.is_empty() {
+        return;
+    }
+    let mut ledger = ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for entry in gone.iter_mut() {
+        let (state, exit_code, signal) = ledger.observe_gone(&entry.child).unwrap_or((ChildState::Ended, None, None));
+        entry.state = state;
+        entry.exit_code = exit_code;
+        entry.signal = signal;
     }
 }
 
@@ -525,12 +706,12 @@ pub fn maybe_sweep() {
     let Ok(rt) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    if !lock().claim_sweep(Instant::now()) {
+    let Some(watermark) = lock().claim_sweep(Instant::now()) else {
         return;
-    }
-    rt.spawn_blocking(|| {
+    };
+    rt.spawn_blocking(move || {
         let scan = scan_proc();
-        lock().finish_sweep(Some(&scan), Instant::now());
+        lock().finish_sweep(Some(&scan), watermark, Instant::now());
     });
 }
 
@@ -559,11 +740,55 @@ pub fn forget_host(child: &ChildIdentity) {
     lock().remove_host(child);
 }
 
-/// A listing from the process-wide ledger (see [`Ledger::list`]).
+/// A listing of the stored state from the process-wide ledger (see
+/// [`Ledger::list`]); no fresh check. The `children` reply uses
+/// [`list_checked`].
 pub fn list(session_id: Option<&str>, sid: Option<u32>) -> ChildListing {
     let listing = lock().list(session_id, sid);
     maybe_sweep();
     listing
+}
+
+/// The `children` reply's listing. Blocking (run it on the blocking pool):
+/// each listed running leader is read now, and one found gone, reused or a
+/// zombie turns its record ended before the reply says anything (only the
+/// listed records are checked); host entries are listed only while their
+/// process runs; with `scan`, members are attached within their caps.
+pub fn list_checked(session_id: Option<&str>, sid: Option<u32>, scan: Option<&[(u32, StatFields)]>) -> ChildListing {
+    let mut listing = lock().list(session_id, sid);
+    validate_leaders_in(ledger(), &mut listing, read_stat);
+    listing.host.retain(|h| leader_runs(&h.child, read_stat(h.child.pid)));
+    if let Some(scan) = scan {
+        attach_members(&mut listing, scan);
+    }
+    listing
+}
+
+type Scan = std::sync::Arc<Vec<(u32, StatFields)>>;
+
+/// One `/proc` walk for concurrent member queries: a query reuses a walk
+/// that began after it asked, else runs one itself (on the blocking pool).
+/// One walk at a time; queries waiting meanwhile hold no thread.
+pub async fn shared_scan() -> Scan {
+    static CACHE: OnceLock<tokio::sync::Mutex<Option<(Instant, Scan)>>> = OnceLock::new();
+    shared_scan_in(CACHE.get_or_init(Default::default), scan_proc).await
+}
+
+async fn shared_scan_in(
+    cache: &tokio::sync::Mutex<Option<(Instant, Scan)>>,
+    walk: fn() -> Vec<(u32, StatFields)>,
+) -> Scan {
+    let asked = Instant::now();
+    let mut slot = cache.lock().await;
+    if let Some((began, scan)) = slot.as_ref() {
+        if *began >= asked {
+            return scan.clone();
+        }
+    }
+    let began = Instant::now();
+    let scan: Scan = std::sync::Arc::new(tokio::task::spawn_blocking(walk).await.unwrap_or_default());
+    *slot = Some((began, scan.clone()));
+    scan
 }
 
 /// The records to put in the reload state.
@@ -723,8 +948,10 @@ mod tests {
         }
         assert_eq!(l.len(), MAX_TOTAL);
         assert!(!l.insert("fresh", spawn("t", ident(pid, 1, pid))), "all running: not kept");
-        assert!(l.list(Some("fresh"), None).sessions.is_empty());
-        assert!(l.truncated.contains("fresh"));
+        let fresh = l.list(Some("fresh"), None);
+        assert_eq!(fresh.sessions.len(), 1, "a session refused its first record still shows");
+        assert!(fresh.sessions[0].truncated && fresh.sessions[0].children.is_empty());
+        assert!(l.truncated.contains_key("fresh"));
         l.mark_ended(&ident(10_300, 1, 10_300), None, Some(9)); // in s1
         assert!(l.insert("fresh", spawn("t", ident(pid + 1, 1, pid + 1))));
         assert_eq!(l.len(), MAX_TOTAL);
@@ -745,7 +972,7 @@ mod tests {
         l.add_host(HostOwnerKind::Extension, "live-ext", ident(31, 5, 31));
         // pid 77 is a background job still in sid 21; 22 runs; 23 was reused.
         let scan = vec![(77, stat(21, 9)), (22, stat(22, 5)), (23, stat(23, 99)), (31, stat(31, 5))];
-        l.apply_sweep(&scan);
+        l.apply_sweep(&scan, u64::MAX);
         let got = l.list(Some("s"), None);
         let kept: Vec<(&str, ChildState)> =
             got.sessions[0].children.iter().map(|c| (c.tool_id.as_str(), c.state)).collect();
@@ -763,11 +990,11 @@ mod tests {
     fn sweeps_are_claimed_at_most_once_per_interval() {
         let mut l = Ledger::new();
         let t0 = Instant::now();
-        assert!(l.claim_sweep(t0));
-        assert!(!l.claim_sweep(t0), "one in flight");
-        l.finish_sweep(None, t0);
-        assert!(!l.claim_sweep(t0 + SWEEP_EVERY - Duration::from_millis(1)));
-        assert!(l.claim_sweep(t0 + SWEEP_EVERY));
+        assert!(l.claim_sweep(t0).is_some());
+        assert!(l.claim_sweep(t0).is_none(), "one in flight");
+        l.finish_sweep(None, 0, t0);
+        assert!(l.claim_sweep(t0 + SWEEP_EVERY - Duration::from_millis(1)).is_none());
+        assert!(l.claim_sweep(t0 + SWEEP_EVERY).is_some());
     }
 
     #[test]
@@ -828,7 +1055,7 @@ mod tests {
         // 70 is a zombie leader with a live process (83) left in its sid;
         // 71's sid holds only a zombie; 72's a live process.
         let scan = [(70, zombie(70, 5)), (83, stat(70, 9)), (81, zombie(71, 9)), (82, stat(72, 9))];
-        l.apply_sweep(&scan);
+        l.apply_sweep(&scan, u64::MAX);
         let got: Vec<(String, ChildState)> = l.records.iter().map(|r| (r.tool_id.clone(), r.state)).collect();
         assert_eq!(
             got,
@@ -869,7 +1096,7 @@ mod tests {
 
         let mut l = Ledger::new();
         l.insert("s", spawn("zombie", identity.clone()));
-        l.apply_sweep(&scan_proc());
+        l.apply_sweep(&scan_proc(), u64::MAX);
         assert_eq!(l.records[0].state, ChildState::Ended, "after a sweep");
         let mut restored = Ledger::new();
         let mut carried = Ledger::new();
@@ -903,6 +1130,343 @@ mod tests {
         assert_eq!(l.len(), MAX_PER_SESSION);
         let ids: HashSet<String> = l.records.iter().map(|r| r.tool_id.clone()).collect();
         assert!(!ids.contains("t1") && !ids.contains("t2") && !ids.contains("t5"));
-        assert!(l.truncated.contains("s"));
+        assert!(l.truncated.contains_key("s"));
+    }
+    fn carried(session: &str, i: u32) -> ChildRecord {
+        ChildRecord {
+            session_id: session.into(),
+            tool_id: format!("t{i}"),
+            tool_name: "bash".into(),
+            handle_id: None,
+            shell_session_id: None,
+            child: ident(100_000 + i, 5, 100_000 + i),
+            state: ChildState::Running,
+            exit_code: None,
+            signal: None,
+        }
+    }
+
+    fn fill_running(l: &mut Ledger) {
+        let mut pid = 200_000u32;
+        for s in 0..(MAX_TOTAL / MAX_PER_SESSION) {
+            for _ in 0..MAX_PER_SESSION {
+                assert!(l.insert(&format!("full{s}"), spawn("t", ident(pid, 1, pid))));
+                pid += 1;
+            }
+        }
+        assert_eq!(l.len(), MAX_TOTAL);
+    }
+
+    /// The sweep race: a scan taken before a spawn must not end or drop the
+    /// spawn's record (or a host entry added after it), and a later scan that
+    /// sees the leader alive keeps it running.
+    #[test]
+    fn a_sweep_applies_only_to_what_was_there_before_its_scan() {
+        let mut l = Ledger::new();
+        l.insert("s", spawn("before", ident(90, 5, 90)));
+        let t0 = Instant::now();
+        let watermark = l.claim_sweep(t0).expect("due");
+        // The walk ran here: 90 was gone (a member, 95, held its sid), and
+        // 91 did not exist yet.
+        let old_scan: Vec<(u32, StatFields)> = vec![(1, stat(1, 1)), (95, stat(90, 9))];
+        l.insert("s", spawn("after", ident(91, 5, 91)));
+        // Spawned and reaped during the walk: its sid looks empty to the walk.
+        l.insert("s", spawn("after-ended", ident(93, 5, 93)));
+        l.mark_ended(&ident(93, 5, 93), Some(0), None);
+        l.add_host(HostOwnerKind::Extension, "late-ext", ident(92, 5, 92));
+        l.finish_sweep(Some(&old_scan), watermark, t0);
+        let got: Vec<(String, ChildState)> = l.records.iter().map(|r| (r.tool_id.clone(), r.state)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("before".to_string(), ChildState::Ended),
+                ("after".to_string(), ChildState::Running),
+                ("after-ended".to_string(), ChildState::Ended),
+            ],
+            "only the record the scan could have seen is judged"
+        );
+        assert_eq!(l.list(None, None).host.len(), 1, "the host entry added after the scan stays");
+        // The next sweep sees 91 and 92 alive: still running, still listed.
+        let next = l.claim_sweep(t0 + SWEEP_EVERY).expect("due again");
+        l.finish_sweep(Some(&[(91, stat(91, 5)), (92, stat(92, 5))]), next, t0 + SWEEP_EVERY);
+        assert_eq!(l.records.iter().find(|r| r.child.pid == 91).map(|r| r.state), Some(ChildState::Running));
+        assert_eq!(l.list(None, None).host.len(), 1);
+    }
+
+    /// A reply checks each listed running leader now: a zombie (or gone)
+    /// leader reads ended in the reply and in the ledger, with a live member
+    /// left in its sid; an ended record never reads running again; a code
+    /// the tool already recorded shows.
+    #[test]
+    fn a_reply_ends_a_leader_found_gone_or_a_zombie_and_never_the_reverse() {
+        let zombie = |sid: u32, ticks: u64| StatFields { state: 'Z', ..stat(sid, ticks) };
+        let ledger = Mutex::new(Ledger::new());
+        {
+            let mut l = ledger.lock().unwrap();
+            l.insert("s", spawn("zombie", ident(60, 5, 60)));
+            l.insert("s", spawn("live", ident(61, 5, 61)));
+            l.insert("s", spawn("gone", ident(62, 5, 62)));
+            l.insert("s", spawn("reused", ident(63, 5, 63)));
+            l.insert("s", spawn("ended", ident(64, 5, 64)));
+            l.mark_ended(&ident(64, 5, 64), Some(3), None);
+        }
+        let stat_of = |pid: u32| match pid {
+            60 => Some(zombie(60, 5)),
+            61 => Some(stat(61, 5)),
+            63 => Some(stat(63, 6)),
+            64 => Some(stat(64, 5)),
+            _ => None,
+        };
+        let mut listing = ledger.lock().unwrap().list(None, None);
+        validate_leaders_in(&ledger, &mut listing, stat_of);
+        attach_members(&mut listing, &[(60, zombie(60, 5)), (70, stat(60, 9))]);
+        let reply: Vec<(&str, ChildState, Option<i32>)> =
+            listing.sessions[0].children.iter().map(|c| (c.tool_id.as_str(), c.state, c.exit_code)).collect();
+        assert_eq!(
+            reply,
+            vec![
+                ("zombie", ChildState::Ended, None),
+                ("live", ChildState::Running, None),
+                ("gone", ChildState::Ended, None),
+                ("reused", ChildState::Ended, None),
+                ("ended", ChildState::Ended, Some(3)),
+            ]
+        );
+        assert_eq!(listing.sessions[0].children[0].members, Some(vec![ChildMember { pid: 70, start_ticks: 9 }]));
+        let stored: Vec<ChildState> = ledger.lock().unwrap().records.iter().map(|r| r.state).collect();
+        assert_eq!(
+            stored,
+            vec![ChildState::Ended, ChildState::Running, ChildState::Ended, ChildState::Ended, ChildState::Ended],
+            "the ledger holds what the reply said"
+        );
+    }
+
+    /// The fresh check never overrides what the tool recorded meanwhile, and
+    /// with a sid filter only the listed leaders are read.
+    #[test]
+    fn a_reply_checks_only_the_listed_leaders_and_keeps_a_reaped_code() {
+        let ledger = Mutex::new(Ledger::new());
+        {
+            let mut l = ledger.lock().unwrap();
+            l.insert("s", spawn("a", ident(80, 5, 500)));
+            l.insert("s", spawn("b", ident(81, 5, 600)));
+        }
+        let mut listing = ledger.lock().unwrap().list(None, Some(500));
+        // The tool reaps 80 between the listing and the check.
+        ledger.lock().unwrap().mark_ended(&ident(80, 5, 500), Some(7), None);
+        let read = std::cell::RefCell::new(Vec::new());
+        validate_leaders_in(&ledger, &mut listing, |pid| {
+            read.borrow_mut().push(pid);
+            None
+        });
+        assert_eq!(*read.borrow(), vec![80], "only the sid's records are checked");
+        let c = &listing.sessions[0].children[0];
+        assert_eq!((c.state, c.exit_code), (ChildState::Ended, Some(7)), "the reaped code shows");
+        assert_eq!(ledger.lock().unwrap().records[1].state, ChildState::Running, "81 was not judged");
+    }
+
+    /// Restore goes through the same bounded insertion: 4097 running carried
+    /// records keep both caps, the refused one is counted and its session
+    /// reads truncated.
+    #[test]
+    fn restore_of_4097_running_records_holds_the_caps() {
+        let per = 241u32; // 17 sessions of 241 = 4097, each under the session cap.
+        let records: Vec<ChildRecord> =
+            (0..17u32).flat_map(|s| (0..per).map(move |i| carried(&format!("r{s}"), s * per + i))).collect();
+        assert_eq!(records.len(), MAX_TOTAL + 1);
+        let mut l = Ledger::new();
+        l.restore(records, BOOT, |pid| Some(stat(pid, 5)));
+        assert_eq!(l.len(), MAX_TOTAL);
+        let listing = l.list(None, None);
+        assert_eq!(listing.refused_records, 1);
+        assert!(listing.ledger_full);
+        let last = listing.sessions.iter().find(|g| g.session_id == "r16").expect("r16");
+        assert!(last.truncated && last.children.len() == per as usize - 1);
+        assert!(listing.sessions.iter().filter(|g| g.truncated).count() == 1, "only the session that lost one");
+
+        // Over the session cap, all running: refused and counted too.
+        let mut one = Ledger::new();
+        one.restore((0..MAX_PER_SESSION as u32 + 2).map(|i| carried("solo", i)).collect(), BOOT, |pid| {
+            Some(stat(pid, 5))
+        });
+        assert_eq!(one.len(), MAX_PER_SESSION);
+        assert_eq!(one.list(None, None).refused_records, 2);
+    }
+
+    /// refused_records counts every refusal; ledger_full holds only while the
+    /// total cap is reached with nothing ended to evict.
+    #[test]
+    fn refusals_are_counted_and_a_full_ledger_says_so() {
+        let mut l = Ledger::new();
+        let empty = l.list(None, None);
+        assert_eq!((empty.refused_records, empty.ledger_full), (0, false));
+        fill_running(&mut l);
+        assert!(l.list(None, None).ledger_full, "at the cap with nothing ended");
+        assert!(!l.insert("late", spawn("t", ident(1, 1, 1))));
+        assert!(!l.insert("late", spawn("t", ident(2, 1, 2))));
+        let full = l.list(None, None);
+        assert_eq!((full.refused_records, full.ledger_full), (2, true));
+        // One ends: there is something to evict again.
+        l.mark_ended(&ident(200_000, 1, 200_000), Some(0), None);
+        assert!(!l.list(None, None).ledger_full);
+        // Taking its place fills the ledger again, with no refusal.
+        assert!(l.insert("late", spawn("t", ident(3, 1, 3))));
+        let again = l.list(None, None);
+        assert_eq!((again.refused_records, again.ledger_full), (2, true));
+        // A sweep that drops ended records clears it too.
+        l.mark_ended(&ident(200_001, 1, 200_001), Some(0), None);
+        l.mark_ended(&ident(200_002, 1, 200_002), Some(0), None);
+        let all_live: Vec<(u32, StatFields)> = l
+            .records
+            .iter()
+            .filter(|r| r.state == ChildState::Running)
+            .map(|r| (r.child.pid, stat(r.child.sid, r.child.start_ticks)))
+            .collect();
+        l.apply_sweep(&all_live, u64::MAX);
+        assert_eq!(l.len(), MAX_TOTAL - 2);
+        assert!(!l.list(None, None).ledger_full);
+    }
+
+    /// The truncated set is bounded: sessions with no record left keep their
+    /// mark until the next sweep, at most MAX_TRUNCATED_EMPTY of them, and
+    /// they show as empty truncated groups (not under a sid filter).
+    #[test]
+    fn empty_truncated_sessions_are_bounded_and_expire() {
+        let mut l = Ledger::new();
+        fill_running(&mut l);
+        let extra = MAX_TRUNCATED_EMPTY as u32 + 44;
+        for i in 0..extra {
+            assert!(!l.insert(&format!("e{i}"), spawn("t", ident(i + 1, 1, i + 1))));
+        }
+        let listing = l.list(None, None);
+        let empty: Vec<&str> =
+            listing.sessions.iter().filter(|g| g.children.is_empty()).map(|g| g.session_id.as_str()).collect();
+        assert_eq!(empty.len(), MAX_TRUNCATED_EMPTY);
+        assert_eq!(empty.first().copied(), Some("e44"), "the oldest marks went first");
+        assert_eq!(empty.last().copied(), Some(format!("e{}", extra - 1).as_str()));
+        assert!(listing.sessions.iter().filter(|g| g.children.is_empty()).all(|g| g.truncated));
+        assert!(l.list(None, Some(1)).sessions.is_empty(), "a sid filter lists records only");
+        let one = l.list(Some("e299"), None);
+        assert_eq!((one.sessions.len(), one.sessions[0].truncated), (1, true));
+        // A sweep after the marks expires them; sessions with records keep theirs.
+        l.mark_ended(&ident(200_000, 1, 200_000), Some(0), None);
+        assert!(l.insert("full0", spawn("t", ident(9, 1, 9))));
+        let live: Vec<(u32, StatFields)> = l.records.iter().map(|r| (r.child.pid, stat(r.child.sid, 1))).collect();
+        let watermark = l.next_seq;
+        l.apply_sweep(&live, watermark);
+        let after = l.list(None, None);
+        assert!(after.sessions.iter().all(|g| !g.children.is_empty()), "no empty group left");
+        assert!(after.sessions.iter().find(|g| g.session_id == "full0").is_some_and(|g| g.truncated));
+        assert!(l.truncated.len() <= MAX_TOTAL / MAX_PER_SESSION);
+    }
+
+    /// Members: only listed sids are expanded, each up to its cap, and in all
+    /// up to the reply cap; a list cut short marks its group truncated.
+    #[test]
+    fn members_are_capped_per_sid_and_per_reply() {
+        let mut l = Ledger::new();
+        l.insert("big", spawn("t", ident(1, 1, 1_000_000)));
+        l.insert("small", spawn("t", ident(2, 1, 2_000_000)));
+        let mut scan: Vec<(u32, StatFields)> =
+            (0..MAX_MEMBERS_PER_SID as u32 + 5).map(|i| (10 + i, stat(1_000_000, 1))).collect();
+        scan.push((5, stat(2_000_000, 1)));
+        let mut listing = l.list(None, None);
+        attach_members(&mut listing, &scan);
+        let big = &listing.sessions[0];
+        assert_eq!(big.children[0].members.as_ref().map(Vec::len), Some(MAX_MEMBERS_PER_SID));
+        assert!(big.truncated, "a cut list marks the group");
+        assert!(!listing.sessions[1].truncated);
+        assert_eq!(listing.sessions[1].children[0].members, Some(vec![ChildMember { pid: 5, start_ticks: 1 }]));
+
+        // The reply cap: 17 records each with a full sid.
+        let mut many = Ledger::new();
+        let mut scan = Vec::new();
+        for s in 0..17u32 {
+            let sid = 3_000_000 + s;
+            many.insert(&format!("m{s}"), spawn("t", ident(sid, 1, sid)));
+            scan.extend((0..MAX_MEMBERS_PER_SID as u32).map(|i| (sid * 1000 + i, stat(sid, 1))));
+        }
+        let mut listing = many.list(None, None);
+        attach_members(&mut listing, &scan);
+        let total: usize =
+            listing.sessions.iter().flat_map(|g| &g.children).map(|c| c.members.as_ref().map_or(0, Vec::len)).sum();
+        assert_eq!(total, MAX_MEMBERS_PER_REPLY);
+        assert!(!listing.sessions[15].truncated && listing.sessions[16].truncated);
+        assert_eq!(listing.sessions[16].children[0].members, Some(Vec::new()));
+    }
+
+    static WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn slow_walk() -> Vec<(u32, StatFields)> {
+        WALKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        vec![(1, stat(1, 1))]
+    }
+
+    /// Concurrent member queries share walks: one runs at a time, and a
+    /// query reuses a walk that began after it asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_member_queries_share_one_walk() {
+        let cache: &'static tokio::sync::Mutex<Option<(Instant, Scan)>> = Box::leak(Box::default());
+        let first = tokio::spawn(shared_scan_in(cache, slow_walk));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Eight more arrive while the first walk runs.
+        let rest: Vec<_> = (0..8).map(|_| tokio::spawn(shared_scan_in(cache, slow_walk))).collect();
+        assert_eq!(first.await.unwrap().len(), 1);
+        for r in rest {
+            assert_eq!(r.await.unwrap().len(), 1);
+        }
+        assert_eq!(WALKS.load(std::sync::atomic::Ordering::SeqCst), 2, "the first, then one for all who came after it");
+        // A later query never reuses an older walk.
+        shared_scan_in(cache, slow_walk).await;
+        assert_eq!(WALKS.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// The real case: `bash -c 'sleep … & exit 0'` in its own session. The
+    /// leader exits at once (a zombie until reaped) while the background
+    /// sleep holds the sid. The reply reads it ended, with the sleep listed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_zombie_leader_with_a_live_member_reads_ended_in_the_reply() {
+        use std::os::unix::process::CommandExt;
+        if boot_id().is_none() {
+            return;
+        }
+        let mut cmd = std::process::Command::new("bash");
+        cmd.args(["-c", "sleep 30 >/dev/null 2>&1 & exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn bash");
+        let pid = child.id();
+        let identity = identify(pid).expect("readable while unreaped");
+        let session = format!("real-zombie-{pid}");
+        record_spawn(&session, spawn("bash", identity.clone()));
+        let t0 = Instant::now();
+        while read_stat(pid).is_some_and(|s| s.is_live()) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the leader never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let scan = scan_proc();
+        let listing = list_checked(Some(&session), None, Some(&scan));
+        let entry = &listing.sessions[0].children[0];
+        assert_eq!(entry.state, ChildState::Ended, "a zombie leader is not running");
+        let members = entry.members.clone().unwrap_or_default();
+        let stored = list(Some(&session), None).sessions.first().map(|g| g.children[0].state);
+        // SAFETY: kill(2) on the child's own process group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        child.wait().unwrap();
+        assert!(!members.is_empty(), "the background sleep is listed as a member");
+        assert!(members.iter().all(|m| m.pid != pid));
+        assert_eq!(stored, Some(ChildState::Ended), "the ledger says so too");
     }
 }
