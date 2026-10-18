@@ -171,6 +171,92 @@ async fn a_wake_queued_by_the_reload_checkpoint_starts_no_turn_until_the_exec_fa
     assert_eq!(started(&seen), 1);
     until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
     assert_eq!(f.hits.load(Ordering::SeqCst), 2);
-    let _ = &f.bodies;
+    end(&mut f.client).await;
+}
+
+/// `sa_8` is running: the reload stops it. Its "finalizer" settles as soon
+/// as the stop reaches it, withholding its completion wake as a cancel does.
+fn worker_running_into_the_reload(f: &Fixture) {
+    let state = Arc::new(RwLock::new(SubagentState::new()));
+    f.registry.lock().unwrap().register(SubagentHandle::new(
+        "sa_8".into(),
+        8,
+        "digger".into(),
+        "dig".into(),
+        MODEL.into(),
+        String::new(),
+        300,
+        Arc::clone(&state),
+        None,
+        None,
+        None,
+    ));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(20));
+        let mut s = state.write().unwrap();
+        if s.cancel_requested {
+            s.status = SubagentStatus::Cancelled;
+            s.finished_at = Some(std::time::Instant::now());
+            s.archive_path = Some("/archives/sa_8.json".into());
+            s.finalization_started = true;
+            s.finalization_ready = true;
+            s.completion_settled = true;
+            return;
+        }
+    });
+}
+
+/// Every wake in the last provider request's user turns that names
+/// worker `id` (adjacent user messages are merged on the wire, so count
+/// the wakes, not the messages).
+fn mentions(bodies: &Bodies, id: &str) -> Vec<String> {
+    let bodies = bodies.lock().unwrap();
+    let last = bodies.last().expect("a request");
+    let text: String = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].to_string())
+        .collect();
+    text.split("Subagent '")
+        .skip(1)
+        .filter(|wake| wake.contains(&format!("({id})")))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A failed exec delivers each worker's news to its parent exactly once.
+/// The completion `sa_7` queued during the checkpoint is still queued in
+/// this image (only the exec would have discarded it): it is not re-posted
+/// from the record. `sa_8`, which the reload itself stopped (its finalizer
+/// withheld the wake), is announced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_exec_wakes_the_parent_once_per_worker() {
+    let _h = Home::new();
+    let mut f = fixture().await;
+    worker_finishing_during_the_checkpoint(&f);
+    worker_running_into_the_reload(&f);
+
+    let workers = checkpoint_for_reload(&mut f).await;
+    let by = |id: &str| workers.iter().find(|w| w.id == id).unwrap().clone();
+    assert!(by("sa_7").wake_lost && by("sa_7").needs_wake());
+    assert!(by("sa_8").stopped_by_reload && by("sa_8").needs_wake());
+
+    f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    // No second wake turn for a re-posted completion either.
+    let later = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&later), 0, "{later:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 2);
+
+    let sa7 = mentions(&f.bodies, "sa_7");
+    assert_eq!(sa7.len(), 1, "sa_7's completion, once: {sa7:#?}");
+    assert!(sa7[0].contains("SA7-RESULT"), "the original wake: {sa7:#?}");
+    let sa8 = mentions(&f.bodies, "sa_8");
+    assert_eq!(sa8.len(), 1, "sa_8's stop, once: {sa8:#?}");
+    assert!(sa8[0].contains("by a daemon reload, not by the user"), "{sa8:#?}");
     end(&mut f.client).await;
 }

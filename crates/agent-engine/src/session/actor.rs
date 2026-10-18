@@ -4213,15 +4213,21 @@ impl SessionActor {
         let Some(fence) = self.reload_fence.take() else {
             return;
         };
-        if self.runtime.is_live() {
-            self.runtime
+        let workers = if self.runtime.is_live() {
+            let mut registry = self
+                .runtime
                 .subagent_registry()
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .lift_reload_fence();
-        }
+                .unwrap_or_else(|p| p.into_inner());
+            registry.lift_reload_fence();
+            // The queue the record assumed lost is still here: only the
+            // reload's own stops owe a wake.
+            registry.rewake_after_failed_exec(fence.workers)
+        } else {
+            Vec::new()
+        };
         tracing::info!(session = %self.id, "reload did not exec: fence lifted");
-        self.adopt_workers(fence.workers);
+        self.adopt_workers(workers);
         self.rearm_park();
         if !self.event_queue.is_empty() {
             self.on_queue_wake().await;

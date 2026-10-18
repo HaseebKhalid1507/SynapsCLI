@@ -183,6 +183,23 @@ impl SubagentRegistry {
         self.reload_woken.insert(worker.id.clone(), worker.clone());
     }
 
+    /// A reload that did not exec: what of its record still owes the parent
+    /// a wake in THIS image. Only the workers the reload stopped — their
+    /// finalizers withheld the completion wake, expecting the next image to
+    /// post one. A completion it carried as `wake_lost` is still queued
+    /// here (or still coming from its finalizer), and a reload wake an
+    /// earlier image posted is still queued too: re-posting either would
+    /// wake the parent twice. Everything else keeps its record, `wake` off.
+    pub fn rewake_after_failed_exec(&self, carried: Vec<CarriedWorker>) -> Vec<CarriedWorker> {
+        carried
+            .into_iter()
+            .map(|w| {
+                let wake = w.wake && w.stopped_by_reload && !self.reload_woken.contains_key(&w.id);
+                CarriedWorker { wake, ..w }
+            })
+            .collect()
+    }
+
     /// Whether a daemon reload (not the user) stopped `id`'s run.
     pub fn was_stopped_by_reload(&self, id: &str) -> bool {
         self.stopped_by_reload.contains(id)
@@ -532,6 +549,40 @@ mod tests {
         fenced.register(late);
         let s = late_state.read().unwrap();
         assert!(s.cancel_requested && !s.stopped_by_reload, "the driver's fence, not the reload's");
+    }
+
+    /// A failed exec re-announces only the workers that reload stopped: the
+    /// completions it carried are still in this image's queue, and so is a
+    /// reload wake posted earlier.
+    #[test]
+    fn a_failed_exec_rewakes_only_the_workers_the_reload_stopped() {
+        let mut registry = SubagentRegistry::new();
+        registry.register(make_handle("sa_1"));
+        registry.register(make_finished_handle("sa_2"));
+        let stopped_earlier = CarriedWorker {
+            id: "sa_3".into(),
+            subagent_id: 3,
+            agent: String::new(),
+            status: "cancelled".into(),
+            archive_path: Some("/a/sa_3.json".into()),
+            stopped_by_reload: true,
+            wake_lost: false,
+            wake: true,
+            elapsed_secs: 0,
+            preview: String::new(),
+        };
+        registry.adopt_carried(&stopped_earlier);
+        registry.note_reload_wake(&stopped_earlier);
+        registry.stop_for_reload();
+        let queued: std::collections::HashSet<String> = ["sa_3".to_string()].into();
+        let carried = registry.reload_carry(&queued);
+        assert_eq!(carried.iter().filter(|w| w.needs_wake()).count(), 3, "{carried:?}");
+
+        let rewake = registry.rewake_after_failed_exec(carried.clone());
+        let woken: Vec<&str> =
+            rewake.iter().filter(|w| w.needs_wake()).map(|w| w.id.as_str()).collect();
+        assert_eq!(woken, ["sa_1"], "only this reload's own stop: {rewake:?}");
+        assert_eq!(rewake.len(), carried.len(), "every record is kept");
     }
 
     #[test]
