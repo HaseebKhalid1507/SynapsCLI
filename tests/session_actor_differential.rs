@@ -530,6 +530,25 @@ fn assert_same_ext(o: &ReferenceReactorExt, a: &ActorRun) {
     );
 }
 
+/// The save-count checks are upper bounds, which a sampler that counts
+/// nothing passes trivially. So prove it is live: once the actor's journal
+/// exists the sampler must observe at least that inode. Poll to a short
+/// deadline; the sampler thread may simply not have run since the rename.
+fn assert_sampler_live(a_s: &SaveSampler, a_path: &std::path::Path) {
+    if !a_path.exists() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while a_s.count() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        a_s.count() >= 1,
+        "save sampler counted no save although the actor's journal exists: \
+         the sampler is broken, so the save-count checks would prove nothing"
+    );
+}
+
 fn assert_saves(
     o: &ReferenceReactorExt,
     a_s: &SaveSampler,
@@ -541,6 +560,7 @@ fn assert_saves(
     // LATEST state when saves pile up (and never re-queues an identical
     // one), so it may write fewer times than the oracle — never more. What
     // must match is the state it leaves on disk.
+    assert_sampler_live(a_s, a_path);
     assert!(
         a_s.count() <= o.saves,
         "actor wrote more often than the oracle: {} > {}",
@@ -881,6 +901,7 @@ async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
     // Coalescing writer: at most as many writes, never more (see
     // `assert_saves`; the sampled count is a lower bound).
     assert!(a_path.exists(), "the actor never saved");
+    assert_sampler_live(&a_s, &a_path);
     assert!(
         a_s.count() <= o.saves,
         "actor saves {} vs oracle {}",
