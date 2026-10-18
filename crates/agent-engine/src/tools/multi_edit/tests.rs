@@ -181,11 +181,11 @@ async fn one_clock_reading_across_files_and_jsonl_rows() {
 fn finalize_failure_restores_committed_files_and_names_each() {
     struct FailSecond;
     impl commit::Hooks for FailSecond {
-        fn finalize(&mut self, index: usize, tmp: &Path, p: &commit::Pending) -> std::io::Result<()> {
+        fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
             if index == 1 {
                 return Err(std::io::Error::other("injected rename failure"));
             }
-            commit::finalize(tmp, p)
+            commit::Hooks::finalize(&mut commit::RealHooks, index, s, p)
         }
     }
     let d = tmpdir();
@@ -455,7 +455,7 @@ fn staging_never_follows_reuses_or_removes_an_existing_temp_path() {
     std::fs::write(&victim, "keep\n").unwrap();
     let tmp = d.path().join("planted.agent-tmp");
     std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-    let err = commit::write_new(&tmp, b"new\n", None).unwrap_err();
+    let err = commit::create_temp_for_test(d.path(), "planted.agent-tmp", b"new\n").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
     assert!(
@@ -493,4 +493,423 @@ async fn timestamp_field_never_overwrites_a_given_field() {
     .unwrap_err();
     assert!(err.contains("edits[0]") && err.contains("`ts` is already in value"), "{err}");
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem hardening (review round 1): staging permissions, directory
+// handles, non-regular files, no-clobber creation, input limits.
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// Every name in `dir`, sorted.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A file of `len` bytes that takes no disk space.
+fn sparse(path: &Path, len: u64) {
+    std::fs::File::create(path).unwrap().set_len(len).unwrap();
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let c = std::ffi::CString::new(p(path)).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+/// Records each temp's permission bits and size once its bytes are written.
+#[cfg(unix)]
+#[derive(Default)]
+struct TempModes {
+    seen: Vec<(u32, u64)>,
+    fail_finalize_at: Option<usize>,
+}
+
+#[cfg(unix)]
+impl commit::Hooks for TempModes {
+    fn temp_written(&mut self, file: &std::fs::File) {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = file.metadata().unwrap();
+        self.seen.push((meta.permissions().mode() & 0o7777, meta.len()));
+    }
+    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
+        if self.fail_finalize_at == Some(index) {
+            return Err(std::io::Error::other("injected rename failure"));
+        }
+        commit::Hooks::finalize(&mut commit::RealHooks, index, s, p)
+    }
+}
+
+// An existing file's replacement temp, and a restore's temp, stay
+// owner-only while their bytes are written; the final mode comes after.
+#[cfg(unix)]
+#[test]
+fn existing_and_restore_temps_are_owner_only_until_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir();
+    let a = d.path().join("a.md");
+    let b = d.path().join("b.md");
+    std::fs::write(&a, "a\n").unwrap();
+    std::fs::write(&b, "b\n").unwrap();
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let edits = json!({"edits": [
+        {"path": p(&a), "op": "append", "text": "1\n"},
+        {"path": p(&b), "op": "append", "text": "2\n"}
+    ]});
+    let mut hooks = TempModes::default();
+    run_with(edits.clone(), &mut hooks).unwrap();
+    assert_eq!(hooks.seen, vec![(0o600, 4), (0o600, 4)]);
+    assert_eq!((mode_of(&a), mode_of(&b)), (0o640, 0o600));
+    // The 2nd file fails: the 1st is put back through an owner-only temp too.
+    let mut hooks = TempModes {
+        fail_finalize_at: Some(1),
+        ..TempModes::default()
+    };
+    let err = run_with(edits, &mut hooks).unwrap_err();
+    assert!(err.contains(&format!("Committed then restored: {}", p(&a))), "{err}");
+    assert_eq!(hooks.seen, vec![(0o600, 6), (0o600, 6), (0o600, 4)]);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a\n1\n");
+    assert_eq!(mode_of(&a), 0o640);
+}
+
+/// After staging (or, `late`, inside the first finalize, i.e. after the
+/// re-check), moves `dir` to `moved`, puts a symlink to `denied` in its
+/// place and plants a file under the staged temp's name in `denied`.
+#[cfg(unix)]
+struct SwapParent {
+    dir: PathBuf,
+    moved: PathBuf,
+    denied: PathBuf,
+    late: bool,
+    planted: Option<String>,
+}
+
+#[cfg(unix)]
+impl SwapParent {
+    fn new(root: &Path, late: bool) -> SwapParent {
+        let swap = SwapParent {
+            dir: root.join("allowed"),
+            moved: root.join("moved"),
+            denied: root.join("denied"),
+            late,
+            planted: None,
+        };
+        std::fs::create_dir(&swap.dir).unwrap();
+        std::fs::create_dir(&swap.denied).unwrap();
+        swap
+    }
+
+    fn swap(&mut self) {
+        std::fs::rename(&self.dir, &self.moved).unwrap();
+        std::os::unix::fs::symlink(&self.denied, &self.dir).unwrap();
+        let temp = leftovers(&self.moved).pop().expect("a staged temp");
+        std::fs::write(self.denied.join(&temp), "planted").unwrap();
+        self.planted = Some(temp);
+    }
+
+    /// One edit; any path under `denied` overlaps a worker's write scope.
+    fn call(&mut self, edit: Value) -> std::result::Result<String, String> {
+        let req = parse_request(&json!({ "edits": [edit] })).unwrap();
+        let denied = p(&self.denied);
+        run(req, fixed_now(), None, &|s: &str| s.starts_with(&denied), self)
+    }
+}
+
+#[cfg(unix)]
+impl commit::Hooks for SwapParent {
+    fn after_stage(&mut self) {
+        if !self.late {
+            self.swap();
+        }
+    }
+    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
+        if self.late && self.planted.is_none() {
+            self.swap();
+        }
+        commit::Hooks::finalize(&mut commit::RealHooks, index, s, p)
+    }
+}
+
+// Review probe, adopted: the parent directory is swapped for a symlink into
+// a refused directory after staging, with a file planted there under the
+// temp's name. The call is refused; nothing is published anywhere, the
+// planted file is left alone and no temp is left behind.
+#[cfg(unix)]
+#[test]
+fn a_parent_directory_replaced_after_staging_is_refused() {
+    let d = tmpdir();
+    let mut swap = SwapParent::new(d.path(), false);
+    let target = swap.dir.join("new.md");
+    let err = swap
+        .call(json!({"path": p(&target), "op": "append", "create": true, "text": "wanted"}))
+        .unwrap_err();
+    assert!(
+        err.contains(&format!("the parent directory of {} was replaced", p(&target))),
+        "{err}"
+    );
+    assert!(err.contains("no file was changed"), "{err}");
+    let planted = swap.planted.clone().unwrap();
+    assert_eq!(entries(&swap.denied), vec![planted.clone()]);
+    assert_eq!(std::fs::read_to_string(swap.denied.join(&planted)).unwrap(), "planted");
+    assert!(entries(&swap.moved).is_empty(), "{:?}", entries(&swap.moved));
+}
+
+// A parent that moves after the re-check (the documented unlocked window)
+// cannot redirect the publish: it goes through the verified directory
+// handle, so the file lands in the moved directory and the refused
+// directory gets nothing.
+#[cfg(unix)]
+#[test]
+fn publishing_goes_through_the_verified_directory_handle() {
+    for existing in [false, true] {
+        let d = tmpdir();
+        let mut swap = SwapParent::new(d.path(), true);
+        let target = swap.dir.join("t.md");
+        if existing {
+            std::fs::write(&target, "old\n").unwrap();
+        }
+        let out = swap
+            .call(json!({"path": p(&target), "op": "append", "create": true, "text": "wanted\n"}))
+            .unwrap();
+        let want = if existing { "old\nwanted\n" } else { "wanted\n" };
+        let landed = std::fs::read_to_string(swap.moved.join("t.md")).unwrap_or_default();
+        assert_eq!(landed, want, "existing={existing}: {out}");
+        let planted = swap.planted.clone().unwrap();
+        assert_eq!(entries(&swap.denied), vec![planted.clone()], "existing={existing}");
+        assert_eq!(std::fs::read_to_string(swap.denied.join(&planted)).unwrap(), "planted");
+        assert_eq!(entries(&swap.moved), vec!["t.md".to_string()], "existing={existing}");
+    }
+}
+
+// A staged temp that was replaced under the same name is never published
+// or removed; the call is refused.
+#[cfg(unix)]
+#[test]
+fn a_replaced_staged_temp_is_refused_and_left_alone() {
+    struct ReplaceTemp(PathBuf);
+    impl commit::Hooks for ReplaceTemp {
+        fn after_stage(&mut self) {
+            let temp = self.0.join(leftovers(&self.0).pop().unwrap());
+            // Created first, then renamed over: a new inode, never a reused one.
+            let other = self.0.join("other");
+            std::fs::write(&other, "planted").unwrap();
+            std::fs::rename(&other, &temp).unwrap();
+        }
+    }
+    let d = tmpdir();
+    let f = d.path().join("a.md");
+    std::fs::write(&f, "orig\n").unwrap();
+    let err = run_with(
+        json!({"edits": [{"path": p(&f), "op": "append", "text": "new\n"}]}),
+        &mut ReplaceTemp(d.path().to_path_buf()),
+    )
+    .unwrap_err();
+    assert!(err.contains(&format!("the staged temp of {} was replaced", p(&f))), "{err}");
+    assert!(err.contains("no file was changed"), "{err}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "orig\n");
+    let left = leftovers(d.path());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(std::fs::read_to_string(d.path().join(&left[0])).unwrap(), "planted");
+}
+
+// A FIFO with no writer is refused at once: opening it never waits.
+#[cfg(unix)]
+#[test]
+fn a_fifo_without_a_writer_is_refused_without_waiting() {
+    let d = tmpdir();
+    let fifo = d.path().join("pipe");
+    mkfifo(&fifo);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = p(&fifo);
+    let worker = std::thread::spawn(move || {
+        let edit = json!({"edits": [{"path": path, "op": "append", "text": "x"}]});
+        let _ = tx.send(run_with(edit, &mut commit::RealHooks));
+    });
+    let Ok(result) = rx.recv_timeout(std::time::Duration::from_secs(1)) else {
+        // Blocked in open: give it a writer so no thread is left behind.
+        let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        worker.join().unwrap();
+        drop(writer);
+        panic!("loading a FIFO with no writer waited for more than 1 s");
+    };
+    worker.join().unwrap();
+    let err = result.unwrap_err();
+    assert!(err.contains("not a regular file"), "{err}");
+    assert!(err.contains("no file was changed"), "{err}");
+}
+
+// A FIFO is refused before anything is read from it: bytes queued in it are
+// still there afterwards.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_is_refused_before_anything_is_read() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let d = tmpdir();
+    let fifo = d.path().join("pipe");
+    mkfifo(&fifo);
+    // Linux: opening a FIFO read-write never blocks; it keeps a writer present.
+    let mut holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    holder.write_all(b"queued").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = p(&fifo);
+    let worker = std::thread::spawn(move || {
+        let edit = json!({"edits": [{"path": path, "op": "append", "text": "x"}]});
+        let _ = tx.send(run_with(edit, &mut commit::RealHooks));
+    });
+    let Ok(result) = rx.recv_timeout(std::time::Duration::from_secs(1)) else {
+        drop(holder); // end of file for a blocked reader
+        worker.join().unwrap();
+        panic!("loading a FIFO with a writer waited for more than 1 s");
+    };
+    worker.join().unwrap();
+    let err = result.unwrap_err();
+    assert!(err.contains("not a regular file"), "{err}");
+    let mut buf = [0u8; 16];
+    let n = holder.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"queued");
+}
+
+/// Declares the listed primitives unsupported.
+struct NoPrimitive(Vec<commit::Primitive>);
+
+impl commit::Hooks for NoPrimitive {
+    fn unsupported(&mut self, primitive: commit::Primitive) -> bool {
+        self.0.contains(&primitive)
+    }
+}
+
+// With neither an exclusive rename nor a hard link, a new file is refused;
+// it is never created by check-then-rename.
+#[test]
+fn creating_fails_closed_without_a_no_replace_primitive() {
+    let d = tmpdir();
+    let f = d.path().join("new.md");
+    let err = run_with(
+        json!({"edits": [{"path": p(&f), "op": "append", "create": true, "text": "x\n"}]}),
+        &mut NoPrimitive(vec![commit::Primitive::RenameNoReplace, commit::Primitive::Link]),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains(&format!(
+            "cannot create {} without risking an overwrite on this filesystem",
+            p(&f)
+        )),
+        "{err}"
+    );
+    assert!(!f.exists());
+    assert!(leftovers(d.path()).is_empty(), "{:?}", leftovers(d.path()));
+}
+
+// Without the exclusive rename, a hard link still creates the file without
+// replacing anything, and the temp name is removed.
+#[test]
+fn creating_falls_back_to_a_hard_link() {
+    let d = tmpdir();
+    let f = d.path().join("new.md");
+    run_with(
+        json!({"edits": [{"path": p(&f), "op": "append", "create": true, "text": "x\n"}]}),
+        &mut NoPrimitive(vec![commit::Primitive::RenameNoReplace]),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "x\n");
+    assert!(leftovers(d.path()).is_empty(), "{:?}", leftovers(d.path()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&f).unwrap().nlink(), 1);
+    }
+}
+
+/// Counts reads of existing files.
+#[derive(Default)]
+struct CountReads(usize);
+
+impl commit::Hooks for CountReads {
+    fn before_read(&mut self) {
+        self.0 += 1;
+    }
+}
+
+// A file over the per-file limit is refused from its size, before any byte
+// is read.
+#[test]
+fn an_oversized_file_is_refused_before_it_is_read() {
+    let d = tmpdir();
+    let f = d.path().join("big.md");
+    sparse(&f, MAX_FILE_BYTES as u64 + 1);
+    let mut reads = CountReads::default();
+    let err = run_with(
+        json!({"edits": [{"path": p(&f), "op": "append", "text": "x"}]}),
+        &mut reads,
+    )
+    .unwrap_err();
+    assert!(err.contains(&format!("larger than {MAX_FILE_BYTES} bytes")), "{err}");
+    assert_eq!(reads.0, 0);
+}
+
+// A file that grows past the limit between its size check and the read is
+// still refused: at most limit + 1 bytes are read.
+#[test]
+fn a_file_that_grows_after_its_size_check_is_refused() {
+    struct Grow(PathBuf);
+    impl commit::Hooks for Grow {
+        fn before_read(&mut self) {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&self.0).unwrap();
+            f.write_all(b"z").unwrap();
+        }
+    }
+    let d = tmpdir();
+    let f = d.path().join("grows.md");
+    sparse(&f, MAX_FILE_BYTES as u64);
+    let err = run_with(
+        json!({"edits": [{"path": p(&f), "op": "append", "text": "x"}]}),
+        &mut Grow(f.clone()),
+    )
+    .unwrap_err();
+    assert!(err.contains(&format!("larger than {MAX_FILE_BYTES} bytes")), "{err}");
+    assert_eq!(std::fs::metadata(&f).unwrap().len(), MAX_FILE_BYTES as u64 + 1);
+}
+
+// The call's input limit counts the files read so far and is checked from
+// the next file's size, before reading it.
+#[test]
+fn the_call_input_limit_is_checked_before_each_read() {
+    let d = tmpdir();
+    let mut edits = Vec::new();
+    for i in 0..4 {
+        let f = d.path().join(format!("f{i}.md"));
+        sparse(&f, 15 * 1024 * 1024);
+        // The files hold NUL bytes, so these edits are skipped.
+        edits.push(json!({"path": p(&f), "op": "append", "text": "x", "unless_present": "\u{0}"}));
+    }
+    let last = d.path().join("f4.md");
+    sparse(&last, 5 * 1024 * 1024);
+    edits.push(json!({"path": p(&last), "op": "append", "text": "x"}));
+    let mut reads = CountReads::default();
+    let err = run_with(json!({ "edits": edits }), &mut reads).unwrap_err();
+    assert!(err.starts_with("edits[4]"), "{err}");
+    assert!(
+        err.contains(&format!("the files this call reads would exceed {MAX_TOTAL_BYTES} bytes")),
+        "{err}"
+    );
+    assert_eq!(reads.0, 4);
 }

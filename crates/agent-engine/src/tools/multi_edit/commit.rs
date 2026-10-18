@@ -33,24 +33,63 @@ pub(crate) struct Pending {
     pub new: Vec<u8>,
 }
 
-/// Test seams. Production uses [`RealHooks`].
+/// A staged temp file.
+pub(crate) struct Staged {
+    path: PathBuf,
+}
+
+/// A filesystem primitive a test can declare unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Primitive {
+    RenameNoReplace,
+    Link,
+}
+
+/// Test seams. Production uses [`RealHooks`]; the `cfg(test)` methods do not
+/// exist in a release build.
 pub(crate) trait Hooks {
     /// Runs after every temp is staged and before the re-check.
     fn after_stage(&mut self) {}
     /// Finalizes file `index` (rename, or link for a new file).
-    fn finalize(&mut self, _index: usize, tmp: &Path, pending: &Pending) -> std::io::Result<()> {
-        finalize(tmp, pending)
+    fn finalize(&mut self, _index: usize, staged: &Staged, pending: &Pending) -> std::io::Result<()> {
+        #[cfg(test)]
+        let mut unsupported = |p: Primitive| self.unsupported(p);
+        #[cfg(not(test))]
+        let mut unsupported = |_: Primitive| false;
+        finalize(staged, pending, &mut unsupported)
     }
+    /// Sees each temp after its bytes are written, before its final mode.
+    #[cfg(test)]
+    fn temp_written(&mut self, _file: &std::fs::File) {}
+    /// Pretends `primitive` is not supported by the filesystem.
+    #[cfg(test)]
+    fn unsupported(&mut self, _primitive: Primitive) -> bool {
+        false
+    }
+    /// Runs just before an existing file's bytes are read.
+    #[cfg(test)]
+    fn before_read(&mut self) {}
 }
 
 pub(crate) struct RealHooks;
 impl Hooks for RealHooks {}
 
-pub(crate) fn finalize(tmp: &Path, pending: &Pending) -> std::io::Result<()> {
+pub(crate) fn finalize(
+    staged: &Staged,
+    pending: &Pending,
+    unsupported: &mut dyn FnMut(Primitive) -> bool,
+) -> std::io::Result<()> {
+    let tmp = staged.path.as_path();
     if pending.original.is_some() {
         return std::fs::rename(tmp, &pending.target);
     }
-    match std::fs::hard_link(tmp, &pending.target) {
+    let linked = if unsupported(Primitive::Link) {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    } else {
+        std::fs::hard_link(tmp, &pending.target)
+    };
+    match linked {
         Ok(()) => {
             let _ = std::fs::remove_file(tmp);
             Ok(())
@@ -71,16 +110,27 @@ pub(crate) fn finalize(tmp: &Path, pending: &Pending) -> std::io::Result<()> {
 
 /// Create a sibling temp file of `target` holding `bytes`, with `mode`
 /// (or `0666 & ~umask` for a new file).
-fn stage(target: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<PathBuf> {
+fn stage(
+    target: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    hooks: &mut dyn Hooks,
+) -> std::io::Result<Staged> {
     let tmp = super::super::util::unique_tmp_path(target);
-    write_new(&tmp, bytes, mode)?;
-    Ok(tmp)
+    write_new(&tmp, bytes, mode, hooks)?;
+    Ok(Staged { path: tmp })
 }
 
 /// Write `bytes` to a file created at `tmp` exclusively: an existing path,
 /// a symlink included, is never followed, reused or removed. A file this
 /// call did create is removed again if writing it fails.
-pub(crate) fn write_new(tmp: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+#[cfg_attr(not(test), allow(unused_variables))]
+pub(crate) fn write_new(
+    tmp: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    hooks: &mut dyn Hooks,
+) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -91,6 +141,8 @@ pub(crate) fn write_new(tmp: &Path, bytes: &[u8], mode: Option<u32>) -> std::io:
     let mut file = options.open(tmp)?;
     let written: std::io::Result<()> = (|| {
         file.write_all(bytes)?;
+        #[cfg(test)]
+        hooks.temp_written(&file);
         #[cfg(unix)]
         if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
@@ -142,7 +194,7 @@ fn unchanged(p: &Pending) -> Result<(), String> {
 
 /// Put back a file this call already committed. Only if it still holds the
 /// bytes we wrote (otherwise someone else changed it after us: leave it).
-fn restore(p: &Pending) -> Result<(), String> {
+fn restore(p: &Pending, hooks: &mut dyn Hooks) -> Result<(), String> {
     let current = std::fs::read(&p.target).map_err(|e| format!("cannot read it back: {e}"))?;
     if current != p.new {
         return Err("it changed again after this call wrote it; left as is".into());
@@ -150,25 +202,32 @@ fn restore(p: &Pending) -> Result<(), String> {
     match &p.original {
         None => std::fs::remove_file(&p.target).map_err(|e| format!("cannot remove it: {e}")),
         Some(original) => {
-            let tmp = stage(&p.target, original, p.mode).map_err(|e| format!("staging: {e}"))?;
-            std::fs::rename(&tmp, &p.target).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
+            let tmp = stage(&p.target, original, p.mode, hooks)
+                .map_err(|e| format!("staging: {e}"))?;
+            std::fs::rename(&tmp.path, &p.target).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp.path);
                 format!("rename: {e}")
             })
         }
     }
 }
 
-fn remove_all(temps: &[PathBuf]) {
+fn remove_all(temps: &[Staged]) {
     for tmp in temps {
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp.path);
     }
 }
 
+/// Creates `name` in `parent` the way staging creates a temp (tests only).
+#[cfg(test)]
+pub(crate) fn create_temp_for_test(parent: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    write_new(&parent.join(name), bytes, None, &mut RealHooks)
+}
+
 pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<(), String> {
-    let mut temps: Vec<PathBuf> = Vec::with_capacity(files.len());
+    let mut temps: Vec<Staged> = Vec::with_capacity(files.len());
     for p in files {
-        match stage(&p.target, &p.new, p.mode) {
+        match stage(&p.target, &p.new, p.mode, hooks) {
             Ok(tmp) => temps.push(tmp),
             Err(e) => {
                 remove_all(&temps);
@@ -189,7 +248,7 @@ pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<(), Str
             let mut restored = Vec::new();
             let mut failed = Vec::new();
             for done in &files[..k] {
-                match restore(done) {
+                match restore(done, hooks) {
                     Ok(()) => restored.push(done.display.clone()),
                     Err(why) => failed.push(format!("{} ({why})", done.display)),
                 }

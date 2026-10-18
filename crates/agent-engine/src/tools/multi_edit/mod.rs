@@ -246,7 +246,8 @@ struct Loaded {
     mode: Option<u32>,
 }
 
-fn load_existing(target: &Path) -> std::result::Result<Loaded, String> {
+#[cfg_attr(not(test), allow(unused_variables))]
+fn load_existing(target: &Path, hooks: &mut dyn commit::Hooks) -> std::result::Result<Loaded, String> {
     use std::io::Read;
     let mut file = std::fs::File::open(target).map_err(|e| format!("cannot open: {e}"))?;
     let meta = file.metadata().map_err(|e| format!("cannot stat: {e}"))?;
@@ -266,6 +267,8 @@ fn load_existing(target: &Path) -> std::result::Result<Loaded, String> {
     if meta.len() > MAX_FILE_BYTES as u64 {
         return Err(format!("larger than {MAX_FILE_BYTES} bytes"));
     }
+    #[cfg(test)]
+    hooks.before_read();
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.by_ref()
         .take(MAX_FILE_BYTES as u64 + 1)
@@ -331,7 +334,7 @@ fn run(
                         content,
                         identity,
                         mode,
-                    } = load_existing(&target).map_err(at)?;
+                    } = load_existing(&target, hooks).map_err(at)?;
                     FileEntry {
                         display: spec.path.clone(),
                         target: target.clone(),
