@@ -3321,6 +3321,36 @@ impl RemoteBroker {
         })
     }
 
+    /// A non-2xx `/proxy` answer. A 502 whose `error` is a retryable
+    /// `BrokerError::Refresh` from the daemon (it maps those to 502) becomes
+    /// the same typed error, so the client keeps its "retry shortly" hint.
+    /// Only the KIND is read from the body, by matching the exact prefix our
+    /// own Display produces for that kind; the message is static, so no
+    /// broker-controlled byte reaches the Display (spec §5.1).
+    async fn proxy_failure(resp: reqwest::Response, fallback: String) -> BrokerError {
+        if resp.status() != reqwest::StatusCode::BAD_GATEWAY {
+            return BrokerError::Transport(fallback);
+        }
+        let Ok(body) = read_body_capped(resp, 4096).await else {
+            return BrokerError::Transport(fallback);
+        };
+        let text = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        use super::token::{RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let prefix = BrokerError::Refresh(RefreshFailure::new(kind, "")).to_string();
+            if text.starts_with(&prefix) {
+                return BrokerError::Refresh(RefreshFailure::new(
+                    kind,
+                    "the remote credential broker could not refresh this credential",
+                ));
+            }
+        }
+        BrokerError::Transport(fallback)
+    }
+
     async fn post_proxy(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
         let resp = self
@@ -3475,10 +3505,8 @@ impl CredentialBroker for RemoteBroker {
         request.stream = false;
         let resp = self.post_proxy(&request).await?;
         if !resp.status().is_success() {
-            return Err(BrokerError::Transport(format!(
-                "broker proxy returned HTTP {}",
-                resp.status()
-            )));
+            let fallback = format!("broker proxy returned HTTP {}", resp.status());
+            return Err(Self::proxy_failure(resp, fallback).await);
         }
         let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
         serde_json::from_str::<ProxyResponse>(&body)
@@ -3491,11 +3519,10 @@ impl CredentialBroker for RemoteBroker {
         let resp = self.post_proxy(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            // Broker-controlled error body: dropped unread (spec §5.1).
-            drop(resp);
-            return Err(BrokerError::Transport(format!(
-                "broker proxy stream failed: {status}"
-            )));
+            // Broker-controlled error body: only a refresh-failure kind is
+            // recovered from it, never its text (spec §5.1).
+            let fallback = format!("broker proxy stream failed: {status}");
+            return Err(Self::proxy_failure(resp, fallback).await);
         }
         use futures::StreamExt;
         let stream = resp
@@ -5044,6 +5071,62 @@ mod tests {
             assert!(msg.contains(&status.to_string()), "status lost: {msg}");
             assert_no_hostile_bytes(&msg);
         }
+    }
+
+    async fn spawn_remote_broker_body(status: u16, body: String) -> RemoteBroker {
+        use axum::routing::post;
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().route(
+            "/proxy",
+            post(move || {
+                let body = body.clone();
+                async move { (code, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        RemoteBroker::new(
+            format!("http://{addr}"),
+            "opaque-machine-token",
+            reqwest::Client::new(),
+            super::super::TokenCache::new(),
+        )
+    }
+
+    /// Round-2 item 4: the daemon's 502 for a retryable refresh failure
+    /// (a Muse re-mint that hit the network) reaches a remote client as the
+    /// typed retryable refresh error, so the "retry shortly" hint survives.
+    /// Only the kind is taken from the body; the text is static, so a
+    /// hostile broker still can't put its bytes into the Display.
+    #[tokio::test]
+    async fn remote_broker_502_keeps_a_retryable_refresh_failure() {
+        use super::super::token::{RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let daemon_text = BrokerError::Refresh(RefreshFailure::new(
+                kind,
+                format!("HTTP error 503 {HOSTILE_SENTINEL} ECHOED input_schema"),
+            ))
+            .to_string();
+            let body = serde_json::json!({ "error": daemon_text }).to_string();
+            let broker = spawn_remote_broker_body(502, body.clone()).await;
+            let stream_err = broker.proxy_stream(groq_request(true)).await.err().unwrap();
+            let buffered_err = broker.proxy(groq_request(false)).await.unwrap_err();
+            for err in [stream_err, buffered_err] {
+                let BrokerError::Refresh(f) = &err else {
+                    panic!("{kind:?}: expected Refresh, got {err:?}");
+                };
+                assert_eq!(f.kind, kind);
+                let msg = err.to_string();
+                assert!(msg.contains("retry shortly"), "{msg}");
+                assert_no_hostile_bytes(&msg);
+            }
+        }
+        // Anything else in a 502 stays an opaque transport error.
+        let broker = spawn_remote_broker_body(502, hostile_broker_json()).await;
+        let err = broker.proxy_stream(groq_request(true)).await.err().unwrap();
+        assert!(matches!(err, BrokerError::Transport(_)), "{err:?}");
+        assert_no_hostile_bytes(&err.to_string());
     }
 
     /// RemoteBroker::proxy_stream: a non-2xx broker body must never enter the
