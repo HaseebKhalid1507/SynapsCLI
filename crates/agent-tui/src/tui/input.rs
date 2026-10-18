@@ -422,8 +422,15 @@ fn handle_key(
             return InputAction::None;
         }
         // While main streams, an unknown `/word` would be sent to main as a
-        // steer. In a worker view it is refused there instead.
-        (KeyCode::Enter, _) if watching && streaming && !slash_is_known(app, registry) => {
+        // steer; idle, a `/` with no command word would be sent to main as a
+        // prompt (prG R1). In a worker view both are refused there instead.
+        // Idle, a non-empty unknown `/word` still goes to the session (a
+        // newer daemon's command), and its answer lands in this view.
+        (KeyCode::Enter, _)
+            if watching
+                && !slash_is_known(app, registry)
+                && (streaming || slash_word(app).is_empty()) =>
+        {
             let word = app.input_first_line().split_whitespace().next().unwrap_or("/").to_string();
             super::watch::notice(app, format!("unknown command: {word}"));
             return InputAction::None;
@@ -555,11 +562,13 @@ fn handle_key(
 /// refuse, rather than send to the main agent as a steer (the same
 /// resolution as `dispatch`'s `StreamingInput` arm). Non-slash input: true.
 fn slash_is_known(app: &App, registry: &Arc<CommandRegistry>) -> bool {
-    let line = app.input_first_line();
-    let Some(rest) = line.strip_prefix('/') else {
+    if !app.input_first_line().starts_with('/') {
         return true;
-    };
-    let raw = rest.split_whitespace().next().unwrap_or("");
+    }
+    let raw = slash_word(app);
+    if raw.is_empty() {
+        return false;
+    }
     let streaming = super::commands::to_owned_commands(super::commands::STREAMING_COMMANDS);
     if super::commands::is_streaming_command(&super::commands::resolve_prefix(raw, &streaming)) {
         return true;
@@ -567,6 +576,15 @@ fn slash_is_known(app: &App, registry: &Arc<CommandRegistry>) -> bool {
     let all = super::commands::all_commands_with_skills(registry);
     let resolved = super::commands::resolve_prefix(raw, &all);
     all.contains(&resolved)
+}
+
+/// The command word of `/word args` (empty for a bare `/`).
+fn slash_word(app: &App) -> &str {
+    let rest = app.input_first_line().strip_prefix('/').unwrap_or("");
+    if rest.starts_with(char::is_whitespace) {
+        return "";
+    }
+    rest.split_whitespace().next().unwrap_or("")
 }
 
 /// User pressed Enter with non-empty input while not streaming.

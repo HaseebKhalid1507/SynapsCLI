@@ -450,3 +450,25 @@ fn the_footer_advertises_alt_arrows_for_agents() {
     let footer = frame.lines().last().unwrap_or("");
     assert!(footer.contains("alt+\u{2191}\u{2193} agents"), "{footer:?}");
 }
+
+/// prG R1: with main idle, a bare `/` (no command word) in a worker view
+/// fell through to process_submit, which only treats `/x` (len > 1) as a
+/// command, and was sent to MAIN as a prompt. It is refused in the view.
+#[test]
+fn a_bare_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 11, "scout");
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_11", "scout", "running", vec![], 0));
+    let main_before = h.main_transcript_text();
+    for typed in ["/", "/   "] {
+        h.type_str(typed);
+        h.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(h.take_actions().is_empty(), "{typed:?}: nothing is sent");
+        assert_eq!(h.input_contents(), typed, "the text stays");
+        h.key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+    }
+    let worker = h.worker_transcript_text("sa_11");
+    assert!(worker.contains("unknown command: /"), "{worker}");
+    assert_eq!(h.main_transcript_text(), main_before, "main gets nothing");
+}
