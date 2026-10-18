@@ -1105,28 +1105,43 @@ mod tests {
     fn system_blocks_oauth_transport_identity_first_and_marker_on_last() {
         const CLAUDE_CODE_IDENTITY: &str =
             "You are Claude Code, Anthropic's official CLI for Claude.";
-        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
-            let prompt = Some("custom prompt".to_string());
-            let system = HelperMethods::build_system_blocks("oauth", &prompt, ttl).unwrap();
-            let blocks = system.as_array().unwrap();
-            assert_eq!(blocks.len(), 4);
-            // OAuth's protocol identity is fixed and FIRST. Product/user identity
-            // remains additive and therefore cannot replace the transport contract.
-            assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
-            // Whatever identity is configured -- including the transport line
-            // itself, which is valid config -- rides after it.
-            assert_eq!(blocks[1]["text"], crate::core::config::get_identity());
-            assert!(blocks[0].get("cache_control").is_none());
-            assert!(blocks[1].get("cache_control").is_none());
-            assert!(blocks[2].get("cache_control").is_none());
-            // Last block carries the stable-prefix marker.
-            let cc = &blocks[3]["cache_control"];
-            assert_eq!(cc["type"], "ephemeral");
-            match ttl {
-                CacheTtl::FiveMinutes => assert!(cc.get("ttl").is_none(), "5m: no ttl key"),
-                _ => assert_eq!(cc["ttl"], "1h"),
+        // Pinned, not latched: `config::IDENTITY` is process-wide and set by
+        // whichever test first loads a config, so read ambiently this test
+        // depended on test order and on the developer's real HOME.
+        crate::core::config::with_identity_for_tests(crate::core::config::DEFAULT_IDENTITY, || {
+            for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
+                let prompt = Some("custom prompt".to_string());
+                let system = HelperMethods::build_system_blocks("oauth", &prompt, ttl).unwrap();
+                let blocks = system.as_array().unwrap();
+                assert_eq!(blocks.len(), 4);
+                // OAuth's protocol identity is fixed and FIRST. Product/user identity
+                // remains additive and therefore cannot replace the transport contract.
+                assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+                // The configured identity rides after it ...
+                assert_eq!(blocks[1]["text"], crate::core::config::DEFAULT_IDENTITY);
+                // ... and out of the box it is the product identity, not a second
+                // copy of the transport line.
+                assert_ne!(blocks[0]["text"], blocks[1]["text"]);
+                assert!(blocks[0].get("cache_control").is_none());
+                assert!(blocks[1].get("cache_control").is_none());
+                assert!(blocks[2].get("cache_control").is_none());
+                // Last block carries the stable-prefix marker.
+                let cc = &blocks[3]["cache_control"];
+                assert_eq!(cc["type"], "ephemeral");
+                match ttl {
+                    CacheTtl::FiveMinutes => assert!(cc.get("ttl").is_none(), "5m: no ttl key"),
+                    _ => assert_eq!(cc["ttl"], "1h"),
+                }
             }
-        }
+        });
+        // Configuring the transport line itself as the identity is valid: it
+        // is sent twice, transport copy still first.
+        crate::core::config::with_identity_for_tests(CLAUDE_CODE_IDENTITY, || {
+            let system = HelperMethods::build_system_blocks("oauth", &None, CacheTtl::FiveMinutes).unwrap();
+            let blocks = system.as_array().unwrap();
+            assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+            assert_eq!(blocks[1]["text"], CLAUDE_CODE_IDENTITY);
+        });
     }
 
     #[test]
