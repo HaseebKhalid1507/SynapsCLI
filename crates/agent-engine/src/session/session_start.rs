@@ -328,16 +328,17 @@ pub(crate) async fn run_at_create(host: &EngineHost, bus: &Arc<HookBus>, session
 /// Both controls are scoped to one session, named by its journal id (the
 /// key its hook gets): only `#[serial]` tests are serialized, and the other
 /// tests of the same binary run their own sessions meanwhile, so an
-/// unscoped flag or count could be taken or moved by them. The requeue slot
-/// holds one session at a time, so tests that set it must be `#[serial]`
-/// with each other.
+/// unscoped flag or count could be taken or moved by them. Requeue requests
+/// are kept per session, so one for a second session does not replace one
+/// whose turn has not ended yet.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Mutex, MutexGuard};
 
-    static REQUEUE_AFTER_TURN: Mutex<Option<String>> = Mutex::new(None);
+    static REQUEUE_AFTER_TURN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     static CALLS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+    static ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock().unwrap_or_else(|p| p.into_inner())
@@ -347,21 +348,16 @@ pub mod testing {
     /// back in line, as if it had not run yet. With the keep-warm period
     /// that turn starts, this reaches a ping that is due while the hook is
     /// pending, which no production path does today: a period needs an
-    /// accepted request, and that request waited for the hook. One-shot.
+    /// accepted request, and that request waited for the hook. One-shot,
+    /// per session: the actor takes it at the turn's end, before `Idle`.
     pub fn requeue_after_next_turn(session: &str) {
-        *lock(&REQUEUE_AFTER_TURN) = Some(session.to_string());
+        lock(&REQUEUE_AFTER_TURN).insert(session.to_string());
     }
 
     /// Consume the request above if it names `session` (its actor, at a
     /// turn's end).
     pub(crate) fn take_requeue(session: &str) -> bool {
-        let mut slot = lock(&REQUEUE_AFTER_TURN);
-        if slot.as_deref() == Some(session) {
-            *slot = None;
-            true
-        } else {
-            false
-        }
+        lock(&REQUEUE_AFTER_TURN).remove(session)
     }
 
     /// `on_session_start` calls made through the gate for `session`.
@@ -369,8 +365,15 @@ pub mod testing {
         lock(&CALLS).get(session).copied().unwrap_or(0)
     }
 
+    /// The sessions whose `on_session_start` calls went through the gate,
+    /// in call order (every session of the process: filter by journal id).
+    pub fn call_order() -> Vec<String> {
+        lock(&ORDER).clone()
+    }
+
     pub(super) fn note_call(session: &str) {
         *lock(&CALLS).entry(session.to_string()).or_insert(0) += 1;
+        lock(&ORDER).push(session.to_string());
     }
 
     /// Holds the host's session-start gate while alive: every hook in line

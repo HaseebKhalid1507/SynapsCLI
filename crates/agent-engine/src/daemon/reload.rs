@@ -980,6 +980,25 @@ mod tests {
         assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
     }
 
+    /// The restore without the hook wait keeps #255's `/memory` carry: the
+    /// session's recorded choice rides in the saved config, Parked or not.
+    #[test]
+    fn a_restore_keeps_the_sessions_memory_choice() {
+        use crate::session::SessionMemoryMode;
+        for mode in [Some(SessionMemoryMode::Off), Some(SessionMemoryMode::CaptureOnly), None] {
+            let saved = SessionConfig {
+                memory_mode: mode,
+                await_extensions: true,
+                ..Default::default()
+            };
+            for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
+                let restored = restore_config(&saved, lifecycle);
+                assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
+                assert!(!restored.await_extensions, "{lifecycle:?}");
+            }
+        }
+    }
+
     /// Likewise the session's `/memory` choice: a reload without a
     /// checkpoint reply must not re-grant memory the user turned off.
     #[test]

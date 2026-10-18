@@ -348,3 +348,65 @@ async fn a_typed_turn_waiting_for_on_session_start_is_not_bound_by_the_event_bud
     assert_eq!(outcome, None, "no budget stop for a typed turn");
     assert_history_pairing(&history);
 }
+
+/// `/budget` reply text (`EngineCommand`, served mid-turn too).
+async fn budget(t: &mut LocalTransport, id: u64, arg: &str) -> String {
+    t.send(SessionCommand::EngineCommand {
+        id,
+        name: "budget".into(),
+        arg: arg.into(),
+    })
+    .await
+    .unwrap();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(30), t.next_event())
+            .await
+            .expect("actor hung")
+            .expect("alive");
+        if let SessionEventWire::QueryResult { id: i, value } = env.event {
+            if i == id {
+                return value.to_string();
+            }
+        }
+    }
+}
+
+/// The event budget lives only in the stream's own copy. While an event turn
+/// runs (here one whose request waited for the hook), the session's budget
+/// stays the session's: `/budget status` shows it, and a `/budget time` set
+/// mid-turn is still there once the event turn has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn during_an_event_turn_the_budget_command_sees_the_session_budget() {
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let hold = start_seam::hold_gate(&host).await;
+    let (mut t, _journal) = deferred_start_session(&host).await;
+
+    send_event(&t, "evt-budget-status").await;
+    until_turn_started(&mut t).await;
+    drop(hold);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while hits.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the event turn's request is in flight");
+
+    let status = budget(&mut t, 41, "status").await;
+    assert!(
+        status.contains("provider rounds: off"),
+        "the session's budget, not the event turn's: {status}"
+    );
+    let set = budget(&mut t, 42, "time 4h").await;
+    assert!(set.contains("14400s"), "{set}");
+
+    t.send(SessionCommand::Cancel).await.unwrap();
+    drive_to_idle(&mut t).await;
+    let status = budget(&mut t, 43, "status").await;
+    assert!(
+        status.contains("wall-clock: 14400s") && status.contains("provider rounds: off"),
+        "the mid-turn change outlives the event turn: {status}"
+    );
+}

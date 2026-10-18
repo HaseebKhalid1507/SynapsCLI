@@ -1398,3 +1398,76 @@ async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
     assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once in all");
     end(&mut t).await;
 }
+
+// ── A due ping while fenced for a reload AND waiting for the hook ───────────
+//
+// A reload's checkpoint fences the session until the exec (or the daemon's
+// report that it failed): the exec would discard the ping's result. The
+// ping also waits for `on_session_start`. Fenced and waiting, the due ping
+// goes out only once both have cleared, in either order.
+
+/// Fence `handle` as a reload's checkpoint does (host-sent).
+async fn fence_for_reload(t: &mut LocalTransport, handle: &SessionHandle) {
+    use agent_engine::session::wire::CHECKPOINT_QUERY_ID;
+    handle
+        .send(SessionCommand::Checkpoint {
+            reason: agent_engine::session::CheckpointReason::Reload,
+        })
+        .await
+        .unwrap();
+    until(t, |e| {
+        matches!(e, agent_engine::session::SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_due_ping_while_fenced_and_waiting_for_the_hook_goes_out_once_both_clear_fence_first() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    fence_for_reload(&mut t, &handle).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "no ping while fenced and waiting");
+
+    handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "the fence lifted; the ping still waits for the hook");
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls, "the hook still waits");
+
+    drop(hold);
+    assert!(
+        wait_pings(&bodies, 1, PATIENCE).await,
+        "the held ping goes out once both have cleared"
+    );
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
+    end(&mut t).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_due_ping_while_fenced_and_waiting_for_the_hook_goes_out_once_both_clear_hook_first() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    fence_for_reload(&mut t, &handle).await;
+
+    drop(hold);
+    assert!(
+        hooks_run(&handle.journal_id(), calls, 1, PATIENCE).await,
+        "the hook runs under the fence"
+    );
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "the hook ran; the ping still waits for the fence");
+
+    handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    assert!(
+        wait_pings(&bodies, 1, PATIENCE).await,
+        "the held ping goes out once both have cleared"
+    );
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
+    end(&mut t).await;
+}

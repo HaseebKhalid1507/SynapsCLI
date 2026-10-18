@@ -1012,12 +1012,13 @@ impl SessionActor {
         // checkpoint reply.
         self.sync_memory_choice();
         self.flush_saves().await;
-        self.emit(SessionEventWire::Idle);
-        self.cache_keepwarm_on_idle().await;
+        // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
         #[cfg(any(test, feature = "testing"))]
         if super::session_start::testing::take_requeue(&self.journal_id.load()) {
             self.queue_session_start();
         }
+        self.emit(SessionEventWire::Idle);
+        self.cache_keepwarm_on_idle().await;
     }
 
     /// Wall 1 — actor-owned context-head checkpoint persistence.

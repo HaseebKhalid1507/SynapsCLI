@@ -772,3 +772,191 @@ async fn a_worker_recheck_still_honours_the_reconnect_grace() {
     );
     handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
 }
+
+// ── A park and a pending `on_session_start` ─────────────────────────────────
+//
+// A park that happens takes a hook not called yet out of line (nothing runs
+// for a parked session); the unpark puts it back. A park that does not
+// happen (#255 holds it while a worker's result waits, and re-checks it)
+// takes nothing out: the hook keeps its place in line and runs while the
+// session is live. Two test seams make the hook pending after a turn: the
+// host's session-start gate is held, and that turn puts a fresh hook back in
+// line at its end.
+
+use agent_engine::session::session_start_testing as start_seam;
+
+/// One turn on `t`, ending with `sid`'s hook back in line (behind a held gate).
+async fn turn_leaving_the_hook_in_line(t: &mut LocalTransport, sid: &str) {
+    start_seam::requeue_after_next_turn(sid);
+    t.send(submit("hello")).await.unwrap();
+    until(t, |e| matches!(e, SessionEventWire::Idle)).await;
+}
+
+/// Wait (bounded) until `n` hooks of `sid` have run since `base`.
+async fn hooks_run(sid: &str, base: u64, n: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if start_seam::calls(sid) >= base + n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Session A's hook is in line before session B's. A's park is held by its
+/// worker's uncollected result and re-checked every 300 ms; none of those
+/// parks happens, so A's hook keeps its place: released, it runs first, with
+/// A live, then B's. Once collected, A parks; its hook has run, so its
+/// unpark runs none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_park_held_by_workers_leaves_the_hook_in_line() {
+    use agent_engine::session::actor::testing::WorkerParkRecheck;
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _r = WorkerParkRecheck::set(Duration::from_millis(300));
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (a_handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let b_handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(a_handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let (mut b, _) = LocalTransport::attach(b_handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let (sa, sb) = (a_handle.journal_id(), b_handle.journal_id());
+    let hold = start_seam::hold_gate(&host).await;
+    let (ca, cb) = (start_seam::calls(&sa), start_seam::calls(&sb));
+    turn_leaving_the_hook_in_line(&mut a, &sa).await;
+    turn_leaving_the_hook_in_line(&mut b, &sb).await;
+
+    // A's worker finished; its result is not collected: the park is held.
+    let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
+    fake_worker(&registry, "sa_2", &state);
+    finish(&state);
+    detach(&mut a).await;
+    assert!(
+        !wait_lifecycle(&a_handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await,
+        "held while the result waits"
+    );
+    assert_eq!(start_seam::calls(&sa), ca, "A's hook still waits");
+
+    let before = start_seam::call_order().len();
+    drop(hold);
+    assert!(hooks_run(&sb, cb, 1).await, "B's hook runs");
+    assert!(hooks_run(&sa, ca, 1).await, "A's hook runs");
+    let order: Vec<String> = start_seam::call_order()[before..]
+        .iter()
+        .filter(|s| **s == sa || **s == sb)
+        .cloned()
+        .collect();
+    assert_eq!(order, [sa.clone(), sb.clone()], "A's hook kept its place in line");
+    assert_eq!(a_handle.lifecycle(), SessionLifecycle::Live, "A's hook ran while A was live");
+
+    // Collected: A parks. Its hook has run: the unpark runs none.
+    registry.lock().unwrap().get_mut("sa_2").unwrap().mark_collected();
+    assert!(
+        wait_lifecycle(&a_handle, SessionLifecycle::Parked, Duration::from_secs(3)).await,
+        "the re-check parked it"
+    );
+    let (_a2, _) = LocalTransport::attach(a_handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    assert!(wait_lifecycle(&a_handle, SessionLifecycle::Live, Duration::from_secs(5)).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(start_seam::calls(&sa), ca + 1, "once per session");
+    assert_eq!(start_seam::calls(&sb), cb + 1, "once per session");
+    for h in [&a_handle, &b_handle] {
+        h.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+    }
+}
+
+/// A's park is held by its worker, then the result is collected and the
+/// re-check parks it: that park takes the hook out of line, so nothing runs
+/// for the parked session when the gate frees. An event (as `synaps send`)
+/// unparks it: the hook runs once, and the event's turn sends its request
+/// after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_park_that_happens_takes_the_hook_out_of_line_and_the_unpark_runs_it_once() {
+    use agent_engine::session::actor::testing::WorkerParkRecheck;
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _r = WorkerParkRecheck::set(Duration::from_millis(300));
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    let queue = task.event_queue();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let sid = handle.journal_id();
+    let hold = start_seam::hold_gate(&host).await;
+    let calls = start_seam::calls(&sid);
+    turn_leaving_the_hook_in_line(&mut a, &sid).await;
+
+    let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
+    fake_worker(&registry, "sa_2", &state);
+    finish(&state);
+    detach(&mut a).await;
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await,
+        "held while the result waits"
+    );
+    registry.lock().unwrap().get_mut("sa_2").unwrap().mark_collected();
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(3)).await,
+        "the re-check parked it"
+    );
+
+    drop(hold);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(start_seam::calls(&sid), calls, "no hook for a parked session");
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked);
+
+    // The whole round (unpark, hook, turn, park again: the grace is 0) can
+    // fit between two lifecycle polls: watch the events instead.
+    let hits_before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let mut watch = handle.subscribe();
+    queue
+        .push(agent_engine::events::types::Event::simple("test", "wake up", None))
+        .unwrap();
+    let (mut saw_live, mut saw_turn) = (false, false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), watch.recv()).await {
+            Ok(Ok(env)) => match env.event {
+                SessionEventWire::Lifecycle(SessionLifecycle::Live) => saw_live = true,
+                SessionEventWire::TurnStarted {
+                    trigger: TurnTrigger::EventAuto,
+                    ..
+                } => saw_turn = true,
+                SessionEventWire::Lifecycle(SessionLifecycle::Parked) if saw_turn => break,
+                _ => {}
+            },
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(saw_live, "the event unparks it");
+    assert!(saw_turn, "the event's turn starts");
+    assert!(hooks_run(&sid, calls, 1).await, "the unpark runs the hook");
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) > hits_before,
+        "the event's turn sent its request"
+    );
+    // Its turn ended and it parked again: no second hook.
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(start_seam::calls(&sid), calls + 1, "the hook ran once");
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}
