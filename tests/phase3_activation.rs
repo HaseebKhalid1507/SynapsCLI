@@ -48,6 +48,9 @@
 //! Flag matrix: every session-set scenario runs with the core-set flag
 //! OFF (default core) and ON (progressive core) via `for_both_cores`.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -395,6 +398,7 @@ fn acceptance_registry(mcp: &McpFixture, ext: &ExtFixture) -> ToolRegistry {
 
 #[test]
 fn a01_first_request_core_only_within_budget() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a01", json!([]));
     let ext = ext_fixture("a01");
     let registry = acceptance_registry(&mcp, &ext);
@@ -431,6 +435,7 @@ fn a01_first_request_core_only_within_budget() {
 
 #[test]
 fn a02_dormant_bodies_absent_from_first_request() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a02", json!([]));
     let ext = ext_fixture("a02");
     let registry = acceptance_registry(&mcp, &ext);
@@ -468,6 +473,7 @@ fn a02_dormant_bodies_absent_from_first_request() {
 
 #[tokio::test]
 async fn a03_search_starts_zero_processes() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a03", json!([]));
     let ext = ext_fixture("a03");
     let registry = acceptance_registry(&mcp, &ext);
@@ -524,6 +530,7 @@ async fn a03_search_starts_zero_processes() {
 
 #[test]
 fn a04_activation_adds_exactly_one_schema() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a04", json!([]));
     let ext = ext_fixture("a04");
     let registry = acceptance_registry(&mcp, &ext);
@@ -574,6 +581,7 @@ fn a04_activation_adds_exactly_one_schema() {
 
 #[test]
 fn a05_forged_unactivated_call_denied_before_execution() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a05", json!([]));
     let ext = ext_fixture("a05");
     let registry = acceptance_registry(&mcp, &ext);
@@ -615,6 +623,7 @@ fn a05_forged_unactivated_call_denied_before_execution() {
 
 #[test]
 fn a06_alias_spellings_cannot_bypass_activation() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a06", json!([]));
     let ext = ext_fixture("a06");
     let registry = acceptance_registry(&mcp, &ext);
@@ -662,6 +671,7 @@ fn a06_alias_spellings_cannot_bypass_activation() {
 
 #[test]
 fn a07_new_sessions_inherit_no_activation() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a07", json!([]));
     let ext = ext_fixture("a07");
     let registry = acceptance_registry(&mcp, &ext);
@@ -695,6 +705,7 @@ fn a07_new_sessions_inherit_no_activation() {
 
 #[tokio::test]
 async fn a08_mcp_exact_lease_no_sibling_grant() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture(
         "a08",
         json!([
@@ -740,6 +751,7 @@ async fn a08_mcp_exact_lease_no_sibling_grant() {
 
 #[tokio::test]
 async fn a09_extension_exact_lease_no_sibling_grant() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a09", json!([]));
     let ext = ext_fixture("a09");
     let registry = Arc::new(tokio::sync::RwLock::new(acceptance_registry(&mcp, &ext)));
@@ -793,6 +805,7 @@ async fn a09_extension_exact_lease_no_sibling_grant() {
 
 #[test]
 fn a10_revocation_digest_generation_invalidate() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a10", json!([]));
     let ext = ext_fixture("a10");
     let mut registry = acceptance_registry(&mcp, &ext);
@@ -884,6 +897,7 @@ fn a10_revocation_digest_generation_invalidate() {
 
 #[test]
 fn a11_cross_provider_logical_set_equivalence() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a11", json!([]));
     let ext = ext_fixture("a11");
     let registry = acceptance_registry(&mcp, &ext);
@@ -991,6 +1005,7 @@ fn a11_cross_provider_logical_set_equivalence() {
 
 #[tokio::test]
 async fn a12_skill_bodies_lazy_and_exact() {
+    hermetic_base_dir::pin();
     let root = tmp_dir("skill");
     let dir = root.join("skills").join("zq-skill");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1052,6 +1067,7 @@ async fn a12_skill_bodies_lazy_and_exact() {
 
 #[test]
 fn a13_activate_many_single_generation_update() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a13", json!([]));
     let ext = ext_fixture("a13");
     let registry = acceptance_registry(&mcp, &ext);
@@ -1110,6 +1126,7 @@ fn a13_activate_many_single_generation_update() {
 
 #[tokio::test]
 async fn a14_consent_policy_hooks_gate_model_activation() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a14", json!([]));
     let ext = ext_fixture("a14");
     let registry = acceptance_registry(&mcp, &ext);
@@ -1220,6 +1237,7 @@ fn names_of(schemas: &[Value]) -> BTreeSet<String> {
 
 #[test]
 fn a15_deferred_split_keeps_loaded_tools_stable_across_activation() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a15", json!([]));
     let ext = ext_fixture("a15");
     let registry = acceptance_registry(&mcp, &ext);
@@ -1285,6 +1303,7 @@ fn a15_deferred_split_keeps_loaded_tools_stable_across_activation() {
 
 #[test]
 fn a16_untrusted_tools_are_never_advertised_deferred() {
+    hermetic_base_dir::pin();
     struct Unverified;
     #[async_trait::async_trait]
     impl Tool for Unverified {
@@ -1324,6 +1343,7 @@ fn a16_untrusted_tools_are_never_advertised_deferred() {
 
 #[tokio::test]
 async fn a17_activate_tools_answers_with_text_then_tool_references() {
+    hermetic_base_dir::pin();
     let mcp = mcp_fixture("a17", json!([]));
     let ext = ext_fixture("a17");
     let registry = acceptance_registry(&mcp, &ext);

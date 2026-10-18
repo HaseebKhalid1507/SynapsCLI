@@ -656,7 +656,9 @@ mod tests {
         SessionOpts {
             command: Some(command.to_string()),
             working_directory: None,
-            env: HashMap::new(),
+            // An interactive bash saves its history to $HOME/.bash_history on
+            // exit: the developer's real one, unless the test says otherwise.
+            env: HashMap::from([("HISTFILE".to_string(), "/dev/null".to_string())]),
             rows: None,
             cols: None,
             readiness_timeout_ms: None,

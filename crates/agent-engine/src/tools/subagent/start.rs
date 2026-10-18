@@ -473,11 +473,30 @@ mod tests {
         );
     }
 
+    /// These tests launch a real worker thread. Run unpinned, it read the
+    /// developer's real `auth.json` (and could reach the provider), and wrote
+    /// `logs/subagents` and `subagent-history` under the real `~/.synaps-cli`,
+    /// after the test returned. Pin an empty base dir (no credentials: the
+    /// worker fails at auth, offline) and keep it until the worker has exited.
+    fn join_worker(registry: &Mutex<SubagentRegistry>, handle_id: &str) {
+        let thread = registry
+            .lock()
+            .unwrap()
+            .get_mut(handle_id)
+            .and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_blank_agent_uses_system_prompt() {
+        let _base = crate::test_env::BaseDirGuard::new();
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
-        ctx.capabilities.subagent_registry = Some(Arc::new(Mutex::new(SubagentRegistry::new())));
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        ctx.capabilities.subagent_registry = Some(registry.clone());
 
         let params = json!({
             "agent": "",
@@ -494,14 +513,15 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(body["agent_name"], "inline");
-        assert!(body["handle_id"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("sa_"));
+        let handle_id = body["handle_id"].as_str().unwrap_or_default();
+        assert!(handle_id.starts_with("sa_"));
+        join_worker(&registry, handle_id);
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_inline_name_labels_the_handle() {
+        let _base = crate::test_env::BaseDirGuard::new();
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
         let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
@@ -519,10 +539,13 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(body["agent_name"], "gif-recorder");
         let handle_id = body["handle_id"].as_str().unwrap();
-        let reg = registry.lock().unwrap();
-        assert_eq!(
-            reg.get(handle_id).expect("registered").agent_name,
-            "gif-recorder"
-        );
+        {
+            let reg = registry.lock().unwrap();
+            assert_eq!(
+                reg.get(handle_id).expect("registered").agent_name,
+                "gif-recorder"
+            );
+        }
+        join_worker(&registry, handle_id);
     }
 }

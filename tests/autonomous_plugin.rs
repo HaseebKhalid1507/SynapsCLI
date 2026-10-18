@@ -1,4 +1,7 @@
 //! Real external plugin/host protocol tests: no inference, network or user config.
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,6 +44,7 @@ async fn invoke(manager: &ExtensionManager, args: &[&str]) -> Reply {
 
 #[tokio::test]
 async fn real_plugin_explicit_start_limits_and_host_revocation() {
+    hermetic_base_dir::pin();
     let (temp, manifest) = plugin_copy();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     manager
@@ -106,6 +110,7 @@ async fn real_plugin_explicit_start_limits_and_host_revocation() {
 
 #[tokio::test]
 async fn real_plugin_exact_failover_and_restart_never_resurrects() {
+    hermetic_base_dir::pin();
     let (temp, manifest) = plugin_copy();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     manager
@@ -162,6 +167,7 @@ async fn real_plugin_exact_failover_and_restart_never_resurrects() {
 
 #[tokio::test]
 async fn real_plugin_time_checkpoint_continues_same_model_with_context_off() {
+    hermetic_base_dir::pin();
     let (temp, manifest) = plugin_copy();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     manager
@@ -229,6 +235,7 @@ async fn real_plugin_time_checkpoint_continues_same_model_with_context_off() {
 
 #[tokio::test]
 async fn structured_start_without_declared_permission_cannot_get_driver_handler() {
+    hermetic_base_dir::pin();
     let (temp, mut manifest) = plugin_copy();
     manifest.permissions = vec!["tools.register".into()];
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
@@ -245,6 +252,7 @@ async fn structured_start_without_declared_permission_cannot_get_driver_handler(
 
 #[test]
 fn plugin_stays_external_and_manifest_declares_only_driver_authority() {
+    hermetic_base_dir::pin();
     let (_, manifest) = plugin_copy();
     manifest.validate("autonomous").unwrap();
     assert_eq!(manifest.permissions, vec!["session.drive"]);
@@ -259,6 +267,7 @@ fn plugin_stays_external_and_manifest_declares_only_driver_authority() {
 
 #[tokio::test]
 async fn real_plugin_repeated_completed_turns_advance_exact_favorite_once() {
+    hermetic_base_dir::pin();
     let (temp, manifest) = plugin_copy();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     manager
@@ -348,6 +357,7 @@ async fn real_plugin_repeated_completed_turns_advance_exact_favorite_once() {
 
 #[tokio::test]
 async fn real_plugin_context_default_and_explicit_override_are_start_only() {
+    hermetic_base_dir::pin();
     let (temp, manifest) = plugin_copy();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     manager
