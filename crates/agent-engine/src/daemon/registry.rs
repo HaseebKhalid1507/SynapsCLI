@@ -43,23 +43,72 @@ fn chmod_600(path: &Path) {
 #[cfg(not(unix))]
 fn chmod_600(_path: &Path) {}
 
-/// Write `daemon.json` + `daemon.pid` atomically (tmp + rename), 0600.
+/// Write `daemon.json` + `daemon.pid` atomically (each through its own
+/// temp file + rename), 0600.
 pub fn write_daemon_json(paths: &DaemonPaths, info: &DaemonInfo) -> io::Result<()> {
     let body = serde_json::to_vec_pretty(info).map_err(io::Error::other)?;
     write_atomic(&paths.json, &body)?;
     write_atomic(&paths.pid, format!("{}\n", info.pid).as_bytes())
 }
 
-fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body)?;
-    chmod_600(&tmp);
-    #[cfg(test)]
-    test_pause::at(&test_pause::BEFORE_RENAME);
-    std::fs::rename(&tmp, path)
+/// `<file name>.tmp` next to `path`: one temp file per target, so writes of
+/// `daemon.json` and `daemon.pid` never share one.
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
-/// 0600 tmp + rename (reload-state).
+/// Create `path` as a new private file: `O_CREAT | O_EXCL` (never opens an
+/// existing file, and so never a symlink), `O_NOFOLLOW`, mode 0600 at
+/// creation.
+fn create_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn set_private(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Exactly 0600, whatever the umask took away at creation.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+#[cfg(not(unix))]
+fn set_private(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+/// Write `body` to `<path>.tmp`, created exclusively (a leftover or a
+/// planted file there is unlinked first, never followed), 0600, then rename
+/// it over `path`. The temp file is removed when anything fails.
+fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = temp_path(path);
+    let mut file = match create_private(&tmp) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp)?;
+            create_private(&tmp)?
+        }
+        opened => opened?,
+    };
+    let written = file.write_all(body).and_then(|()| set_private(&file));
+    drop(file);
+    #[cfg(test)]
+    test_pause::at(&test_pause::BEFORE_RENAME);
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, path));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
+}
+
+/// 0600 temp file + rename (reload-state), as [`write_atomic`].
 pub fn write_private_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
     write_atomic(path, body)
 }
