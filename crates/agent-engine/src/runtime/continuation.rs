@@ -1105,13 +1105,19 @@ impl crate::Runtime {
     }
 }
 
-/// Host-only message metadata keys; never sent on any provider wire.
-const HOST_KEYS: [&str; 2] = ["_synaps_context", TURN_KEY];
+/// Host-only message metadata: every `_synaps_*` key (`_synaps_context`,
+/// [`TURN_KEY`], and any later one). Never sent on any provider wire.
+const HOST_KEY_PREFIX: &str = "_synaps_";
+
+fn has_host_key(message: &Value) -> bool {
+    message
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| k.starts_with(HOST_KEY_PREFIX)))
+}
 
 /// Host continuation metadata never goes onto any provider wire.
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
-    let has_host_key = |m: &SharedMessage| HOST_KEYS.iter().any(|k| m.get(*k).is_some());
-    if !messages.iter().any(has_host_key) {
+    if !messages.iter().any(|m| has_host_key(m)) {
         return None;
     }
     Some(
@@ -1123,9 +1129,7 @@ pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMess
                 }
                 let mut m = (**m).clone();
                 if let Some(obj) = m.as_object_mut() {
-                    for key in HOST_KEYS {
-                        obj.remove(key);
-                    }
+                    obj.retain(|k, _| !k.starts_with(HOST_KEY_PREFIX));
                 }
                 Arc::new(m)
             })
@@ -1134,7 +1138,9 @@ pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMess
 }
 
 /// Message key carrying the host's turn identity: `{"id": "<uuid>"}`.
-pub(crate) const TURN_KEY: &str = "_synaps_turn";
+/// Persistence keeps it beside the message, never inside (see
+/// `session_journal::MESSAGE_TURN_KEY`), so older builds never send it.
+pub(crate) const TURN_KEY: &str = agent_core::core::session_journal::MESSAGE_TURN_KEY;
 
 fn turn_id(message: &Value) -> Option<&str> {
     message[TURN_KEY]["id"].as_str()
@@ -1168,7 +1174,8 @@ fn starts_turn(message: &Value) -> bool {
 /// stable id (it is the unsaved tail of a just-submitted turn in practice).
 /// Otherwise (only pushed events or tool traffic since, e.g. a wake after a
 /// cancel and resume) the work is resumed and the recorded start is kept.
-/// The id lives in the message, so it survives checkpoints and restore.
+/// The id lives on the message in memory and beside it on disk, so it
+/// survives checkpoints and restore.
 pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &mut [SharedMessage]) {
     let last_tagged = messages.iter().rposition(|m| turn_id(m).is_some());
     let newer = last_tagged.map_or(0, |i| i + 1);
@@ -2834,6 +2841,26 @@ mod budget_tests {
         let wire = wire_messages(&m).expect("host keys present");
         assert!(wire.iter().all(|x| x.get(TURN_KEY).is_none()));
         assert_eq!(wire.last().unwrap()["content"], "continue");
+    }
+
+    /// Every `_synaps_*` key is host metadata, including ones a later build
+    /// adds: none reaches a provider request.
+    #[test]
+    fn provider_messages_never_carry_any_synaps_key() {
+        let messages: Vec<SharedMessage> = vec![
+            Arc::new(json!({"role":"user","content":"a","_synaps_turn":{"id":"t"}})),
+            Arc::new(json!({"role":"assistant","content":"b","_synaps_future":1})),
+            Arc::new(json!({"role":"user","content":"c","_synaps_context":{"schema":MARKER}})),
+            Arc::new(json!({"role":"user","content":"d"})),
+        ];
+        let wire = wire_messages(&messages).expect("host keys present");
+        for m in &wire {
+            let keys: Vec<_> = m.as_object().unwrap().keys().collect();
+            assert!(keys.iter().all(|k| !k.starts_with("_synaps_")), "{m}");
+        }
+        assert_eq!(wire[3], messages[3]);
+        assert!(wire_messages(&messages[3..]).is_none(), "no copy without host keys");
+        assert_eq!(TURN_KEY, agent_core::core::session_journal::MESSAGE_TURN_KEY);
     }
 
     /// The host's tool-in-flight note (a cancel whose drain timed out) is

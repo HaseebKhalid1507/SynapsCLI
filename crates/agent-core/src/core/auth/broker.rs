@@ -168,7 +168,9 @@ pub(crate) fn anthropic_oauth_catalog_request_headers() -> &'static [(&'static s
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Broker failures. Messages never contain credential values.
+/// Non-exhaustive: new failure kinds are added as brokers gain operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BrokerError {
     /// The named provider is not in any broker registry.
     UnknownProvider(String),
@@ -201,6 +203,9 @@ pub enum BrokerError {
     InvalidAccount(String),
     /// Automatic selection found no account with proven capacity.
     NoAccountAvailable { provider: String, reason: String },
+    /// The remote broker predates an operation this client needs; the
+    /// payload names what is unavailable. Upgrade the broker host.
+    BrokerTooOld(String),
     /// A locked token refresh failed; the kind tells a per-account cooldown,
     /// a busy refresh lock or a transient network/provider failure apart
     /// from an unusable login. Message is secret-free.
@@ -256,11 +261,19 @@ impl std::fmt::Display for BrokerError {
             Self::NoAccountAvailable { provider, reason } => {
                 write!(f, "no account with proven capacity for '{provider}': {reason}")
             }
+            Self::BrokerTooOld(what) => write!(
+                f,
+                "broker is older than this client; {what} unavailable (upgrade the broker host)"
+            ),
         }
     }
 }
 
 impl std::error::Error for BrokerError {}
+
+#[cfg(test)]
+#[path = "broker_remote_compat_tests.rs"]
+mod remote_compat_tests;
 
 // ── Vended types ─────────────────────────────────────────────────────────────
 
@@ -3214,7 +3227,43 @@ pub struct RemoteBroker {
     account_policy: Option<AccountPolicy>,
 }
 
+/// A 404 from a route the broker does not have: 0.10.2's axum router
+/// answers an empty, untyped body, while a current broker's errors are JSON.
+/// Only emptiness and the content type are inspected, never the content.
+async fn route_missing(resp: reqwest::Response) -> bool {
+    let json = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    !json
+        && read_body_capped(resp, 1024)
+            .await
+            .is_ok_and(|body| body.trim().is_empty())
+}
+
 impl RemoteBroker {
+    /// True if the broker has no `/usage/snapshot` (0.10.2 and older). The
+    /// probe sends an empty account, which a current broker rejects with a
+    /// 400 before touching any credential.
+    async fn predates_usage_snapshot(&self) -> Result<bool, BrokerError> {
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                    .get(format!("{}/usage/snapshot", self.endpoint))
+                    .query(&[("provider", "anthropic"), ("account", "")])
+                    .bearer_auth(t)
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            404 => Ok(route_missing(resp).await),
+            _ => Ok(false),
+        }
+    }
+
     pub fn new(
         endpoint: impl Into<String>,
         machine_token: impl Into<String>,
@@ -3461,11 +3510,17 @@ impl CredentialBroker for RemoteBroker {
 
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
         let caps = self.capabilities().await?;
-        Ok(caps
+        let accounts = caps
             .into_iter()
             .find(|c| c.key == provider.as_str())
             .map(|c| c.accounts)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        // A 0.10.2 broker lists no accounts at all; don't report that as
+        // "nothing logged in".
+        if accounts.is_empty() && self.predates_usage_snapshot().await? {
+            return Err(BrokerError::BrokerTooOld("account listing".into()));
+        }
+        Ok(accounts)
     }
 
     async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
@@ -3485,11 +3540,23 @@ impl CredentialBroker for RemoteBroker {
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
             404 => {
-                drop(resp);
-                Err(BrokerError::UnknownAccount {
-                    provider: cred.provider.as_str().to_string(),
-                    label: cred.account.label_str().to_string(),
-                })
+                if !route_missing(resp).await {
+                    return Err(BrokerError::UnknownAccount {
+                        provider: cred.provider.as_str().to_string(),
+                        label: cred.account.label_str().to_string(),
+                    });
+                }
+                if cred.provider != OAuthProviderId::Anthropic || !cred.account.is_default() {
+                    return Err(BrokerError::BrokerTooOld("per-account usage".into()));
+                }
+                // The old broker's `/usage` serves its default Anthropic slot.
+                let body = self.anthropic_usage().await?.to_string();
+                super::usage::parse_anthropic_usage(
+                    &body,
+                    cred.account.label_str(),
+                    crate::epoch_millis(),
+                )
+                .map_err(super::usage::UsageError::into_broker_error)
             }
             s if !(200..300).contains(&s) => {
                 // Broker-controlled error body: dropped unread (spec §5.1).

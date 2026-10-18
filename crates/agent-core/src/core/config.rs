@@ -1547,6 +1547,50 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
     }
 }
 
+/// Warning for an `auth.*` key no parser reads (a typo would otherwise
+/// silently leave traffic on the default account), with a did-you-mean.
+fn unknown_auth_key_warning(key: &str) -> Option<String> {
+    const EXACT: [&str; 2] = ["auth.remote_endpoint", "auth.machine_token"];
+    const FAMILIES: [&str; 2] = ["auth.account", "auth.auto"];
+    const PLACEHOLDERS: [&str; 2] = ["<provider>", "<key>"];
+    if EXACT.contains(&key) {
+        return None;
+    }
+    for (family, placeholder) in FAMILIES.iter().zip(PLACEHOLDERS) {
+        match key.strip_prefix(family) {
+            // `auth.account` or `auth.account.` (no provider): name the shape.
+            Some("") | Some(".") => {
+                return Some(format!(
+                    "unknown key '{key}' (did you mean '{family}.{placeholder}'?)"
+                ))
+            }
+            Some(rest) if rest.starts_with('.') && !rest[1..].trim().is_empty() => return None,
+            _ => {}
+        }
+    }
+    // A family typo keeps its suffix: `auth.acount.x` → `auth.account.x`.
+    let (head, rest) = match key.match_indices('.').nth(1) {
+        Some((i, _)) => key.split_at(i),
+        None => (key, ""),
+    };
+    let suggestion = EXACT
+        .iter()
+        .map(|k| (levenshtein(key, k), k.to_string()))
+        .chain(
+            FAMILIES
+                .iter()
+                .filter(|_| !rest.is_empty())
+                .map(|f| (levenshtein(head, f), format!("{f}{rest}"))),
+        )
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k);
+    Some(match suggestion {
+        Some(s) => format!("unknown key '{key}' (did you mean '{s}'?)"),
+        None => format!("unknown key '{key}' — ignored"),
+    })
+}
+
 /// Parse auth.* configuration keys and update the AuthConfig.
 fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
     let v = val.trim();
@@ -1575,7 +1619,7 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
                         .insert(provider.to_string(), v.to_string());
                 }
             }
-            if let Some(key) = key.strip_prefix("auth.auto.") {
+            if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
                 auth_config.auto.insert(key.to_string(), v.to_string());
             }
             // Other unknown auth.* keys preserved (not rejected)
@@ -1972,17 +2016,22 @@ fn apply_config_content_with(
                     parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
-                    if let Some(key) = key.strip_prefix("auth.auto.") {
+                    if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
                         let (_, warnings) = crate::auth::AutoSelectionPolicy::from_config_map(
                             &BTreeMap::from([(key.to_string(), val.trim().to_string())]));
                         config.warnings.extend(warnings);
                     }
-                    if let Some(provider) = key.strip_prefix("auth.account.") {
+                    if let Some(provider) =
+                        key.strip_prefix("auth.account.").filter(|p| !p.trim().is_empty())
+                    {
                         let mut one = BTreeMap::new();
                         one.insert(provider.trim().to_string(), val.trim().to_string());
                         let (_, warnings) =
                             crate::core::auth::AccountPolicy::from_config_map(&one);
                         config.warnings.extend(warnings);
+                    }
+                    if let Some(warning) = unknown_auth_key_warning(key) {
+                        config.warnings.push(warning);
                     }
                 } else if key.starts_with("events.") {
                     if let Err(diagnostic) = parse_events_config_key(&mut config.events, key, val)
@@ -4404,6 +4453,48 @@ api_retries = 5
         let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
         assert_eq!(cfg.shell.max_sessions, 8);
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    #[test]
+    fn bare_or_empty_auth_family_keys_warn() {
+        let cfg = load_config_from_str(
+            "auth.account = work\nauth.account. = work\nauth.auto = on\nauth.auto. = 1\n",
+        );
+        let w = &cfg.warnings;
+        for key in ["auth.account", "auth.account."] {
+            assert!(
+                w.contains(&format!("unknown key '{key}' (did you mean 'auth.account.<provider>'?)")),
+                "{key}: {w:?}"
+            );
+        }
+        for key in ["auth.auto", "auth.auto."] {
+            assert!(
+                w.contains(&format!("unknown key '{key}' (did you mean 'auth.auto.<key>'?)")),
+                "{key}: {w:?}"
+            );
+        }
+        assert!(cfg.auth.accounts.is_empty() && cfg.auth.auto.is_empty());
+    }
+
+    #[test]
+    fn unknown_auth_keys_warn_with_a_suggestion() {
+        let cfg = load_config_from_str(
+            "auth.acount.anthropic = work\nauth.remote_endpont = x\nauth.bogus = 1\n\
+             auth.account.anthropic = work\nauth.machine_token = t\n",
+        );
+        let w = &cfg.warnings;
+        assert!(
+            w.contains(&"unknown key 'auth.acount.anthropic' (did you mean 'auth.account.anthropic'?)".into()),
+            "{w:?}"
+        );
+        assert!(
+            w.contains(&"unknown key 'auth.remote_endpont' (did you mean 'auth.remote_endpoint'?)".into()),
+            "{w:?}"
+        );
+        assert!(w.contains(&"unknown key 'auth.bogus' — ignored".into()), "{w:?}");
+        assert_eq!(w.iter().filter(|w| w.contains("auth.")).count(), 3, "{w:?}");
+        assert_eq!(cfg.auth.accounts.get("anthropic").map(String::as_str), Some("work"));
+        assert!(!cfg.auth.accounts.contains_key("acount.anthropic"));
     }
 
     /// Every listed family key is accepted by its parser for some value

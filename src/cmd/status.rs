@@ -58,7 +58,7 @@ trait UsageBackend: Send + Sync {
     /// `local` or `remote`.
     fn source_label(&self) -> &str;
     /// Labels of the stored accounts for `provider` (non-secret listing).
-    async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, String>;
+    async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, BrokerError>;
     /// Optional display metadata; unavailable metadata must not hide usage.
     async fn identities(&self, _provider: OAuthProviderId) -> Vec<(String, String)> {
         Vec::new()
@@ -110,6 +110,7 @@ fn summary_from_broker_error(e: &BrokerError) -> UsageErrorSummary {
         BrokerError::UnsupportedAccount { .. } => "unsupported_account",
         BrokerError::InvalidAccount(_) => "invalid_account",
         BrokerError::NoAccountAvailable { .. } => "no_account_available",
+        BrokerError::BrokerTooOld(_) => "broker_too_old",
         _ => "broker_error",
     };
     UsageErrorSummary::other(kind, e.to_string())
@@ -121,12 +122,11 @@ impl UsageBackend for BrokerBackend {
         self.source
     }
 
-    async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, String> {
+    async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, BrokerError> {
         self.broker
             .accounts(provider)
             .await
             .map(|rows| rows.into_iter().map(|r| r.label).collect())
-            .map_err(|e| e.to_string())
     }
 
     async fn identities(&self, provider: OAuthProviderId) -> Vec<(String, String)> {
@@ -252,10 +252,17 @@ async fn select_targets(
                         }
                     }
                 }
-                Err(message) => selection.listing_failures.push(ListingFailure {
-                    provider: p,
-                    message,
-                }),
+                Err(e) => {
+                    // A 0.10.2 broker cannot list accounts, but still serves
+                    // its default Anthropic slot through the legacy `/usage`.
+                    if matches!(e, BrokerError::BrokerTooOld(_)) && p == OAuthProviderId::Anthropic {
+                        selection.targets.push(CredentialRef::new(p, Account::Default));
+                    }
+                    selection.listing_failures.push(ListingFailure {
+                        provider: p,
+                        message: e.to_string(),
+                    })
+                }
             }
         }
         return Ok(selection);
@@ -686,7 +693,7 @@ mod usage_tests {
     const T0: u64 = 1_758_400_000_000;
 
     struct FakeBackend {
-        accounts: BTreeMap<OAuthProviderId, Result<Vec<String>, String>>,
+        accounts: BTreeMap<OAuthProviderId, Result<Vec<String>, BrokerError>>,
         defaults: BTreeMap<OAuthProviderId, Result<Account, String>>,
         results: BTreeMap<String, Result<UsageSnapshot, UsageErrorSummary>>,
         identities: BTreeMap<OAuthProviderId, Vec<(String, String)>>,
@@ -707,7 +714,11 @@ mod usage_tests {
             self
         }
         fn with_listing_error(mut self, p: OAuthProviderId, msg: &str) -> Self {
-            self.accounts.insert(p, Err(msg.into()));
+            self.accounts.insert(p, Err(BrokerError::Credential(msg.into())));
+            self
+        }
+        fn with_listing_broker_error(mut self, p: OAuthProviderId, e: BrokerError) -> Self {
+            self.accounts.insert(p, Err(e));
             self
         }
         fn with_default(mut self, p: OAuthProviderId, account: Result<Account, String>) -> Self {
@@ -729,7 +740,7 @@ mod usage_tests {
         fn source_label(&self) -> &str {
             "local"
         }
-        async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, String> {
+        async fn list_accounts(&self, provider: OAuthProviderId) -> Result<Vec<String>, BrokerError> {
             self.accounts
                 .get(&provider)
                 .cloned()
@@ -933,6 +944,29 @@ mod usage_tests {
             .iter()
             .all(|c| c.provider == OAuthProviderId::Anthropic));
         assert!(sel.listing_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_against_an_old_broker_names_it_and_keeps_the_default_account() {
+        let too_old = || BrokerError::BrokerTooOld("account listing".into());
+        let backend = FakeBackend::new()
+            .with_listing_broker_error(OAuthProviderId::Anthropic, too_old())
+            .with_listing_broker_error(OAuthProviderId::OpenAiCodex, too_old())
+            .with_result("anthropic", Ok(anthropic_snapshot("default")));
+        let sel = select_targets(&backend, &opts(None, None, true, false))
+            .await
+            .unwrap();
+        let keys: Vec<String> = sel.targets.iter().map(|c| c.storage_key()).collect();
+        assert_eq!(keys, vec!["anthropic"], "default slot served via legacy /usage");
+        assert!(sel
+            .listing_failures
+            .iter()
+            .all(|f| f.message.contains("broker is older than this client")));
+        let report = build_report(&backend, sel).await;
+        assert_eq!(report.ok_count(), 1);
+        let text = render_verbose(&report, T0);
+        assert!(!text.contains("No connected accounts"), "{text}");
+        assert!(text.contains("broker is older than this client"), "{text}");
     }
 
     // ── aggregation + rendering ─────────────────────────────────────
@@ -1186,6 +1220,13 @@ mod usage_tests {
         let s = summary_from_broker_error(&BrokerError::Credential("refresh failed".into()));
         assert_eq!(s.kind, "credential");
         assert_eq!(s.http_status, None);
+    }
+
+    #[test]
+    fn an_old_broker_is_named_as_the_cause() {
+        let s = summary_from_broker_error(&BrokerError::BrokerTooOld("per-account usage".into()));
+        assert_eq!(s.kind, "broker_too_old");
+        assert!(s.message.contains("broker is older than this client"), "{}", s.message);
     }
 }
 

@@ -34,6 +34,13 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Message key carrying the host's turn identity (`{"id": "<uuid>"}`) in
+/// memory. Never persisted inside a message: 0.10.2 strips only
+/// `_synaps_context` before a provider request, so an inline key would reach
+/// the wire after a rollback. Saves move the id to a sibling (`t` on journal
+/// `msg` records, `_turn_ids` in the snapshot), which older readers ignore.
+pub const MESSAGE_TURN_KEY: &str = "_synaps_turn";
+
 /// Journal record schema version (line-level `"v"` field).
 pub const JOURNAL_SCHEMA_VERSION: u8 = 2;
 
@@ -331,13 +338,20 @@ enum JournalRecord {
         generation: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         history_hash: Option<String>,
+        /// [`turns_hash`] of the same prefix; absent = no turn ids.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turns_hash: Option<String>,
     },
-    /// Message at ABSOLUTE history index `i`.
+    /// Message at ABSOLUTE history index `i`; `t` is its turn id, kept
+    /// beside the message (see [`MESSAGE_TURN_KEY`]).
     #[serde(rename = "msg")]
     Msg {
         v: u8,
         i: usize,
         m: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Any JSON on read: a malformed id is dropped, it never ends replay.
+        t: Option<serde_json::Value>,
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
@@ -346,7 +360,72 @@ enum JournalRecord {
         meta: Box<SessionMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         history_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turns_hash: Option<String>,
     },
+}
+
+fn message_turn_id(message: &serde_json::Value) -> Option<&str> {
+    message.get(MESSAGE_TURN_KEY)?.get("id")?.as_str()
+}
+
+/// A message as persisted: the in-memory turn key removed.
+struct Stored<'a>(&'a serde_json::Value);
+
+impl Serialize for Stored<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_object() {
+            Some(object) if object.contains_key(MESSAGE_TURN_KEY) => {
+                let mut object = object.clone();
+                object.remove(MESSAGE_TURN_KEY);
+                object.serialize(serializer)
+            }
+            _ => self.0.serialize(serializer),
+        }
+    }
+}
+
+struct StoredMessages<'a>(&'a [SharedMessage]);
+
+impl Serialize for StoredMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|m| Stored(m)))
+    }
+}
+
+fn stored_value(message: &serde_json::Value) -> serde_json::Value {
+    let mut message = message.clone();
+    if let Some(object) = message.as_object_mut() {
+        object.remove(MESSAGE_TURN_KEY);
+    }
+    message
+}
+
+/// `(index, turn id)` of every tagged message, in order.
+fn turn_ids(messages: &[SharedMessage]) -> Vec<(usize, &str)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| message_turn_id(m).map(|id| (i, id)))
+        .collect()
+}
+
+/// Turn ids are outside the stored messages, so [`history_hash`] cannot see
+/// a tag added to an already-saved message; this hash does. `None` = none.
+fn turns_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let ids = turn_ids(messages);
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&ids).map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+fn set_turn_id(message: &mut serde_json::Value, id: String) {
+    if let Some(object) = message.as_object_mut() {
+        object.insert(MESSAGE_TURN_KEY.into(), serde_json::json!({ "id": id }));
+    }
 }
 
 fn is_zero_cost(v: &f64) -> bool {
@@ -457,6 +536,32 @@ impl SessionMeta {
 struct SnapshotBinding {
     #[serde(default, rename = "_journal_generation")]
     generation: Option<String>,
+    /// After `api_messages`, so header-only reads leave it empty. Parsed
+    /// leniently by [`stored_turn_ids`]: it is best-effort metadata.
+    #[serde(default, rename = "_turn_ids")]
+    turn_ids: serde_json::Value,
+}
+
+/// Well-formed `[index, id]` entries of a snapshot's `_turn_ids`. Anything
+/// else is dropped with a warning; the turn start is then re-derived.
+fn stored_turn_ids(value: serde_json::Value) -> Vec<(usize, String)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _turn_ids; turn ids dropped");
+            return Vec::new();
+        }
+    };
+    let total = entries.len();
+    let ids: Vec<(usize, String)> = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect();
+    if ids.len() != total {
+        tracing::warn!(dropped = total - ids.len(), "malformed _turn_ids entries dropped");
+    }
+    ids
 }
 
 fn snapshot_binding(file: std::fs::File) -> std::io::Result<SnapshotBinding> {
@@ -488,7 +593,8 @@ fn matching_open(record: &JournalRecord, snapshot_generation: Option<&str>) -> O
     }
 }
 
-/// Hash the exact ordered prefix, including all message fields. Unlike the
+/// Hash the exact ordered prefix as stored (what an older build loads and
+/// hashes), including all stored message fields. Unlike the
 /// old last-message tripwire this detects same-length edits anywhere, even
 /// when the journal contains only its open record. Uses the existing sha2 dep.
 fn history_hash(messages: &[SharedMessage]) -> std::io::Result<String> {
@@ -504,7 +610,7 @@ fn history_hash(messages: &[SharedMessage]) -> std::io::Result<String> {
         }
     }
     let mut writer = HashWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, messages).map_err(std::io::Error::other)?;
+    serde_json::to_writer(&mut writer, &StoredMessages(messages)).map_err(std::io::Error::other)?;
     Ok(format!("{:x}", writer.0.finalize()))
 }
 
@@ -513,6 +619,7 @@ fn history_hash(messages: &[SharedMessage]) -> std::io::Result<String> {
 struct JournalState {
     durable_len: usize,
     history_hash: String,
+    turns_hash: Option<String>,
     bytes: u64,
 }
 
@@ -543,6 +650,7 @@ fn read_journal_state(
     let JournalRecord::Open {
         base,
         history_hash: Some(mut hash),
+        turns_hash: mut turns,
         ..
     } = open
     else {
@@ -561,11 +669,13 @@ fn read_journal_state(
                 v,
                 meta,
                 history_hash: Some(next_hash),
+                turns_hash: next_turns,
             }) if v == JOURNAL_SCHEMA_VERSION
                 && meta.id == id
                 && meta.message_count == Some(durable_len) =>
             {
                 hash = next_hash;
+                turns = next_turns;
                 hashed_len = durable_len;
             }
             _ => return Ok(None),
@@ -577,6 +687,7 @@ fn read_journal_state(
     Ok(Some(JournalState {
         durable_len,
         history_hash: hash,
+        turns_hash: turns,
         bytes: raw.len() as u64,
     }))
 }
@@ -656,6 +767,7 @@ fn save_journal_mode(
 
     if session.api_messages.len() < state.durable_len
         || history_hash(&session.api_messages[..state.durable_len])? != state.history_hash
+        || turns_hash(&session.api_messages[..state.durable_len])? != state.turns_hash
     {
         return full_snapshot_reset(handle, session);
     }
@@ -666,7 +778,8 @@ fn save_journal_mode(
         let record = JournalRecord::Msg {
             v: JOURNAL_SCHEMA_VERSION,
             i: state.durable_len + offset,
-            m: msg.as_ref().clone(),
+            m: stored_value(msg),
+            t: message_turn_id(msg).map(serde_json::Value::from),
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
         buf.push(b'\n');
@@ -675,6 +788,7 @@ fn save_journal_mode(
         v: JOURNAL_SCHEMA_VERSION,
         meta: Box::new(SessionMeta::of(session)),
         history_hash: Some(history_hash(&session.api_messages)?),
+        turns_hash: turns_hash(&session.api_messages)?,
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -741,13 +855,16 @@ struct SessionSnapshotRef<'a> {
     env: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     env_stripped: &'a [String],
-    api_messages: &'a [SharedMessage],
+    api_messages: StoredMessages<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     abort_context: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_provenance: &'a Option<crate::prompt::PromptProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction: &'a Option<crate::core::compaction::CompactionRecord>,
+    /// Storage-only, like `_journal_generation`: `Session` ignores it.
+    #[serde(rename = "_turn_ids", skip_serializing_if = "Vec::is_empty")]
+    turn_ids: Vec<(usize, &'a str)>,
 }
 
 impl<'a> SessionSnapshotRef<'a> {
@@ -772,10 +889,11 @@ impl<'a> SessionSnapshotRef<'a> {
             compacted_into: &s.compacted_into,
             env: scrub_secret_env(s.env.as_ref()),
             env_stripped: &s.env_stripped,
-            api_messages: &s.api_messages,
+            api_messages: StoredMessages(&s.api_messages),
             abort_context: &s.abort_context,
             prompt_provenance: &s.prompt_provenance,
             compaction: &s.compaction,
+            turn_ids: turn_ids(&s.api_messages),
         }
     }
 }
@@ -826,6 +944,7 @@ fn publish_snapshot(
             base: session.api_messages.len(),
             generation,
             history_hash: Some(history_hash(&session.api_messages)?),
+            turns_hash: turns_hash(&session.api_messages)?,
         };
         serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
         journal.push(b'\n');
@@ -895,6 +1014,11 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
         serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     session.clamp_keepwarm_to_totals();
+    for (i, id) in stored_turn_ids(binding.turn_ids) {
+        if let Some(message) = session.api_messages.get_mut(i) {
+            set_turn_id(std::sync::Arc::make_mut(message), id);
+        }
+    }
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
@@ -917,8 +1041,11 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             {
                 break;
             }
-            Ok(JournalRecord::Msg { i, m, .. }) => {
+            Ok(JournalRecord::Msg { i, mut m, t, .. }) => {
                 if i == session.api_messages.len() {
+                    if let Some(serde_json::Value::String(id)) = t {
+                        set_turn_id(&mut m, id);
+                    }
                     session.api_messages.push(std::sync::Arc::new(m));
                 } else if i > session.api_messages.len() {
                     break; // gap — stop at the consistent prefix
@@ -1186,7 +1313,7 @@ mod tests {
             .any(|(k, _)| k == "DATABASE_URL" || k == "SENTRY_DSN"));
     }
 
-    fn with_messages(n: usize) -> Session {
+    pub(super) fn with_messages(n: usize) -> Session {
         let mut s = Session::new("checkpoint-test", "medium", None);
         for i in 0..n {
             push_message(&mut s, &format!("old {i}"));
@@ -1194,7 +1321,7 @@ mod tests {
         s
     }
 
-    fn push_message(s: &mut Session, text: &str) {
+    pub(super) fn push_message(s: &mut Session, text: &str) {
         s.api_messages.push(std::sync::Arc::new(
             serde_json::json!({"role": "user", "content": text}),
         ));
@@ -1332,6 +1459,7 @@ mod tests {
             base: 1,
             generation: None,
             history_hash: None,
+            turns_hash: None,
         }];
         for i in 1..5 {
             push_message(&mut s, "legacy delta");
@@ -1339,6 +1467,7 @@ mod tests {
                 v: 1,
                 i,
                 m: s.api_messages[i].as_ref().clone(),
+                t: None,
             });
         }
         s.title = "legacy title".into();
@@ -1347,6 +1476,7 @@ mod tests {
             v: 1,
             meta: Box::new(SessionMeta::of(&s)),
             history_hash: None,
+            turns_hash: None,
         });
         let mut bytes = Vec::new();
         for record in legacy {
@@ -1683,6 +1813,7 @@ mod save_cost_bench {
 /// readable by 0.10.1.
 #[cfg(test)]
 mod snapshot_only_fields {
+    use super::tests::{push_message, with_messages};
     use super::*;
 
     /// Task #444: keep-warm spend persists through the snapshot in both
@@ -1852,5 +1983,254 @@ mod snapshot_only_fields {
         assert_eq!(loaded.keepwarm_cost, 0.25);
         assert_eq!(loaded.keepwarm_tokens.input, 3);
         assert_eq!(loaded.keepwarm_tokens.output, 1);
+    }
+
+    // ── turn ids stay out of persisted message objects (03 C-2) ──────────
+
+    fn tagged(text: &str, id: &str) -> SharedMessage {
+        std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": text, MESSAGE_TURN_KEY: {"id": id}
+        }))
+    }
+
+    fn assert_no_host_keys(m: &serde_json::Value, ctx: &str) {
+        let keys: Vec<_> = m
+            .as_object()
+            .map(|o| o.keys().filter(|k| k.starts_with("_synaps_turn")).cloned().collect())
+            .unwrap_or_default();
+        assert!(keys.is_empty(), "{ctx}: persisted message carries {keys:?}: {m}");
+    }
+
+    /// What 0.10.2 (0862f255) loads: `Session` from the snapshot (it ignores
+    /// unknown top-level fields) plus every journal `m`, unchanged. Its
+    /// `session_journal`/`session` are byte-identical to this build's
+    /// pre-fix code, so the frozen reader types above stand in for it.
+    fn old_reader_view(dir: &Path, id: &str) -> (Vec<serde_json::Value>, Option<String>) {
+        let snap: Session =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{id}.json"))).unwrap())
+                .unwrap();
+        let mut messages: Vec<_> = snap.api_messages.iter().map(|m| (**m).clone()).collect();
+        let mut hash = None;
+        if let Ok(raw) = std::fs::read_to_string(journal_path(dir, id)) {
+            for line in raw.lines() {
+                match serde_json::from_str::<JournalRecordV0_10_1>(line)
+                    .unwrap_or_else(|e| panic!("0.10.2 cannot parse {line}: {e}"))
+                {
+                    JournalRecordV0_10_1::Msg { i, m, .. } if i == messages.len() => {
+                        messages.push(m)
+                    }
+                    JournalRecordV0_10_1::Open { history_hash, .. }
+                    | JournalRecordV0_10_1::Meta { history_hash, .. } => hash = history_hash,
+                    _ => {}
+                }
+            }
+        }
+        (messages, hash)
+    }
+
+    #[test]
+    fn turn_ids_are_persisted_beside_messages_not_inside_them() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(tagged("first", "t-1"));
+            push_message(&mut s, "reply");
+            save_session_in_dir(&dir, &s, mode).unwrap();
+            s.api_messages.push(tagged("second", "t-2"));
+            let receipt = save_session_in_dir(&dir, &s, mode).unwrap();
+            if mode == SessionPersistence::Journal {
+                assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }));
+            }
+
+            let (old, hash) = old_reader_view(&dir, &s.id);
+            assert_eq!(old.len(), 3, "{mode:?}");
+            for m in &old {
+                assert_no_host_keys(m, &format!("{mode:?}"));
+            }
+            if mode == SessionPersistence::Journal {
+                // 0.10.2 hashes the messages it loaded; equal hashes let it
+                // keep appending instead of treating the journal as edited.
+                let old: Vec<SharedMessage> =
+                    old.into_iter().map(std::sync::Arc::new).collect();
+                assert_eq!(hash, Some(history_hash(&old).unwrap()), "{mode:?}");
+            }
+
+            // This build gets its turn ids back.
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded.api_messages).unwrap(),
+                serde_json::to_value(&s.api_messages).unwrap(),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// The pre-fix `history_hash`: over the messages with the tag inline.
+    fn dev_build_hash(messages: &[SharedMessage]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(serde_json::to_vec(messages).unwrap()))
+    }
+
+    #[test]
+    fn inline_turn_ids_from_earlier_dev_builds_still_load_and_migrate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", None);
+        s.api_messages.push(tagged("first", "t-1"));
+        // The pre-fix layout: the tag inline in the snapshot and the journal.
+        let id = s.id.clone();
+        let generation = "g-1";
+        let mut snap = serde_json::to_value(&s).unwrap();
+        snap["_journal_generation"] = generation.into();
+        snap["message_count"] = 1.into();
+        write_json_snapshot(&dir, &id, snap.to_string().as_bytes()).unwrap();
+        let inline_hash = dev_build_hash(&s.api_messages);
+        s.api_messages.push(tagged("second", "t-2"));
+        let mut journal = String::new();
+        for record in [
+            serde_json::json!({"k":"open","v":2,"base":1,"generation":generation,"history_hash":inline_hash}),
+            serde_json::json!({"k":"msg","v":2,"i":1,"m":&*s.api_messages[1]}),
+            serde_json::json!({"k":"meta","v":2,"meta":SessionMeta::of(&s),
+                "history_hash":dev_build_hash(&s.api_messages)}),
+        ] {
+            journal.push_str(&record.to_string());
+            journal.push('\n');
+        }
+        std::fs::write(journal_path(&dir, &id), journal).unwrap();
+
+        let loaded = load_session_in_dir(&dir, &id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded.api_messages).unwrap(),
+            serde_json::to_value(&s.api_messages).unwrap()
+        );
+        // The next save rewrites it in the sibling layout.
+        let receipt = save_session_in_dir(&dir, &loaded, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::FullSnapshot));
+        for m in old_reader_view(&dir, &id).0 {
+            assert_no_host_keys(&m, "migrated");
+        }
+        let again = load_session_in_dir(&dir, &id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again.api_messages).unwrap(),
+            serde_json::to_value(&s.api_messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn tagging_an_already_saved_message_forces_a_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages[1] = tagged("old 1", "late");
+        let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::FullSnapshot));
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages[1][MESSAGE_TURN_KEY]["id"], "late");
+    }
+
+    /// The rollback this layout exists for: this build saves, 0.10.2 opens
+    /// the session and appends a turn, then this build reads it back.
+    #[test]
+    fn rollback_round_trip_through_a_0_10_2_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = Session::new("m", "medium", None);
+        s.api_messages.push(tagged("first", "t-1"));
+        push_message(&mut s, "reply");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(tagged("second", "t-2"));
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+
+        // 0.10.2: loads the stored form, checks its prefix hash (equal, so
+        // it appends rather than rewriting), and appends one turn with no
+        // `t` and no `turns_hash`.
+        let (old, hash) = old_reader_view(&dir, &s.id);
+        let mut old: Vec<SharedMessage> = old.into_iter().map(std::sync::Arc::new).collect();
+        assert_eq!(hash, Some(history_hash(&old).unwrap()));
+        old.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": "asked on 0.10.2"}),
+        ));
+        let mut old_session = s.clone();
+        old_session.api_messages = old.clone();
+        old_session.updated_at += chrono::Duration::minutes(1);
+        let mut journal = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap();
+        for record in [
+            serde_json::json!({"k":"msg","v":2,"i":3,"m":&*old[3]}),
+            serde_json::json!({"k":"meta","v":2,"meta":SessionMeta::of(&old_session),
+                "history_hash":history_hash(&old).unwrap()}),
+        ] {
+            journal.push_str(&record.to_string());
+            journal.push('\n');
+        }
+        std::fs::write(journal_path(&dir, &s.id), journal).unwrap();
+
+        // This build: ids back on the same indices, the 0.10.2 turn untagged.
+        let mut loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 4);
+        let ids: Vec<_> = loaded.api_messages.iter().map(|m| message_turn_id(m)).collect();
+        assert_eq!(ids, vec![Some("t-1"), None, Some("t-2"), None]);
+        assert_eq!(loaded.api_messages[3]["content"], "asked on 0.10.2");
+        // One full snapshot (the old meta has no turns hash), then appends.
+        let receipt = save_session_in_dir(&dir, &loaded, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::FullSnapshot), "{:?}", receipt.mode);
+        loaded.api_messages.push(tagged("third", "t-3"));
+        let receipt = save_session_in_dir(&dir, &loaded, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }), "{:?}", receipt.mode);
+        let again = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again.api_messages).unwrap(),
+            serde_json::to_value(&loaded.api_messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_malformed_journal_turn_id_does_not_end_replay() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(1);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(tagged("second", "t-2"));
+        push_message(&mut s, "third");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let path = journal_path(&dir, &s.id);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""t":"t-2""#));
+        std::fs::write(&path, raw.replace(r#""t":"t-2""#, r#""t":{"bad":1}"#)).unwrap();
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 3, "replay continued past the bad id");
+        assert_eq!(message_turn_id(&loaded.api_messages[1]), None);
+    }
+
+    /// `_turn_ids` is best-effort metadata: a malformed value drops the ids,
+    /// never the session.
+    #[test]
+    fn malformed_turn_ids_are_dropped_not_fatal() {
+        for bad in [
+            serde_json::json!("garbage"),
+            serde_json::json!([[0, "t-1"], ["x", 1], [99, "past-the-end"], 7]),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(tagged("first", "t-1"));
+            push_message(&mut s, "reply");
+            save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+            let path = dir.join(format!("{}.json", s.id));
+            let mut snap: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            snap["_turn_ids"] = bad.clone();
+            std::fs::write(&path, snap.to_string()).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id)
+                .unwrap_or_else(|e| panic!("{bad}: session not loadable: {e}"));
+            assert_eq!(loaded.api_messages.len(), 2, "{bad}");
+            let well_formed = bad.as_array().is_some();
+            assert_eq!(
+                message_turn_id(&loaded.api_messages[0]),
+                well_formed.then_some("t-1"),
+                "{bad}: valid entries survive"
+            );
+        }
     }
 }
