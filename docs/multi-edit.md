@@ -85,21 +85,41 @@ opener is plain text.
 
 ## Writing
 
-Only files whose content changed are written. For each:
+Only files whose content changed are written. During planning, each
+target's parent directory is opened from the same canonical path the
+write-scope check saw, by walking it from `/` without following symlinks.
+Every later step (reading, staging, the re-check, publishing, restoring and
+cleanup) works relative to that directory handle and never traverses the
+parent path again.
+
+Existing files are opened through the handle without following a symlink
+and without waiting: a FIFO with no writer, or a device, is never blocked
+on. Anything but a regular file is refused before a byte is read.
+
+For each file:
 
 1. The new content goes into a temp file next to the target, created
-   exclusively. An existing file's permission bits are copied onto it; a new
-   file gets `0666` minus the umask.
-2. After every temp is staged, each target is checked again: still the same
-   inode with the same bytes that were planned against (or, for a new file,
-   still absent). Any change refuses the whole call and removes the temps.
-3. Each temp is renamed onto its target. A new file is linked into place, so
-   it never replaces a file that appeared meanwhile.
+   exclusively. An existing file's temp is owner-only (`0600`) until every
+   byte is written; only then does it get the file's permission bits. A new
+   file's temp gets `0666` minus the umask, the mode it is published with.
+2. After every temp is staged, and before anything is published, everything
+   is checked again. Each parent path must still lead to the directory its
+   handle holds (otherwise: "the parent directory of PATH was replaced").
+   Each temp must still be the file this call created. Each target must
+   still be the same inode with the same bytes that were planned against
+   (or, for a new file, still absent). Any change refuses the whole call and
+   removes this call's temps; a temp name taken over by someone else is left
+   alone.
+3. Each temp is renamed onto its target. A new file is published only by a
+   primitive that never replaces an existing name: `renameat2` with
+   `RENAME_NOREPLACE` on Linux, otherwise a hard link. On a filesystem with
+   neither, the create is refused ("cannot create PATH without risking an
+   overwrite on this filesystem"); there is no check-then-rename.
 
 If a later file fails in step 3, the files already written are put back from
-their in-memory originals (only if they still hold what this call wrote), and
-the error lists which files were restored, which could not be, and which were
-never written.
+their in-memory originals (only if they still hold what this call wrote),
+through owner-only temps like step 1, and the error lists which files were
+restored, which could not be, and which were never written.
 
 - A symlink stays a symlink: its target file is edited. A dangling symlink is
   an error.
@@ -107,16 +127,41 @@ never written.
   links).
 - Only `append`/`append_jsonl` with `create: true` may create a file; the
   parent directory must exist.
+- The written file is a new inode. Its permission bits are kept; its owner,
+  group, ACLs and extended attributes are not (they are those of a new file
+  made by this process), the same as with `edit` and `write`. This holds for
+  a file put back by a restore too.
 - No fsync, matching `edit` and `write`: a crash can lose the latest change but
-  does not leave a half-written file. The window between the re-check and the
-  rename is not locked.
+  does not leave a half-written file.
+
+Best effort, not a transaction:
+
+- The window between the re-check and the renames is not locked. A write by
+  another process in that window can be overwritten. A parent directory
+  moved in that window still receives the file, through its handle, where
+  it now is.
+- A symlink given as the path and switched to another target after planning
+  does not change what is written: the target resolved during planning is
+  the one edited.
+- A restore has its own unlocked window between reading a file back and
+  putting its original back. Each file's outcome is reported exactly.
+- Nothing is atomic across files or across a crash.
+
+On systems other than Unix there are no directory handles: every step works
+by path, as before, the parent re-check does not apply, and a new file is
+published by hard link only.
 
 ## Limits
 
 Fixed, not configurable: 64 edits and 16 files per call, 16 MiB per file
 (as read and after every edit), 1 MiB per `anchor`/`text`/`unless_present`/
 `value` field (`text` and the `append_jsonl` row are checked again after
-expansion), 64 MiB of file content per call. Files must be UTF-8.
+expansion), 64 MiB of existing files read per call and 64 MiB of content
+written per call. The read limits are checked from each file's size before
+it is read, and at most one byte past a limit is read, so a file that grows
+in between is still refused. These are input limits, not a bound on the
+process's memory: planning holds each file's original and edited copies and
+the anchor matches. Files must be UTF-8.
 
 ## Classification
 
