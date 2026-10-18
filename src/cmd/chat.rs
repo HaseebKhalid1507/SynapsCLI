@@ -766,7 +766,12 @@ mod actor {
                         // Confirm (e.g. `activate_tools`): show the FULL body
                         // and take one y/n line. Anything but y/yes denies.
                         self.end_thinking();
-                        eprint!("\n[confirm] {}\n{}\n(y/n): ", pr.title, pr.prompt);
+                        // Sanitized (prA I-R4-3): no cursor moves or bidi tricks.
+                        eprint!(
+                            "\n[confirm] {}\n{}\n(y/n): ",
+                            agent_engine::session::sanitize_prompt_text(&pr.title),
+                            agent_engine::session::sanitize_prompt_text(&pr.prompt)
+                        );
                         io::stderr().flush().ok();
                         self.pending_confirm = Some(pr);
                         return;

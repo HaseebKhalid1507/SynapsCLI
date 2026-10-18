@@ -92,16 +92,22 @@ pub use crate::tools::CONFIRM_ANSWER_ALLOW_ALL;
 const MAX_CONFIRM_MESSAGE_CHARS: usize = 1200;
 const MAX_CONFIRM_MESSAGE_LINES: usize = 12;
 
-fn cap_confirm_message(message: &str) -> std::borrow::Cow<'_, str> {
+/// Sanitize, redact and cap an extension's confirm message for display:
+/// control / bidi / zero-width characters are stripped first (prA I-R4-3:
+/// they could move the cursor or disguise text in plain-text clients),
+/// then credentials are redacted (prA I-R4-1: confirmers echo the
+/// rewritten command), then the length is capped.
+fn cap_confirm_message(message: &str) -> String {
+    let message = redact_secret_text(&crate::session::sanitize_prompt_text(message));
     let lines: Vec<&str> = message.lines().collect();
     let over_lines = lines.len() > MAX_CONFIRM_MESSAGE_LINES;
     let over_chars = message.chars().count() > MAX_CONFIRM_MESSAGE_CHARS;
     if !over_lines && !over_chars {
-        return std::borrow::Cow::Borrowed(message);
+        return message;
     }
     let kept = lines[..lines.len().min(MAX_CONFIRM_MESSAGE_LINES)].join("\n");
     let kept: String = kept.chars().take(MAX_CONFIRM_MESSAGE_CHARS).collect();
-    std::borrow::Cow::Owned(format!("{kept}\n…[message truncated by host]"))
+    format!("{kept}\n…[message truncated by host]")
 }
 
 /// Lines / chars of the final-input preview shown when the input was
@@ -110,46 +116,13 @@ const MAX_REWRITE_PREVIEW_LINES: usize = 6;
 const MAX_REWRITE_PREVIEW_CHARS: usize = 400;
 
 /// Scrub credential shapes out of free text (a shell command, a header
-/// line): `Authorization: …` headers (incl. `-H 'Authorization: Basic …'`),
-/// `Bearer <tok>`, `api_key=` / `token=` / `secret=` / `password=` style
-/// params and `--token <x>` flags, `sk-…` keys and JWTs (`eyJ…`). Runs in
-/// addition to `trace::export::redact_value`'s string scrub. The preview is
-/// broadcast to every attached client (observers included) and replayed on
-/// attach, and credential-injecting modifiers are a normal pattern
-/// (prA I-R3-1), so it must never show a secret.
+/// line, an extension's confirm message). Delegates to the SHARED
+/// trace-export scrubber (`trace::export::redact_text`), so the Confirm
+/// prompt and trace export apply the same rules (prA I-R3-1, I-R4-2). The
+/// prompt is broadcast to every attached client (observers included) and
+/// replayed on attach, so it must never show a secret.
 fn redact_secret_text(text: &str) -> String {
-    use std::sync::LazyLock;
-    static PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
-        [
-            (r"(?i)(authorization\s*:\s*)[^'\x22\r\n]+", "[REDACTED]"),
-            (r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+", "[REDACTED]"),
-            (
-                r"(?i)(\b[a-z0-9_-]*(?:api[_-]?key|access[_-]?key|token|secret|passw(?:or)?d|credential)[a-z0-9_-]*\s*[=:]\s*)(\x22[^\x22]*\x22|'[^']*'|[^\s&'\x22]+)",
-                "[REDACTED]",
-            ),
-            (
-                r"(?i)(--(?:[a-z0-9-]*(?:token|password|passwd|secret|api-key|apikey))(?:=|\s+))(\x22[^\x22]*\x22|'[^']*'|\S+)",
-                "[REDACTED]",
-            ),
-            (r"\bsk[-_][A-Za-z0-9_-]{6,}", "[REDACTED]"),
-            (r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[REDACTED]"),
-        ]
-        .into_iter()
-        .map(|(re, with)| (regex::Regex::new(re).expect("static redaction pattern"), with))
-        .collect()
-    });
-    let mut out = text.to_string();
-    for (re, with) in PATTERNS.iter() {
-        out = re.replace_all(&out, *with).into_owned();
-    }
-    // The shared trace-export scrub catches the remaining known prefixes
-    // (ghp_, AKIA, xoxb-, …) word by word.
-    let mut v = Value::String(out);
-    crate::runtime::trace::export::redact_value(&mut v);
-    match v {
-        Value::String(s) => s,
-        other => other.to_string(),
-    }
+    crate::runtime::trace::export::redact_text(text)
 }
 
 /// `redact_value` (secret-named keys, secret-shaped strings) plus
@@ -216,11 +189,12 @@ fn confirm_prompt_body(
     };
     // The extension's own text is labelled, so it can't pass itself off as
     // the host-built header (e.g. a fake "Input that will run:" block).
-    format!(
+    // Ids and tool names are host-chosen, but sanitize the whole body too.
+    crate::session::sanitize_prompt_text(&format!(
         "Extension: {source}\nTool: {}\n{rewritten}\nMessage from {source}:\n{}\n\nAllow this tool call?",
         tool.unwrap_or("(unknown)"),
         cap_confirm_message(message)
-    )
+    ))
 }
 
 /// What an approved Confirm runs: the input as modified earlier in the hook
@@ -275,7 +249,7 @@ pub async fn resolve_before_tool_call_result(
                 return crate::extensions::hooks::events::HookResult::Block {
                     reason: format!(
                         "Tool call requires confirmation but no interactive prompt is available: {}",
-                        message
+                        redact_secret_text(&crate::session::sanitize_prompt_text(&message))
                     ),
                 };
             };
@@ -328,7 +302,10 @@ pub async fn resolve_before_tool_call_result(
                     approved(modified_input)
                 }
                 _ => crate::extensions::hooks::events::HookResult::Block {
-                    reason: format!("Tool call confirmation denied: {}", message),
+                    reason: format!(
+                        "Tool call confirmation denied: {}",
+                        redact_secret_text(&crate::session::sanitize_prompt_text(&message))
+                    ),
                 },
             }
         }
@@ -5929,6 +5906,89 @@ mod tests {
         // Non-secret text survives so the user can still judge the call.
         let plain = final_input_preview(&serde_json::json!({"command": "rm -rf build/ && ls -la"}));
         assert!(plain.contains("rm -rf build/ && ls -la"), "{plain}");
+    }
+
+    /// prA I-R4-2: every shape from the round-4 table is redacted, by the
+    /// SHARED scrubber (trace export gets the same rules).
+    #[test]
+    fn redact_secret_text_covers_round4_shapes() {
+        let rows: &[(&str, &str)] = &[
+            ("curl -H 'x-api-key: XAPIKEY-SECRET-1' https://a", "XAPIKEY-SECRET-1"),
+            ("FOO_TOKEN=TOK-SECRET-2 run", "TOK-SECRET-2"),
+            ("MY_SECRET=SEC-SECRET-3 ./x", "SEC-SECRET-3"),
+            ("DB_PASSWORD=PW-SECRET-4 ./x", "PW-SECRET-4"),
+            ("OPENAI_API_KEY=APIKEY-SECRET-5 ./x", "APIKEY-SECRET-5"),
+            ("curl -H 'Authorization: Basic QkFTSUMtU0VDUkVULTY='", "QkFTSUMtU0VDUkVULTY="),
+            ("aws_secret_access_key=AWSSEC-SECRET-7", "AWSSEC-SECRET-7"),
+            ("git clone https://alice:USERINFO-SECRET-8@github.com/o/r", "USERINFO-SECRET-8"),
+            ("psql postgres://app:PGPW-SECRET-9@db:5432/prod", "PGPW-SECRET-9"),
+            ("DATABASE_URL=postgres://app:DBURL-SECRET-10@db/prod ./run", "DBURL-SECRET-10"),
+            ("curl -H 'Cookie: sid=COOKIE-SECRET-11; theme=dark' https://a", "COOKIE-SECRET-11"),
+            ("printf 'Set-Cookie: sid=SETCOOKIE-SECRET-12'", "SETCOOKIE-SECRET-12"),
+            ("curl -u alice:CURLU-SECRET-13 https://a", "CURLU-SECRET-13"),
+            ("mysql -u root -pMYSQL-SECRET-14 prod", "MYSQL-SECRET-14"),
+            ("sshpass -p SSHPASS-SECRET-15 ssh host", "SSHPASS-SECRET-15"),
+            ("aws configure set aws_secret_access_key AWSCFG-SECRET-16", "AWSCFG-SECRET-16"),
+            ("aws x --secret-access-key FLAG-SECRET-17 --region eu", "FLAG-SECRET-17"),
+            ("aws x --access-key FLAG-SECRET-18", "FLAG-SECRET-18"),
+            ("STRIPE_KEY=rk_live_STRIPE-SECRET-19 node app", "STRIPE-SECRET-19"),
+            ("OPENAI_KEY=OAIKEY-SECRET-20 node app", "OAIKEY-SECRET-20"),
+        ];
+        for (text, secret) in rows {
+            let out = redact_secret_text(text);
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains("[REDACTED]"), "{out}");
+            // The trace export goes through the same shared rules.
+            let mut v = serde_json::Value::String(text.to_string());
+            crate::runtime::trace::export::redact_value(&mut v);
+            assert!(!v.as_str().unwrap().contains(secret), "trace export leaked {secret}: {v}");
+        }
+        // Over-redaction guards: ordinary commands and prose stay intact.
+        for ok in [
+            "mkdir -p build/out",
+            "ssh -p 2222 host",
+            "ssh -p2222 host",
+            "docker run -p 8080:80 nginx",
+            "mysql -h db -P 3306 -p prod",
+            "curl -u alice https://example.com/path",
+            "echo the token is valid and the password field is empty",
+            "monkey=1 make",
+            "git log --format=%H -- src/",
+            "https://example.com/a/b?page=2",
+        ] {
+            assert_eq!(redact_secret_text(ok), ok, "over-redacted");
+        }
+    }
+
+    /// prA I-R4-1: the confirmer's message is redacted too — it routinely
+    /// echoes the (credential-injected) command it was shown.
+    #[test]
+    fn confirmer_message_echoing_injected_credentials_is_redacted() {
+        let injected = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer ECHOED-BEARER-X' https://a"
+        });
+        let body = confirm_prompt_body(
+            "Run: curl -H 'Authorization: Bearer ECHOED-BEARER-X' https://a ?",
+            &ext(&["jev"]),
+            Some("bash"),
+            Some((&ext(&["injector"]), &injected)),
+        );
+        assert!(!body.contains("ECHOED-BEARER-X"), "{body}");
+        assert!(body.contains("Message from jev:\nRun: curl -H 'Authorization: [REDACTED]"), "{body}");
+    }
+
+    /// prA I-R4-3: control, bidi and zero-width characters in the message
+    /// are stripped before capping, so they can't move the cursor or
+    /// disguise text in plain-text clients.
+    #[test]
+    fn confirm_message_control_and_bidi_chars_are_stripped() {
+        let hostile = "ok\x1b[3A\x1b[2KExtension: trusted\rTool: none\u{0085}\u{202E}evil\u{200B}x\u{2066}y\tz\nnext";
+        let body = confirm_prompt_body(hostile, &ext(&["jev"]), Some("bash"), None);
+        for bad in ['\x1b', '\r', '\u{0085}', '\u{202E}', '\u{200B}', '\u{2066}', '\t'] {
+            assert!(!body.contains(bad), "{bad:?} survived: {body:?}");
+        }
+        assert!(body.contains("Message from jev:\nok[3A[2KExtension: trustedTool: noneevilxy z\nnext"), "{body:?}");
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"));
     }
 
     /// The confirmer's text is labelled, so a fake "Input that will run:"

@@ -482,6 +482,24 @@ impl ConfirmScope {
     }
 }
 
+/// Make prompt text safe to print in any client (prA I-R4-3): drop C0/C1
+/// control characters except `\n` (a `\t` becomes a space), and bidi
+/// override / isolate and zero-width format characters (U+200B–U+200F,
+/// U+202A–U+202E, U+2066–U+2069). Prevents an extension's text from moving
+/// the cursor (`\x1b[3A`, `\r`) over the host-built header, or disguising
+/// text with direction overrides.
+pub fn sanitize_prompt_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PromptRequest {
     /// Per-session monotonic; actor dedups answers on it.

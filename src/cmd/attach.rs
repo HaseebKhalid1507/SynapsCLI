@@ -478,6 +478,25 @@ fn resolve_id(sessions: &[SessionMeta], q: &str) -> Option<SessionId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// prA I-R4-3: the line client never prints control / bidi characters
+    /// from a prompt, so extension text can't overwrite the header lines.
+    #[test]
+    fn render_prompt_line_strips_control_and_bidi_chars() {
+        let p = PromptRequest {
+            id: 1,
+            kind: PromptKind::Confirm,
+            title: "Confirm tool call".into(),
+            prompt: "Extension: jev\nMessage from jev:\n\x1b[3A\x1b[2KExtension: trusted\r\u{202E}x\u{200B}y".into(),
+            raised_at: chrono::Utc::now(),
+            confirm_scope: None,
+        };
+        let line = render_prompt_line(&p);
+        for bad in ['\x1b', '\r', '\u{202E}', '\u{200B}'] {
+            assert!(!line.contains(bad), "{bad:?} in {line:?}");
+        }
+        assert!(line.contains("Extension: jev\nMessage from jev:\n[3A[2KExtension: trustedxy"), "{line:?}");
+    }
     use clap::Parser;
 
     #[derive(Parser)]
@@ -521,9 +540,14 @@ mod tests {
 /// One prompt as the line client shows it. Confirm prompts keep the FULL
 /// multi-line body (the exact tool-id list for `activate_tools`) and ask
 /// `(y/n)`; Secret prompts keep the legacy `> ` shape with echo off.
+/// Title and body are sanitized (prA I-R4-3): a prompt can carry
+/// extension text, and raw control / bidi characters would let it move
+/// the cursor over the lines printed above it.
 fn render_prompt_line(p: &PromptRequest) -> String {
+    let title = agent_engine::session::sanitize_prompt_text(&p.title);
+    let body = agent_engine::session::sanitize_prompt_text(&p.prompt);
     match p.kind {
-        PromptKind::Confirm => format!("[confirm #{}] {}\n{}\n(y/n): ", p.id, p.title, p.prompt),
-        PromptKind::Secret => format!("[prompt #{}] {}: {} > ", p.id, p.title, p.prompt),
+        PromptKind::Confirm => format!("[confirm #{}] {title}\n{body}\n(y/n): ", p.id),
+        PromptKind::Secret => format!("[prompt #{}] {title}: {body} > ", p.id),
     }
 }
