@@ -107,7 +107,7 @@ is printed to stderr so scripts piping stdout are not affected.
 | `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup) |
 | `daemon.lock` | 0600 | **flock = liveness oracle.** Alive iff someone holds it. Nobody unlinks on ECONNREFUSED alone; `reap_stale` unlinks sock/json/pid only when the lock is free. A second daemon on the same paths is refused. |
 | `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
-| `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (tmp + rename, 0600; one INFO line `daemon.json rewritten` per 10 min). `daemon status` and `daemon reload` Ping before they read it. |
+| `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (one INFO line `daemon.json rewritten` per 10 min). Every write of `daemon.json` and `daemon.pid` goes through that file's own `<name>.tmp`, created exclusively and without following a symlink, mode 0600, then renamed into place. One metadata lock serializes the start write, the heal, the reload's write and its restore, and the shutdown cleanup: a heal never writes back an older record than the one held, and nothing writes the files after the cleanup. `daemon status`, `daemon reload`, `daemon stop` and `daemon start --detach` Ping before they read it. |
 | `daemon.pid` | 0600 | pid |
 
 ## Per-session event endpoint ownership
@@ -391,13 +391,16 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
    inheritable (`SYNAPS_DAEMON_LOCK_FD`), `execv(exe, original argv)`. The listener is CLOEXEC (asserted in
-   `listener::bind`) — closed at exec; the new image rebinds. **Exec failure**: `daemon.json`/reload-state
-   restored, `reloading` cleared, the reload-announce token re-armed (new connections are served again),
+   `listener::bind`) — closed at exec; the new image rebinds. **Exec failure**: the record from before the
+   attempt is put back whole, in memory and in `daemon.json` (exe and started_at too, so the next default
+   reload uses the old exe), the reload-state file removed, `reloading` cleared, the reload-announce token re-armed (new connections are served again),
    extension discovery re-spawned (the sidecars were stopped for the exec — bounded 10 s like boot), old
    image keeps serving (sessions checkpointed but alive; the requester already got `Bye{Reloading}` and
    reconnects to the same generation). `--exe` is validated **before** the probe: canonical path, regular
    file, executable, owned by our uid or root, not group/world-writable; then `--print-version` must parse
-   and pass the gate. Tested: `exe_validation_refuses_and_exec_failure_keeps_serving`.
+   and pass the gate. A failed `daemon.json` write at the exec or at the restore logs one WARN line. Tested:
+   `exe_validation_refuses_and_exec_failure_keeps_serving`,
+   `a_failed_reload_exec_leaves_the_previous_record_in_memory_and_on_disk`.
 6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
