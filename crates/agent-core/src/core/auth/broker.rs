@@ -343,6 +343,7 @@ impl ProxyRequest {
             && provider != "openai-codex"
             && provider != "anthropic"
             && provider != "kimi-code"
+            && provider != "muse"
             && static_provider(provider).is_none()
         {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
@@ -371,6 +372,11 @@ impl ProxyRequest {
                 && (self.path == "/chat/completions"
                     || self.method == ProxyMethod::Get
                         && matches!(self.path.as_str(), "/models" | "/me" | "/usages"))
+            // Meta Muse: Responses inference plus the read-only model catalog.
+            // Never the key mint/logout endpoints on the same host.
+            || provider == "muse"
+                && (self.method == ProxyMethod::Post && self.path == "/v1/responses"
+                    || self.method == ProxyMethod::Get && self.path == "/muse-code/models")
             || provider == "openai-codex"
                 && self.method == ProxyMethod::Get
                 && is_allowed_openai_codex_path(&self.path)
@@ -1620,6 +1626,8 @@ pub struct LocalBroker {
     google_gemini_base_url: Option<String>,
     /// Test seam: overrides the pinned ChatGPT backend base URL.
     openai_codex_base_url: Option<String>,
+    /// Test seam: overrides the pinned Meta Muse API origin.
+    muse_base_url: Option<String>,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
@@ -1688,6 +1696,7 @@ impl LocalBroker {
             anthropic_usage_url: None,
             google_gemini_base_url: None,
             openai_codex_base_url: None,
+            muse_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
@@ -1760,6 +1769,15 @@ impl LocalBroker {
     #[doc(hidden)]
     pub fn with_openai_codex_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
         self.openai_codex_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Test seam: point the pinned Meta Muse origin at a loopback fake. Only
+    /// relaxes the origin; the path allowlist, bearer resolution, 401
+    /// recovery and redirect denial are unchanged.
+    #[doc(hidden)]
+    pub fn with_muse_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
+        self.muse_base_url = Some(base_url.into().trim_end_matches('/').to_string());
         self
     }
 
@@ -2315,7 +2333,13 @@ impl LocalBroker {
         // header from that same credential.
         let oauth_provider: Option<OAuthProviderId> = provider_key.parse().ok();
         let mut pinned: Option<PinnedToken> = None;
-        if let Some(provider) = oauth_provider {
+        // Muse honours the official CLI's `META_API_KEY` override: a Model
+        // API key from the environment wins over the account login (only for
+        // policy-selected requests — an explicit account stays explicit).
+        let muse_env_key = (provider_key == "muse" && explicit_account.is_none())
+            .then(super::muse::api_key_from_env)
+            .flatten();
+        if let Some(provider) = oauth_provider.filter(|_| muse_env_key.is_none()) {
             if provider_key != LOCAL_PROVIDER_KEY && static_provider(provider_key).is_none() {
                 pinned = Some(self.resolve_and_vend(provider, explicit_account, None).await?);
             }
@@ -2356,6 +2380,20 @@ impl LocalBroker {
             // token resolved broker-side; the rotating refresh token never
             // leaves the boundary. Base is pinned to the managed endpoint.
             (bearer(&pinned)?, super::kimi_code::API_BASE_URL.to_string())
+        } else if provider_key == "muse" {
+            // Meta Muse: the bearer is a Model API key (env override, or the
+            // key minted from the broker-owned Meta OAuth login). The OAuth
+            // token itself never leaves the boundary. Origin is pinned; the
+            // allowlist pins the paths.
+            let key = match &muse_env_key {
+                Some(key) => key.clone(),
+                None => bearer(&pinned)?,
+            };
+            let base = self
+                .muse_base_url
+                .clone()
+                .unwrap_or_else(|| super::muse::API_ORIGIN.to_string());
+            (key, base)
         } else if provider_key == "anthropic" {
             // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
             // Keeps the access token broker-owned (no runtime token vending).
@@ -2366,6 +2404,41 @@ impl LocalBroker {
                 self.base_url_for(provider_key)?,
             )
         };
+        let response = self
+            .dispatch(request, provider_key, &key, &base, &pinned)
+            .await?;
+        // Muse mirrors the official CLI: a 401 on a minted key re-mints ONCE
+        // from the stored OAuth login (under the credential's refresh locks;
+        // a peer's fresh key is adopted instead) and the request is retried
+        // once. An env-supplied key is never re-minted.
+        if provider_key == "muse" && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(rejected) = pinned.as_ref() {
+                tracing::info!(credential = %rejected.credential, "muse key rejected (401); re-minting once");
+                let fresh = self
+                    .recover_rejected_token(&rejected.credential, &key)
+                    .await?;
+                let pinned = Some(PinnedToken {
+                    credential: rejected.credential.clone(),
+                    token: fresh,
+                });
+                let key = bearer(&pinned)?;
+                return self
+                    .dispatch(request, provider_key, &key, &base, &pinned)
+                    .await;
+            }
+        }
+        Ok(response)
+    }
+
+    /// Build and send one upstream request with an already-resolved bearer.
+    async fn dispatch(
+        &self,
+        request: &ProxyRequest,
+        provider_key: &str,
+        key: &str,
+        base: &str,
+        pinned: &Option<PinnedToken>,
+    ) -> Result<reqwest::Response, BrokerError> {
         let url = format!("{base}{}", request.path);
         // Deny redirects for credential-bearing OAuth catalog traffic and
         // google-gemini: a 3xx must not replay the bearer token off-origin.
@@ -2373,6 +2446,7 @@ impl LocalBroker {
             || provider_key == "openai-codex"
             || provider_key == "anthropic"
             || provider_key == "kimi-code"
+            || provider_key == "muse"
         {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -2389,7 +2463,7 @@ impl LocalBroker {
                 ProxyMethod::Post => self.http.post(&url),
             }
         };
-        builder = builder.bearer_auth(&key);
+        builder = builder.bearer_auth(key);
         if provider_key == "openai-codex" {
             // ChatGPT backend requires the account id. Derive it from the SAME
             // credential that produced the bearer: the JWT claim first, then
@@ -2398,7 +2472,7 @@ impl LocalBroker {
                 .as_ref()
                 .map(|p| p.credential.clone())
                 .unwrap_or_else(|| CredentialRef::default_for(OAuthProviderId::OpenAiCodex));
-            let account_id = super::extract_codex_account_id(&key)
+            let account_id = super::extract_codex_account_id(key)
                 .or_else(|| {
                     storage::load_credential(&cred)
                         .ok()
@@ -2442,6 +2516,11 @@ impl LocalBroker {
                 builder = builder.query(&[("alt", "sse")]);
             }
             builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
+        }
+        if provider_key == "muse" {
+            // API-key requests need only Authorization (verified); identify
+            // Synaps honestly instead of mimicking the official client.
+            builder = builder.header("user-agent", super::muse::USER_AGENT);
         }
         if provider_key == "kimi-code" {
             // Conventional Kimi device-identity surface (mirrors the official

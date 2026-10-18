@@ -26,6 +26,7 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub mod identity;
 pub mod kimi_code;
+pub mod muse;
 mod openai_codex;
 mod pkce;
 pub mod provider;
@@ -74,6 +75,7 @@ pub use identity::{
     identity_http_client, resolve_seat, supports_seat_identity, ResolvedSeat, SeatResolution,
 };
 pub use kimi_code::login as login_kimi_code;
+pub use muse::login as login_muse;
 pub use openai_codex::{
     extract_account_id as extract_codex_account_id, extract_email as extract_codex_email,
     login as login_openai_codex,

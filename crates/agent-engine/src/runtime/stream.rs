@@ -782,6 +782,9 @@ impl StreamMethods {
         }
 
         let mut round_checkpoint = RoundCheckpoint::default();
+        // Muse dangling-preamble continuation: at most once per user turn
+        // (this run), so a model that keeps stopping on a preamble cannot loop.
+        let mut preamble_nudged = false;
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
@@ -1521,6 +1524,32 @@ impl StreamMethods {
                     // instead of entering history after the cancel.
                     let steered = !cancel.is_cancelled()
                         && HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    // Muse ended on an announced-but-unperformed action ("Blocking
+                    // question before I build anything:"). Continue ONCE with a
+                    // visible harness note instead of silently ending the turn.
+                    // Only the Muse route sets the sidecar; steering wins.
+                    if !steered {
+                        if let Some(reason) = crate::runtime::openai::stream::take_preamble_nudge(
+                            &response,
+                            &mut preamble_nudged,
+                            response_cancelled || cancel.is_cancelled(),
+                            crate::runtime::openai::stream::preamble_nudge_enabled(),
+                        ) {
+                            tracing::info!(
+                                event = "muse_preamble_nudge",
+                                reason = reason.as_str(),
+                                "continuing turn once after a dangling preamble"
+                            );
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                crate::runtime::openai::stream::PREAMBLE_NUDGE_NOTICE.to_string(),
+                            )));
+                            messages.push(Arc::new(json!({
+                                "role": "user",
+                                "content": crate::runtime::openai::stream::PREAMBLE_NUDGE,
+                            })));
+                            continue;
+                        }
+                    }
                     if !steered {
                         // No steering, truly done. Completion is still subject to the
                         // session orchestration policy (including streamed runs).

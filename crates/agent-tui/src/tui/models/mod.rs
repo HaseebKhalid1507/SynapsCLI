@@ -51,6 +51,11 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             auth_kind: DevProviderAuth::OAuth("kimi-code"),
         },
         DevProviderSelection {
+            key: "muse",
+            name: "Meta Muse",
+            auth_kind: DevProviderAuth::OAuth("muse"),
+        },
+        DevProviderSelection {
             key: "azure-openai",
             name: "Azure OpenAI",
             auth_kind: DevProviderAuth::Cloud,
@@ -538,9 +543,15 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
         synaps_cli::auth::OAuthProviderId::GitHubCopilot,
         synaps_cli::auth::OAuthProviderId::GoogleGemini,
         synaps_cli::auth::OAuthProviderId::KimiCode,
+        synaps_cli::auth::OAuthProviderId::Muse,
     ]
     .into_iter()
-    .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
+    .filter(|id| {
+        synaps_cli::auth::broker::oauth_provider_logged_in(*id)
+            // Muse also runs on the official `META_API_KEY` override alone.
+            || (*id == synaps_cli::auth::OAuthProviderId::Muse
+                && synaps_cli::auth::muse::env_api_key_present())
+    })
     .map(|id| id.as_str())
     .collect()
 }
@@ -771,6 +782,12 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
             })
             .collect(),
         "xai-auth" => synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
+            .into_iter()
+            .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
+            .collect(),
+        // Server-driven catalog: only the documented seed ships statically;
+        // the live list replaces it once fetched (`e` / auto-refresh).
+        "muse" => synaps_cli::runtime::openai::catalog::muse_static_catalog_models()
             .into_iter()
             .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
             .collect(),

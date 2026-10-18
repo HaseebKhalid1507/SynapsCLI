@@ -246,6 +246,7 @@ async fn run_inline(
                 // ── Slash commands ──
                 if let Some((cmd, arg)) = commands::parse_command(trimmed) {
                     // Try engine-level command first
+                    commands::prepare_engine_command(cmd, arg, &runtime).await;
                     if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
                         match result {
                             CommandResult::Quit => break,
