@@ -3,7 +3,8 @@
 Long jobs (renders, training runs, sweeps) leave an agent with nothing to do
 for hours. Polling with `trigger = "always"` and a short `cooldown_secs`
 starts a full LLM session every few minutes just to learn "still running".
-These config keys let the agent sleep cheaply and run in a bounded sandbox.
+These config keys let the agent sleep cheaply and run under resource limits.
+The limits are not a sandbox; see *Not a security boundary* below.
 
 ```toml
 [agent]
@@ -43,3 +44,12 @@ notify_session = "e331"       # deliver to exactly one running session; dropped 
 - **Notices never broadcast.** Headless watcher agents also never pick up
   `watcher-*.json` inbox files, so one agent can't steal another's
   completion notice.
+
+## Not a security boundary
+
+`limits` and `wake_if` protect against runaway resource use, not against the
+agent itself. The agent runs as your user and can edit its own `config.toml`
+with its own tools. Because these keys hot-reload, an edit takes effect on the
+next spawn or wake poll: the agent can delete `memory_max`/`cpu_quota_pct`, or
+add a `wake_if` command. `wake_if` runs through `sh -c` in the supervisor,
+outside the `systemd-run` scope that applies the limits.

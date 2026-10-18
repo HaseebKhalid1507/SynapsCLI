@@ -98,6 +98,10 @@ pub(crate) fn notify_inbox_completion(
 /// Re-read the agent's config.toml so edits to limits / hooks / wake_if take
 /// effect at the next spawn without restarting the supervisor. The trigger
 /// *mode* (always/watch/manual) still needs a redeploy to rewire tasks.
+///
+/// Not a security boundary: the agent can edit its own config.toml, so it can
+/// drop its `limits` or add a `wake_if` (run below via `sh -c`, outside the
+/// systemd scope) and this picks the change up.
 pub(crate) fn refresh_config(agent: &mut ManagedAgent) {
     match AgentConfig::load(&agent.config_path) {
         Ok(cfg) => agent.config = cfg,
