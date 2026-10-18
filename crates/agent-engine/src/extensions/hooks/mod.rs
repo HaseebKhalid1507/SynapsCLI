@@ -63,7 +63,7 @@ fn accept_context_phase(
     tracing::info!(
         hook = %kind.as_str(),
         extension = %reg.handler.id(),
-        phase = %phase,
+        phase = %crate::runtime::continuation::phase_for_log(&phase),
         "Extension reported advisory context phase"
     );
     Some(phase)
