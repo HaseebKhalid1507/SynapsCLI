@@ -49,33 +49,50 @@ Opt-in. `live` / `on` / `true` / `1` / `yes` attaches OpenAI's hosted
 `web_search` tool to Codex requests; `cached` attaches it with
 `external_web_access: false`; anything else leaves it off.
 
-- **Where it is read.** The variable is read from the environment of the
-  process that runs the turn. In daemon mode that is the **daemon's**
-  environment (inherited from the shell that first spawned it), not the
-  attaching client's. Setting or unsetting it in another shell does nothing
-  until `synaps daemon stop`. The first Codex request of each session prints a
-  one-line `🔎 Codex web_search is on` notice when it is attached.
-- **Which requests.** Foreground turns only. Subagent workers also need
-  `SYNAPS_CODEX_WEB_SEARCH_WORKERS=1`; internal turns never get it. Models
-  that can't use it are skipped: `gpt-5.3-codex-spark` (text-only), and any
-  live `/codex/models` row with `supports_search_tool: false`.
-- **Visibility.** Each completed `web_search_call` item in the Responses
-  stream is shown as a `🔎 Codex web_search (<action>, <status>): <query>`
-  notice and logged at info (`target: synaps::web_search`). The search runs
-  on OpenAI's servers, so `before_tool_call` / `after_tool_call` hooks never
-  see it and can't block it.
+- **Where it is read.** From the environment of the process that runs the
+  turn. In daemon mode that is the **daemon's** environment (inherited from
+  the shell that first spawned it), not the attaching client's. Setting or
+  unsetting it in another shell does nothing until `synaps daemon stop`.
+  At the first turn of a session (and again if the model changes) the
+  session shows one line: `🔎 Codex web_search is on (…)`, or
+  `🔎 Codex web_search was requested … but is not attached for <model>:
+  <reason>`. A client attaching during that turn sees it in the replay; a
+  client attaching on a later turn does not.
+- **Which requests.** Foreground turns. Subagent workers also need
+  `SYNAPS_CODEX_WEB_SEARCH_WORKERS=1`; internal turns never get it.
+- **Which models.** Following upstream codex-rs (`spec_plan.rs`
+  `hosted_model_tool_specs`, openai/codex 8c076942), a model whose catalog row
+  has `use_responses_lite: true` gets no hosted tools. The live
+  `/codex/models` row wins; offline, the upstream bundled values are used
+  (every gpt-6.x and gpt-5.6 row is Responses Lite; gpt-5.5 is not).
+  `gpt-5.3-codex-spark` never gets it. `supports_search_tool` is upstream's
+  tool_search flag and is not consulted.
+- **Visibility.** Each completed `web_search_call` item becomes a notice
+  showing what left the machine: `🔎 Codex web_search (<action>, <status>):
+  <target>`, where the target is every query (`a | b | …`, first five, then
+  `(+k more)`), the URL, or `'<pattern>' in <url>` for find-in-page.
+  Bidi and zero-width characters are stripped. Worker searches appear in the
+  parent as `🔎 [worker <label>] …` while the turn that started the worker
+  is running; a background worker that outlives that turn searches without
+  a visible notice, and the worker watch view doesn't show searches.
+- **Logs.** One info record per call (`provider-hosted web_search call`)
+  with metadata only: action, status, query count and lengths, URL and
+  pattern lengths. The query text is never logged.
+- **Hooks.** The search runs on OpenAI's servers, so `before_tool_call` /
+  `after_tool_call` hooks never see it and can't block it.
 
 ## Codex HTTP 4xx errors
 
 A terminal 4xx from `/codex/responses` reads a bounded slice of the body
-(8 KiB). The error shows the sanitized `error.type` / `error.code`
-identifiers, the `param` path, and the provider message after redaction:
-one line, capped at 200 characters, quoted spans over 48 characters and
-token-shaped runs replaced with `[redacted]`, and the whole message dropped
-if it contains JSON or HTML structure. The trace terminal code carries only
-the identifiers (`http_400:invalid_request_error:unsupported_value`). "Not
-supported when using Codex with a ChatGPT account" adds a hint to switch
-account or model.
+(8 KiB) for classification only. Provider prose is never shown, logged, or
+passed to a parent agent (spec §5.1). The error carries identifier-shaped
+`error.type` / `error.code` and the `param` path, plus a Synaps-written
+explanation for known shapes: a rejected reasoning setting (`param`
+`reasoning.*`), a rejected tool (`param` `tools…`), an unsupported
+parameter, `model_not_found`, and "not supported when using Codex with a
+ChatGPT account" (detected as a boolean; the text is dropped). Anything else
+shows the identifiers alone. The trace terminal code carries only the
+identifiers (`http_400:invalid_request_error:unsupported_value`).
 
 ## Discovery and picker
 
