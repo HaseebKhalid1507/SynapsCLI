@@ -128,6 +128,17 @@ pub const MCP_CONFIG_MAX_ENV_VALUE_BYTES: usize = 4096;
 /// Only the FIRST expansion level is applied: a parent value containing `${…}`
 /// is copied verbatim (no recursion, so no expansion loops).
 pub fn expand_env_value(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    expand_env_value_with(value, lookup, |_| {})
+}
+
+/// [`expand_env_value`], calling `on_unset(name)` for every `${VAR}` with no
+/// fallback whose variable is unset (and so expands to ""). A set-but-empty
+/// variable is not reported.
+pub fn expand_env_value_with(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+    mut on_unset: impl FnMut(&str),
+) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -151,6 +162,7 @@ pub fn expand_env_value(value: &str, lookup: impl Fn(&str) -> Option<String>) ->
         if is_ident {
             match lookup(name) {
                 Some(v) if !(v.is_empty() && fallback.is_some()) => out.push_str(&v),
+                None if fallback.is_none() => on_unset(name),
                 _ => out.push_str(fallback.unwrap_or("")),
             }
         } else {
@@ -593,6 +605,25 @@ mod tests {
         let server = &config.mcp_servers["test"];
         assert_eq!(server.command, "echo");
         assert_eq!(server.args, vec!["hi"]);
+    }
+
+    /// 01 M1 / 08 I6.3: an unset `${VAR}` with no fallback silently became
+    /// "". The spawn path now warns; this pins which names it reports.
+    #[test]
+    fn expand_env_value_reports_unset_vars_without_fallback() {
+        let lookup = |k: &str| match k {
+            "SET" => Some("v".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let mut unset = Vec::new();
+        let out = expand_env_value_with(
+            "${SET}:${MISSING}:${EMPTY}:${GONE:-d}:${ALSO_MISSING}:${}",
+            lookup,
+            |name| unset.push(name.to_string()),
+        );
+        assert_eq!(out, "v:::d::${}");
+        assert_eq!(unset, ["MISSING", "ALSO_MISSING"]);
     }
 
     #[test]

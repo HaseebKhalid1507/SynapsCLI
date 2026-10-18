@@ -18,6 +18,33 @@ Configured in `~/.synaps-cli/mcp.json` (profile variant honoured):
 | `env`     | `{}`    | Extra environment for the child. |
 | `shared`  | `false` | Daemon mode: one child for **every** session in the process (see below). |
 
+## Environment and `${VAR}` expansion
+
+MCP children start with a cleared environment: only `PATH`, `HOME`, `LANG`,
+`TERM`, `XDG_RUNTIME_DIR` and `TMPDIR` are passed through, so host secrets
+such as `ANTHROPIC_API_KEY` never reach a server by accident. Anything else a
+server needs goes in `env`, and an `env` value can forward a variable from the
+Synaps process:
+
+```json
+"env": { "TOKEN_FILE": "${MY_TOKEN_FILE}", "BASE_URL": "${API_URL:-http://localhost:3000}/v1" }
+```
+
+- `${VAR}` expands to the variable's value. If `VAR` is unset it expands to
+  an empty string, and a warning naming the variable (never a value) is
+  logged.
+- `${VAR:-fallback}` uses `fallback` when `VAR` is unset or empty.
+- Anything else is literal: `$VAR`, a lone `$`, `${}` and an unterminated
+  `${`. There is no escape syntax. Expansion is one level deep; a value that
+  itself contains `${…}` is copied as is.
+
+**Daemon mode:** expansion happens in the daemon process, so it uses the
+daemon's environment: a copy of the shell that started it (with auto-spawn,
+the first client that attached). It does not use the shell you attach from.
+A variable you export in a later shell is unset as far as MCP servers are
+concerned until you restart the daemon (`synaps daemon stop`). This applies
+to every server, `shared` or not.
+
 ## Exact leases (progressive disclosure)
 
 Under progressive tool disclosure MCP tools are *dormant* registry entries
