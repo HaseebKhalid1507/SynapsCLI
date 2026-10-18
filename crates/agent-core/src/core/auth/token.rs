@@ -7,7 +7,8 @@ use reqwest::Client;
 
 use super::account::{CredentialRef, SeatIdentity};
 use super::storage::{
-    auth_file_path, load_provider_auth_at, save_provider_auth_if_refresh_matches_at, CasOutcome,
+    auth_file_path, load_provider_auth_at, save_provider_auth_if_refresh_matches_typed_at,
+    CasOutcome, StoreError,
 };
 use super::{is_token_expired, now_millis, OAuthCredentials, TokenResponse, CLIENT_ID, TOKEN_URL};
 
@@ -314,6 +315,17 @@ impl From<String> for RefreshFailure {
     }
 }
 
+/// A store lock that stayed held past its deadline is a busy lock (retry
+/// shortly); any other store failure keeps the credential classification.
+impl From<StoreError> for RefreshFailure {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::Busy(m) => Self::new(RefreshFailureKind::LockBusy, m),
+            StoreError::Failed(m) => Self::new(RefreshFailureKind::Credential, m),
+        }
+    }
+}
+
 impl From<RefreshFailure> for String {
     fn from(f: RefreshFailure) -> Self {
         f.message
@@ -527,7 +539,8 @@ where
     let lock_path = refresh_lock_path(path, &key);
     let load = || load_checked(path, cred, expected_seat);
     let save = |old_refresh: &str, fresh: &OAuthCredentials| {
-        save_provider_auth_if_refresh_matches_at(path, &key, old_refresh, fresh)
+        save_provider_auth_if_refresh_matches_typed_at(path, &key, old_refresh, fresh)
+            .map_err(RefreshFailure::from)
     };
     ensure_gated_locked_policy(
         refresh_gate(&gate_key),
@@ -763,6 +776,7 @@ where
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
 {
+    let save = |old: &str, fresh: &OAuthCredentials| save(old, fresh).map_err(RefreshFailure::from);
     ensure_gated_locked_policy(gate, lock_path, load, refresh, save, None, |_| Ok(()))
         .await
         .map_err(String::from)
@@ -790,7 +804,7 @@ where
     Refresh: Fn(String) -> RFut,
     RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, RErr>>,
     RErr: Into<RefreshFailure>,
-    Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
+    Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, RefreshFailure>,
     MayForce: Fn(Option<u64>) -> std::result::Result<(), RefreshFailure>,
 {
     // In-process waiters are bounded like cross-process ones.
@@ -1705,6 +1719,28 @@ mod rejected_token_tests {
         .await
         .map_err(String::from)
     }
+    /// m2: a CAS save that timed out on `auth.json.lock` is a busy lock
+    /// ("retry shortly"), never a credential failure ("sign in again").
+    #[tokio::test]
+    async fn busy_store_lock_on_save_is_lock_busy() {
+        use super::super::storage::StoreError;
+        let store = StdMutex::new(credential("rejected"));
+        let err = ensure_gated_locked_policy(
+            Arc::new(Mutex::new(())),
+            None,
+            || Ok(store.lock().unwrap().clone()),
+            |_| async { Ok::<_, String>(credential("new")) },
+            |_, _| Err(StoreError::Busy("timed out waiting for auth.json.lock".into()).into()),
+            Some("rejected"),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::LockBusy, "{err}");
+        let failed: RefreshFailure = StoreError::Failed("Failed to parse auth.json".into()).into();
+        assert_eq!(failed.kind, RefreshFailureKind::Credential);
+    }
+
     #[tokio::test]
     async fn changed_token_is_adopted_without_refresh() {
         let store = StdMutex::new(credential("peer-token"));

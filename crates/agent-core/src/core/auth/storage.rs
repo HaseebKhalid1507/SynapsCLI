@@ -278,12 +278,25 @@ pub enum CasOutcome {
 /// metadata and, when the rotated credential omits `accountId`, the stored
 /// one. Used by the refresh path so a concurrent removal or re-login is never
 /// overwritten by a stale rotation.
+#[cfg(test)]
 pub(crate) fn save_provider_auth_if_refresh_matches_at(
     path: &Path,
     key: &str,
     expected_refresh: &str,
     creds: &OAuthCredentials,
 ) -> std::result::Result<CasOutcome, String> {
+    save_provider_auth_if_refresh_matches_typed_at(path, key, expected_refresh, creds)
+        .map_err(String::from)
+}
+
+/// [`save_provider_auth_if_refresh_matches_at`] that tells a busy store
+/// lock apart from other failures.
+pub(crate) fn save_provider_auth_if_refresh_matches_typed_at(
+    path: &Path,
+    key: &str,
+    expected_refresh: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<CasOutcome, StoreError> {
     let encoded =
         serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
     let fields = encoded
@@ -293,7 +306,7 @@ pub(crate) fn save_provider_auth_if_refresh_matches_at(
     if !path.exists() {
         return Ok(CasOutcome::Removed);
     }
-    with_locked_root(path, false, |root| {
+    with_locked_root_typed(path, false, STORE_LOCK_WAIT, |root| {
         let Some(entry) = root.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
             return Ok((false, CasOutcome::Removed));
         };
@@ -805,8 +818,75 @@ fn with_locked_root<T>(
         &mut serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<(bool, T), String>,
 ) -> std::result::Result<T, String> {
-    use fs4::fs_std::FileExt;
+    with_locked_root_typed(path, recover_corrupt, STORE_LOCK_WAIT, edit).map_err(String::from)
+}
 
+/// Longest wait for `auth.json.lock`. A healthy holder keeps it for one
+/// read-merge-fsync-rename (milliseconds); a stopped or wedged process must
+/// not block every saver (and the refresh runtime's workers) forever.
+pub(crate) const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Why a locked store edit failed: the lock stayed held past the deadline,
+/// or anything else (I/O, parse, the edit itself).
+#[derive(Debug)]
+pub(crate) enum StoreError {
+    Busy(String),
+    Failed(String),
+}
+
+impl From<StoreError> for String {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::Busy(m) | StoreError::Failed(m) => m,
+        }
+    }
+}
+
+impl From<String> for StoreError {
+    fn from(m: String) -> Self {
+        StoreError::Failed(m)
+    }
+}
+
+/// Poll `try_lock_exclusive` until `wait` runs out.
+fn lock_store_exclusive(
+    lock_file: &std::fs::File,
+    lock_path: &std::path::Path,
+    wait: std::time::Duration,
+) -> std::result::Result<(), StoreError> {
+    use fs4::fs_std::FileExt;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match FileExt::try_lock_exclusive(lock_file) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(StoreError::Failed(format!(
+                    "Failed to lock {}: {}",
+                    lock_path.display(),
+                    e
+                )))
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(StoreError::Busy(format!(
+                "timed out after {}s waiting for {} (another synaps process holds it)",
+                wait.as_secs(),
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn with_locked_root_typed<T>(
+    path: &std::path::Path,
+    recover_corrupt: bool,
+    wait: std::time::Duration,
+    edit: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<(bool, T), String>,
+) -> std::result::Result<T, StoreError> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -824,8 +904,7 @@ fn with_locked_root<T>(
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("Failed to open lock file {}: {}", lock_path.display(), e))?;
-    FileExt::lock_exclusive(&lock_file)
-        .map_err(|e| format!("Failed to lock {}: {}", lock_path.display(), e))?;
+    lock_store_exclusive(&lock_file, &lock_path, wait)?;
 
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)
@@ -838,7 +917,7 @@ fn with_locked_root<T>(
         match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content) {
             Ok(map) => map,
             Err(e) if !recover_corrupt => {
-                return Err(format!("Failed to parse {}: {}", path.display(), e));
+                return Err(format!("Failed to parse {}: {}", path.display(), e).into());
             }
             Err(e) => {
                 tracing::warn!(
@@ -1741,5 +1820,62 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+}
+
+/// m2: a wedged process holding `auth.json.lock` must not block a saver
+/// (and with it a refresh-runtime worker) forever.
+#[cfg(test)]
+mod store_lock_wait_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn hold_store_lock(path: &Path) -> std::fs::File {
+        use fs4::fs_std::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .unwrap();
+        assert!(FileExt::try_lock_exclusive(&lock).unwrap());
+        lock
+    }
+
+    #[test]
+    fn store_lock_wait_has_a_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let _held = hold_store_lock(&path);
+        let started = Instant::now();
+        let err = with_locked_root_typed(&path, false, Duration::from_millis(200), |_| {
+            Ok((false, ()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Busy(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(String::from(err).contains("auth.json.lock"));
+    }
+
+    #[test]
+    fn store_lock_is_taken_once_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let held = hold_store_lock(&path);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        with_locked_root_typed(&path, false, Duration::from_secs(10), |_| Ok((false, ())))
+            .expect("lock is acquired after the holder lets go");
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn production_store_lock_wait_is_bounded() {
+        assert!(STORE_LOCK_WAIT >= Duration::from_secs(5));
+        assert!(STORE_LOCK_WAIT <= Duration::from_secs(30));
     }
 }
