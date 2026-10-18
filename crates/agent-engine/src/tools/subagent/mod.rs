@@ -618,6 +618,7 @@ mod codex_ultra_worker_tests {
             tool: Some("bash".into()),
             generations: vec![],
             modified_input: None,
+            modified_by: vec![],
         };
         let parent = crate::Runtime::new_headless();
         let mut independent = crate::Runtime::new_headless();

@@ -416,6 +416,11 @@ pub enum HookResult {
         /// the chain. Approval runs THIS input (never extension-settable).
         #[serde(skip)]
         modified_input: Option<Value>,
+        /// Host-set: ids of the extensions whose `Modify` produced
+        /// `modified_input` (chain order, de-duplicated). Shown in the
+        /// prompt so the user knows the input was rewritten, and by whom.
+        #[serde(skip)]
+        modified_by: Vec<String>,
     },
     /// Replace the tool **input** before execution (structured JSON args).
     /// Only valid on before_tool_call hooks. The output-side counterpart is
@@ -452,6 +457,7 @@ impl HookResult {
             generations: Vec::new(),
             tool: None,
             modified_input: None,
+            modified_by: vec![],
         }
     }
 }
@@ -785,6 +791,7 @@ mod tests {
             generations: vec![3],
             tool: Some("bash".into()),
             modified_input: Some(serde_json::json!({"x": 1})),
+            modified_by: vec![],
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -801,7 +808,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(&spoof, HookResult::Confirm { sources, tool: None, modified_input: None, .. } if sources.is_empty()),
+            matches!(&spoof, HookResult::Confirm { sources, tool: None, modified_input: None, modified_by, .. } if sources.is_empty() && modified_by.is_empty()),
             "{spoof:?}"
         );
     }
@@ -892,6 +899,7 @@ mod tests {
                     generations: vec![],
                     tool: None,
                     modified_input: None,
+                    modified_by: vec![],
                 },
             ),
             (

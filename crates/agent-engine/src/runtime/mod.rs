@@ -104,16 +104,61 @@ fn cap_confirm_message(message: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{kept}\n…[message truncated by host]"))
 }
 
+/// Lines / chars of the final-input preview shown when the input was
+/// rewritten by an earlier extension.
+const MAX_REWRITE_PREVIEW_LINES: usize = 6;
+const MAX_REWRITE_PREVIEW_CHARS: usize = 400;
+
+/// Host-rendered, capped preview of the input that will actually run: a
+/// shell-style `command` string as-is, anything else as pretty JSON.
+fn final_input_preview(input: &Value) -> String {
+    let full = match input.get("command").and_then(Value::as_str) {
+        Some(cmd) => cmd.to_string(),
+        None => serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
+    };
+    let lines: Vec<&str> = full.lines().collect();
+    let mut out: String = lines[..lines.len().min(MAX_REWRITE_PREVIEW_LINES)]
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cut = lines.len() > MAX_REWRITE_PREVIEW_LINES;
+    if out.chars().count() > MAX_REWRITE_PREVIEW_CHARS {
+        out = out.chars().take(MAX_REWRITE_PREVIEW_CHARS).collect();
+        cut = true;
+    }
+    if cut {
+        out.push_str("\n  …[preview truncated]");
+    }
+    out
+}
+
 /// Prompt body for an extension tool-call Confirm: the host-known source and
 /// tool lead, so an extension's own `message` cannot hide who is asking.
-fn confirm_prompt_body(message: &str, sources: &[String], tool: Option<&str>) -> String {
+/// When earlier extensions rewrote the input (prA N3) the header also says
+/// so, by whom, and previews the FINAL input — the one approval runs —
+/// before the extension's own message (which is cut first on small screens).
+fn confirm_prompt_body(
+    message: &str,
+    sources: &[String],
+    tool: Option<&str>,
+    rewrite: Option<(&[String], &Value)>,
+) -> String {
     let source = if sources.is_empty() {
         "(unknown)".to_string()
     } else {
         sources.join(", ")
     };
+    let rewritten = match rewrite {
+        Some((by, input)) => format!(
+            "Input rewritten by: {}\nInput that will run:\n{}\n",
+            if by.is_empty() { "(unknown)".to_string() } else { by.join(", ") },
+            final_input_preview(input)
+        ),
+        None => String::new(),
+    };
     format!(
-        "Extension: {source}\nTool: {}\n\n{}\n\nAllow this tool call?",
+        "Extension: {source}\nTool: {}\n{rewritten}\n{}\n\nAllow this tool call?",
         tool.unwrap_or("(unknown)"),
         cap_confirm_message(message)
     )
@@ -151,6 +196,7 @@ pub async fn resolve_before_tool_call_result(
             generations,
             tool,
             modified_input,
+            modified_by,
         } => {
             let keys = crate::tools::latch_keys(&sources, &generations);
             if auto_approve_confirms {
@@ -181,12 +227,22 @@ pub async fn resolve_before_tool_call_result(
                 crate::session::ConfirmScope {
                     extensions: sources.clone(),
                     tool: tool.clone(),
+                    rewritten_by: if modified_input.is_some() {
+                        modified_by.clone()
+                    } else {
+                        Vec::new()
+                    },
                 }
             });
             let response = prompt
                 .prompt_scoped(
                     crate::session::CONFIRM_PROMPT_TITLE.to_string(),
-                    confirm_prompt_body(&message, &sources, tool.as_deref()),
+                    confirm_prompt_body(
+                        &message,
+                        &sources,
+                        tool.as_deref(),
+                        modified_input.as_ref().map(|i| (modified_by.as_slice(), i)),
+                    ),
                     scope,
                 )
                 .await;
@@ -5522,6 +5578,7 @@ mod tests {
             tool: Some(tool.into()),
             generations: vec![],
             modified_input: None,
+            modified_by: vec![],
         }
     }
 
@@ -5613,6 +5670,7 @@ mod tests {
                 Some(crate::session::ConfirmScope {
                     extensions: vec!["jev".into()],
                     tool: Some("bash".into()),
+                    rewritten_by: vec![],
                 })
             );
             assert!(first.prompt.starts_with("Extension: jev\nTool: bash\n"), "{}", first.prompt);
@@ -5693,6 +5751,7 @@ mod tests {
             generations: vec![],
             tool: Some("bash".into()),
             modified_input: None,
+            modified_by: vec![],
         };
         let first = resolve_before_tool_call_result(merged(), Some(&handle), false, Some(&latch)).await;
         task.await.unwrap();
@@ -5726,17 +5785,76 @@ mod tests {
         assert!(matches!(r, crate::extensions::hooks::events::HookResult::Continue));
     }
 
+    /// prA N3: a Confirm whose input an earlier extension rewrote shows who
+    /// rewrote it and a capped preview of the FINAL input, ahead of the
+    /// confirmer's own message; the scope records `rewritten_by` so the
+    /// session can mark the transcript; approval runs that final input.
+    #[tokio::test]
+    async fn rewritten_input_is_shown_in_the_confirm_prompt() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            let body = req.prompt.clone();
+            let scope = req.confirm_scope.clone().unwrap();
+            let _ = req.response_tx.send(Some("y".into()));
+            (body, scope)
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run this bash command?".into(),
+                sources: ext(&["jev"]),
+                generations: vec![],
+                tool: Some("bash".into()),
+                modified_input: Some(serde_json::json!({"command": "rm -rf build/"})),
+                modified_by: ext(&["rewriter"]),
+            },
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        let (body, scope) = task.await.unwrap();
+        let header_end = body.find("Run this bash command?").unwrap();
+        let header = &body[..header_end];
+        assert!(header.contains("Input rewritten by: rewriter"), "{body}");
+        assert!(header.contains("Input that will run:\n  rm -rf build/"), "{body}");
+        assert_eq!(scope.rewritten_by, ext(&["rewriter"]));
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Modify { input }
+                if input == serde_json::json!({"command": "rm -rf build/"})
+        ));
+        // No rewrite → no rewrite header, empty rewritten_by.
+        let plain = confirm_prompt_body("m", &ext(&["jev"]), Some("bash"), None);
+        assert!(!plain.contains("rewritten"), "{plain}");
+    }
+
+    #[test]
+    fn final_input_preview_is_capped() {
+        let many = serde_json::json!({"command": (1..=20).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n")});
+        let p = final_input_preview(&many);
+        assert!(p.lines().count() <= MAX_REWRITE_PREVIEW_LINES + 1, "{p}");
+        assert!(p.ends_with("…[preview truncated]"), "{p}");
+        let wide = serde_json::json!({"path": "x".repeat(2000)});
+        let p = final_input_preview(&wide);
+        assert!(p.chars().count() <= MAX_REWRITE_PREVIEW_CHARS + 30, "{}", p.len());
+        let obj = serde_json::json!({"path": "/tmp/a", "content": "hi"});
+        assert!(final_input_preview(&obj).contains("\"path\": \"/tmp/a\""));
+    }
+
     /// A long extension message is capped so the host header, buttons and
     /// scope line stay on screen.
     #[test]
     fn long_confirm_message_is_capped() {
         let long = "x\n".repeat(500);
-        let body = confirm_prompt_body(&long, &ext(&["jev"]), Some("bash"));
+        let body = confirm_prompt_body(&long, &ext(&["jev"]), Some("bash"), None);
         assert!(body.starts_with("Extension: jev\nTool: bash\n"));
         assert!(body.contains("…[message truncated by host]"));
         assert!(body.lines().count() <= MAX_CONFIRM_MESSAGE_LINES + 7, "{}", body.lines().count());
         let wide = "y".repeat(10_000);
-        assert!(confirm_prompt_body(&wide, &ext(&["jev"]), None).chars().count() < 1400);
+        assert!(confirm_prompt_body(&wide, &ext(&["jev"]), None, None).chars().count() < 1400);
     }
 
     /// An unattributed confirm (no host-stamped source) offers no scope and

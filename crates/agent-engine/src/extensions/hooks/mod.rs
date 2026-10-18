@@ -242,6 +242,8 @@ impl HookBus {
         // handlers see — and vet — the MODIFIED input, so a Modify can no
         // longer smuggle unchecked input past a later Block or Confirm.
         let mut modified_event: Option<HookEvent> = None;
+        // Who rewrote it (chain order, de-duplicated).
+        let mut modified_by: Vec<String> = Vec::new();
 
         for reg in &registrations {
             let ev: &HookEvent = modified_event.as_ref().unwrap_or(event);
@@ -361,6 +363,10 @@ impl HookBus {
                     let mut next = ev.clone();
                     next.tool_input = Some(input);
                     modified_event = Some(next);
+                    let id = reg.handler.id().to_string();
+                    if !modified_by.contains(&id) {
+                        modified_by.push(id);
+                    }
                 }
                 Ok(HookResult::Replace { output }) => {
                     // Two-key gate: subscribing to after_tool_call needs
@@ -462,6 +468,7 @@ impl HookBus {
                 generations,
                 tool,
                 modified_input: modified_event.and_then(|e| e.tool_input),
+                modified_by,
             };
         }
         if let Some(input) = modified_event.and_then(|e| e.tool_input) {
@@ -586,6 +593,7 @@ impl HookBus {
                         generations: vec![self.extension_generation(reg.handler.id())],
                         tool: event.tool_runtime_name.clone().or_else(|| event.tool_name.clone()),
                         modified_input: None,
+                        modified_by: vec![],
                     };
                 }
                 Ok(result @ HookResult::ContextPhase { .. }) => {

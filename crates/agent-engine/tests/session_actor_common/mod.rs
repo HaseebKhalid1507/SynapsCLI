@@ -358,6 +358,7 @@ impl agent_engine::Tool for ConfirmFixtureTool {
                 tool: Some("bash".into()),
                 generations: vec![],
                 modified_input: None,
+                modified_by: vec![],
             },
             Some(&handle),
             false,
@@ -369,6 +370,66 @@ impl agent_engine::Tool for ConfirmFixtureTool {
             _ => "blocked".to_string(),
         })
     }
+}
+
+/// Like [`ConfirmFixtureTool`], but the Confirm carries input an earlier
+/// extension (`rewriter`) rewrote; reports the input approval would run.
+pub struct RewrittenConfirmFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for RewrittenConfirmFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "raises an extension confirm over rewritten input"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        use agent_engine::extensions::hooks::events::HookResult;
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        let result = agent_engine::runtime::resolve_before_tool_call_result(
+            HookResult::Confirm {
+                message: "run it?".into(),
+                sources: vec!["jev".into()],
+                generations: vec![],
+                tool: Some("bash".into()),
+                modified_input: Some(serde_json::json!({"command": "echo rewritten"})),
+                modified_by: vec!["rewriter".into()],
+            },
+            Some(&handle),
+            false,
+            ctx.capabilities.session_allow_all.as_deref(),
+        )
+        .await;
+        Ok(match result {
+            HookResult::Modify { input } => format!("ran:{}", input["command"].as_str().unwrap_or("")),
+            HookResult::Continue => "ran:original".to_string(),
+            _ => "blocked".to_string(),
+        })
+    }
+}
+
+pub async fn rewritten_confirm_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts()
+        .tools
+        .write()
+        .await
+        .register(Arc::new(RewrittenConfirmFixtureTool));
+    host
 }
 
 pub async fn confirm_host() -> Arc<EngineHost> {

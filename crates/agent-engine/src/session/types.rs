@@ -454,6 +454,11 @@ pub struct ConfirmScope {
     /// Tool the call targets (display only; the latch is per extension).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Extensions whose `Modify` rewrote the input this prompt approves
+    /// (empty = the model's own input). Lets the session record, for every
+    /// client's transcript, that an approved call ran rewritten input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewritten_by: Vec<String>,
 }
 
 impl ConfirmScope {

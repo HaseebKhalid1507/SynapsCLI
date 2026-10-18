@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn allow_all_requires_an_attributed_tool_call_confirm() {
-        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: Some("bash".into()) };
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: Some("bash".into()), rewritten_by: vec![] };
         let title = crate::session::CONFIRM_PROMPT_TITLE;
         assert!(confirm(title, Some(scope.clone())).confirm_offers_allow_all());
         assert!(
@@ -430,7 +430,7 @@ mod tests {
         );
         assert!(!confirm(
             title,
-            Some(ConfirmScope { extensions: vec![], tool: None })
+            Some(ConfirmScope { extensions: vec![], tool: None, rewritten_by: vec![] })
         )
         .confirm_offers_allow_all());
         assert!(!confirm(crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE, Some(scope))
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn focus_does_not_wrap_and_allow_all_needs_two_enters() {
-        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None };
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] };
         let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
         q.arm_now_for_tests();
         q.move_confirm_focus(true);
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn dropping_allow_all_moves_focus_off_it() {
-        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None };
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] };
         let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
         q.move_confirm_focus(false);
         assert_eq!(q.confirm_focus(), ConfirmChoice::AllowAll);
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn confirm_ignores_input_until_armed_secret_never_waits() {
-        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None };
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] };
         let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
         assert!(!q.input_armed(), "a fresh confirm is not armed");
         q.arm_now_for_tests();

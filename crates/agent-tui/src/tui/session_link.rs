@@ -526,6 +526,7 @@ mod tests {
             p.confirm_scope = Some(agent_engine::session::ConfirmScope {
                 extensions: vec!["jev".into()],
                 tool: None,
+                rewritten_by: vec![],
             });
             p
         };

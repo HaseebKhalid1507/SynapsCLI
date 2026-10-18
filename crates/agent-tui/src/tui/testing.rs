@@ -522,6 +522,7 @@ impl TestHarness {
             Some(agent_engine::session::ConfirmScope {
                 extensions: vec![extension.to_string()],
                 tool: Some(tool.to_string()),
+                rewritten_by: vec![],
             }),
         )
     }
@@ -571,6 +572,7 @@ impl TestHarness {
             confirm_scope: Some(agent_engine::session::ConfirmScope {
                 extensions: vec![extension.to_string()],
                 tool: Some(tool.to_string()),
+                rewritten_by: vec![],
             }),
             response_tx,
         })

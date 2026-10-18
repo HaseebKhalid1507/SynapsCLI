@@ -3608,18 +3608,36 @@ impl SessionActor {
             }
             return; // the prompt stays pending for an eligible client
         }
+        let approved = allow_all
+            || value
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|v| v.eq_ignore_ascii_case("y") || v.eq_ignore_ascii_case("yes"));
         let (prompt, tx) = self.pending_prompts.remove(pos).expect("position");
         let _ = tx.send(value);
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
+        let by = match from {
+            Some(c) => format!("client #{}", c.0),
+            None => "the host".to_string(),
+        };
+        // prA N3: the tool card shows the model's original input; when the
+        // approved call runs input rewritten by an extension, every client's
+        // transcript records that (the prompt showed the final input).
+        if approved && prompt.title == CONFIRM_PROMPT_TITLE {
+            if let Some(scope) = prompt.confirm_scope.as_ref().filter(|s| !s.rewritten_by.is_empty()) {
+                self.emit(SessionEventWire::SystemNotice(format!(
+                    "Approved by {by}: {} runs with input rewritten by {} (not the input shown \
+                     on its tool card; the approval prompt showed what runs).",
+                    scope.tool.as_deref().unwrap_or("the tool call"),
+                    scope.rewritten_by.join(", ")
+                )));
+            }
+        }
         // Arming the latch is announced to every attached client, not just
         // the one that pressed the key.
         if allow_all && prompt.title == CONFIRM_PROMPT_TITLE {
             if let Some(scope) = prompt.confirm_scope.as_ref().filter(|s| !s.extensions.is_empty()) {
-                let by = match from {
-                    Some(c) => format!("client #{}", c.0),
-                    None => "the host".to_string(),
-                };
                 self.emit(SessionEventWire::SystemNotice(format!(
                     "Allow all armed by {by}: tool-call confirms from {} are auto-approved \
                      until /new. Other extensions still ask. /confirms reset revokes.",

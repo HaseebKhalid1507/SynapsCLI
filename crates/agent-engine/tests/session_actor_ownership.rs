@@ -229,6 +229,46 @@ async fn confirm_answers_are_owner_gated_and_allow_all_is_announced() {
     end(&mut a).await;
 }
 
+/// prA N3: approving a call whose input an extension rewrote is recorded
+/// for every attached client (the tool card shows the model's original
+/// input), and the approved call runs the rewritten input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn approving_rewritten_input_is_announced_to_every_client() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = rewritten_confirm_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+    a.send_from_self(submit("go")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let SessionEventWire::Prompt(pr) = &seen.last().unwrap().event else {
+        unreachable!()
+    };
+    assert!(pr.prompt.contains("Input rewritten by: rewriter"), "{}", pr.prompt);
+    assert!(pr.prompt.contains("echo rewritten"), "{}", pr.prompt);
+    a.send_from_self(SessionCommand::Answer {
+        prompt_id: pr.id,
+        value: Some("y".into()),
+    })
+    .await
+    .unwrap();
+    let marked = |e: &SessionEventWire| {
+        matches!(e, SessionEventWire::SystemNotice(n)
+            if n.contains("rewritten by rewriter") && n.contains("bash"))
+    };
+    until(&mut o, marked).await;
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| marked(&e.event)), "{seen:#?}");
+    assert_eq!(
+        tool_results(&last_conversation(&seen)),
+        vec!["ran:echo rewritten".to_string()]
+    );
+    end(&mut a).await;
+}
+
 /// A plain (non-always) answer from a non-owner Mirror is still accepted:
 /// only arming the latch is owner-only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
