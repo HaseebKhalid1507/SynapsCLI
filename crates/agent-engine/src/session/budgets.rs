@@ -44,8 +44,8 @@ pub const WORKER_RELOAD_STOP_TIMEOUT: std::time::Duration =
 /// Longest a reload checkpoint fences its session (no queue-wake turns,
 /// keep-warm pings, driver ticks or parking) waiting for the `execv` or for
 /// the daemon to report it failed (`ReloadAborted`). Both normally come
-/// within seconds; this only bounds a reload that never reports back (or a
-/// client-sent reload checkpoint, which no exec follows).
+/// within seconds; this only bounds a reload that never reports back (a
+/// daemon bug: clients cannot send a reload checkpoint).
 pub const RELOAD_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Session end's bounded observability flush (`finish` STEP 3).

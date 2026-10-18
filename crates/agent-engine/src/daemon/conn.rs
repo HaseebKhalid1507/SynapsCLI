@@ -48,8 +48,13 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::SubmitPrepared { .. }
         | C::PluginCommand { .. }
         | C::Resume { .. }
-        | C::Checkpoint { .. }
         | C::KeepWarm { .. } => Ok(()),
+        // A reload checkpoint stops every worker and fences the session
+        // for the exec that follows: only the daemon's own reload sends it.
+        C::Checkpoint { reason: crate::session::CheckpointReason::Reload } => {
+            Err("checkpoint(reload): host-only (use `synaps daemon reload`)")
+        }
+        C::Checkpoint { .. } => Ok(()),
         C::Detach { client } if *client == own => Ok(()),
         C::Detach { .. } => Err("detach: not your client id"),
         C::Attach { .. } => Err("attach: already attached (one session per connection)"),
@@ -612,5 +617,35 @@ fn reload_bye(state: &DaemonState) -> ByeReason {
     ByeReason::Reloading {
         generation: state.reload_generation.load(Ordering::SeqCst),
         retry_after_ms: super::reload::RETRY_AFTER_MS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::CheckpointReason;
+
+    /// A reload checkpoint stops every worker and fences the session until
+    /// an exec that only the daemon's own reload performs: no client may
+    /// send one. A host-request checkpoint stays a client command.
+    #[test]
+    fn a_reload_checkpoint_is_host_only() {
+        let own = ClientId(1);
+        let reload = SessionCommand::Checkpoint { reason: CheckpointReason::Reload };
+        assert!(client_may_send(&reload, own).is_err());
+        let host = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
+        assert!(client_may_send(&host, own).is_ok());
+    }
+
+    /// The drain gate refuses work that would start after the record, and
+    /// leaves what the turn being drained still needs.
+    #[test]
+    fn the_drain_gate_keeps_steering_the_running_turn() {
+        let submit = SessionCommand::Submit { text: "x".into(), attachments: vec![] };
+        assert!(refused_while_draining(&submit));
+        assert!(refused_while_draining(&SessionCommand::NewSession));
+        assert!(refused_while_draining(&SessionCommand::Resume { id: 1, query: "q".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Steer { text: "x".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Cancel));
     }
 }

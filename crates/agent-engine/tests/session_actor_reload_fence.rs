@@ -350,3 +350,32 @@ async fn a_failed_exec_announces_a_worker_registered_after_the_snapshot() {
     assert!(sa9[0].contains("by a daemon reload, not by the user"), "{sa9:#?}");
     end(&mut f.client).await;
 }
+
+/// A reload checkpoint is the daemon's: from a client it would stop every
+/// worker and fence the session for an exec that never comes. Refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_client_cannot_send_a_reload_checkpoint() {
+    let _h = Home::new();
+    let mut f = fixture().await;
+    let worker = Arc::new(RwLock::new(SubagentState::new()));
+    fake_worker(&f, "sa_3", "busy", &worker);
+
+    f.client
+        .send_from_self(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
+        .await
+        .unwrap();
+    let seen = until(&mut f.client, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    let refused = refusals(&seen);
+    assert_eq!(refused[0].0, "checkpoint", "{refused:?}");
+    assert!(!worker.read().unwrap().cancel_requested, "its workers keep running");
+    assert!(!seen.iter().any(|e| matches!(
+        &e.event,
+        SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID
+    )));
+    // Not fenced: the next turn runs.
+    f.client.send_from_self(submit("still here")).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut f.client).await;
+}

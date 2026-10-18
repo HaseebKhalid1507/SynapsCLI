@@ -4370,6 +4370,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // Only the daemon's reload sends a reload checkpoint (it stops
+            // every worker and fences the session for the exec after it).
+            if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "checkpoint(reload) is host-only; use `synaps daemon reload`".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             if is_input_command(&cmd) && self.input_owner != Some(c) {
                 let reason = match self.input_owner {
                     Some(o) => format!("input owned by client #{}", o.0),
