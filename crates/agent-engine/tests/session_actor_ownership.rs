@@ -225,6 +225,7 @@ async fn owner_detach_passes_to_oldest_non_observer() {
 /// `shell_start sleep <marker>` then `Checkpoint`: the PTY child is gone, the
 /// stream is cancelled (history kept + restart marker), the reply lands on
 /// `CHECKPOINT_QUERY_ID`, and the session is still alive.
+#[cfg(feature = "command-exec")]
 const SSE_SHELL_START: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"type\":\"message\",",
     "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
@@ -241,6 +242,7 @@ const SSE_SHELL_START: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
 );
 
+#[cfg(feature = "command-exec")]
 fn marker_alive() -> bool {
     std::process::Command::new("pgrep")
         .args(["-f", "sleep 271828"])
@@ -249,6 +251,7 @@ fn marker_alive() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "command-exec")] // drives the bash / shell_* tools
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {

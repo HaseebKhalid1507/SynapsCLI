@@ -611,10 +611,10 @@ fn batch_rejects_collision_with_existing_registry_tool() {
     let mut registry = ToolRegistry::new();
     let before = registry_snapshot(&registry);
 
-    // "bash" is a live builtin: a batch must never replace it, whatever
+    // "read" is a live builtin (in every build): a batch must never replace it, whatever
     // origin the incoming tool claims.
     let err = registry
-        .try_register_batch(vec![named("bash", "srv", "bash")])
+        .try_register_batch(vec![named("read", "srv", "read")])
         .expect_err("existing runtime tool must not be replaceable via batch");
     assert!(matches!(
         err,
@@ -622,7 +622,7 @@ fn batch_rejects_collision_with_existing_registry_tool() {
     ));
     assert_eq!(registry_snapshot(&registry), before);
     // The live builtin is untouched.
-    assert!(registry.get("bash").is_some());
+    assert!(registry.get("read").is_some());
 }
 
 // ── daemon-mode phase 2 (C4): record_server_listing (write-back) ────────────

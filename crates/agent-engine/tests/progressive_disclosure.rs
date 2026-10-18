@@ -176,6 +176,9 @@ fn production_core_first_request_fits_documented_budget() {
         "search_tools",
         "activate_tools",
     ] {
+        if required == "bash" && !cfg!(feature = "command-exec") {
+            continue;
+        }
         assert!(names.contains(&required), "core member missing: {required}");
     }
     for deferred in ["subagent_start", "subagent", "shell_start", "shell_send"] {

@@ -2263,6 +2263,7 @@ mod lifecycle_tests {
     /// keep the three context tools AND carry exact activations. The old
     /// rebuild (`rebuilt_for_catalog`, bare progressive core) dropped the
     /// context tools for the rest of the turn, so the next rollover failed.
+    #[cfg(feature = "command-exec")] // uses shell_start as the deferred builtin
     #[test]
     fn round_top_rebuild_after_generation_bump_keeps_context_tools() {
         use crate::tools::catalog::SessionActivationGrant;

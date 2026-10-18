@@ -1360,12 +1360,14 @@ mod tests {
     // compress-then-truncate ordering (Synaps Fork 1) — RED stub
     // ────────────────────────────────────────────────────────────────────────
 
+    #[cfg(feature = "command-exec")]
     #[derive(Debug)]
     struct RecordingHandler {
         id: String,
         recorded_len: Arc<AtomicUsize>,
         result: HookResult,
     }
+    #[cfg(feature = "command-exec")]
     impl RecordingHandler {
         fn new(id: &str, result: HookResult) -> (Arc<Self>, Arc<AtomicUsize>) {
             let recorded_len = Arc::new(AtomicUsize::new(0));
@@ -1377,6 +1379,7 @@ mod tests {
             (h, recorded_len)
         }
     }
+    #[cfg(feature = "command-exec")]
     #[async_trait]
     impl crate::extensions::runtime::ExtensionHandler for RecordingHandler {
         fn id(&self) -> &str {
