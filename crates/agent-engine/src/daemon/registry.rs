@@ -54,6 +54,8 @@ fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, body)?;
     chmod_600(&tmp);
+    #[cfg(test)]
+    test_pause::at(&test_pause::BEFORE_RENAME);
     std::fs::rename(&tmp, path)
 }
 
@@ -82,6 +84,8 @@ pub fn heal_daemon_json(paths: &DaemonPaths, info: &DaemonInfo, _lock: &DaemonLo
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
+    #[cfg(test)]
+    test_pause::at(&test_pause::HEAL_BEFORE_WRITE);
     write_daemon_json(paths, info)?;
     Ok(true)
 }
@@ -165,6 +169,37 @@ impl Metadata {
     /// [`cleanup_metadata`] (shutdown).
     pub fn cleanup(&self, lock: &DaemonLock) -> bool {
         cleanup_metadata(&self.paths, lock)
+    }
+}
+
+/// Test-only pause points (thread-local, so a test pauses only its own
+/// thread): a hook set here runs at that point of the write path.
+#[cfg(test)]
+pub(crate) mod test_pause {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    pub(crate) type Hook = RefCell<Option<Box<dyn Fn()>>>;
+
+    thread_local! {
+        /// In [`super::heal_daemon_json`], after it found the file missing
+        /// or foreign and before it writes the record it was given.
+        pub(crate) static HEAL_BEFORE_WRITE: Hook = const { RefCell::new(None) };
+        /// In `write_atomic`, after the temp file is written and before it
+        /// is renamed into place.
+        pub(crate) static BEFORE_RENAME: Hook = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(slot: &'static LocalKey<Hook>, hook: impl Fn() + 'static) {
+        slot.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn at(slot: &'static LocalKey<Hook>) {
+        slot.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook();
+            }
+        });
     }
 }
 
@@ -463,6 +498,115 @@ mod tests {
         std::fs::create_dir(&p.json).unwrap();
         assert!(!heal_daemon_json(&p, &ours, &lock).unwrap());
         assert!(p.json.is_dir());
+    }
+
+    /// Wait (at most 5 s) until `n` threads have arrived here.
+    fn rendezvous(n: usize) -> impl Fn() + Clone + Send + Sync + 'static {
+        let seen = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        move || {
+            let (count, cv) = &*seen;
+            let mut c = count.lock().unwrap();
+            *c += 1;
+            cv.notify_all();
+            let _ = cv.wait_timeout_while(c, std::time::Duration::from_secs(5), |c| *c < n).unwrap();
+        }
+    }
+
+    /// A heal that took the held record, found the file missing and then
+    /// stalls before its write (a pause point) while a reload publishes a newer
+    /// record must not write its older copy over the newer one: the newer
+    /// record ends on disk and in memory.
+    #[test]
+    fn a_heal_paused_after_its_snapshot_never_writes_over_a_newer_record() {
+        let (_d, p) = paths();
+        let lock = DaemonLock::try_acquire(&p).unwrap().unwrap();
+        let old = info_for(&p, 4_000_010);
+        let meta = Metadata::start(p.clone(), old.clone()).unwrap();
+        std::fs::remove_file(&p.json).unwrap(); // so the heal writes
+        let new = DaemonInfo { generation: old.generation + 1, exe: Some("/opt/synaps-new".into()), ..old.clone() };
+        let (snapped_tx, snapped_rx) = std::sync::mpsc::channel::<()>();
+        let (published_tx, published_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let healer = s.spawn(|| {
+                test_pause::set(&test_pause::HEAL_BEFORE_WRITE, move || {
+                    snapped_tx.send(()).unwrap();
+                    // Held here until the publish is done, or 500 ms if the
+                    // publish waits for this heal.
+                    let _ = published_rx.recv_timeout(std::time::Duration::from_millis(500));
+                });
+                meta.heal(&lock).unwrap()
+            });
+            snapped_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the heal is about to write");
+            meta.publish(new.clone()).unwrap();
+            let _ = published_tx.send(());
+            assert!(matches!(healer.join().unwrap(), Healed::Yes { .. }));
+        });
+        assert_eq!(read_daemon_json(&p), Some(new.clone()), "on disk: the newer record");
+        assert_eq!(meta.info(), new, "in memory: the newer record");
+    }
+
+    /// `daemon.json` and `daemon.pid` written at the same moment (both temp
+    /// files written before either is renamed) each end with their own
+    /// contents: the two writes never share a temp file.
+    #[test]
+    fn daemon_json_and_daemon_pid_written_at_once_keep_their_own_contents() {
+        let (_d, p) = paths();
+        let meet = rendezvous(2);
+        let results: Vec<io::Result<()>> = std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                test_pause::set(&test_pause::BEFORE_RENAME, meet.clone());
+                write_atomic(&p.json, b"{\"the\":\"json\"}")
+            });
+            let b = s.spawn(|| {
+                test_pause::set(&test_pause::BEFORE_RENAME, meet.clone());
+                write_atomic(&p.pid, b"4000011\n")
+            });
+            vec![a.join().unwrap(), b.join().unwrap()]
+        });
+        for r in &results {
+            assert!(r.is_ok(), "{results:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&p.json).unwrap(), "{\"the\":\"json\"}");
+        assert_eq!(std::fs::read_to_string(&p.pid).unwrap(), "4000011\n");
+    }
+
+    /// A symlink planted where a temp file goes is never followed: the
+    /// write replaces the link, the file it points at keeps its contents,
+    /// and the written files are 0600.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_a_temp_path_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, p) = paths();
+        let target = d.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        // The shared temp name of earlier versions and the per-file names.
+        for name in ["daemon.tmp", "daemon.json.tmp", "daemon.pid.tmp"] {
+            std::os::unix::fs::symlink(&target, d.path().join(name)).unwrap();
+        }
+        let ours = info_for(&p, 4_000_012);
+        write_daemon_json(&p, &ours).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert_eq!(read_daemon_json(&p), Some(ours));
+        assert_eq!(std::fs::read_to_string(&p.pid).unwrap(), "4000012\n");
+        for path in [&p.json, &p.pid] {
+            assert!(std::fs::symlink_metadata(path).unwrap().file_type().is_file());
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    /// After shutdown's cleanup no later write puts the files back: neither
+    /// a publish (a reload racing the shutdown) nor a heal.
+    #[test]
+    fn nothing_writes_the_metadata_back_after_cleanup() {
+        let (_d, p) = paths();
+        let lock = DaemonLock::try_acquire(&p).unwrap().unwrap();
+        let ours = info_for(&p, 4_000_013);
+        let meta = Metadata::start(p.clone(), ours.clone()).unwrap();
+        assert!(meta.cleanup(&lock));
+        let _ = meta.publish(DaemonInfo { generation: 9, ..ours });
+        assert_eq!(meta.heal(&lock).unwrap(), Healed::No);
+        assert!(!p.json.exists() && !p.pid.exists());
     }
 
     #[test]
