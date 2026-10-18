@@ -21,20 +21,95 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **Turns have no round, tool-call or tool-result-byte limit by default.**
-  Every role used to stop a turn at a compiled cap (foreground 128 rounds /
-  512 tool calls / 32 MiB of tool results; worker 64 / 256 / 16 MiB;
-  autonomous 24 / 96 / 8 MiB), even while it was making progress. A limit
-  now applies only when configured: `turn_budget.<role>.max_provider_rounds`,
-  `max_tool_calls` or `max_accumulated_tool_result_bytes` = N (`0` also
-  means no limit). Round renewals apply only once a round limit is set.
-  `/budget status` shows `off` for an unset limit.
+- **Interactive turns have no round, tool-call or tool-result-byte limit by
+  default.** Foreground turns used to stop at a compiled cap (128 rounds /
+  512 tool calls / 32 MiB of tool results) even while they were making
+  progress. A limit now applies only when configured:
+  `turn_budget.foreground.max_provider_rounds`, `max_tool_calls` or
+  `max_accumulated_tool_result_bytes` = N. `/budget status` shows `off` for
+  an unset limit. Unattended roles stay bounded by default: autonomous
+  (watcher) turns stop at 24 rounds / 96 tool calls / 8 MiB, and subagent
+  workers at 64 rounds x (1 + 2 renewals) = 192 rounds per run, where each
+  `subagent_start` or `subagent_resume` is a new run (their tool-call and
+  tool-result-byte limits are off). Override per role under
+  `turn_budget.autonomous.*` / `turn_budget.worker.*`.
+- **Turns a session starts by itself when events arrive are bounded.**
+  Inbox messages and subagent completions start "event" turns; these now
+  stop at 24 rounds / 96 tool calls / 8 MiB of tool results per turn, with
+  no renewals, combined with the session's own budget (the stricter limit
+  wins). Configure them under the new `turn_budget.event.*` role, e.g.
+  `turn_budget.event.max_provider_rounds = unlimited`. This applies to the
+  TUI, daemon sessions, `synaps chat` and `synaps rpc`. Turns you type or
+  queue, plugin commands and session-driver turns stay on the interactive
+  (foreground) budget, and so do headless `synaps chat`, `synaps rpc`,
+  detached daemon sessions and resumed sessions: they are unlimited unless
+  `turn_budget.foreground.*` is set.
+- **`turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
+  `max_accumulated_tool_result_bytes` take a number or `unlimited`.**
+  `unlimited` is the way to say "no limit". `0` keeps its 0.10.2 meaning,
+  "none allowed", in every role, and is deprecated: config loading warns
+  "`0` will be rejected in a future release; use `unlimited` for no limit,
+  or a positive number". The warning shows at TUI startup, in watcher agent
+  logs, and on stderr for `synaps chat`, `synaps rpc` and the daemon.
+  `/settings` no longer writes a new `0` for these rows.
+  `max_elapsed_secs = 0` still means no wall-clock limit.
+
+### Fixed
+
+- **Watcher agent session limits bind inside a turn.** The agent's
+  `max_session_cost_usd`, `max_session_tokens`, `max_session_duration_mins`,
+  `max_tool_calls` and `max_daily_cost_usd` were only checked between
+  turns; crossing one mid-turn logged "will exit after this turn" and the
+  turn ran on. Each turn now runs under the engine's per-turn budget
+  narrowed to what the session (and today's cap) has left, so it stops at a
+  round boundary with a valid history: calls past the tool-call limit get a
+  "not executed" result while the in-budget calls of the same batch run,
+  and refused calls are not counted. A turn stuck in one long tool round
+  (a slow command, a `timeout: 0` subagent) is cancelled 5 s after the
+  session time limit. The agent then asks for its handoff as before.
+- **A turn stopped by its cost or token budget keeps the response it paid
+  for.** The stopped round's text and tool calls stay in history (the calls
+  are not run and get a "not executed" result), so the next turn, such as
+  the watcher's handoff turn, sees it. They used to be discarded.
+- **Watcher cost accounting includes prompt-cache tokens.** Session and
+  daily cost used to count only uncached input and output tokens at
+  hard-coded rates; cache reads and writes, most of a long watcher
+  context, were free. Usage is now priced with the runtime's pricing table,
+  cache included, for the session limit, the daily cap and `stats.json`.
+  `max_session_tokens` still counts uncached input + output tokens.
+- **The post-limit handoff turn is metered** into the session and daily
+  totals, and a signal during it stops it.
+- **A watcher exit counts only when the handoff was saved.** The agent
+  treated a `watcher_exit` call as a clean exit as soon as the call started,
+  so a turn stopped on that round kept the previous session's handoff and
+  recorded a clean exit. Now only a successful `watcher_exit` result counts;
+  otherwise the handoff turn runs, and failing that the minimal handoff is
+  written.
+- **Watcher exits at a configured limit are no longer counted as crashes**
+  in `stats.json`. Exit reasons: `token_limit`, `cost_limit`,
+  `daily_cost_limit`, `time_limit`, `tool_limit`.
+- **Turn cost budgets bind on every provider.** `turn_budget.<role>.max_cost_usd`
+  was only checked against usage from the native Anthropic transport;
+  OpenAI-compatible and cloud-broker routes now count too.
 
 ### Upgrade notes
 
-- **`synaps-engine` crate users:** `TurnBudget::max_provider_rounds`,
-  `max_tool_calls` and `max_accumulated_tool_result_bytes` are now `Option`s
-  (`None` = no limit). To keep the old bounds, set them in `config.toml`.
+- **`synaps-engine` / `synaps-core` crate users:** these changes break full
+  struct literals and exhaustive matches.
+  - `TurnBudget::max_provider_rounds`, `max_tool_calls` and
+    `max_accumulated_tool_result_bytes` are now `Option`s (`None` = no
+    limit). To keep the old foreground bounds, set them in `config.toml`.
+  - New field `TurnBudget::max_total_tokens: Option<u64>`.
+  - New variants `TurnRole::Event` and `BudgetDimension::TotalTokens`
+    (wire label `total_tokens`).
+  - `TurnBudgetOverrides` uses `Option<TurnLimit<_>>` for the three count
+    fields (`TurnLimit::Max(n)`, `TurnLimit::Unlimited`); `Max(0)` means
+    none allowed.
+  - New field `TurnBudgetsConfig::event`.
+  - New: `TurnBudget::tighter`, `TurnBudget::for_event_turn`,
+    `runtime::budget::{TOOL_CALL_NOT_EXECUTED, TOOL_CALL_BUDGET_REFUSAL}`,
+    `tools::WATCHER_EXIT_ACK`, `EngineHost::report_config_warnings`, and the
+    `synaps_cli::watcher_session` module.
 
 ## [0.10.2] — 2026-10-12
 

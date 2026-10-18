@@ -962,6 +962,7 @@ mod actor {
             mcp_discovery: agent_engine::McpDiscovery::Inline,
         })
         .await?;
+        host.report_config_warnings();
         // Extension discovery completes BEFORE the session exists, so
         // `on_session_start` reaches subscribers and the first API call sees
         // extension-registered tools (piped stdin is ready immediately).

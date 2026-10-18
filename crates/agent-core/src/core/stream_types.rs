@@ -97,6 +97,8 @@ pub enum BudgetDimension {
     ToolResultBytes,
     /// Accumulated estimated USD cost within one stream turn (spec §8.1).
     CostUsd,
+    /// Uncached input + output tokens summed over one stream turn.
+    TotalTokens,
 }
 
 impl BudgetDimension {
@@ -110,6 +112,7 @@ impl BudgetDimension {
             Self::ProviderRounds => "provider_rounds",
             Self::ToolResultBytes => "tool_result_bytes",
             Self::CostUsd => "cost_usd",
+            Self::TotalTokens => "total_tokens",
         }
     }
 }

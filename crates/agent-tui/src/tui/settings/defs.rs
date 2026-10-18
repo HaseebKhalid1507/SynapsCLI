@@ -99,6 +99,23 @@ fn whole_number(key: &str, value: &str) -> SettingApply {
     }
 }
 
+/// A per-turn count limit: a positive whole number or `unlimited`. A new `0`
+/// is refused: it still means "none allowed" in config, but is deprecated.
+fn turn_limit(key: &str, value: &str) -> SettingApply {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("unlimited") {
+        return config_edit(key, v);
+    }
+    match v.parse::<u64>() {
+        Ok(0) => SettingApply::Local(Err(
+            "0 (none allowed) is deprecated; enter unlimited for no limit, or a positive number"
+                .to_string(),
+        )),
+        Ok(_) => config_edit(key, value),
+        Err(_) => SettingApply::Local(Err("expected a positive whole number or unlimited".to_string())),
+    }
+}
+
 /// Free text that must not be blank (the parser would store it verbatim).
 fn non_empty_text(key: &str, value: &str) -> SettingApply {
     if value.trim().is_empty() {
@@ -457,108 +474,143 @@ define_settings! {
 
     "turn_budget.foreground.max_cost_usd", "Foreground cost (USD)", Budgets,
         EditorKind::Text { numeric: false },
-        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| budget_usd("turn_budget.foreground.max_cost_usd", value);
 
     "turn_budget.foreground.max_elapsed_secs", "Foreground time (s)", Budgets,
         EditorKind::Text { numeric: true },
-        "Wall-clock seconds one turn may run; 0 = no limit (the default) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.foreground.max_elapsed_secs", value);
 
     "turn_budget.foreground.max_tool_calls", "Foreground tool calls", Budgets,
-        EditorKind::Text { numeric: true },
-        "Tool calls allowed in one turn; 0 = no limit (the default) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.foreground.max_tool_calls", value);
+        EditorKind::Text { numeric: false },
+        "Tool calls allowed in one turn; a positive number, or unlimited (default: no limit) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.foreground.max_tool_calls", value);
 
     "turn_budget.foreground.max_provider_rounds", "Foreground rounds", Budgets,
-        EditorKind::Text { numeric: true },
-        "Model round-trips allowed in one turn before the allowance runs out; 0 = no limit (the default) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.foreground.max_provider_rounds", value);
+        EditorKind::Text { numeric: false },
+        "Model round-trips allowed in one turn before the allowance runs out; a positive number, or unlimited (default: no limit) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.foreground.max_provider_rounds", value);
 
     "turn_budget.foreground.max_round_renewals", "Foreground renewals", Budgets,
         EditorKind::Text { numeric: true },
-        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.foreground.max_round_renewals", value);
 
     "turn_budget.foreground.max_context_tokens", "Foreground ctx tokens", Budgets,
         EditorKind::Text { numeric: true },
-        "Context tokens one turn may use — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Context tokens one turn may use — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.foreground.max_context_tokens", value);
 
     "turn_budget.foreground.max_accumulated_tool_result_bytes", "Foreground tool bytes", Budgets,
-        EditorKind::Text { numeric: true },
-        "Total bytes of tool results one turn may accumulate; 0 = no limit (the default) — your interactive turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.foreground.max_accumulated_tool_result_bytes", value);
+        EditorKind::Text { numeric: false },
+        "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: no limit) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.foreground.max_accumulated_tool_result_bytes", value);
 
     "turn_budget.autonomous.max_cost_usd", "Autonomous cost (USD)", Budgets,
         EditorKind::Text { numeric: false },
-        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| budget_usd("turn_budget.autonomous.max_cost_usd", value);
 
     "turn_budget.autonomous.max_elapsed_secs", "Autonomous time (s)", Budgets,
         EditorKind::Text { numeric: true },
-        "Wall-clock seconds one turn may run; 0 = no limit (the default) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.autonomous.max_elapsed_secs", value);
 
     "turn_budget.autonomous.max_tool_calls", "Autonomous tool calls", Budgets,
-        EditorKind::Text { numeric: true },
-        "Tool calls allowed in one turn; 0 = no limit (the default) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_tool_calls", value);
+        EditorKind::Text { numeric: false },
+        "Tool calls allowed in one turn; a positive number, or unlimited (default: 96) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.autonomous.max_tool_calls", value);
 
     "turn_budget.autonomous.max_provider_rounds", "Autonomous rounds", Budgets,
-        EditorKind::Text { numeric: true },
-        "Model round-trips allowed in one turn before the allowance runs out; 0 = no limit (the default) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_provider_rounds", value);
+        EditorKind::Text { numeric: false },
+        "Model round-trips allowed in one turn before the allowance runs out; a positive number, or unlimited (default: 24) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.autonomous.max_provider_rounds", value);
 
     "turn_budget.autonomous.max_round_renewals", "Autonomous renewals", Budgets,
         EditorKind::Text { numeric: true },
-        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.autonomous.max_round_renewals", value);
 
     "turn_budget.autonomous.max_context_tokens", "Autonomous ctx tokens", Budgets,
         EditorKind::Text { numeric: true },
-        "Context tokens one turn may use — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Context tokens one turn may use — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.autonomous.max_context_tokens", value);
 
     "turn_budget.autonomous.max_accumulated_tool_result_bytes", "Autonomous tool bytes", Budgets,
+        EditorKind::Text { numeric: false },
+        "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: 8 MiB) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.autonomous.max_accumulated_tool_result_bytes", value);
+
+    "turn_budget.event.max_cost_usd", "Event cost (USD)", Budgets,
+        EditorKind::Text { numeric: false },
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| budget_usd("turn_budget.event.max_cost_usd", value);
+
+    "turn_budget.event.max_elapsed_secs", "Event time (s)", Budgets,
         EditorKind::Text { numeric: true },
-        "Total bytes of tool results one turn may accumulate; 0 = no limit (the default) — autonomous (watcher/event) turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_accumulated_tool_result_bytes", value);
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.event.max_elapsed_secs", value);
+
+    "turn_budget.event.max_tool_calls", "Event tool calls", Budgets,
+        EditorKind::Text { numeric: false },
+        "Tool calls allowed in one turn; a positive number, or unlimited (default: 96) — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.event.max_tool_calls", value);
+
+    "turn_budget.event.max_provider_rounds", "Event rounds", Budgets,
+        EditorKind::Text { numeric: false },
+        "Model round-trips allowed in one turn before the allowance runs out; a positive number, or unlimited (default: 24) — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.event.max_provider_rounds", value);
+
+    "turn_budget.event.max_round_renewals", "Event renewals", Budgets,
+        EditorKind::Text { numeric: true },
+        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.event.max_round_renewals", value);
+
+    "turn_budget.event.max_context_tokens", "Event ctx tokens", Budgets,
+        EditorKind::Text { numeric: true },
+        "Context tokens one turn may use — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| whole_number("turn_budget.event.max_context_tokens", value);
+
+    "turn_budget.event.max_accumulated_tool_result_bytes", "Event tool bytes", Budgets,
+        EditorKind::Text { numeric: false },
+        "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: 8 MiB) — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.event.max_accumulated_tool_result_bytes", value);
 
     "turn_budget.worker.max_cost_usd", "Worker cost (USD)", Budgets,
         EditorKind::Text { numeric: false },
-        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| budget_usd("turn_budget.worker.max_cost_usd", value);
 
     "turn_budget.worker.max_elapsed_secs", "Worker time (s)", Budgets,
         EditorKind::Text { numeric: true },
-        "Wall-clock seconds one turn may run; 0 = no limit (the default) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Wall-clock seconds one turn may run; 0 = no limit (the default) — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.worker.max_elapsed_secs", value);
 
     "turn_budget.worker.max_tool_calls", "Worker tool calls", Budgets,
-        EditorKind::Text { numeric: true },
-        "Tool calls allowed in one turn; 0 = no limit (the default) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.worker.max_tool_calls", value);
+        EditorKind::Text { numeric: false },
+        "Tool calls allowed in one turn; a positive number, or unlimited (default: no limit) — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.worker.max_tool_calls", value);
 
     "turn_budget.worker.max_provider_rounds", "Worker rounds", Budgets,
-        EditorKind::Text { numeric: true },
-        "Model round-trips allowed in one turn before the allowance runs out; 0 = no limit (the default) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.worker.max_provider_rounds", value);
+        EditorKind::Text { numeric: false },
+        "Model round-trips allowed in one turn before the allowance runs out; a positive number, or unlimited (default: 64 per allowance) — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.worker.max_provider_rounds", value);
 
     "turn_budget.worker.max_round_renewals", "Worker renewals", Budgets,
         EditorKind::Text { numeric: true },
-        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.worker.max_round_renewals", value);
 
     "turn_budget.worker.max_context_tokens", "Worker ctx tokens", Budgets,
         EditorKind::Text { numeric: true },
-        "Context tokens one turn may use — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        "Context tokens one turn may use — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| whole_number("turn_budget.worker.max_context_tokens", value);
 
     "turn_budget.worker.max_accumulated_tool_result_bytes", "Worker tool bytes", Budgets,
-        EditorKind::Text { numeric: true },
-        "Total bytes of tool results one turn may accumulate; 0 = no limit (the default) — subagent worker turns. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.worker.max_accumulated_tool_result_bytes", value);
+        EditorKind::Text { numeric: false },
+        "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: no limit) — subagent workers; each start or resume gets a fresh allowance. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
+        |_app, value| turn_limit("turn_budget.worker.max_accumulated_tool_result_bytes", value);
     // ── Tool limits ──────────────────────────────────────────────────────
 
     "progressive_tool_disclosure", "Progressive tools", ToolLimits,
@@ -1063,6 +1115,13 @@ mod tests {
             assert!(is_err(d("turn_budget.worker.max_cost_usd", "-1")));
             assert!(is_err(d("turn_budget.worker.max_cost_usd", "NaN")));
             assert!(is_err(d("turn_budget.foreground.max_tool_calls", "many")));
+            assert!(is_err(d("turn_budget.foreground.max_tool_calls", "0")));
+            assert!(is_ok(d("turn_budget.foreground.max_tool_calls", "unlimited")));
+            assert!(is_err(d("turn_budget.worker.max_provider_rounds", "0")));
+            assert!(is_ok(d("turn_budget.worker.max_provider_rounds", "unlimited")));
+            assert!(is_ok(d("turn_budget.worker.max_provider_rounds", "128")));
+            assert!(is_err(d("turn_budget.autonomous.max_accumulated_tool_result_bytes", "0")));
+            assert!(is_ok(d("turn_budget.autonomous.max_accumulated_tool_result_bytes", "unlimited")));
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));

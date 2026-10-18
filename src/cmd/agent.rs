@@ -6,18 +6,20 @@
 //! Usage: synaps-agent --config <path/to/config.toml>
 
 use fs4::fs_std::FileExt;
-use futures::StreamExt;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use synaps_cli::engine::reactor::{drain_event_queue, idle_should_wait};
+use synaps_cli::watcher_session::{
+    push_user_prompt, run_handoff_turn, run_session_turn, SessionAllowance, SessionLimit,
+    SessionTotals,
+};
 use synaps_cli::{
     watcher_types::{AgentStats, DailyStats},
     AgentConfig, HandoffState, LlmEvent, Runtime, SessionEvent, StreamEvent,
 };
-use tokio_util::sync::CancellationToken;
 
 /// Write data to a file atomically (write to .tmp, then rename)
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -66,19 +68,6 @@ fn update_stats(agent_dir: &Path, updater: impl FnOnce(&mut AgentStats)) {
     let _ = file.flush();
 
     // Lock released when file is dropped
-}
-
-/// Calculate approximate cost for a model
-fn estimate_cost(input_tokens: u64, output_tokens: u64, model: &str) -> f64 {
-    let (input_rate, output_rate) = if model.contains("opus") {
-        (15.0 / 1_000_000.0, 75.0 / 1_000_000.0)
-    } else if model.contains("haiku") {
-        (0.25 / 1_000_000.0, 1.25 / 1_000_000.0)
-    } else {
-        // sonnet
-        (3.0 / 1_000_000.0, 15.0 / 1_000_000.0)
-    };
-    input_tokens as f64 * input_rate + output_tokens as f64 * output_rate
 }
 
 fn log(agent: &str, msg: &str) {
@@ -243,13 +232,19 @@ pub async fn run(config_path: String, trigger_context: String) {
         );
         std::process::exit(1);
     });
+    let synaps_config = synaps_cli::config::load_config();
+    for warning in &synaps_config.warnings {
+        log(agent_name, &format!("config warning: {warning}"));
+    }
     // Bind notes independently of worker settings and memory-context consent.
-    runtime.apply_memory_backend_config(&synaps_cli::config::load_config().memory_backend);
+    runtime.apply_memory_backend_config(&synaps_config.memory_backend);
     // Task 23: headless autonomous workers run under the AUTONOMOUS turn
-    // budget (typed config overrides applied) — the tightest role.
+    // budget (typed config overrides applied) — the tightest role, finite by
+    // default (24 rounds / 96 tool calls / 8 MiB per turn). Each turn narrows
+    // it further to what the session's limits have left.
     runtime.set_turn_budget(synaps_cli::runtime::budget::TurnBudget::from_config(
         synaps_cli::runtime::budget::TurnRole::Autonomous,
-        &synaps_cli::config::load_config().turn_budgets,
+        &synaps_config.turn_budgets,
     ));
     runtime.set_model(config.agent.model.clone());
     let foreground = agent_engine::orchestration::canonical_foreground_identity(runtime.model())
@@ -359,14 +354,26 @@ pub async fn run(config_path: String, trigger_context: String) {
         });
     }
 
-    // Session tracking
-    let mut total_tokens: u64 = 0;
-    let mut total_cost: f64 = 0.0;
-    let mut total_tool_calls: u64 = 0;
+    // Session tracking. The session limits are enforced by the engine
+    // inside each turn: every turn runs under the role budget narrowed to
+    // what the session has left (tool calls, cost against the session and
+    // daily caps, time, tokens).
+    let role_budget = runtime.turn_budget().clone();
+    let daily_spent_before = if stats.today.date == today {
+        stats.today.cost_usd
+    } else {
+        0.0
+    };
+    let allowance = SessionAllowance {
+        limits: &config.limits,
+        daily_spent_before,
+    };
+    let mut totals = SessionTotals::default();
     let mut tool_call_num: u64 = 0;
     let session_start = Instant::now();
-    let max_duration = std::time::Duration::from_secs(config.limits.max_session_duration_mins * 60);
     let mut watcher_exit_called = false;
+    let mut handoff_saved = false;
+    let mut limit_hit: Option<SessionLimit> = None;
     let mut messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
         json!({"role": "user", "content": boot_message}),
     )];
@@ -374,49 +381,111 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Invariant: exactly one waiter on event_queue.notified() exists in agent mode.
     let mut pending_events: Vec<String> = Vec::new();
 
+    // Logs one turn's events (shared by the main turns and the handoff turn).
+    let mut log_event = |event: &StreamEvent, totals: &SessionTotals| match event {
+        StreamEvent::Llm(LlmEvent::Text(text)) if text.len() > 100 => {
+            log(
+                agent_name,
+                &format!("output: {}...", synaps_cli::truncate_str(text, 100)),
+            );
+            write_log(
+                &session_log_path,
+                &json!({
+                    "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "type": "text",
+                    "length": text.len(),
+                    "preview": text.chars().take(200).collect::<String>()
+                }),
+            );
+        }
+        StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
+            tool_call_num += 1;
+            log(agent_name, &format!("tool: {}", tool_name));
+            write_log(
+                &session_log_path,
+                &json!({
+                    "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "type": "tool_start",
+                    "name": tool_name,
+                    "call_num": tool_call_num
+                }),
+            );
+        }
+        StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
+            let preview: String = result.chars().take(100).collect();
+            log(agent_name, &format!("  result: {}", preview));
+            write_log(
+                &session_log_path,
+                &json!({
+                    "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "type": "tool_result",
+                    "name": "unknown", // We don't have tool name here, but it's from the most recent tool
+                    "preview": result.chars().take(200).collect::<String>()
+                }),
+            );
+        }
+        StreamEvent::Session(SessionEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            ..
+        }) => {
+            log(
+                agent_name,
+                &format!(
+                    "  tokens: +{}/+{} (cache read {}, write {}; total: {}, cost: ${:.4})",
+                    input_tokens,
+                    output_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                    totals.tokens,
+                    totals.cost_usd
+                ),
+            );
+            write_log(
+                &session_log_path,
+                &json!({
+                    "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "type": "usage",
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "total_tokens": totals.tokens,
+                    "cost": totals.cost_usd
+                }),
+            );
+        }
+        StreamEvent::Session(SessionEvent::Error(e)) => {
+            // Typed spec §5.2 outcome — log the terminal category +
+            // correlation ID alongside the message.
+            log(
+                agent_name,
+                &format!("ERROR: {} [{}]", e.message, e.category_label()),
+            );
+        }
+        _ => {} // Thinking, SubagentStart/Update/Done, etc.
+    };
+
     log(agent_name, "session started — entering agentic loop");
 
     // Main agentic loop
     loop {
         // Check limits before each turn
-        if total_tokens >= config.limits.max_session_tokens {
+        if let Some(limit) = allowance.limit_reached(&totals, session_start.elapsed()) {
             log(
                 agent_name,
                 &format!(
-                    "token limit reached ({}/{})",
-                    total_tokens, config.limits.max_session_tokens
+                    "{} reached ({} tokens, ${:.4}, {} tool calls, {}s)",
+                    limit.exit_reason(),
+                    totals.tokens,
+                    totals.cost_usd,
+                    totals.tool_calls,
+                    session_start.elapsed().as_secs()
                 ),
             );
-            break;
-        }
-        if session_start.elapsed() >= max_duration {
-            log(
-                agent_name,
-                &format!(
-                    "time limit reached ({}m)",
-                    config.limits.max_session_duration_mins
-                ),
-            );
-            break;
-        }
-        if total_cost >= config.limits.max_session_cost_usd {
-            log(
-                agent_name,
-                &format!(
-                    "cost limit reached (${:.4}/${:.2})",
-                    total_cost, config.limits.max_session_cost_usd
-                ),
-            );
-            break;
-        }
-        if total_tool_calls >= config.limits.max_tool_calls {
-            log(
-                agent_name,
-                &format!(
-                    "tool call limit reached ({}/{})",
-                    total_tool_calls, config.limits.max_tool_calls
-                ),
-            );
+            limit_hit = Some(limit);
             break;
         }
         if interrupted.load(Ordering::Acquire) {
@@ -445,151 +514,22 @@ pub async fn run(config_path: String, trigger_context: String) {
             }
         }
 
-        // Run one streaming turn
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        let int_check = interrupted.clone();
-
-        // Monitor for interrupt during streaming
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                if int_check.load(Ordering::Acquire) {
-                    cancel_clone.cancel();
-                    break;
-                }
-            }
-        });
-
-        // Vec<SharedMessage> clone = pointer bumps only.
-        let msgs_in: Vec<synaps_cli::SharedMessage> = messages.clone();
-        let mut stream = runtime
-            .run_stream_with_messages(
-                msgs_in, cancel, None, // no steering for autonomous agents
-                None, false,
-            )
-            .await;
-
-        let mut turn_done = false;
-        while let Some(event) = stream.next().await {
-            match event {
-                StreamEvent::Llm(LlmEvent::Text(text)) => {
-                    // Log significant text output
-                    if text.len() > 100 {
-                        log(
-                            agent_name,
-                            &format!("output: {}...", synaps_cli::truncate_str(&text, 100)),
-                        );
-                        write_log(
-                            &session_log_path,
-                            &json!({
-                                "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                                "type": "text",
-                                "length": text.len(),
-                                "preview": text.chars().take(200).collect::<String>()
-                            }),
-                        );
-                    }
-                }
-                StreamEvent::Llm(LlmEvent::ToolUseStart {
-                    tool_name: name, ..
-                }) => {
-                    total_tool_calls += 1;
-                    tool_call_num += 1;
-                    log(agent_name, &format!("tool: {}", name));
-
-                    write_log(
-                        &session_log_path,
-                        &json!({
-                            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            "type": "tool_start",
-                            "name": name,
-                            "call_num": tool_call_num
-                        }),
-                    );
-
-                    // Check if this is a watcher_exit call
-                    if name == "watcher_exit" {
-                        watcher_exit_called = true;
-                    }
-                }
-                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
-                    let preview: String = result.chars().take(100).collect();
-                    log(agent_name, &format!("  result: {}", preview));
-
-                    write_log(
-                        &session_log_path,
-                        &json!({
-                            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            "type": "tool_result",
-                            "name": "unknown", // We don't have tool name here, but it's from the most recent tool
-                            "preview": result.chars().take(200).collect::<String>()
-                        }),
-                    );
-                }
-                StreamEvent::Session(SessionEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    model,
-                    ..
-                }) => {
-                    total_tokens += input_tokens + output_tokens;
-                    total_cost += estimate_cost(
-                        input_tokens,
-                        output_tokens,
-                        model.as_deref().unwrap_or("sonnet"),
-                    );
-                    log(
-                        agent_name,
-                        &format!(
-                            "  tokens: +{}/+{} (total: {}, cost: ${:.4})",
-                            input_tokens, output_tokens, total_tokens, total_cost
-                        ),
-                    );
-
-                    write_log(
-                        &session_log_path,
-                        &json!({
-                            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            "type": "usage",
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "total_tokens": total_tokens,
-                            "cost": total_cost
-                        }),
-                    );
-
-                    // Real-time limit check during streaming
-                    if total_tokens >= config.limits.max_session_tokens
-                        || total_cost >= config.limits.max_session_cost_usd
-                    {
-                        log(
-                            agent_name,
-                            "limit reached during streaming — will exit after this turn",
-                        );
-                    }
-                }
-                StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-                    messages = history;
-                    turn_done = true;
-                }
-                StreamEvent::Session(SessionEvent::Done) => {
-                    if !turn_done {
-                        // Stream ended without MessageHistory — single turn, no tool use
-                        turn_done = true;
-                    }
-                }
-                StreamEvent::Session(SessionEvent::Error(e)) => {
-                    // Typed spec §5.2 outcome — log the terminal category +
-                    // correlation ID alongside the message.
-                    log(
-                        agent_name,
-                        &format!("ERROR: {} [{}]", e.message, e.category_label()),
-                    );
-                    turn_done = true;
-                }
-                _ => {} // Thinking, SubagentStart/Update/Done, etc.
-            }
+        // Run one streaming turn under what the session has left; a turn
+        // stuck in a long tool round is cancelled at the session deadline.
+        let report = run_session_turn(
+            &mut runtime,
+            &mut messages,
+            &allowance,
+            &role_budget,
+            &mut totals,
+            session_start,
+            &interrupted,
+            &mut log_event,
+        )
+        .await;
+        if report.handoff_saved {
+            watcher_exit_called = true;
+            handoff_saved = true;
         }
 
         // If watcher_exit was called, agent is done
@@ -645,10 +585,10 @@ pub async fn run(config_path: String, trigger_context: String) {
                         agent_name,
                         "agent ended turn without tool calls — prompting for handoff",
                     );
-                    messages.push(std::sync::Arc::new(json!({
-                        "role": "user",
-                        "content": "You stopped without calling watcher_exit. If you're done, call watcher_exit now with your handoff state. If you have more work, continue."
-                    })));
+                    push_user_prompt(
+                        &mut messages,
+                        "You stopped without calling watcher_exit. If you're done, call watcher_exit now with your handoff state. If you have more work, continue.",
+                    );
                     // Let it have one more turn
                     continue;
                 }
@@ -656,38 +596,22 @@ pub async fn run(config_path: String, trigger_context: String) {
         }
     }
 
-    // Exit phase — if we didn't get a clean watcher_exit, ask for handoff
+    // Exit phase — if we didn't get a clean watcher_exit, ask for handoff.
+    // The handoff turn is metered like any other (it is real spend).
     if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
         log(agent_name, "requesting handoff before shutdown...");
-        messages.push(std::sync::Arc::new(json!({
-            "role": "user",
-            "content": "You're being shut down (resource limit reached). Call watcher_exit NOW with your handoff state — summarize what you did, what's pending, and any context your next session needs."
-        })));
-
-        let cancel = CancellationToken::new();
-        let msgs_in: Vec<synaps_cli::SharedMessage> = messages.clone();
-        let mut stream = runtime
-            .run_stream_with_messages(msgs_in, cancel, None, None, false)
-            .await;
-
-        // Give it 60 seconds to write handoff
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
-        loop {
-            tokio::select! {
-                event = stream.next() => {
-                    match event {
-                        Some(StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. })) if name == "watcher_exit" => {
-                            watcher_exit_called = true;
-                        }
-                        Some(StreamEvent::Session(SessionEvent::Done)) | None => break,
-                        _ => {}
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    log(agent_name, "handoff deadline exceeded — forcing exit");
-                    break;
-                }
-            }
+        let report = run_handoff_turn(
+            &mut runtime,
+            &mut messages,
+            &role_budget,
+            &mut totals,
+            &interrupted,
+            &mut log_event,
+        )
+        .await;
+        handoff_saved = report.handoff_saved;
+        if !handoff_saved {
+            log(agent_name, "handoff turn ended without a saved handoff");
         }
     }
 
@@ -699,14 +623,14 @@ pub async fn run(config_path: String, trigger_context: String) {
     let _ = inbox_task.await;
 
     // If we still don't have a handoff, write a minimal one
-    if !watcher_exit_called {
+    if !handoff_saved {
         log(agent_name, "no handoff from agent — writing minimal state");
         let minimal = HandoffState {
             summary: format!(
                 "Session ended without clean handoff. Ran for {:.0}s, {} tokens, ${:.4}",
                 session_start.elapsed().as_secs_f64(),
-                total_tokens,
-                total_cost
+                totals.tokens,
+                totals.cost_usd
             ),
             pending: vec!["Review previous session — no clean handoff was written".to_string()],
             context: serde_json::Value::Null,
@@ -722,14 +646,8 @@ pub async fn run(config_path: String, trigger_context: String) {
         "watcher_exit"
     } else if interrupted.load(Ordering::Acquire) {
         "signal"
-    } else if total_tokens >= config.limits.max_session_tokens {
-        "token_limit"
-    } else if total_cost >= config.limits.max_session_cost_usd {
-        "cost_limit"
-    } else if session_start.elapsed() >= max_duration {
-        "time_limit"
-    } else if total_tool_calls >= config.limits.max_tool_calls {
-        "tool_limit"
+    } else if let Some(limit) = limit_hit {
+        limit.exit_reason()
     } else {
         "unknown"
     };
@@ -740,9 +658,10 @@ pub async fn run(config_path: String, trigger_context: String) {
             "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             "type": "exit",
             "reason": exit_reason,
-            "total_tokens": total_tokens,
-            "total_cost": total_cost,
-            "tool_calls": total_tool_calls,
+            "total_tokens": totals.tokens,
+            "total_cost": totals.cost_usd,
+            "tool_calls": totals.tool_calls,
+            "handoff_saved": handoff_saved,
             "duration_secs": elapsed as u64
         }),
     );
@@ -751,7 +670,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         agent_name,
         &format!(
             "session complete — {:.0}s, {} tokens, {} tool calls, ${:.4}",
-            elapsed, total_tokens, total_tool_calls, total_cost
+            elapsed, totals.tokens, totals.tool_calls, totals.cost_usd
         ),
     );
 
@@ -771,15 +690,16 @@ pub async fn run(config_path: String, trigger_context: String) {
 
         // Update stats
         stats.total_sessions += 1;
-        stats.total_tokens += total_tokens;
-        stats.total_cost_usd += total_cost;
+        stats.total_tokens += totals.tokens;
+        stats.total_cost_usd += totals.cost_usd;
         stats.total_uptime_secs += session_start.elapsed().as_secs_f64();
         stats.today.sessions += 1;
-        stats.today.cost_usd += total_cost;
-        stats.today.tokens += total_tokens;
+        stats.today.cost_usd += totals.cost_usd;
+        stats.today.tokens += totals.tokens;
 
-        // If we crashed (non-clean exit), record it
-        if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
+        // A crash is an exit that was neither clean, a signal, nor a
+        // configured session limit (limits are the designed way to stop).
+        if !watcher_exit_called && !interrupted.load(Ordering::Acquire) && limit_hit.is_none() {
             stats.crashes += 1;
             stats.last_crash = Some(format!(
                 "{}: {}",

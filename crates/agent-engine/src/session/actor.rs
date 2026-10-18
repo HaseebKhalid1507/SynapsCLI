@@ -2198,6 +2198,18 @@ impl SessionActor {
             .begin_turn();
         let completion = crate::runtime::TurnCompletion::new();
         self.turn_completion = Some(completion.clone());
+        // A turn started by events (nobody typed it) runs under the event
+        // turn budget for this turn only; the stream copies the budget when
+        // it starts, so the session budget is restored right after.
+        let session_budget = (trigger == TurnTrigger::EventAuto).then(|| {
+            let event_budget = self
+                .runtime
+                .turn_budget()
+                .for_event_turn(&self.host.config().turn_budgets);
+            let session_budget = self.runtime.turn_budget().clone();
+            self.runtime.set_turn_budget(event_budget);
+            session_budget
+        });
         let stream = self
             .runtime
             .run_stream_tracked(
@@ -2209,6 +2221,9 @@ impl SessionActor {
                 completion,
             )
             .await;
+        if let Some(session_budget) = session_budget {
+            self.runtime.set_turn_budget(session_budget);
+        }
         self.stream = Some(stream);
         self.cancel = Some(ct);
         self.steer_tx = Some(s_tx);

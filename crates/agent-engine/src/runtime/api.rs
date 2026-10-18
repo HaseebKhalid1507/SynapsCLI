@@ -1150,25 +1150,29 @@ impl ApiMethods {
                 if cancel.is_cancelled() {
                     return Err(RuntimeError::Canceled);
                 }
-                return crate::runtime::cloud_invoke::cloud_invoke_stream(
-                    provider,
-                    model,
-                    cloud_model,
-                    cloud_context,
-                    !tools_schema.is_empty(),
-                    || {
-                        crate::auth::broker_from_source(
-                            &options.credential_source,
-                            &options.token_cache,
-                            client.clone(),
-                        )
-                    },
-                    system_prompt,
-                    messages,
-                    &tx,
-                    cancel,
-                    &options.trace,
-                )
+                let has_tools = !tools_schema.is_empty();
+                return with_usage_metering(model, options.usage_counters.clone(), &tx, |tx| async move {
+                    crate::runtime::cloud_invoke::cloud_invoke_stream(
+                        provider,
+                        model,
+                        cloud_model,
+                        cloud_context,
+                        has_tools,
+                        || {
+                            crate::auth::broker_from_source(
+                                &options.credential_source,
+                                &options.token_cache,
+                                client.clone(),
+                            )
+                        },
+                        system_prompt,
+                        messages,
+                        &tx,
+                        cancel,
+                        &options.trace,
+                    )
+                    .await
+                })
                 .await;
             }
         }
@@ -1176,30 +1180,42 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
-        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
-            model,
-            client,
-            &tools_schema,
-            system_prompt,
-            messages,
-            &tx,
-            None,
-            None,
-            thinking_budget,
-            reasoning_level,
-            cancel,
-            &options.credential_source,
-            &options.token_cache,
-            max_retries,
-            options.codex_request_role,
-            options.tool_session_id.as_ref(),
-            options.session_tool_set.as_ref(),
-            options.memory_backend.as_ref(),
-            &options.trace,
-            options.suppress_stream_deltas,
-        )
-        .await
-        {
+        let routed = {
+            let tools_schema = &tools_schema;
+            // Native Anthropic models fall through to the transport below,
+            // which books its own usage.
+            let counters = options
+                .usage_counters
+                .clone()
+                .filter(|_| !super::auth::model_is_anthropic(model));
+            with_usage_metering(model, counters, &tx, |tx| async move {
+                crate::runtime::openai::try_route_with_memory_backend(
+                    model,
+                    client,
+                    tools_schema,
+                    system_prompt,
+                    messages,
+                    &tx,
+                    None,
+                    None,
+                    thinking_budget,
+                    reasoning_level,
+                    cancel,
+                    &options.credential_source,
+                    &options.token_cache,
+                    max_retries,
+                    options.codex_request_role,
+                    options.tool_session_id.as_ref(),
+                    options.session_tool_set.as_ref(),
+                    options.memory_backend.as_ref(),
+                    &options.trace,
+                    options.suppress_stream_deltas,
+                )
+                .await
+            })
+            .await
+        };
+        if let Some(result) = routed {
             // Classify honestly: transport blips are API failures, not
             // config problems (incident: session 20260714-025948-3dab).
             return result
@@ -2393,10 +2409,121 @@ impl ApiMethods {
     }
 }
 
+/// Transports other than native Anthropic (cloud brokers, OpenAI-compatible
+/// providers) emit `SessionEvent::Usage` but do not book the turn's
+/// [`UsageCounters`](crate::runtime::budget::UsageCounters). Book their Usage
+/// events on the way through, priced for `model`, so the turn's cost and
+/// token budgets bind on every provider. Events keep their order.
+pub(crate) async fn with_usage_metering<T, Fut>(
+    model: &str,
+    counters: Option<Arc<crate::runtime::budget::UsageCounters>>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    route: impl FnOnce(mpsc::UnboundedSender<StreamEvent>) -> Fut,
+) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    let Some(counters) = counters else {
+        return route(tx.clone()).await;
+    };
+    let forward = move |counters: &crate::runtime::budget::UsageCounters,
+                        model: &str,
+                        tx: &mpsc::UnboundedSender<StreamEvent>,
+                        event: StreamEvent| {
+        if let StreamEvent::Session(SessionEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
+            ..
+        }) = &event
+        {
+            counters.record_priced(
+                model,
+                *input_tokens,
+                *output_tokens,
+                *cache_read_input_tokens,
+                *cache_creation_input_tokens,
+                *cache_creation_5m,
+                *cache_creation_1h,
+            );
+        }
+        let _ = tx.send(event);
+    };
+    let (route_tx, mut route_rx) = mpsc::unbounded_channel();
+    let routed = route(route_tx);
+    tokio::pin!(routed);
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(event) = route_rx.recv() => forward(&counters, model, tx, event),
+            result = &mut routed => break result,
+        }
+    };
+    // Drain what this request sent before returning, so its usage is booked
+    // before the stream loop checks the turn budget. Normally the route's
+    // sender is gone and this ends at once; a sender clone still held by a
+    // provider task winding down gets a short, bounded wait.
+    let drained = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = route_rx.recv().await {
+            forward(&counters, model, tx, event);
+        }
+    })
+    .await
+    .is_ok();
+    if drained {
+        return result;
+    }
+    // A sender that outlives even that must not lose its events.
+    let tx = tx.clone();
+    let model = model.to_string();
+    tokio::spawn(async move {
+        while let Some(event) = route_rx.recv().await {
+            forward(&counters, &model, &tx, event);
+        }
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::telemetry::TelemetryLevel;
+
+    #[tokio::test]
+    async fn non_anthropic_usage_is_booked_into_the_turn_counters() {
+        let counters = Arc::new(crate::runtime::budget::UsageCounters::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = with_usage_metering("gpt-5", Some(Arc::clone(&counters)), &tx, |route_tx| async move {
+            let _ = route_tx.send(StreamEvent::Llm(LlmEvent::Text("hi".into())));
+            let _ = route_tx.send(StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                cache_read_input_tokens: 50_000,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }));
+            7
+        })
+        .await;
+        assert_eq!(out, 7);
+        assert_eq!(counters.records(), 1);
+        assert_eq!(counters.totals(), (1_000, 200, 50_000, 0));
+        let expected = agent_core::pricing::calculate_cost_optional_split(
+            "gpt-5", 1_000, 200, 50_000, 0, None, None,
+        );
+        assert!((counters.cost_usd() - expected).abs() < 1e-6);
+        // Events still reach the caller, in order.
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Llm(LlmEvent::Text(_)))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::Session(SessionEvent::Usage { .. }))
+        ));
+    }
 
     /// Test harness: fresh ParseState + unbounded channel + EventCtx (Full
     /// telemetry so capture paths run). Returns (state, rx, ctx-parts).
