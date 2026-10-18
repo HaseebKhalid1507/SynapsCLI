@@ -61,7 +61,8 @@ pub use broker::{
 };
 pub use broker_token::{
     is_loopback_endpoint, load_or_create_broker_token, local_broker_token_path,
-    read_local_broker_token, LOCAL_BROKER_TOKEN_FILE,
+    read_local_broker_token, unauthorized_hint, BrokerTokenOrigin, MachineToken,
+    LOCAL_BROKER_TOKEN_FILE,
 };
 pub use browser::open_browser;
 pub use callback::{

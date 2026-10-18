@@ -221,7 +221,7 @@ impl std::fmt::Display for BrokerError {
                 f,
                 "no credential configured for '{p}'. Run `synaps login` to add one."
             ),
-            Self::Unauthorized => write!(f, "broker rejected machine auth"),
+            Self::Unauthorized => f.write_str(&super::broker_token::unauthorized_hint()),
             Self::Denied(msg) => write!(f, "broker denied request: {msg}"),
             Self::UnsupportedCapability {
                 provider,
@@ -3206,7 +3206,9 @@ impl CredentialBroker for LocalBroker {
 pub struct RemoteBroker {
     http: reqwest::Client,
     endpoint: String,
-    machine_token: String,
+    /// Reloadable from the local broker token file after a 401 when the
+    /// endpoint is loopback (prA I2).
+    machine_token: super::MachineToken,
     cache: super::TokenCache,
     /// Injected account policy; `None` → env + config per call.
     account_policy: Option<AccountPolicy>,
@@ -3228,10 +3230,11 @@ impl RemoteBroker {
             .timeout(Duration::from_secs(90))
             .build()
             .unwrap_or(http);
+        let machine_token = super::MachineToken::for_endpoint(&endpoint, machine_token);
         Self {
             http,
             endpoint,
-            machine_token: machine_token.into(),
+            machine_token,
             cache,
             account_policy: None,
         }
@@ -3250,7 +3253,7 @@ impl RemoteBroker {
     }
 
     fn fetcher(&self) -> super::BrokerClient {
-        super::BrokerClient::with_client(
+        super::BrokerClient::with_machine_token(
             self.endpoint.clone(),
             self.machine_token.clone(),
             self.http.clone(),
@@ -3259,7 +3262,7 @@ impl RemoteBroker {
 
     /// Cache scope: endpoint + machine-principal digest (never the token).
     fn scope(&self) -> String {
-        super::credential_source::source_scope(&self.endpoint, &self.machine_token)
+        super::credential_source::source_scope(&self.endpoint, &self.machine_token.get())
     }
 
     /// Resolve the credential for a token request on the client side. An
@@ -3300,11 +3303,13 @@ impl RemoteBroker {
             query.push(("model", model));
         }
         let resp = self
-            .http
-            .get(format!("{}/token", self.endpoint))
-            .query(&query)
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/token", self.endpoint))
+                .query(&query)
+                .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -3387,11 +3392,13 @@ impl RemoteBroker {
     async fn post_proxy(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
         let resp = self
-            .http
-            .post(format!("{}/proxy", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .json(request)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .post(format!("{}/proxy", self.endpoint))
+                .bearer_auth(t)
+                .json(request)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -3463,14 +3470,16 @@ impl CredentialBroker for RemoteBroker {
 
     async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
         let resp = self
-            .http
-            .get(format!("{}/usage/snapshot", self.endpoint))
-            .query(&[
-                ("provider", cred.provider.as_str()),
-                ("account", cred.account.label_str()),
-            ])
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/usage/snapshot", self.endpoint))
+                .query(&[
+                    ("provider", cred.provider.as_str()),
+                    ("account", cred.account.label_str()),
+                ])
+                .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -3512,16 +3521,18 @@ impl CredentialBroker for RemoteBroker {
         reason: &str,
     ) -> Result<(), BrokerError> {
         let resp = self
-            .http
-            .post(format!("{}/accounts/cooldown", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .json(&serde_json::json!({
-                "provider": cred.provider.as_str(),
-                "account": cred.account.label_str(),
-                "until_ms": until_ms,
-                "reason": crate::truncate_str(reason, 64),
-            }))
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .post(format!("{}/accounts/cooldown", self.endpoint))
+                .bearer_auth(t)
+                .json(&serde_json::json!({
+                    "provider": cred.provider.as_str(),
+                    "account": cred.account.label_str(),
+                    "until_ms": until_ms,
+                    "reason": crate::truncate_str(reason, 64),
+                }))
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -3568,10 +3579,12 @@ impl CredentialBroker for RemoteBroker {
         // Machine-authenticated typed operation: the remote broker resolves
         // the OAuth token on its side and returns usage JSON only.
         let resp = self
-            .http
-            .get(format!("{}/usage", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/usage", self.endpoint))
+                .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -3597,7 +3610,7 @@ impl CredentialBroker for RemoteBroker {
         context_ref: &str,
         allow_stale: bool,
     ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
-        let resp = self.http.post(format!("{}/cloud/catalog", self.endpoint)).bearer_auth(&self.machine_token).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"allow_stale":allow_stale})).send().await.map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let resp = self.machine_token.send(|t| self.http.post(format!("{}/cloud/catalog", self.endpoint)).bearer_auth(t).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"allow_stale":allow_stale}))).await.map_err(|e| BrokerError::Transport(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(BrokerError::Unauthorized);
         }
@@ -3629,7 +3642,7 @@ impl CredentialBroker for RemoteBroker {
         model_id: &str,
         request: InvokeRequest,
     ) -> Result<CloudEventStream, BrokerError> {
-        let resp = self.http.post(format!("{}/cloud/invoke", self.endpoint)).bearer_auth(&self.machine_token).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"model_id":model_id,"request":request})).send().await.map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let resp = self.machine_token.send(|t| self.http.post(format!("{}/cloud/invoke", self.endpoint)).bearer_auth(t).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"model_id":model_id,"request":request}))).await.map_err(|e| BrokerError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
                 BrokerError::Unauthorized
@@ -3706,10 +3719,12 @@ impl CredentialBroker for RemoteBroker {
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
         let resp = self
-            .http
-            .get(format!("{}/capabilities", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/capabilities", self.endpoint))
+                .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -4496,7 +4511,11 @@ mod tests {
         let e = BrokerError::NotConfigured("groq".into());
         assert!(!format!("{e}").contains("sk-"));
         let e = BrokerError::Unauthorized;
-        assert_eq!(format!("{e}"), "broker rejected machine auth");
+        let shown = format!("{e}");
+        assert!(shown.starts_with("broker rejected machine auth"), "{shown}");
+        // Actionable: names the config keys and the token file location.
+        assert!(shown.contains("auth.machine_token") && shown.contains("SYNAPS_MACHINE_TOKEN"), "{shown}");
+        assert!(shown.contains("auth-broker.token") && shown.contains("restart"), "{shown}");
     }
 
     #[test]

@@ -188,26 +188,46 @@ struct BrokerState {
     /// disables auth: only a non-loopback bind with explicit
     /// `--insecure-no-auth`. A loopback broker always has one (#147 C1).
     machine_token: Option<String>,
-    /// Loopback binds only: the exact `Host` values accepted
-    /// (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`). Anything
-    /// else is refused before routing, so a DNS-rebinding page cannot
-    /// talk to the broker through the victim's browser.
+    /// Loopback binds only: the hostnames a `Host` header may name
+    /// (`localhost`, `127.0.0.1`, `[::1]` and the bound IP), any port.
+    /// Anything else is refused before routing, so a DNS-rebinding page
+    /// (`Host: attacker.example`) cannot talk to the broker through the
+    /// victim's browser. The port is deliberately not checked: it adds no
+    /// protection and would break `ssh -L <other-port>:127.0.0.1:<port>`.
     allowed_hosts: Option<Arc<[String]>>,
+    /// Where the expected machine token comes from, for actionable denial
+    /// logs (a path or an env var name; never the token).
+    token_source: Arc<str>,
     /// The in-process broker that owns every credential (all providers and
     /// account slots), refreshes them, and executes proxied requests. Raw
     /// keys and refresh tokens never leave this boundary.
     local: Arc<auth::LocalBroker>,
 }
 
-/// `Host` values a loopback broker on `port` accepts. A client may omit the
-/// port when it is the scheme default (80 for http, 443 for https).
-fn loopback_allowed_hosts(port: u16, tls: bool) -> Vec<String> {
-    let names = ["127.0.0.1", "localhost", "[::1]"];
-    let mut hosts: Vec<String> = names.iter().map(|n| format!("{n}:{port}")).collect();
-    if port == if tls { 443 } else { 80 } {
-        hosts.extend(names.iter().map(|n| n.to_string()));
+/// Hostnames a loopback broker bound to `bind_ip` accepts in `Host`
+/// (compared without the port).
+fn loopback_allowed_hostnames(bind_ip: std::net::IpAddr) -> Vec<String> {
+    let mut names: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    let bound = match bind_ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    if !names.contains(&bound) {
+        names.push(bound);
     }
-    hosts
+    names
+}
+
+/// The hostname part of a `Host` / `:authority` value, if well-formed.
+fn host_header_hostname(value: &str) -> Option<String> {
+    let authority: axum::http::uri::Authority = value.parse().ok()?;
+    if authority.as_str().contains('@') {
+        return None; // userinfo has no place in a Host header
+    }
+    Some(authority.host().to_string())
 }
 
 /// Refuse any request whose `Host` (or HTTP/2 `:authority`) is not on the
@@ -224,7 +244,11 @@ async fn host_guard(
             .and_then(|v| v.to_str().ok())
             .or_else(|| req.uri().authority().map(|a| a.as_str()))
             .unwrap_or("");
-        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+        let hostname = host_header_hostname(host);
+        if !hostname
+            .as_deref()
+            .is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)))
+        {
             eprintln!(
                 "[auth-broker] DENIED request with non-loopback Host ({} chars)",
                 host.len()
@@ -254,14 +278,32 @@ fn resolve_machine_token(
         return Ok(explicit);
     }
     if is_loopback {
-        let (token, created) = auth::load_or_create_broker_token(token_path).map_err(|e| {
+        if insecure_no_auth {
+            eprintln!(
+                "[auth-broker] WARNING: --insecure-no-auth is ignored on a loopback bind; \
+                 a loopback broker always requires a machine token"
+            );
+        }
+        let (token, origin) = auth::load_or_create_broker_token(token_path).map_err(|e| {
             anyhow::anyhow!("broker token file {}: {e}", token_path.display())
         })?;
-        eprintln!(
-            "[auth-broker] loopback machine token {} {} (0600; local clients read it automatically)",
-            if created { "generated at" } else { "loaded from" },
-            token_path.display()
-        );
+        match origin {
+            auth::BrokerTokenOrigin::Rotated => eprintln!(
+                "[auth-broker] WARNING: {} was readable by other users, so its token may have \
+                 leaked. Generated a NEW token (0600). Restart or reload every client that \
+                 used the old one.",
+                token_path.display()
+            ),
+            auth::BrokerTokenOrigin::Created | auth::BrokerTokenOrigin::Loaded => eprintln!(
+                "[auth-broker] loopback machine token {} {} (0600; local clients read it automatically)",
+                if origin == auth::BrokerTokenOrigin::Created {
+                    "generated at"
+                } else {
+                    "loaded from"
+                },
+                token_path.display()
+            ),
+        }
         return Ok(Some(token));
     }
     if !insecure_no_auth {
@@ -273,6 +315,38 @@ fn resolve_machine_token(
         );
     }
     Ok(None)
+}
+
+/// 401 for a request that failed machine auth, with an actionable log line
+/// (prA I2): old clients can't explain a bare 401, so the broker does. The
+/// token itself is never logged or echoed.
+fn deny_machine_auth(st: &BrokerState, headers: &HeaderMap, route: &str) -> axum::response::Response {
+    let presented = headers.get("authorization").is_some();
+    if presented {
+        eprintln!(
+            "[auth-broker] DENIED {route} (wrong machine token). The expected token is {}; \
+             if it was regenerated, restart or reload the client.",
+            st.token_source
+        );
+    } else {
+        eprintln!(
+            "[auth-broker] DENIED {route} (no machine token presented). Clients must set \
+             auth.machine_token or SYNAPS_MACHINE_TOKEN to the token in {}. Clients older than \
+             this broker, or running as another user or base dir, do not pick it up \
+             automatically; restart or reload clients after it changes.",
+            st.token_source
+        );
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "bad machine auth",
+            "hint": "set auth.machine_token or SYNAPS_MACHINE_TOKEN to the broker's machine token \
+                     (a loopback broker writes it to auth-broker.token in its base dir); restart \
+                     or reload the client after it changes",
+        })),
+    )
+        .into_response()
 }
 
 /// Constant-time machine-auth check shared by every credential endpoint.
@@ -411,11 +485,17 @@ pub async fn run(
     // B2 + #147 C1: a loopback broker always requires a machine token
     // (auto-generated next to auth.json when none is configured); a
     // non-loopback bind without one is refused unless explicitly opted in.
+    let local_token_path = auth::local_broker_token_path();
+    let token_source: Arc<str> = match (&machine_token_file, machine_token.is_some()) {
+        (Some(path), _) => format!("the --machine-token-file {}", path.display()).into(),
+        (None, true) => "SYNAPS_BROKER_TOKEN on the broker host".into(),
+        (None, false) => format!("{} on the broker host", local_token_path.display()).into(),
+    };
     let machine_token = resolve_machine_token(
         machine_token,
         addr.ip().is_loopback(),
         insecure_no_auth,
-        &auth::local_broker_token_path(),
+        &local_token_path,
     )?;
 
     // D1: fail fast if no OAuth credential of ANY provider/account is
@@ -442,7 +522,8 @@ pub async fn run(
         allowed_hosts: addr
             .ip()
             .is_loopback()
-            .then(|| Arc::from(loopback_allowed_hosts(addr.port(), tls.is_some()))),
+            .then(|| Arc::from(loopback_allowed_hostnames(addr.ip()))),
+        token_source,
         local: Arc::new(auth::LocalBroker::new(client.clone())),
     };
 
@@ -550,6 +631,7 @@ fn build_router_with_cloud_backend(
     build_router(BrokerState {
         machine_token,
         allowed_hosts: None,
+        token_source: Arc::from("test"),
         local: Arc::new(local),
     })
 }
@@ -626,12 +708,8 @@ async fn token(
 ) -> impl IntoResponse {
     // ── machine auth (constant-time) ──
     if !machine_auth_ok(&st, &headers) {
-        eprintln!("[auth-broker] DENIED from {} (bad machine auth)", peer.ip());
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        eprintln!("[auth-broker] DENIED /token from {}", peer.ip());
+        return deny_machine_auth(&st, &headers, "/token");
     }
 
     // ── provider allowlist ──
@@ -742,11 +820,7 @@ async fn proxy(
     Json(request): Json<auth::ProxyRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/proxy");
     }
     if let Err(e) = request.validate() {
         // BrokerError Display is secret-free by contract.
@@ -786,11 +860,7 @@ async fn proxy(
 /// endpoint — it is deliberately not a general OAuth proxy.
 async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/usage");
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.anthropic_usage().await {
@@ -808,11 +878,7 @@ async fn usage_snapshot(
     Query(q): Query<UsageSnapshotQuery>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/usage/snapshot");
     }
     use synaps_cli::auth::CredentialBroker;
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
@@ -860,11 +926,7 @@ async fn accounts_cooldown(
     Json(report): Json<CooldownReport>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/accounts/cooldown");
     }
     use synaps_cli::auth::CredentialBroker;
     let Some(provider_id) = broker_provider(&report.provider) else {
@@ -906,11 +968,7 @@ async fn cloud_catalog(
     Json(request): Json<CloudCatalogRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"bad machine auth"})),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/cloud/catalog");
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -937,11 +995,7 @@ async fn cloud_invoke(
     Json(request): Json<CloudInvokeRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"bad machine auth"})),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/cloud/invoke");
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -985,11 +1039,7 @@ async fn capabilities(
     headers: HeaderMap,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/capabilities");
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.capabilities().await {
@@ -1509,7 +1559,8 @@ mod tests {
         let state = BrokerState {
             machine_token,
             allowed_hosts: loopback_host_check
-                .then(|| Arc::from(loopback_allowed_hosts(addr.port(), false))),
+                .then(|| Arc::from(loopback_allowed_hostnames(addr.ip()))),
+            token_source: Arc::from("test"),
             local: Arc::new(local),
         };
         let app = build_router(state);
@@ -1725,8 +1776,11 @@ mod tests {
             .as_u16()
     }
 
+    /// prA I4: the hostname is checked, the port is not (DNS rebinding sends
+    /// a foreign hostname; an `ssh -L 9000:127.0.0.1:<port>` forward sends
+    /// `Host: 127.0.0.1:9000` and must work).
     #[tokio::test]
-    async fn loopback_broker_rejects_foreign_host_headers() {
+    async fn loopback_broker_rejects_foreign_hostnames_but_not_other_ports() {
         let base = spawn_broker_service(Some("machine-secret".into()), None).await;
         let port = base.rsplit(':').next().unwrap().to_string();
         for host in [
@@ -1734,15 +1788,20 @@ mod tests {
             format!("localhost:{port}"),
             format!("LOCALHOST:{port}"),
             format!("[::1]:{port}"),
+            "127.0.0.1:9000".to_string(),
+            "localhost:1".to_string(),
+            "localhost".to_string(),
+            "[::1]".to_string(),
         ] {
             assert_eq!(capabilities_with_host(&base, &host).await, 200, "{host}");
         }
         for host in [
             format!("evil.example:{port}"),
             "evil.example".to_string(),
-            format!("127.0.0.1:{}", port.parse::<u16>().unwrap().wrapping_add(1)),
-            "127.0.0.1".to_string(),
             format!("localhost.evil.example:{port}"),
+            format!("127.0.0.1.evil.example:{port}"),
+            format!("user@127.0.0.1:{port}"),
+            "127.0.0.2".to_string(),
             String::new(),
         ] {
             assert_eq!(
@@ -1763,6 +1822,50 @@ mod tests {
         assert!(!body.contains("machine-secret"));
     }
 
+    /// An HTTP/1.0 request with no Host header at all is refused.
+    #[tokio::test]
+    async fn loopback_broker_refuses_a_missing_host_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let addr = base.trim_start_matches("http://");
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET /healthz HTTP/1.0\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        conn.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            reply.starts_with("HTTP/1.0 403") || reply.starts_with("HTTP/1.1 403"),
+            "{reply}"
+        );
+    }
+
+    /// prA m6: a broker bound to another 127.x address accepts its own IP.
+    #[tokio::test]
+    async fn loopback_broker_on_another_127_address_accepts_its_bind_ip() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.2:0").await {
+            Ok(l) => l,
+            Err(_) => return, // platform without 127/8 aliasing (macOS)
+        };
+        let addr = listener.local_addr().unwrap();
+        let state = BrokerState {
+            machine_token: Some("machine-secret".into()),
+            allowed_hosts: Some(Arc::from(loopback_allowed_hostnames(addr.ip()))),
+            token_source: Arc::from("test"),
+            local: Arc::new(auth::LocalBroker::new(reqwest::Client::new())),
+        };
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base = format!("http://{addr}");
+        assert_eq!(capabilities_with_host(&base, &addr.to_string()).await, 200);
+        assert_eq!(capabilities_with_host(&base, "127.0.0.3:1").await, 403);
+    }
+
     #[tokio::test]
     async fn host_allowlist_is_only_applied_to_loopback_binds() {
         let base = spawn_broker_service_with(Some("machine-secret".into()), None, false).await;
@@ -1770,15 +1873,38 @@ mod tests {
     }
 
     #[test]
-    fn loopback_allowed_hosts_cover_the_three_loopback_names() {
+    fn loopback_allowed_hostnames_cover_the_loopback_names_and_bind_ip() {
+        let v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(
-            loopback_allowed_hosts(8181, false),
-            vec!["127.0.0.1:8181", "localhost:8181", "[::1]:8181"]
+            loopback_allowed_hostnames(v4),
+            vec!["localhost", "127.0.0.1", "[::1]"]
         );
-        // Default ports may be sent without a port.
-        assert!(loopback_allowed_hosts(80, false).contains(&"localhost".to_string()));
-        assert!(loopback_allowed_hosts(443, true).contains(&"[::1]".to_string()));
-        assert!(!loopback_allowed_hosts(443, false).contains(&"localhost".to_string()));
+        let other: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        assert!(loopback_allowed_hostnames(other).contains(&"127.0.0.2".to_string()));
+        assert_eq!(host_header_hostname("[::1]:8181").as_deref(), Some("[::1]"));
+        assert_eq!(host_header_hostname("LOCALHOST").as_deref(), Some("LOCALHOST"));
+        assert_eq!(host_header_hostname(""), None);
+    }
+
+    /// prA I2: a denied request gets an actionable hint and never the token.
+    #[tokio::test]
+    async fn machine_auth_denial_carries_a_hint_and_no_token() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/capabilities"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "bad machine auth");
+        let hint = body["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("auth.machine_token") && hint.contains("SYNAPS_MACHINE_TOKEN"),
+            "{hint}"
+        );
+        assert!(hint.contains("auth-broker.token") && hint.contains("restart"), "{hint}");
+        assert!(!body.to_string().contains("machine-secret"));
     }
 
     // ── Loopback machine-token bootstrap (#147 C1) ───────────────────────────

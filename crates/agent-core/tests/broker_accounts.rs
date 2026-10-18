@@ -824,3 +824,55 @@ async fn generic_codex_headroom_does_not_authorize_a_model_not_reported_availabl
         .selected()
         .is_some());
 }
+
+/// prA I2: a long-lived client that started before the loopback broker
+/// generated (or rotated) its token re-reads `<base_dir>/auth-broker.token`
+/// after a 401 and retries once — no restart needed. A non-loopback broker
+/// never triggers a local file read.
+#[tokio::test]
+#[serial_test::serial]
+async fn remote_broker_rereads_local_token_file_after_401_on_loopback() {
+    let home = install_store();
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = hits.clone();
+    let app = Router::new().route(
+        "/capabilities",
+        get(move |headers: axum::http::HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                seen.lock().unwrap().push(auth.clone());
+                if auth == "Bearer rotated-token" {
+                    (axum::http::StatusCode::OK, axum::Json(serde_json::json!([])))
+                } else {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({"error": "bad machine auth"})),
+                    )
+                }
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    // The client was configured (at startup) with the old token.
+    let remote = RemoteBroker::new(&base, "stale-token", reqwest::Client::new(), TokenCache::new());
+    let err = remote.capabilities().await.unwrap_err();
+    assert!(err.to_string().contains("auth.machine_token"), "actionable: {err}");
+    // The broker (re)generated its token file; the next call recovers.
+    std::fs::write(home.path().join("auth-broker.token"), "rotated-token\n").unwrap();
+    assert!(remote.capabilities().await.is_ok());
+    let seen = hits.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            "Bearer stale-token".to_string(),
+            "Bearer stale-token".to_string(),
+            "Bearer rotated-token".to_string(),
+        ],
+        "exactly one retry, with the re-read token"
+    );
+}

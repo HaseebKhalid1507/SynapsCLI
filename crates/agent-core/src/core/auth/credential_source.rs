@@ -268,7 +268,7 @@ pub enum TokenFetchError {
 impl std::fmt::Display for TokenFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unauthorized => write!(f, "broker rejected machine auth (401)"),
+            Self::Unauthorized => f.write_str(&super::broker_token::unauthorized_hint()),
             Self::UnknownAccount => write!(f, "broker reports unknown account (404)"),
             Self::InvalidAccount => write!(f, "broker rejected account label (400)"),
             Self::UnsupportedAccount => write!(f, "named accounts are not supported by this fetcher"),
@@ -418,7 +418,9 @@ pub async fn resolve_remote_token<F: TokenFetcher>(
 pub struct BrokerClient {
     http: reqwest::Client,
     endpoint: String,
-    machine_token: String,
+    /// Reloaded from the local broker token file after a 401 when the
+    /// endpoint is loopback (prA I2).
+    machine_token: super::MachineToken,
 }
 
 impl BrokerClient {
@@ -431,10 +433,12 @@ impl BrokerClient {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
+        let endpoint = endpoint.into();
+        let machine_token = super::MachineToken::for_endpoint(&endpoint, machine_token);
         Self {
             http,
-            endpoint: endpoint.into(),
-            machine_token: machine_token.into(),
+            endpoint,
+            machine_token,
         }
     }
 
@@ -445,10 +449,26 @@ impl BrokerClient {
         machine_token: impl Into<String>,
         http: reqwest::Client,
     ) -> Self {
+        let endpoint = endpoint.into();
+        let machine_token = super::MachineToken::for_endpoint(&endpoint, machine_token);
+        Self {
+            http,
+            endpoint,
+            machine_token,
+        }
+    }
+
+    /// Share an existing (reloadable) machine token, e.g. the
+    /// [`super::RemoteBroker`]'s, so a reload after a 401 reaches both.
+    pub fn with_machine_token(
+        endpoint: impl Into<String>,
+        machine_token: super::MachineToken,
+        http: reqwest::Client,
+    ) -> Self {
         Self {
             http,
             endpoint: endpoint.into(),
-            machine_token: machine_token.into(),
+            machine_token,
         }
     }
 
@@ -485,7 +505,7 @@ pub async fn resolve_access_token(
 impl BrokerClient {
     /// Source scope for cache keys (endpoint + machine-principal digest).
     pub fn scope(&self) -> String {
-        source_scope(&self.endpoint, &self.machine_token)
+        source_scope(&self.endpoint, &self.machine_token.get())
     }
 
     /// `GET /token?provider=X[&account=Y]`.
@@ -510,11 +530,8 @@ impl BrokerClient {
             query.push(("account", account));
         }
         let resp = self
-            .http
-            .get(&url)
-            .query(&query)
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| self.http.get(&url).query(&query).bearer_auth(t))
             .await
             .map_err(|e| TokenFetchError::Other(format!("broker request failed: {e}")))?;
         let status = resp.status();
