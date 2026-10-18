@@ -23,22 +23,35 @@ This string is the **single canonical representation** used everywhere:
 **Invariant**: the formatted string produced for a given `Event` is identical
 regardless of which mode (chat, RPC, server) drains it.
 
-**Sanitising.** The rendering is a prompt-injection boundary, so nothing an
-event carries can break out of its envelope or forge another event tag:
+**Sanitising.** The rendering is a syntactic boundary: what an event carries
+cannot close its own tag or open another one that this renderer would read as
+an event tag. It is not a guarantee about how a model reads the text.
 - Every attribute value (`id`, `type`, `source`, `channel`): `"` becomes `'`,
   `<` and `>` are dropped, and control characters become spaces.
-- Text and `Data:` first lose every closing `</event>` tag (any ASCII case,
-  whitespace after `</` and before `>`). Anything still readable as an event
-  tag then has its `<` written as `&lt;`: an opener (`<event`, `< EVENT x>`),
-  `< /event>`, or a closer that the removal reassembled. Other tags (`<b>`,
-  `<events>`) and comparisons (`1 < 2`) are left alone.
+- Text and `Data:` first lose every closing `</event>` tag (the ASCII word in
+  any case, Unicode whitespace allowed after `</` and before `>`). Then
+  anything still readable as an event tag has its `<` written as `&lt;`: an
+  opener (`<event`, `< EVENT x>`), `< /event>`, or a closer that the removal
+  reassembled.
+- "Readable as an event tag" means: an ASCII `<`, optional Unicode whitespace,
+  an optional `/` with optional whitespace after it, and the ASCII word
+  `event` in any case, followed by whitespace, `>`, `/` or the end of the
+  text.
+- Lookalikes are not neutralised and pass through unchanged: a fullwidth or
+  other non-ASCII `<`, or a zero-width or NUL character inside the word (such
+  as `<ev\0ent>` or `</event\0>`). This renderer does not read them as tags,
+  but a model may.
+- Other tags (`<b>`, `<events>`) and comparisons (`1 < 2`) are left alone.
 - An event without these characters renders exactly as before.
+- The boundary applies when an `Event` is rendered. History that was already
+  saved keeps the strings it was saved with (a compaction carries pending
+  events forward as formatted strings), and is not re-sanitised.
 
 **Ids at intake.** Events from outside the process (the event socket and the
 inbox) must carry a plain-token id: 1 to 128 ASCII letters, digits, `.`, `_`,
-`:` or `-`. Uuids qualify. Any other id is replaced by a fresh uuid and a
-warning is logged (its length, never its bytes). The event is still
-delivered.
+`:` or `-`. Uuids qualify. Any other id is replaced by a fresh uuid, and a
+warning is logged with the rejected id's length in bytes and the replacement
+uuid, never the rejected bytes. The event is still delivered.
 
 ---
 
