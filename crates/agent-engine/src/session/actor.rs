@@ -540,6 +540,10 @@ pub struct SessionActor {
     /// Shared with the handle: `config.memory_mode`, readable by a reload
     /// that gets no checkpoint reply.
     pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
+    /// This runtime's memory has been seen active (a grant took effect).
+    /// Only then does "memory is off" mean consent was revoked; see
+    /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
+    pub(crate) memory_seen_active: bool,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -761,7 +765,7 @@ impl SessionActor {
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
 
-        let actor = SessionActor {
+        let mut actor = SessionActor {
             id,
             meta,
             config: cfg,
@@ -826,7 +830,10 @@ impl SessionActor {
             },
             reload_fence: None,
             memory_mode_slot: memory_mode,
+            memory_seen_active: false,
         };
+        // Whether the build's grant (default or restored choice) took.
+        actor.observe_memory();
         Ok((handle, SessionTask(actor)))
     }
 
@@ -2245,6 +2252,9 @@ impl SessionActor {
         }
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // A fresh runtime: whether its grant took effect is its own.
+        self.memory_seen_active = false;
+        self.observe_memory();
         self.publish_view().await;
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
@@ -2357,6 +2367,9 @@ impl SessionActor {
         // any foreground turn that starts while armed.)
         let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
         // Stamp this turn's worker launches before the stream can start any.
+        // A grant made since the last turn (e.g. while the session was
+        // being rebuilt) is seen before this turn can revoke it.
+        self.observe_memory();
         self.turn_worker_generation = self
             .runtime
             .subagent_registry()

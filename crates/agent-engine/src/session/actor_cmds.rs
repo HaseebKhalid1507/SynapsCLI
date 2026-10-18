@@ -145,6 +145,7 @@ impl SessionActor {
         }
         if cmd == "memory" {
             self.note_memory_choice(&arg);
+            self.observe_memory();
         }
         if view_changed {
             self.publish_view().await;
@@ -167,6 +168,11 @@ impl SessionActor {
     /// only from `/memory` ([`Self::note_memory_choice`]): the tool cannot
     /// enable (that needs the command's ExplicitCommand proof), so no other
     /// path may make one sticky.
+    ///
+    /// Off counts as a revocation only once memory was seen active in this
+    /// runtime (`memory_seen_active`): a grant that never took effect — an
+    /// extension-backed provider not registered yet after a reload or
+    /// unpark — leaves the choice alone, so the next rebuild retries it.
     pub(crate) fn effective_memory_mode(&self) -> Option<super::SessionMemoryMode> {
         use crate::runtime::memory_context::DurableStatus;
         let recorded = self.config.memory_mode;
@@ -178,7 +184,7 @@ impl SessionActor {
             Some(mode) => mode.lease_mode().is_some(),
             None => self.memory_default_is_durable(),
         };
-        if off && would_grant {
+        if off && would_grant && self.memory_seen_active {
             Some(super::SessionMemoryMode::Off)
         } else {
             recorded
@@ -196,8 +202,25 @@ impl SessionActor {
             )
     }
 
+    /// Latch `memory_seen_active` if this runtime's memory is active now.
+    /// Called where a grant can take effect: the runtime's build, `/memory`,
+    /// each turn's start and end.
+    pub(crate) fn observe_memory(&mut self) {
+        use crate::runtime::memory_context::DurableStatus;
+        if self.runtime.is_live()
+            && matches!(
+                self.runtime.memory_context_status().durable,
+                DurableStatus::Active { .. }
+            )
+        {
+            self.memory_seen_active = true;
+        }
+    }
+
     /// Record [`Self::effective_memory_mode`] (config + the handle's slot).
+    /// A revocation recorded here (not by `/memory`) is told to the user.
     pub(crate) fn sync_memory_choice(&mut self) {
+        self.observe_memory();
         let mode = self.effective_memory_mode();
         if mode != self.config.memory_mode {
             self.config.memory_mode = mode;
@@ -205,6 +228,12 @@ impl SessionActor {
                 .memory_mode_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+            if mode == Some(super::SessionMemoryMode::Off) {
+                self.emit(SessionEventWire::SystemNotice(
+                    "memory stays off for this session: its consent was revoked, and a park or daemon reload keeps it off (/memory on turns it back on)"
+                        .into(),
+                ));
+            }
         }
     }
 

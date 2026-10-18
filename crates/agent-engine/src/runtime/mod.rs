@@ -3217,6 +3217,9 @@ impl Runtime {
     ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
     {
         use crate::extensions::context_provider as ext_cp;
+        if memory_context::provider_unavailable_for_test() {
+            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+        }
         if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
             || self
                 .memory_backend_reconfigure_denied

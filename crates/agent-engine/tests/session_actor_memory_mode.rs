@@ -197,6 +197,16 @@ async fn consent_revoked_outside_slash_memory_survives_park_and_reload() {
 
     runtime.memory_context_disable();
     assert!(memory(&mut t, 2, "status").await.contains("mode off"));
+    // The next turn end records it, and says so.
+    t.send(submit("carry on")).await.unwrap();
+    let seen = until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n.starts_with("memory stays off for this session")
+        )),
+        "the user is told the revocation is kept"
+    );
     t = park_and_unpark(&handle, t).await;
     let status = memory(&mut t, 3, "status").await;
     assert!(status.contains("mode off"), "the revocation was undone by the unpark: {status}");
@@ -244,5 +254,92 @@ async fn a_revocation_after_slash_memory_on_is_not_re_granted() {
     t = park_and_unpark(&handle, t).await;
     let status = memory(&mut t, 2, "status").await;
     assert!(status.contains("mode off"), "{status}");
+    end(&mut t).await;
+}
+
+/// The memory choice in the record a `Checkpoint{HostRequest}` reports
+/// (the same record a reload takes; this reason does not fence).
+async fn recorded_memory_mode(
+    handle: &SessionHandle,
+    t: &mut LocalTransport,
+) -> Option<agent_engine::session::SessionMemoryMode> {
+    handle
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest })
+        .await
+        .unwrap();
+    let seen = until(t, |e| {
+        matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
+    })
+    .await;
+    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else {
+        unreachable!()
+    };
+    serde_json::from_value::<SessionReloadRecord>(value["record"].clone())
+        .unwrap()
+        .config
+        .memory_mode
+}
+
+/// Off is not always a revocation: a rebuilt runtime whose grant failed
+/// (an extension-backed provider not registered yet after a reload or
+/// unpark) is off without anyone saying no. A turn ending then must not
+/// record `Off` over the user's `/memory recall`: the next rebuild retries
+/// the grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_grant_that_failed_on_rebuild_is_retried_not_recorded_off() {
+    use agent_engine::runtime::memory_context::testing::ProviderUnavailable;
+    use agent_engine::session::SessionMemoryMode;
+    let _h = home_with_memory_default();
+    let _g = Grace::zero();
+    let (handle, mut t) = session().await;
+    assert!(memory(&mut t, 2, "recall").await.contains("mode recall_each_prompt"));
+
+    let unavailable = ProviderUnavailable::set();
+    t = park_and_unpark(&handle, t).await;
+    assert!(memory(&mut t, 3, "status").await.contains("mode off"), "the restore failed");
+    t.send(submit("meanwhile")).await.unwrap();
+    let seen = until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n.starts_with("memory stays off")
+        )),
+        "nobody revoked anything"
+    );
+    assert_eq!(
+        recorded_memory_mode(&handle, &mut t).await,
+        Some(SessionMemoryMode::RecallEachPrompt),
+        "the user's choice stands"
+    );
+
+    drop(unavailable);
+    t = park_and_unpark(&handle, t).await;
+    let status = memory(&mut t, 4, "status").await;
+    assert!(status.contains("mode recall_each_prompt"), "the grant is retried: {status}");
+    end(&mut t).await;
+}
+
+/// The same for the operator default: a default grant that failed on a
+/// rebuild leaves the session with no recorded choice, so the next rebuild
+/// applies the default again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_default_grant_that_failed_on_rebuild_is_retried() {
+    use agent_engine::runtime::memory_context::testing::ProviderUnavailable;
+    let _h = home_with_memory_default();
+    let _g = Grace::zero();
+    let (handle, mut t) = session().await;
+
+    let unavailable = ProviderUnavailable::set();
+    t = park_and_unpark(&handle, t).await;
+    assert!(memory(&mut t, 2, "status").await.contains("mode off"));
+    t.send(submit("meanwhile")).await.unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(recorded_memory_mode(&handle, &mut t).await, None, "still no choice");
+
+    drop(unavailable);
+    t = park_and_unpark(&handle, t).await;
+    assert!(memory(&mut t, 3, "status").await.contains("mode capture_and_recall"));
     end(&mut t).await;
 }
