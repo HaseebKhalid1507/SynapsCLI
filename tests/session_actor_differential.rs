@@ -448,11 +448,15 @@ fn oracle_journal_path(o: &ReferenceReactorExt, guard: &HomeGuard) -> std::path:
 
 /// Save counter from OUTSIDE the process under test: `Session::save` goes
 /// through `write_atomic_private` (tmp + rename), so every save gives
-/// `sessions/<id>.json` a fresh inode. A spinning thread samples the inode
-/// far faster than a save can complete (JSON serialise + spawn_blocking
-/// round-trip); the oracle's logical counter is compared against this
-/// sampler on the oracle's own file in every scenario, so a sampler miss
-/// shows up as an oracle self-mismatch, not as a false actor pass.
+/// `sessions/<id>.json` a fresh inode, which a spinning thread samples.
+///
+/// It is a LOWER bound, never exact: a thread that isn't scheduled between
+/// two renames (a loaded runner) misses one, and the filesystem may hand a
+/// freed inode number straight back. So it is only ever compared from below
+/// against the oracle's exact logical counter (`o.saves`): a miss can't
+/// fail a test, and a count above the oracle's is a real extra write. It
+/// used to be checked for equality against a second sampler on the oracle's
+/// file after a 50 ms "catch-up" sleep, which failed under load.
 struct SaveSampler {
     stop: Arc<AtomicBool>,
     inodes: Arc<Mutex<Vec<u64>>>,
@@ -528,30 +532,22 @@ fn assert_same_ext(o: &ReferenceReactorExt, a: &ActorRun) {
 
 fn assert_saves(
     o: &ReferenceReactorExt,
-    o_s: &SaveSampler,
     a_s: &SaveSampler,
     o_path: &std::path::Path,
     a_path: &std::path::Path,
 ) {
-    // The actor side is flushed by the caller (`ActorRun::flushed`); this
-    // only lets the polling samplers observe the last rename.
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(
-        o.saves,
-        o_s.count(),
-        "sampler self-check: oracle logical saves != sampled saves"
-    );
-    // The actor queues its saves on a background writer that writes only the
+    // The actor side is flushed by the caller (`ActorRun::flushed`). The
+    // actor queues its saves on a background writer that writes only the
     // LATEST state when saves pile up (and never re-queues an identical
     // one), so it may write fewer times than the oracle — never more. What
     // must match is the state it leaves on disk.
     assert!(
-        a_s.count() <= o_s.count(),
+        a_s.count() <= o.saves,
         "actor wrote more often than the oracle: {} > {}",
         a_s.count(),
-        o_s.count()
+        o.saves
     );
-    assert_eq!(o.saves > 0, a_s.count() > 0, "one side never saved");
+    assert_eq!(o.saves > 0, a_path.exists(), "one side never saved");
     if o.saves > 0 {
         assert_eq!(
             journal_fields(o_path),
@@ -679,7 +675,6 @@ async fn tool_loop() {
 
     let mut o = oracle_ext(&host).await;
     let o_path = oracle_journal_path(&o, &guard);
-    let o_s = SaveSampler::watch(o_path.clone());
     o.submit("call the tool".into()).await;
     o.drive_to_idle(None).await;
 
@@ -698,7 +693,7 @@ async fn tool_loop() {
         "tool result reached the history"
     );
     a.flushed().await;
-    assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
+    assert_saves(&o, &a_s, &o_path, &a_path);
     assert_eq!(o.saves, histories, "one save per MessageHistory (stream_handler.rs:77)");
     a.end().await;
 }
@@ -718,7 +713,6 @@ async fn steer_mid_stream() {
     // Oracle: submit, pump until the first Text, steer, drive to idle.
     let mut o = oracle_ext(&host).await;
     let o_path = oracle_journal_path(&o, &guard);
-    let o_s = SaveSampler::watch(o_path.clone());
     o.submit("start".into()).await;
     pump_until_text(&mut o).await;
     assert!(o.steer("redirect".into()), "steer delivered while streaming");
@@ -746,7 +740,7 @@ async fn steer_mid_stream() {
     assert_same_ext(&o, &a);
     assert!(a.api_messages.iter().any(|m| m["content"] == "redirect"));
     a.flushed().await;
-    assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
+    assert_saves(&o, &a_s, &o_path, &a_path);
     a.end().await;
 }
 
@@ -764,7 +758,6 @@ async fn event_injection_busy_steered() {
 
     let mut o = oracle_ext(&host).await;
     let o_path = oracle_journal_path(&o, &guard);
-    let o_s = SaveSampler::watch(o_path.clone());
     o.submit("start".into()).await;
     pump_until_text(&mut o).await;
     o.r.runtime.event_queue().push(fixed_event(0)).unwrap();
@@ -791,7 +784,7 @@ async fn event_injection_busy_steered() {
             .any(|m| m["content"].as_str().is_some_and(|c| c.contains("event 0")))
     );
     a.flushed().await;
-    assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
+    assert_saves(&o, &a_s, &o_path, &a_path);
     a.end().await;
 }
 
@@ -819,8 +812,6 @@ async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
     // Oracle: submit, see "partial", queue a steer, abort, then submit again
     // (fold) and abort that too (the stub never finishes a turn).
     let mut o = oracle_ext(&host).await;
-    let o_path = oracle_journal_path(&o, &guard);
-    let o_s = SaveSampler::watch(o_path.clone());
     o.submit("first".into()).await;
     pump_until_text(&mut o).await;
     o.steer("queued-then-dropped".into());
@@ -886,16 +877,15 @@ async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
     // Saves, per turn on both sides: the engine's prompt checkpoint (round
     // boundary before the first request) + one at abort (dispatch.rs:191).
     a.flushed().await;
-    std::thread::sleep(Duration::from_millis(50)); // oracle sampler catch-up
     assert_eq!(o.saves, 4, "prompt checkpoint + abort, per turn");
-    assert_eq!(o.saves, o_s.count(), "sampler self-check");
     // Coalescing writer: at most as many writes, never more (see
-    // `assert_saves`).
+    // `assert_saves`; the sampled count is a lower bound).
+    assert!(a_path.exists(), "the actor never saved");
     assert!(
-        (1..=o_s.count()).contains(&a_s.count()),
+        a_s.count() <= o.saves,
         "actor saves {} vs oracle {}",
         a_s.count(),
-        o_s.count()
+        o.saves
     );
     a.end().await;
 }
@@ -913,7 +903,6 @@ async fn secret_prompt_roundtrip() {
 
     let mut o = oracle_ext(&host).await;
     let o_path = oracle_journal_path(&o, &guard);
-    let o_s = SaveSampler::watch(o_path.clone());
     o.submit("go".into()).await;
     o.drive_to_idle(Some("s3cret".into())).await;
 
@@ -959,6 +948,6 @@ async fn secret_prompt_roundtrip() {
     assert!(a.seen.iter().any(|s| s.contains("answered:6")));
     assert_same_ext(&o, &a);
     a.flushed().await;
-    assert_saves(&o, &o_s, &a_s, &o_path, &a_path);
+    assert_saves(&o, &a_s, &o_path, &a_path);
     a.end().await;
 }
