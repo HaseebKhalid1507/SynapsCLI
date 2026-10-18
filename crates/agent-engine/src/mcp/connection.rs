@@ -20,6 +20,7 @@ pub(super) struct McpConnection {
 impl McpConnection {
     /// Spawn and initialize an MCP server.
     pub(super) async fn start(
+        server: &str,
         config: &super::McpServerConfig,
     ) -> std::result::Result<Self, String> {
         let mut cmd = Command::new(&config.command);
@@ -47,7 +48,11 @@ impl McpConnection {
                 v,
                 |name| std::env::var(name).ok(),
                 |name| {
+                    if !super::first_unset_warning(server, name) {
+                        return;
+                    }
                     tracing::warn!(
+                        server = %server,
                         command = %config.command,
                         env_key = %k,
                         unset_var = %name,

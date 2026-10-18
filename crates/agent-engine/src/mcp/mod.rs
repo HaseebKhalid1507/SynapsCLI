@@ -175,6 +175,18 @@ pub fn expand_env_value_with(
     out
 }
 
+/// True the first time this process sees an unset `${VAR}` for
+/// (`server`, `var`); false after. Keeps the spawn warning to one line per
+/// server and variable instead of one per session spawn in daemon mode.
+pub(crate) fn first_unset_warning(server: &str, var: &str) -> bool {
+    static SEEN: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    SEEN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((server.to_string(), var.to_string()))
+}
+
 fn safe_str(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -518,7 +530,7 @@ async fn discover_one(
     opts: McpDiscoveryOpts,
 ) -> bool {
     let listing = tokio::time::timeout(opts.timeout, async {
-        let mut conn = connection::McpConnection::start(&server).await?;
+        let mut conn = connection::McpConnection::start(&name, &server).await?;
         let result = conn.list_tools().await;
         conn.start_kill();
         result
@@ -624,6 +636,16 @@ mod tests {
         );
         assert_eq!(out, "v:::d::${}");
         assert_eq!(unset, ["MISSING", "ALSO_MISSING"]);
+    }
+
+    /// The unset-var warning fires once per (server, var) per process, not
+    /// on every spawn (daemon mode spawns one child per session).
+    #[test]
+    fn unset_var_warning_is_once_per_server_and_var() {
+        assert!(first_unset_warning("dedupe-srv", "DEDUPE_VAR"));
+        assert!(!first_unset_warning("dedupe-srv", "DEDUPE_VAR"));
+        assert!(first_unset_warning("dedupe-srv", "OTHER_VAR"));
+        assert!(first_unset_warning("other-srv", "DEDUPE_VAR"));
     }
 
     #[test]
