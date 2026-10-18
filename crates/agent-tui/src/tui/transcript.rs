@@ -586,6 +586,9 @@ pub(crate) struct TranscriptStore {
     bytes_since_audit: usize,
     /// Messages dropped by the cap so far (the sentinel line reports it).
     scrollback_dropped: usize,
+    /// A subagent view's store: its trim note doesn't point at `/resync`,
+    /// which only reloads the main thread.
+    worker_view: bool,
 
     // ── Tool timing (moved in slice b′; locked decision #2) ──────────────────
     /// Tracks when the current tool started executing (for elapsed time display)
@@ -675,6 +678,7 @@ impl TranscriptStore {
             pushes_since_audit: 0,
             bytes_since_audit: 0,
             scrollback_dropped: 0,
+            worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
             viewport: None,
@@ -694,6 +698,11 @@ impl TranscriptStore {
     pub(crate) fn set_scrollback(&mut self, msgs: usize, bytes: usize) {
         self.max_msgs = msgs;
         self.max_bytes = bytes;
+    }
+
+    /// Mark this store as a subagent view's (see `worker_view`).
+    pub(crate) fn set_worker_view(&mut self) {
+        self.worker_view = true;
     }
 
     /// Messages the scrollback cap has dropped so far.
@@ -763,10 +772,18 @@ impl TranscriptStore {
         let dropped_real = if had_sentinel { n - 1 } else { n };
         self.messages.drain(0..n);
         self.scrollback_dropped += dropped_real;
+        let reload = if self.worker_view {
+            "a subagent view keeps only its newest messages".to_string()
+        } else {
+            format!(
+                "/resync reloads the last {} user/assistant items from the daemon, without tool output",
+                agent_engine::session::types::tail_items_from_env()
+            )
+        };
         let sentinel = TimestampedMsg {
             msg: ChatMessage::System(format!(
-                "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; /resync reloads the last {} user/assistant items from the daemon, without tool output)",
-                self.scrollback_dropped, self.max_msgs, agent_engine::session::types::tail_items_from_env()
+                "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; {reload})",
+                self.scrollback_dropped, self.max_msgs
             )),
             time: chrono::Local::now().format("%H:%M").to_string(),
         };

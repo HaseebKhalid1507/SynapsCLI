@@ -213,8 +213,10 @@ pub(crate) fn focus_worker(app: &mut App, c: &Candidate, now: Instant) {
         WORKER_SCROLLBACK,
     );
     if thread.store.is_empty() {
+        // Whether Enter steers it is the header's and footer's to say (the
+        // worker may already be finished, 04-tui M5).
         thread.store.push_msg(ChatMessage::System(format!(
-            "subagent {} ({}) \u{2014} Enter steers it \u{00b7} Esc or Ctrl-\u{2193} returns to the main thread",
+            "subagent {} ({}) \u{2014} Esc returns to the main thread \u{00b7} Alt-\u{2191}/\u{2193} switches subagents",
             c.agent_name, c.handle_id
         )));
         if app.watch.unsupported {

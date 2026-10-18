@@ -222,6 +222,8 @@ fn a_finished_worker_view_is_read_only() {
     assert_eq!(h.input_contents(), "one more thing", "the text stays");
     let worker = h.worker_transcript_text("sa_5");
     assert!(worker.contains("its view is read-only"), "{worker}");
+    // 04-tui M5: the opening line no longer promises "Enter steers it".
+    assert!(!worker.contains("Enter steers"), "{worker}");
     assert!(h.snapshot().lines().next().unwrap().contains("read-only"));
 }
 

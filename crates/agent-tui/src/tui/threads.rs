@@ -99,6 +99,7 @@ impl Threads {
             .or_insert_with(|| {
                 let mut store = TranscriptStore::new(clock);
                 store.set_scrollback(scrollback.0, scrollback.1);
+                store.set_worker_view();
                 WorkerThread {
                     subagent_id,
                     agent_name: agent_name.to_string(),
@@ -163,6 +164,24 @@ pub(crate) fn active_mut<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 04-tui M6: a worker view's trim note pointed at `/resync`, which only
+    /// reloads the main thread.
+    #[test]
+    fn a_worker_views_trim_note_does_not_point_at_resync() {
+        let mut threads = Threads::default();
+        let w = threads.open_worker("sa_1", 1, "scout", TuiClock::test(), (10, 0));
+        for i in 0..100 {
+            w.store.push_msg(ChatMessage::Text(format!("line {i}")));
+        }
+        let note = match &w.store.messages()[0].msg {
+            ChatMessage::System(t) => t.clone(),
+            _ => panic!("expected the trim note first"),
+        };
+        assert!(note.contains("earlier message(s) hidden"), "{note}");
+        assert!(!note.contains("/resync"), "{note}");
+        assert!(note.contains("subagent view"), "{note}");
+    }
 
     fn store_with(text: &str) -> TranscriptStore {
         let mut s = TranscriptStore::new(TuiClock::test());
