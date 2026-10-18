@@ -1063,6 +1063,19 @@ impl ExtensionManager {
         entries: &[ExtensionConfigEntry],
         host_project_root: Option<&str>,
     ) -> Result<Value, String> {
+        Self::resolve_config_with_env(id, entries, host_project_root, &|name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// [`Self::resolve_config`] with the environment lookup injected, so
+    /// tests can prove which variable names are (and are never) read.
+    fn resolve_config_with_env(
+        id: &str,
+        entries: &[ExtensionConfigEntry],
+        host_project_root: Option<&str>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Value, String> {
         let mut out = Map::new();
         let own_keys: Vec<&str> = entries.iter().map(|e| e.key.trim()).collect();
         for entry in entries {
@@ -1134,12 +1147,12 @@ impl ExtensionManager {
                     }
                 },
             };
-            if let Ok(value) = std::env::var(Self::extension_override_var(id, key)) {
+            if let Some(value) = env(&Self::extension_override_var(id, key)) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
             }
             if let Some(secret_env) = secret_env {
-                if let Ok(value) = std::env::var(secret_env) {
+                if let Some(value) = env(secret_env) {
                     out.insert(key.to_string(), Value::String(value));
                     continue;
                 }
@@ -3242,6 +3255,43 @@ mod secret_env_allowlist_tests {
             ExtensionManager::secret_env_name("  PADDED "),
             Some("PADDED")
         );
+    }
+
+    /// A malformed name must never be READ, not merely tolerated: with
+    /// `lower_token` set, the resolved value is still the default. Every name
+    /// the resolver asks for is recorded, and `lower_token` is not among them.
+    #[test]
+    fn malformed_secret_env_is_never_read_even_when_set() {
+        let entry: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "lower_token",
+            "default": "fallback",
+        }))
+        .unwrap();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let env = |name: &str| {
+            asked.lock().unwrap().push(name.to_string());
+            (name == "lower_token").then(|| "LEAK".to_string())
+        };
+        let out = ExtensionManager::resolve_config_with_env("ext", &[entry], None, &env)
+            .expect("malformed secret_env must not fail the load");
+        assert_eq!(out["k"], "fallback", "{out}");
+        assert!(
+            !asked.lock().unwrap().iter().any(|n| n == "lower_token"),
+            "malformed name was looked up: {:?}",
+            asked.lock().unwrap()
+        );
+
+        // Control: a well-formed name IS read through the same seam.
+        let good: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "  GOOD_TOKEN ",
+            "default": "fallback",
+        }))
+        .unwrap();
+        let env = |name: &str| (name == "GOOD_TOKEN").then(|| "value".to_string());
+        let out = ExtensionManager::resolve_config_with_env("ext", &[good], None, &env).unwrap();
+        assert_eq!(out["k"], "value");
     }
 
     /// A malformed `secret_env` is warned about and dropped: the plugin still
