@@ -197,10 +197,22 @@ impl From<MuseAuthError> for String {
 // ── Injectable boundaries ────────────────────────────────────────────────────
 
 /// Minimal HTTP response used by the device-flow / mint state machine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MuseHttpResponse {
     pub status: u16,
     pub body: String,
+}
+
+impl fmt::Debug for MuseHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MuseHttpResponse")
+            .field("status", &self.status)
+            .field(
+                "body",
+                &format_args!("[REDACTED {} bytes]", self.body.len()),
+            )
+            .finish()
+    }
 }
 
 /// Injectable HTTP surface so tests never touch the network.
@@ -244,7 +256,7 @@ pub trait MuseBrowser: Send + Sync {
 
 // ── Device-flow types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceAuthorization {
     /// Opaque device code — never logged via public error types.
     pub(crate) device_code: String,
@@ -255,6 +267,20 @@ pub struct DeviceAuthorization {
     pub expires_in_secs: u64,
     pub interval_secs: u64,
     pub issued_at_ms: u64,
+}
+
+impl fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceAuthorization")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in_secs", &self.expires_in_secs)
+            .field("interval_secs", &self.interval_secs)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .finish()
+    }
 }
 
 impl DeviceAuthorization {
@@ -397,12 +423,24 @@ struct DeviceCodeJson {
     interval: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceTokenJson {
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
     error: Option<String>,
+}
+
+impl fmt::Debug for DeviceTokenJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceTokenJson")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1387,7 +1425,45 @@ mod tests {
         };
         let dbg = format!("{o:?}");
         assert!(!dbg.contains("oauth-secret-123"), "{dbg}");
-        assert!(dbg.contains("Authorized") && dbg.contains("REDACTED"), "{dbg}");
+        assert!(
+            dbg.contains("Authorized") && dbg.contains("REDACTED"),
+            "{dbg}"
+        );
         assert_eq!(format!("{:?}", DevicePollOutcome::Pending), "Pending");
+    }
+
+    #[test]
+    fn device_flow_debug_redacts_secrets() {
+        let r = MuseHttpResponse {
+            status: 200,
+            body: "{\"access_token\":\"body-secret\"}".into(),
+        };
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains("body-secret") && dbg.contains("200"), "{dbg}");
+
+        let a = DeviceAuthorization {
+            device_code: "device-secret".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://example.invalid".into(),
+            verification_uri_complete: None,
+            expires_in_secs: 600,
+            interval_secs: 5,
+            issued_at_ms: 0,
+        };
+        let dbg = format!("{a:?}");
+        assert!(
+            !dbg.contains("device-secret") && dbg.contains("ABCD-EFGH"),
+            "{dbg}"
+        );
+
+        let t = DeviceTokenJson {
+            access_token: Some("token-secret".into()),
+            error: Some("slow_down".into()),
+        };
+        let dbg = format!("{t:?}");
+        assert!(
+            !dbg.contains("token-secret") && dbg.contains("slow_down"),
+            "{dbg}"
+        );
     }
 }
