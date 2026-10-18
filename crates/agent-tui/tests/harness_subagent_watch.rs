@@ -472,3 +472,20 @@ fn a_bare_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
     assert!(worker.contains("unknown command: /"), "{worker}");
     assert_eq!(h.main_transcript_text(), main_before, "main gets nothing");
 }
+
+/// prG review: the footer names `/watch` too, the keyless way in (no
+/// arrow chord at all) when the terminal swallows both chords.
+#[test]
+fn the_footer_names_slash_watch_when_there_are_workers() {
+    let mut h = TestHarness::boot_with_size(160, 30);
+    let frame = h.snapshot();
+    assert!(!frame.lines().last().unwrap_or("").contains("/watch"), "no workers: no hint");
+    start(&mut h, 1, "scout");
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("/watch list"), "{footer:?}");
+    alt(&mut h, KeyCode::Up);
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("/watch list"), "{footer:?}");
+}

@@ -1508,6 +1508,7 @@ pub(crate) fn render_frame_into(
                 h.push(("enter", "steer"));
             }
             h.extend([(arrows, "agents"), (scroll, "scroll"), ("ctrl+o", compact)]);
+            h.push(("/watch", "list"));
             h
         }
         None => {
@@ -1519,7 +1520,8 @@ pub(crate) fn render_frame_into(
                 ("enter", "send"),
             ];
             if !model.subagents.is_empty() {
-                h.push((arrows, "agents"));
+                // `/watch` too: the way in when the terminal eats both chords.
+                h.extend([(arrows, "agents"), ("/watch", "list")]);
             }
             h
         }
