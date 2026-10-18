@@ -65,13 +65,17 @@ Opt-in. `live` / `on` / `true` / `1` / `yes` attaches OpenAI's hosted
   requests, so upstream's `use_responses_lite` (a request-format switch in
   codex-rs) and `supports_search_tool` (tool_search) are not consulted. If
   the backend answers a request carrying the hosted tool with a 400 that
-  rejects a tool (`param: tools…`, or a tool-rejection code), Synaps
-  remembers that for the model for the rest of the process, shows
-  `🔎 Codex web_search was rejected by <model>; continuing without it.`
-  once, and resends that request once without the tool. A 400 is returned
-  before inference, so the resend isn't double-billed; a second rejection
-  is returned as the error. Pending: a live check of gpt-5.6-sol with
-  `SYNAPS_CODEX_WEB_SEARCH=live`.
+  points at it (`param: tools`, `tools[<web_search index>]…` (web_search is
+  always the last tool), or a tool-rejection code), Synaps resends that
+  request once without it. A 400 is returned before inference, so the
+  resend isn't double-billed. Only if the resend succeeds does Synaps
+  remember the rejection for that model, for the rest of the process (every
+  session on a daemon, until `synaps daemon stop`), and show
+  `🔎 Codex web_search (rejected by <model>): continuing without it.` once.
+  If the resend fails too, nothing is remembered or shown and the resend's
+  error is returned. A 400 naming another tool (a user or MCP schema at
+  another `tools[i]`) is never resent and never blamed on web_search.
+  Pending: a live check of gpt-5.6-sol with `SYNAPS_CODEX_WEB_SEARCH=live`.
 - **Visibility.** Each completed `web_search_call` item becomes a notice
   showing what left the machine: `🔎 Codex web_search (<action>, <status>):
   <target>`, where the target is every query (`a | b | …`, first five, then
@@ -96,7 +100,7 @@ explanation for known shapes: a rejected reasoning setting (`param`
 `reasoning.*`), a rejected tool (`param` `tools…`), an unsupported
 parameter, `model_not_found`, and "not supported when using Codex with a
 ChatGPT account" (detected as a boolean; the text is dropped). The tool
-explanation names web_search only when it was attached. Anything else
+explanation never blames web_search. Anything else
 shows the identifiers alone. The trace terminal code carries only the
 identifiers (`http_400:invalid_request_error:unsupported_value`).
 
