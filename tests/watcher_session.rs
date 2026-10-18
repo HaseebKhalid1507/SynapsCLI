@@ -25,7 +25,8 @@ use support::*;
 use synaps_cli::runtime::budget::{TurnBudget, TurnRole, TOOL_CALL_BUDGET_REFUSAL};
 use synaps_cli::tools::{Tool, ToolContext, ToolOrigin};
 use synaps_cli::watcher_session::{
-    run_handoff_turn, run_turn, SessionAllowance, SessionLimit, SessionTotals,
+    run_handoff_turn, run_session_turn, run_turn, SessionAllowance, SessionLimit, SessionTotals,
+    TURN_DEADLINE_GRACE,
 };
 use synaps_cli::{
     BudgetDimension, Result, Runtime, SessionLimits, SharedMessage, TurnOutcome, Value,
@@ -270,7 +271,7 @@ async fn a_parallel_batch_crossing_the_tool_limit_runs_its_in_budget_calls() {
 #[serial]
 async fn a_cost_limit_crossed_while_calling_watcher_exit_still_ends_with_a_handoff() {
     let _guard = HomeGuard::new();
-    let (url, hits, _) = spawn_stub(Script::SeqSse(&[
+    let (url, hits, bodies) = spawn_stub(Script::SeqSse(&[
         SSE_EXPENSIVE_WATCHER_EXIT,
         SSE_CHEAP_WATCHER_EXIT,
         SSE_DONE,
@@ -333,6 +334,18 @@ async fn a_cost_limit_crossed_while_calling_watcher_exit_still_ends_with_a_hando
     );
     let unchanged = std::fs::read_to_string(&handoff).unwrap();
     assert!(unchanged.contains("previous session"));
+    // The stopped round was paid for: its watcher_exit call stays in
+    // history, paired with a "not executed" result.
+    let results = tool_results(&messages);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "toolu_x1");
+    assert!(results[0]
+        .1
+        .starts_with(synaps_cli::runtime::budget::TOOL_CALL_NOT_EXECUTED));
+    assert_eq!(
+        totals.tool_calls, 0,
+        "a call that did not run is not counted"
+    );
 
     // The handoff turn runs, writes the handoff, and is metered.
     let cost_before = totals.cost_usd;
@@ -346,6 +359,12 @@ async fn a_cost_limit_crossed_while_calling_watcher_exit_still_ends_with_a_hando
     )
     .await;
     assert!(report.handoff_saved, "the handoff turn saved the handoff");
+    // The handoff request carried the stopped round's response.
+    let handoff_request = String::from_utf8(bodies.lock().unwrap()[1].clone()).unwrap();
+    assert!(
+        handoff_request.contains("first try") && handoff_request.contains("toolu_x1"),
+        "the handoff turn sees the stopped round"
+    );
     let written = std::fs::read_to_string(&handoff).unwrap();
     assert!(written.contains("handoff after limit"), "{written}");
     assert!(totals.cost_usd > cost_before, "the handoff turn is metered");
@@ -402,4 +421,105 @@ async fn a_signal_cancelled_turn_leaves_a_valid_history() {
     assert!(!report.handoff_saved);
     assert_eq!(messages[0]["content"], "boot");
     assert_history_pairing(&messages);
+}
+
+/// One call to a tool that never finishes on its own.
+const SSE_SLOW_TOOL: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_slow\",\"name\":\"slow_fixture_tool\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+struct SlowTool;
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn name(&self) -> &str {
+        "slow_fixture_tool"
+    }
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+    fn description(&self) -> &str {
+        "a tool that outlives the session"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type":"object"})
+    }
+    async fn execute(&self, _p: Value, _c: ToolContext) -> Result<String> {
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok("too late".into())
+    }
+}
+
+/// The turn `synaps agent` runs (`run_session_turn`) is bounded by the
+/// session time limit even inside one long tool round: the engine only
+/// checks time before a provider call, so the session deadline (plus a
+/// small grace) cancels the turn as a backstop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_session_time_limit_binds_inside_a_long_tool_round() {
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::SeqSse(&[SSE_SLOW_TOOL, SSE_DONE])).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut rt, _) = watcher_runtime(&dir.path().join("handoff.json")).await;
+    rt.tools_shared().write().await.register(Arc::new(SlowTool));
+
+    let limits = SessionLimits {
+        max_session_duration_mins: 1,
+        ..limits()
+    };
+    let allowance = SessionAllowance {
+        limits: &limits,
+        daily_spent_before: 0.0,
+    };
+    // One second of session time left when the turn starts.
+    let session_start = std::time::Instant::now() - Duration::from_secs(59);
+    let role = rt.turn_budget().clone();
+    let mut totals = SessionTotals::default();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let mut messages = prompt();
+    let started = std::time::Instant::now();
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_session_turn(
+            &mut rt,
+            &mut messages,
+            &allowance,
+            &role,
+            &mut totals,
+            session_start,
+            &interrupted,
+            |_, _| {},
+        ),
+    )
+    .await
+    .expect("the session deadline ends a turn stuck in a tool");
+    assert!(
+        started.elapsed() <= Duration::from_secs(1) + TURN_DEADLINE_GRACE + Duration::from_secs(3)
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(!report.handoff_saved);
+    assert_history_pairing(&messages);
+    let results = tool_results(&messages);
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].1.starts_with("Canceled") && !results[0].1.contains("by user"),
+        "a deadline is not a user cancel: {}",
+        results[0].1
+    );
+    assert_eq!(totals.tool_calls, 0, "a cancelled call is not counted");
+    assert_eq!(
+        allowance.limit_reached(&totals, session_start.elapsed()),
+        Some(SessionLimit::Time)
+    );
 }

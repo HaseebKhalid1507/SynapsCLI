@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use futures::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::budget::{TurnBudget, TOOL_CALL_BUDGET_REFUSAL};
+use crate::runtime::budget::{TurnBudget, TOOL_CALL_NOT_EXECUTED};
+use crate::runtime::{CancelCause, TurnCompletion};
 use crate::tools::WATCHER_EXIT_ACK;
 use crate::{
     LlmEvent, Runtime, SessionEvent, SessionLimits, SharedMessage, StreamEvent, TurnError,
@@ -72,6 +73,12 @@ pub struct SessionAllowance<'a> {
 impl SessionAllowance<'_> {
     fn max_duration(&self) -> Duration {
         Duration::from_secs(self.limits.max_session_duration_mins.saturating_mul(60))
+    }
+
+    /// When a turn still running is cancelled: the session time limit plus
+    /// [`TURN_DEADLINE_GRACE`].
+    pub fn turn_deadline(&self, session_start: Instant) -> Instant {
+        session_start + self.max_duration() + TURN_DEADLINE_GRACE
     }
 
     /// The first limit `totals` has reached after `elapsed`, if any.
@@ -176,7 +183,9 @@ where
                 exit_call = Some(tool_id.clone());
             }
             StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
-                if result != TOOL_CALL_BUDGET_REFUSAL {
+                // Calls a budget refused, and calls a cancel cut short, did
+                // not run to completion and are not counted.
+                if !result.starts_with(TOOL_CALL_NOT_EXECUTED) && !result.starts_with("Canceled") {
                     totals.tool_calls = totals.tool_calls.saturating_add(1);
                 }
                 if exit_call.as_deref() == Some(tool_id.as_str())
@@ -254,10 +263,12 @@ pub const HANDOFF_PROMPT: &str = "You're being shut down (resource limit reached
 pub const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Watches one streaming turn: cancels it on SIGINT/SIGTERM, or once
-/// `deadline` passes. Exits when the turn ends. Session limits are not
-/// enforced here; the engine enforces them inside the turn.
+/// `deadline` passes, as a host stop (canceled tool results say so, not
+/// "by user"). Exits when the turn ends. Session limits are otherwise
+/// enforced by the engine inside the turn.
 pub async fn watch_turn(
     cancel: CancellationToken,
+    completion: TurnCompletion,
     interrupted: Arc<AtomicBool>,
     turn_over: Arc<AtomicBool>,
     deadline: Option<Instant>,
@@ -265,6 +276,7 @@ pub async fn watch_turn(
 ) {
     while !turn_over.load(Ordering::Acquire) && !cancel.is_cancelled() {
         if interrupted.load(Ordering::Acquire) || deadline.is_some_and(|d| Instant::now() >= d) {
+            completion.note_cancel_cause(CancelCause::Host);
             cancel.cancel();
             break;
         }
@@ -286,9 +298,11 @@ pub async fn run_turn(
 ) -> TurnReport {
     runtime.set_turn_budget(budget);
     let cancel = CancellationToken::new();
+    let completion = TurnCompletion::new();
     let turn_over = Arc::new(AtomicBool::new(false));
     tokio::spawn(watch_turn(
         cancel.clone(),
+        completion.clone(),
         Arc::clone(interrupted),
         Arc::clone(&turn_over),
         deadline,
@@ -296,7 +310,7 @@ pub async fn run_turn(
     ));
     let model = runtime.model().to_string();
     let stream = runtime
-        .run_stream_with_messages(messages.clone(), cancel, None, None, false)
+        .run_stream_tracked(messages.clone(), cancel, None, None, false, completion)
         .await;
     let report = drive_turn(stream, &model, totals, on_event).await;
     turn_over.store(true, Ordering::Release);
@@ -304,6 +318,39 @@ pub async fn run_turn(
         *messages = history.clone();
     }
     report
+}
+
+/// Extra time past the session time limit before a turn still running is
+/// cancelled. The engine stops a turn at the next provider call once the
+/// session time is used up; this deadline only catches a turn stuck in a
+/// long tool round (a slow command, a `timeout: 0` subagent).
+pub const TURN_DEADLINE_GRACE: Duration = Duration::from_secs(5);
+
+/// One turn of a watcher session, as `synaps agent` runs it: the role
+/// budget narrowed to what the session has left.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_turn(
+    runtime: &mut Runtime,
+    messages: &mut Vec<SharedMessage>,
+    allowance: &SessionAllowance<'_>,
+    role: &TurnBudget,
+    totals: &mut SessionTotals,
+    session_start: Instant,
+    interrupted: &Arc<AtomicBool>,
+    on_event: impl FnMut(&StreamEvent, &SessionTotals),
+) -> TurnReport {
+    let budget = allowance.turn_budget(role, totals, session_start.elapsed());
+    let deadline = allowance.turn_deadline(session_start);
+    run_turn(
+        runtime,
+        messages,
+        budget,
+        totals,
+        interrupted,
+        Some(deadline),
+        on_event,
+    )
+    .await
 }
 
 /// After a session limit: ask for the handoff in one more turn, bounded by
@@ -338,7 +385,7 @@ pub async fn run_handoff_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::budget::TurnRole;
+    use crate::runtime::budget::{TurnRole, TOOL_CALL_BUDGET_REFUSAL};
 
     fn limits() -> SessionLimits {
         SessionLimits {
@@ -553,6 +600,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(watch_turn(
             cancel.clone(),
+            TurnCompletion::new(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -566,6 +614,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(watch_turn(
             cancel.clone(),
+            TurnCompletion::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Some(Instant::now()),
@@ -580,6 +629,7 @@ mod tests {
         let turn_over = Arc::new(AtomicBool::new(false));
         let watcher = tokio::spawn(watch_turn(
             cancel.clone(),
+            TurnCompletion::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&turn_over),
             None,

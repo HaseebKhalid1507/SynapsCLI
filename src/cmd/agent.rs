@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use synaps_cli::engine::reactor::{drain_event_queue, idle_should_wait};
 use synaps_cli::watcher_session::{
-    push_user_prompt, run_handoff_turn, run_turn, SessionAllowance, SessionLimit, SessionTotals,
+    push_user_prompt, run_handoff_turn, run_session_turn, SessionAllowance, SessionLimit,
+    SessionTotals,
 };
 use synaps_cli::{
     watcher_types::{AgentStats, DailyStats},
@@ -513,15 +514,16 @@ pub async fn run(config_path: String, trigger_context: String) {
             }
         }
 
-        // Run one streaming turn under what the session has left.
-        let budget = allowance.turn_budget(&role_budget, &totals, session_start.elapsed());
-        let report = run_turn(
+        // Run one streaming turn under what the session has left; a turn
+        // stuck in a long tool round is cancelled at the session deadline.
+        let report = run_session_turn(
             &mut runtime,
             &mut messages,
-            budget,
+            &allowance,
+            &role_budget,
             &mut totals,
+            session_start,
             &interrupted,
-            None,
             &mut log_event,
         )
         .await;
