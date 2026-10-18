@@ -238,14 +238,27 @@ async fn run_queued(
             "extensions_ready timed out — on_session_start may miss late extensions"
         );
     }
-    let permit = host.session_start_gate().acquire(&ticket).await;
+    call_in_line(host.session_start_gate(), &ticket, || async {
+        let id = (**journal_id.load()).clone();
+        crate::extensions::loader::emit_session_start(&bus, &id).await;
+    })
+    .await
+}
+
+/// Wait for `ticket`'s turn at `gate`, then make the call while holding it.
+/// `false` if the ticket was withdrawn before its turn came (not called).
+async fn call_in_line<F, Fut>(gate: &SessionStartGate, ticket: &Arc<StartTicket>, call: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let permit = gate.acquire(ticket).await;
     if !ticket.begin() {
         return false;
     }
-    let id = (**journal_id.load()).clone();
     #[cfg(any(test, feature = "testing"))]
     testing::note_call();
-    crate::extensions::loader::emit_session_start(&bus, &id).await;
+    call().await;
     drop(permit);
     true
 }
@@ -338,6 +351,107 @@ mod tests {
             order.lock().unwrap().push(name);
             drop(permit);
         })
+    }
+
+    /// A hook in line at `gate` whose extension is still working on it once
+    /// called: `called` fires when the call is made, and the call returns
+    /// when `release` fires (or is dropped).
+    struct Blocking {
+        called: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+    }
+
+    fn blocking_start(gate: &Arc<SessionStartGate>) -> (SessionStart, Blocking) {
+        let ticket = StartTicket::new(false);
+        let (called_tx, called) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel::<()>();
+        let (gate, t) = (Arc::clone(gate), Arc::clone(&ticket));
+        let task = tokio::spawn(async move {
+            call_in_line(&gate, &t, move || async move {
+                let _ = called_tx.send(());
+                let _ = release_rx.await;
+            })
+            .await
+        });
+        (SessionStart::Queued { task, ticket }, Blocking { called, release })
+    }
+
+    /// Long enough for an aborted task to be dropped and its turn at the
+    /// gate to pass on (the current-thread test runtime runs it meanwhile).
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// A session that ends while its extension still works on the hook does
+    /// not hand the gate on: the next hook would queue behind that call in
+    /// the same extension process and could pass the handler timeout.
+    #[tokio::test]
+    async fn a_hook_already_called_keeps_the_gate_when_its_session_ends() {
+        let gate = Arc::new(SessionStartGate::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (ending, mut hook) = blocking_start(&gate);
+        (&mut hook.called).await.expect("the hook is called");
+        let next = waiter(&gate, StartTicket::new(false), "next", &order);
+        until_queued(&gate, 1).await;
+
+        drop(ending);
+        settle().await;
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the next hook waits for the call in flight"
+        );
+
+        let _ = hook.release.send(());
+        next.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["next"]);
+    }
+
+    /// The same for a park: the call in flight finishes, then the gate
+    /// passes on, and the session's hook counts as run.
+    #[tokio::test]
+    async fn a_hook_already_called_keeps_the_gate_when_its_session_parks() {
+        let gate = Arc::new(SessionStartGate::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (mut parking, mut hook) = blocking_start(&gate);
+        (&mut hook.called).await.expect("the hook is called");
+        let next = waiter(&gate, StartTicket::new(false), "next", &order);
+        until_queued(&gate, 1).await;
+
+        parking.withdraw_for_park();
+        settle().await;
+        assert!(
+            matches!(parking, SessionStart::Queued { .. }),
+            "a running hook is not withdrawn"
+        );
+        assert!(order.lock().unwrap().is_empty(), "the next hook waits");
+
+        let _ = hook.release.send(());
+        next.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["next"]);
+        let SessionStart::Queued { task, .. } = &mut parking else {
+            unreachable!()
+        };
+        assert!(task.await.unwrap(), "the hook ran");
+    }
+
+    /// A hook not called yet leaves the line when its session ends: it is
+    /// never called, and the gate passes on.
+    #[tokio::test]
+    async fn a_hook_not_yet_called_leaves_the_line_when_its_session_ends() {
+        let gate = Arc::new(SessionStartGate::new());
+        let held = gate.acquire(&StartTicket::new(false)).await;
+        let (ending, hook) = blocking_start(&gate);
+        until_queued(&gate, 1).await;
+
+        drop(ending);
+        drop(held);
+        let free = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.acquire(&StartTicket::new(false)),
+        )
+        .await;
+        assert!(free.is_ok(), "the gate is free again");
+        assert!(hook.called.await.is_err(), "the hook was never called");
     }
 
     #[tokio::test]
