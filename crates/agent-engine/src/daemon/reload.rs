@@ -483,11 +483,15 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
     // From this image's own record, not daemon.json (which can be lost while
     // the daemon runs). The record follows what is written, so a heal in the
     // hand-off window writes the same.
-    let mut info = state.daemon_info();
-    let prev_generation = info.generation;
-    info.generation = p.generation;
-    info.started_at = chrono::Utc::now();
-    info.exe = Some(p.exe.clone());
+    // `previous` stays untouched: a failed exec puts it back whole.
+    let previous = state.daemon_info();
+    let prev_generation = previous.generation;
+    let info = registry::DaemonInfo {
+        generation: p.generation,
+        started_at: chrono::Utc::now(),
+        exe: Some(p.exe.clone()),
+        ..previous.clone()
+    };
     state.set_daemon_info(info.clone());
     let _ = registry::write_daemon_json(paths, &info);
     let _ = tokio::time::timeout(
@@ -498,9 +502,10 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
 
     let err = exec_self(&p.exe, &p.rs_path, state);
     tracing::error!(error = %err, "daemon: reload exec failed; continuing on the old image");
-    info.generation = prev_generation;
-    state.set_daemon_info(info.clone());
-    let _ = registry::write_daemon_json(paths, &info);
+    // The record before this attempt, whole: exe and started_at too, so the
+    // next default reload uses the old exe, not the one that failed.
+    state.set_daemon_info(previous.clone());
+    let _ = registry::write_daemon_json(paths, &previous);
     let _ = std::fs::remove_file(&p.rs_path);
     state.reload_generation.store(prev_generation, Ordering::SeqCst);
     state.reset_announce();
