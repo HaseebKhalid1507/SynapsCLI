@@ -217,6 +217,7 @@ pub fn handle_engine_command(
         "trace" => return Some(trace_command(arg, runtime)),
         "budget" => return Some(budget_command(arg, runtime)),
         "workers" => return Some(workers_command(arg, runtime)),
+        "confirms" => return Some(confirms_command(arg, runtime)),
         "memory" => return Some(memory_command(arg, runtime)),
         _ => {}
     }
@@ -314,6 +315,43 @@ pub fn context_command(
         runtime.context_report(history).render(),
         runtime.context_management_status()
     ))
+}
+
+/// `/confirms [status] | reset` — inspect or revoke the session's extension
+/// "Allow all" latch (#148 I2b). Reset clears the shared set, so running
+/// subagents stop auto-approving immediately too.
+pub fn confirms_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
+    const USAGE: &str = "usage: /confirms [status] | /confirms reset";
+    let latch = runtime.session_allow_all();
+    match arg.trim() {
+        "" | "status" => {
+            let ids = latch.extensions();
+            if ids.is_empty() {
+                CommandResult::Output(
+                    "No extension has \"Allow all\" this session; every extension confirm prompts."
+                        .to_string(),
+                )
+            } else {
+                CommandResult::Output(format!(
+                    "\"Allow all\" is armed for: {}. Their tool-call confirms are auto-approved \
+                     (subagents included). /confirms reset revokes.",
+                    ids.join(", ")
+                ))
+            }
+        }
+        "reset" => {
+            let revoked = latch.clear();
+            if revoked.is_empty() {
+                CommandResult::Output("Nothing to revoke: no extension had \"Allow all\".".to_string())
+            } else {
+                CommandResult::Output(format!(
+                    "Revoked \"Allow all\" for: {}. Their confirms prompt again (subagents included).",
+                    revoked.join(", ")
+                ))
+            }
+        }
+        _ => CommandResult::Error(USAGE.to_string()),
+    }
 }
 
 /// `/workers [status] | cancel <sa_N|all> | reconcile <sa_N|all>` — the
@@ -1267,6 +1305,34 @@ mod tests {
             Some(CommandResult::Output(text)) | Some(CommandResult::Error(text)) => text,
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// #148 I2b: `/confirms` shows which extensions are latched and
+    /// `/confirms reset` revokes them — for workers sharing the set too.
+    #[test]
+    fn confirms_lists_and_reset_revokes_the_allow_all_latch() {
+        let mut runtime = crate::Runtime::new_headless();
+        let worker = runtime.clone();
+        let text = command_text(handle_engine_command("confirms", "", &mut runtime));
+        assert!(text.contains("No extension"), "{text}");
+
+        worker
+            .session_allow_all()
+            .allow(&["jev".to_string(), "audit".to_string()]);
+        let text = command_text(handle_engine_command("confirms", "status", &mut runtime));
+        assert!(text.contains("jev") && text.contains("audit"), "{text}");
+
+        let text = command_text(handle_engine_command("confirms", "reset", &mut runtime));
+        assert!(text.contains("Revoked") && text.contains("jev"), "{text}");
+        assert!(worker.session_allow_all().is_empty(), "shared with workers");
+        let text = command_text(handle_engine_command("confirms", "reset", &mut runtime));
+        assert!(text.contains("Nothing to revoke"), "{text}");
+
+        assert!(matches!(
+            handle_engine_command("confirms", "explode", &mut runtime),
+            Some(CommandResult::Error(e)) if e.contains("usage: /confirms")
+        ));
+        assert!(crate::skills::BUILTIN_COMMANDS.contains(&"confirms"));
     }
 
     #[test]

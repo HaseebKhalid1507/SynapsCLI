@@ -2055,6 +2055,7 @@ fn scenario_confirm_tool_call_offers_allow_all_button() {
     );
     assert!(flat.contains("subagents included"), "scope covers subagents:\n{frame}");
     assert!(flat.contains("Other extensions still ask"), "{frame}");
+    assert!(flat.contains("until /new or /confirms reset"), "revocation is stated:\n{frame}");
     assert!(frame.contains("y allow · a allow all · n/esc deny"), "footer:\n{frame}");
     assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
 }

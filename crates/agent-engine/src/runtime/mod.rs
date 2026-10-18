@@ -1692,10 +1692,12 @@ impl Runtime {
     }
 
     /// Start an explicitly new or resumed conversation with fresh Confirm consent.
-    /// Replace the Arc rather than clearing its flag: old stream/worker clones
-    /// must not be able to grant consent to the next conversation. Ordinary
-    /// turns and linked compaction successors must not call this method.
+    /// Revoke the old set first, so workers still running from the previous
+    /// conversation stop auto-approving, then replace the Arc so old
+    /// stream/worker clones cannot grant consent to the next conversation.
+    /// Ordinary turns and linked compaction successors must not call this.
     pub fn begin_conversation(&mut self, id: Option<String>) {
+        self.session_allow_all.clear();
         self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
         self.set_session_id(id);
     }
@@ -5511,6 +5513,12 @@ mod tests {
             runtime.session_allow_all(),
             old_worker.session_allow_all()
         ));
+        // #148 I2b: workers still running from the old conversation stop
+        // auto-approving — the old set is revoked before the swap.
+        assert!(
+            old_worker.session_allow_all().is_empty(),
+            "old latch must be cleared, not just replaced"
+        );
         // An old clone arming its latch cannot grant the new conversation.
         old_worker.session_allow_all().allow(&ext(&["jev"]));
         assert!(runtime.session_allow_all().is_empty());

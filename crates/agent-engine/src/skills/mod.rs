@@ -228,6 +228,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "context",
     "budget",
     "workers",
+    "confirms",
     "keepwarm",
     "trace",
     "memory",
