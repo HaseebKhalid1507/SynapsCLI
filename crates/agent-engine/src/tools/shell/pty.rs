@@ -791,11 +791,12 @@ mod tests {
             .expect("spawn");
         handle.watch_child(Some(&sink), "shell_t");
         assert!(matches!(rx.try_recv(), Ok(ChildProcessEvent::Spawned(_))));
-        handle.write(b"trap '' HUP; echo trap-is-set\n").unwrap();
+        // The typed line can be echoed twice (the terminal, then readline)
+        // before bash runs it, so wait for text only the output contains.
+        handle.write(b"trap '' HUP; echo trap'-is-'set\n").unwrap();
         let mut seen = String::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        // The echoed command line, then the output line.
-        while seen.matches("trap-is-set").count() < 2 {
+        while !seen.contains("trap-is-set") {
             assert!(std::time::Instant::now() < deadline, "no prompt: {seen:?}");
             seen.push_str(&String::from_utf8_lossy(&handle.try_read_output(Duration::from_millis(100)).await));
         }
