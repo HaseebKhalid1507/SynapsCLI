@@ -42,6 +42,8 @@ pub use watcher_types::{
     WatcherCommand, WatcherResponse,
 };
 
+pub mod watcher_session;
+
 // Re-export for convenience
 pub use serde_json::Value;
 pub use tokio_util::sync::CancellationToken;

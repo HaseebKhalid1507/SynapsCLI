@@ -3,6 +3,11 @@ use crate::watcher_types::HandoffState;
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 
+/// Start of a successful `watcher_exit` result: the handoff was written
+/// (atomically) before this text was returned. The watcher agent treats
+/// only such a result as a clean exit.
+pub const WATCHER_EXIT_ACK: &str = "Shutdown acknowledged. Handoff saved.";
+
 pub struct WatcherExitTool;
 
 #[async_trait::async_trait]
@@ -100,9 +105,6 @@ impl Tool for WatcherExitTool {
                 .map_err(|e| RuntimeError::Tool(format!("Failed to rename handoff file: {}", e)))?;
         }
 
-        Ok(format!(
-            "Shutdown acknowledged. Handoff saved. Reason: {}",
-            reason
-        ))
+        Ok(format!("{WATCHER_EXIT_ACK} Reason: {reason}"))
     }
 }

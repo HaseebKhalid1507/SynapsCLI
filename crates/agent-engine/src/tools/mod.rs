@@ -78,7 +78,7 @@ pub use subagent::{
     SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
     SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
-pub use watcher_exit::WatcherExitTool;
+pub use watcher_exit::{WatcherExitTool, WATCHER_EXIT_ACK};
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
