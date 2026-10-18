@@ -406,22 +406,40 @@ fn handle_key(
         {
             return InputAction::None;
         }
+        // Shift/Alt-Enter in a worker view only ever add a line: while main
+        // streams, the arms below would send the text to MAIN (04-tui I1).
+        (KeyCode::Enter, m) if watching && m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            app.editor.insert_newline();
+            return InputAction::None;
+        }
         // Enter with text in a worker view steers that worker; slash
         // commands still run as usual.
-        (KeyCode::Enter, m)
-            if watching
-                && !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                && !app.input_is_empty()
-                && !app.input_first_line().starts_with('/') =>
+        (KeyCode::Enter, _)
+            if watching && !app.input_is_empty() && !app.input_first_line().starts_with('/') =>
         {
             match super::watch::steer_target(app) {
                 Some(Ok(handle_id)) => return process_subagent_steer(app, handle_id),
-                Some(Err(reason)) => {
-                    super::watch::steer_unavailable(app, reason);
-                    return InputAction::None;
-                }
-                None => {}
+                Some(Err(reason)) => super::watch::steer_unavailable(app, reason),
+                None => super::watch::steer_unavailable(app, "this view has no subagent to steer".into()),
             }
+            return InputAction::None;
+        }
+        // While main streams, an unknown `/word` would be sent to main as a
+        // steer. In a worker view it is refused there instead.
+        (KeyCode::Enter, _) if watching && streaming && !slash_is_known(app, registry) => {
+            let word = app.input_first_line().split_whitespace().next().unwrap_or("/").to_string();
+            super::watch::notice(app, format!("unknown command: {word}"));
+            return InputAction::None;
+        }
+        // Staged attachments are main's; an empty Enter here never sends them.
+        (KeyCode::Enter, _) if watching && app.input_is_empty() => {
+            if !app.pending_attachments.is_empty() {
+                super::watch::notice(
+                    app,
+                    "attachments go to the main thread \u{2014} Esc, then Enter sends them".into(),
+                );
+            }
+            return InputAction::None;
         }
         _ => {}
     }
@@ -534,6 +552,24 @@ fn handle_key(
         }
     }
     InputAction::None
+}
+
+/// Whether the input is a `/command` the streaming dispatch would run or
+/// refuse, rather than send to the main agent as a steer (the same
+/// resolution as `dispatch`'s `StreamingInput` arm). Non-slash input: true.
+fn slash_is_known(app: &App, registry: &Arc<CommandRegistry>) -> bool {
+    let line = app.input_first_line();
+    let Some(rest) = line.strip_prefix('/') else {
+        return true;
+    };
+    let raw = rest.split_whitespace().next().unwrap_or("");
+    let streaming = super::commands::to_owned_commands(super::commands::STREAMING_COMMANDS);
+    if super::commands::is_streaming_command(&super::commands::resolve_prefix(raw, &streaming)) {
+        return true;
+    }
+    let all = super::commands::all_commands_with_skills(registry);
+    let resolved = super::commands::resolve_prefix(raw, &all);
+    all.contains(&resolved)
 }
 
 /// User pressed Enter with non-empty input while not streaming.
@@ -1324,6 +1360,26 @@ mod tests {
     }
 
     /// Shift-Enter inserts a newline into the buffer instead of submitting.
+    /// 04-tui I1: in a worker view, Enter on an empty box with staged
+    /// attachments fell through to the attachment-only submit, to MAIN.
+    #[test]
+    fn enter_with_only_attachments_in_a_worker_view_sends_nothing_to_main() {
+        let mut app = make_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "hi").unwrap();
+        let file = agent_engine::attachments::load_attachment_sync(&path).unwrap();
+        app.pending_attachments.add(file).unwrap();
+        let clock = app.clock.clone();
+        app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        app.threads.focus_worker("sa_1");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        assert_eq!(app.pending_attachments.len(), 1, "still staged for main");
+    }
+
     #[test]
     fn shift_enter_inserts_newline() {
         let mut app = make_app();

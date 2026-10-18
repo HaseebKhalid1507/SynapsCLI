@@ -290,3 +290,55 @@ fn clicking_a_tray_row_opens_that_workers_view() {
     let header = h.snapshot().lines().next().unwrap().to_string();
     assert!(header.contains("scout"), "{header}");
 }
+
+/// 04-tui I1: with the main turn streaming, Shift/Alt+Enter in a worker view
+/// used to fall through to the main thread's streaming submit and steer the
+/// MAIN agent. In a worker view they only ever add a line; nothing goes to
+/// main.
+#[test]
+fn shift_or_alt_enter_in_a_worker_view_never_steers_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 8, "scout");
+    h.set_streaming(true);
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_8", "scout", "running", vec![], 0));
+
+    h.type_str("check the tests first");
+    h.key(KeyCode::Enter, KeyModifiers::ALT);
+    h.type_str("then the docs");
+    h.key(KeyCode::Enter, KeyModifiers::SHIFT);
+    assert!(h.take_actions().is_empty(), "nothing is sent anywhere");
+    assert_eq!(
+        h.input_contents(),
+        "check the tests first\nthen the docs\n",
+        "both add a line"
+    );
+
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    let actions = h.take_actions();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert!(
+        actions[0].starts_with("subagent-steer:sa_8:check the tests first"),
+        "Enter steers the worker: {actions:?}"
+    );
+}
+
+/// 04-tui I1: an unknown `/word` typed in a worker view while main streams
+/// used to reach the main thread's streaming path, which steers main with
+/// it. It is refused in the worker view instead and the text stays.
+#[test]
+fn an_unknown_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 9, "scout");
+    h.set_streaming(true);
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_9", "scout", "running", vec![], 0));
+
+    h.type_str("/zzz-not-a-command please");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.take_actions().is_empty(), "nothing is sent");
+    assert_eq!(h.input_contents(), "/zzz-not-a-command please");
+    let worker = h.worker_transcript_text("sa_9");
+    assert!(worker.contains("unknown command: /zzz-not-a-command"), "{worker}");
+    assert!(!h.main_transcript_text().contains("zzz"));
+}
