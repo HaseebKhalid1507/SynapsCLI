@@ -284,6 +284,15 @@ pub enum RefreshFailureKind {
     ActionRequired,
 }
 
+impl RefreshFailureKind {
+    /// Retrying later can succeed without the user doing anything: a
+    /// transient provider/network failure, a busy refresh lock, or a local
+    /// failure. The single definition the broker and the runtime share.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::LockBusy | Self::Other)
+    }
+}
+
 /// A refresh failure: its kind plus a log-safe message (our own texts, or
 /// provider errors that went through the provider's sanitizer). Never
 /// carries token material.

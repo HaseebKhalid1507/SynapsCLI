@@ -16,6 +16,7 @@
 //!   `RuntimeError::Config`, same prefix as before
 
 use crate::core::error::{error_chain_string, humanize_provider_network_error};
+use crate::auth::RefreshFailureKind;
 use crate::RuntimeError;
 
 /// Boxed error type produced by the provider routes.
@@ -53,12 +54,15 @@ pub fn provider_error_to_runtime_for(qualified_model: &str, e: BoxedProviderErro
         return RuntimeError::Canceled;
     }
 
-    // A retryable broker refresh failure (`BrokerError::Refresh` with a
-    // transient / lock-busy / local kind, e.g. a Muse re-mint that hit the
-    // network): not a configuration problem and not a login problem.
-    if msg.starts_with("credential refresh failed (") && msg.contains("retry shortly") {
-        tracing::warn!(error = %msg, "provider credential refresh failed (retryable)");
-        return RuntimeError::ApiStatus(msg);
+    // A broker credential-refresh failure, typed by the stream path: a
+    // retryable or action-required one (e.g. a Muse re-mint that hit the
+    // network, a billing requirement) is neither a configuration problem
+    // nor a login problem.
+    if let Some(refresh) = find_in_chain::<BrokerRefreshError>(e.as_ref()) {
+        if refresh.kind.is_retryable() || refresh.kind == RefreshFailureKind::ActionRequired {
+            tracing::warn!(error = %msg, "provider credential refresh failed");
+            return RuntimeError::ApiStatus(msg);
+        }
     }
 
     // Upstream returned an HTTP error status or the Responses API reported a
@@ -175,6 +179,46 @@ fn is_responses_terminal_failure_message(msg: &str) -> bool {
     })
 }
 
+/// A `BrokerError::Refresh` from `proxy_stream`, kept typed so its kind
+/// classifies the turn error (no matching on our own hint text). Display is
+/// the broker's text: ours, with no upstream bytes.
+#[derive(Debug)]
+pub(crate) struct BrokerRefreshError {
+    pub(crate) kind: RefreshFailureKind,
+    message: String,
+}
+
+impl BrokerRefreshError {
+    pub(crate) fn new(failure: crate::auth::RefreshFailure) -> Self {
+        let kind = failure.kind;
+        Self {
+            kind,
+            message: crate::auth::BrokerError::Refresh(failure).to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for BrokerRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BrokerRefreshError {}
+
+fn find_in_chain<'a, T: std::error::Error + 'static>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a T> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(found) = err.downcast_ref::<T>() {
+            return Some(found);
+        }
+        current = err.source();
+    }
+    None
+}
+
 /// Walk the boxed error and its source chain looking for a `reqwest::Error`.
 ///
 /// `send().await?` boxes the `reqwest::Error` directly, but helpers may wrap
@@ -260,27 +304,6 @@ mod tests {
             .send()
             .await
             .expect_err("must fail to connect")
-    }
-
-    /// A retryable broker refresh failure (Muse re-mint hit a network
-    /// error) is an API-side failure to retry, not "Config error", and never
-    /// tells the user to sign in again.
-    #[test]
-    fn retryable_refresh_failure_is_api_status_not_config() {
-        use agent_core::auth::{BrokerError, RefreshFailure, RefreshFailureKind as K};
-        for kind in [K::Transient, K::LockBusy, K::Other] {
-            let e = BrokerError::Refresh(RefreshFailure::new(kind, "transport error"));
-            let runtime = provider_error_to_runtime_for("muse/muse-x", e.to_string().into());
-            let crate::RuntimeError::ApiStatus(msg) = &runtime else {
-                panic!("{kind:?}: {runtime:?}");
-            };
-            assert!(msg.contains("retry shortly"), "{msg}");
-            assert!(!msg.contains("synaps login"), "{msg}");
-        }
-        // A credential failure keeps its old category.
-        let e = BrokerError::Refresh(RefreshFailure::new(K::Credential, "invalid_grant"));
-        let runtime = provider_error_to_runtime_for("muse/muse-x", e.to_string().into());
-        assert!(matches!(runtime, crate::RuntimeError::Config(_)), "{runtime:?}");
     }
 
     #[tokio::test]

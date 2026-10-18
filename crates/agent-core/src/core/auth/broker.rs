@@ -2468,13 +2468,8 @@ impl LocalBroker {
                     // the refresh error, not the upstream 401 (which the
                     // runtime shows as "sign in again").
                     Err(BrokerError::Refresh(f))
-                        if matches!(
-                            f.kind,
-                            super::token::RefreshFailureKind::Transient
-                                | super::token::RefreshFailureKind::LockBusy
-                                | super::token::RefreshFailureKind::Other
-                                | super::token::RefreshFailureKind::ActionRequired
-                        ) =>
+                        if f.kind.is_retryable()
+                            || f.kind == super::token::RefreshFailureKind::ActionRequired =>
                     {
                         tracing::warn!(
                             credential = %rejected.credential,
