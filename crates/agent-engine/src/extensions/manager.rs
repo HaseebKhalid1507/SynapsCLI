@@ -132,7 +132,7 @@ pub struct ExtensionStatus {
 ///    be run. The hint points the user at the exact command. This is
 ///    the common case for fresh marketplace installs of plugins that
 ///    build their extension binary from source.
-/// 2. **Anything else** — the generic "run plugin validate" hint.
+/// 2. **Anything else** — a generic hint pointing at the manifest contract.
 ///
 /// Pure function for unit-testability. Lives here (not in
 /// `ExtensionLoadFailure`) because the sidecar/setup convention is a
@@ -153,7 +153,7 @@ pub fn compute_extension_load_hint(
             sanitize_hint_fragment(&plugin_dir.display().to_string()),
             sanitize_hint_fragment(setup),
         ),
-        _ => "Run `plugin validate <plugin-dir>` and confirm the extension command is installed"
+        _ => "Check the `extension` block in .synaps-plugin/plugin.json against docs/extensions/contract.json and confirm the extension command is installed"
             .to_string(),
     }
 }
@@ -1919,7 +1919,7 @@ impl ExtensionManager {
                         plugin_name,
                         Some(manifest_path),
                         reason,
-                        "Check manifest file permissions, then run `plugin validate <plugin-dir>`",
+                        "Check manifest file permissions",
                     ));
                     continue;
                 }
@@ -1934,7 +1934,7 @@ impl ExtensionManager {
                         plugin_name,
                         Some(manifest_path),
                         reason,
-                        "Fix JSON syntax, then run `plugin validate <plugin-dir>`",
+                        "Fix the JSON syntax in .synaps-plugin/plugin.json",
                     ));
                     continue;
                 }
@@ -1954,7 +1954,7 @@ impl ExtensionManager {
                         plugin_name,
                         Some(manifest_path),
                         reason,
-                        "Check the `extension` block shape against docs/extensions/contract.json, then run `plugin validate <plugin-dir>`",
+                        "Check the `extension` block shape against docs/extensions/contract.json",
                     ));
                     continue;
                 }
@@ -2742,7 +2742,7 @@ mod tests {
             None,
         );
         assert!(
-            hint.contains("plugin validate"),
+            hint.contains("contract.json"),
             "no setup declared → generic hint: {hint}"
         );
         assert!(
@@ -2761,7 +2761,7 @@ mod tests {
         // Setup script is declared, but the error is *not* a missing
         // binary — running the script wouldn't help. Fall back to the
         // generic hint so we don't mislead the user.
-        assert!(hint.contains("plugin validate"), "got {hint}");
+        assert!(hint.contains("contract.json"), "got {hint}");
         assert!(!hint.contains("Extension binary missing"), "got {hint}");
     }
 
@@ -2785,7 +2785,7 @@ mod tests {
             None,
         );
         assert!(hint.contains("Expected: integrated Axel"));
-        assert!(!hint.contains("plugin validate"));
+        assert!(!hint.contains("contract.json"));
     }
 
     // ── bugfix: installed-plugin backup discovery ───────────────────────────

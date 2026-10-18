@@ -1537,7 +1537,7 @@ async fn discovery_failures_include_plugin_manifest_path_reason_and_hint() {
         failure.reason.contains("Invalid plugin manifest JSON"),
         "{failure:?}"
     );
-    assert!(failure.hint.contains("plugin validate"), "{failure:?}");
+    assert!(failure.hint.contains("plugin.json"), "{failure:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]
