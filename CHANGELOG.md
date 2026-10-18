@@ -49,8 +49,13 @@ All notable changes to this project will be documented in this file.
   narrowed to what the session (and today's cap) has left, so it stops at a
   round boundary with a valid history: calls past the tool-call limit get a
   "not executed" result while the in-budget calls of the same batch run,
-  and refused calls are not counted. The agent then asks for its handoff
-  as before.
+  and refused calls are not counted. A turn stuck in one long tool round
+  (a slow command, a `timeout: 0` subagent) is cancelled 5 s after the
+  session time limit. The agent then asks for its handoff as before.
+- **A turn stopped by its cost or token budget keeps the response it paid
+  for.** The stopped round's text and tool calls stay in history (the calls
+  are not run and get a "not executed" result), so the next turn, such as
+  the watcher's handoff turn, sees it. They used to be discarded.
 - **Watcher cost accounting includes prompt-cache tokens.** Session and
   daily cost used to count only uncached input and output tokens at
   hard-coded rates; cache reads and writes, most of a long watcher
@@ -74,11 +79,22 @@ All notable changes to this project will be documented in this file.
 
 ### Upgrade notes
 
-- **`synaps-engine` crate users:** `TurnBudget::max_provider_rounds`,
-  `max_tool_calls` and `max_accumulated_tool_result_bytes` are now `Option`s
-  (`None` = no limit). `TurnBudgetOverrides` uses `Option<TurnLimit<_>>`
-  for the same three fields (`TurnLimit::Max(n)` or `TurnLimit::Unlimited`).
-  To keep the old foreground bounds, set them in `config.toml`.
+- **`synaps-engine` / `synaps-core` crate users:** these changes break full
+  struct literals and exhaustive matches.
+  - `TurnBudget::max_provider_rounds`, `max_tool_calls` and
+    `max_accumulated_tool_result_bytes` are now `Option`s (`None` = no
+    limit). To keep the old foreground bounds, set them in `config.toml`.
+  - New field `TurnBudget::max_total_tokens: Option<u64>`.
+  - New variants `TurnRole::Event` and `BudgetDimension::TotalTokens`
+    (wire label `total_tokens`).
+  - `TurnBudgetOverrides` uses `Option<TurnLimit<_>>` for the three count
+    fields (`TurnLimit::Max(n)`, `TurnLimit::Unlimited`); `Max(0)` means
+    none allowed.
+  - New field `TurnBudgetsConfig::event`.
+  - New: `TurnBudget::tighter`, `TurnBudget::for_event_turn`,
+    `runtime::budget::{TOOL_CALL_NOT_EXECUTED, TOOL_CALL_BUDGET_REFUSAL}`,
+    `tools::WATCHER_EXIT_ACK`, `EngineHost::report_config_warnings`, and the
+    `synaps_cli::watcher_session` module.
 
 ## [0.10.2] — 2026-10-12
 
