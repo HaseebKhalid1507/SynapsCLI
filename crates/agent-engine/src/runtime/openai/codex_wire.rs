@@ -34,8 +34,6 @@ const EXPLAIN_MODEL_NOT_FOUND: &str =
     "the backend doesn't know this model for this account; pick another with /model.";
 const EXPLAIN_REASONING: &str =
     "this model rejected the requested reasoning setting; pick another level with /effort.";
-const EXPLAIN_TOOLS_WEB_SEARCH: &str = "the model rejected a request tool; hosted web_search \
-     (SYNAPS_CODEX_WEB_SEARCH) was attached and is the likely cause.";
 const EXPLAIN_TOOLS: &str =
     "the backend rejected a request tool definition for this model; try another model with /model.";
 const EXPLAIN_PARAMETER: &str =
@@ -70,27 +68,51 @@ impl CodexHttpErrorDetail {
         }
     }
 
-    /// The backend rejected a request tool: a `tools` param, or a code that
-    /// names a tool rejection.
-    pub(crate) fn rejects_hosted_tool(&self) -> bool {
+    fn tool_code(&self) -> bool {
+        matches!(
+            self.code.as_deref(),
+            Some(
+                "unsupported_tool"
+                    | "tool_not_supported"
+                    | "unsupported_tool_type"
+                    | "invalid_tool_type"
+            )
+        )
+    }
+
+    /// The backend rejected some request tool: any `tools` param, or a code
+    /// naming a tool rejection.
+    pub(crate) fn rejects_tool(&self) -> bool {
         let param = self.param.as_deref().unwrap_or("");
         param == "tools"
             || param.starts_with("tools[")
             || param.starts_with("tools.")
-            || matches!(
-                self.code.as_deref(),
-                Some(
-                    "unsupported_tool"
-                        | "tool_not_supported"
-                        | "unsupported_tool_type"
-                        | "invalid_tool_type"
-                )
-            )
+            || self.tool_code()
+    }
+
+    /// The rejection points at the tool at `tools[index]`: that index (with
+    /// or without a sub-path), a bare `tools` param, or a tool-rejection
+    /// code. A different index is a user/MCP tool, not this one.
+    pub(crate) fn rejects_tool_at(&self, index: usize) -> bool {
+        let at = format!("tools[{index}]");
+        match self.param.as_deref() {
+            Some("tools") => true,
+            Some(p)
+                if p == at
+                    || p.starts_with(&format!("{at}."))
+                    || p.starts_with(&format!("{at}[")) =>
+            {
+                true
+            }
+            Some(p) if p.starts_with("tools") => false,
+            _ => self.tool_code(),
+        }
     }
 
     /// Synaps-authored explanation for a known (type, code, param) shape.
-    /// web_search is blamed for a tool rejection only when it was attached.
-    pub(crate) fn explanation(&self, web_search_attached: bool) -> Option<&'static str> {
+    /// A tool rejection never blames web_search: one that points at it is
+    /// resent without it, so only other tools' rejections surface.
+    pub(crate) fn explanation(&self) -> Option<&'static str> {
         let code = self.code.as_deref();
         let param = self.param.as_deref().unwrap_or("");
         if self.account_entitlement {
@@ -102,12 +124,8 @@ impl CodexHttpErrorDetail {
         if param == "reasoning" || param.starts_with("reasoning.") {
             return Some(EXPLAIN_REASONING);
         }
-        if self.rejects_hosted_tool() {
-            return Some(if web_search_attached {
-                EXPLAIN_TOOLS_WEB_SEARCH
-            } else {
-                EXPLAIN_TOOLS
-            });
+        if self.rejects_tool() {
+            return Some(EXPLAIN_TOOLS);
         }
         match code {
             Some("unsupported_parameter" | "unknown_parameter") => Some(EXPLAIN_PARAMETER),
@@ -132,12 +150,7 @@ impl CodexHttpErrorDetail {
     /// User-visible error: keeps the `codex request failed: <status>` prefix
     /// (net.rs / session_driver classify on it), then identifiers, then our
     /// static explanation. Safe to log and to hand to a parent model.
-    pub(crate) fn user_message(
-        &self,
-        label: &str,
-        status: reqwest::StatusCode,
-        web_search_attached: bool,
-    ) -> String {
+    pub(crate) fn user_message(&self, label: &str, status: reqwest::StatusCode) -> String {
         let mut out = format!("{label} request failed: {status}");
         let ids: Vec<&str> = [&self.kind, &self.code]
             .into_iter()
@@ -156,7 +169,7 @@ impl CodexHttpErrorDetail {
             }
             out.push(']');
         }
-        if let Some(explanation) = self.explanation(web_search_attached) {
+        if let Some(explanation) = self.explanation() {
             out.push_str(" — ");
             out.push_str(explanation);
         }
@@ -264,13 +277,13 @@ pub(crate) fn codex_web_search_unsupported_reason(model_id: &str) -> Option<&'st
         .then_some("the backend rejected hosted web_search for this model earlier in this process")
 }
 
-/// Typed terminal Codex 4xx: the identifiers-only message, plus whether the
-/// backend rejected a request tool (so the caller can drop hosted
-/// web_search and retry once).
+/// Typed terminal Codex 4xx: the identifiers-only message plus the
+/// classified detail (so the caller can tell whether hosted web_search was
+/// the rejected tool).
 #[derive(Debug)]
 pub(crate) struct CodexRequestRejected {
     pub message: String,
-    pub hosted_tool_rejected: bool,
+    pub detail: CodexHttpErrorDetail,
 }
 
 impl std::fmt::Display for CodexRequestRejected {
@@ -281,34 +294,42 @@ impl std::fmt::Display for CodexRequestRejected {
 
 impl std::error::Error for CodexRequestRejected {}
 
-/// After a send failed: if hosted web_search was attached and the backend
-/// rejected a request tool, remember that for this model, show a one-time
-/// notice, clear `attached` and return `Ok(())` so the caller resends once
-/// without it. A second rejection finds `attached == false` and is returned
-/// as the error, so the retry cannot loop.
+/// After a send failed: if hosted web_search is attached (at `tools[i]`,
+/// `*web_search_index == Some(i)`) and the 400 points at it, clear the index
+/// and return `Ok(())` so the caller resends once without it. Nothing is
+/// learned yet: the caller calls [`confirm_web_search_rejected`] only if the
+/// resend succeeds. A second rejection finds no index and is returned as the
+/// error, so the resend cannot loop. Other errors pass through unchanged.
 pub(crate) fn hosted_search_retry(
     error: Box<dyn std::error::Error + Send + Sync>,
-    attached: &mut bool,
+    web_search_index: &mut Option<usize>,
     model_id: &str,
-    tx: &mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let rejected = error
+    let Some(index) = *web_search_index else {
+        return Err(error);
+    };
+    let points_at_web_search = error
         .downcast_ref::<CodexRequestRejected>()
-        .is_some_and(|e| e.hosted_tool_rejected);
-    if !*attached || !rejected {
+        .is_some_and(|e| e.detail.rejects_tool_at(index));
+    if !points_at_web_search {
         return Err(error);
     }
-    *attached = false;
+    *web_search_index = None;
     tracing::warn!(
         model = model_id,
-        "codex rejected hosted web_search; retrying once without it"
+        "codex 400 points at hosted web_search; resending once without it"
     );
+    Ok(())
+}
+
+/// The resend without web_search succeeded, so web_search caused the 400:
+/// remember it for this model (process-wide) and say so once.
+pub(crate) fn confirm_web_search_rejected(model_id: &str, tx: &mpsc::UnboundedSender<StreamEvent>) {
     if record_web_search_rejected(model_id) {
         let _ = tx.send(StreamEvent::Session(crate::SessionEvent::Notice(format!(
-            "🔎 Codex web_search was rejected by {model_id}; continuing without it."
+            "🔎 Codex{CALL_MARK}rejected by {model_id}): continuing without it."
         ))));
     }
-    Ok(())
 }
 
 /// Drop the hosted web_search entry from a built Codex request body.
@@ -613,7 +634,7 @@ mod tests {
             "http_400:invalid_request_error:unsupported_value"
         );
         assert_eq!(
-            d.user_message("codex", bad_request(), false),
+            d.user_message("codex", bad_request()),
             format!(
                 "codex request failed: 400 Bad Request \
                  [invalid_request_error/unsupported_value, param reasoning.effort] — {EXPLAIN_REASONING}"
@@ -628,7 +649,7 @@ mod tests {
         );
         assert!(d.account_entitlement);
         assert_eq!(d.trace_code(400), "http_400");
-        let msg = d.user_message("codex", bad_request(), false);
+        let msg = d.user_message("codex", bad_request());
         assert_eq!(
             msg,
             format!("codex request failed: 400 Bad Request — {EXPLAIN_ENTITLEMENT}")
@@ -643,7 +664,7 @@ mod tests {
         );
         assert_eq!(d.trace_code(400), "http_400:invalid_request_error");
         assert_eq!(
-            d.user_message("codex", bad_request(), false),
+            d.user_message("codex", bad_request()),
             format!(
                 "codex request failed: 400 Bad Request [invalid_request_error, param tools] — {EXPLAIN_TOOLS}"
             )
@@ -655,7 +676,7 @@ mod tests {
         let d = detail(
             r#"{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model.","type":"invalid_request_error","param":"temperature","code":"unsupported_parameter"}}"#,
         );
-        let msg = d.user_message("codex", bad_request(), false);
+        let msg = d.user_message("codex", bad_request());
         assert!(msg.ends_with(EXPLAIN_PARAMETER), "{msg}");
         assert!(!msg.contains("not supported with this model"), "{msg}");
     }
@@ -666,7 +687,7 @@ mod tests {
             r#"{"error":{"message":"Something novel happened to your request.","type":"invalid_request_error","code":"brand_new_code"}}"#,
         );
         assert_eq!(
-            d.user_message("codex", bad_request(), false),
+            d.user_message("codex", bad_request()),
             "codex request failed: 400 Bad Request [invalid_request_error/brand_new_code]"
         );
     }
@@ -682,7 +703,7 @@ mod tests {
         let d = detail(&body);
         assert_eq!(d, CodexHttpErrorDetail::default());
         assert_eq!(
-            d.user_message("codex", bad_request(), false),
+            d.user_message("codex", bad_request()),
             "codex request failed: 400 Bad Request"
         );
         let d = detail(r#"{"error":{"type":"sk-ABCDEF","code":"Bearer"}}"#);
@@ -700,7 +721,7 @@ mod tests {
             let d = detail(body);
             assert_eq!(d, CodexHttpErrorDetail::default());
             assert_eq!(
-                d.user_message("codex", bad_request(), false),
+                d.user_message("codex", bad_request()),
                 "codex request failed: 400 Bad Request"
             );
         }
@@ -777,50 +798,82 @@ mod tests {
     }
 
     #[test]
-    fn hosted_search_retry_happens_once_and_only_for_tool_rejections() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let rejected = || -> Box<dyn std::error::Error + Send + Sync> {
+    fn hosted_search_retry_happens_once_and_only_when_web_search_is_the_target() {
+        let rejected = |body: &str| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(CodexRequestRejected {
                 message: "codex request failed: 400 Bad Request".into(),
-                hosted_tool_rejected: true,
+                detail: detail(body),
             })
         };
-        let mut attached = true;
-        assert!(hosted_search_retry(rejected(), &mut attached, "gpt-zz-retry-1", &tx).is_ok());
-        assert!(!attached);
+        let bare = r#"{"error":{"param":"tools"}}"#;
+        // web_search is the last tool: tools[2] here.
+        let mut idx = Some(2);
+        assert!(hosted_search_retry(rejected(bare), &mut idx, "gpt-zz-retry-1").is_ok());
+        assert_eq!(idx, None);
         // Second rejection: nothing attached any more, so it is the error.
-        assert!(hosted_search_retry(rejected(), &mut attached, "gpt-zz-retry-1", &tx).is_err());
-        // Other errors, or nothing attached, never retry.
-        let mut attached = true;
+        assert!(hosted_search_retry(rejected(bare), &mut idx, "gpt-zz-retry-1").is_err());
+        // Pointing at web_search's index (with a sub-path) or a tool code: retry.
+        for body in [
+            r#"{"error":{"param":"tools[2]"}}"#,
+            r#"{"error":{"param":"tools[2].type"}}"#,
+            r#"{"error":{"code":"unsupported_tool"}}"#,
+        ] {
+            let mut idx = Some(2);
+            assert!(
+                hosted_search_retry(rejected(body), &mut idx, "m").is_ok(),
+                "{body}"
+            );
+        }
+        // A user/MCP tool at another index, other params, other errors: no retry.
+        for body in [
+            r#"{"error":{"param":"tools[0].parameters"}}"#,
+            r#"{"error":{"param":"tools[12]"}}"#,
+            r#"{"error":{"param":"reasoning.effort"}}"#,
+        ] {
+            let mut idx = Some(2);
+            assert!(
+                hosted_search_retry(rejected(body), &mut idx, "m").is_err(),
+                "{body}"
+            );
+            assert_eq!(idx, Some(2));
+        }
+        let mut idx = Some(2);
         let other: Box<dyn std::error::Error + Send + Sync> = "codex request failed: 401".into();
-        assert!(hosted_search_retry(other, &mut attached, "gpt-zz-retry-2", &tx).is_err());
-        let not_tools: Box<dyn std::error::Error + Send + Sync> = Box::new(CodexRequestRejected {
-            message: "x".into(),
-            hosted_tool_rejected: false,
-        });
-        assert!(hosted_search_retry(not_tools, &mut attached, "gpt-zz-retry-2", &tx).is_err());
-        assert!(attached);
+        assert!(hosted_search_retry(other, &mut idx, "m").is_err());
+        // Retrying records nothing; only confirmation does, once.
+        assert_eq!(codex_web_search_unsupported_reason("gpt-zz-retry-1"), None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        confirm_web_search_rejected("gpt-zz-retry-1", &tx);
+        confirm_web_search_rejected("gpt-zz-retry-1", &tx);
+        assert!(codex_web_search_unsupported_reason("gpt-zz-retry-1").is_some());
         assert_eq!(
             notices(&mut rx),
             vec![
-                "🔎 Codex web_search was rejected by gpt-zz-retry-1; continuing without it."
+                "🔎 Codex web_search (rejected by gpt-zz-retry-1): continuing without it."
                     .to_string()
             ]
         );
     }
 
     #[test]
-    fn tool_rejection_blames_web_search_only_when_attached() {
+    fn rejection_notice_is_forwarded_from_workers() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ev = StreamEvent::Session(crate::SessionEvent::Notice(
+            "🔎 Codex web_search (rejected by m): continuing without it.".into(),
+        ));
+        forward_worker_web_search("w", &ev, Some(&tx));
+        assert_eq!(notices(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn tool_rejection_never_blames_web_search() {
         let d = detail(r#"{"error":{"type":"invalid_request_error","param":"tools[2]"}}"#);
-        assert!(d.rejects_hosted_tool());
-        assert!(d
-            .user_message("codex", bad_request(), true)
-            .ends_with(EXPLAIN_TOOLS_WEB_SEARCH));
-        let generic = d.user_message("codex", bad_request(), false);
-        assert!(generic.ends_with(EXPLAIN_TOOLS), "{generic}");
-        assert!(!generic.contains("web_search"), "{generic}");
-        assert!(detail(r#"{"error":{"code":"unsupported_tool"}}"#).rejects_hosted_tool());
-        assert!(!detail(r#"{"error":{"param":"reasoning.effort"}}"#).rejects_hosted_tool());
+        assert!(d.rejects_tool());
+        let msg = d.user_message("codex", bad_request());
+        assert!(msg.ends_with(EXPLAIN_TOOLS), "{msg}");
+        assert!(!msg.contains("web_search"), "{msg}");
+        assert!(detail(r#"{"error":{"code":"unsupported_tool"}}"#).rejects_tool());
+        assert!(!detail(r#"{"error":{"param":"reasoning.effort"}}"#).rejects_tool());
         let mut body = json!({"tools":[{"type":"function","name":"bash"},{"type":"web_search"}]});
         strip_web_search_tool(&mut body);
         assert_eq!(body, json!({"tools":[{"type":"function","name":"bash"}]}));

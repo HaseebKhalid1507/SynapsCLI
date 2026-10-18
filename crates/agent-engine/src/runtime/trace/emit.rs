@@ -314,6 +314,16 @@ impl TraceContext {
         self
     }
 
+    /// The logical request just failed pre-inference and is being resent
+    /// with a different body (Codex dropping a rejected hosted tool). Let the
+    /// resend's `begin` through an armed one-shot gate so `/trace next` still
+    /// records it. No-op on ungated contexts.
+    pub fn reopen_one_shot_for_resend(&self) {
+        if let Some(gate) = &self.one_shot_gate {
+            gate.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// Pass (consume) the one-shot gate. `true` for ungated contexts and
     /// for the first caller on a gated context; `false` afterwards.
     fn pass_one_shot_gate(&self) -> bool {

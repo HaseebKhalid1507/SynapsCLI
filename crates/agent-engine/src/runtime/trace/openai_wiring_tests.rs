@@ -1239,6 +1239,19 @@ async fn drive_codex_model(
     Result<Value, Box<dyn std::error::Error + Send + Sync>>,
     Vec<StreamEvent>,
 ) {
+    drive_codex_model_tools(base_url, trace, model, level, &[]).await
+}
+
+async fn drive_codex_model_tools(
+    base_url: &str,
+    trace: &TraceContext,
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    tools: &[Value],
+) -> (
+    Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    Vec<StreamEvent>,
+) {
     let cfg = ProviderConfig {
         base_url: base_url.to_string(),
         model: model.to_string(),
@@ -1250,7 +1263,7 @@ async fn drive_codex_model(
         &cfg,
         &reqwest::Client::new(),
         &broker,
-        &[],
+        tools,
         &Some(format!("system {SENTINEL}")),
         &messages(),
         &tx,
@@ -1371,6 +1384,13 @@ const TOOLS_400: &str = r#"{"error":{"message":"Tool 'web_search' is not support
 /// hosted web_search tool (or to every body when `always_reject`), SSE
 /// success otherwise. Records every body.
 async fn spawn_web_search_rejecting_stub(always_reject: bool) -> (String, CapturedBodies) {
+    spawn_rejecting_stub_with(always_reject, TOOLS_400).await
+}
+
+async fn spawn_rejecting_stub_with(
+    always_reject: bool,
+    reject_body: &'static str,
+) -> (String, CapturedBodies) {
     let bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
     let bodies_c = Arc::clone(&bodies);
     let app = Router::new().route(
@@ -1384,7 +1404,7 @@ async fn spawn_web_search_rejecting_stub(always_reject: bool) -> (String, Captur
                     (
                         StatusCode::BAD_REQUEST,
                         [("content-type", "application/json")],
-                        TOOLS_400.to_string(),
+                        reject_body.to_string(),
                     )
                         .into_response()
                 } else {
@@ -1445,7 +1465,7 @@ async fn codex_tools_400_is_remembered_per_model_and_retried_once_without_search
     assert_eq!(
         notices
             .iter()
-            .filter(|n| n.contains("web_search was rejected by gpt-zz-ws-retry"))
+            .filter(|n| n.contains("web_search (rejected by gpt-zz-ws-retry)"))
             .count(),
         1,
         "{notices:?}"
@@ -1491,6 +1511,78 @@ async fn codex_tools_400_is_never_retried_twice() {
     );
     // web_search was not attached on the failing send, so it isn't blamed.
     assert!(!err.contains("web_search"), "{err}");
+    // The resend failed the same way: web_search wasn't the cause, so
+    // nothing is learned and nothing is announced.
+    assert_eq!(
+        crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason("gpt-zz-ws-loop"),
+        None
+    );
+    assert!(
+        notice_texts(&_events)
+            .iter()
+            .all(|n| !n.contains("rejected")),
+        "{:?}",
+        notice_texts(&_events)
+    );
+}
+
+#[tokio::test]
+async fn codex_bad_user_tool_schema_400_is_not_blamed_on_web_search() {
+    let _env = web_search_on();
+    const BAD_SCHEMA_400: &str = r#"{"error":{"message":"Invalid schema for function 'mcp_tool'.","type":"invalid_request_error","param":"tools[0].parameters","code":"invalid_function_parameters"}}"#;
+    let (upstream, bodies) = spawn_rejecting_stub_with(true, BAD_SCHEMA_400).await;
+    let h = harness();
+    let user_tool = json!({
+        "name": "mcp_tool",
+        "description": "an MCP tool",
+        "input_schema": {"type": "object", "properties": {}}
+    });
+    let (result, events) = drive_codex_model_tools(
+        &upstream,
+        &h.trace,
+        "gpt-zz-ws-badschema",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+        &[user_tool],
+    )
+    .await;
+    let err = result.expect_err("the schema 400 surfaces").to_string();
+    {
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 1, "no resend for a user-tool rejection");
+        assert!(
+            body_has_web_search(&sent[0]),
+            "web_search was attached at tools[1]"
+        );
+    }
+    assert!(err.contains("param tools[0].parameters"), "{err}");
+    assert_eq!(
+        crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason(
+            "gpt-zz-ws-badschema"
+        ),
+        None
+    );
+    assert!(notice_texts(&events)
+        .iter()
+        .all(|n| !n.contains("rejected")));
+}
+
+#[tokio::test]
+async fn codex_web_search_resend_is_traced_under_an_armed_one_shot_gate() {
+    let _env = web_search_on();
+    let (upstream, _bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let armed = h.trace.clone().with_one_shot_request_gate();
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &armed,
+        "gpt-zz-ws-oneshot",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await;
+    result.expect("resend succeeds");
+    let records = h.sink.records();
+    assert_schema_valid_and_content_free(&records);
+    assert_eq!(records.len(), 2, "rejected send and resend are both traced");
 }
 
 #[tokio::test]

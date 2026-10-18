@@ -221,11 +221,7 @@ async fn send_with_retries(
                         body = read_body_for_classification(resp, super::codex_wire::CODEX_ERROR_BODY_CAP) => body,
                     };
                     let detail = super::codex_wire::CodexHttpErrorDetail::from_body(&body);
-                    // `false`: a tool rejection while hosted web_search is
-                    // attached is retried once without it by the caller
-                    // (`codex_wire::hosted_search_retry`); only the retry's
-                    // result can surface, and that request has no web_search.
-                    let message = detail.user_message(label, status, false);
+                    let message = detail.user_message(label, status);
                     tracing::warn!(error = %message, "{label} request rejected (identifiers only)");
                     trace_attempt.finish_failed(
                         &detail.trace_code(status.as_u16()),
@@ -234,7 +230,7 @@ async fn send_with_retries(
                     );
                     return Err(Box::new(super::codex_wire::CodexRequestRejected {
                         message,
-                        hosted_tool_rejected: detail.rejects_hosted_tool(),
+                        detail,
                     }));
                 } else {
                     // Privacy (spec §5.1): the response body is provider-controlled
@@ -829,8 +825,11 @@ pub(crate) async fn call_codex_stream_with_router(
         codex_request_role,
         super::codex_wire::engine_env,
     );
-    // Cleared after one learned rejection, so the retry below can't loop.
-    let mut web_search_attached = web_search.is_some();
+    // web_search is always the last tool. Cleared on the one resend without
+    // it, so that resend can't loop; the rejection is learned only if the
+    // resend then succeeds (`web_search_pending`).
+    let mut web_search_index = web_search.as_ref().map(|_| tools.len());
+    let mut web_search_pending = false;
     tools.extend(web_search);
     // Codex already receives the effective system prompt in `instructions`.
     // Do not also prepend it to `input`: that doubles prompt tokens and repeats
@@ -936,7 +935,12 @@ pub(crate) async fn call_codex_stream_with_router(
         )
         .await;
         let resp = match sent {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                if std::mem::take(&mut web_search_pending) {
+                    super::codex_wire::confirm_web_search_rejected(&cfg.model, tx);
+                }
+                resp
+            }
             Err(error) => match error.downcast::<super::account_routing::CodexQuotaExhausted>() {
                 // A 429 that proved exhaustion arrives before any response
                 // body was streamed: nothing was produced on this attempt, so
@@ -978,16 +982,19 @@ pub(crate) async fn call_codex_stream_with_router(
                     }
                 }
                 Err(other) => {
-                    // Hosted web_search rejected (pre-inference 400): drop it,
-                    // re-serialize, and resend once under a fresh trace record.
+                    // A pre-inference 400 pointing at hosted web_search: drop
+                    // it, re-serialize, and resend once under a fresh trace
+                    // record (one-shot `/trace next` gates are reopened for
+                    // it; content capture is not redone).
                     super::codex_wire::hosted_search_retry(
                         other,
-                        &mut web_search_attached,
+                        &mut web_search_index,
                         &cfg.model,
-                        tx,
                     )?;
+                    web_search_pending = true;
                     super::codex_wire::strip_web_search_tool(&mut body);
                     body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+                    trace.reopen_one_shot_for_resend();
                     attempt = tr::StreamAttempt::new(
                         tr::begin_openai_tracer(
                             trace,
