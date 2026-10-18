@@ -180,6 +180,49 @@ pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_se
 /// (`can_park_ignoring_keepwarm`).
 pub const WORKER_PARK_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(any(test, feature = "testing"))]
+static WORKER_PARK_RECHECK_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// [`WORKER_PARK_RECHECK`], or the test override. Code-only, like
+/// `cache_keepwarm::interval_override`: no binary input can reach it.
+fn worker_park_recheck() -> std::time::Duration {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let ms = WORKER_PARK_RECHECK_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    WORKER_PARK_RECHECK
+}
+
+/// Test-only controls (`cfg(test)` / `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// Replaces the worker park re-check interval for every session in
+    /// this process while alive (tests that use it must be `#[serial]`).
+    #[must_use = "the override is cleared when the guard drops"]
+    pub struct WorkerParkRecheck(());
+
+    impl WorkerParkRecheck {
+        pub fn set(interval: Duration) -> Self {
+            let ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX).max(1);
+            super::WORKER_PARK_RECHECK_OVERRIDE_MS.store(ms, Ordering::Relaxed);
+            Self(())
+        }
+    }
+
+    impl Drop for WorkerParkRecheck {
+        fn drop(&mut self) {
+            super::WORKER_PARK_RECHECK_OVERRIDE_MS.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// `SYNAPS_DAEMON_PROMPT_ABANDON_SECS`: how long a pending host confirmation on
 /// a NON-driver session survives after the LAST client detaches before it is
 /// fail-closed answered `None` (deny) so `can_park()` can proceed. This bounds
@@ -1934,7 +1977,7 @@ impl SessionActor {
                 && park_grace().is_some();
             self.park_deadline = if workers_only {
                 self.park_deadline
-                    .or_else(|| Some(tokio::time::Instant::now() + WORKER_PARK_RECHECK))
+                    .or_else(|| Some(tokio::time::Instant::now() + worker_park_recheck()))
             } else {
                 None
             };
@@ -1942,9 +1985,11 @@ impl SessionActor {
         }
         match park_grace() {
             Some(grace) => {
-                if self.park_deadline.is_none() {
-                    self.park_deadline = Some(tokio::time::Instant::now() + grace);
-                }
+                // The earlier of a pending deadline and a fresh grace: a
+                // grace armed at detach keeps counting, while a far-off
+                // worker re-check gives way once the workers let go.
+                let due = tokio::time::Instant::now() + grace;
+                self.park_deadline = Some(self.park_deadline.map_or(due, |d| d.min(due)));
             }
             None => self.park_deadline = None,
         }
