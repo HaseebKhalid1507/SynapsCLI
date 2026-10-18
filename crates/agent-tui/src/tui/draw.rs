@@ -165,6 +165,50 @@ pub(crate) fn sidecar_pill_text(
     }
 }
 
+/// One sidecar pill as the header draws it (text from
+/// [`sidecar_pill_text`]; armed/active pills pulse in the streaming colour).
+pub(crate) fn sidecar_pill_span(
+    pill: &super::render_model::SidecarPillSnap,
+    spinner_frame: usize,
+) -> Span<'static> {
+    let label = pill.display_name.as_deref().unwrap_or("sidecar");
+    let text = sidecar_pill_text(label, &pill.status, pill.armed, spinner_frame);
+    let color = match &pill.status {
+        super::sidecar::SidecarUiStatus::Idle => {
+            if pill.armed {
+                let pulse =
+                    ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                let base = match THEME.load().status_streaming {
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    _ => (220, 80, 80),
+                };
+                Color::Rgb(
+                    (base.0 as f64 * pulse) as u8,
+                    (base.1 as f64 * pulse) as u8,
+                    (base.2 as f64 * pulse) as u8,
+                )
+            } else {
+                THEME.load().muted
+            }
+        }
+        super::sidecar::SidecarUiStatus::Active { .. } => {
+            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+            let base = match THEME.load().status_streaming {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => (220, 80, 80),
+            };
+            Color::Rgb(
+                (base.0 as f64 * pulse) as u8,
+                (base.1 as f64 * pulse) as u8,
+                (base.2 as f64 * pulse) as u8,
+            )
+        }
+        super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
+        super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
+    };
+    Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)] // test mod precedes helper items in this file
 mod sidecar_pill_tests {
@@ -723,6 +767,7 @@ pub(crate) fn build_render_model(
 
     // ── 14. Assemble ──────────────────────────────────────────────────────────
     let model = std::sync::Arc::new(RenderModel {
+        header: inputs.header.clone(),
         status_text: inputs.status_text.clone(),
         streaming: inputs.streaming,
         spinner_frame: inputs.spinner_frame,
@@ -768,7 +813,7 @@ pub(crate) fn build_render_model(
 }
 
 /// Header spans for a focused worker view: `│ ◉ name · sa_N · status · hint`.
-fn watch_banner_spans(b: &super::watch::Banner) -> Vec<Span<'static>> {
+pub(crate) fn watch_banner_spans(b: &super::watch::Banner) -> Vec<Span<'static>> {
     let theme = THEME.load();
     let status_fg = match b.status.as_str() {
         "running" => theme.status_streaming,
@@ -917,7 +962,6 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Layout ────────────────────────────────────────────────────────────
-    let has_subagents = !model.subagents.is_empty();
     let subagent_height = super::subagent_tray::tray_height(model.subagents.len());
     let input_inner_width = frame
         .area()
@@ -939,127 +983,10 @@ pub(crate) fn render_frame_into(
     } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
 
     // ── Header ────────────────────────────────────────────────────────────
-    let spinner_idx = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
-    let status_span = if let Some(ref status) = model.status_text {
-        Span::styled(
-            format!(" {} {} ", SPINNER_FRAMES[spinner_idx], status),
-            Style::default().fg(THEME.load().status_streaming),
-        )
-    } else if has_subagents {
-        let active = model.subagents.iter().filter(|s| !s.done).count();
-        let done = model.subagents.iter().filter(|s| s.done).count();
-        let spinner = if active > 0 {
-            SPINNER_FRAMES[spinner_idx]
-        } else {
-            "\u{2714}"
-        };
-        Span::styled(
-            format!(
-                " {} {} agent{} ({} done) ",
-                spinner,
-                active,
-                if active != 1 { "s" } else { "" },
-                done
-            ),
-            Style::default().fg(THEME.load().subagent_name),
-        )
-    } else if model.streaming {
-        let pulse = ((model.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-        let (sr, sg, sb) = match THEME.load().status_streaming {
-            Color::Rgb(r, g, b) => (r, g, b),
-            _ => (128, 128, 128),
-        };
-        Span::styled(
-            " \u{25cf} streaming ",
-            Style::default().fg(Color::Rgb(
-                (sr as f64 * pulse) as u8,
-                (sg as f64 * pulse) as u8,
-                (sb as f64 * pulse) as u8,
-            )),
-        )
-    } else {
-        Span::styled(
-            " \u{25cb} ready ",
-            Style::default().fg(THEME.load().status_ready),
-        )
-    };
-    let version_span = Span::styled(
-        concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"), " "),
-        Style::default().fg(THEME.load().muted),
-    );
-    let header = Paragraph::new(Line::from({
-        let mut spans = vec![
-            Span::styled(
-                "  Synaps",
-                Style::default()
-                    .fg(THEME.load().header_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
-            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
-            status_span,
-        ];
-        // Worker view: say whose thread this is and how to get back.
-        if let Some(b) = &model.watch_banner {
-            spans.extend(watch_banner_spans(b));
-        }
-        // Sidecar pills from snapshot
-        for pill in &model.sidecar_pills {
-            spans.push(Span::styled(
-                "\u{2502}",
-                Style::default().fg(THEME.load().border),
-            ));
-            let label = pill.display_name.as_deref().unwrap_or("sidecar");
-            let text = sidecar_pill_text(label, &pill.status, pill.armed, model.spinner_frame);
-            let color = match &pill.status {
-                super::sidecar::SidecarUiStatus::Idle => {
-                    if pill.armed {
-                        let pulse =
-                            ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                        let base = match THEME.load().status_streaming {
-                            Color::Rgb(r, g, b) => (r, g, b),
-                            _ => (220, 80, 80),
-                        };
-                        Color::Rgb(
-                            (base.0 as f64 * pulse) as u8,
-                            (base.1 as f64 * pulse) as u8,
-                            (base.2 as f64 * pulse) as u8,
-                        )
-                    } else {
-                        THEME.load().muted
-                    }
-                }
-                super::sidecar::SidecarUiStatus::Active { .. } => {
-                    let pulse = ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                    let base = match THEME.load().status_streaming {
-                        Color::Rgb(r, g, b) => (r, g, b),
-                        _ => (220, 80, 80),
-                    };
-                    Color::Rgb(
-                        (base.0 as f64 * pulse) as u8,
-                        (base.1 as f64 * pulse) as u8,
-                        (base.2 as f64 * pulse) as u8,
-                    )
-                }
-                super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
-                super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
-            };
-            spans.push(Span::styled(
-                text,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-        }
-        let used: usize = spans.iter().map(|s| s.content.len()).sum();
-        let total_w = header_area.width as usize;
-        if total_w > used + version_span.content.len() {
-            let pad = total_w - used - version_span.content.len();
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        spans.push(version_span);
-        spans
-    }))
-    .style(Style::default().bg(THEME.load().bg));
-    frame.render_widget(header, header_area);
+    // Ghost header (header.rs): wordmark + pills, session in the centre,
+    // live state on the right. The row under it is the message pane's top
+    // edge, drawn as the header's lower half (`header::style_top_edge`).
+    super::header::render(frame, header_area, model);
 
     // ── Messages ──────────────────────────────────────────────────────────
     let msg_area = body;
@@ -1067,11 +994,12 @@ pub(crate) fn render_frame_into(
     let visible: Vec<ratatui::text::Line> = model.lines.to_vec();
     let visible_is_empty = visible.is_empty();
 
-    let msg_block = Block::default()
-        .borders(Borders::TOP)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(THEME.load().border))
-        .padding(Padding::horizontal(1));
+    let msg_block = super::header::style_top_edge(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_type(BorderType::Plain),
+    )
+    .padding(Padding::horizontal(1));
     let msg_inner = msg_block.inner(msg_area);
     let messages_widget = Paragraph::new(visible).block(msg_block.clone());
     // The conversation canvas is the ONLY surface the background toggle owns.
@@ -1301,10 +1229,12 @@ pub(crate) fn render_frame_into(
     // Scroll indicator
     if model.scroll_back > 0 {
         let indicator = format!(" \u{2191}{} ", model.scroll_back);
-        let indicator_widget = Paragraph::new(Span::styled(
-            indicator,
-            Style::default().fg(THEME.load().muted),
-        ))
+        let mut indicator_style = Style::default().fg(THEME.load().muted);
+        if super::header::top_edge_is_half_block() {
+            // Sits on the header's lower half: hang it off the header.
+            indicator_style = indicator_style.bg(THEME.load().bg);
+        }
+        let indicator_widget = Paragraph::new(Span::styled(indicator, indicator_style))
         .alignment(Alignment::Right);
         let indicator_area = ratatui::layout::Rect {
             x: msg_area.x,

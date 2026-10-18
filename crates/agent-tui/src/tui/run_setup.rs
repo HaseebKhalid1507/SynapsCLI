@@ -439,6 +439,7 @@ pub(crate) async fn try_reconnect(
 
             // F9: clear streaming state — a turn cannot be streaming without a daemon.
             if app.streaming {
+                app.header_turn_ended(None);
                 app.streaming = false;
             }
             app.compacting = false;

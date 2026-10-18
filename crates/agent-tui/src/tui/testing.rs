@@ -158,6 +158,10 @@ impl TestHarness {
         // Determinism: `App::new` resolves agent_name from the user config —
         // pin it so snapshots don't vary per machine.
         app.agent_name = "agent".to_string();
+        // Determinism: a fresh session's id is a timestamp plus a random
+        // suffix, and the header shows it when the session has no name or
+        // title — pin it so replays are byte-identical across boots.
+        app.session.id = "test-session".to_string();
         // Skip the boot animation; a fixed frame beats a time-parametric one.
         app.logo_build_t = None;
 

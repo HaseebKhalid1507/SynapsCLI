@@ -3,7 +3,10 @@
 //! every other envelope maps to the `ChatMessage`/state mutation the inline
 //! turn machine used to perform. The actor never renders.
 
+use agent_engine::{TurnError, TurnOutcome};
 use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+
+use super::header::Activity;
 
 use agent_engine::session::{Envelope, RuntimeView, SessionEventWire, TurnTrigger};
 
@@ -146,6 +149,41 @@ pub(super) fn apply_transcript_event(
     Applied::Changed
 }
 
+/// Ghost header state for the MAIN thread: what the turn is doing now and
+/// how it ended. App-level, so it stays out of [`apply_transcript_event`]
+/// (a watched worker's thread never drives the main header).
+fn track_activity(app: &mut App, event: &StreamEvent) {
+    match event {
+        StreamEvent::Llm(LlmEvent::Thinking(_)) => app.activity = Activity::Thinking,
+        StreamEvent::Llm(LlmEvent::Text(_))
+        | StreamEvent::Llm(LlmEvent::ToolUseStart { .. })
+        | StreamEvent::Llm(LlmEvent::ToolUseDelta { .. }) => app.activity = Activity::Writing,
+        StreamEvent::Llm(LlmEvent::ToolUse { .. }) => {
+            app.tools_in_flight += 1;
+            app.activity = Activity::Tool;
+        }
+        StreamEvent::Llm(LlmEvent::ToolResult { .. }) => {
+            app.tools_in_flight = app.tools_in_flight.saturating_sub(1);
+            if app.tools_in_flight == 0 {
+                // All results back: the next request is on its way.
+                app.activity = Activity::Waiting;
+            }
+        }
+        // Retry notices all lead with ⏳ (runtime/api.rs).
+        StreamEvent::Session(SessionEvent::Notice(text)) if text.starts_with('\u{23f3}') => {
+            app.activity = Activity::Retry;
+        }
+        StreamEvent::Llm(LlmEvent::ResponseStart) if app.tools_in_flight == 0 => {
+            app.activity = Activity::Waiting;
+        }
+        StreamEvent::Session(SessionEvent::Done) => app.header_turn_ended(None),
+        StreamEvent::Session(SessionEvent::Error(err)) => {
+            app.header_turn_ended(failure_label(err));
+        }
+        _ => {}
+    }
+}
+
 /// Process a StreamEvent, update app state. Presentation only: history,
 /// saves, queued/pending flushes and auto-turns are the actor's (mirrored
 /// back by `Conversation` / `TurnStarted`).
@@ -153,6 +191,7 @@ pub(super) fn apply_transcript_event(
 /// The transcript half is [`apply_transcript_event`] on the MAIN thread's
 /// store; everything below it is App-level state.
 pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &RuntimeView) {
+    track_activity(app, &event);
     match apply_transcript_event(&mut app.transcript, &mut app.response_preview, &event) {
         Applied::Changed => app.request_redraw(),
         Applied::RolledBack => app.invalidate(),
@@ -294,6 +333,21 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
         StreamEvent::Llm(_)
         | StreamEvent::Session(SessionEvent::Notice(_))
         | StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
+    }
+}
+
+/// Short label the Ghost header keeps after a failed turn (`None` = the
+/// turn didn't fail in a way worth flagging).
+fn failure_label(err: &TurnError) -> Option<String> {
+    match &err.outcome {
+        TurnOutcome::Completed | TurnOutcome::Canceled => None,
+        TurnOutcome::ProviderFailed { code, .. } => {
+            let code: String = code.chars().filter(|c| !c.is_control()).take(16).collect();
+            Some(if code.is_empty() { "provider".into() } else { code })
+        }
+        TurnOutcome::ToolFailed { .. } => Some("tool failed".into()),
+        TurnOutcome::BudgetExceeded { .. } => Some("budget".into()),
+        TurnOutcome::InterruptedAfterSideEffect { .. } => Some("interrupted".into()),
     }
 }
 
@@ -448,6 +502,9 @@ pub(super) async fn handle_session_event_arm(
                 // The turn was accepted: the attachment drafts it carried are
                 // consumed now (a `Refused` would have left them for a retry).
                 app.pending_attachments.clear();
+                if !app.streaming {
+                    app.header_turn_started();
+                }
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.status_text = None;
@@ -466,6 +523,9 @@ pub(super) async fn handle_session_event_arm(
                 }
                 app.transcript.scroll_to_bottom();
                 app.status_text = Some("connecting…".to_string());
+                if !app.streaming {
+                    app.header_turn_started();
+                }
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.spinner_frame = 0;
@@ -475,6 +535,9 @@ pub(super) async fn handle_session_event_arm(
                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
             }
             TurnTrigger::EventAuto | TurnTrigger::Compaction | TurnTrigger::DriverAuto => {
+                if !app.streaming {
+                    app.header_turn_started();
+                }
                 app.streaming = true;
                 app.turn_baseline = turn_baseline;
                 app.spinner_frame = 0;
@@ -579,6 +642,7 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Ended { .. } => return ArmFlow::Ended,
         SessionEventWire::Aborted { context_saved } => {
             app.transcript.end_response();
+            app.header_turn_ended(None);
             app.streaming = false;
             app.quit_guard.reset();
             app.subagents.clear();
@@ -704,6 +768,7 @@ pub(super) async fn handle_session_event_arm(
                 app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
                 // The pre-send presentation assumed a turn: undo it.
                 if app.streaming && app.turn_baseline == app.api_messages_len {
+                    app.header_turn_ended(None);
                     app.streaming = false;
             app.quit_guard.reset();
                     app.status_text = None;

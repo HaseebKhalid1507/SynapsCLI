@@ -17,6 +17,8 @@ use super::sidecar::SidecarUiStatus;
 /// The per-frame snapshot shipped to the render side.
 pub(crate) struct RenderModel {
     // ── Header / status ──────────────────────────────────────────────────────
+    /// Ghost header inputs: activity, session label, turn clock, anim clock.
+    pub(crate) header: super::header::HeaderSnap,
     pub(crate) status_text: Option<String>,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,

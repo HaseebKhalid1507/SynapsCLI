@@ -47,6 +47,8 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── status / spinner / identity ──
+    /// Ghost header snapshot (header.rs), built once per frame.
+    pub(crate) header: super::header::HeaderSnap,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
     /// Label of the focused thread's assistant messages: the session's agent
@@ -120,7 +122,9 @@ impl<'a> ViewInputs<'a> {
                 app.streaming,
             ),
         };
+        let header = app.header_snap();
         Self {
+            header,
             gamba_active: app.gamba_child.is_some(),
             transcript: super::threads::active_mut(&mut app.transcript, &mut app.threads),
             input,

@@ -183,6 +183,14 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// Transient status text shown in the header bar (auto-cleared when streaming starts)
     pub(crate) status_text: Option<String>,
+    /// Ghost header: what the current turn is doing (stream_handler.rs).
+    pub(crate) activity: super::header::Activity,
+    /// Ghost header: tool calls dispatched whose results are not back yet.
+    pub(crate) tools_in_flight: u32,
+    /// Ghost header: when the current turn started (`None` between turns).
+    pub(crate) turn_started: Option<std::time::Instant>,
+    /// Ghost header: zero of the indicator animation clock.
+    pub(crate) header_epoch: std::time::Instant,
     /// (E-P8) Thin session-driver client state: "driver armed" mirror, set
     /// purely from `DriverArmed`/`DriverRevoked` wire events. Gates Esc/Ctrl-C
     /// routing and the status toast. The actor owns all driver lifecycle.
@@ -446,6 +454,10 @@ impl App {
             pasted_char_count: 0,
             spinner_frame: 0,
             status_text: None,
+            activity: super::header::Activity::Idle,
+            tools_in_flight: 0,
+            turn_started: None,
+            header_epoch: std::time::Instant::now(),
             driver_ui: super::driver_client::DriverUiState::default(),
             gamba_child: None,
             settings: None,
@@ -709,6 +721,47 @@ impl App {
     pub(crate) fn request_immediate_redraw(&mut self) {
         self.needs_redraw = true;
         self.force_redraw = true;
+    }
+
+    /// Ghost header: a turn began (pre-send or `TurnStarted` on a client
+    /// that was idle). Starts the turn clock; clears a previous failure.
+    pub(crate) fn header_turn_started(&mut self) {
+        self.turn_started = Some(self.clock.now());
+        self.activity = super::header::Activity::Waiting;
+        self.tools_in_flight = 0;
+    }
+
+    /// Ghost header: the turn ended. `failure` keeps a short label on the
+    /// right of the header until the next turn starts.
+    pub(crate) fn header_turn_ended(&mut self, failure: Option<String>) {
+        self.turn_started = None;
+        self.tools_in_flight = 0;
+        self.activity = failure.map_or(super::header::Activity::Idle, super::header::Activity::Failed);
+    }
+
+    /// True while the header animates (so the tick asks for redraws).
+    pub(crate) fn header_animating(&self) -> bool {
+        self.streaming
+            || self.compacting
+            || self.status_text.is_some()
+            || self.subagents.iter().any(|s| !s.done)
+    }
+
+    /// The header's per-frame snapshot.
+    pub(crate) fn header_snap(&self) -> super::header::HeaderSnap {
+        let now = self.clock.now();
+        super::header::HeaderSnap {
+            activity: self.activity.clone(),
+            session_label: super::header::session_label(
+                self.session.name.as_deref(),
+                &self.session.title,
+                &self.session.id,
+            ),
+            turn_elapsed_secs: self
+                .turn_started
+                .map(|t| now.saturating_duration_since(t).as_secs()),
+            anim_ms: now.saturating_duration_since(self.header_epoch).as_millis() as u64,
+        }
     }
 
     /// Advance spinner/animation state.
