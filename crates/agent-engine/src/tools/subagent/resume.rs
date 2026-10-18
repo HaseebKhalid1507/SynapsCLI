@@ -124,6 +124,15 @@ fn prior_run(
         })?),
         None => None,
     };
+    // A startup-failure archive holds no conversation: resuming it would
+    // start the worker blank under a preamble claiming earlier work.
+    if let Some(a) = archive.as_ref().filter(|a| a.history.is_empty()) {
+        return Err(RuntimeError::Tool(format!(
+            "Subagent '{prior_handle_id}' has no conversation to resume: it exited before its \
+             first history checkpoint ({}). Start a new subagent instead.",
+            a.error.as_deref().unwrap_or(&a.status)
+        )));
+    }
     let (agent_name, model, system_prompt, timeout_secs) = match (live, &archive) {
         (Some(live), _) => live,
         (None, Some(a)) => (
@@ -753,6 +762,46 @@ mod tests {
         let prior = prior_run(&registry, "sa_3", Some(path), "pick up").unwrap();
         assert_eq!(prior.agent_name, "archived-label");
         assert_continues_archive(&prior, "pick up");
+    }
+
+    #[test]
+    fn empty_history_archive_is_refused_not_resumed_blank() {
+        // A startup-failure archive (worker exited before its first
+        // checkpoint) is written with no history; resuming it would start
+        // the worker with nothing but a preamble claiming earlier work.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "archived-label".into(),
+            model: "anthropic/claude-opus-5-5".into(),
+            system_prompt: "archived system".into(),
+            timeout_secs: 30,
+        };
+        let path = super::super::archive::write_archive(
+            dir.path(),
+            "sa_empty",
+            &meta,
+            "failed",
+            Some("provider refused the model"),
+            "",
+            &[],
+        )
+        .unwrap();
+        let registry = Mutex::new(SubagentRegistry::new());
+        let err = match prior_run(&registry, "sa_empty", Some(path.clone()), "go on") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("empty archive resumed"),
+        };
+        assert!(err.contains("no conversation to resume"), "{err}");
+        assert!(err.contains("provider refused the model"), "{err}");
+        // Same through the registry (reaped handle, archive on record).
+        {
+            let mut reg = registry.lock().unwrap();
+            let mut h = finished_handle("sa_empty", SubagentStatus::Failed("x".into()), Some(path));
+            h.mark_collected();
+            reg.register(h);
+            reg.cleanup_finished_with_ttl(Duration::ZERO);
+        }
+        assert!(prior_run(&registry, "sa_empty", None, "go on").is_err());
     }
 
     #[test]
