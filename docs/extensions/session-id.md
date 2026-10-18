@@ -102,9 +102,10 @@ has costs the field does not:
 
 - It needs `tools.intercept`, a permission that lets the plugin block or
   rewrite every tool call it subscribes to.
-- The first `modify`, `confirm` or `block` result stops the handler chain.
-  If another extension acts on the call first, there is no token. And once
-  you stamp a call, extensions after you never see it.
+- On `before_tool_call`, only `block` stops the handler chain. A `modify` rewrites the input and the chain continues: every later handler sees the modified input, a later `block` still wins, and a later `confirm` still prompts (approving runs the modified input). A `confirm` is recorded and the chain continues: a later `block` still wins, confirms from several extensions are merged into one prompt that names all of them, and a `modify` that arrives after a `confirm` is ignored and logged (the user confirms the input as it was when they were asked). Later handlers therefore run, with any side effects, before the user answers a `confirm`, and they are not told whether the user approved.
+  So if an earlier extension blocks the call, or raises a `confirm` before
+  your `modify`, your token is never applied. Extensions after you see the
+  stamped input, token included.
 
 Do not match a `tool.call` to the preceding `before_tool_call` by tool name
 and input. Two sessions can make identical calls at the same time, and the

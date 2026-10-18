@@ -94,6 +94,21 @@ All notable changes to this project will be documented in this file.
 
 ### Upgrade notes
 
+- **Loopback `synaps auth-broker` now requires a machine token.** With no
+  `--machine-token-file` / `SYNAPS_BROKER_TOKEN` it writes one to
+  `~/.synaps-cli/auth-broker.token` (0600). Same-user clients pointed at a
+  loopback endpoint pick it up automatically. Older clients, clients running
+  as another user or with another `SYNAPS_BASE_DIR`, and SSH-forwarded
+  clients get a 401 until you set `auth.machine_token` (or
+  `SYNAPS_MACHINE_TOKEN`) to that token. A loopback broker also refuses
+  requests whose `Host` isn't `localhost`, `127.0.0.1`, `[::1]` or its bind
+  IP (any port). `/token` no longer vends Meta Muse keys; `/proxy` still
+  serves Muse.
+- **Extension `before_tool_call` chain:** only `block` stops it now. A
+  `modify` no longer hides the call from later extensions, and a `confirm`
+  no longer skips a later `block`. "Allow all" in the confirm dialog covers
+  only the extension that asked, needs Tab/arrows + Enter (no letter key),
+  and is revoked by `/new` or `/confirms reset`.
 - **`synaps-engine` / `synaps-core` crate users:** these changes break full
   struct literals and exhaustive matches.
   - `TurnBudget::max_provider_rounds`, `max_tool_calls` and

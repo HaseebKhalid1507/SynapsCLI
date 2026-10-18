@@ -374,7 +374,9 @@ impl HookEvent {
 /// What an extension handler returns after processing a hook event.
 ///
 /// The runtime resolves multiple handlers by precedence:
-/// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
+/// - For `before_tool_call` only `Block` stops the handler chain. `Modify`
+///   rewrites the input that later handlers see; `Confirm` is merged and
+///   resolved after the whole chain (a `Modify` after it is ignored).
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -394,10 +396,36 @@ pub enum HookResult {
     Inject { content: String },
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
-    Confirm { message: String },
+    ///
+    /// `sources` / `tool` are host-stamped by `HookBus::emit` (the extension
+    /// id(s) that asked, and the tool name). They are never read from or
+    /// written to the extension wire format, so an extension cannot claim to
+    /// be another extension. The "Allow all" latch is keyed by `sources`.
+    Confirm {
+        message: String,
+        #[serde(skip)]
+        sources: Vec<String>,
+        /// Host-set load generation of each source (parallel to `sources`;
+        /// missing entries mean 0). Part of the latch key, so a plugin
+        /// reinstalled under the same id starts unlatched.
+        #[serde(skip)]
+        generations: Vec<u64>,
+        #[serde(skip)]
+        tool: Option<String>,
+        /// Host-set: the input as rewritten by `Modify` results earlier in
+        /// the chain. Approval runs THIS input (never extension-settable).
+        #[serde(skip)]
+        modified_input: Option<Value>,
+        /// Host-set: ids of the extensions whose `Modify` produced
+        /// `modified_input` (chain order, de-duplicated). Shown in the
+        /// prompt so the user knows the input was rewritten, and by whom.
+        #[serde(skip)]
+        modified_by: Vec<String>,
+    },
     /// Replace the tool **input** before execution (structured JSON args).
     /// Only valid on before_tool_call hooks. The output-side counterpart is
-    /// [`HookResult::Replace`]. The first modifier stops the handler chain.
+    /// [`HookResult::Replace`]. Does not stop the chain: later handlers see
+    /// (and may block or confirm) the modified input.
     Modify { input: Value },
     /// Replace the tool **output** after execution (flat string), before it
     /// enters history. Only valid on after_tool_call hooks. The input-side
@@ -417,6 +445,21 @@ pub enum HookResult {
     /// `phase` is parsed host-side with `WorkPhase::parse`; unknown strings
     /// are ignored with a warning.
     ContextPhase { phase: String },
+}
+
+impl HookResult {
+    /// An unattributed `Confirm` (as an extension returns it, before
+    /// `HookBus::emit` stamps the source).
+    pub fn confirm(message: impl Into<String>) -> Self {
+        Self::Confirm {
+            message: message.into(),
+            sources: Vec::new(),
+            generations: Vec::new(),
+            tool: None,
+            modified_input: None,
+            modified_by: vec![],
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -744,6 +787,11 @@ mod tests {
     fn hook_result_confirm_serde() {
         let r = HookResult::Confirm {
             message: "Run this command?".to_string(),
+            sources: vec!["host-stamped".into()],
+            generations: vec![3],
+            tool: Some("bash".into()),
+            modified_input: Some(serde_json::json!({"x": 1})),
+            modified_by: vec![],
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -752,7 +800,17 @@ mod tests {
         );
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, HookResult::Confirm { message } if message == "Run this command?"));
+        assert!(matches!(back, HookResult::Confirm { message, .. } if message == "Run this command?"));
+
+        // An extension cannot name a source: wire fields are ignored.
+        let spoof: HookResult = serde_json::from_str(
+            r#"{"action":"confirm","message":"m","sources":["trusted"],"tool":"x"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&spoof, HookResult::Confirm { sources, tool: None, modified_input: None, modified_by, .. } if sources.is_empty() && modified_by.is_empty()),
+            "{spoof:?}"
+        );
     }
 
     /// Modify carries replacement input through serialization.
@@ -837,6 +895,11 @@ mod tests {
                 "confirm",
                 HookResult::Confirm {
                     message: "m".into(),
+                    sources: vec![],
+                    generations: vec![],
+                    tool: None,
+                    modified_input: None,
+                    modified_by: vec![],
                 },
             ),
             (

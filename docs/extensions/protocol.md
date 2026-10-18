@@ -450,9 +450,15 @@ Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on
 |-----------|--------|----------|--------------------------------------------------|
 | `message` | string | yes      | Human-readable confirmation prompt for the user  |
 
+The host shows your extension id and the tool name above `message`; an extension cannot set or spoof them. The dialog offers **Allow** (this call), **Allow all from `<your-extension>` this session**, and **Deny**. "Allow all" auto-approves later `confirm` results from *your loaded extension only* (any tool) until `/new` or `/confirms reset`; reloading or reinstalling your extension clears it, confirms from other extensions still prompt, and `block` is never overridden. Subagent tool calls do not run extension `before_tool_call` hooks today, so neither `confirm` nor `block` applies to them. A long `message` is cut to 12 lines / 1200 characters. If an earlier extension's `modify` rewrote the input, the host adds "Input rewritten by: <ids>" and a capped, credential-redacted preview (6 lines / 400 characters; secret-named fields, `Authorization`/`Bearer` headers, `api_key=`/`token=`-style parameters, `sk-…` keys and JWTs become `[REDACTED]`) of the input that will actually run above your `message`, which is shown under "Message from <your-extension>:" (your `message` is credential-redacted the same way, and control, bidi and zero-width characters are stripped from it), and when the user approves, every attached client gets a transcript line saying the call ran rewritten input. Assume any `confirm` you return may be auto-approved once the user has chosen "Allow all" for your extension.
+
+### Handler chain order
+
+On `before_tool_call`, only `block` stops the handler chain. A `modify` rewrites the input and the chain continues: every later handler sees the modified input, a later `block` still wins, and a later `confirm` still prompts (approving runs the modified input). A `confirm` is recorded and the chain continues: a later `block` still wins, confirms from several extensions are merged into one prompt that names all of them, and a `modify` that arrives after a `confirm` is ignored and logged (the user confirms the input as it was when they were asked). Later handlers therefore run, with any side effects, before the user answers a `confirm`, and they are not told whether the user approved.
+
 ### `modify`
 
-Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify`, `confirm`, or `block` result stops the handler chain. Trace logs record `action=modify` but do not log the replacement input.
+Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. Trace logs record `action=modify` but do not log the replacement input.
 
 ```json
 {

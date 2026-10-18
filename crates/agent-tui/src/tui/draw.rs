@@ -761,6 +761,8 @@ pub(crate) fn build_render_model(
         masked_buffer_chars: p.buffer.chars().count(),
         confirm_focus: p.confirm_focus,
         confirm_offers_allow_all: p.offers_allow_all(),
+        confirm_scope: p.confirm_scope.clone(),
+        confirm_allow_all_pending: p.allow_all_pending,
     });
 
     // ── 13. Runtime strings ───────────────────────────────────────────────────
@@ -1638,19 +1640,20 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
 /// the stack-order modal loop in [`render_frame_into`].
 fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSnap) {
     use synaps_cli::tools::PromptKind;
+    if prompt.kind == PromptKind::Confirm {
+        render_confirm_prompt(frame, prompt);
+        return;
+    }
     let area = frame.area();
-    let is_confirm = prompt.kind == PromptKind::Confirm;
-    // Cap to available width; prefer 30-62 (72 for confirm — tool ids are
-    // long) but never overflow (#tui-safety fix 3).
-    let width = area.width.min(if is_confirm { 72 } else { 62 });
+    // Cap to available width; prefer 30-62 but never overflow (#tui-safety
+    // fix 3).
+    let width = area.width.min(62);
     let inner_w = width.saturating_sub(2);
     let body_lines = wrapped_line_count(&prompt.prompt, inner_w);
-    // body + blank + (field | nothing) + footer, plus 2 border rows. Floor
-    // at the legacy fixed 7 so single-line secret prompts render exactly as
-    // before (reference-binary differential); grow only for longer bodies.
-    // Confirm: blank + button row + blank + footer + auto-approve hint;
-    // Secret: blank + field + footer.
-    let content_rows = body_lines + if is_confirm { 5 } else { 3 };
+    // body + blank + field + footer, plus 2 border rows. Floor at the legacy
+    // fixed 7 so single-line secret prompts render exactly as before
+    // (reference-binary differential); grow only for longer bodies.
+    let content_rows = body_lines + 3;
     let height = (content_rows as u16 + 2).max(7).min(area.height).max(3);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
@@ -1664,18 +1667,11 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
     // surface with a heavy warning-coloured bar down its left edge; the
     // title leads the text. The border rows/columns become padding.
     let theme = THEME.load();
-    let surface = theme.raised_surface(1.32);
+    let surface = theme.prompt_surface();
     let warn = theme.warning_color;
     super::modal_kit::dim_backdrop(frame.buffer_mut(), area, modal_area);
     frame.render_widget(Clear, modal_area);
-    let block = Block::default()
-        .padding(ratatui::widgets::Padding {
-            left: 2,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .style(Style::default().bg(surface));
+    let block = prompt_block(surface);
     let mut text: Vec<ratatui::text::Line<'_>> = vec![ratatui::text::Line::from(Span::styled(
         prompt.title.clone(),
         Style::default().fg(warn).add_modifier(Modifier::BOLD),
@@ -1686,58 +1682,16 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
             Style::default().fg(theme.claude_text),
         ))
     }));
-    if text.is_empty() {
-        text.push(ratatui::text::Line::from(""));
-    }
     text.push(ratatui::text::Line::from(""));
     let p = super::modal_kit::Palette::for_modal(&theme, None);
     let hint = |h: &str| super::modal_kit::hint_line(&p, h, modal_area.width.saturating_sub(3));
-    if is_confirm {
-        // Button lightbox. The focused button renders as a filled pill;
-        // Deny is focused by default so a bare Enter stays fail-closed.
-        use synaps_cli::tools::ConfirmChoice;
-        let focused = Style::default()
-            .fg(theme.bg)
-            .bg(warn)
-            .add_modifier(Modifier::BOLD);
-        let idle = Style::default().fg(theme.help_fg);
-        let style_for = |c: ConfirmChoice| if prompt.confirm_focus == c { focused } else { idle };
-        let mut row: Vec<Span<'_>> = vec![
-            Span::raw("   "),
-            Span::styled("[ Allow (y) ]", style_for(ConfirmChoice::Allow)),
-        ];
-        if prompt.confirm_offers_allow_all {
-            row.push(Span::raw("   "));
-            row.push(Span::styled(
-                "[ Allow all this session (a) ]",
-                style_for(ConfirmChoice::AllowAll),
-            ));
-        }
-        row.push(Span::raw("   "));
-        row.push(Span::styled("[ Deny (n) ]", style_for(ConfirmChoice::Deny)));
-        text.push(ratatui::text::Line::from(row));
-        text.push(ratatui::text::Line::from(""));
-        text.push(ratatui::text::Line::from(Span::styled(
-            if prompt.confirm_offers_allow_all {
-                "y allow · a allow all · n/esc deny · ←/→/Tab select · Enter confirm"
-            } else {
-                "y allow · n/esc deny · ←/→/Tab select · Enter confirm"
-            },
-            Style::default().fg(p.dim),
-        )));
-        text.push(ratatui::text::Line::from(Span::styled(
-            "server.auto_approve_confirms=true skips this",
-            Style::default().fg(p.dim),
-        )));
-    } else {
-        let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
-        text.push(ratatui::text::Line::from(vec![
-            Span::styled("password: ", Style::default().fg(p.dim)),
-            Span::styled(masked, Style::default().fg(theme.input_fg)),
-            Span::styled("\u{2588}", Style::default().fg(warn)),
-        ]));
-        text.push(hint("enter submit  esc cancel"));
-    }
+    let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
+    text.push(ratatui::text::Line::from(vec![
+        Span::styled("password: ", Style::default().fg(p.dim)),
+        Span::styled(masked, Style::default().fg(theme.input_fg)),
+        Span::styled("\u{2588}", Style::default().fg(warn)),
+    ]));
+    text.push(hint("enter submit  esc cancel"));
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -1745,11 +1699,282 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
             .wrap(ratatui::widgets::Wrap { trim: false }),
         modal_area,
     );
+    paint_prompt_bar(frame, modal_area, warn, surface);
+}
+
+fn prompt_block(surface: ratatui::style::Color) -> Block<'static> {
+    Block::default()
+        .padding(ratatui::widgets::Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .style(Style::default().bg(surface))
+}
+
+fn paint_prompt_bar(
+    frame: &mut ratatui::Frame<'_>,
+    modal_area: ratatui::layout::Rect,
+    warn: ratatui::style::Color,
+    surface: ratatui::style::Color,
+) {
     for y in modal_area.top()..modal_area.bottom() {
         if let Some(cell) = frame.buffer_mut().cell_mut((modal_area.x, y)) {
             cell.set_symbol("\u{2503}").set_fg(warn).set_bg(surface);
         }
     }
+}
+
+/// Rows `text` takes when greedily word-wrapped at `width` display cells
+/// (ratatui's `Wrap { trim: false }` is greedy too). Words wider than the
+/// row are hard-split. Every source line takes at least one row.
+fn word_wrapped_rows(text: &str, width: u16) -> usize {
+    let w = usize::from(width.max(1));
+    text.split('\n')
+        .map(|line| {
+            let mut rows = 1usize;
+            let mut cur = 0usize;
+            for word in line.split(' ') {
+                let ww = display_width(word);
+                let need = if cur == 0 { ww } else { cur + 1 + ww };
+                if need <= w {
+                    cur = need;
+                    continue;
+                }
+                if cur > 0 {
+                    rows += 1;
+                }
+                // Hard-split an over-long word.
+                rows += ww.saturating_sub(1) / w;
+                cur = if ww == 0 { 0 } else { (ww - 1) % w + 1 };
+            }
+            rows
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// The Confirm lightbox (#148 C1, 04-tui C1/I5/I6).
+///
+/// Laid out bottom-up: the decision controls — buttons, the "Allow all"
+/// scope line and the key hints — are measured at the real text width and
+/// get their rows first, in their own rect; the body (host header + the
+/// extension's message) gets what remains and is cut with a marker when it
+/// doesn't fit. On a narrow pane the button labels switch to a compact form.
+/// The buttons and scope line are therefore never pushed off-screen by a
+/// long message or a small terminal.
+fn render_confirm_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSnap) {
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+    use synaps_cli::tools::ConfirmChoice;
+    let area = frame.area();
+    let scope = prompt
+        .confirm_scope
+        .as_ref()
+        .filter(|_| prompt.confirm_offers_allow_all);
+    let width = area.width.min(if scope.is_some() { 88 } else { 72 });
+    // Padding: left 2 (incl. the bar), right 1.
+    let tw = width.saturating_sub(3).max(1);
+
+    // ── Buttons: full labels when they fit on one row, else compact ──
+    let full: (String, Option<String>, String, &str) = (
+        "[ Allow (y) ]".into(),
+        scope.map(|s| format!("[ {} ]", s.allow_all_label())),
+        "[ Deny (n) ]".into(),
+        "   ",
+    );
+    let row_text = |b: &(String, Option<String>, String, &str)| {
+        let mut t = b.0.clone();
+        if let Some(all) = &b.1 {
+            t.push_str(b.3);
+            t.push_str(all);
+        }
+        t.push_str(b.3);
+        t.push_str(&b.2);
+        t
+    };
+    let buttons = if display_width(&row_text(&full)) <= usize::from(tw) {
+        full
+    } else {
+        (
+            "[Allow y]".into(),
+            scope.map(|s| format!("[Allow all: {}]", s.extensions_label())),
+            "[Deny n]".into(),
+            "  ",
+        )
+    };
+    let button_rows = word_wrapped_rows(&row_text(&buttons), tw);
+
+    // ── Scope line and key hints ──
+    let scope_text = scope.map(|s| s.allow_all_scope());
+    let scope_rows = scope_text
+        .as_deref()
+        .map_or(0, |t| word_wrapped_rows(t, tw));
+    let wide_hint = if scope.is_some() {
+        "y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button · \
+         Allow all: select it, Enter, then Enter again"
+    } else {
+        "y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button"
+    };
+    let narrow_hint = if scope.is_some() {
+        "y allow · n deny · Tab select · Enter press · Allow all: select + Enter twice"
+    } else {
+        "y allow · n deny · Tab select · Enter press"
+    };
+    let pending_text = scope.filter(|_| prompt.confirm_allow_all_pending).map(|s| {
+        format!(
+            "Press Enter again to allow all from {} for this session · Esc cancels",
+            s.extensions_label()
+        )
+    });
+    let hint_text: String = match &pending_text {
+        Some(t) => t.clone(),
+        None if word_wrapped_rows(wide_hint, tw) <= 2 => wide_hint.to_string(),
+        None => narrow_hint.to_string(),
+    };
+    let hint_rows = word_wrapped_rows(&hint_text, tw);
+
+    // ── Vertical budget ──
+    let max_h = usize::from(area.height);
+    let footer_tight = button_rows + scope_rows + hint_rows;
+    let gaps = if scope.is_some() { 3 } else { 2 }; // body|buttons|scope|hint
+    let body_rows = word_wrapped_rows(&prompt.prompt, tw);
+    // 1 top padding + 1 title.
+    let roomy = 2 + body_rows + gaps + footer_tight <= max_h;
+    let gap_rows = if roomy { gaps } else { 0 };
+    let body_avail = max_h.saturating_sub(2 + gap_rows + footer_tight);
+    let body_shown = body_rows.min(body_avail);
+    let truncated = body_shown < body_rows;
+    let height = (2 + body_shown + gap_rows + footer_tight).min(max_h).max(1) as u16;
+
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let theme = THEME.load();
+    let surface = theme.prompt_surface();
+    let warn = theme.warning_color;
+    let p = super::modal_kit::Palette::for_modal(&theme, None);
+    super::modal_kit::dim_backdrop(frame.buffer_mut(), area, modal_area);
+    frame.render_widget(Clear, modal_area);
+    let block = prompt_block(surface);
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+    let wrap = ratatui::widgets::Wrap { trim: false };
+    let mut row = inner.y;
+    let bottom = inner.bottom();
+    let mut take = |rows: usize| -> Rect {
+        let h = (rows as u16).min(bottom.saturating_sub(row));
+        let r = Rect {
+            x: inner.x,
+            y: row,
+            width: inner.width,
+            height: h,
+        };
+        row += h;
+        r
+    };
+
+    // Title.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            prompt.title.clone(),
+            Style::default().fg(warn).add_modifier(Modifier::BOLD),
+        ))),
+        take(1),
+    );
+    // Body (cut, never the controls).
+    if body_shown > 0 {
+        let body_area = take(body_shown);
+        let (text_area, marker_area) = if truncated {
+            (
+                Rect {
+                    height: body_area.height.saturating_sub(1),
+                    ..body_area
+                },
+                Some(Rect {
+                    y: body_area.bottom().saturating_sub(1),
+                    height: 1.min(body_area.height),
+                    ..body_area
+                }),
+            )
+        } else {
+            (body_area, None)
+        };
+        frame.render_widget(
+            Paragraph::new(
+                prompt
+                    .prompt
+                    .lines()
+                    .map(|l| {
+                        Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(theme.claude_text),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .wrap(wrap),
+            text_area,
+        );
+        if let Some(marker) = marker_area {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "… message cut to fit",
+                    Style::default().fg(p.dim),
+                ))),
+                marker,
+            );
+        }
+    }
+    if gap_rows > 0 {
+        take(1);
+    }
+    // Buttons. The focused one renders as a filled pill; Deny is focused by
+    // default so a bare Enter stays fail-closed.
+    let (idle_fg, focus_fg, focus_bg) = theme.confirm_button_colors();
+    let focused = Style::default()
+        .fg(focus_fg)
+        .bg(focus_bg)
+        .add_modifier(Modifier::BOLD);
+    let idle = Style::default().fg(idle_fg);
+    let style_for = |c: ConfirmChoice| if prompt.confirm_focus == c { focused } else { idle };
+    let mut spans: Vec<Span<'_>> = vec![Span::styled(buttons.0.clone(), style_for(ConfirmChoice::Allow))];
+    if let Some(all) = &buttons.1 {
+        spans.push(Span::raw(buttons.3));
+        spans.push(Span::styled(all.clone(), style_for(ConfirmChoice::AllowAll)));
+    }
+    spans.push(Span::raw(buttons.3));
+    spans.push(Span::styled(buttons.2.clone(), style_for(ConfirmChoice::Deny)));
+    frame.render_widget(Paragraph::new(Line::from(spans)).wrap(wrap), take(button_rows));
+    if let Some(text) = scope_text {
+        if gap_rows > 0 {
+            take(1);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(idle_fg))))
+                .wrap(wrap),
+            take(scope_rows),
+        );
+    }
+    if gap_rows > 0 {
+        take(1);
+    }
+    let hint_style = if pending_text.is_some() {
+        Style::default().fg(warn).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.dim)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint_text, hint_style))).wrap(wrap),
+        take(hint_rows),
+    );
+    paint_prompt_bar(frame, modal_area, warn, surface);
 }
 
 /// Toast box dimensions, clamped so they ALWAYS fit a terminal of any size.

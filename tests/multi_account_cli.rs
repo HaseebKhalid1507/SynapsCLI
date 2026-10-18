@@ -342,3 +342,208 @@ async fn codex_only_broker_serves_distinct_accounts_and_authenticates_metadata()
             && !text.contains("synthetic-static-secret")
     );
 }
+
+/// #147 C1 end to end: a loopback broker started with NO token configured
+/// generates `<base_dir>/auth-broker.token` (0600) and requires it; a local
+/// `synaps` pointed at the loopback endpoint with no token configured reads
+/// that file and works with zero config. A DNS-rebinding Host is refused.
+#[tokio::test]
+async fn zero_config_loopback_broker_requires_its_generated_token() {
+    let sandbox = Sandbox::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let child = sandbox
+        .command()
+        .args(["auth-broker", "--bind", &addr.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = BrokerProcess(child);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let base = format!("http://{addr}");
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "broker exited before ready"
+        );
+        if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "zero-config loopback broker did not become healthy");
+
+    let token_path = sandbox.dir.path().join("auth-broker.token");
+    let token = std::fs::read_to_string(&token_path)
+        .expect("token file generated next to auth.json")
+        .trim()
+        .to_string();
+    assert_eq!(token.len(), 64);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&token_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // No bearer: refused. Was open before (#147 C1).
+    let unauth = client
+        .get(format!("{base}/token"))
+        .query(&[("provider", "openai-codex")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401);
+    let rebinding = client
+        .get(format!("{base}/capabilities"))
+        .header(reqwest::header::HOST, format!("attacker.example:{}", addr.port()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebinding.status().as_u16(), 403);
+    let authed = client
+        .get(format!("{base}/capabilities"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(authed.status().is_success());
+
+    // A local client with only the endpoint configured picks up the token.
+    let listed = sandbox
+        .command()
+        .env("SYNAPS_AUTH_ENDPOINT", &base)
+        .args(["auth", "list", "--provider", "openai-codex", "--json"])
+        .output()
+        .unwrap();
+    assert_ok(&listed);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("second"), "{text}");
+    assert!(!text.contains(&token), "machine token never printed");
+}
+
+/// #147 I5: `/token?account=` status mapping, `/usage/snapshot` and
+/// `/accounts/cooldown` against the production binary's real router, with a
+/// hermetic store (no network: no `auto` candidate means no usage fetch).
+#[tokio::test]
+async fn broker_token_account_mapping_and_metadata_endpoints_on_real_router() {
+    let sandbox = Sandbox::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let child = sandbox
+        .command()
+        .env("SYNAPS_BROKER_TOKEN", "synthetic-machine-auth")
+        .args(["auth-broker", "--bind", &addr.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = BrokerProcess(child);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://{addr}");
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(process.0.try_wait().unwrap().is_none(), "broker exited");
+        if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready);
+
+    // /token?account= → 400 (bad) / 404 (unknown) / 503 (auto, no capacity).
+    for (provider, account, expected) in [
+        ("openai-codex", "Bad Label", 400),
+        ("openai-codex", "../x", 400),
+        ("openai-codex", "nosuchslot", 404),
+        ("anthropic", "auto", 503),
+    ] {
+        let response = client
+            .get(format!("{base}/token"))
+            .query(&[("provider", provider), ("account", account)])
+            .bearer_auth("synthetic-machine-auth")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            expected,
+            "{provider}?account={account}"
+        );
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("synthetic-access"), "{text}");
+    }
+
+    // /usage/snapshot and /accounts/cooldown: 401 without / with a wrong
+    // bearer, served with the right one.
+    for bearer in [None, Some("wrong")] {
+        let mut snap = client
+            .get(format!("{base}/usage/snapshot"))
+            .query(&[("provider", "openai-codex"), ("account", "second")]);
+        let mut cool = client
+            .post(format!("{base}/accounts/cooldown"))
+            .json(&json!({"provider": "openai-codex", "account": "second"}));
+        if let Some(b) = bearer {
+            snap = snap.bearer_auth(b);
+            cool = cool.bearer_auth(b);
+        }
+        assert_eq!(snap.send().await.unwrap().status().as_u16(), 401, "{bearer:?}");
+        assert_eq!(cool.send().await.unwrap().status().as_u16(), 401, "{bearer:?}");
+    }
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 600_000;
+    let cool = client
+        .post(format!("{base}/accounts/cooldown"))
+        .bearer_auth("synthetic-machine-auth")
+        .json(&json!({"provider": "openai-codex", "account": "second", "until_ms": until, "reason": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cool.status().as_u16(), 200);
+    let caps: Value = client
+        .get(format!("{base}/capabilities"))
+        .bearer_auth("synthetic-machine-auth")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second = caps
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["accounts"].as_array())
+        .flatten()
+        .find(|a| a["provider"] == "openai-codex" && a["label"] == "second")
+        .expect("second slot listed");
+    assert!(second["cooldown_until"].as_u64().is_some(), "{second}");
+    let snap = client
+        .get(format!("{base}/usage/snapshot"))
+        .query(&[("provider", "openai-codex"), ("account", "Bad Label")])
+        .bearer_auth("synthetic-machine-auth")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status().as_u16(), 400, "authorized snapshot reaches validation");
+}

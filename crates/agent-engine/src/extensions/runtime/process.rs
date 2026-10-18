@@ -269,7 +269,9 @@ pub async fn execute_provider_tool_use(
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
         false,
-        None,
+        // The session's latch, so "Allow all" here arms (and honours) the
+        // same per-extension consent as the main tool path.
+        ctx.capabilities.session_allow_all.as_deref(),
     )
     .await;
 

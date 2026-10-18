@@ -16,6 +16,7 @@ pub mod anthropic_profile;
 pub mod aws_bedrock;
 pub mod azure_openai;
 pub mod broker;
+pub mod broker_token;
 mod browser;
 mod callback;
 pub mod cloud;
@@ -57,6 +58,11 @@ pub use broker::{
     PinnedToken, ProviderStatus, ProxyByteStream, ProxyMethod, ProxyRequest, ProxyResponse,
     RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES,
     MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
+};
+pub use broker_token::{
+    is_loopback_endpoint, load_or_create_broker_token, local_broker_token_path,
+    read_local_broker_token, unauthorized_hint, BrokerTokenOrigin, MachineToken,
+    LOCAL_BROKER_TOKEN_FILE,
 };
 pub use browser::open_browser;
 pub use callback::{

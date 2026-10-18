@@ -79,49 +79,206 @@ pub async fn emit_before_tool_call(
     hook_bus.emit(&event).await
 }
 
-/// Answer the Confirm dialog sends for its "Allow all (session)" button.
+/// Answer the Confirm dialog sends for its "Allow all from <ext>" button.
 /// `resolve_before_tool_call_result` treats it as an allow AND latches the
-/// session's [`Runtime::session_allow_all`] flag so later Confirm results
-/// are auto-approved without a prompt (until the session ends).
+/// confirm's source extension(s) in the session's
+/// [`Runtime::session_allow_all`] set, so later Confirm results from those
+/// extensions (only) are auto-approved without a prompt.
 pub use crate::tools::CONFIRM_ANSWER_ALLOW_ALL;
+
+/// Longest extension `message` shown in a Confirm prompt (chars / lines).
+/// The host-built header and the dialog's buttons and scope line must stay
+/// visible, so a long or hostile message is cut with a marker.
+const MAX_CONFIRM_MESSAGE_CHARS: usize = 1200;
+const MAX_CONFIRM_MESSAGE_LINES: usize = 12;
+
+/// Sanitize, redact and cap an extension's confirm message for display:
+/// control / bidi / zero-width characters are stripped first (prA I-R4-3:
+/// they could move the cursor or disguise text in plain-text clients),
+/// then credentials are redacted (prA I-R4-1: confirmers echo the
+/// rewritten command), then the length is capped.
+fn cap_confirm_message(message: &str) -> String {
+    let message = redact_secret_text(&crate::session::sanitize_prompt_text(message));
+    let lines: Vec<&str> = message.lines().collect();
+    let over_lines = lines.len() > MAX_CONFIRM_MESSAGE_LINES;
+    let over_chars = message.chars().count() > MAX_CONFIRM_MESSAGE_CHARS;
+    if !over_lines && !over_chars {
+        return message;
+    }
+    let kept = lines[..lines.len().min(MAX_CONFIRM_MESSAGE_LINES)].join("\n");
+    let kept: String = kept.chars().take(MAX_CONFIRM_MESSAGE_CHARS).collect();
+    format!("{kept}\n…[message truncated by host]")
+}
+
+/// Lines / chars of the final-input preview shown when the input was
+/// rewritten by an earlier extension.
+const MAX_REWRITE_PREVIEW_LINES: usize = 6;
+const MAX_REWRITE_PREVIEW_CHARS: usize = 400;
+
+/// Scrub credential shapes out of free text (a shell command, a header
+/// line, an extension's confirm message) for the Confirm prompt only. Uses
+/// the AGGRESSIVE `trace::export::redact_command_text` (the shared
+/// high-precision rules plus recall-first ones). Stored text the model or
+/// user reads back (context archive, memory, traces) keeps the precise
+/// shared scrub (prA I-R5-1). The prompt is broadcast to every attached
+/// client (observers included) and replayed on attach, so it must never
+/// show a secret.
+fn redact_secret_text(text: &str) -> String {
+    crate::runtime::trace::export::redact_command_text(text)
+}
+
+/// `redact_value` (secret-named keys, secret-shaped strings) plus
+/// [`redact_secret_text`] on every remaining string, recursively.
+fn redact_preview_value(value: &mut Value) {
+    crate::runtime::trace::export::redact_value(value);
+    match value {
+        Value::Object(map) => map.values_mut().for_each(redact_preview_value),
+        Value::Array(items) => items.iter_mut().for_each(redact_preview_value),
+        Value::String(s) => *s = redact_secret_text(s),
+        _ => {}
+    }
+}
+
+/// Host-rendered, capped, REDACTED preview of the input that will actually
+/// run: a shell-style `command` string as-is, anything else as pretty JSON.
+fn final_input_preview(input: &Value) -> String {
+    let mut input = input.clone();
+    redact_preview_value(&mut input);
+    let full = match input.get("command").and_then(Value::as_str) {
+        Some(cmd) => cmd.to_string(),
+        None => serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string()),
+    };
+    let lines: Vec<&str> = full.lines().collect();
+    let mut out: String = lines[..lines.len().min(MAX_REWRITE_PREVIEW_LINES)]
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cut = lines.len() > MAX_REWRITE_PREVIEW_LINES;
+    if out.chars().count() > MAX_REWRITE_PREVIEW_CHARS {
+        out = out.chars().take(MAX_REWRITE_PREVIEW_CHARS).collect();
+        cut = true;
+    }
+    if cut {
+        out.push_str("\n  …[preview truncated]");
+    }
+    out
+}
+
+/// Prompt body for an extension tool-call Confirm: the host-known source and
+/// tool lead, so an extension's own `message` cannot hide who is asking.
+/// When earlier extensions rewrote the input (prA N3) the header also says
+/// so, by whom, and previews the FINAL input — the one approval runs —
+/// before the extension's own message (which is cut first on small screens).
+fn confirm_prompt_body(
+    message: &str,
+    sources: &[String],
+    tool: Option<&str>,
+    rewrite: Option<(&[String], &Value)>,
+) -> String {
+    let source = if sources.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        sources.join(", ")
+    };
+    let rewritten = match rewrite {
+        Some((by, input)) => format!(
+            "Input rewritten by: {}\nInput that will run:\n{}\n",
+            if by.is_empty() { "(unknown)".to_string() } else { by.join(", ") },
+            final_input_preview(input)
+        ),
+        None => String::new(),
+    };
+    // The extension's own text is labelled, so it can't pass itself off as
+    // the host-built header (e.g. a fake "Input that will run:" block).
+    // Ids and tool names are host-chosen, but sanitize the whole body too.
+    crate::session::sanitize_prompt_text(&format!(
+        "Extension: {source}\nTool: {}\n{rewritten}\nMessage from {source}:\n{}\n\nAllow this tool call?",
+        tool.unwrap_or("(unknown)"),
+        cap_confirm_message(message)
+    ))
+}
+
+/// What an approved Confirm runs: the input as modified earlier in the hook
+/// chain, if any (`Modify`), else the original (`Continue`).
+fn approved(
+    modified_input: Option<Value>,
+) -> crate::extensions::hooks::events::HookResult {
+    match modified_input {
+        Some(input) => crate::extensions::hooks::events::HookResult::Modify { input },
+        None => crate::extensions::hooks::events::HookResult::Continue,
+    }
+}
 
 /// Resolve a before_tool_call result that may request user confirmation.
 ///
-/// When `auto_approve_confirms` is true, or `session_allow_all` has been
-/// latched by an earlier "Allow all (session)" answer, `Confirm` is
-/// short-circuited to `Continue`. Headless/non-interactive callers with
-/// neither fail closed.
+/// When `auto_approve_confirms` is true, or every source extension of the
+/// Confirm (same load generation) has been latched by an earlier "Allow
+/// all" answer, `Confirm` is short-circuited to approval. Headless /
+/// non-interactive callers with neither fail closed. "Allow all" is only
+/// offered (a `ConfirmScope` is attached) when this call site has a latch
+/// to arm; otherwise the dialog offers Allow / Deny only.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
-    session_allow_all: Option<&std::sync::atomic::AtomicBool>,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> crate::extensions::hooks::events::HookResult {
-    use std::sync::atomic::Ordering;
     match hook_result {
-        crate::extensions::hooks::events::HookResult::Confirm { message } => {
+        crate::extensions::hooks::events::HookResult::Confirm {
+            message,
+            sources,
+            generations,
+            tool,
+            modified_input,
+            modified_by,
+        } => {
+            let keys = crate::tools::latch_keys(&sources, &generations);
             if auto_approve_confirms {
                 tracing::info!(message = %message, "confirm auto-approved (auto_approve_confirms=true)");
-                return crate::extensions::hooks::events::HookResult::Continue;
+                return approved(modified_input);
             }
-            if session_allow_all.is_some_and(|f| f.load(Ordering::Relaxed)) {
-                tracing::info!(message = %message, "confirm auto-approved (session allow-all latched)");
-                return crate::extensions::hooks::events::HookResult::Continue;
+            if session_allow_all.is_some_and(|latch| latch.allows_all(&keys)) {
+                tracing::info!(
+                    message = %message,
+                    extensions = ?sources,
+                    "confirm auto-approved (extension allow-all latched)"
+                );
+                return approved(modified_input);
             }
 
             let Some(prompt) = secret_prompt else {
                 return crate::extensions::hooks::events::HookResult::Block {
                     reason: format!(
                         "Tool call requires confirmation but no interactive prompt is available: {}",
-                        message
+                        redact_secret_text(&crate::session::sanitize_prompt_text(&message))
                     ),
                 };
             };
 
+            // No latch on this path → no scope → no Allow-all button, so the
+            // dialog and the "armed" notice never promise what can't happen.
+            let scope = (session_allow_all.is_some() && !sources.is_empty()).then(|| {
+                crate::session::ConfirmScope {
+                    extensions: sources.clone(),
+                    tool: tool.clone(),
+                    rewritten_by: if modified_input.is_some() {
+                        modified_by.clone()
+                    } else {
+                        Vec::new()
+                    },
+                }
+            });
             let response = prompt
-                .prompt(
-                    "Confirm tool call".to_string(),
-                    format!("{}\n\nAllow this tool call?", message),
+                .prompt_scoped(
+                    crate::session::CONFIRM_PROMPT_TITLE.to_string(),
+                    confirm_prompt_body(
+                        &message,
+                        &sources,
+                        tool.as_deref(),
+                        modified_input.as_ref().map(|i| (modified_by.as_slice(), i)),
+                    ),
+                    scope,
                 )
                 .await;
 
@@ -129,24 +286,28 @@ pub async fn resolve_before_tool_call_result(
                 Some(answer)
                     if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
                 {
-                    crate::extensions::hooks::events::HookResult::Continue
+                    approved(modified_input)
                 }
                 Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
                     match session_allow_all {
-                        Some(flag) => {
-                            flag.store(true, Ordering::Relaxed);
-                            tracing::warn!(
-                                "user chose Allow all: tool-call confirms auto-approved for the rest of this session"
-                            );
-                        }
+                        Some(latch) if latch.allow(&keys) => tracing::warn!(
+                            extensions = ?sources,
+                            "user chose Allow all: confirms from these extensions are auto-approved for the rest of this conversation"
+                        ),
+                        Some(_) => tracing::warn!(
+                            "user chose Allow all on an unattributed or revoked confirm; approving this call only"
+                        ),
                         None => tracing::warn!(
                             "user chose Allow all but this path has no session latch; approving this call only"
                         ),
                     }
-                    crate::extensions::hooks::events::HookResult::Continue
+                    approved(modified_input)
                 }
                 _ => crate::extensions::hooks::events::HookResult::Block {
-                    reason: format!("Tool call confirmation denied: {}", message),
+                    reason: format!(
+                        "Tool call confirmation denied: {}",
+                        redact_secret_text(&crate::session::sanitize_prompt_text(&message))
+                    ),
                 },
             }
         }
@@ -160,7 +321,7 @@ pub async fn resolve_before_tool_call_decision(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
-    session_allow_all: Option<&std::sync::atomic::AtomicBool>,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> BeforeToolCallDecision {
     match resolve_before_tool_call_result(
         hook_result,
@@ -552,11 +713,11 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
-    /// Session-scoped "Allow all" latch for extension `Confirm` gates
-    /// (`before_tool_call`). Set when the user picks "Allow all (session)"
-    /// in the Confirm dialog; shared by clones and delegated workers in the
-    /// same session. Never persisted.
-    session_allow_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped, per-extension "Allow all" latch for extension
+    /// `Confirm` gates (`before_tool_call`). An extension id is added when
+    /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
+    /// clones and delegated workers in the same session. Never persisted.
+    session_allow_all: std::sync::Arc<crate::tools::SessionConfirmLatch>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -1127,7 +1288,7 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
-            session_allow_all: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -1664,11 +1825,13 @@ impl Runtime {
     }
 
     /// Start an explicitly new or resumed conversation with fresh Confirm consent.
-    /// Replace the Arc rather than clearing its flag: old stream/worker clones
-    /// must not be able to grant consent to the next conversation. Ordinary
-    /// turns and linked compaction successors must not call this method.
+    /// Revoke the old set first, so workers still running from the previous
+    /// conversation stop auto-approving, then replace the Arc so old
+    /// stream/worker clones cannot grant consent to the next conversation.
+    /// Ordinary turns and linked compaction successors must not call this.
     pub fn begin_conversation(&mut self, id: Option<String>) {
-        self.session_allow_all = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.session_allow_all.revoke();
+        self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
         self.set_session_id(id);
     }
 
@@ -4216,16 +4379,16 @@ impl Runtime {
         .await
     }
 
-    /// Session-scoped "Allow all" latch for extension Confirm gates. `true`
-    /// once the user picked "Allow all (session)" in a Confirm dialog.
-    pub fn session_allow_all(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+    /// Session-scoped "Allow all" latch for extension Confirm gates: the
+    /// extension ids the user picked "Allow all from <ext>" for.
+    pub fn session_allow_all(&self) -> &std::sync::Arc<crate::tools::SessionConfirmLatch> {
         &self.session_allow_all
     }
 
     /// Bind a worker to the calling session, not the process-wide host.
     pub(crate) fn inherit_session_allow_all(
         &mut self,
-        parent: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        parent: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
     ) {
         if let Some(parent) = parent {
             self.session_allow_all = parent.clone();
@@ -5346,9 +5509,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_without_prompt_fails_closed() {
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             None,
             false,
             None,
@@ -5396,9 +5557,7 @@ mod tests {
         });
 
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
             None,
@@ -5423,9 +5582,7 @@ mod tests {
         });
 
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
             None,
@@ -5440,9 +5597,32 @@ mod tests {
         ));
     }
 
+    fn ext(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn key(ids: &[&str]) -> Vec<crate::tools::LatchKey> {
+        ids.iter().map(|s| (s.to_string(), 0)).collect()
+    }
+
+    fn sourced_confirm(
+        message: &str,
+        source: &str,
+        tool: &str,
+    ) -> crate::extensions::hooks::events::HookResult {
+        crate::extensions::hooks::events::HookResult::Confirm {
+            message: message.into(),
+            sources: ext(&[source]),
+            tool: Some(tool.into()),
+            generations: vec![],
+            modified_input: None,
+            modified_by: vec![],
+        }
+    }
+
     #[test]
     fn session_allow_all_clones_share_but_independent_runtimes_do_not() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
         let parent = Runtime::new_headless();
         let cloned = parent.clone();
         let independent = Runtime::new_headless();
@@ -5454,36 +5634,43 @@ mod tests {
             parent.session_allow_all(),
             independent.session_allow_all()
         ));
-        cloned.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(parent.session_allow_all().load(Ordering::Relaxed));
-        assert!(!independent.session_allow_all().load(Ordering::Relaxed));
+        cloned.session_allow_all().allow(&key(&["jev"]));
+        assert!(parent.session_allow_all().allows_all(&key(&["jev"])));
+        assert!(!independent.session_allow_all().allows_all(&key(&["jev"])));
     }
 
     #[test]
     fn session_allow_all_conversation_boundary_isolates_old_clones() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
         let mut runtime = Runtime::new_headless();
         let old_worker = runtime.clone();
-        old_worker.session_allow_all().store(true, Ordering::Relaxed);
+        old_worker.session_allow_all().allow(&key(&["jev"]));
 
         runtime.begin_conversation(Some("next".into()));
         assert_eq!(runtime.session_id(), Some("next"));
-        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(runtime.session_allow_all().is_empty());
         assert!(!Arc::ptr_eq(
             runtime.session_allow_all(),
             old_worker.session_allow_all()
         ));
-        assert!(old_worker.session_allow_all().load(Ordering::Relaxed));
-        old_worker.session_allow_all().store(false, Ordering::Relaxed);
-        old_worker.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        // #148 I2b: workers still running from the old conversation stop
+        // auto-approving — the old set is revoked before the swap.
+        assert!(
+            old_worker.session_allow_all().is_empty(),
+            "old latch must be cleared, not just replaced"
+        );
+        // An old clone can neither grant the new conversation nor re-arm
+        // the revoked (orphaned) set.
+        assert!(!old_worker.session_allow_all().allow(&key(&["jev"])));
+        assert!(old_worker.session_allow_all().is_empty());
+        assert!(runtime.session_allow_all().is_empty());
 
         let new_worker = runtime.clone();
-        new_worker.session_allow_all().store(true, Ordering::Relaxed);
-        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+        new_worker.session_allow_all().allow(&key(&["jev"]));
+        assert!(runtime.session_allow_all().allows_all(&key(&["jev"])));
         // Explicit resume of even the same ID starts fresh consent.
         runtime.begin_conversation(Some("next".into()));
-        assert!(!runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(runtime.session_allow_all().is_empty());
         assert!(!Arc::ptr_eq(
             runtime.session_allow_all(),
             new_worker.session_allow_all()
@@ -5492,40 +5679,55 @@ mod tests {
 
     #[test]
     fn session_allow_all_identity_change_preserves_compaction_consent() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::Arc;
         let mut runtime = Runtime::new_headless();
         let worker = runtime.clone();
-        worker.session_allow_all().store(true, Ordering::Relaxed);
+        worker.session_allow_all().allow(&key(&["jev"]));
         runtime.set_session_id(Some("linked-successor".into()));
         assert!(Arc::ptr_eq(
             runtime.session_allow_all(),
             worker.session_allow_all()
         ));
-        assert!(runtime.session_allow_all().load(Ordering::Relaxed));
+        assert!(runtime.session_allow_all().allows_all(&key(&["jev"])));
     }
 
-    /// "Allow all (session)": the answer continues THIS call and latches the
-    /// session flag, after which a Confirm resolves without any prompt.
+    /// "Allow all from <ext>": the answer continues THIS call and latches
+    /// that extension only. A later confirm from the same extension resolves
+    /// without a prompt; a confirm from another extension still prompts.
     #[tokio::test]
-    async fn confirm_prompt_always_latches_session_allow_all() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let latch = AtomicBool::new(false);
+    async fn confirm_prompt_always_latches_only_the_source_extension() {
+        let latch = crate::tools::SessionConfirmLatch::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = crate::tools::SecretPromptHandle::new(tx);
 
         let task = tokio::spawn(async move {
-            let request = rx.recv().await.expect("confirm prompt request");
-            let _ = request
+            let first = rx.recv().await.expect("first confirm prompt");
+            // The dialog is told who asks and for which tool BEFORE answering.
+            assert_eq!(
+                first.confirm_scope,
+                Some(crate::session::ConfirmScope {
+                    extensions: vec!["jev".into()],
+                    tool: Some("bash".into()),
+                    rewritten_by: vec![],
+                })
+            );
+            assert!(first.prompt.starts_with("Extension: jev\nTool: bash\n"), "{}", first.prompt);
+            let _ = first
                 .response_tx
                 .send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
-            // A second prompt must NEVER arrive: the latch short-circuits it.
-            assert!(rx.recv().await.is_none(), "second confirm must not prompt");
+            // The next prompt must be the OTHER extension's confirm (jev's
+            // second confirm is latched and never prompts).
+            let other = rx.recv().await.expect("other extension still prompts");
+            assert_eq!(
+                other.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+                Some(vec!["other".to_string()])
+            );
+            let _ = other.response_tx.send(None);
+            assert!(rx.recv().await.is_none(), "no further prompts");
         });
 
         let first = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            sourced_confirm("Run deploy?", "jev", "bash"),
             Some(&handle),
             false,
             Some(&latch),
@@ -5535,12 +5737,10 @@ mod tests {
             first,
             crate::extensions::hooks::events::HookResult::Continue
         ));
-        assert!(latch.load(Ordering::Relaxed), "latch set by 'always'");
+        assert_eq!(latch.extensions(), ext(&["jev"]), "latch keyed by source");
 
         let second = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy again?".into(),
-            },
+            sourced_confirm("Run deploy again?", "jev", "write"),
             Some(&handle),
             false,
             Some(&latch),
@@ -5550,17 +5750,374 @@ mod tests {
             second,
             crate::extensions::hooks::events::HookResult::Continue
         ));
+
+        let other = resolve_before_tool_call_result(
+            sourced_confirm("Run ls?", "other", "bash"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(
+            matches!(other, crate::extensions::hooks::events::HookResult::Block { .. }),
+            "another extension's confirm is not covered by jev's latch"
+        );
         drop(handle);
         task.await.unwrap();
     }
 
+    /// Latched A + unlatched B on one call (a merged Confirm): it prompts,
+    /// the prompt names both, and "Allow all" then latches both.
+    #[tokio::test]
+    async fn latched_plus_unlatched_source_prompts_and_allow_all_latches_both() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&key(&["a"]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.expect("must prompt: b is not latched");
+            assert_eq!(
+                req.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+                Some(vec!["a".to_string(), "b".to_string()])
+            );
+            assert!(req.prompt.starts_with("Extension: a, b\n"), "{}", req.prompt);
+            let _ = req.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let merged = || crate::extensions::hooks::events::HookResult::Confirm {
+            message: "[a] x\n\n[b] y".into(),
+            sources: ext(&["a", "b"]),
+            generations: vec![],
+            tool: Some("bash".into()),
+            modified_input: None,
+            modified_by: vec![],
+        };
+        let first = resolve_before_tool_call_result(merged(), Some(&handle), false, Some(&latch)).await;
+        task.await.unwrap();
+        assert!(matches!(first, crate::extensions::hooks::events::HookResult::Continue));
+        assert!(latch.allows_all(&key(&["a", "b"])));
+        // Now fully latched: no prompt (handle dropped → would block).
+        drop(handle);
+        let second = resolve_before_tool_call_result(merged(), None, false, Some(&latch)).await;
+        assert!(matches!(second, crate::extensions::hooks::events::HookResult::Continue));
+    }
+
+    /// A call site with no latch never offers "Allow all" (no scope), so the
+    /// dialog and the session's "armed" notice can't promise it.
+    #[tokio::test]
+    async fn no_latch_means_no_allow_all_scope() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert!(req.confirm_scope.is_none());
+            let _ = req.response_tx.send(Some("y".into()));
+        });
+        let r = resolve_before_tool_call_result(
+            sourced_confirm("Run?", "jev", "bash"),
+            Some(&handle),
+            false,
+            None,
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(r, crate::extensions::hooks::events::HookResult::Continue));
+    }
+
+    /// prA N3: a Confirm whose input an earlier extension rewrote shows who
+    /// rewrote it and a capped preview of the FINAL input, ahead of the
+    /// confirmer's own message; the scope records `rewritten_by` so the
+    /// session can mark the transcript; approval runs that final input.
+    #[tokio::test]
+    async fn rewritten_input_is_shown_in_the_confirm_prompt() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            let body = req.prompt.clone();
+            let scope = req.confirm_scope.clone().unwrap();
+            let _ = req.response_tx.send(Some("y".into()));
+            (body, scope)
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run this bash command?".into(),
+                sources: ext(&["jev"]),
+                generations: vec![],
+                tool: Some("bash".into()),
+                modified_input: Some(serde_json::json!({"command": "rm -rf build/"})),
+                modified_by: ext(&["rewriter"]),
+            },
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        let (body, scope) = task.await.unwrap();
+        let header_end = body.find("Message from jev:\nRun this bash command?").unwrap();
+        let header = &body[..header_end];
+        assert!(header.contains("Input rewritten by: rewriter"), "{body}");
+        assert!(header.contains("Input that will run:\n  rm -rf build/"), "{body}");
+        assert_eq!(scope.rewritten_by, ext(&["rewriter"]));
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Modify { input }
+                if input == serde_json::json!({"command": "rm -rf build/"})
+        ));
+        // No rewrite → no rewrite header, empty rewritten_by.
+        let plain = confirm_prompt_body("m", &ext(&["jev"]), Some("bash"), None);
+        assert!(!plain.contains("rewritten"), "{plain}");
+    }
+
+    /// prA I-R3-1: the preview is redacted before it is rendered.
+    #[test]
+    fn final_input_preview_redacts_credentials() {
+        let secrets = [
+            "SECRET-BEARER-123",
+            "SECRET-KEY-456",
+            "SECRET-FIELD-789",
+            "QmFzaWNTRUNSRVQ=",
+            "SECRET-TOK-000",
+            "SECRET-FLAG-111",
+            "sk-ant-api03-abcdefghijklmnop",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        ];
+        let command = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer SECRET-BEARER-123' \
+                        'https://api.example/v1?api_key=SECRET-KEY-456' \
+                        -H \"authorization: Basic QmFzaWNTRUNSRVQ=\" \
+                        && TOKEN=SECRET-TOK-000 deploy --password SECRET-FLAG-111 \
+                        sk-ant-api03-abcdefghijklmnop \
+                        eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl \
+                        ghp_abcdefghijklmnopqrstuvwxyz0123"
+        });
+        let json = serde_json::json!({
+            "url": "https://x/y",
+            "api_key": "SECRET-FIELD-789",
+            "headers": {"X-Note": "Bearer SECRET-BEARER-123"},
+            "args": ["--token=SECRET-TOK-000"],
+        });
+        for input in [command, json] {
+            let p = final_input_preview(&input);
+            for secret in secrets {
+                assert!(!p.contains(secret), "{secret} leaked in:\n{p}");
+            }
+            assert!(p.contains("[REDACTED]"), "{p}");
+        }
+        // Non-secret text survives so the user can still judge the call.
+        let plain = final_input_preview(&serde_json::json!({"command": "rm -rf build/ && ls -la"}));
+        assert!(plain.contains("rm -rf build/ && ls -la"), "{plain}");
+    }
+
+    /// prA I-R4-2: every shape from the round-4 table is redacted, by the
+    /// SHARED scrubber (trace export gets the same rules).
+    #[test]
+    fn redact_secret_text_covers_round4_shapes() {
+        let rows: &[(&str, &str)] = &[
+            ("curl -H 'x-api-key: XAPIKEY-SECRET-1' https://a", "XAPIKEY-SECRET-1"),
+            ("FOO_TOKEN=TOK-SECRET-2 run", "TOK-SECRET-2"),
+            ("MY_SECRET=SEC-SECRET-3 ./x", "SEC-SECRET-3"),
+            ("DB_PASSWORD=PW-SECRET-4 ./x", "PW-SECRET-4"),
+            ("OPENAI_API_KEY=APIKEY-SECRET-5 ./x", "APIKEY-SECRET-5"),
+            ("curl -H 'Authorization: Basic QkFTSUMtU0VDUkVULTY='", "QkFTSUMtU0VDUkVULTY="),
+            ("aws_secret_access_key=AWSSEC-SECRET-7", "AWSSEC-SECRET-7"),
+            ("git clone https://alice:USERINFO-SECRET-8@github.com/o/r", "USERINFO-SECRET-8"),
+            ("psql postgres://app:PGPW-SECRET-9@db:5432/prod", "PGPW-SECRET-9"),
+            ("DATABASE_URL=postgres://app:DBURL-SECRET-10@db/prod ./run", "DBURL-SECRET-10"),
+            ("curl -H 'Cookie: sid=COOKIE-SECRET-11; theme=dark' https://a", "COOKIE-SECRET-11"),
+            ("printf 'Set-Cookie: sid=SETCOOKIE-SECRET-12'", "SETCOOKIE-SECRET-12"),
+            ("curl -u alice:CURLU-SECRET-13 https://a", "CURLU-SECRET-13"),
+            ("mysql -u root -pMYSQL-SECRET-14 prod", "MYSQL-SECRET-14"),
+            ("sshpass -p SSHPASS-SECRET-15 ssh host", "SSHPASS-SECRET-15"),
+            ("aws configure set aws_secret_access_key AWSCFG-SECRET-16", "AWSCFG-SECRET-16"),
+            ("aws x --secret-access-key FLAG-SECRET-17 --region eu", "FLAG-SECRET-17"),
+            ("aws x --access-key FLAG-SECRET-18", "FLAG-SECRET-18"),
+            ("STRIPE_KEY=rk_live_STRIPE-SECRET-19 node app", "STRIPE-SECRET-19"),
+            ("OPENAI_KEY=OAIKEY-SECRET-20 node app", "OAIKEY-SECRET-20"),
+        ];
+        // prA I-R5-1: rows whose shape is unmistakable are also caught by
+        // the SHARED high-precision scrub (trace export, memory, archive).
+        let precise = [
+            "QkFTSUMtU0VDUkVULTY=",
+            "USERINFO-SECRET-8",
+            "PGPW-SECRET-9",
+            "DBURL-SECRET-10",
+            "COOKIE-SECRET-11",
+            "SETCOOKIE-SECRET-12",
+            "CURLU-SECRET-13",
+            "MYSQL-SECRET-14",
+            "SSHPASS-SECRET-15",
+        ];
+        for (text, secret) in rows {
+            // The Confirm prompt path catches every row.
+            let out = redact_secret_text(text);
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains("[REDACTED]"), "{out}");
+            let preview = final_input_preview(&serde_json::json!({ "command": text }));
+            assert!(!preview.contains(secret), "{secret} leaked in preview: {preview}");
+            if precise.contains(secret) {
+                let mut v = serde_json::Value::String(text.to_string());
+                crate::runtime::trace::export::redact_value(&mut v);
+                assert!(
+                    !v.as_str().unwrap().contains(secret),
+                    "shared scrub leaked {secret}: {v}"
+                );
+            }
+        }
+        // Over-redaction guards: ordinary commands and prose stay intact.
+        for ok in [
+            "mkdir -p build/out",
+            "ssh -p 2222 host",
+            "ssh -p2222 host",
+            "docker run -p 8080:80 nginx",
+            "mysql -h db -P 3306 -p prod",
+            "curl -u alice https://example.com/path",
+            "echo the token is valid and the password field is empty",
+            "monkey=1 make",
+            "git log --format=%H -- src/",
+            "https://example.com/a/b?page=2",
+        ] {
+            assert_eq!(redact_secret_text(ok), ok, "over-redacted");
+        }
+    }
+
+    /// prA I-R5-1: the shared scrub (`redact_value`) also runs over the
+    /// rollover context archive, memory captures and traces, so benign code
+    /// and prose must pass through it unchanged. Only the Confirm prompt
+    /// uses the aggressive rules.
+    #[test]
+    fn shared_scrub_leaves_benign_code_and_prose_alone() {
+        let benign = [
+            "max_tokens: 4096",
+            "password: String,",
+            "let token = load()?;",
+            "the password-reset flow",
+            "pub authorization: Option<String>,",
+            "cookie: HashMap<String, String>,",
+            "MY_KEY=value_in_docs",
+            "--token-file path/to/file",
+            "fn refresh_access_token(&self) -> Result<Token>",
+            "aws_secret_access_key is the field name",
+        ];
+        for text in benign {
+            let mut v = serde_json::Value::String(text.to_string());
+            crate::runtime::trace::export::redact_value(&mut v);
+            assert_eq!(v.as_str().unwrap(), text, "shared scrub mangled benign text");
+            assert_eq!(crate::runtime::trace::export::redact_text(text), text);
+        }
+        // Inside objects too (archive / memory records are JSON).
+        let mut record = serde_json::json!({
+            "text": "set max_tokens: 4096 and keep the password-reset flow",
+            "code": ["password: String,", "let token = load()?;"],
+        });
+        let before = record.clone();
+        crate::runtime::trace::export::redact_value(&mut record);
+        assert_eq!(record, before);
+    }
+
+    /// prA I-R4-1: the confirmer's message is redacted too — it routinely
+    /// echoes the (credential-injected) command it was shown.
+    #[test]
+    fn confirmer_message_echoing_injected_credentials_is_redacted() {
+        let injected = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer ECHOED-BEARER-X' https://a"
+        });
+        let body = confirm_prompt_body(
+            "Run: curl -H 'Authorization: Bearer ECHOED-BEARER-X' https://a ?",
+            &ext(&["jev"]),
+            Some("bash"),
+            Some((&ext(&["injector"]), &injected)),
+        );
+        assert!(!body.contains("ECHOED-BEARER-X"), "{body}");
+        assert!(body.contains("Message from jev:\nRun: curl -H 'Authorization: [REDACTED]"), "{body}");
+    }
+
+    /// prA I-R4-3: control, bidi and zero-width characters in the message
+    /// are stripped before capping, so they can't move the cursor or
+    /// disguise text in plain-text clients.
+    #[test]
+    fn confirm_message_control_and_bidi_chars_are_stripped() {
+        let hostile = "ok\x1b[3A\x1b[2KExtension: trusted\rTool: none\u{0085}\u{202E}evil\u{200B}x\u{2066}y\tz\nnext";
+        let body = confirm_prompt_body(hostile, &ext(&["jev"]), Some("bash"), None);
+        for bad in ['\x1b', '\r', '\u{0085}', '\u{202E}', '\u{200B}', '\u{2066}', '\t'] {
+            assert!(!body.contains(bad), "{bad:?} survived: {body:?}");
+        }
+        assert!(body.contains("Message from jev:\nok[3A[2KExtension: trustedTool: noneevilxy z\nnext"), "{body:?}");
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"));
+    }
+
+    /// The confirmer's text is labelled, so a fake "Input that will run:"
+    /// in it lands visibly under "Message from <ext>:", after the host block.
+    #[test]
+    fn extension_message_is_labelled_after_the_host_header() {
+        let fake = "Input that will run:\n  echo harmless";
+        let body = confirm_prompt_body(fake, &ext(&["jev"]), Some("bash"), None);
+        let label = body.find("Message from jev:\n").expect(&body);
+        assert_eq!(body.find("Input that will run:"), Some(label + "Message from jev:\n".len()));
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"), "{body}");
+    }
+
+    #[test]
+    fn final_input_preview_is_capped() {
+        let many = serde_json::json!({"command": (1..=20).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n")});
+        let p = final_input_preview(&many);
+        assert!(p.lines().count() <= MAX_REWRITE_PREVIEW_LINES + 1, "{p}");
+        assert!(p.ends_with("…[preview truncated]"), "{p}");
+        let wide = serde_json::json!({"path": "x".repeat(2000)});
+        let p = final_input_preview(&wide);
+        assert!(p.chars().count() <= MAX_REWRITE_PREVIEW_CHARS + 30, "{}", p.len());
+        let obj = serde_json::json!({"path": "/tmp/a", "content": "hi"});
+        assert!(final_input_preview(&obj).contains("\"path\": \"/tmp/a\""));
+    }
+
+    /// A long extension message is capped so the host header, buttons and
+    /// scope line stay on screen.
+    #[test]
+    fn long_confirm_message_is_capped() {
+        let long = "x\n".repeat(500);
+        let body = confirm_prompt_body(&long, &ext(&["jev"]), Some("bash"), None);
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"));
+        assert!(body.contains("…[message truncated by host]"));
+        assert!(body.lines().count() <= MAX_CONFIRM_MESSAGE_LINES + 8, "{}", body.lines().count());
+        let wide = "y".repeat(10_000);
+        assert!(confirm_prompt_body(&wide, &ext(&["jev"]), None, None).chars().count() < 1400);
+    }
+
+    /// An unattributed confirm (no host-stamped source) offers no scope and
+    /// an "always" answer approves only this call; nothing is latched.
+    #[tokio::test]
+    async fn unattributed_confirm_always_answer_does_not_latch() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.expect("prompt");
+            assert!(req.confirm_scope.is_none());
+            let _ = req.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        assert!(latch.is_empty());
+    }
+
     /// The latch only short-circuits Confirm; Block from an extension is
-    /// still a Block, and a headless path with the latch set continues
-    /// instead of failing closed.
+    /// still a Block, and a headless path with the source latched continues
+    /// instead of failing closed (an unlatched source still fails closed).
     #[tokio::test]
     async fn session_allow_all_does_not_override_block() {
-        use std::sync::atomic::AtomicBool;
-        let latch = AtomicBool::new(true);
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&key(&["jev"]));
         let blocked = resolve_before_tool_call_result(
             crate::extensions::hooks::events::HookResult::Block {
                 reason: "nope".into(),
@@ -5575,9 +6132,7 @@ mod tests {
             crate::extensions::hooks::events::HookResult::Block { reason } if reason == "nope"
         ));
         let headless = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            sourced_confirm("Run deploy?", "jev", "bash"),
             None,
             false,
             Some(&latch),
@@ -5586,6 +6141,17 @@ mod tests {
         assert!(matches!(
             headless,
             crate::extensions::hooks::events::HookResult::Continue
+        ));
+        let other = resolve_before_tool_call_result(
+            sourced_confirm("Run deploy?", "other", "bash"),
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            other,
+            crate::extensions::hooks::events::HookResult::Block { .. }
         ));
     }
 

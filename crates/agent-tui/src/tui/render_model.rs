@@ -164,6 +164,10 @@ pub(crate) struct SecretPromptSnap {
     pub(crate) masked_buffer_chars: usize,
     /// `Confirm` only: the focused button.
     pub(crate) confirm_focus: synaps_cli::tools::ConfirmChoice,
-    /// `Confirm` only: whether the "Allow all (session)" button is offered.
+    /// `Confirm` only: whether the "Allow all from <ext>" button is offered.
     pub(crate) confirm_offers_allow_all: bool,
+    /// `Confirm` only: source extension(s) and tool of a tool-call confirm.
+    pub(crate) confirm_scope: Option<synaps_cli::tools::ConfirmScope>,
+    /// `Confirm` only: "Allow all" awaits its second Enter.
+    pub(crate) confirm_allow_all_pending: bool,
 }

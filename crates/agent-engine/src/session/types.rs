@@ -442,6 +442,69 @@ impl PromptKind {
     }
 }
 
+/// Who raised an extension tool-call Confirm and what "Allow all" would
+/// cover. Built host-side from the hook chain (`HookBus::emit` stamps the
+/// extension ids; an extension cannot name itself or another extension), so
+/// the dialog can show the exact scope BEFORE the user answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmScope {
+    /// Extension ids whose `Confirm` this prompt resolves; "Allow all"
+    /// latches exactly these.
+    pub extensions: Vec<String>,
+    /// Tool the call targets (display only; the latch is per extension).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Extensions whose `Modify` rewrote the input this prompt approves
+    /// (empty = the model's own input). Lets the session record, for every
+    /// client's transcript, that an approved call ran rewritten input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewritten_by: Vec<String>,
+}
+
+impl ConfirmScope {
+    /// `a` or `a, b`.
+    pub fn extensions_label(&self) -> String {
+        self.extensions.join(", ")
+    }
+
+    /// Text of the "Allow all" button (without the key hint).
+    pub fn allow_all_label(&self) -> String {
+        format!("Allow all from {} this session", self.extensions_label())
+    }
+
+    /// The exact reach of "Allow all", shown before the user answers.
+    pub fn allow_all_scope(&self) -> String {
+        format!(
+            "Allow all: later confirms from {} (any tool) are approved without asking until \
+             /new or /confirms reset. Other extensions still ask.",
+            self.extensions_label()
+        )
+    }
+}
+
+/// Make prompt text safe to print in any client (prA I-R4-3, I-R5): drop
+/// C0/C1 control characters except `\n` (a `\t` becomes a space); the
+/// zero-width space and the LRM/RLM marks (U+200B, U+200E, U+200F); bidi
+/// embeddings/overrides/isolates (U+202A–U+202E, U+2066–U+2069) and the
+/// Arabic letter mark (U+061C); and the line/paragraph separators (U+2028,
+/// U+2029), which some terminals treat as line breaks. ZWNJ / ZWJ
+/// (U+200C, U+200D) are KEPT: emoji sequences and several scripts need
+/// them. Prevents an extension's text from moving the cursor (`\x1b[3A`,
+/// `\r`) over the host-built header, or disguising text with direction
+/// overrides.
+pub fn sanitize_prompt_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{2028}' | '\u{2029}' => None,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PromptRequest {
     /// Per-session monotonic; actor dedups answers on it.
@@ -450,6 +513,10 @@ pub struct PromptRequest {
     pub title: String,
     pub prompt: String,
     pub raised_at: chrono::DateTime<chrono::Utc>,
+    /// Extension tool-call confirms only: the source extension(s) and tool.
+    /// Absent → "Allow all" is not offered (it could not be scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_scope: Option<ConfirmScope>,
 }
 
 // ── commands, settings, queries ───────────────────────────────────────────────
@@ -1109,6 +1176,19 @@ pub mod reasoning_level_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// prA I-R5 minor: line/paragraph separators and the Arabic letter mark
+    /// are stripped with the other format characters; ZWNJ/ZWJ are kept so
+    /// emoji sequences and scripts that need them render intact.
+    #[test]
+    fn sanitize_prompt_text_strips_separators_keeps_zwj_zwnj() {
+        let input = "a\u{2028}b\u{2029}c\u{061C}d\u{200B}e\u{200E}f\u{200F}g\u{202E}h\u{2067}i\x1bj\tk\nl";
+        assert_eq!(sanitize_prompt_text(input), "abcdefghij k\nl");
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(sanitize_prompt_text(family), family, "ZWJ emoji intact");
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+        assert_eq!(sanitize_prompt_text(persian), persian, "ZWNJ intact");
+    }
 
     #[test]
     fn prompt_kind_from_title() {

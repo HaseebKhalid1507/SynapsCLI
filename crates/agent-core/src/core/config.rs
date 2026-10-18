@@ -505,6 +505,14 @@ impl AuthConfig {
     /// Resolve the credential source. Environment variables take precedence over
     /// config-file values: `SYNAPS_AUTH_ENDPOINT` / `SYNAPS_MACHINE_TOKEN`.
     /// Returns `Remote` iff an endpoint is set (env or config), else `Local`.
+    ///
+    /// The machine token here is only ever the EXPLICIT one (env or config).
+    /// When none is configured it stays empty, and that emptiness is the
+    /// provenance record: the broker client ([`crate::core::auth::MachineToken`])
+    /// then uses — and may re-read after a 401 — the local broker's
+    /// auto-generated `<base_dir>/auth-broker.token`, but only for a loopback
+    /// endpoint (#147 C1, prA N1). An explicit token is never replaced by,
+    /// or sent alongside, the file token.
     pub fn credential_source(&self) -> crate::core::auth::CredentialSource {
         let endpoint = std::env::var("SYNAPS_AUTH_ENDPOINT")
             .ok()
@@ -513,7 +521,7 @@ impl AuthConfig {
         let machine_token = std::env::var("SYNAPS_MACHINE_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.machine_token.clone());
+            .or_else(|| self.machine_token.clone().filter(|s| !s.trim().is_empty()));
         crate::core::auth::CredentialSource::from_parts(endpoint, machine_token)
     }
 }
@@ -4260,6 +4268,51 @@ api_retries = 5
             }
         );
     }
+    /// #147 C1 / prA N1: only an explicit token travels in the source; the
+    /// local file is resolved by the client, for loopback + none configured.
+    #[test]
+    #[serial]
+    fn test_credential_source_records_token_provenance_and_file_is_resolved_lazily() {
+        use crate::core::auth::MachineToken;
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SYNAPS_BASE_DIR");
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path());
+        std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
+        std::env::remove_var("SYNAPS_MACHINE_TOKEN");
+        std::fs::write(dir.path().join("auth-broker.token"), "local-file-tok\n").unwrap();
+        let source = |endpoint: &str, token: Option<&str>| {
+            AuthConfig {
+                remote_endpoint: Some(endpoint.into()),
+                machine_token: token.map(str::to_string),
+                accounts: BTreeMap::new(),
+                auto: BTreeMap::new(),
+            }
+            .credential_source()
+        };
+        let remote_tok = |s: crate::core::auth::CredentialSource| match s {
+            crate::core::auth::CredentialSource::Remote { machine_token, .. } => machine_token,
+            other => panic!("{other:?}"),
+        };
+        // The source carries only the explicit token: empty = "none configured".
+        let loopback = remote_tok(source("http://127.0.0.1:8181", None));
+        let explicit = remote_tok(source("http://127.0.0.1:8181", Some("cfg-tok")));
+        let remote = remote_tok(source("https://jade.jade:8181", None));
+        assert_eq!(loopback, "");
+        assert_eq!(explicit, "cfg-tok");
+        assert_eq!(remote, "");
+        // The client resolves the file only for "none configured" + loopback.
+        let auto = MachineToken::for_endpoint("http://localhost:8181", &loopback);
+        let fixed = MachineToken::for_endpoint("http://127.0.0.1:8181", &explicit);
+        let far = MachineToken::for_endpoint("https://jade.jade:8181", &remote);
+        match prev {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        assert_eq!(auto.get(), "local-file-tok");
+        assert_eq!(fixed.get(), "cfg-tok", "explicit token is never replaced");
+        assert_eq!(far.get(), "", "never read for a non-loopback broker");
+    }
+
     #[test]
     fn config_parses_ultracode_as_distinct_canonical_level() {
         let cfg = load_config_from_str("thinking = ultracode\n");
