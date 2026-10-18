@@ -660,18 +660,34 @@ impl ModelCatalogProvider for MuseCatalogProvider {
     }
 }
 
-/// Minimum spacing between Muse catalog warm-ups in one process, so an id
-/// absent from the live catalog (or a logged-out / failing broker) can never
-/// turn every turn or setting change into a catalog request.
+/// Spacing after a SUCCESSFUL Muse catalog warm-up, so an id absent from the
+/// live catalog can never turn every turn or setting change into a catalog
+/// request.
 const MUSE_WARMUP_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+/// Spacing after a FAILED warm-up (timeout, broker error, not logged in,
+/// unparseable catalog). Short, because without evidence a saved effort
+/// level fails the turn: one failed fetch must not block Muse for 5 minutes.
+const MUSE_WARMUP_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(20);
 /// Upper bound on one warm-up: it runs on the model-change / settings path.
 const MUSE_WARMUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-static MUSE_WARMUP_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// Earliest time the next warm-up may start.
+static MUSE_WARMUP_NEXT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn set_muse_warmup_backoff(backoff: std::time::Duration) {
+    *MUSE_WARMUP_NEXT.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(std::time::Instant::now() + backoff);
+}
 
 #[cfg(test)]
 pub(crate) fn reset_muse_warmup_backoff() {
-    *MUSE_WARMUP_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *MUSE_WARMUP_NEXT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn muse_warmup_retry_in() -> Option<std::time::Duration> {
+    let next = (*MUSE_WARMUP_NEXT.lock().unwrap_or_else(|e| e.into_inner()))?;
+    next.checked_duration_since(std::time::Instant::now())
 }
 
 /// Load live Muse capability evidence for `model` into THIS process.
@@ -682,7 +698,8 @@ pub(crate) fn reset_muse_warmup_backoff() {
 /// well-formed `muse/` id with no live row in this process, fetch the live
 /// catalog once through `broker` and refresh the cache. Bounded: a no-op for
 /// non-Muse / malformed ids or ids already known live; at most one attempt
-/// per [`MUSE_WARMUP_BACKOFF`]; each attempt capped at
+/// per [`MUSE_WARMUP_BACKOFF`] after a success, or per
+/// [`MUSE_WARMUP_FAILURE_BACKOFF`] after a failure; each attempt capped at
 /// [`MUSE_WARMUP_TIMEOUT`]. Never affects routing (shape-based) and never
 /// fails the caller — errors are logged; validation reports the outcome.
 pub async fn ensure_muse_catalog_for(
@@ -699,15 +716,20 @@ pub async fn ensure_muse_catalog_for(
         return;
     }
     {
-        let mut last = MUSE_WARMUP_AT.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|at| at.elapsed() < MUSE_WARMUP_BACKOFF) {
+        let mut next = MUSE_WARMUP_NEXT.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if next.is_some_and(|at| now < at) {
             return;
         }
-        // Claimed BEFORE the request: concurrent callers don't stampede.
-        *last = Some(std::time::Instant::now());
+        // Claimed BEFORE the request (long, covering the in-flight fetch):
+        // concurrent callers don't stampede. A failure shortens it below.
+        *next = Some(now + MUSE_WARMUP_BACKOFF);
     }
+    // Anything but a successful load (including this future being dropped
+    // mid-fetch when the turn is aborted) leaves only the short backoff.
+    let mut failure = WarmupFailureGuard(true);
     let fetch = broker_proxy_catalog_body_via(broker, MUSE_PROVIDER_KEY, MUSE_MODELS_PATH);
-    match tokio::time::timeout(MUSE_WARMUP_TIMEOUT, fetch).await {
+    let loaded = match tokio::time::timeout(MUSE_WARMUP_TIMEOUT, fetch).await {
         Ok(Ok(body)) => match parse_muse_catalog_models(&body) {
             Ok(models) => {
                 let row = models.iter().find(|m| m.id == id);
@@ -718,16 +740,38 @@ pub async fn ensure_muse_catalog_for(
                     "muse catalog loaded for {model}"
                 );
                 capability_cache::replace_provider(MUSE_PROVIDER_KEY, &models);
+                true
             }
-            Err(err) => tracing::warn!("muse catalog warm-up parse failed: {err}"),
+            Err(err) => {
+                tracing::warn!("muse catalog warm-up parse failed: {err}");
+                false
+            }
         },
         Ok(Err(CatalogBrokerError::NotAuthenticated(_))) => {
-            tracing::info!("muse catalog warm-up skipped: no Muse login or META_API_KEY")
+            tracing::info!("muse catalog warm-up skipped: no Muse login or META_API_KEY");
+            false
         }
         Ok(Err(CatalogBrokerError::Failed(err))) => {
-            tracing::warn!("muse catalog warm-up failed: {err}")
+            tracing::warn!("muse catalog warm-up failed: {err}");
+            false
         }
-        Err(_) => tracing::warn!("muse catalog warm-up timed out"),
+        Err(_) => {
+            tracing::warn!("muse catalog warm-up timed out");
+            false
+        }
+    };
+    failure.0 = !loaded;
+}
+
+/// Shortens the in-flight warm-up claim to the failure backoff on drop,
+/// unless the warm-up loaded the catalog.
+struct WarmupFailureGuard(bool);
+
+impl Drop for WarmupFailureGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            set_muse_warmup_backoff(MUSE_WARMUP_FAILURE_BACKOFF);
+        }
     }
 }
 
@@ -1906,6 +1950,84 @@ mod muse_warmup_tests {
             assert_eq!(failing.seen.lock().unwrap().len(), 1);
             assert_eq!(muse_supported_levels("muse-warmup-probe-zz7"), None);
         }
+        fresh();
+    }
+
+    /// Broker whose catalog GET never answers.
+    struct HangingBroker;
+
+    #[async_trait::async_trait]
+    impl CredentialBroker for HangingBroker {
+        async fn access_token(
+            &self,
+            _: crate::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            unreachable!()
+        }
+        async fn proxy(&self, _: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            std::future::pending().await
+        }
+        async fn proxy_stream(&self, _: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+            unreachable!()
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            unreachable!()
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Round-2 m-e: a warm-up dropped mid-fetch (turn aborted) must not keep
+    /// the 300s in-flight claim; it falls back to the short backoff.
+    #[test]
+    fn cancelled_warmup_falls_back_to_the_short_backoff() {
+        let _guard = muse::test_cache_guard();
+        fresh();
+        let dyn_broker: Arc<dyn CredentialBroker> = Arc::new(HangingBroker);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let warm = ensure_muse_catalog_for("muse/muse-warmup-probe-zz7", &dyn_broker);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), warm)
+                        .await
+                        .is_err(),
+                    "the fetch hangs and is dropped"
+                );
+            });
+        let wait = muse_warmup_retry_in().expect("backed off");
+        assert!(wait <= std::time::Duration::from_secs(30), "{wait:?}");
+        fresh();
+    }
+
+    /// 216 I5: one failed warm-up must not block Muse turns that use a
+    /// saved effort level for the full 5 minutes. A failure backs off
+    /// briefly; only a successful load backs off long.
+    #[test]
+    fn failed_warmup_backs_off_briefly_and_success_backs_off_long() {
+        let _guard = muse::test_cache_guard();
+        for err in [
+            BrokerError::Transport("down".into()),
+            BrokerError::NotConfigured("muse".into()),
+        ] {
+            fresh();
+            run("muse/muse-warmup-probe-zz7", &broker(Err(err)));
+            let wait = muse_warmup_retry_in().expect("backed off");
+            assert!(wait <= std::time::Duration::from_secs(30), "{wait:?}");
+            assert!(wait >= std::time::Duration::from_secs(10), "{wait:?}");
+        }
+        // Unparseable catalog: also a failure.
+        fresh();
+        run("muse/muse-warmup-probe-zz7", &broker(Ok("not json")));
+        assert!(muse_warmup_retry_in().unwrap() <= std::time::Duration::from_secs(30));
+
+        fresh();
+        run("muse/not-in-live-catalog-zz8", &broker(Ok(CATALOG)));
+        let wait = muse_warmup_retry_in().expect("backed off");
+        assert!(wait > std::time::Duration::from_secs(240), "{wait:?}");
         fresh();
     }
 }

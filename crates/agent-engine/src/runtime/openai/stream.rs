@@ -3842,10 +3842,18 @@ async fn stream_broker_responses(
             broker.proxy_stream(proxy_request.clone()),
         )
         .await
-        .map_err(|_| "request canceled")?
-        // Privacy (spec §5.1): a broker proxy error may carry an upstream
-        // response-body snippet; redact it to status-only before surfacing.
-        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
+        .map_err(|_| "request canceled")?;
+        // A credential refresh failure keeps its kind as a type (retryable /
+        // action-required vs credential); its text is ours, no upstream bytes.
+        let stream = match stream {
+            Err(crate::auth::BrokerError::Refresh(f)) => {
+                attempt.finish_failed("broker_error", None, None);
+                return Err(Box::new(super::net::BrokerRefreshError::new(f)));
+            }
+            // Privacy (spec §5.1): a broker proxy error may carry an upstream
+            // response-body snippet; redact it to status-only before surfacing.
+            other => other.map_err(|e| super::net::redact_provider_proxy_error(&e.to_string())),
+        };
         let mut stream = match stream {
             Ok(stream) => {
                 attempt.mark_headers();
@@ -4340,6 +4348,85 @@ mod xai_capacity_retry_tests {
         }
         async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
             Ok(vec![])
+        }
+    }
+
+    /// Broker whose `proxy_stream` fails with a typed refresh failure (a
+    /// Muse re-mint that hit the network, a corrupt store).
+    struct RefreshFailingBroker(agent_core::auth::RefreshFailureKind);
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for RefreshFailingBroker {
+        async fn access_token(
+            &self,
+            _p: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            Err(BrokerError::Denied("stub".into()))
+        }
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("stub".into()))
+        }
+        async fn proxy_stream(&self, _r: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Refresh(agent_core::auth::RefreshFailure::new(
+                self.0,
+                "transport error",
+            )))
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("stub".into()))
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Round-2 m-a: the retryable kind is carried as a type through the real
+    /// pipeline (redaction, normalization, classification), not recovered
+    /// from our hint text. Retryable and action-required refresh failures
+    /// are API-side, never "Config error" and never "sign in again".
+    #[tokio::test]
+    async fn broker_refresh_failure_kind_survives_the_stream_pipeline() {
+        use agent_core::auth::RefreshFailureKind as K;
+        for (kind, api) in [
+            (K::Transient, true),
+            (K::LockBusy, true),
+            (K::Other, true),
+            (K::ActionRequired, true),
+            (K::Credential, false),
+        ] {
+            let broker: Arc<dyn crate::auth::CredentialBroker> =
+                Arc::new(RefreshFailingBroker(kind));
+            let cfg = ProviderConfig {
+                base_url: "https://api.meta.ai/v1".to_string(),
+                model: "muse-x".to_string(),
+                provider: "muse".to_string(),
+            };
+            let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let err = call_xai_responses_stream_inner(
+                &cfg,
+                &broker,
+                &[],
+                &None,
+                &[],
+                &tx,
+                None,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                &tokio_util::sync::CancellationToken::new(),
+                0,
+                &crate::runtime::trace::TraceContext::disabled(),
+                true,
+            )
+            .await
+            .unwrap_err();
+            let runtime = super::super::net::provider_error_to_runtime_for("muse/muse-x", err);
+            match (&runtime, api) {
+                (crate::RuntimeError::ApiStatus(m), true) => {
+                    assert!(m.contains("credential refresh failed"), "{kind:?}: {m}");
+                    assert!(!m.contains("Sign in again"), "{kind:?}: {m}");
+                }
+                (crate::RuntimeError::Config(_), false) => {}
+                other => panic!("{kind:?}: {other:?}"),
+            }
         }
     }
 

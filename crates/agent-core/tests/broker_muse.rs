@@ -6,6 +6,8 @@
 //! * A 401 on the minted key runs the broker's rejected-token recovery once
 //!   (here: a peer already re-minted, so the fresh key is adopted with no
 //!   network mint) and retries exactly once — never a loop.
+//! * Every broker here points the Muse key mint at a loopback fake
+//!   (`with_muse_mint_url_for_tests`): no test can reach api.meta.ai.
 //! * `META_API_KEY` overrides the account login for policy-selected requests
 //!   (official CLI semantics); an explicit account stays explicit, and an env
 //!   key is never "recovered".
@@ -59,6 +61,66 @@ fn responses_request(provider: &str) -> ProxyRequest {
         body: Some(json!({ "model": "muse-wonder-1.0", "input": "hi", "stream": false })),
         stream: false,
         body_bytes: None,
+    }
+}
+
+/// A loopback URL nothing listens on: an accidental mint fails locally.
+async fn dead_mint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}/muse-code/key")
+}
+
+/// Muse broker against a fake upstream and a fake (or dead) key mint.
+fn muse_broker(upstream: String, mint: String) -> LocalBroker {
+    LocalBroker::new(reqwest::Client::new())
+        .with_account_policy(AccountPolicy::new())
+        .with_muse_base_url_for_tests(upstream)
+        .with_muse_mint_url_for_tests(mint)
+}
+
+/// Fake key mint: records each request's bearer and answers the next
+/// scripted `(status, body)` (the last one repeats).
+#[derive(Clone)]
+struct Mint {
+    bearers: Arc<Mutex<Vec<String>>>,
+    replies: Arc<Vec<(StatusCode, String)>>,
+}
+
+impl Mint {
+    fn new(replies: &[(StatusCode, &str)]) -> Self {
+        Self {
+            bearers: Arc::default(),
+            replies: Arc::new(replies.iter().map(|(s, b)| (*s, b.to_string())).collect()),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.bearers.lock().unwrap().len()
+    }
+    async fn spawn(&self) -> String {
+        let mint = self.clone();
+        let app = Router::new().route(
+            "/muse-code/key",
+            post(move |headers: HeaderMap| {
+                let mint = mint.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let n = {
+                        let mut b = mint.bearers.lock().unwrap();
+                        b.push(auth);
+                        b.len()
+                    };
+                    let (status, body) = mint.replies[(n - 1).min(mint.replies.len() - 1)].clone();
+                    (status, body).into_response()
+                }
+            }),
+        );
+        format!("{}/muse-code/key", spawn(app).await)
     }
 }
 
@@ -122,9 +184,7 @@ async fn muse_401_adopts_fresh_key_and_retries_exactly_once() {
     let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
     let seen = Seen::default();
     let upstream = spawn(rotating_upstream(seen.clone(), home.path().to_path_buf(), false)).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, dead_mint().await);
 
     let resp = broker.proxy(responses_request("muse")).await.unwrap();
     assert_eq!(resp.status, 200);
@@ -142,9 +202,7 @@ async fn muse_persistent_401_is_returned_after_one_retry() {
     let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
     let seen = Seen::default();
     let upstream = spawn(rotating_upstream(seen.clone(), home.path().to_path_buf(), true)).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, dead_mint().await);
 
     let resp = broker.proxy(responses_request("muse")).await.unwrap();
     assert_eq!(resp.status, 401);
@@ -197,9 +255,7 @@ async fn muse_permanent_401_does_not_mint_inside_the_cooldown() {
     stamp_recent_refresh(home.path(), "muse");
     let seen = Seen::default();
     let upstream = spawn(always_401_upstream(seen.clone())).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, dead_mint().await);
 
     for n in 1..=3 {
         let resp = broker
@@ -213,59 +269,169 @@ async fn muse_permanent_401_does_not_mint_inside_the_cooldown() {
     assert!(seen.auths().iter().all(|a| a == "Bearer KEY-1"), "no new key was minted");
 }
 
-/// Restores proxy-related env vars on drop.
-struct EnvRestore(Vec<(&'static str, Option<String>)>);
-
-impl EnvRestore {
-    fn set(vars: &[(&'static str, &str)]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|(k, v)| {
-                let old = std::env::var(k).ok();
-                std::env::set_var(k, v);
-                (*k, old)
-            })
-            .collect();
-        Self(saved)
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        for (k, old) in &self.0 {
-            match old {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
+/// Upstream that accepts only `good` and rejects every other key.
+fn accepts_only(seen: Seen, good: &'static str) -> Router {
+    Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                seen.push(&headers);
+                let ok = headers.get("authorization").and_then(|v| v.to_str().ok())
+                    == Some(&format!("Bearer {good}"));
+                if ok {
+                    (StatusCode::OK, r#"{"id":"resp_1","status":"completed"}"#).into_response()
+                } else {
+                    (StatusCode::UNAUTHORIZED, UPSTREAM_401_BODY).into_response()
+                }
             }
-        }
-    }
+        }),
+    )
 }
 
-/// Re-mint is allowed (no recent refresh stamp) but the mint itself fails
-/// at the transport (all non-loopback HTTPS goes to a dead proxy, so nothing
-/// leaves the machine): the caller still gets the original upstream 401,
-/// after exactly one upstream call.
+fn stored_muse(home: &std::path::Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(home.join("auth.json")).unwrap();
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["muse"].clone()
+}
+
+/// (a) A real re-mint: the 401 on the stored key mints a new key from the
+/// stored Meta OAuth login (sent only to the mint), persists it, stamps the
+/// account's cooldown, and the request is retried once with the new key.
 #[tokio::test]
 #[serial_test::serial]
-async fn muse_remint_transport_failure_returns_the_original_401() {
+async fn muse_401_remints_from_the_fake_mint_and_retries_once() {
     std::env::remove_var("META_API_KEY");
-    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
-    let _env = EnvRestore::set(&[
-        ("HTTPS_PROXY", "http://127.0.0.1:9"),
-        ("https_proxy", "http://127.0.0.1:9"),
-        ("NO_PROXY", "127.0.0.1,localhost"),
-        ("no_proxy", "127.0.0.1,localhost"),
-    ]);
+    let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[(StatusCode::OK, r#"{"api_key":"KEY-MINTED"}"#)]);
+    let seen = Seen::default();
+    let upstream = spawn(accepts_only(seen.clone(), "KEY-MINTED")).await;
+    let broker = muse_broker(upstream, mint.spawn().await);
+
+    let resp = broker.proxy(responses_request("muse")).await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(seen.auths(), vec!["Bearer KEY-1", "Bearer KEY-MINTED"]);
+    assert_eq!(*mint.bearers.lock().unwrap(), vec!["Bearer META-OAUTH-SECRET"]);
+    let stored = stored_muse(home.path());
+    assert_eq!(stored["access"], "KEY-MINTED");
+    assert_eq!(stored["refresh"], "META-OAUTH-SECRET", "OAuth login is kept");
+    let stamp = std::fs::read_to_string(home.path().join("auth.json.muse.refresh.lock")).unwrap();
+    assert!(stamp.trim().parse::<u64>().is_ok(), "re-mint stamped the cooldown: {stamp:?}");
+}
+
+/// (b) The mint rejects the stored Meta login (401): a credential failure.
+/// The caller gets the ORIGINAL upstream 401 (the runtime's "sign in
+/// again"), inference is not retried, and nothing is written.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_mint_401_returns_the_upstream_401_without_retry() {
+    std::env::remove_var("META_API_KEY");
+    let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#)]);
     let seen = Seen::default();
     let upstream = spawn(always_401_upstream(seen.clone())).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, mint.spawn().await);
 
     let resp = broker.proxy(responses_request("muse")).await.unwrap();
     assert_eq!(resp.status, 401);
     assert_eq!(resp.body, UPSTREAM_401_BODY);
-    assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no retry without a fresh key");
+    assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no inference retry");
+    assert_eq!(mint.calls(), 1);
+    assert_eq!(stored_muse(home.path())["access"], "KEY-1", "nothing persisted");
+}
+
+/// (c) Upstream rejects every key: the first 401 mints once and retries
+/// once; later requests inside the cooldown get the upstream 401 without
+/// minting again. At most one mint per cooldown, however many requests.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_persistent_401_mints_at_most_once_per_cooldown() {
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[
+        (StatusCode::OK, r#"{"api_key":"KEY-M1"}"#),
+        (StatusCode::OK, r#"{"api_key":"KEY-M2"}"#),
+    ]);
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = muse_broker(upstream, mint.spawn().await);
+
+    for _ in 0..3 {
+        let resp = broker.proxy(responses_request("muse")).await.unwrap();
+        assert_eq!(resp.status, 401);
+    }
+    assert_eq!(mint.calls(), 1, "one mint per cooldown");
+    assert_eq!(
+        seen.auths(),
+        vec!["Bearer KEY-1", "Bearer KEY-M1", "Bearer KEY-M1", "Bearer KEY-M1"]
+    );
+}
+
+/// (d) The re-mint fails for a transient reason (mint 503, or no network
+/// at all): not a login problem, so the caller gets a retryable refresh
+/// error, not the upstream 401 ("sign in again"). No inference retry, and
+/// nothing is written.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_transient_mint_failure_is_a_retryable_error() {
+    use agent_core::auth::RefreshFailureKind;
+    std::env::remove_var("META_API_KEY");
+    let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[(StatusCode::SERVICE_UNAVAILABLE, "<html>busy</html>")]);
+    for mint_url in [mint.spawn().await, dead_mint().await] {
+        let seen = Seen::default();
+        let upstream = spawn(always_401_upstream(seen.clone())).await;
+        let broker = muse_broker(upstream, mint_url.clone());
+        let err = broker.proxy(responses_request("muse")).await.unwrap_err();
+        let BrokerError::Refresh(failure) = &err else {
+            panic!("{mint_url}: expected a refresh error, got {err:?}");
+        };
+        assert_eq!(failure.kind, RefreshFailureKind::Transient, "{mint_url}: {err}");
+        let text = err.to_string();
+        assert!(text.contains("retry"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+        assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no inference retry");
+        assert_eq!(stored_muse(home.path())["access"], "KEY-1");
+    }
+    assert_eq!(mint.calls(), 1);
+}
+
+/// The mint says the Meta account needs a plan / payment method: a
+/// billing problem, not the login. The caller gets that instruction (typed
+/// ActionRequired), not the upstream 401 ("sign in again"), and no retry.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_payment_required_is_not_sign_in_again() {
+    use agent_core::auth::RefreshFailureKind;
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[(StatusCode::OK, r#"{"require_payment":true}"#)]);
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = muse_broker(upstream, mint.spawn().await);
+    let err = broker.proxy(responses_request("muse")).await.unwrap_err();
+    let BrokerError::Refresh(failure) = &err else {
+        panic!("expected a refresh error, got {err:?}");
+    };
+    assert_eq!(failure.kind, RefreshFailureKind::ActionRequired, "{err}");
+    assert!(err.to_string().contains("payment method"), "{err}");
+    assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no inference retry");
+}
+
+/// The stream path surfaces the same retryable refresh error.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_stream_transient_mint_failure_is_a_retryable_error() {
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = muse_broker(upstream, dead_mint().await);
+    let err = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(_) => panic!("401 must not stream"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, BrokerError::Refresh(_)), "{err:?}");
+    assert_eq!(seen.auths().len(), 1);
 }
 
 /// `proxy_stream` goes through the same `send`: a refused re-mint surfaces
@@ -279,9 +445,7 @@ async fn muse_stream_refused_remint_surfaces_the_upstream_401() {
     stamp_recent_refresh(home.path(), "muse");
     let seen = Seen::default();
     let upstream = spawn(always_401_upstream(seen.clone())).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, dead_mint().await);
 
     let err = match broker.proxy_stream(responses_request("muse")).await {
         Ok(_) => panic!("401 must not stream"),
@@ -300,9 +464,7 @@ async fn muse_env_key_overrides_login_and_is_never_recovered() {
     std::env::set_var("META_API_KEY", "ENV-KEY");
     let seen = Seen::default();
     let upstream = spawn(rotating_upstream(seen.clone(), home.path().to_path_buf(), true)).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, dead_mint().await);
 
     let resp = broker.proxy(responses_request("muse")).await.unwrap();
     assert_eq!(resp.status, 401);
@@ -338,9 +500,7 @@ async fn muse_catalog_get_is_allowed_and_mint_logout_are_denied() {
         }),
     );
     let upstream = spawn(app).await;
-    let broker = LocalBroker::new(reqwest::Client::new())
-        .with_account_policy(AccountPolicy::new())
-        .with_muse_base_url_for_tests(upstream);
+    let broker = muse_broker(upstream, dead_mint().await);
     let resp = broker
         .proxy(ProxyRequest {
             provider: "muse".into(),
@@ -376,4 +536,86 @@ async fn muse_catalog_get_is_allowed_and_mint_logout_are_denied() {
         assert!(matches!(err, BrokerError::Denied(_)), "{path}: {err:?}");
     }
     assert_eq!(seen.auths().len(), 1, "denied requests never reach upstream");
+}
+
+/// Upstream that sends `chunks` SSE frames `gap` apart, then (if `stall`)
+/// holds the connection open forever without another byte.
+fn dripping_upstream(chunks: usize, gap: std::time::Duration, stall: bool) -> Router {
+    Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            use futures::StreamExt;
+            let frames = futures::stream::iter(0..chunks).then(move |i| async move {
+                if i > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                Ok::<_, std::io::Error>(bytes::Bytes::from(format!("data: {{\"n\":{i}}}\n\n")))
+            });
+            let body = if stall {
+                axum::body::Body::from_stream(frames.chain(futures::stream::pending()))
+            } else {
+                axum::body::Body::from_stream(frames)
+            };
+            (StatusCode::OK, [("content-type", "text/event-stream")], body).into_response()
+        }),
+    )
+}
+
+/// 07-providers I1: a Muse stream that stalls after its headers (silent
+/// NAT drop, a hung edge) ends with a transport error once no byte has
+/// arrived for the idle timeout, instead of hanging the turn forever.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_stalled_stream_hits_the_idle_timeout() {
+    use futures::StreamExt;
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let upstream = spawn(dripping_upstream(1, std::time::Duration::ZERO, true)).await;
+    let broker = muse_broker(upstream, dead_mint().await)
+        .with_stream_idle_timeout_for_tests(std::time::Duration::from_millis(300));
+    let mut stream = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(s) => s,
+        Err(e) => panic!("{e:?}"),
+    };
+    assert!(stream.next().await.unwrap().is_ok(), "first frame arrives");
+    let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("the idle timeout ends the stall, not the test timeout");
+    match next {
+        Some(Err(BrokerError::Transport(_))) => {}
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+/// The idle timeout is between bytes, not a total budget: a stream that
+/// keeps sending runs well past it.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_long_but_live_stream_is_not_cut() {
+    use futures::StreamExt;
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let gap = std::time::Duration::from_millis(150);
+    let upstream = spawn(dripping_upstream(8, gap, false)).await;
+    let broker = muse_broker(upstream, dead_mint().await)
+        .with_stream_idle_timeout_for_tests(std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let mut stream = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(s) => s,
+        Err(e) => panic!("{e:?}"),
+    };
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        text.push_str(std::str::from_utf8(&chunk.expect("no idle timeout")).unwrap());
+    }
+    assert!(started.elapsed() > std::time::Duration::from_millis(900));
+    assert!(text.contains("\"n\":7"), "{text}");
+}
+
+#[test]
+fn broker_stream_idle_timeout_matches_the_runtime_client() {
+    assert_eq!(
+        agent_core::auth::broker::BROKER_STREAM_IDLE_TIMEOUT,
+        std::time::Duration::from_secs(90)
+    );
 }

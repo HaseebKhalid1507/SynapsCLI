@@ -305,11 +305,44 @@ async fn login_with_persist(
     }
 }
 
+/// Overrides for the endpoints a refresh talks to. Empty in production;
+/// tests point the Muse key mint at a loopback fake so a broker-level 401
+/// test can never reach the real mint.
+#[derive(Debug, Clone, Default)]
+pub struct RefreshEndpoints {
+    muse_mint_url: Option<String>,
+}
+
+impl RefreshEndpoints {
+    /// Loopback `http://127.0.0.1` / `localhost` mint URL only; anything
+    /// else is refused at mint time.
+    #[doc(hidden)]
+    pub fn with_muse_mint_url_for_tests(mut self, url: impl Into<String>) -> Self {
+        self.muse_mint_url = Some(url.into());
+        self
+    }
+}
+
+/// [`refresh`] through `endpoints`.
+pub async fn refresh_via(
+    client: &Client,
+    id: OAuthProviderId,
+    refresh: &str,
+    endpoints: &RefreshEndpoints,
+) -> Result<OAuthCredentials, super::token::RefreshFailure> {
+    match (&endpoints.muse_mint_url, id) {
+        (Some(url), OAuthProviderId::Muse) => {
+            super::muse::refresh_token_via_test_mint(url, refresh).await
+        }
+        _ => self::refresh(client, id, refresh).await,
+    }
+}
+
 pub async fn refresh(
     client: &Client,
     id: OAuthProviderId,
     refresh: &str,
-) -> Result<OAuthCredentials, String> {
+) -> Result<OAuthCredentials, super::token::RefreshFailure> {
     match registry()
         .get(id)
         .expect("typed built-in provider")

@@ -288,7 +288,8 @@ where
         None,
         /* require_refresh = */ true,
     )
-    .await?;
+    .await
+    .map_err(GeminiAuthError::into_secret_safe)?;
 
     if let Some(key) = persist_key {
         save_provider_auth(key, &creds)
@@ -306,12 +307,15 @@ async fn wait_for_callback(
 }
 
 /// Refresh grant against the production Google token endpoint.
-pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+pub async fn refresh_token(
+    client: &Client,
+    refresh: &str,
+) -> Result<OAuthCredentials, super::RefreshFailure> {
     if refresh.trim().is_empty() {
-        return Err(GeminiAuthError::EmptyRefreshToken.into_secret_safe());
+        return Err(GeminiAuthError::EmptyRefreshToken.refresh_failure());
     }
-    let registration = GeminiRegistration::production()?;
-    refresh_with_registration(
+    let registration = GeminiRegistration::production().map_err(super::RefreshFailure::credential)?;
+    refresh_with_registration_typed(
         client,
         TOKEN_URL,
         /* allow_http = */ false,
@@ -330,8 +334,27 @@ pub async fn refresh_with_registration(
     registration: &GeminiRegistration,
     refresh: &str,
 ) -> Result<OAuthCredentials, String> {
+    refresh_with_registration_typed(
+        client,
+        token_endpoint,
+        allow_http_token_endpoint,
+        registration,
+        refresh,
+    )
+    .await
+    .map_err(String::from)
+}
+
+/// [`refresh_with_registration`] with the failure kind kept.
+pub async fn refresh_with_registration_typed(
+    client: &Client,
+    token_endpoint: &str,
+    allow_http_token_endpoint: bool,
+    registration: &GeminiRegistration,
+    refresh: &str,
+) -> Result<OAuthCredentials, super::RefreshFailure> {
     if refresh.trim().is_empty() {
-        return Err(GeminiAuthError::EmptyRefreshToken.into_secret_safe());
+        return Err(GeminiAuthError::EmptyRefreshToken.refresh_failure());
     }
     let mut form = vec![
         ("client_id", registration.client_id()),
@@ -350,6 +373,7 @@ pub async fn refresh_with_registration(
         /* require_refresh = */ false,
     )
     .await
+    .map_err(GeminiAuthError::refresh_failure)
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -368,6 +392,22 @@ pub enum GeminiAuthError {
 }
 
 impl GeminiAuthError {
+    /// Typed refresh failure: transport and unusable success bodies are
+    /// transient, a status goes by [`super::token::status_kind`].
+    pub fn refresh_failure(self) -> super::RefreshFailure {
+        use super::token::RefreshFailureKind as K;
+        let kind = match self {
+            Self::TokenRequestFailed(code) => super::token::status_kind(code),
+            Self::Transport
+            | Self::InvalidTokenResponse
+            | Self::EmptyAccessToken
+            | Self::ResponseTooLarge => K::Transient,
+            Self::EmptyRefreshToken => K::Credential,
+            Self::UntrustedEndpoint => K::Other,
+        };
+        super::RefreshFailure::new(kind, self.into_secret_safe())
+    }
+
     fn into_secret_safe(self) -> String {
         match self {
             Self::UntrustedEndpoint => "google-gemini: untrusted endpoint".into(),
@@ -516,17 +556,16 @@ async fn token_post(
     form: &[(&str, &str)],
     previous_refresh: Option<&str>,
     require_refresh: bool,
-) -> Result<OAuthCredentials, String> {
+) -> Result<OAuthCredentials, GeminiAuthError> {
     if allow_http_token_endpoint {
         let url = Url::parse(token_endpoint)
-            .map_err(|_| GeminiAuthError::UntrustedEndpoint.into_secret_safe())?;
+            .map_err(|_| GeminiAuthError::UntrustedEndpoint)?;
         let host = url.host_str().unwrap_or("");
         if !(url.scheme() == "http" && (host == "127.0.0.1" || host == "localhost")) {
-            return Err(GeminiAuthError::UntrustedEndpoint.into_secret_safe());
+            return Err(GeminiAuthError::UntrustedEndpoint);
         }
     } else {
-        validate_google_https_endpoint(token_endpoint)
-            .map_err(GeminiAuthError::into_secret_safe)?;
+        validate_google_https_endpoint(token_endpoint)?;
     }
     // OAuth secrets (refresh tokens, code_verifier, client_secret) must never
     // be replayed to a redirect target. Use a dedicated no-redirect client.
@@ -535,29 +574,28 @@ async fn token_post(
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
+        .map_err(|_| GeminiAuthError::Transport)?;
     let response = no_redirect_client
         .post(token_endpoint)
         .form(form)
         .send()
         .await
-        .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
+        .map_err(|_| GeminiAuthError::Transport)?;
     let status = response.status();
     if !status.is_success() {
-        return Err(GeminiAuthError::TokenRequestFailed(status.as_u16()).into_secret_safe());
+        return Err(GeminiAuthError::TokenRequestFailed(status.as_u16()));
     }
     // Bound the body — never trust upstream to be small.
     let bytes = response
         .bytes()
         .await
-        .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
+        .map_err(|_| GeminiAuthError::Transport)?;
     if bytes.len() > MAX_RESPONSE_BODY_BYTES {
-        return Err(GeminiAuthError::ResponseTooLarge.into_secret_safe());
+        return Err(GeminiAuthError::ResponseTooLarge);
     }
     let body = std::str::from_utf8(&bytes)
-        .map_err(|_| GeminiAuthError::InvalidTokenResponse.into_secret_safe())?;
+        .map_err(|_| GeminiAuthError::InvalidTokenResponse)?;
     credentials_from_token_response(body, previous_refresh, require_refresh)
-        .map_err(GeminiAuthError::into_secret_safe)
 }
 
 #[cfg(test)]
@@ -611,7 +649,7 @@ mod tests {
     async fn refresh_rejects_empty_refresh_without_network() {
         let err = refresh_token(&Client::new(), "").await.unwrap_err();
         // Must fail before registration lookup or any network call.
-        assert!(err.contains("empty refresh token"));
+        assert!(err.message().contains("empty refresh token"));
     }
 
     #[test]

@@ -41,7 +41,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
-use super::{now_millis, open_browser, save_provider_auth, OAuthCredentials};
+use super::{now_millis, open_browser, OAuthCredentials};
 
 // ── Public constants (evidence: muse 1.4.6-R6000.1 binary + mock capture) ────
 
@@ -145,6 +145,9 @@ pub enum MuseAuthError {
     Transport,
     ResponseTooLarge,
     Persist,
+    /// The credential store is corrupt; carries our own repair text
+    /// (path + `mv` command, no secrets).
+    CorruptStore(String),
 }
 
 impl fmt::Display for MuseAuthError {
@@ -167,7 +170,7 @@ impl fmt::Display for MuseAuthError {
             Self::PaymentRequired => write!(
                 f,
                 "your Meta account needs an active Model API plan or payment method — set it \
-                 up at {ONBOARDING_URL}, then run `synaps login --provider muse` again"
+                 up at {ONBOARDING_URL}, then retry"
             ),
             Self::LoginRejected(code) => write!(
                 f,
@@ -178,7 +181,42 @@ impl fmt::Display for MuseAuthError {
             Self::Transport => f.write_str("transport error"),
             Self::ResponseTooLarge => f.write_str("response body too large"),
             Self::Persist => f.write_str("credential persistence failed"),
+            Self::CorruptStore(msg) => f.write_str(msg),
         }
+    }
+}
+
+impl MuseAuthError {
+    /// Login persistence failure: a corrupt store keeps its actionable text.
+    pub(crate) fn from_store(e: super::storage::StoreError) -> Self {
+        match e {
+            super::storage::StoreError::Corrupt(msg) => Self::CorruptStore(msg),
+            _ => Self::Persist,
+        }
+    }
+
+    /// Typed re-mint failure: only a rejected or unfinished Meta login is a
+    /// credential failure; transport, 5xx / 429 and unusable mint bodies are
+    /// transient.
+    pub fn refresh_failure(&self) -> super::RefreshFailure {
+        use super::token::RefreshFailureKind as K;
+        let kind = match self {
+            Self::HttpStatus(code) => super::token::status_kind(*code),
+            // Billing: re-login does not help, and the text says what does.
+            Self::PaymentRequired => K::ActionRequired,
+            Self::LoginRejected(_)
+            | Self::OnboardingRequired
+            | Self::EmptyAccessToken
+            | Self::AccessDenied
+            | Self::Expired => K::Credential,
+            Self::Transport
+            | Self::ResponseTooLarge
+            | Self::InvalidMintResponse
+            | Self::InvalidTokenResponse
+            | Self::EmptyApiKey => K::Transient,
+            _ => K::Other,
+        };
+        super::RefreshFailure::new(kind, self.to_string())
     }
 }
 
@@ -725,7 +763,7 @@ where
         }
     }
     if let Some(key) = persist_key {
-        save_provider_auth(key, &creds).map_err(|_| MuseAuthError::Persist)?;
+        super::storage::save_provider_auth_typed(key, &creds).map_err(MuseAuthError::from_store)?;
     }
     Ok(creds)
 }
@@ -760,12 +798,75 @@ pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, S
 pub async fn refresh_token(
     _client: &Client,
     oauth_access_token: &str,
-) -> Result<OAuthCredentials, String> {
-    let http = ProductionHttp::new().map_err(|e| e.to_string())?;
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let http = ProductionHttp::new().map_err(|e| e.refresh_failure())?;
     mint_credentials(&http, &ProductionClock, oauth_access_token)
         .await
         .map(|(creds, _)| creds)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.refresh_failure())
+}
+
+/// Test seam behind [`super::provider::RefreshEndpoints`]: re-mint against
+/// a loopback fake. The mint request is built exactly as in production
+/// (pinned `MINT_URL` validated, same headers and body); only the socket it
+/// is sent to differs, and only a plain-HTTP loopback URL is accepted.
+pub(crate) async fn refresh_token_via_test_mint(
+    mint_url: &str,
+    oauth_access_token: &str,
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let parsed = Url::parse(mint_url)
+        .map_err(|_| MuseAuthError::UntrustedEndpoint.refresh_failure())?;
+    let loopback = matches!(parsed.host_str(), Some("127.0.0.1") | Some("localhost"));
+    if parsed.scheme() != "http" || !loopback {
+        return Err(MuseAuthError::UntrustedEndpoint.refresh_failure());
+    }
+    let http = LoopbackMintHttp {
+        inner: ProductionHttp::new().map_err(|e| e.refresh_failure())?,
+        mint_url: mint_url.to_string(),
+    };
+    mint_credentials(&http, &ProductionClock, oauth_access_token)
+        .await
+        .map(|(creds, _)| creds)
+        .map_err(|e| e.refresh_failure())
+}
+
+struct LoopbackMintHttp {
+    inner: ProductionHttp,
+    mint_url: String,
+}
+
+#[async_trait]
+impl MuseHttp for LoopbackMintHttp {
+    async fn post_form(&self, _: &str, _: &[(&str, &str)]) -> Result<MuseHttpResponse, MuseAuthError> {
+        Err(MuseAuthError::UntrustedEndpoint)
+    }
+
+    async fn post_json_bearer(
+        &self,
+        url: &str,
+        bearer: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<MuseHttpResponse, MuseAuthError> {
+        validate_mint_endpoint(url)?;
+        let mut req = self
+            .inner
+            .client
+            .post(&self.mint_url)
+            .header("Authorization", format!("Bearer {bearer}"));
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            req = req.header(*name, *value);
+        }
+        let response = req
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|_| MuseAuthError::Transport)?;
+        ProductionHttp::finish(response).await
+    }
 }
 
 // ── Production adapters ──────────────────────────────────────────────────────
@@ -890,7 +991,46 @@ impl MuseBrowser for ProductionBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Billing is fixed outside synaps; the next re-mint just works, so the
+    /// text says "retry", not "log in again".
+    #[test]
+    fn payment_required_text_does_not_send_the_user_to_login() {
+        let text = MuseAuthError::PaymentRequired.to_string();
+        assert!(text.contains(ONBOARDING_URL), "{text}");
+        assert!(text.ends_with("then retry"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+    }
+
+    /// Round-2 I2: a corrupt store at login is reported with its repair
+    /// command, not as "credential persistence failed".
+    #[test]
+    fn login_save_on_a_corrupt_store_says_how_to_fix_it() {
+        use super::super::storage::StoreError;
+        let msg = "/x/auth.json is not valid JSON; mv '/x/auth.json' '/x/auth.json.broken-1'";
+        let err = MuseAuthError::from_store(StoreError::Corrupt(msg.into()));
+        assert_eq!(err.to_string(), msg);
+        assert_eq!(
+            MuseAuthError::from_store(StoreError::Failed("disk full".into())).to_string(),
+            "credential persistence failed"
+        );
+    }
     use std::sync::Mutex;
+
+    /// The mint test seam only ever sends to plain-HTTP loopback.
+    #[tokio::test]
+    async fn test_mint_seam_refuses_non_loopback_urls() {
+        for url in [
+            "https://api.meta.ai/muse-code/key",
+            "http://10.0.0.1/muse-code/key",
+            "https://127.0.0.1/muse-code/key",
+            "http://evil.example/muse-code/key",
+            "not a url",
+        ] {
+            let err = refresh_token_via_test_mint(url, "OAUTH").await.unwrap_err();
+            assert_eq!(err.message(), "untrusted endpoint", "{url}");
+        }
+    }
 
     #[derive(Default)]
     struct FakeClock {

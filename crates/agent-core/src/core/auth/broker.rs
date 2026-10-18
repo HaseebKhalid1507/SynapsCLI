@@ -233,7 +233,16 @@ impl std::fmt::Display for BrokerError {
             ),
             Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
-            Self::Refresh(failure) => write!(f, "credential refresh failed: {failure}"),
+            Self::Refresh(failure) => {
+                use super::token::RefreshFailureKind as K;
+                let hint = match failure.kind {
+                    K::Transient => " (network or provider error, not a login problem; retry shortly)",
+                    K::LockBusy => " (another refresh of this account is still running; retry shortly)",
+                    K::Other => " (retry shortly)",
+                    K::Credential | K::Cooldown { .. } | K::ActionRequired => "",
+                };
+                write!(f, "credential refresh failed{hint}: {failure}")
+            }
             Self::UnknownAccount { provider, label } => write!(
                 f,
                 "unknown account '{label}' for provider '{provider}' (no fallback; run \
@@ -1633,6 +1642,10 @@ pub struct LocalBroker {
     openai_codex_base_url: Option<String>,
     /// Test seam: overrides the pinned Meta Muse API origin.
     muse_base_url: Option<String>,
+    /// Test seam: refresh endpoint overrides (the Muse key mint).
+    refresh_endpoints: super::provider::RefreshEndpoints,
+    /// Idle (between-bytes) timeout for the per-request no-redirect client.
+    stream_idle_timeout: Duration,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
@@ -1692,6 +1705,16 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 /// selection is a spend decision and should rest on a fresh reading.
 pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
+/// Idle timeout between bytes on the broker's per-request no-redirect
+/// client (Muse, Kimi, Gemini, Codex/Anthropic catalog). Matches the runtime
+/// client's 90s read timeout that xAI streams already get.
+pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Gemini (Code Assist) sends no data chunk while it thinks (thought
+/// streaming is off), and a hard prompt can think silently for minutes;
+/// its stream has no retry, so it gets a longer idle limit.
+pub const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
         let cloud_backend = Arc::new(ProductionCloudBackend::new(http.clone()));
@@ -1702,6 +1725,8 @@ impl LocalBroker {
             google_gemini_base_url: None,
             openai_codex_base_url: None,
             muse_base_url: None,
+            refresh_endpoints: Default::default(),
+            stream_idle_timeout: BROKER_STREAM_IDLE_TIMEOUT,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
@@ -1783,6 +1808,33 @@ impl LocalBroker {
     #[doc(hidden)]
     pub fn with_muse_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
         self.muse_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Idle (between-bytes) limit for `provider_key`'s no-redirect client.
+    fn stream_idle_timeout_for(&self, provider_key: &str) -> Duration {
+        if provider_key == "google-gemini" {
+            GEMINI_STREAM_IDLE_TIMEOUT.max(self.stream_idle_timeout)
+        } else {
+            self.stream_idle_timeout
+        }
+    }
+
+    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`] (not Gemini's).
+    #[doc(hidden)]
+    pub fn with_stream_idle_timeout_for_tests(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
+        self
+    }
+
+    /// Test seam: send Muse key re-mints to a loopback fake mint
+    /// (`http://127.0.0.1:<port>/...`) instead of the pinned
+    /// `https://api.meta.ai/muse-code/key`. The request itself (headers,
+    /// body, OAuth bearer) is built exactly as in production.
+    #[doc(hidden)]
+    pub fn with_muse_mint_url_for_tests(mut self, mint_url: impl Into<String>) -> Self {
+        self.refresh_endpoints =
+            std::mem::take(&mut self.refresh_endpoints).with_muse_mint_url_for_tests(mint_url);
         self
     }
 
@@ -2417,12 +2469,14 @@ impl LocalBroker {
         // a peer's fresh key is adopted instead) and the request is retried
         // once. An env-supplied key is never re-minted.
         //
-        // If the re-mint is refused (forced-refresh cooldown) or fails, the
-        // caller gets the ORIGINAL upstream 401 — status and body untouched,
-        // exactly like the env-key path — not a broker error (the
-        // authenticator-gives-up convention). Only the status has been read,
-        // so `response` is still unconsumed here. This covers `proxy` and
-        // `proxy_stream`, which both go through `send`.
+        // If the re-mint is refused (forced-refresh cooldown) or the mint
+        // rejects the stored login, the caller gets the ORIGINAL upstream 401
+        // — status and body untouched, exactly like the env-key path — not a
+        // broker error (the authenticator-gives-up convention). A transient,
+        // lock-busy or local failure is a retryable `BrokerError::Refresh`
+        // instead. Only the status has been read, so `response` is still
+        // unconsumed here. This covers `proxy` and `proxy_stream`, which both
+        // go through `send`.
         if provider_key == "muse" && response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(rejected) = pinned.as_ref() {
                 tracing::info!(credential = %rejected.credential, "muse key rejected (401); re-minting once");
@@ -2437,13 +2491,29 @@ impl LocalBroker {
                             .dispatch(request, provider_key, &key, &base, &pinned)
                             .await;
                     }
+                    // A transient mint failure, a busy refresh lock, a local
+                    // failure or something the user must fix elsewhere (a
+                    // corrupt store) says nothing about the login: surface
+                    // the refresh error, not the upstream 401 (which the
+                    // runtime shows as "sign in again").
+                    Err(BrokerError::Refresh(f))
+                        if f.kind.is_retryable()
+                            || f.kind == super::token::RefreshFailureKind::ActionRequired =>
+                    {
+                        tracing::warn!(
+                            credential = %rejected.credential,
+                            reason = %f,
+                            "muse key re-mint failed; returning a retryable error"
+                        );
+                        return Err(BrokerError::Refresh(f));
+                    }
                     Err(e) => {
                         // Token-free: recovery errors carry sanitized reasons
                         // (cooldown, MuseAuthError labels, lock timeouts).
                         tracing::warn!(
                             credential = %rejected.credential,
                             reason = %e,
-                            "muse key re-mint refused or failed; returning the upstream 401"
+                            "muse key re-mint refused or rejected; returning the upstream 401"
                         );
                     }
                 }
@@ -2470,9 +2540,13 @@ impl LocalBroker {
             || provider_key == "kimi-code"
             || provider_key == "muse"
         {
+            // `read_timeout` is an IDLE timer (reset on every read), so a
+            // long SSE stream that keeps sending is never cut; a stalled one
+            // (silent NAT drop, hung edge) fails instead of hanging the turn.
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
+                .read_timeout(self.stream_idle_timeout_for(provider_key))
                 .build()
                 .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
             match request.method {
@@ -2885,9 +2959,14 @@ impl CredentialBroker for LocalBroker {
         rejected: &str,
     ) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        let creds = super::token::recover_rejected_credential(&self.http, cred, rejected)
-            .await
-            .map_err(BrokerError::Refresh)?;
+        let creds = super::token::recover_rejected_credential(
+            &self.http,
+            cred,
+            rejected,
+            &self.refresh_endpoints,
+        )
+        .await
+        .map_err(BrokerError::Refresh)?;
         Ok(AccessToken {
             token: creds.access,
             expires: creds.expires,
@@ -2904,9 +2983,15 @@ impl CredentialBroker for LocalBroker {
 
     async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        let creds = super::ensure_fresh_credential(&self.http, cred)
-            .await
-            .map_err(BrokerError::Credential)?;
+        let creds =
+            super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
+                .await
+                .map_err(|f| match f.kind {
+                    // Typed so the runtime doesn't send the user to a login
+                    // that would fail on the same store.
+                    super::token::RefreshFailureKind::ActionRequired => BrokerError::Refresh(f),
+                    _ => BrokerError::Credential(f.into()),
+                })?;
         // Strip to token + expiry: the refresh token stays behind the boundary.
         Ok(AccessToken {
             token: creds.access,
@@ -3269,6 +3354,36 @@ impl RemoteBroker {
         })
     }
 
+    /// A non-2xx `/proxy` answer. A 502 whose `error` is a retryable
+    /// `BrokerError::Refresh` from the daemon (it maps those to 502) becomes
+    /// the same typed error, so the client keeps its "retry shortly" hint.
+    /// Only the KIND is read from the body, by matching the exact prefix our
+    /// own Display produces for that kind; the message is static, so no
+    /// broker-controlled byte reaches the Display (spec §5.1).
+    async fn proxy_failure(resp: reqwest::Response, fallback: String) -> BrokerError {
+        if resp.status() != reqwest::StatusCode::BAD_GATEWAY {
+            return BrokerError::Transport(fallback);
+        }
+        let Ok(body) = read_body_capped(resp, 4096).await else {
+            return BrokerError::Transport(fallback);
+        };
+        let text = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        use super::token::{RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let prefix = BrokerError::Refresh(RefreshFailure::new(kind, "")).to_string();
+            if text.starts_with(&prefix) {
+                return BrokerError::Refresh(RefreshFailure::new(
+                    kind,
+                    "the remote credential broker could not refresh this credential",
+                ));
+            }
+        }
+        BrokerError::Transport(fallback)
+    }
+
     async fn post_proxy(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
         let resp = self
@@ -3423,10 +3538,8 @@ impl CredentialBroker for RemoteBroker {
         request.stream = false;
         let resp = self.post_proxy(&request).await?;
         if !resp.status().is_success() {
-            return Err(BrokerError::Transport(format!(
-                "broker proxy returned HTTP {}",
-                resp.status()
-            )));
+            let fallback = format!("broker proxy returned HTTP {}", resp.status());
+            return Err(Self::proxy_failure(resp, fallback).await);
         }
         let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
         serde_json::from_str::<ProxyResponse>(&body)
@@ -3439,11 +3552,10 @@ impl CredentialBroker for RemoteBroker {
         let resp = self.post_proxy(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            // Broker-controlled error body: dropped unread (spec §5.1).
-            drop(resp);
-            return Err(BrokerError::Transport(format!(
-                "broker proxy stream failed: {status}"
-            )));
+            // Broker-controlled error body: only a refresh-failure kind is
+            // recovered from it, never its text (spec §5.1).
+            let fallback = format!("broker proxy stream failed: {status}");
+            return Err(Self::proxy_failure(resp, fallback).await);
         }
         use futures::StreamExt;
         let stream = resp
@@ -4992,6 +5104,77 @@ mod tests {
             assert!(msg.contains(&status.to_string()), "status lost: {msg}");
             assert_no_hostile_bytes(&msg);
         }
+    }
+
+    /// R2-I1: Gemini can think silently for minutes before its first data
+    /// chunk, so its no-redirect client idles longer than everyone else's.
+    #[test]
+    fn gemini_gets_the_longer_stream_idle_timeout() {
+        let broker = LocalBroker::new(reqwest::Client::new());
+        assert_eq!(broker.stream_idle_timeout_for("google-gemini"), Duration::from_secs(300));
+        for key in ["muse", "kimi-code", "openai-codex", "anthropic"] {
+            assert_eq!(broker.stream_idle_timeout_for(key), Duration::from_secs(90), "{key}");
+        }
+        let short = LocalBroker::new(reqwest::Client::new())
+            .with_stream_idle_timeout_for_tests(Duration::from_millis(10));
+        assert_eq!(short.stream_idle_timeout_for("muse"), Duration::from_millis(10));
+        assert!(short.stream_idle_timeout_for("google-gemini") >= Duration::from_secs(300));
+    }
+
+    async fn spawn_remote_broker_body(status: u16, body: String) -> RemoteBroker {
+        use axum::routing::post;
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().route(
+            "/proxy",
+            post(move || {
+                let body = body.clone();
+                async move { (code, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        RemoteBroker::new(
+            format!("http://{addr}"),
+            "opaque-machine-token",
+            reqwest::Client::new(),
+            super::super::TokenCache::new(),
+        )
+    }
+
+    /// Round-2 item 4: the daemon's 502 for a retryable refresh failure
+    /// (a Muse re-mint that hit the network) reaches a remote client as the
+    /// typed retryable refresh error, so the "retry shortly" hint survives.
+    /// Only the kind is taken from the body; the text is static, so a
+    /// hostile broker still can't put its bytes into the Display.
+    #[tokio::test]
+    async fn remote_broker_502_keeps_a_retryable_refresh_failure() {
+        use super::super::token::{RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let daemon_text = BrokerError::Refresh(RefreshFailure::new(
+                kind,
+                format!("HTTP error 503 {HOSTILE_SENTINEL} ECHOED input_schema"),
+            ))
+            .to_string();
+            let body = serde_json::json!({ "error": daemon_text }).to_string();
+            let broker = spawn_remote_broker_body(502, body.clone()).await;
+            let stream_err = broker.proxy_stream(groq_request(true)).await.err().unwrap();
+            let buffered_err = broker.proxy(groq_request(false)).await.unwrap_err();
+            for err in [stream_err, buffered_err] {
+                let BrokerError::Refresh(f) = &err else {
+                    panic!("{kind:?}: expected Refresh, got {err:?}");
+                };
+                assert_eq!(f.kind, kind);
+                let msg = err.to_string();
+                assert!(msg.contains("retry shortly"), "{msg}");
+                assert_no_hostile_bytes(&msg);
+            }
+        }
+        // Anything else in a 502 stays an opaque transport error.
+        let broker = spawn_remote_broker_body(502, hostile_broker_json()).await;
+        let err = broker.proxy_stream(groq_request(true)).await.err().unwrap();
+        assert!(matches!(err, BrokerError::Transport(_)), "{err:?}");
+        assert_no_hostile_bytes(&err.to_string());
     }
 
     /// RemoteBroker::proxy_stream: a non-2xx broker body must never enter the

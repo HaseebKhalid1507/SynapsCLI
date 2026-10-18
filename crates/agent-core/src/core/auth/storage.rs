@@ -34,13 +34,22 @@ pub(crate) fn load_provider_auth_at(
     path: &Path,
     provider: &str,
 ) -> std::result::Result<Option<OAuthCredentials>, String> {
+    load_provider_auth_typed_at(path, provider).map_err(String::from)
+}
+
+/// [`load_provider_auth_at`] that reports an unparseable store as
+/// [`StoreError::Corrupt`].
+pub(crate) fn load_provider_auth_typed_at(
+    path: &Path,
+    provider: &str,
+) -> std::result::Result<Option<OAuthCredentials>, StoreError> {
     if !path.exists() {
         return Ok(None);
     }
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| corrupt_store(path, &e))?;
     let Some(raw) = value.get(provider) else {
         return Ok(None);
     };
@@ -61,8 +70,8 @@ pub fn load_credential(
 /// Persist a credential into exactly one account slot. Other slots (including
 /// the provider's default slot) and any non-secret metadata already stored in
 /// this slot are preserved. A corrupt store is an error — the account path
-/// never resets the file (that would wipe every other slot); only the legacy
-/// single-credential [`save_provider_auth`] keeps the recovery behaviour.
+/// never resets the file (that would wipe every other slot); the legacy
+/// single-credential [`save_provider_auth`] resets only an empty file.
 pub fn save_credential(
     cred: &CredentialRef,
     creds: &OAuthCredentials,
@@ -125,13 +134,28 @@ pub(crate) fn remove_key_at(path: &Path, key: &str) -> std::result::Result<bool,
     // NOTE: the per-credential refresh lock file (`<auth>.<key>.refresh.lock`)
     // is deliberately NOT unlinked here: unlinking a lock file another
     // process may hold defeats flock (a re-created file is a new inode).
-    if !path.exists() {
-        return Ok(false);
-    }
-    with_locked_root(path, false, |root| {
-        let removed = root.remove(key).is_some();
-        Ok((removed, removed))
-    })
+    // The parked-refresh sidecar IS removed: it is a regular file holding a
+    // live refresh token for the account being removed.
+    let removed = if path.exists() {
+        with_locked_root(path, false, |root| {
+            let removed = root.remove(key).is_some();
+            Ok((removed, removed))
+        })?
+    } else {
+        false
+    };
+    let _ = std::fs::remove_file(refresh_pending_path(path, key));
+    Ok(removed)
+}
+
+/// `<auth>.<key>.refresh.pending`: a rotation whose save failed, parked
+/// beside the account's refresh lock (see `token.rs`).
+pub(crate) fn refresh_pending_path(auth_path: &Path, key: &str) -> PathBuf {
+    let file_name = auth_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("auth.json");
+    auth_path.with_file_name(format!("{file_name}.{key}.refresh.pending"))
 }
 
 /// Non-secret metadata stored beside a credential (`label`, `identity`,
@@ -271,6 +295,9 @@ pub enum CasOutcome {
     /// The slot now holds a different credential (re-login while the refresh
     /// was in flight). Nothing was written.
     Replaced,
+    /// The credential file itself is gone (e.g. moved aside by the user).
+    /// Nothing was written.
+    StoreMissing,
 }
 
 /// Write a rotated credential only if the slot still holds the credential
@@ -278,12 +305,26 @@ pub enum CasOutcome {
 /// metadata and, when the rotated credential omits `accountId`, the stored
 /// one. Used by the refresh path so a concurrent removal or re-login is never
 /// overwritten by a stale rotation.
+#[cfg(test)]
 pub(crate) fn save_provider_auth_if_refresh_matches_at(
     path: &Path,
     key: &str,
     expected_refresh: &str,
     creds: &OAuthCredentials,
 ) -> std::result::Result<CasOutcome, String> {
+    save_provider_auth_if_refresh_matches_typed_at(path, key, expected_refresh, creds, STORE_LOCK_WAIT)
+        .map_err(String::from)
+}
+
+/// [`save_provider_auth_if_refresh_matches_at`] that tells a busy store
+/// lock apart from other failures. `wait` bounds the `auth.json.lock` wait.
+pub(crate) fn save_provider_auth_if_refresh_matches_typed_at(
+    path: &Path,
+    key: &str,
+    expected_refresh: &str,
+    creds: &OAuthCredentials,
+    wait: std::time::Duration,
+) -> std::result::Result<CasOutcome, StoreError> {
     let encoded =
         serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
     let fields = encoded
@@ -291,9 +332,9 @@ pub(crate) fn save_provider_auth_if_refresh_matches_at(
         .cloned()
         .ok_or_else(|| "credential did not serialize to an object".to_string())?;
     if !path.exists() {
-        return Ok(CasOutcome::Removed);
+        return Ok(CasOutcome::StoreMissing);
     }
-    with_locked_root(path, false, |root| {
+    with_locked_root_typed(path, false, wait, |root| {
         let Some(entry) = root.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
             return Ok((false, CasOutcome::Removed));
         };
@@ -754,6 +795,32 @@ pub(crate) fn save_static_key_at(
 /// Path-explicit variant of `save_provider_auth`. Splits out the I/O so
 /// the corrupt-file fallback path can be unit-tested without touching the
 /// user's real `~/.synaps-cli/auth.json`.
+/// [`save_provider_auth`] that reports a corrupt store as
+/// [`StoreError::Corrupt`] (provider logins with typed errors).
+pub(crate) fn save_provider_auth_typed(
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), StoreError> {
+    let path = crate::config::resolve_write_path("auth.json");
+    save_provider_auth_typed_at(&path, provider, creds)
+}
+
+pub(crate) fn save_provider_auth_typed_at(
+    path: &std::path::Path,
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), StoreError> {
+    let encoded =
+        serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    let fields = encoded
+        .as_object()
+        .ok_or_else(|| "credential did not serialize to an object".to_string())?;
+    with_locked_root_typed(path, true, STORE_LOCK_WAIT, |root| {
+        merge_provider_fields(root, provider, fields);
+        Ok((true, ()))
+    })
+}
+
 pub(crate) fn save_provider_auth_at(
     path: &std::path::Path,
     provider: &str,
@@ -775,29 +842,38 @@ fn save_provider_fields_at(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
     with_locked_root(path, true, |root| {
-        // Merge known credential fields into an existing provider object rather
-        // than replacing it. Providers may add metadata (including nested objects)
-        // that must survive refresh/login writes.
-        let mut provider_value = root
-            .remove(provider)
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(target) = provider_value.as_object_mut() {
-            for (key, value) in fields {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-        root.insert(provider.to_string(), provider_value);
+        merge_provider_fields(root, provider, fields);
         Ok((true, ()))
     })
+}
+
+/// Merge known credential fields into an existing provider object rather
+/// than replacing it. Providers may add metadata (including nested objects)
+/// that must survive refresh/login writes.
+fn merge_provider_fields(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    provider: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) {
+    let mut provider_value = root
+        .remove(provider)
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(target) = provider_value.as_object_mut() {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    root.insert(provider.to_string(), provider_value);
 }
 
 /// Locked read-modify-write over the auth.json root object.
 ///
 /// Holds the exclusive `auth.json.lock` for the whole cycle, hands the parsed
 /// root to `edit`, and — when `edit` returns `(true, _)` — writes the result
-/// atomically (0600 tmp + rename). `recover_corrupt` selects the login-path
-/// behaviour of resetting an unparseable file (with a backup) versus failing.
+/// atomically (0600 tmp + rename). `recover_corrupt` lets the legacy
+/// single-credential writers reset an EMPTY file (with a backup); any other
+/// unparseable content is always an error.
 fn with_locked_root<T>(
     path: &std::path::Path,
     recover_corrupt: bool,
@@ -805,8 +881,100 @@ fn with_locked_root<T>(
         &mut serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<(bool, T), String>,
 ) -> std::result::Result<T, String> {
-    use fs4::fs_std::FileExt;
+    with_locked_root_typed(path, recover_corrupt, STORE_LOCK_WAIT, edit).map_err(String::from)
+}
 
+/// Longest wait for `auth.json.lock`. A healthy holder keeps it for one
+/// read-merge-fsync-rename (milliseconds); a stopped or wedged process must
+/// not block every saver (and the refresh runtime's workers) forever.
+pub(crate) const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Why a locked store edit failed: the lock stayed held past the deadline,
+/// or anything else (I/O, parse, the edit itself).
+#[derive(Debug)]
+pub(crate) enum StoreError {
+    Busy(String),
+    /// auth.json exists but does not parse; the message names the file and
+    /// the exact command to move it aside (see [`corrupt_store`]).
+    Corrupt(String),
+    Failed(String),
+}
+
+impl From<StoreError> for String {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::Busy(m) | StoreError::Corrupt(m) | StoreError::Failed(m) => m,
+        }
+    }
+}
+
+/// The corrupt-store error: names the file, says why it is not reset, and
+/// gives the exact command to move it aside. Never suggests `synaps login`
+/// on its own: login fails on the same file until it is moved.
+pub(crate) fn corrupt_store(path: &Path, err: &serde_json::Error) -> StoreError {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let p = path.display().to_string();
+    StoreError::Corrupt(format!(
+        "{p} is not valid JSON ({err}); synaps will not overwrite it because it may hold other \
+         accounts. Move it aside with `mv {} {}`, then log in again (or repair it by hand).",
+        shell_quote(&p),
+        shell_quote(&format!("{p}.broken-{ts}"))
+    ))
+}
+
+/// POSIX single-quote `s` for a copy-pasteable command.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+impl From<String> for StoreError {
+    fn from(m: String) -> Self {
+        StoreError::Failed(m)
+    }
+}
+
+/// Poll `try_lock_exclusive` until `wait` runs out.
+fn lock_store_exclusive(
+    lock_file: &std::fs::File,
+    lock_path: &std::path::Path,
+    wait: std::time::Duration,
+) -> std::result::Result<(), StoreError> {
+    use fs4::fs_std::FileExt;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match FileExt::try_lock_exclusive(lock_file) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(StoreError::Failed(format!(
+                    "Failed to lock {}: {}",
+                    lock_path.display(),
+                    e
+                )))
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(StoreError::Busy(format!(
+                "timed out after {}s waiting for {} (another synaps process holds it)",
+                wait.as_secs(),
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn with_locked_root_typed<T>(
+    path: &std::path::Path,
+    recover_corrupt: bool,
+    wait: std::time::Duration,
+    edit: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<(bool, T), String>,
+) -> std::result::Result<T, StoreError> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -824,21 +992,21 @@ fn with_locked_root<T>(
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("Failed to open lock file {}: {}", lock_path.display(), e))?;
-    FileExt::lock_exclusive(&lock_file)
-        .map_err(|e| format!("Failed to lock {}: {}", lock_path.display(), e))?;
+    lock_store_exclusive(&lock_file, &lock_path, wait)?;
 
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        // Corrupt-file recovery: if the existing auth.json is not a JSON
-        // object (truncated write, manual edit error, swap-file detritus),
-        // log a warning and start fresh rather than refusing to save the
-        // new credential. The alternative is permanently locking the user
-        // out of `synaps login`.
+        // Corrupt-file recovery is limited to a file with nothing in it
+        // (zero-length or whitespace, e.g. a crash before the first write):
+        // that holds no account to lose. Anything else that does not parse
+        // (a truncated write, a manual edit error) may still hold every
+        // named slot's refresh token; resetting it would log the user out
+        // of all of them, so it is an error for the user to repair.
         match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content) {
             Ok(map) => map,
-            Err(e) if !recover_corrupt => {
-                return Err(format!("Failed to parse {}: {}", path.display(), e));
+            Err(e) if !recover_corrupt || !content.trim().is_empty() => {
+                return Err(corrupt_store(path, &e));
             }
             Err(e) => {
                 tracing::warn!(
@@ -985,40 +1153,61 @@ mod tests {
         assert!(parsed.get("openai-codex").is_some());
     }
 
+    /// 147 I4: a corrupt multi-account store is never reset by a legacy
+    /// save (it would drop every named slot). The save fails and the file is
+    /// left exactly as it was, for the user to repair.
     #[test]
-    fn save_provider_auth_at_recovers_from_corrupt_file() {
-        // Pre-fix: a corrupt auth.json would lock the user out of
-        // `synaps login` entirely because save_provider_auth would fail
-        // to parse and bail. After fix: corrupt content is replaced with
-        // a fresh structure containing the new credential.
+    fn legacy_save_refuses_to_reset_a_corrupt_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("auth.json");
-        std::fs::write(&path, "this is not json {{{").unwrap();
-        save_provider_auth_at(&path, "openai-codex", &fresh_creds())
-            .expect("save must succeed even on corrupt input");
-        let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&content).expect("file must now contain valid JSON");
-        assert!(parsed.get("openai-codex").is_some());
-        assert!(
-            parsed.get("anthropic").is_none(),
-            "corrupt fallback discards old (unrecoverable) entries"
-        );
+        // A truncated multi-account store.
+        let corrupt = r#"{"anthropic":{"type":"oauth","refresh":"r1"},"anthropic@work":{"type":"oau"#;
+        std::fs::write(&path, corrupt).unwrap();
+        for save in [
+            save_provider_auth_at(&path, "openai-codex", &fresh_creds()),
+            save_static_key_at(&path, "groq", "gsk-1"),
+        ] {
+            let err = save.expect_err("must not reset a corrupt store");
+            assert!(err.contains("not valid JSON"), "{err}");
+            assert!(err.contains("other accounts"), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt, "file untouched");
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".corrupt."))
+            .count();
+        assert_eq!(backups, 0, "nothing reset, nothing to back up");
     }
 
     #[test]
-    fn save_provider_auth_at_recovers_from_array_root() {
-        // auth.json was a JSON array (perhaps from a botched migration).
-        // Treat it as corrupt — same recovery as garbage input.
+    fn legacy_save_refuses_a_non_object_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("auth.json");
         std::fs::write(&path, "[1, 2, 3]").unwrap();
         save_provider_auth_at(&path, "openai-codex", &fresh_creds())
-            .expect("save must succeed against non-object root");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(parsed.is_object());
-        assert!(parsed.get("openai-codex").is_some());
+            .expect_err("a non-object root may still hold data");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1, 2, 3]");
+    }
+
+    /// An empty / whitespace-only file holds nothing to lose: it is reset
+    /// (with the usual `.corrupt.<ts>` backup) so `synaps login` still works.
+    #[test]
+    fn legacy_save_resets_an_empty_store_with_a_backup() {
+        for content in ["", "  \n\t "] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("auth.json");
+            std::fs::write(&path, content).unwrap();
+            save_provider_auth_at(&path, "openai-codex", &fresh_creds())
+                .expect("empty store is reset");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(parsed.get("openai-codex").is_some());
+            let backups = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".corrupt."))
+                .count();
+            assert_eq!(backups, 1, "{content:?}");
+        }
     }
 
     // ── Broker-owned static-key storage ──────────────────────────────────────
@@ -1629,11 +1818,12 @@ mod tests {
             CasOutcome::Removed
         );
         assert!(read_root(&path).get(key).is_none());
-        // Missing file: nothing is created either.
+        // Missing file: nothing is created either (and the caller can tell
+        // a missing store from a removed slot).
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             save_provider_auth_if_refresh_matches_at(&path, key, "x", &creds("x", None)).unwrap(),
-            CasOutcome::Removed
+            CasOutcome::StoreMissing
         );
         assert!(!path.exists());
     }
@@ -1741,5 +1931,140 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+}
+
+/// m2: a wedged process holding `auth.json.lock` must not block a saver
+/// (and with it a refresh-runtime worker) forever.
+#[cfg(test)]
+mod store_lock_wait_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn hold_store_lock(path: &Path) -> std::fs::File {
+        use fs4::fs_std::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .unwrap();
+        assert!(FileExt::try_lock_exclusive(&lock).unwrap());
+        lock
+    }
+
+    #[test]
+    fn store_lock_wait_has_a_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let _held = hold_store_lock(&path);
+        let started = Instant::now();
+        let err = with_locked_root_typed(&path, false, Duration::from_millis(200), |_| {
+            Ok((false, ()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Busy(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(String::from(err).contains("auth.json.lock"));
+    }
+
+    #[test]
+    fn store_lock_is_taken_once_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let held = hold_store_lock(&path);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        with_locked_root_typed(&path, false, Duration::from_secs(10), |_| Ok((false, ())))
+            .expect("lock is acquired after the holder lets go");
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn production_store_lock_wait_is_bounded() {
+        assert!(STORE_LOCK_WAIT >= Duration::from_secs(5));
+        assert!(STORE_LOCK_WAIT <= Duration::from_secs(30));
+    }
+}
+
+/// Round-2 I2: a corrupt store is a typed error that names the file and the
+/// exact command to move it aside, on the legacy, account and load paths.
+#[cfg(test)]
+mod corrupt_store_error_tests {
+    use super::*;
+
+    fn assert_actionable(msg: &str, path: &Path) {
+        let p = path.display().to_string();
+        assert!(msg.contains(&format!("mv '{p}' '{p}.broken-")), "{msg}");
+        assert!(msg.contains("not valid JSON"), "{msg}");
+        assert!(!msg.contains("synaps login"), "{msg}");
+    }
+
+    #[test]
+    fn corrupt_store_error_names_the_file_and_the_mv_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{\"anthropic\":{").unwrap();
+        let cred = CredentialRef::parse_storage_key("anthropic@work").unwrap();
+        let creds = OAuthCredentials {
+            auth_type: "oauth".into(),
+            refresh: "r".into(),
+            access: "a".into(),
+            expires: 1,
+            account_id: None,
+        };
+        // Legacy (login) save and account-scoped save: same text.
+        assert_actionable(&save_provider_auth_at(&path, "kimi-code", &creds).unwrap_err(), &path);
+        assert_actionable(&save_credential_at(&path, &cred, &creds).unwrap_err(), &path);
+        // Typed: both the login save and the load say Corrupt.
+        for err in [
+            save_provider_auth_typed_at(&path, "muse", &creds).unwrap_err(),
+            load_provider_auth_typed_at(&path, "anthropic").unwrap_err(),
+        ] {
+            let StoreError::Corrupt(msg) = err else {
+                panic!("expected Corrupt, got {err:?}");
+            };
+            assert_actionable(&msg, &path);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"anthropic\":{");
+    }
+
+    #[test]
+    fn shell_quoting_survives_a_quote_in_the_path() {
+        assert_eq!(shell_quote("/a/it's/auth.json"), r#"'/a/it'\''s/auth.json'"#);
+    }
+}
+
+/// R2-m1: removing an account also removes its parked refresh sidecar (a
+/// live refresh token for an account the user removed).
+#[cfg(test)]
+mod remove_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_slot_deletes_its_refresh_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"anthropic@work":{"type":"oauth"},"anthropic":{"type":"oauth"}}"#)
+            .unwrap();
+        let work = refresh_pending_path(&path, "anthropic@work");
+        let other = refresh_pending_path(&path, "anthropic");
+        assert_eq!(
+            work,
+            dir.path().join("auth.json.anthropic@work.refresh.pending")
+        );
+        std::fs::write(&work, "{}").unwrap();
+        std::fs::write(&other, "{}").unwrap();
+        assert!(remove_key_at(&path, "anthropic@work").unwrap());
+        assert!(!work.exists(), "removed slot's sidecar is gone");
+        assert!(other.exists(), "other slots keep theirs");
+        // Even when the slot was already gone from the store.
+        std::fs::write(&work, "{}").unwrap();
+        assert!(!remove_key_at(&path, "anthropic@work").unwrap());
+        assert!(!work.exists());
     }
 }
