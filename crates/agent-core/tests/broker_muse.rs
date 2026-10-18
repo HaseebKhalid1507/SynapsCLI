@@ -151,6 +151,54 @@ async fn muse_persistent_401_is_returned_after_one_retry() {
     assert_eq!(seen.auths().len(), 2, "one recovery retry, never a loop");
 }
 
+/// Upstream that rejects every key and never rotates storage: the stored
+/// key stays the rejected one, so recovery would have to re-mint.
+fn always_401_upstream(seen: Seen) -> Router {
+    Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                seen.push(&headers);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    r#"{"error":{"code":"invalid_api_key","type":"authentication_error"}}"#,
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+/// The Muse 401 re-mint runs through the single locked refresh path and its
+/// per-credential forced-refresh cooldown: auth.json was just written
+/// (`install_store`, i.e. "another process rotated it"), so no request mints
+/// a new key — none reaches the network mint (which would fail here) and
+/// every request makes exactly one upstream call. A permanent 401 therefore
+/// never mints on every request.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_permanent_401_does_not_mint_inside_the_cooldown() {
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_account_policy(AccountPolicy::new())
+        .with_muse_base_url_for_tests(upstream);
+
+    for n in 1..=3 {
+        let err = broker
+            .proxy(responses_request("muse"))
+            .await
+            .expect_err("recovery is refused by the cooldown");
+        let msg = err.to_string();
+        assert!(msg.contains("not refreshing again"), "{msg}");
+        assert!(!msg.contains("KEY-1") && !msg.contains("META-OAUTH"), "{msg}");
+        assert_eq!(seen.auths().len(), n, "one upstream call, no retry, per request");
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn muse_env_key_overrides_login_and_is_never_recovered() {
