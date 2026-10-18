@@ -334,7 +334,7 @@ pub fn confirms_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
             } else {
                 CommandResult::Output(format!(
                     "\"Allow all\" is armed for: {}. Their tool-call confirms are auto-approved \
-                     (subagents included). /confirms reset revokes.",
+                     until /new. /confirms reset revokes.",
                     ids.join(", ")
                 ))
             }
@@ -345,7 +345,7 @@ pub fn confirms_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
                 CommandResult::Output("Nothing to revoke: no extension had \"Allow all\".".to_string())
             } else {
                 CommandResult::Output(format!(
-                    "Revoked \"Allow all\" for: {}. Their confirms prompt again (subagents included).",
+                    "Revoked \"Allow all\" for: {}. Their confirms prompt again.",
                     revoked.join(", ")
                 ))
             }
@@ -1318,7 +1318,7 @@ mod tests {
 
         worker
             .session_allow_all()
-            .allow(&["jev".to_string(), "audit".to_string()]);
+            .allow(&[("jev".to_string(), 0), ("audit".to_string(), 0)]);
         let text = command_text(handle_engine_command("confirms", "status", &mut runtime));
         assert!(text.contains("jev") && text.contains("audit"), "{text}");
 

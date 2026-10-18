@@ -374,9 +374,9 @@ impl HookEvent {
 /// What an extension handler returns after processing a hook event.
 ///
 /// The runtime resolves multiple handlers by precedence:
-/// - `Block` and `Modify` stop the handler chain for `before_tool_call`.
-/// - `Confirm` does not: later handlers still run so a later `Block` wins;
-///   confirms are merged and resolved after the whole chain.
+/// - For `before_tool_call` only `Block` stops the handler chain. `Modify`
+///   rewrites the input that later handlers see; `Confirm` is merged and
+///   resolved after the whole chain (a `Modify` after it is ignored).
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -405,12 +405,22 @@ pub enum HookResult {
         message: String,
         #[serde(skip)]
         sources: Vec<String>,
+        /// Host-set load generation of each source (parallel to `sources`;
+        /// missing entries mean 0). Part of the latch key, so a plugin
+        /// reinstalled under the same id starts unlatched.
+        #[serde(skip)]
+        generations: Vec<u64>,
         #[serde(skip)]
         tool: Option<String>,
+        /// Host-set: the input as rewritten by `Modify` results earlier in
+        /// the chain. Approval runs THIS input (never extension-settable).
+        #[serde(skip)]
+        modified_input: Option<Value>,
     },
     /// Replace the tool **input** before execution (structured JSON args).
     /// Only valid on before_tool_call hooks. The output-side counterpart is
-    /// [`HookResult::Replace`]. The first modifier stops the handler chain.
+    /// [`HookResult::Replace`]. Does not stop the chain: later handlers see
+    /// (and may block or confirm) the modified input.
     Modify { input: Value },
     /// Replace the tool **output** after execution (flat string), before it
     /// enters history. Only valid on after_tool_call hooks. The input-side
@@ -439,7 +449,9 @@ impl HookResult {
         Self::Confirm {
             message: message.into(),
             sources: Vec::new(),
+            generations: Vec::new(),
             tool: None,
+            modified_input: None,
         }
     }
 }
@@ -770,7 +782,9 @@ mod tests {
         let r = HookResult::Confirm {
             message: "Run this command?".to_string(),
             sources: vec!["host-stamped".into()],
+            generations: vec![3],
             tool: Some("bash".into()),
+            modified_input: Some(serde_json::json!({"x": 1})),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -787,7 +801,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(&spoof, HookResult::Confirm { sources, tool: None, .. } if sources.is_empty()),
+            matches!(&spoof, HookResult::Confirm { sources, tool: None, modified_input: None, .. } if sources.is_empty()),
             "{spoof:?}"
         );
     }
@@ -875,7 +889,9 @@ mod tests {
                 HookResult::Confirm {
                     message: "m".into(),
                     sources: vec![],
+                    generations: vec![],
                     tool: None,
+                    modified_input: None,
                 },
             ),
             (

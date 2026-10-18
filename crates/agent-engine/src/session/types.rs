@@ -470,9 +470,8 @@ impl ConfirmScope {
     /// The exact reach of "Allow all", shown before the user answers.
     pub fn allow_all_scope(&self) -> String {
         format!(
-            "Allow all: every later confirm from {} (any tool) is auto-approved for this \
-             session, subagents included, until /new or /confirms reset. Other extensions \
-             still ask.",
+            "Allow all: later confirms from {} (any tool) are approved without asking until \
+             /new or /confirms reset. Other extensions still ask.",
             self.extensions_label()
         )
     }

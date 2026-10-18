@@ -611,11 +611,13 @@ mod codex_ultra_worker_tests {
         use crate::extensions::hooks::events::HookResult;
         use std::sync::Arc;
 
-        let jev = vec!["jev".to_string()];
+        let jev = vec![("jev".to_string(), 0u64)];
         let confirm_from = |source: &str| HookResult::Confirm {
             message: "worker action".into(),
             sources: vec![source.to_string()],
             tool: Some("bash".into()),
+            generations: vec![],
+            modified_input: None,
         };
         let parent = crate::Runtime::new_headless();
         let mut independent = crate::Runtime::new_headless();

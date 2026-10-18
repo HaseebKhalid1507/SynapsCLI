@@ -69,7 +69,7 @@ pub use registry::{
     DeferredToolSplit, DroppedSessionMember, SessionSchemaProjection, ToolRegistry,
 };
 pub use respond::RespondTool;
-pub use confirm_latch::SessionConfirmLatch;
+pub use confirm_latch::{latch_keys, LatchKey, SessionConfirmLatch};
 pub use secret_prompt::SecretPromptQueue;
 pub use secret_prompt::{
     ConfirmChoice, ConfirmScope, PromptKind, SecretPromptHandle, SecretPromptRequest,

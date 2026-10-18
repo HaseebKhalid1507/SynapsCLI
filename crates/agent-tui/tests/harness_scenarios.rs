@@ -2048,12 +2048,12 @@ fn scenario_confirm_tool_call_offers_allow_all_button() {
     );
     assert!(frame.contains("[ Deny (n) ]"), "{frame}");
     // The scope is stated BEFORE the answer, not after.
-    let flat: String = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat: String = frame.split_whitespace().filter(|t| *t != "\u{2503}").collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains("every later confirm from jev (any tool) is auto-approved"),
+        flat.contains("later confirms from jev (any tool) are approved without asking"),
         "scope line:\n{frame}"
     );
-    assert!(flat.contains("subagents included"), "scope covers subagents:\n{frame}");
+    assert!(!flat.contains("subagents"), "no claim about subagents (they run no hooks):\n{frame}");
     assert!(flat.contains("Other extensions still ask"), "{frame}");
     assert!(flat.contains("until /new or /confirms reset"), "revocation is stated:\n{frame}");
     assert!(frame.contains("y allow · a allow all · n/esc deny"), "footer:\n{frame}");

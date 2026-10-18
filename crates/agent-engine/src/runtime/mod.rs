@@ -86,6 +86,24 @@ pub async fn emit_before_tool_call(
 /// extensions (only) are auto-approved without a prompt.
 pub use crate::tools::CONFIRM_ANSWER_ALLOW_ALL;
 
+/// Longest extension `message` shown in a Confirm prompt (chars / lines).
+/// The host-built header and the dialog's buttons and scope line must stay
+/// visible, so a long or hostile message is cut with a marker.
+const MAX_CONFIRM_MESSAGE_CHARS: usize = 1200;
+const MAX_CONFIRM_MESSAGE_LINES: usize = 12;
+
+fn cap_confirm_message(message: &str) -> std::borrow::Cow<'_, str> {
+    let lines: Vec<&str> = message.lines().collect();
+    let over_lines = lines.len() > MAX_CONFIRM_MESSAGE_LINES;
+    let over_chars = message.chars().count() > MAX_CONFIRM_MESSAGE_CHARS;
+    if !over_lines && !over_chars {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let kept = lines[..lines.len().min(MAX_CONFIRM_MESSAGE_LINES)].join("\n");
+    let kept: String = kept.chars().take(MAX_CONFIRM_MESSAGE_CHARS).collect();
+    std::borrow::Cow::Owned(format!("{kept}\n…[message truncated by host]"))
+}
+
 /// Prompt body for an extension tool-call Confirm: the host-known source and
 /// tool lead, so an extension's own `message` cannot hide who is asking.
 fn confirm_prompt_body(message: &str, sources: &[String], tool: Option<&str>) -> String {
@@ -95,17 +113,31 @@ fn confirm_prompt_body(message: &str, sources: &[String], tool: Option<&str>) ->
         sources.join(", ")
     };
     format!(
-        "Extension: {source}\nTool: {}\n\n{message}\n\nAllow this tool call?",
-        tool.unwrap_or("(unknown)")
+        "Extension: {source}\nTool: {}\n\n{}\n\nAllow this tool call?",
+        tool.unwrap_or("(unknown)"),
+        cap_confirm_message(message)
     )
+}
+
+/// What an approved Confirm runs: the input as modified earlier in the hook
+/// chain, if any (`Modify`), else the original (`Continue`).
+fn approved(
+    modified_input: Option<Value>,
+) -> crate::extensions::hooks::events::HookResult {
+    match modified_input {
+        Some(input) => crate::extensions::hooks::events::HookResult::Modify { input },
+        None => crate::extensions::hooks::events::HookResult::Continue,
+    }
 }
 
 /// Resolve a before_tool_call result that may request user confirmation.
 ///
 /// When `auto_approve_confirms` is true, or every source extension of the
-/// Confirm has been latched by an earlier "Allow all" answer, `Confirm` is
-/// short-circuited to `Continue`. Headless/non-interactive callers with
-/// neither fail closed.
+/// Confirm (same load generation) has been latched by an earlier "Allow
+/// all" answer, `Confirm` is short-circuited to approval. Headless /
+/// non-interactive callers with neither fail closed. "Allow all" is only
+/// offered (a `ConfirmScope` is attached) when this call site has a latch
+/// to arm; otherwise the dialog offers Allow / Deny only.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
@@ -116,19 +148,22 @@ pub async fn resolve_before_tool_call_result(
         crate::extensions::hooks::events::HookResult::Confirm {
             message,
             sources,
+            generations,
             tool,
+            modified_input,
         } => {
+            let keys = crate::tools::latch_keys(&sources, &generations);
             if auto_approve_confirms {
                 tracing::info!(message = %message, "confirm auto-approved (auto_approve_confirms=true)");
-                return crate::extensions::hooks::events::HookResult::Continue;
+                return approved(modified_input);
             }
-            if session_allow_all.is_some_and(|latch| latch.allows_all(&sources)) {
+            if session_allow_all.is_some_and(|latch| latch.allows_all(&keys)) {
                 tracing::info!(
                     message = %message,
                     extensions = ?sources,
                     "confirm auto-approved (extension allow-all latched)"
                 );
-                return crate::extensions::hooks::events::HookResult::Continue;
+                return approved(modified_input);
             }
 
             let Some(prompt) = secret_prompt else {
@@ -140,9 +175,13 @@ pub async fn resolve_before_tool_call_result(
                 };
             };
 
-            let scope = (!sources.is_empty()).then(|| crate::session::ConfirmScope {
-                extensions: sources.clone(),
-                tool: tool.clone(),
+            // No latch on this path → no scope → no Allow-all button, so the
+            // dialog and the "armed" notice never promise what can't happen.
+            let scope = (session_allow_all.is_some() && !sources.is_empty()).then(|| {
+                crate::session::ConfirmScope {
+                    extensions: sources.clone(),
+                    tool: tool.clone(),
+                }
             });
             let response = prompt
                 .prompt_scoped(
@@ -156,22 +195,22 @@ pub async fn resolve_before_tool_call_result(
                 Some(answer)
                     if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
                 {
-                    crate::extensions::hooks::events::HookResult::Continue
+                    approved(modified_input)
                 }
                 Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
                     match session_allow_all {
-                        Some(latch) if latch.allow(&sources) => tracing::warn!(
+                        Some(latch) if latch.allow(&keys) => tracing::warn!(
                             extensions = ?sources,
-                            "user chose Allow all: confirms from these extensions are auto-approved for the rest of this session"
+                            "user chose Allow all: confirms from these extensions are auto-approved for the rest of this conversation"
                         ),
                         Some(_) => tracing::warn!(
-                            "user chose Allow all on an unattributed confirm; approving this call only"
+                            "user chose Allow all on an unattributed or revoked confirm; approving this call only"
                         ),
                         None => tracing::warn!(
                             "user chose Allow all but this path has no session latch; approving this call only"
                         ),
                     }
-                    crate::extensions::hooks::events::HookResult::Continue
+                    approved(modified_input)
                 }
                 _ => crate::extensions::hooks::events::HookResult::Block {
                     reason: format!("Tool call confirmation denied: {}", message),
@@ -1697,7 +1736,7 @@ impl Runtime {
     /// stream/worker clones cannot grant consent to the next conversation.
     /// Ordinary turns and linked compaction successors must not call this.
     pub fn begin_conversation(&mut self, id: Option<String>) {
-        self.session_allow_all.clear();
+        self.session_allow_all.revoke();
         self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
         self.set_session_id(id);
     }
@@ -5468,6 +5507,10 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
+    fn key(ids: &[&str]) -> Vec<crate::tools::LatchKey> {
+        ids.iter().map(|s| (s.to_string(), 0)).collect()
+    }
+
     fn sourced_confirm(
         message: &str,
         source: &str,
@@ -5477,6 +5520,8 @@ mod tests {
             message: message.into(),
             sources: ext(&[source]),
             tool: Some(tool.into()),
+            generations: vec![],
+            modified_input: None,
         }
     }
 
@@ -5494,9 +5539,9 @@ mod tests {
             parent.session_allow_all(),
             independent.session_allow_all()
         ));
-        cloned.session_allow_all().allow(&ext(&["jev"]));
-        assert!(parent.session_allow_all().allows_all(&ext(&["jev"])));
-        assert!(!independent.session_allow_all().allows_all(&ext(&["jev"])));
+        cloned.session_allow_all().allow(&key(&["jev"]));
+        assert!(parent.session_allow_all().allows_all(&key(&["jev"])));
+        assert!(!independent.session_allow_all().allows_all(&key(&["jev"])));
     }
 
     #[test]
@@ -5504,7 +5549,7 @@ mod tests {
         use std::sync::Arc;
         let mut runtime = Runtime::new_headless();
         let old_worker = runtime.clone();
-        old_worker.session_allow_all().allow(&ext(&["jev"]));
+        old_worker.session_allow_all().allow(&key(&["jev"]));
 
         runtime.begin_conversation(Some("next".into()));
         assert_eq!(runtime.session_id(), Some("next"));
@@ -5519,13 +5564,15 @@ mod tests {
             old_worker.session_allow_all().is_empty(),
             "old latch must be cleared, not just replaced"
         );
-        // An old clone arming its latch cannot grant the new conversation.
-        old_worker.session_allow_all().allow(&ext(&["jev"]));
+        // An old clone can neither grant the new conversation nor re-arm
+        // the revoked (orphaned) set.
+        assert!(!old_worker.session_allow_all().allow(&key(&["jev"])));
+        assert!(old_worker.session_allow_all().is_empty());
         assert!(runtime.session_allow_all().is_empty());
 
         let new_worker = runtime.clone();
-        new_worker.session_allow_all().allow(&ext(&["jev"]));
-        assert!(runtime.session_allow_all().allows_all(&ext(&["jev"])));
+        new_worker.session_allow_all().allow(&key(&["jev"]));
+        assert!(runtime.session_allow_all().allows_all(&key(&["jev"])));
         // Explicit resume of even the same ID starts fresh consent.
         runtime.begin_conversation(Some("next".into()));
         assert!(runtime.session_allow_all().is_empty());
@@ -5540,13 +5587,13 @@ mod tests {
         use std::sync::Arc;
         let mut runtime = Runtime::new_headless();
         let worker = runtime.clone();
-        worker.session_allow_all().allow(&ext(&["jev"]));
+        worker.session_allow_all().allow(&key(&["jev"]));
         runtime.set_session_id(Some("linked-successor".into()));
         assert!(Arc::ptr_eq(
             runtime.session_allow_all(),
             worker.session_allow_all()
         ));
-        assert!(runtime.session_allow_all().allows_all(&ext(&["jev"])));
+        assert!(runtime.session_allow_all().allows_all(&key(&["jev"])));
     }
 
     /// "Allow all from <ext>": the answer continues THIS call and latches
@@ -5623,6 +5670,75 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// Latched A + unlatched B on one call (a merged Confirm): it prompts,
+    /// the prompt names both, and "Allow all" then latches both.
+    #[tokio::test]
+    async fn latched_plus_unlatched_source_prompts_and_allow_all_latches_both() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&key(&["a"]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.expect("must prompt: b is not latched");
+            assert_eq!(
+                req.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+                Some(vec!["a".to_string(), "b".to_string()])
+            );
+            assert!(req.prompt.starts_with("Extension: a, b\n"), "{}", req.prompt);
+            let _ = req.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let merged = || crate::extensions::hooks::events::HookResult::Confirm {
+            message: "[a] x\n\n[b] y".into(),
+            sources: ext(&["a", "b"]),
+            generations: vec![],
+            tool: Some("bash".into()),
+            modified_input: None,
+        };
+        let first = resolve_before_tool_call_result(merged(), Some(&handle), false, Some(&latch)).await;
+        task.await.unwrap();
+        assert!(matches!(first, crate::extensions::hooks::events::HookResult::Continue));
+        assert!(latch.allows_all(&key(&["a", "b"])));
+        // Now fully latched: no prompt (handle dropped → would block).
+        drop(handle);
+        let second = resolve_before_tool_call_result(merged(), None, false, Some(&latch)).await;
+        assert!(matches!(second, crate::extensions::hooks::events::HookResult::Continue));
+    }
+
+    /// A call site with no latch never offers "Allow all" (no scope), so the
+    /// dialog and the session's "armed" notice can't promise it.
+    #[tokio::test]
+    async fn no_latch_means_no_allow_all_scope() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert!(req.confirm_scope.is_none());
+            let _ = req.response_tx.send(Some("y".into()));
+        });
+        let r = resolve_before_tool_call_result(
+            sourced_confirm("Run?", "jev", "bash"),
+            Some(&handle),
+            false,
+            None,
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(r, crate::extensions::hooks::events::HookResult::Continue));
+    }
+
+    /// A long extension message is capped so the host header, buttons and
+    /// scope line stay on screen.
+    #[test]
+    fn long_confirm_message_is_capped() {
+        let long = "x\n".repeat(500);
+        let body = confirm_prompt_body(&long, &ext(&["jev"]), Some("bash"));
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"));
+        assert!(body.contains("…[message truncated by host]"));
+        assert!(body.lines().count() <= MAX_CONFIRM_MESSAGE_LINES + 7, "{}", body.lines().count());
+        let wide = "y".repeat(10_000);
+        assert!(confirm_prompt_body(&wide, &ext(&["jev"]), None).chars().count() < 1400);
+    }
+
     /// An unattributed confirm (no host-stamped source) offers no scope and
     /// an "always" answer approves only this call; nothing is latched.
     #[tokio::test]
@@ -5656,7 +5772,7 @@ mod tests {
     #[tokio::test]
     async fn session_allow_all_does_not_override_block() {
         let latch = crate::tools::SessionConfirmLatch::new();
-        latch.allow(&ext(&["jev"]));
+        latch.allow(&key(&["jev"]));
         let blocked = resolve_before_tool_call_result(
             crate::extensions::hooks::events::HookResult::Block {
                 reason: "nope".into(),

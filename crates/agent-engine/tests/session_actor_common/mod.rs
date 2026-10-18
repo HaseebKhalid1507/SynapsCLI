@@ -356,6 +356,8 @@ impl agent_engine::Tool for ConfirmFixtureTool {
                 message: "run it?".into(),
                 sources: vec!["jev".into()],
                 tool: Some("bash".into()),
+                generations: vec![],
+                modified_input: None,
             },
             Some(&handle),
             false,

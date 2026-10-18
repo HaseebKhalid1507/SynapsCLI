@@ -88,6 +88,11 @@ pub struct HandlerRegistration {
 /// the handler list, and registration takes a write lock only briefly.
 pub struct HookBus {
     handlers: RwLock<HashMap<HookKind, Vec<HandlerRegistration>>>,
+    /// Per-extension-id load generation, bumped by [`Self::unsubscribe_all`]
+    /// (unload / reload / reinstall). Stamped on every `Confirm` so the
+    /// "Allow all" latch keys on (id, generation): a different plugin later
+    /// installed under the same id does not inherit an earlier consent.
+    generations: std::sync::Mutex<HashMap<String, u64>>,
     /// Context injected by `on_session_start` handlers, held for the lifetime
     /// of the session.
     ///
@@ -108,7 +113,18 @@ impl HookBus {
         Self {
             handlers: RwLock::new(HashMap::new()),
             session_injection: RwLock::new(HashMap::new()),
+            generations: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Current load generation of `extension_id` (0 until first unloaded).
+    pub fn extension_generation(&self, extension_id: &str) -> u64 {
+        self.generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(extension_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Record context injected by an `on_session_start` handler for
@@ -186,12 +202,16 @@ impl HookBus {
     /// Returns the first `Block` result if any handler blocks, otherwise
     /// returns `Continue`. Handlers are called in registration order.
     ///
-    /// `Confirm` does not stop the chain (#148 I1): later handlers still
-    /// run, so a later `Block` wins even when the confirming extension is
-    /// already latched. Confirms are merged (all sources, all messages) and
-    /// returned last. A `Modify` after a pending `Confirm` is ignored — the
-    /// user is asked about the original input, as when Confirm stopped the
-    /// chain.
+    /// For `before_tool_call` only `Block` ends the chain (#148 I1):
+    /// - `Modify` rewrites the input and the chain continues; every later
+    ///   handler sees (and vets) the modified input, and the final input is
+    ///   returned as `Modify` unless something blocks or confirms.
+    /// - `Confirm` is recorded and the chain continues, so a later `Block`
+    ///   wins even when the confirming extension is already latched.
+    ///   Confirms are merged (all sources, all messages) and returned last,
+    ///   carrying any input modified BEFORE the first Confirm.
+    /// - A `Modify` after a pending `Confirm` is ignored (logged at warn):
+    ///   the user confirms the input as it stood when they were asked.
     ///
     /// If no handlers are registered for this hook, returns immediately
     /// (the no-extensions fast path).
@@ -215,13 +235,21 @@ impl HookBus {
         let mut context_phase: Option<String> = None;
         // (source extension id, message) for every Confirm, in chain order.
         let mut confirms: Vec<(String, String)> = Vec::new();
+        // (id, load generation) per distinct confirming extension.
+        let mut source_keys: Vec<(String, u64)> = Vec::new();
+
+        // Input rewritten by an earlier Modify (#148 I1 / prA I1). Later
+        // handlers see — and vet — the MODIFIED input, so a Modify can no
+        // longer smuggle unchecked input past a later Block or Confirm.
+        let mut modified_event: Option<HookEvent> = None;
 
         for reg in &registrations {
+            let ev: &HookEvent = modified_event.as_ref().unwrap_or(event);
             // Tool-specific filter: skip handlers that don't match.
             // Check both API name and runtime name so MCP tools with
             // sanitized names (slashes→underscores) still match.
             if let Some(ref filter) = reg.tool_filter {
-                let matches = match (&event.tool_name, &event.tool_runtime_name) {
+                let matches = match (&ev.tool_name, &ev.tool_runtime_name) {
                     (Some(api), Some(runtime)) => filter == api || filter == runtime,
                     (Some(api), None) => filter == api,
                     (None, Some(runtime)) => filter == runtime,
@@ -233,14 +261,14 @@ impl HookBus {
             }
 
             if let Some(ref matcher) = reg.matcher {
-                if !matcher.matches(event) {
+                if !matcher.matches(ev) {
                     continue;
                 }
             }
 
             // Call handler with timeout
             let handler = reg.handler.clone();
-            let event_clone = event.clone();
+            let event_clone = ev.clone();
             let trace_enabled = extensions_trace_enabled();
             let started_at = trace_enabled.then(Instant::now);
             let result = tokio::time::timeout(HANDLER_TIMEOUT, handler.handle(&event_clone)).await;
@@ -257,7 +285,7 @@ impl HookBus {
                         let action = hook_result_action(hook_result);
                         tracing::info!(
                             extension_trace = true,
-                            hook = %event.kind.as_str(),
+                            hook = %ev.kind.as_str(),
                             extension = %reg.handler.id(),
                             action = action,
                             duration_ms = duration_ms,
@@ -269,7 +297,7 @@ impl HookBus {
                     Err(_) => {
                         tracing::warn!(
                             extension_trace = true,
-                            hook = %event.kind.as_str(),
+                            hook = %ev.kind.as_str(),
                             extension = %reg.handler.id(),
                             action = "timeout",
                             duration_ms = duration_ms,
@@ -283,9 +311,9 @@ impl HookBus {
             }
 
             match result {
-                Ok(result) if !event.kind.allows_result(&result) => {
+                Ok(result) if !ev.kind.allows_result(&result) => {
                     tracing::warn!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
                         action = hook_result_action(&result),
                         "Extension returned action not allowed for hook — ignoring"
@@ -294,7 +322,7 @@ impl HookBus {
                 }
                 Ok(HookResult::Block { reason }) => {
                     tracing::info!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
                         reason = %reason,
                         "Hook blocked by extension"
@@ -304,7 +332,7 @@ impl HookBus {
                 Ok(HookResult::Continue) => {}
                 Ok(HookResult::Inject { content }) => {
                     tracing::debug!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
                         len = content.len(),
                         "Extension injected context"
@@ -314,19 +342,25 @@ impl HookBus {
                 }
                 Ok(HookResult::Modify { input }) => {
                     if !confirms.is_empty() {
+                        // The user is asked about the input as it stood at
+                        // the first Confirm; a rewrite after that point
+                        // would run something they never saw.
                         tracing::warn!(
-                            hook = %event.kind.as_str(),
+                            hook = %ev.kind.as_str(),
                             extension = %reg.handler.id(),
-                            "Extension Modify after a pending Confirm — ignoring (the original input is confirmed)"
+                            confirming = ?confirms.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                            "Extension Modify after a pending Confirm IGNORED: the user confirms the input as it was when the first Confirm was raised"
                         );
                         continue;
                     }
                     tracing::info!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
-                        "Hook modified tool input by extension"
+                        "Hook modified tool input by extension; later handlers vet the modified input"
                     );
-                    return HookResult::Modify { input };
+                    let mut next = ev.clone();
+                    next.tool_input = Some(input);
+                    modified_event = Some(next);
                 }
                 Ok(HookResult::Replace { output }) => {
                     // Two-key gate: subscribing to after_tool_call needs
@@ -336,15 +370,15 @@ impl HookBus {
                     // preserved) and continue the chain.
                     if !reg.permissions.has(Permission::ToolsTransformOutput) {
                         tracing::warn!(
-                            hook = %event.kind.as_str(),
+                            hook = %ev.kind.as_str(),
                             extension = %reg.handler.id(),
                             "Extension returned Replace without tools.transform_output permission — ignoring transform"
                         );
                         continue;
                     }
-                    let observed_len = event.tool_output.as_ref().map_or(0, String::len);
+                    let observed_len = ev.tool_output.as_ref().map_or(0, String::len);
                     tracing::info!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
                         observed_len,
                         replacement_len = output.len(),
@@ -355,8 +389,8 @@ impl HookBus {
                     // failed audit write must not break the tool flow.
                     let _ = crate::extensions::audit::record_tool_output_replace(
                         reg.handler.id(),
-                        event.kind.as_str(),
-                        event.tool_name.clone(),
+                        ev.kind.as_str(),
+                        ev.tool_name.clone(),
                         observed_len,
                         output.len(),
                     );
@@ -365,7 +399,7 @@ impl HookBus {
                 }
                 Ok(HookResult::Confirm { message, .. }) => {
                     tracing::info!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
                         "Hook requested confirmation by extension"
                     );
@@ -373,16 +407,20 @@ impl HookBus {
                     // the dialog key on the extension that actually asked.
                     // Keep going: a later Block must still win.
                     confirms.push((reg.handler.id().to_string(), message));
+                    let id = reg.handler.id();
+                    if !source_keys.iter().any(|(k, _)| k == id) {
+                        source_keys.push((id.to_string(), self.extension_generation(id)));
+                    }
                 }
                 Ok(HookResult::ContextPhase { phase }) => {
                     // Advisory only — never stops the chain. Two-key gated;
                     // an ignored report is a plain continue.
-                    if let Some(phase) = accept_context_phase(reg, event.kind, phase) {
+                    if let Some(phase) = accept_context_phase(reg, ev.kind, phase) {
                         if context_phase.is_none() {
                             context_phase = Some(phase);
                         } else {
                             tracing::debug!(
-                                hook = %event.kind.as_str(),
+                                hook = %ev.kind.as_str(),
                                 extension = %reg.handler.id(),
                                 "Extension context_phase superseded by an earlier report — ignoring"
                             );
@@ -391,7 +429,7 @@ impl HookBus {
                 }
                 Err(_timeout) => {
                     tracing::warn!(
-                        hook = %event.kind.as_str(),
+                        hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
                         timeout_secs = HANDLER_TIMEOUT.as_secs(),
                         "Hook handler timed out — skipping"
@@ -416,17 +454,18 @@ impl HookBus {
                     .collect::<Vec<_>>()
                     .join("\n\n")
             };
-            let mut sources: Vec<String> = Vec::new();
-            for (id, _) in confirms {
-                if !sources.contains(&id) {
-                    sources.push(id);
-                }
-            }
+            let sources = source_keys.iter().map(|(id, _)| id.clone()).collect();
+            let generations = source_keys.iter().map(|(_, g)| *g).collect();
             return HookResult::Confirm {
                 message,
                 sources,
+                generations,
                 tool,
+                modified_input: modified_event.and_then(|e| e.tool_input),
             };
+        }
+        if let Some(input) = modified_event.and_then(|e| e.tool_input) {
+            return HookResult::Modify { input };
         }
 
         // Merge accumulated injections from all handlers. An advisory phase
@@ -544,7 +583,9 @@ impl HookBus {
                     return HookResult::Confirm {
                         message,
                         sources: vec![reg.handler.id().to_string()],
+                        generations: vec![self.extension_generation(reg.handler.id())],
                         tool: event.tool_runtime_name.clone().or_else(|| event.tool_name.clone()),
+                        modified_input: None,
                     };
                 }
                 Ok(result @ HookResult::ContextPhase { .. }) => {
@@ -587,6 +628,12 @@ impl HookBus {
 
     /// Remove all handlers for a given extension ID.
     pub async fn unsubscribe_all(&self, extension_id: &str) {
+        *self
+            .generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(extension_id.to_string())
+            .or_insert(0) += 1;
         let mut handlers = self.handlers.write().await;
         for regs in handlers.values_mut() {
             regs.retain(|r| r.handler.id() != extension_id);
@@ -1237,7 +1284,7 @@ mod tests {
         );
         let bus = bus_with(vec![confirmer, blocker.clone()]).await;
         let latch = crate::tools::SessionConfirmLatch::new();
-        latch.allow(&["jev".to_string()]);
+        latch.allow(&[("jev".to_string(), 0)]);
         let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
         let decision = crate::runtime::resolve_before_tool_call_decision(
             serde_json::json!({}),
@@ -1254,6 +1301,164 @@ mod tests {
         ));
     }
 
+    /// Records the `tool_input` it was shown, then returns `result`.
+    struct InputSeen {
+        id: String,
+        seen: std::sync::Mutex<Option<serde_json::Value>>,
+        result: HookResult,
+    }
+    #[async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for InputSeen {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            *self.seen.lock().unwrap() = event.tool_input.clone();
+            self.result.clone()
+        }
+        async fn shutdown(&self) {}
+    }
+    fn input_seen(id: &str, result: HookResult) -> Arc<InputSeen> {
+        Arc::new(InputSeen {
+            id: id.into(),
+            seen: std::sync::Mutex::new(None),
+            result,
+        })
+    }
+    fn modify(cmd: &str) -> HookResult {
+        HookResult::Modify {
+            input: serde_json::json!({ "command": cmd }),
+        }
+    }
+    async fn bus_of(handlers: Vec<Arc<dyn crate::extensions::runtime::ExtensionHandler>>) -> HookBus {
+        let bus = HookBus::new();
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+        for h in handlers {
+            bus.subscribe(HookKind::BeforeToolCall, h, None, None, perms.clone())
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    /// prA I1: a Modify no longer ends the chain. A later Block sees the
+    /// MODIFIED input and still wins.
+    #[tokio::test]
+    async fn modify_then_block_blocks_and_blocker_vets_modified_input() {
+        let blocker = input_seen(
+            "policy",
+            HookResult::Block {
+                reason: "veto".into(),
+            },
+        );
+        let bus = bus_of(vec![input_seen("rewriter", modify("rm -rf /")), blocker.clone()]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "ls"}));
+        assert!(matches!(bus.emit(&event).await, HookResult::Block { reason } if reason == "veto"));
+        assert_eq!(
+            blocker.seen.lock().unwrap().clone(),
+            Some(serde_json::json!({"command": "rm -rf /"})),
+            "the blocker must vet the rewritten input, not the original"
+        );
+    }
+
+    /// Modify then Confirm: the user is still asked, and approval runs the
+    /// modified input.
+    #[tokio::test]
+    async fn modify_then_confirm_prompts_with_modified_input() {
+        let confirmer = input_seen("jev", HookResult::confirm("ok?"));
+        let bus = bus_of(vec![input_seen("rewriter", modify("echo safe")), confirmer.clone()]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "ls"}));
+        let result = bus.emit(&event).await;
+        assert_eq!(
+            confirmer.seen.lock().unwrap().clone(),
+            Some(serde_json::json!({"command": "echo safe"}))
+        );
+        match &result {
+            HookResult::Confirm {
+                sources,
+                modified_input,
+                ..
+            } => {
+                assert_eq!(sources, &vec!["jev".to_string()]);
+                assert_eq!(
+                    modified_input,
+                    &Some(serde_json::json!({"command": "echo safe"}))
+                );
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+        // Approved (here: auto-approve) → the MODIFIED input runs.
+        let decision = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({"command": "ls"}),
+            result,
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            decision,
+            crate::runtime::BeforeToolCallDecision::Continue { input }
+                if input == serde_json::json!({"command": "echo safe"})
+        ));
+    }
+
+    /// Two modifiers compose in order; with nothing else, the final input is
+    /// returned as a Modify.
+    #[tokio::test]
+    async fn modifiers_compose_and_final_input_is_returned() {
+        let second = input_seen("second", modify("two"));
+        let bus = bus_of(vec![input_seen("first", modify("one")), second.clone()]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "zero"}));
+        assert!(matches!(
+            bus.emit(&event).await,
+            HookResult::Modify { input } if input == serde_json::json!({"command": "two"})
+        ));
+        assert_eq!(
+            second.seen.lock().unwrap().clone(),
+            Some(serde_json::json!({"command": "one"}))
+        );
+    }
+
+    /// Unloading / reinstalling an extension under the same id bumps its
+    /// load generation, so a latch armed for the old instance doesn't match.
+    #[tokio::test]
+    async fn reinstall_under_same_id_gets_a_new_confirm_generation() {
+        let bus = bus_with(vec![TestHandler::new("jev", HookResult::confirm("ok?"))]).await;
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        let gens = |r: HookResult| match r {
+            HookResult::Confirm { generations, .. } => generations,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(gens(bus.emit(&event).await), vec![0]);
+        bus.unsubscribe_all("jev").await;
+        bus.subscribe(
+            HookKind::BeforeToolCall,
+            TestHandler::new("jev", HookResult::confirm("ok?")),
+            None,
+            None,
+            perms_with(&[Permission::ToolsIntercept]),
+        )
+        .await
+        .unwrap();
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&[("jev".to_string(), 0)]);
+        let result = bus.emit(&event).await;
+        let decision = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({}),
+            result.clone(),
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert_eq!(gens(result), vec![1]);
+        assert!(
+            matches!(decision, crate::runtime::BeforeToolCallDecision::Block { .. }),
+            "old consent must not carry over to the reinstalled extension"
+        );
+    }
+
     /// A Modify after a pending Confirm is not applied (the user is asked to
     /// confirm the original call) — same outcome as before, when the chain
     /// stopped at the Confirm.
@@ -1268,7 +1473,10 @@ mod tests {
         );
         let bus = bus_with(vec![confirmer, modifier]).await;
         let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
-        assert!(matches!(bus.emit(&event).await, HookResult::Confirm { .. }));
+        assert!(matches!(
+            bus.emit(&event).await,
+            HookResult::Confirm { modified_input: None, .. }
+        ), "Confirm→Modify: the modify is ignored (logged), the original input is confirmed");
     }
 
     #[tokio::test]
@@ -1285,6 +1493,7 @@ mod tests {
                 message,
                 sources,
                 tool,
+                ..
             } => {
                 assert_eq!(message, "Run ls?");
                 assert_eq!(sources, vec!["jev".to_string()]);
@@ -1353,9 +1562,10 @@ mod tests {
         assert_eq!(after.calls(), 0); // never reached
     }
 
+    /// prA I1 (was `modify_stops_chain`, which pinned the bypass): a later
+    /// Block still runs after a Modify, and wins.
     #[tokio::test]
-    async fn modify_stops_chain() {
-        let bus = HookBus::new();
+    async fn modify_does_not_stop_chain_later_block_wins() {
         let modifier = TestHandler::new(
             "modifier",
             HookResult::Modify {
@@ -1365,32 +1575,15 @@ mod tests {
         let after = TestHandler::new(
             "after",
             HookResult::Block {
-                reason: "should not run".into(),
+                reason: "vetoed".into(),
             },
         );
-        let perms = perms_with(&[Permission::ToolsIntercept]);
-
-        bus.subscribe(
-            HookKind::BeforeToolCall,
-            modifier.clone(),
-            None,
-            None,
-            perms.clone(),
-        )
-        .await
-        .unwrap();
-        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, None, perms)
-            .await
-            .unwrap();
-
+        let bus = bus_with(vec![modifier.clone(), after.clone()]).await;
         let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "rm -rf /"}));
         let result = bus.emit(&event).await;
-
-        assert!(
-            matches!(result, HookResult::Modify { input } if input == serde_json::json!({"command": "echo safe"}))
-        );
+        assert!(matches!(result, HookResult::Block { reason } if reason == "vetoed"));
         assert_eq!(modifier.calls(), 1);
-        assert_eq!(after.calls(), 0); // never reached
+        assert_eq!(after.calls(), 1);
     }
 
     #[tokio::test]

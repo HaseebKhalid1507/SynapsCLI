@@ -634,9 +634,9 @@
     "aliases": [],
     "keywords": ["confirm", "allow all", "approve", "revoke", "consent", "extension"],
     "lines": [
-      "When an extension asks you to confirm a tool call, the dialog names the extension and the tool. \"Allow all from <ext> this session\" auto-approves later confirms from that extension only (any tool), subagents included. Other extensions still ask, and a block from any extension still wins.",
-      "/confirms (or /confirms status) lists the extensions with \"Allow all\" armed. /confirms reset revokes them all at once, including for subagents already running.",
-      "/new and resuming a session also start with nothing armed. Only the input owner can choose \"Allow all\"; every attached client is told when it is armed."
+      "When an extension asks you to confirm a tool call, the dialog names the extension and the tool. \"Allow all from <ext> this session\" auto-approves later confirms from that loaded extension only (any tool), until /new or /confirms reset; reloading or reinstalling the extension clears it. Other extensions still ask, and a block from any extension still wins. Note: subagent tool calls do not run extension before_tool_call hooks today, so extension confirms and blocks do not apply to them at all.",
+      "/confirms (or /confirms status) lists the extensions with \"Allow all\" armed. /confirms reset revokes them all at once.",
+      "/new and resuming a session also start with nothing armed. Only the input owner can choose \"Allow all\" (focus the button with Tab or the arrow keys and press Enter); every attached client is told when it is armed."
     ],
     "related": ["/extensions"]
   },

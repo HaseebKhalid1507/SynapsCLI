@@ -3621,9 +3621,8 @@ impl SessionActor {
                     None => "the host".to_string(),
                 };
                 self.emit(SessionEventWire::SystemNotice(format!(
-                    "Allow all armed by {by}: tool-call confirms from {} are auto-approved for \
-                     the rest of this session (subagents included). Other extensions still ask. \
-                     /confirms reset revokes.",
+                    "Allow all armed by {by}: tool-call confirms from {} are auto-approved \
+                     until /new. Other extensions still ask. /confirms reset revokes.",
                     scope.extensions_label()
                 )));
             }

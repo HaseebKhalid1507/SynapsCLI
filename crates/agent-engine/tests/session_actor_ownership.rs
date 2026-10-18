@@ -216,7 +216,7 @@ async fn confirm_answers_are_owner_gated_and_allow_all_is_announced() {
     .unwrap();
     let armed = |e: &SessionEventWire| {
         matches!(e, SessionEventWire::SystemNotice(n)
-            if n.contains("Allow all") && n.contains("jev") && n.contains("subagents"))
+            if n.contains("Allow all") && n.contains("jev") && n.contains("/confirms reset"))
     };
     until(&mut o, armed).await;
     until(&mut b, armed).await;
