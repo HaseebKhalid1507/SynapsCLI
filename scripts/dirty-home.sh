@@ -47,7 +47,10 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 
 dirty="$(mktemp -d "${TMPDIR:-/tmp}/synaps-dirty-home.XXXXXX")"
-trap 'rm -rf "$dirty"' EXIT
+log="$(mktemp "${TMPDIR:-/tmp}/synaps-dirty-home-log.XXXXXX")"
+# The seeded HOME is made read-only for the run (below); restore write
+# permission first or `rm -rf` can't remove it.
+trap 'chmod -R u+w "$dirty" 2>/dev/null; rm -rf "$dirty" "$log"' EXIT
 
 mkdir -p "$dirty/.synaps-cli"
 chmod 700 "$dirty/.synaps-cli"
@@ -85,6 +88,14 @@ fingerprint() {
 # Build first, under the normal HOME, so the dirty HOME sees only test runs.
 cargo test "$@" --no-run
 
+# Read-only for the run, so a test that tries to create something here
+# fails AT THAT POINT, under its own name, instead of only showing up as an
+# anonymous diff at the end. The file logger, for example, panics with
+# "initializing rolling file appender failed" when it can't create
+# synaps.log.<date>. Not a substitute for the diff below: a writer that
+# ignores the error is still caught there.
+chmod a-w "$dirty" "$dirty/.synaps-cli"
+
 before="$(fingerprint)"
 
 # Unset anything that would pin the base dir and hide the dirty HOME.
@@ -92,9 +103,18 @@ unset SYNAPS_BASE_DIR SYNAPS_PROFILE
 # A failing test must not skip the write check: run it either way, then
 # report cargo's status.
 status=0
-HOME="$dirty" USERPROFILE="$dirty" bash "$SCRIPT_DIR/cargo-test-nonzero.sh" "$@" || status=$?
+HOME="$dirty" USERPROFILE="$dirty" bash "$SCRIPT_DIR/cargo-test-nonzero.sh" "$@" 2>&1 \
+    | tee "$log" || status=$?  # pipefail: cargo's status, not tee's
 
 after="$(fingerprint)"
+# A subprocess (a spawned `synaps`) that hit the read-only HOME may have
+# had its stderr captured by its test, which could still pass. Its panic
+# text reaches this log only when the child's stderr was inherited, so
+# this is best effort; the diff below remains the backstop.
+if grep -n "initializing rolling file appender failed" "$log" >&2; then
+    echo "::error::a test or a process it spawned tried to create its log file in the seeded HOME (see the lines above for which)" >&2
+    exit 1
+fi
 if [[ "$before" != "$after" ]]; then
     echo "::error::tests wrote into the seeded HOME instead of an isolated base dir:" >&2
     diff <(echo "$before") <(echo "$after") >&2 || true
