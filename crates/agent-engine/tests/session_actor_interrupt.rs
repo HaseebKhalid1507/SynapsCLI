@@ -717,6 +717,98 @@ async fn cancel_that_races_a_finished_answer_marks_nothing() {
     end(&mut a).await;
 }
 
+/// Esc while the engine is slow to finish the cancelled turn (#250): the
+/// provider call was cut, the engine has the partial reply, but it is held
+/// in `on_message_complete` past the actor's drain budget, so its
+/// post-cancel history never reaches the actor. The partial reply the
+/// client already saw must still be kept as an assistant message before the
+/// marker, so the next request is first / assistant "hi" / marker + second,
+/// not one user turn with the reply silently gone. The session still goes
+/// Idle within the drain budget, without waiting for the engine.
+async fn slow_engine_finalize_keeps_the_streamed_partial(persist: bool) {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let _h = Home::new();
+    let bodies: &'static [&'static str] = Box::leak(Box::new([SSE_PREFIX, SSE_HI]));
+    // Hits: 0 = the cancelled round (held open), 1 = the next turn.
+    let (url, hits, seen_bodies) = capture_stub(bodies, Some(0)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let gate = Arc::new(GateHook {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
+    perms.grant(HookKind::OnMessageComplete.required_permission());
+    host.parts()
+        .hook_bus
+        .subscribe(HookKind::OnMessageComplete, gate.clone(), None, None, perms)
+        .await
+        .unwrap();
+    let handle = host
+        .create_session(SessionConfig { persist, ..cfg() })
+        .await
+        .unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("first")).await.unwrap();
+    until(&mut a, is_text).await;
+    let seen = cancel(&mut a).await;
+    // Idle came without the engine: it is parked in on_message_complete
+    // with the partial reply, and the gate is still closed (no clock).
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("the cancelled turn reached on_message_complete");
+    assert_eq!(aborted(&seen), vec![true], "partial work kept: {seen:#?}");
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(|m| text_of(m)).collect();
+    assert_eq!(msgs.len(), 3, "{texts:#?}");
+    assert_eq!(msgs[0]["content"], "first");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], json!([{"type": "text", "text": "hi"}]));
+    assert!(text_of(&msgs[2]).contains(InterruptReason::User.marker()));
+    assert_tools_paired(&msgs);
+    // Let the engine finish now: its late publication must change nothing.
+    gate.release.notify_one();
+
+    a.send(submit("second")).await.unwrap();
+    until(&mut a, |e| {
+        matches!(
+            e,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done))
+        )
+    })
+    .await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let next = strip_cache_control(&seen_bodies.lock().unwrap()[1]["messages"]);
+    assert_eq!(
+        next,
+        json!([
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": InterruptReason::User.marker()},
+                {"type": "text", "text": "second"}
+            ]}
+        ]),
+        "next request: first / partial reply / marker + second"
+    );
+    end(&mut a).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_keeps_the_streamed_partial_without_persistence() {
+    slow_engine_finalize_keeps_the_streamed_partial(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_keeps_the_streamed_partial_with_persistence() {
+    slow_engine_finalize_keeps_the_streamed_partial(true).await;
+}
+
 /// A cancel that was not the user's says so in the canceled tool result:
 /// a reload's checkpoint cuts a running tool and the result reads "Canceled
 /// (Synaps restarted)…", matching the marker — never "Canceled by user".

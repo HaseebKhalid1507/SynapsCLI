@@ -60,7 +60,10 @@ const TURN_REPLAY_CAP: usize = 4096;
 /// response being streamed, flushed at most once per 1 Hz turn tick.
 #[derive(Default)]
 pub(crate) struct TurnDraftState {
-    /// Session id the open draft lives under; `None` = no turn open.
+    /// Session id the open draft is persisted under; `None` = not persisted
+    /// (no turn open, or this actor doesn't write drafts). `base_len` and
+    /// `text` are tracked for every turn: a cancel whose drain times out
+    /// keeps the streamed text (`SessionActor::keep_streamed_partial`).
     open: Option<String>,
     /// History length the in-flight response continues from.
     base_len: usize,
@@ -2223,11 +2226,10 @@ impl SessionActor {
     /// lock holder writes one: without the lock another process may own
     /// this session, and a draft is a claim that a turn is running HERE.
     fn open_turn_draft(&mut self) {
-        if !self.config.persist || !self.conv.is_live() || self.session_lock.is_none() {
-            return;
-        }
+        let persist =
+            self.config.persist && self.conv.is_live() && self.session_lock.is_some();
         self.turn_draft = TurnDraftState {
-            open: Some(self.conv.session.id.clone()),
+            open: persist.then(|| self.conv.session.id.clone()),
             base_len: self.conv.api_messages.len(),
             text: String::new(),
             dirty: true,
@@ -2237,9 +2239,7 @@ impl SessionActor {
 
     fn turn_draft_text(&mut self, delta: &str) {
         let d = &mut self.turn_draft;
-        if d.open.is_some()
-            && d.text.len() < agent_core::core::session_draft::TURN_DRAFT_MAX_TEXT_BYTES
-        {
+        if d.text.len() < agent_core::core::session_draft::TURN_DRAFT_MAX_TEXT_BYTES {
             d.text.push_str(delta);
             d.dirty = true;
         }
@@ -2247,7 +2247,7 @@ impl SessionActor {
 
     fn turn_draft_reset_text(&mut self) {
         let d = &mut self.turn_draft;
-        if d.open.is_some() && !d.text.is_empty() {
+        if !d.text.is_empty() {
             d.text.clear();
             d.dirty = true;
         }
@@ -2255,9 +2255,6 @@ impl SessionActor {
 
     /// A round checkpoint was adopted and saved: later text continues from it.
     fn turn_draft_committed(&mut self) {
-        if self.turn_draft.open.is_none() {
-            return;
-        }
         self.turn_draft.base_len = self.conv.api_messages.len();
         self.turn_draft.text.clear();
         self.turn_draft.dirty = true;
@@ -2562,18 +2559,47 @@ impl SessionActor {
         let drain = self.drain_cancelled_stream().await;
         match drain.history {
             Some(history) => self.conv.api_messages = history,
-            None if !drain.closed => tracing::warn!(
-                session = %self.id,
-                budget_ms = budgets::CANCEL_DRAIN_TIMEOUT_MS,
-                "cancelled turn did not publish its history within the drain budget; \
-                 keeping the last adopted history"
-            ),
-            None => {}
+            None => {
+                if !drain.closed {
+                    tracing::warn!(
+                        session = %self.id,
+                        budget_ms = budgets::CANCEL_DRAIN_TIMEOUT_MS,
+                        "cancelled turn did not publish its history within the drain budget; \
+                         keeping the last adopted history plus the streamed partial reply"
+                    );
+                }
+                self.keep_streamed_partial();
+            }
         }
         // Complete only if the drain consumed the whole stream: the final
         // history is published right after the completion is recorded.
         let completed = drain.closed && self.turn_completed();
         self.finish_interrupted_turn(reason, completed).await;
+    }
+
+    /// An interrupted turn whose engine never published its post-cancel
+    /// history (the drain budget ran out, or the stream ended without it):
+    /// keep the reply text clients were already shown, as a real assistant
+    /// message, so history matches the screen and the marker that follows
+    /// doesn't merge into the next prompt. Same rule as crash recovery
+    /// (`engine::interrupt::recover_crashed_turn`): only when the history is
+    /// still exactly where that text began (`base_len`), never a stale one,
+    /// and right after a user message. Text only, so it can't leave a
+    /// `tool_use` without its result: an in-flight tool call and unsigned
+    /// thinking are dropped, as the engine's own cancel path drops them. The
+    /// engine's late publication is not applied: its stream is gone with the
+    /// drain.
+    fn keep_streamed_partial(&mut self) {
+        let d = &self.turn_draft;
+        let follows_user = self.conv.api_messages.last().is_some_and(|m| m["role"] == "user");
+        if d.base_len == self.conv.api_messages.len() && follows_user && !d.text.trim().is_empty()
+        {
+            let partial = std::sync::Arc::new(serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": d.text}]
+            }));
+            self.conv.api_messages.push(partial);
+        }
     }
 
     /// The engine recorded the running turn's normal end (`TurnCompletion`).
@@ -2709,6 +2735,9 @@ impl SessionActor {
         }
         let completed = stream_closed && self.turn_completed();
         self.stream = None;
+        if !completed {
+            self.keep_streamed_partial();
+        }
         self.finish_interrupted_turn(crate::engine::interrupt::InterruptReason::Driver, completed)
             .await;
     }
