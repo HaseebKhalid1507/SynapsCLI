@@ -2144,7 +2144,7 @@ impl SessionActor {
     fn announce_web_search_state(&mut self) {
         let notice = crate::runtime::openai::codex_wire::session_web_search_notice(
             self.runtime.model(),
-            |k| std::env::var(k).ok(),
+            crate::runtime::openai::codex_wire::engine_env,
         );
         if notice.is_some() && notice != self.web_search_notice {
             self.web_search_notice = notice.clone();

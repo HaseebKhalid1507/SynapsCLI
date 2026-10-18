@@ -221,14 +221,21 @@ async fn send_with_retries(
                         body = read_body_for_classification(resp, super::codex_wire::CODEX_ERROR_BODY_CAP) => body,
                     };
                     let detail = super::codex_wire::CodexHttpErrorDetail::from_body(&body);
-                    let message = detail.user_message(label, status);
+                    // `false`: a tool rejection while hosted web_search is
+                    // attached is retried once without it by the caller
+                    // (`codex_wire::hosted_search_retry`); only the retry's
+                    // result can surface, and that request has no web_search.
+                    let message = detail.user_message(label, status, false);
                     tracing::warn!(error = %message, "{label} request rejected (identifiers only)");
                     trace_attempt.finish_failed(
                         &detail.trace_code(status.as_u16()),
                         Some(status.as_u16()),
                         trace_rid,
                     );
-                    return Err(message.into());
+                    return Err(Box::new(super::codex_wire::CodexRequestRejected {
+                        message,
+                        hosted_tool_rejected: detail.rejects_hosted_tool(),
+                    }));
                 } else {
                     // Privacy (spec §5.1): the response body is provider-controlled
                     // and may echo the full request (prompts, system text, tool
@@ -817,13 +824,14 @@ pub(crate) async fn call_codex_stream_with_router(
     // can't gate it; gated by role and model (codex_wire). The session actor
     // announces the state; each call is announced by the decoder.
     let mut tools = tools;
-    if let Some(web_search) =
-        super::codex_wire::codex_web_search_for_request(&cfg.model, codex_request_role, |k| {
-            std::env::var(k).ok()
-        })
-    {
-        tools.push(web_search);
-    }
+    let web_search = super::codex_wire::codex_web_search_for_request(
+        &cfg.model,
+        codex_request_role,
+        super::codex_wire::engine_env,
+    );
+    // Cleared after one learned rejection, so the retry below can't loop.
+    let mut web_search_attached = web_search.is_some();
+    tools.extend(web_search);
     // Codex already receives the effective system prompt in `instructions`.
     // Do not also prepend it to `input`: that doubles prompt tokens and repeats
     // context/checkpoint guidance. Pass history to the translator unchanged;
@@ -839,7 +847,7 @@ pub(crate) async fn call_codex_stream_with_router(
     let prompt_cache_key = codex_prompt_cache_key(&instructions, input_items.first());
     insert_codex_multi_agent_mode(&mut input_items, &plan);
     let input = serde_json::Value::Array(input_items);
-    let body = build_codex_body(
+    let mut body = build_codex_body(
         &cfg.model,
         &plan,
         input,
@@ -860,8 +868,10 @@ pub(crate) async fn call_codex_stream_with_router(
 
     // Serialize ONCE. These exact bytes are digested for the trace AND are
     // the request body of every attempt — retries resend the identical
-    // buffer, so one wire digest is honest for all attempt records.
-    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+    // buffer, so one wire digest is honest for all attempt records. The one
+    // exception (hosted web_search rejected) re-serializes and opens a new
+    // trace record for the new bytes.
+    let mut body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
     // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
     let tracer = tr::begin_openai_tracer(
         trace,
@@ -967,7 +977,34 @@ pub(crate) async fn call_codex_stream_with_router(
                         }
                     }
                 }
-                Err(other) => return Err(other),
+                Err(other) => {
+                    // Hosted web_search rejected (pre-inference 400): drop it,
+                    // re-serialize, and resend once under a fresh trace record.
+                    super::codex_wire::hosted_search_retry(
+                        other,
+                        &mut web_search_attached,
+                        &cfg.model,
+                        tx,
+                    )?;
+                    super::codex_wire::strip_web_search_tool(&mut body);
+                    body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+                    attempt = tr::StreamAttempt::new(
+                        tr::begin_openai_tracer(
+                            trace,
+                            &cfg.provider,
+                            &cfg.model,
+                            crate::runtime::trace::TransportKind::OpenAiResponses,
+                            &url,
+                            Some(body_bytes.as_ref()),
+                            messages,
+                            system_prompt.as_deref(),
+                            tools_schema,
+                            tr::renamed_tool_losses(&name_map),
+                        )
+                        .await,
+                    );
+                    continue;
+                }
             },
         };
         // Direct HTTP: upstream status and provider request id are observed.

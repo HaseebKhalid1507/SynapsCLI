@@ -181,11 +181,6 @@ struct CodexModelItem {
     multi_agent_version: Option<String>,
     #[serde(default)]
     multi_agent_reasoning_effort: Option<String>,
-    /// Upstream `ModelInfo::use_responses_lite`: when true, codex-rs sends no
-    /// hosted tools (`spec_plan.rs` `hosted_model_tool_specs`), so hosted
-    /// web_search isn't attached. (`supports_search_tool` is tool_search.)
-    #[serde(default)]
-    use_responses_lite: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,9 +287,6 @@ pub fn parse_codex_catalog_models(body: &str) -> Result<Vec<CatalogModel>, serde
         .into_iter()
         .filter(|item| codex_model_is_selectable(item.visibility.as_deref(), item.supported_in_api))
         .filter_map(|item| {
-            if let Some(lite) = item.use_responses_lite {
-                crate::runtime::openai::codex_wire::record_live_responses_lite(&item.slug, lite);
-            }
             let reasoning = codex_reasoning_support(&item);
             let mut m = CatalogModel::new(PROVIDER_KEY, PROVIDER_NAME, item.slug)?;
             m.provider_kind = CatalogProviderKind::OpenAiCodex;
@@ -750,10 +742,12 @@ mod tests {
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
 
     #[test]
-    fn live_use_responses_lite_gates_hosted_web_search() {
+    fn catalog_rows_never_gate_hosted_web_search() {
         use crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason as reason;
-        // Real row shape (2026-10 live cache): `use_responses_lite` decides
-        // hosted tools; `supports_search_tool` (tool_search) must not.
+        // Real row shape (2026-10 live cache). `use_responses_lite` is
+        // upstream's request-format switch and `supports_search_tool` is
+        // tool_search; Synaps sends full Responses requests, so neither keeps
+        // hosted web_search off (only spark and a learned rejection do).
         let body = r#"{"models":[
             {"slug":"gpt-zz-live-lite","visibility":"list","use_responses_lite":true,
              "supports_search_tool":true,"web_search_tool_type":"text_and_image"},
@@ -762,7 +756,7 @@ mod tests {
             {"slug":"gpt-zz-live-silent","visibility":"list"}
         ]}"#;
         assert_eq!(parse_codex_catalog_models(body).unwrap().len(), 3);
-        assert!(reason("gpt-zz-live-lite").is_some());
+        assert_eq!(reason("gpt-zz-live-lite"), None);
         assert_eq!(reason("gpt-zz-live-full"), None);
         assert_eq!(reason("gpt-zz-live-silent"), None);
     }

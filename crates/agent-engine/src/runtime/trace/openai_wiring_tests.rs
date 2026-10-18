@@ -1221,9 +1221,27 @@ async fn drive_codex_collect(
     Result<Value, Box<dyn std::error::Error + Send + Sync>>,
     Vec<StreamEvent>,
 ) {
+    drive_codex_model(
+        base_url,
+        trace,
+        "gpt-5.6-sol",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await
+}
+
+async fn drive_codex_model(
+    base_url: &str,
+    trace: &TraceContext,
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+) -> (
+    Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    Vec<StreamEvent>,
+) {
     let cfg = ProviderConfig {
         base_url: base_url.to_string(),
-        model: "gpt-5.6-sol".to_string(),
+        model: model.to_string(),
         provider: "openai-codex".to_string(),
     };
     let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
@@ -1238,7 +1256,7 @@ async fn drive_codex_collect(
         &tx,
         None,
         None,
-        agent_core::reasoning::ReasoningLevel::Medium,
+        level,
         crate::runtime::openai::catalog::CodexRequestRole::Foreground,
         &CancellationToken::new(),
         3,
@@ -1271,7 +1289,7 @@ async fn codex_400_surfaces_sanitized_provider_error_in_message_and_trace() {
         (
             // Hosted tool not allowed for the model.
             r#"{"error":{"message":"Tool 'web_search' is not supported with gpt-5.6-sol.","type":"invalid_request_error","param":"tools","code":null}}"#.to_string(),
-            "[invalid_request_error, param tools] — the model rejected a request tool",
+            "[invalid_request_error, param tools] — the backend rejected a request tool definition",
             "http_400:invalid_request_error",
         ),
         (
@@ -1343,4 +1361,163 @@ async fn codex_hosted_web_search_call_is_announced_with_query() {
         vec!["🔎 Codex web_search (search, completed): rust reqwest read_timeout"],
         "exactly one notice, on the completed item"
     );
+}
+
+// ═══ Hosted web_search: learned rejection (prE round 3, I1 option b) ═══
+
+const TOOLS_400: &str = r#"{"error":{"message":"Tool 'web_search' is not supported with this model.","type":"invalid_request_error","param":"tools","code":null}}"#;
+
+/// `/codex/responses` stub: answers a tools-400 to any body carrying the
+/// hosted web_search tool (or to every body when `always_reject`), SSE
+/// success otherwise. Records every body.
+async fn spawn_web_search_rejecting_stub(always_reject: bool) -> (String, CapturedBodies) {
+    let bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
+    let bodies_c = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/codex/responses",
+        axum_post(move |body: Bytes| {
+            let bodies = Arc::clone(&bodies_c);
+            async move {
+                let has_search = body_has_web_search(&body);
+                bodies.lock().unwrap().push(body.to_vec());
+                if always_reject || has_search {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        [("content-type", "application/json")],
+                        TOOLS_400.to_string(),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        CODEX_SSE_SUCCESS.to_string(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    (serve(app).await, bodies)
+}
+
+fn body_has_web_search(body: &[u8]) -> bool {
+    let v: Value = serde_json::from_slice(body).unwrap_or_default();
+    v["tools"]
+        .as_array()
+        .is_some_and(|t| t.iter().any(|t| t["type"] == "web_search"))
+}
+
+fn notice_texts(events: &[StreamEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Session(crate::SessionEvent::Notice(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn web_search_on() -> crate::runtime::openai::codex_wire::EnvOverrideGuard {
+    crate::runtime::openai::codex_wire::override_env_for_test(&[(
+        "SYNAPS_CODEX_WEB_SEARCH",
+        "live",
+    )])
+}
+
+#[tokio::test]
+async fn codex_tools_400_is_remembered_per_model_and_retried_once_without_search() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let model = "gpt-zz-ws-retry";
+    let level = agent_core::reasoning::ReasoningLevel::Adaptive;
+
+    let (result, events) = drive_codex_model(&upstream, &h.trace, model, level).await;
+    result.expect("the retry without web_search succeeds");
+    {
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 2, "one rejected send, one retry");
+        assert!(body_has_web_search(&sent[0]));
+        assert!(!body_has_web_search(&sent[1]), "retry drops web_search");
+    }
+    let notices = notice_texts(&events);
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|n| n.contains("web_search was rejected by gpt-zz-ws-retry"))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    // Trace: the rejected attempt and the retry are both recorded.
+    let records = h.sink.records();
+    assert_schema_valid_and_content_free(&records);
+    assert_eq!(records.len(), 2);
+
+    // Remembered for this process: the next request never attaches it.
+    let (result, events) = drive_codex_model(&upstream, &h.trace, model, level).await;
+    result.expect("second request succeeds");
+    let sent = bodies.lock().unwrap();
+    assert_eq!(sent.len(), 3, "no rejected send the second time");
+    assert!(!body_has_web_search(&sent[2]));
+    assert!(
+        notice_texts(&events)
+            .iter()
+            .all(|n| !n.contains("rejected")),
+        "the rejection notice is one-time"
+    );
+}
+
+#[tokio::test]
+async fn codex_tools_400_is_never_retried_twice() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(true).await;
+    let h = harness();
+    let (result, _events) = drive_codex_model(
+        &upstream,
+        &h.trace,
+        "gpt-zz-ws-loop",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await;
+    let err = result
+        .expect_err("a tools-400 without web_search is terminal")
+        .to_string();
+    assert_eq!(bodies.lock().unwrap().len(), 2, "exactly one retry");
+    assert!(
+        err.starts_with("codex request failed: 400 Bad Request"),
+        "{err}"
+    );
+    // web_search was not attached on the failing send, so it isn't blamed.
+    assert!(!err.contains("web_search"), "{err}");
+}
+
+#[tokio::test]
+async fn codex_spark_never_gets_web_search_and_lite_rows_still_do() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &h.trace,
+        "gpt-5.3-codex-spark",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await;
+    result.expect("spark request succeeds");
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert!(!body_has_web_search(&bodies.lock().unwrap()[0]));
+
+    // A Responses-Lite flagship (upstream use_responses_lite: true) still
+    // gets the hosted tool: Synaps sends full Responses requests.
+    let (upstream, bodies, _hits) = spawn_codex_stub(vec![]).await;
+    let _ = drive_codex_model(
+        &upstream,
+        &h.trace,
+        "gpt-5.6-terra",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await;
+    assert!(body_has_web_search(&bodies.lock().unwrap()[0]));
 }

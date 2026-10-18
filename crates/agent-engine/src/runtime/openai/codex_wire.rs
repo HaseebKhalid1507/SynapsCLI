@@ -34,8 +34,10 @@ const EXPLAIN_MODEL_NOT_FOUND: &str =
     "the backend doesn't know this model for this account; pick another with /model.";
 const EXPLAIN_REASONING: &str =
     "this model rejected the requested reasoning setting; pick another level with /effort.";
-const EXPLAIN_TOOLS: &str = "the model rejected a request tool; hosted web_search \
-     (SYNAPS_CODEX_WEB_SEARCH) is the usual cause, so unset it or switch models with /model.";
+const EXPLAIN_TOOLS_WEB_SEARCH: &str = "the model rejected a request tool; hosted web_search \
+     (SYNAPS_CODEX_WEB_SEARCH) was attached and is the likely cause.";
+const EXPLAIN_TOOLS: &str =
+    "the backend rejected a request tool definition for this model; try another model with /model.";
 const EXPLAIN_PARAMETER: &str =
     "the backend rejected a request parameter for this model; try another model with /model.";
 
@@ -68,8 +70,27 @@ impl CodexHttpErrorDetail {
         }
     }
 
+    /// The backend rejected a request tool: a `tools` param, or a code that
+    /// names a tool rejection.
+    pub(crate) fn rejects_hosted_tool(&self) -> bool {
+        let param = self.param.as_deref().unwrap_or("");
+        param == "tools"
+            || param.starts_with("tools[")
+            || param.starts_with("tools.")
+            || matches!(
+                self.code.as_deref(),
+                Some(
+                    "unsupported_tool"
+                        | "tool_not_supported"
+                        | "unsupported_tool_type"
+                        | "invalid_tool_type"
+                )
+            )
+    }
+
     /// Synaps-authored explanation for a known (type, code, param) shape.
-    pub(crate) fn explanation(&self) -> Option<&'static str> {
+    /// web_search is blamed for a tool rejection only when it was attached.
+    pub(crate) fn explanation(&self, web_search_attached: bool) -> Option<&'static str> {
         let code = self.code.as_deref();
         let param = self.param.as_deref().unwrap_or("");
         if self.account_entitlement {
@@ -81,8 +102,12 @@ impl CodexHttpErrorDetail {
         if param == "reasoning" || param.starts_with("reasoning.") {
             return Some(EXPLAIN_REASONING);
         }
-        if param == "tools" || param.starts_with("tools[") || param.starts_with("tools.") {
-            return Some(EXPLAIN_TOOLS);
+        if self.rejects_hosted_tool() {
+            return Some(if web_search_attached {
+                EXPLAIN_TOOLS_WEB_SEARCH
+            } else {
+                EXPLAIN_TOOLS
+            });
         }
         match code {
             Some("unsupported_parameter" | "unknown_parameter") => Some(EXPLAIN_PARAMETER),
@@ -107,7 +132,12 @@ impl CodexHttpErrorDetail {
     /// User-visible error: keeps the `codex request failed: <status>` prefix
     /// (net.rs / session_driver classify on it), then identifiers, then our
     /// static explanation. Safe to log and to hand to a parent model.
-    pub(crate) fn user_message(&self, label: &str, status: reqwest::StatusCode) -> String {
+    pub(crate) fn user_message(
+        &self,
+        label: &str,
+        status: reqwest::StatusCode,
+        web_search_attached: bool,
+    ) -> String {
         let mut out = format!("{label} request failed: {status}");
         let ids: Vec<&str> = [&self.kind, &self.code]
             .into_iter()
@@ -126,7 +156,7 @@ impl CodexHttpErrorDetail {
             }
             out.push(']');
         }
-        if let Some(explanation) = self.explanation() {
+        if let Some(explanation) = self.explanation(web_search_attached) {
             out.push_str(" — ");
             out.push_str(explanation);
         }
@@ -198,55 +228,137 @@ fn cap_chars(s: &str, cap: usize) -> String {
 /// Workers (subagents) get the hosted tool only when this is also truthy.
 pub(crate) const CODEX_WEB_SEARCH_WORKERS_ENV: &str = "SYNAPS_CODEX_WEB_SEARCH_WORKERS";
 
-/// Static `use_responses_lite` per upstream codex-rs bundled
-/// `models-manager/models.json` (openai/codex 8c076942). Upstream emits no
-/// hosted tools for these (`spec_plan.rs` `hosted_model_tool_specs`).
-const STATIC_RESPONSES_LITE: &[(&str, bool)] = &[
-    ("gpt-6.1-sol", true),
-    ("gpt-6-astra", true),
-    ("gpt-6-sol", true),
-    ("gpt-6-luna", true),
-    ("gpt-5.6-sol", true),
-    ("gpt-5.6-terra", true),
-    ("gpt-5.6-luna", true),
-    ("gpt-5.5", false),
-];
-
-/// Text-only model; never sent hosted tools, whatever the catalog says.
+/// Text-only model; never sent hosted tools.
 const SPARK: &str = "gpt-5.3-codex-spark";
 
-type LiveFlags = std::collections::HashMap<String, bool>;
-static LIVE_RESPONSES_LITE: std::sync::Mutex<Option<LiveFlags>> = std::sync::Mutex::new(None);
+/// Models whose backend rejected the hosted tool this process (learned from
+/// a `param: tools` 400). Synaps sends full Responses requests, so upstream's
+/// `use_responses_lite` (a request-format switch) is not a gate here.
+static HOSTED_SEARCH_REJECTED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
 
-/// Record a live `/codex/models` row's explicit `use_responses_lite`.
-pub(crate) fn record_live_responses_lite(slug: &str, lite: bool) {
-    LIVE_RESPONSES_LITE
+/// Remember that `model_id` rejected hosted web_search. Returns whether this
+/// is new (so the caller shows its notice once).
+pub(crate) fn record_web_search_rejected(model_id: &str) -> bool {
+    HOSTED_SEARCH_REJECTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get_or_insert_with(Default::default)
-        .insert(slug.to_string(), lite);
+        .insert(model_id.to_string())
 }
 
-/// Why hosted web_search isn't attached for a model, or `None` if it may be.
-/// Live catalog evidence wins over the static table; unknown models keep
-/// the user's opt-in.
-pub(crate) fn codex_web_search_unsupported_reason(model_id: &str) -> Option<&'static str> {
-    if model_id == SPARK {
-        return Some("gpt-5.3-codex-spark is text-only and takes no hosted tools");
-    }
-    let live = LIVE_RESPONSES_LITE
+fn web_search_rejected(model_id: &str) -> bool {
+    HOSTED_SEARCH_REJECTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .and_then(|m| m.get(model_id).copied());
-    let lite = live.or_else(|| {
-        STATIC_RESPONSES_LITE
-            .iter()
-            .find(|(id, _)| *id == model_id)
-            .map(|(_, lite)| *lite)
+        .is_some_and(|m| m.contains(model_id))
+}
+
+/// Why hosted web_search isn't attached for a model, or `None` if it may be.
+pub(crate) fn codex_web_search_unsupported_reason(model_id: &str) -> Option<&'static str> {
+    if model_id == SPARK {
+        return Some("the built-in table marks gpt-5.3-codex-spark text-only (no hosted tools)");
+    }
+    web_search_rejected(model_id)
+        .then_some("the backend rejected hosted web_search for this model earlier in this process")
+}
+
+/// Typed terminal Codex 4xx: the identifiers-only message, plus whether the
+/// backend rejected a request tool (so the caller can drop hosted
+/// web_search and retry once).
+#[derive(Debug)]
+pub(crate) struct CodexRequestRejected {
+    pub message: String,
+    pub hosted_tool_rejected: bool,
+}
+
+impl std::fmt::Display for CodexRequestRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodexRequestRejected {}
+
+/// After a send failed: if hosted web_search was attached and the backend
+/// rejected a request tool, remember that for this model, show a one-time
+/// notice, clear `attached` and return `Ok(())` so the caller resends once
+/// without it. A second rejection finds `attached == false` and is returned
+/// as the error, so the retry cannot loop.
+pub(crate) fn hosted_search_retry(
+    error: Box<dyn std::error::Error + Send + Sync>,
+    attached: &mut bool,
+    model_id: &str,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rejected = error
+        .downcast_ref::<CodexRequestRejected>()
+        .is_some_and(|e| e.hosted_tool_rejected);
+    if !*attached || !rejected {
+        return Err(error);
+    }
+    *attached = false;
+    tracing::warn!(
+        model = model_id,
+        "codex rejected hosted web_search; retrying once without it"
+    );
+    if record_web_search_rejected(model_id) {
+        let _ = tx.send(StreamEvent::Session(crate::SessionEvent::Notice(format!(
+            "🔎 Codex web_search was rejected by {model_id}; continuing without it."
+        ))));
+    }
+    Ok(())
+}
+
+/// Drop the hosted web_search entry from a built Codex request body.
+pub(crate) fn strip_web_search_tool(body: &mut Value) {
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|t| t.get("type").and_then(Value::as_str) != Some("web_search"));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENV_OVERRIDE: std::cell::RefCell<Option<Vec<(String, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: replace the process env this thread's Codex requests see.
+#[cfg(test)]
+pub(crate) fn override_env_for_test(pairs: &[(&str, &str)]) -> EnvOverrideGuard {
+    ENV_OVERRIDE.with(|o| {
+        *o.borrow_mut() = Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
     });
-    (lite == Some(true))
-        .then_some("the catalog marks it Responses Lite, which takes no hosted tools")
+    EnvOverrideGuard
+}
+
+#[cfg(test)]
+pub(crate) struct EnvOverrideGuard;
+
+#[cfg(test)]
+impl Drop for EnvOverrideGuard {
+    fn drop(&mut self) {
+        ENV_OVERRIDE.with(|o| *o.borrow_mut() = None);
+    }
+}
+
+/// The engine process environment (overridable per thread in tests).
+pub(crate) fn engine_env(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = ENV_OVERRIDE.with(|o| {
+        o.borrow()
+            .as_ref()
+            .map(|pairs| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+    }) {
+        return v;
+    }
+    std::env::var(key).ok()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -317,7 +429,14 @@ pub(crate) fn session_web_search_notice(
     qualified_model: &str,
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let model_id = qualified_model.strip_prefix("openai-codex/")?;
+    // The router decides what is Codex; the prefix is the fallback for ids
+    // it doesn't resolve.
+    let model_id = match super::resolve_route(qualified_model) {
+        Some(route) if route.wire == super::WireProtocol::CodexResponses => route.model,
+        Some(_) => return None,
+        None => qualified_model.strip_prefix("openai-codex/")?.to_string(),
+    };
+    let model_id = model_id.as_str();
     let workers = truthy(env(CODEX_WEB_SEARCH_WORKERS_ENV).as_deref());
     match web_search_decision(model_id, ExecutionRole::Foreground, &env) {
         WebSearchDecision::Attach(spec) => {
@@ -494,7 +613,7 @@ mod tests {
             "http_400:invalid_request_error:unsupported_value"
         );
         assert_eq!(
-            d.user_message("codex", bad_request()),
+            d.user_message("codex", bad_request(), false),
             format!(
                 "codex request failed: 400 Bad Request \
                  [invalid_request_error/unsupported_value, param reasoning.effort] — {EXPLAIN_REASONING}"
@@ -509,7 +628,7 @@ mod tests {
         );
         assert!(d.account_entitlement);
         assert_eq!(d.trace_code(400), "http_400");
-        let msg = d.user_message("codex", bad_request());
+        let msg = d.user_message("codex", bad_request(), false);
         assert_eq!(
             msg,
             format!("codex request failed: 400 Bad Request — {EXPLAIN_ENTITLEMENT}")
@@ -524,7 +643,7 @@ mod tests {
         );
         assert_eq!(d.trace_code(400), "http_400:invalid_request_error");
         assert_eq!(
-            d.user_message("codex", bad_request()),
+            d.user_message("codex", bad_request(), false),
             format!(
                 "codex request failed: 400 Bad Request [invalid_request_error, param tools] — {EXPLAIN_TOOLS}"
             )
@@ -536,7 +655,7 @@ mod tests {
         let d = detail(
             r#"{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model.","type":"invalid_request_error","param":"temperature","code":"unsupported_parameter"}}"#,
         );
-        let msg = d.user_message("codex", bad_request());
+        let msg = d.user_message("codex", bad_request(), false);
         assert!(msg.ends_with(EXPLAIN_PARAMETER), "{msg}");
         assert!(!msg.contains("not supported with this model"), "{msg}");
     }
@@ -547,7 +666,7 @@ mod tests {
             r#"{"error":{"message":"Something novel happened to your request.","type":"invalid_request_error","code":"brand_new_code"}}"#,
         );
         assert_eq!(
-            d.user_message("codex", bad_request()),
+            d.user_message("codex", bad_request(), false),
             "codex request failed: 400 Bad Request [invalid_request_error/brand_new_code]"
         );
     }
@@ -563,7 +682,7 @@ mod tests {
         let d = detail(&body);
         assert_eq!(d, CodexHttpErrorDetail::default());
         assert_eq!(
-            d.user_message("codex", bad_request()),
+            d.user_message("codex", bad_request(), false),
             "codex request failed: 400 Bad Request"
         );
         let d = detail(r#"{"error":{"type":"sk-ABCDEF","code":"Bearer"}}"#);
@@ -581,7 +700,7 @@ mod tests {
             let d = detail(body);
             assert_eq!(d, CodexHttpErrorDetail::default());
             assert_eq!(
-                d.user_message("codex", bad_request()),
+                d.user_message("codex", bad_request(), false),
                 "codex request failed: 400 Bad Request"
             );
         }
@@ -601,7 +720,6 @@ mod tests {
         use ExecutionRole::{Foreground, Internal, Worker};
         let on = env_of(&[("SYNAPS_CODEX_WEB_SEARCH", "live")]);
         let ws = json!({"type": "web_search"});
-        // gpt-5.5 is the full-Responses row upstream (use_responses_lite false).
         assert_eq!(
             web_search_decision("gpt-5.5", Foreground, &on),
             WebSearchDecision::Attach(ws.clone())
@@ -614,10 +732,11 @@ mod tests {
             web_search_decision(SPARK, Foreground, &on),
             WebSearchDecision::ModelUnsupported(_)
         ));
-        assert!(matches!(
+        // Responses-Lite rows upstream still get it: Synaps sends full Responses.
+        assert_eq!(
             web_search_decision("gpt-5.6-sol", Foreground, &on),
-            WebSearchDecision::ModelUnsupported(_)
-        ));
+            WebSearchDecision::Attach(ws.clone())
+        );
         assert_eq!(
             web_search_decision("gpt-5.5", Worker, &on),
             WebSearchDecision::RoleExcluded
@@ -641,14 +760,80 @@ mod tests {
     }
 
     #[test]
-    fn live_responses_lite_overrides_static_but_not_spark() {
+    fn learned_rejection_is_per_model_and_spark_reason_names_the_table() {
         let on = env_of(&[("SYNAPS_CODEX_WEB_SEARCH", "on")]);
         let fg = ExecutionRole::Foreground;
-        record_live_responses_lite("gpt-zz-lite-1", true);
-        record_live_responses_lite("gpt-zz-full-1", false);
-        assert_eq!(codex_web_search_for_request("gpt-zz-lite-1", fg, &on), None);
-        assert!(codex_web_search_for_request("gpt-zz-full-1", fg, &on).is_some());
-        assert!(codex_web_search_for_request("gpt-zz-unknown-1", fg, &on).is_some());
+        assert!(codex_web_search_for_request("gpt-zz-rej-1", fg, &on).is_some());
+        assert!(record_web_search_rejected("gpt-zz-rej-1"));
+        assert!(!record_web_search_rejected("gpt-zz-rej-1"), "only new once");
+        assert_eq!(codex_web_search_for_request("gpt-zz-rej-1", fg, &on), None);
+        assert!(codex_web_search_for_request("gpt-zz-rej-2", fg, &on).is_some());
+        assert!(codex_web_search_unsupported_reason(SPARK)
+            .unwrap()
+            .contains("built-in table"));
+        assert!(codex_web_search_unsupported_reason("gpt-zz-rej-1")
+            .unwrap()
+            .contains("rejected"));
+    }
+
+    #[test]
+    fn hosted_search_retry_happens_once_and_only_for_tool_rejections() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let rejected = || -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(CodexRequestRejected {
+                message: "codex request failed: 400 Bad Request".into(),
+                hosted_tool_rejected: true,
+            })
+        };
+        let mut attached = true;
+        assert!(hosted_search_retry(rejected(), &mut attached, "gpt-zz-retry-1", &tx).is_ok());
+        assert!(!attached);
+        // Second rejection: nothing attached any more, so it is the error.
+        assert!(hosted_search_retry(rejected(), &mut attached, "gpt-zz-retry-1", &tx).is_err());
+        // Other errors, or nothing attached, never retry.
+        let mut attached = true;
+        let other: Box<dyn std::error::Error + Send + Sync> = "codex request failed: 401".into();
+        assert!(hosted_search_retry(other, &mut attached, "gpt-zz-retry-2", &tx).is_err());
+        let not_tools: Box<dyn std::error::Error + Send + Sync> = Box::new(CodexRequestRejected {
+            message: "x".into(),
+            hosted_tool_rejected: false,
+        });
+        assert!(hosted_search_retry(not_tools, &mut attached, "gpt-zz-retry-2", &tx).is_err());
+        assert!(attached);
+        assert_eq!(
+            notices(&mut rx),
+            vec![
+                "🔎 Codex web_search was rejected by gpt-zz-retry-1; continuing without it."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_rejection_blames_web_search_only_when_attached() {
+        let d = detail(r#"{"error":{"type":"invalid_request_error","param":"tools[2]"}}"#);
+        assert!(d.rejects_hosted_tool());
+        assert!(d
+            .user_message("codex", bad_request(), true)
+            .ends_with(EXPLAIN_TOOLS_WEB_SEARCH));
+        let generic = d.user_message("codex", bad_request(), false);
+        assert!(generic.ends_with(EXPLAIN_TOOLS), "{generic}");
+        assert!(!generic.contains("web_search"), "{generic}");
+        assert!(detail(r#"{"error":{"code":"unsupported_tool"}}"#).rejects_hosted_tool());
+        assert!(!detail(r#"{"error":{"param":"reasoning.effort"}}"#).rejects_hosted_tool());
+        let mut body = json!({"tools":[{"type":"function","name":"bash"},{"type":"web_search"}]});
+        strip_web_search_tool(&mut body);
+        assert_eq!(body, json!({"tools":[{"type":"function","name":"bash"}]}));
+    }
+
+    #[test]
+    fn session_notice_resolves_codex_through_the_router() {
+        let on = env_of(&[("SYNAPS_CODEX_WEB_SEARCH", "live")]);
+        assert!(session_web_search_notice("openai-codex/gpt-5.6-sol", &on)
+            .unwrap()
+            .contains("is on (live)"));
+        assert_eq!(session_web_search_notice("xai-auth/grok-4", &on), None);
+        assert_eq!(session_web_search_notice("claude-opus-4-7", &on), None);
     }
 
     #[test]
