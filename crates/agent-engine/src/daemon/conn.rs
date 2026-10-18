@@ -269,7 +269,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         // Tell the requester, flush, close — then exec.
                         let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                         drop(tx);
-                        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(crate::session::budgets::RELOAD_BYE_FLUSH_SECS),
+                            writer,
+                        )
+                        .await;
                         let e = super::reload::exec(&state, &state.paths, prepared).await;
                         tracing::error!(error = %e, "daemon: reload did not exec");
                         return;

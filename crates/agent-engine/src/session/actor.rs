@@ -4254,6 +4254,16 @@ impl SessionActor {
     /// parent is woken once per worker — it was waiting for completions the
     /// exec destroyed.
     pub(crate) fn adopt_workers(&mut self, workers: Vec<crate::runtime::subagent::CarriedWorker>) {
+        self.adopt_carried_workers(workers, false);
+    }
+
+    /// [`Self::adopt_workers`]; `failed_reload`: this image's own exec
+    /// failed (`ReloadAborted`), so the notice must not say it reloaded.
+    fn adopt_carried_workers(
+        &mut self,
+        workers: Vec<crate::runtime::subagent::CarriedWorker>,
+        failed_reload: bool,
+    ) {
         if workers.is_empty() {
             return;
         }
@@ -4294,7 +4304,8 @@ impl SessionActor {
         );
         if !stopped.is_empty() {
             self.emit(SessionEventWire::SystemNotice(format!(
-                "daemon reloaded — worker{} {} stopped by the reload; subagent_resume continues {} from {} archive",
+                "{} — worker{} {} stopped by the reload; subagent_resume continues {} from {} archive",
+                if failed_reload { "daemon reload failed" } else { "daemon reloaded" },
                 if stopped.len() == 1 { "" } else { "s" },
                 stopped.join(", "),
                 if stopped.len() == 1 { "it" } else { "them" },
@@ -4319,9 +4330,19 @@ impl SessionActor {
     /// Lift the reload fence, hand the workers the checkpoint stopped back
     /// to the parent, and deliver what queued up meanwhile.
     pub(crate) async fn reload_aborted(&mut self) {
+        self.lift_reload_fence(
+            "daemon reload failed — this session continues on the running daemon",
+        )
+        .await;
+    }
+
+    /// Lift the reload fence (see [`Self::reload_aborted`]), telling the
+    /// user `notice` (the reload did not happen).
+    async fn lift_reload_fence(&mut self, notice: &str) {
         let Some(fence) = self.reload_fence.take() else {
             return;
         };
+        self.emit(SessionEventWire::SystemNotice(notice.to_string()));
         let workers = if self.runtime.is_live() {
             // From the LIVE registry, not only the checkpoint's snapshot: a
             // worker registered after it was stopped at birth by the
@@ -4348,7 +4369,7 @@ impl SessionActor {
             Vec::new()
         };
         tracing::info!(session = %self.id, "reload did not exec: fence lifted");
-        self.adopt_workers(workers);
+        self.adopt_carried_workers(workers, true);
         self.rearm_park();
         if !self.event_queue.is_empty() {
             self.on_queue_wake().await;
@@ -4362,7 +4383,10 @@ impl SessionActor {
             session = %self.id,
             "reload fence expired with no exec and no abort from the daemon; lifting it"
         );
-        self.reload_aborted().await;
+        self.lift_reload_fence(
+            "daemon reload never completed or reported back — this session continues on the running daemon",
+        )
+        .await;
     }
 
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.

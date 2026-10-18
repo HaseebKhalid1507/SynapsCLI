@@ -248,8 +248,19 @@ async fn a_failed_exec_wakes_the_parent_once_per_worker() {
     assert!(by("sa_8").stopped_by_reload && by("sa_8").needs_wake());
 
     f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
-    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
-    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    let mut seen = until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    seen.extend(until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await);
+    // The user is told the reload failed — never that it happened.
+    let notices: Vec<&String> = seen
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEventWire::SystemNotice(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert!(notices.iter().any(|n| n.starts_with("daemon reload failed")), "{notices:?}");
+    assert!(notices.iter().any(|n| n.contains("sa_8")), "the stopped worker is named: {notices:?}");
+    assert!(!notices.iter().any(|n| n.contains("daemon reloaded")), "{notices:?}");
     // No second wake turn for a re-posted completion either.
     let later = drain_for(&mut f.client, Duration::from_millis(800)).await;
     assert_eq!(started(&later), 0, "{later:#?}");

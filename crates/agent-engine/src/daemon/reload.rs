@@ -48,12 +48,8 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (the drain + its
 /// bounded save) + stopping the session's workers + the checkpoint's own
 /// bounded save + 1 s margin.
-const CHECKPOINT_BUDGET: Duration = Duration::from_secs(
-    crate::session::budgets::CANCEL_TURN_TIMEOUT_SECS
-        + crate::session::budgets::WORKER_RELOAD_STOP_TIMEOUT_SECS
-        + crate::session::budgets::SAVE_TIMEOUT_SECS
-        + 1,
-);
+const CHECKPOINT_BUDGET: Duration =
+    Duration::from_secs(crate::session::budgets::RELOAD_CHECKPOINT_BUDGET_SECS);
 /// What clients are told to wait before reconnecting.
 pub const RETRY_AFTER_MS: u64 = 500;
 
@@ -471,7 +467,7 @@ pub async fn prepare(
     state.reload_generation.store(generation, Ordering::SeqCst);
     state.fire_announce();
     let t1 = std::time::Instant::now();
-    while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(1) {
+    while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(crate::session::budgets::RELOAD_ANNOUNCE_WAIT_SECS) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(Prepared { exe, rs_path, generation })
@@ -502,7 +498,7 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
     info.exe = Some(p.exe.clone());
     let _ = registry::write_daemon_json(paths, &info);
     let _ = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(crate::session::budgets::RELOAD_EXT_SHUTDOWN_SECS),
         async { state.host.ext_manager().write().await.shutdown_all().await },
     )
     .await;
@@ -530,8 +526,14 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
-        tracing::warn!("daemon: extension re-discovery still running after 10 s");
+    if tokio::time::timeout(
+        Duration::from_secs(crate::session::budgets::RELOAD_EXT_REDISCOVERY_SECS),
+        wait,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("daemon: extension re-discovery still running; resuming the sessions");
     }
     // The checkpoint fenced every session and stopped its workers for an
     // exec that did not happen: their parents are still here and still
@@ -642,8 +644,35 @@ fn parse_holder_from_error(e: &str) -> String {
 /// that never checkpointed). The actor re-announces from its own record,
 /// so a checkpoint that answered too late for the reload record is covered.
 async fn abort_checkpoints(state: &Arc<DaemonState>) {
-    for h in state.live_sessions() {
-        let _ = h.send(SessionCommand::ReloadAborted).await;
+    let budget = Duration::from_secs(crate::session::budgets::RELOAD_ABORT_SEND_SECS);
+    let sends = state
+        .live_sessions()
+        .into_iter()
+        .map(|h| async move { send_reload_aborted(&h, budget).await });
+    futures::future::join_all(sends).await;
+}
+
+/// `ReloadAborted` must arrive: dropped, the session would wait out the
+/// fence's backstop. `SessionHandle::send` never waits for queue room, so
+/// retry a full queue (the actor drains it) for up to `budget`.
+pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> bool {
+    use crate::session::TransportError;
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match h.send(SessionCommand::ReloadAborted).await {
+            Ok(()) => return true,
+            Err(TransportError::Backpressure) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %h.id,
+                    error = %e,
+                    "reload: could not tell the session the exec failed; its reload fence lifts at the backstop"
+                );
+                return false;
+            }
+        }
     }
 }
 
@@ -862,5 +891,47 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// Likewise the session's `/memory` choice: a reload without a
+    /// checkpoint reply must not re-grant memory the user turned off.
+    #[test]
+    fn memory_choice_survives_an_unconfirmed_checkpoint() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        use crate::session::SessionMemoryMode;
+        let id = crate::session::SessionId("mem-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert_eq!(record(&handle, None).config.memory_mode, None);
+        *ep.memory_mode.lock().unwrap() = Some(SessionMemoryMode::Off);
+        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
+    }
+
+    /// `ReloadAborted` reaches a session whose command queue is full (the
+    /// actor drains it) instead of being dropped, which would leave the
+    /// session fenced until the backstop.
+    #[tokio::test]
+    async fn reload_aborted_waits_for_room_in_a_full_queue() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("abort-full".into());
+        let (handle, mut ep) = SessionHandle::new(meta_for(&id), view_for());
+        while handle.send(SessionCommand::Save).await.is_ok() {}
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut got_abort = false;
+            while let Some(a) = ep.cmd_rx.recv().await {
+                if matches!(a.cmd, SessionCommand::ReloadAborted) {
+                    got_abort = true;
+                    break;
+                }
+            }
+            got_abort
+        });
+        assert!(send_reload_aborted(&handle, Duration::from_secs(5)).await);
+        assert!(drain.await.unwrap(), "delivered");
+        // No room ever: gives up within its budget, reporting it.
+        let id = crate::session::SessionId("abort-stuck".into());
+        let (stuck, _ep) = SessionHandle::new(meta_for(&id), view_for());
+        while stuck.send(SessionCommand::Save).await.is_ok() {}
+        assert!(!send_reload_aborted(&stuck, Duration::from_millis(100)).await);
     }
 }
