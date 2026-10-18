@@ -547,3 +547,87 @@ async fn broker_token_account_mapping_and_metadata_endpoints_on_real_router() {
         .unwrap();
     assert_eq!(snap.status().as_u16(), 400, "authorized snapshot reaches validation");
 }
+
+/// The client's old-broker probe (`RemoteBroker::predates_usage_snapshot`)
+/// sends `account=` on purpose: a current broker must answer it with a JSON
+/// 400 from input validation, before any credential is read, so the probe can
+/// never turn into a token load or refresh. The store is corrupted once the
+/// broker is up, so any read would surface as a non-400 (see the control).
+#[tokio::test]
+async fn empty_account_usage_probe_is_a_json_400_that_reads_no_credential() {
+    let sandbox = Sandbox::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let child = sandbox
+        .command()
+        .env("SYNAPS_BROKER_TOKEN", "synthetic-machine-auth")
+        .args(["auth-broker", "--bind", &addr.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = BrokerProcess(child);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let base = format!("http://{addr}");
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "broker exited before ready"
+        );
+        if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "broker did not become healthy");
+
+    // The broker refuses to start on a corrupt store, so corrupt it now.
+    let auth_json = sandbox.dir.path().join("auth.json");
+    std::fs::write(&auth_json, b"{ corrupt").unwrap();
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(sandbox.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    let get = |account: &'static str| {
+        client
+            .get(format!("{base}/usage/snapshot"))
+            .query(&[("provider", "anthropic"), ("account", account)])
+            .bearer_auth("synthetic-machine-auth")
+            .send()
+    };
+
+    let probe = get("").await.unwrap();
+    assert_eq!(probe.status().as_u16(), 400);
+    let content_type = probe
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(content_type.contains("application/json"), "{content_type}");
+    let body: Value = probe.json().await.unwrap();
+    assert_eq!(body["error"], "invalid account");
+    assert_eq!(listing(), before, "probe created no lock or temp files");
+    assert_eq!(
+        std::fs::read(&auth_json).unwrap(),
+        b"{ corrupt",
+        "probe left the store untouched"
+    );
+
+    // Control: a real account on the same corrupt store must read it.
+    let control = get("default").await.unwrap().status().as_u16();
+    assert_ne!(control, 400, "control: a real account reads the (corrupt) store");
+}
