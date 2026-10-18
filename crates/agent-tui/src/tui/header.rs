@@ -307,8 +307,27 @@ fn build_label(version: &str, hash: &str) -> String {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    /// Test seam: the build label headers rendered on this thread show,
+    /// whatever id the binary has (`TestHarness::set_build_id`). Headless
+    /// tests render on their own thread, so this never leaks between them.
+    static BUILD_OVERRIDE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin (or with `None`, clear) the build id this thread's headers show.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn set_build_id_for_thread(id: Option<&str>) {
+    let label = id.map(|id| &*Box::leak(build_label(env!("CARGO_PKG_VERSION"), id).into_boxed_str()));
+    BUILD_OVERRIDE.with(|o| o.set(label));
+}
+
 /// This build, as the idle header shows it (see [`build_label`]).
 pub(crate) fn build() -> &'static str {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(label) = BUILD_OVERRIDE.with(std::cell::Cell::get) {
+        return label;
+    }
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // The same identity the version-skew check compares (04-tui M8): the
     // engine's `SYNAPS_BUILD_ID`, which packagers can set.

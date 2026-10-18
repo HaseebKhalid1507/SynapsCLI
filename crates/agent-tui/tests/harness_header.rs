@@ -72,24 +72,17 @@ fn idle_session_shows_the_wordmark_label_and_build() {
         "Ghost drops the 'ready' text: {line:?}"
     );
 
-    // Right side: the build and nothing else. `v<version> · <hash>` in a
-    // checkout, `v<version>` alone in a packaged build (no hash to show).
-    let r = right(&mut h);
+    // Right side: the build and nothing else: `v<version> · <id>` with a
+    // build id, `v<version>` alone without one. Pinned, so it doesn't
+    // depend on the id this test binary was built with.
     let ver = concat!("v", env!("CARGO_PKG_VERSION"));
-    assert!(
-        r.starts_with(ver),
-        "idle right side should be the build: {r:?}"
-    );
-    if let Some(hash) = r[ver.len()..].strip_prefix(" · ") {
-        assert!(
-            !hash.is_empty()
-                && hash != "release"
-                && hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-            "hash: {r:?}"
-        );
-    } else {
-        assert_eq!(r, ver, "build: {r:?}");
-    }
+    h.set_build_id("ae490b32");
+    let r = right(&mut h);
+    assert_eq!(r, format!("{ver} \u{b7} ae490b32"), "idle right side should be the build");
+    h.set_build_id("");
+    let r = right(&mut h);
+    assert_eq!(r, ver, "no build id: the version alone");
+    let line = header(&mut h);
 
     // No indicator anywhere between the wordmark and the build.
     let start = line.find("synaps").unwrap() + "synaps".len();
@@ -103,6 +96,9 @@ fn idle_session_shows_the_wordmark_label_and_build() {
 #[test]
 fn a_narrow_idle_header_drops_the_build_before_the_label() {
     let mut h = TestHarness::boot_with_size(40, 20);
+    // A build id pinned long enough not to fit next to the label at 40
+    // columns, whatever id (or none) the binary was built with.
+    h.set_build_id("ae490b32-dirty");
     let line = header(&mut h);
     assert!(
         line.contains("test-session"),
@@ -111,6 +107,14 @@ fn a_narrow_idle_header_drops_the_build_before_the_label() {
     assert!(
         !line.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
         "build should give way: {line:?}"
+    );
+    // The bare version (no build id) does fit at 40: shown.
+    h.set_build_id("");
+    let line = header(&mut h);
+    assert!(line.contains("test-session"), "{line:?}");
+    assert!(
+        line.trim_end().ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
+        "the version alone fits: {line:?}"
     );
 }
 
