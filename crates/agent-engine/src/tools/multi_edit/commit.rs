@@ -139,7 +139,7 @@ fn create(
     };
     match linked {
         Ok(()) => {
-            let _ = dir.unlink(&staged.name);
+            let _ = remove_if_ours(dir, &staged.name, staged.identity);
             Ok(())
         }
         Err(e) if dir::link_unsupported(&e) => Err(std::io::Error::other(format!(
@@ -165,8 +165,8 @@ fn stage(p: &Pending, bytes: &[u8], hooks: &mut dyn Hooks) -> std::io::Result<St
 /// name, a symlink included, is never followed, reused or removed. With
 /// `mode` (an existing file's bits) the file is owner-only until the bytes
 /// are written, then gets `mode`; without, it is `0666 & ~umask`
-/// throughout. A file this call did create is removed again if writing it
-/// fails.
+/// throughout. If writing fails, the file is removed again, but only while
+/// `name` still holds the file this call created.
 #[cfg_attr(not(test), allow(unused_variables))]
 pub(crate) fn write_new(
     dir: &Dir,
@@ -176,6 +176,8 @@ pub(crate) fn write_new(
     hooks: &mut dyn Hooks,
 ) -> std::io::Result<Staged> {
     let mut file = dir.create_new(name, if mode.is_some() { 0o600 } else { 0o666 })?;
+    // What was created, so a failed write removes only that file.
+    let created = dir::meta_of_file(&file).map(|meta| meta.identity);
     let written: std::io::Result<Option<(u64, u64)>> = (|| {
         file.write_all(bytes)?;
         #[cfg(test)]
@@ -193,7 +195,11 @@ pub(crate) fn write_new(
             identity,
         }),
         Err(e) => {
-            let _ = dir.unlink(name);
+            // Without its identity the file can't be told apart from one
+            // renamed over it: it is left in place.
+            if let Ok(identity) = created {
+                let _ = remove_if_ours(dir, name, identity);
+            }
             Err(e)
         }
     }
@@ -268,11 +274,20 @@ fn restore(p: &Pending, hooks: &mut dyn Hooks) -> Result<(), String> {
 /// Remove a temp, but only the file this call created: a name taken over
 /// by someone else is left alone.
 fn remove_temp(p: &Pending, staged: &Staged) {
-    if p.dir
-        .lstat(&staged.name)
-        .is_ok_and(|meta| meta.kind == Kind::File && meta.identity == staged.identity)
-    {
-        let _ = p.dir.unlink(&staged.name);
+    let _ = remove_if_ours(&p.dir, &staged.name, staged.identity);
+}
+
+/// Remove `name` from `dir` only while it is the regular file with
+/// `identity` (the file this call created). `Err` says why it is still
+/// there; a name that is already gone is `Ok`.
+fn remove_if_ours(dir: &Dir, name: &OsStr, identity: Option<(u64, u64)>) -> Result<(), String> {
+    match dir.lstat(name) {
+        Ok(meta) if meta.kind == Kind::File && meta.identity == identity => {
+            dir.unlink(name).map_err(|e| e.to_string())
+        }
+        Ok(_) => Err("another file has taken its name; left as is".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
