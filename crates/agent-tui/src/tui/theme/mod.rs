@@ -352,7 +352,7 @@ impl Theme {
 }
 
 /// WCAG 2 contrast ratio between two colours; non-RGB colours count as black.
-fn wcag_contrast(a: Color, b: Color) -> f64 {
+pub(crate) fn wcag_contrast(a: Color, b: Color) -> f64 {
     fn lum(c: Color) -> f64 {
         let Color::Rgb(r, g, b) = c else {
             return 0.0;

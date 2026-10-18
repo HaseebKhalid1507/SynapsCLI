@@ -422,13 +422,33 @@ fn glow(i: f32, len: f32, tick: u64) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// The brightest point of the busy wordmark's shimmer: toward white on a
+/// dark header, toward black on a light one (mixing toward white on
+/// `paper` faded the letters to 1.47:1 instead of making them glow).
+fn shimmer_peak(t: &Theme) -> Color {
+    let (white, black) = (Color::Rgb(255, 255, 255), Color::Rgb(0, 0, 0));
+    let wcag = super::theme::wcag_contrast;
+    let toward = if wcag(white, t.bg) >= wcag(black, t.bg) {
+        white
+    } else {
+        black
+    };
+    mix(t.header_fg, toward, 0.65)
+}
+
+/// The idle build label's colour: the chrome's secondary text (≥ 4.5:1 on
+/// every built-in theme; `muted` faded toward `bg` was 1.3–2.7:1).
+fn build_color(t: &Theme) -> Color {
+    t.chrome_dim()
+}
+
 fn wordmark(t: &Theme, state: &HeaderState, tick: u64) -> Vec<Span<'static>> {
     let base = match state {
         HeaderState::Idle => mix(t.muted, t.bg, 0.25),
         HeaderState::Failed(_) => t.error_color,
         _ => t.header_fg,
     };
-    let hi = mix(t.header_fg, Color::Rgb(255, 255, 255), 0.65);
+    let hi = shimmer_peak(t);
     let n = WORDMARK.chars().count() as f32;
     WORDMARK
         .chars()
@@ -485,7 +505,7 @@ fn right_cluster(
 /// hide the session label (the label matters more).
 fn idle_right(t: &Theme, label: &str, width: usize, left_w: usize) -> Vec<Span<'static>> {
     let build = vec![
-        Span::styled(build(), fg(mix(t.muted, t.bg, 0.3))),
+        Span::styled(build(), fg(build_color(t))),
         Span::raw("  "),
     ];
     let label_whole = match place_centre(label, width, left_w, spans_width(&build)) {
@@ -875,6 +895,28 @@ mod tests {
             }
         }
         assert!(right_cluster(&t, &HeaderState::Idle, None, 0).is_empty());
+    }
+
+    /// 04-tui M4: the busy shimmer mixed toward white, which on `paper`
+    /// faded the letters to 1.47:1, and the idle build label was 1.3–2.7:1
+    /// on every built-in theme. Both read at ≥ 3:1 (WCAG non-text/large).
+    #[test]
+    fn shimmer_and_build_label_read_at_3_to_1_on_every_builtin() {
+        for name in [
+            "default", "night-city", "neon-rain", "amber", "phosphor", "solarized-dark",
+            "blood", "ocean", "rose-pine", "nord", "dracula", "monokai", "myx", "gruvbox",
+            "catppuccin", "tokyo-night", "sunset", "ice", "forest", "lavender", "paper",
+        ] {
+            let t = Theme::builtin_for_test(name);
+            let hi = shimmer_peak(&t);
+            for step in 0..=20 {
+                let c = mix(t.header_fg, hi, step as f32 / 20.0);
+                let r = super::super::theme::wcag_contrast(c, t.bg);
+                assert!(r >= 3.0, "{name}: shimmer at {step}/20 is {r:.2}:1");
+            }
+            let r = super::super::theme::wcag_contrast(build_color(&t), t.bg);
+            assert!(r >= 3.0, "{name}: idle build label {r:.2}:1");
+        }
     }
 
     #[test]
