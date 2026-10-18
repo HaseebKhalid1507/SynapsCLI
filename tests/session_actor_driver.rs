@@ -991,10 +991,24 @@ async fn stub_host(
     script: Script,
     extra_config: &str,
 ) -> (Arc<EngineHost>, tempfile::TempDir) {
+    let (host, temp, _hits) = stub_host_counting(guard, script, extra_config).await;
+    (host, temp)
+}
+
+/// [`stub_host`], also returning the stub's request counter.
+async fn stub_host_counting(
+    guard: &HomeGuard,
+    script: Script,
+    extra_config: &str,
+) -> (
+    Arc<EngineHost>,
+    tempfile::TempDir,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     if !extra_config.is_empty() {
         std::fs::write(guard.base_dir().join("config"), extra_config).unwrap();
     }
-    let (url, _hits, _bodies) = spawn_stub(script).await;
+    let (url, hits, _bodies) = spawn_stub(script).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
     let (temp, manifest) = plugin_copy();
@@ -1017,7 +1031,7 @@ async fn stub_host(
         .load_with_cwd("autonomous", &manifest, Some(temp.path().to_path_buf()))
         .await
         .unwrap();
-    (host, temp)
+    (host, temp, hits)
 }
 
 /// A session created against `host` with a caller-tweaked `SessionConfig`, then
@@ -1708,5 +1722,180 @@ async fn a_driver_revoked_mid_turn_ends_as_an_interrupted_turn() {
     assert_eq!(last["content"], InterruptReason::Driver.marker());
     let partial = &conv.api_messages[conv.api_messages.len() - 2];
     assert_eq!(partial["role"], "assistant", "the partial reply is kept");
+    actor.end().await;
+}
+
+// ── The driver while `on_session_start` is pending ──────────────────────────
+//
+// A driver turn opens its stream from the tick, not through `start_turn`, so
+// it never enters the wait for the hook. The driver checks the hook itself
+// (`driver_idle_conflict`): a start is rejected while the hook is pending,
+// and an armed driver that finds the hook pending again is revoked before its
+// next request. A foreground turn that waits for the hook keeps waiting
+// through a rejected driver start and sends once the hook has run. Two test
+// seams make the hook pending: the host's session-start gate is held, and the
+// next turn to end puts a fresh hook back in line.
+
+use agent_engine::session::session_start_testing as start_seam;
+use std::sync::atomic::Ordering::SeqCst;
+
+/// One ordinary turn; afterwards this session's `on_session_start` waits
+/// behind the held gate. Returns the hold and the hook-call count before.
+async fn hook_pending_after_a_turn(
+    actor: &mut TestActor,
+    host: &Arc<EngineHost>,
+) -> (start_seam::GateHold, u64) {
+    let hold = start_seam::hold_gate(host).await;
+    let calls = start_seam::calls();
+    start_seam::requeue_after_next_turn();
+    actor
+        .send(SessionCommand::Submit {
+            text: "first".into(),
+            attachments: vec![],
+        })
+        .await;
+    actor.until(|e| matches!(e, SessionEventWire::Idle)).await;
+    (hold, calls)
+}
+
+/// Wait (bounded) until `n` hooks have run since `base`.
+async fn hooks_run(base: u64, n: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if start_seam::calls() >= base + n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// The next driver-start rejection notice; panics if the driver arms instead.
+async fn driver_rejection(actor: &mut TestActor) -> String {
+    let ev = actor
+        .until(|e| {
+            matches!(e, SessionEventWire::SystemNotice(text) if text.starts_with("Session driver rejected"))
+                || matches!(e, SessionEventWire::DriverArmed { .. })
+        })
+        .await;
+    match ev {
+        SessionEventWire::SystemNotice(text) => text,
+        other => panic!("the driver armed while the hook was pending: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_driver_start_while_on_session_start_is_pending_is_rejected_before_any_request() {
+    let guard = HomeGuard::new();
+    let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let mut actor = session(&host).await;
+    let (hold, calls) = hook_pending_after_a_turn(&mut actor, &host).await;
+    let sent = hits.load(SeqCst);
+
+    actor.driver_start().await;
+    let notice = driver_rejection(&mut actor).await;
+    assert!(
+        notice.contains("extensions loading"),
+        "rejected for the pending hook: {notice}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(SeqCst), sent, "no request while the hook is pending");
+    assert_eq!(start_seam::calls(), calls, "the hook still waits");
+
+    drop(hold);
+    assert!(hooks_run(calls, 1).await, "the hook runs");
+    // With the hook done, a driver arms and runs its turn as usual.
+    actor.arm().await;
+    actor
+        .until(|e| matches!(e, SessionEventWire::DriverTurnOutcome { .. }))
+        .await;
+    assert!(hits.load(SeqCst) > sent, "the driver turn sent its request");
+    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    actor.send(SessionCommand::Cancel).await;
+    actor.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_armed_driver_finding_on_session_start_pending_is_revoked_before_its_next_request() {
+    let guard = HomeGuard::new();
+    let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let mut actor = session(&host).await;
+    let hold = start_seam::hold_gate(&host).await;
+    let calls = start_seam::calls();
+    // The driver's first turn ends with a fresh hook in line, behind the hold.
+    start_seam::requeue_after_next_turn();
+    actor.arm().await;
+
+    let seen = actor
+        .collect_until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))
+        .await;
+    match seen.last() {
+        Some(SessionEventWire::DriverRevoked { reason, .. }) => assert!(
+            reason.contains("extensions loading"),
+            "revoked for the pending hook: {reason}"
+        ),
+        other => panic!("expected a revocation: {other:?}"),
+    }
+    let turns = seen
+        .iter()
+        .filter(|e| matches!(e, SessionEventWire::TurnStarted { .. }))
+        .count();
+    assert_eq!(turns, 1, "one driver turn, then the revocation: {seen:?}");
+    let sent = hits.load(SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(SeqCst), sent, "no request after the revocation");
+
+    drop(hold);
+    assert!(hooks_run(calls, 1).await, "the hook runs");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(hits.load(SeqCst), sent, "the revoked driver sends nothing");
+    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    actor.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_waiting_for_on_session_start_outlasts_a_rejected_driver_start() {
+    let guard = HomeGuard::new();
+    let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let mut actor = session(&host).await;
+    let (hold, calls) = hook_pending_after_a_turn(&mut actor, &host).await;
+    let sent = hits.load(SeqCst);
+
+    actor
+        .send(SessionCommand::Submit {
+            text: "second".into(),
+            attachments: vec![],
+        })
+        .await;
+    actor
+        .until(|e| matches!(e, SessionEventWire::TurnStarted { .. }))
+        .await;
+    actor.driver_start().await;
+    let notice = driver_rejection(&mut actor).await;
+    assert!(
+        notice.contains("foreground turn still active") || notice.contains("extensions loading"),
+        "rejected for the waiting turn: {notice}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(SeqCst), sent, "the turn still waits for the hook");
+
+    drop(hold);
+    let seen = actor
+        .collect_until(|e| matches!(e, SessionEventWire::Idle))
+        .await;
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            SessionEventWire::DriverArmed { .. }
+                | SessionEventWire::DriverTurnOutcome { .. }
+                | SessionEventWire::TurnStarted { .. }
+        )),
+        "only the waiting turn runs: {seen:?}"
+    );
+    assert_eq!(hits.load(SeqCst), sent + 1, "the waiting turn sent its request once");
+    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
     actor.end().await;
 }

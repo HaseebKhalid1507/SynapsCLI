@@ -1698,6 +1698,9 @@ impl SessionActor {
                         self.driver_revoke("foreground work took priority");
                         return;
                     }
+                    // This includes a pending `on_session_start`: a driver
+                    // turn opens its stream below, not through `start_turn`,
+                    // so it never waits for the hook and must not run before it.
                     if let Some(reason) = self.driver_idle_conflict() {
                         self.driver_revoke(reason);
                         return;
