@@ -227,8 +227,10 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 7] = [
         display_name: "Meta Muse",
         description: "Meta account device OAuth for Muse Code (experimental)",
         recommended: false,
-        // The vended "access token" is the minted Model API key; the Meta
-        // OAuth access token that re-mints it stays broker-owned.
+        // The stored "access token" is the minted Model API key; the Meta
+        // OAuth access token that re-mints it stays broker-owned. The remote
+        // broker's `/token` refuses Muse explicitly (#216 I2): it is used
+        // only through `/proxy`.
         broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
         behavior: ProviderBehavior::Muse,
     },

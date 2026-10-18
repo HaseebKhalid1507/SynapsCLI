@@ -38,7 +38,8 @@
 //! Endpoints:
 //!   GET  /healthz                         -> { status }   (no secret; 503 until ANY OAuth slot exists)
 //!   GET  /token?provider=X[&account=Y]    -> { access_token, expires, ttl_ms, account }
-//!                                            (machine-auth, OAuth providers ONLY; `account` is a
+//!                                            (machine-auth, OAuth providers ONLY, never Muse
+//!                                            (proxy-only, #216 I2); `account` is a
 //!                                            label, `default`, or `auto`; unknown → 404, malformed
 //!                                            → 400, no capacity → 503; never a fallback)
 //!   POST /proxy                           -> typed broker proxy (machine-auth; OAuth providers may
@@ -72,6 +73,16 @@ fn broker_provider(value: &str) -> Option<auth::OAuthProviderId> {
     let id: auth::OAuthProviderId = value.try_into().ok()?;
     let descriptor = auth::provider::registry().get(id).copied()?;
     (descriptor.broker_strategy == auth::BrokerCredentialStrategy::OAuthAccessToken).then_some(id)
+}
+
+/// Providers `/token` may vend an access token for: [`broker_provider`]
+/// minus Meta Muse (#216 I2). Muse is routed `BrokerProxy` and its stored
+/// `access` is a minted Model API key that is valid until it 401s, not a
+/// short-lived OAuth access token, so it never leaves the broker. `/proxy`
+/// (which does not consult this list) keeps serving Muse, and usage /
+/// cooldown endpoints keep using `broker_provider`.
+fn token_vending_provider(value: &str) -> Option<auth::OAuthProviderId> {
+    broker_provider(value).filter(|id| *id != auth::OAuthProviderId::Muse)
 }
 
 // ── TLS config types ─────────────────────────────────────────────────────────
@@ -625,7 +636,7 @@ async fn token(
 
     // ── provider allowlist ──
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
-    let Some(provider_id) = broker_provider(&provider) else {
+    let Some(provider_id) = token_vending_provider(&provider) else {
         eprintln!(
             "[auth-broker] DENIED from {} (provider not allowed, {} chars)",
             peer.ip(),
@@ -1802,6 +1813,72 @@ mod tests {
         assert!(resolve_machine_token(None, false, false, &other).is_err());
         assert_eq!(resolve_machine_token(None, false, true, &other).unwrap(), None);
         assert!(!other.exists(), "never auto-generated for a network bind");
+    }
+
+    // ── Muse is proxy-only (#216 I2) ────────────────────────────────────────
+
+    /// The minted Muse Model API key never expires on its own and Muse is
+    /// routed BrokerProxy, so `/token` must never vend it — for any slot.
+    #[tokio::test]
+    async fn token_endpoint_never_vends_muse() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+        for query in [
+            vec![("provider", "muse")],
+            vec![("provider", "muse"), ("account", "default")],
+            vec![("provider", "muse"), ("account", "work")],
+            vec![("provider", "muse"), ("account", "auto")],
+        ] {
+            let resp = client
+                .get(format!("{base}/token"))
+                .query(&query)
+                .bearer_auth("machine-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{query:?}");
+            let body = resp.text().await.unwrap();
+            assert!(!body.contains("access_token"), "{query:?}: {body}");
+        }
+    }
+
+    /// `/proxy` is unaffected: a Muse proxy request still reaches the Muse
+    /// endpoint policy (here: its allowlist refusing the key-mint path,
+    /// checked before any credential or network access).
+    #[tokio::test]
+    async fn proxy_still_routes_muse_requests() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/proxy"))
+            .bearer_auth("machine-secret")
+            .json(&json!({
+                "provider": "muse",
+                "method": "post",
+                "path": "/muse-code/key",
+                "body": {},
+                "stream": false,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("unknown provider"),
+            "muse is still a proxy provider: {body}"
+        );
+        assert!(body.contains("allow"), "the Muse path allowlist answered: {body}");
+    }
+
+    #[test]
+    fn muse_is_excluded_from_token_vending_only() {
+        assert_eq!(token_vending_provider("muse"), None);
+        // Usage snapshots / cooldown reports keep their provider check.
+        assert_eq!(broker_provider("muse"), Some(auth::OAuthProviderId::Muse));
+        assert_eq!(
+            token_vending_provider("anthropic"),
+            Some(auth::OAuthProviderId::Anthropic)
+        );
     }
 
     #[test]
