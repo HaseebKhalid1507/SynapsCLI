@@ -17,15 +17,22 @@
 //!   a running leader is never dropped. When only running records remain,
 //!   the new record is not kept. Either way the session reads
 //!   `truncated: true`.
+//! - **States.** A record is `running` while its leader (the spawned
+//!   process itself) is alive with the same start ticks. It turns `ended`
+//!   when the tool reaps the leader (`tool_child_ended`), or when a sweep or
+//!   a restore finds the leader's pid gone, reused, or a zombie (stat state
+//!   `Z`/`X`: exited but never reaped; exit code and signal unknown). Other
+//!   processes left in its sid only keep an ended record; nothing turns a
+//!   record back to running.
 //! - **Retention.** A record is kept while its leader runs. After it ends,
-//!   it is kept until a sweep finds no live process left in its session id
-//!   (sid). A sweep is one `/proc` walk, run lazily on a spawn or a query at
+//!   it is kept until a sweep finds no live (non-zombie) process left in its
+//!   session id (sid). A sweep is one `/proc` walk, run lazily on a spawn or a query at
 //!   most once per [`SWEEP_EVERY`], on a blocking thread. Records outlive
 //!   their daemon session.
 //! - **Reload.** [`snapshot_for_reload`] / [`restore_after_reload`] carry the
 //!   records across the daemon's exec. On restore a record is dropped when
 //!   its boot id differs, or when its pid is alive with other start ticks
-//!   (reused); a record whose pid is gone is kept as ended.
+//!   (reused); a record whose pid is gone or a zombie is kept as ended.
 //!
 //! Linux only: elsewhere nothing is recorded and lists say
 //! `supported: false`.
@@ -58,6 +65,8 @@ pub struct ChildIdentity {
 /// The `/proc/<pid>/stat` fields the ledger uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatFields {
+    /// Field 3: `R`, `S`, `D`, `Z` (zombie), `X` (dead), ...
+    pub state: char,
     pub ppid: u32,
     pub pgid: u32,
     pub sid: u32,
@@ -70,12 +79,20 @@ pub struct StatFields {
 pub fn parse_stat(text: &str) -> Option<StatFields> {
     let rest = text.get(text.rfind(')')? + 1..)?;
     let mut fields = rest.split_ascii_whitespace();
-    let _state = fields.next()?; // field 3
+    let state = fields.next()?.chars().next()?; // field 3
     let ppid = fields.next()?.parse().ok()?; // 4
     let pgid = fields.next()?.parse().ok()?; // 5
     let sid = fields.next()?.parse().ok()?; // 6
     let start_ticks = fields.nth(15)?.parse().ok()?; // 22
-    Some(StatFields { ppid, pgid, sid, start_ticks })
+    Some(StatFields { state, ppid, pgid, sid, start_ticks })
+}
+
+impl StatFields {
+    /// Not a zombie (`Z`) or dead (`X`, `x`): it exited and only waits to
+    /// be reaped, so it runs nothing and counts as gone.
+    pub fn is_live(&self) -> bool {
+        !matches!(self.state, 'Z' | 'X' | 'x')
+    }
 }
 
 /// The stat fields of a live (or zombie) pid; `None` when it is gone or
@@ -317,12 +334,15 @@ impl Ledger {
         }
     }
 
-    /// Apply one `/proc` scan: a running record whose process is gone (or
-    /// reused) becomes ended, and an ended record with no live process left
-    /// in its sid is dropped.
+    /// Apply one `/proc` scan: a running record whose leader is gone, reused
+    /// or a zombie becomes ended, and an ended record with no live process
+    /// left in its sid is dropped. Zombies count as gone throughout.
     pub fn apply_sweep(&mut self, scan: &[(u32, StatFields)]) {
-        let live_sids: HashSet<u32> = scan.iter().map(|(_, s)| s.sid).collect();
-        let live: HashMap<u32, u64> = scan.iter().map(|(pid, s)| (*pid, s.start_ticks)).collect();
+        let live_sids: HashSet<u32> = scan.iter().filter(|(_, s)| s.is_live()).map(|(_, s)| s.sid).collect();
+        let live: HashMap<u32, u64> =
+            scan.iter().filter(|(_, s)| s.is_live()).map(|(pid, s)| (*pid, s.start_ticks)).collect();
+        // Every pid in the scan, zombies included: for the reuse check.
+        let present: HashMap<u32, u64> = scan.iter().map(|(pid, s)| (*pid, s.start_ticks)).collect();
         for record in self.records.iter_mut() {
             if record.state == ChildState::Running && live.get(&record.child.pid) != Some(&record.child.start_ticks) {
                 record.state = ChildState::Ended;
@@ -333,7 +353,7 @@ impl Ledger {
         // and the live sid of that number belongs to someone else.
         let session_alive = |r: &ChildRecord| {
             let leader_reused = r.child.sid == r.child.pid
-                && live.get(&r.child.pid).is_some_and(|t| *t != r.child.start_ticks);
+                && present.get(&r.child.pid).is_some_and(|t| *t != r.child.start_ticks);
             !leader_reused && live_sids.contains(&r.child.sid)
         };
         self.records.retain(|r| r.state == ChildState::Running || session_alive(r));
@@ -411,8 +431,10 @@ impl Ledger {
             }
             match stat_of(record.child.pid) {
                 Some(stat) if stat.start_ticks != record.child.start_ticks => continue,
-                Some(_) => {}
-                None => record.state = ChildState::Ended,
+                Some(stat) if stat.is_live() => {}
+                // Gone, or a zombie nobody will reap (its tool died with the
+                // old image): ended, code and signal unknown.
+                Some(_) | None => record.state = ChildState::Ended,
             }
             if self.records.iter().any(|r| same_process(&r.child, &record.child)) {
                 continue;
@@ -472,10 +494,11 @@ pub fn scan_proc() -> Vec<(u32, StatFields)> {
     out
 }
 
-/// Fill `members` for every entry: the live processes in its sid.
+/// Fill `members` for every entry: the live (non-zombie) processes in its
+/// sid.
 pub fn attach_members(listing: &mut ChildListing, scan: &[(u32, StatFields)]) {
     let mut by_sid: HashMap<u32, Vec<ChildMember>> = HashMap::new();
-    for (pid, stat) in scan {
+    for (pid, stat) in scan.iter().filter(|(_, s)| s.is_live()) {
         by_sid.entry(stat.sid).or_default().push(ChildMember { pid: *pid, start_ticks: stat.start_ticks });
     }
     for group in &mut listing.sessions {
@@ -577,7 +600,7 @@ mod tests {
     }
 
     fn stat(sid: u32, start_ticks: u64) -> StatFields {
-        StatFields { ppid: 1, pgid: sid, sid, start_ticks }
+        StatFields { state: 'S', ppid: 1, pgid: sid, sid, start_ticks }
     }
 
     fn stat_line(comm: &str, ppid: u32, pgid: u32, sid: u32, start: u64) -> String {
@@ -590,11 +613,14 @@ mod tests {
     #[test]
     fn stat_fields_come_from_after_the_last_paren() {
         let line = stat_line("a b) c) S 9 9 9", 77, 88, 99, 26981644);
-        assert_eq!(parse_stat(&line), Some(StatFields { ppid: 77, pgid: 88, sid: 99, start_ticks: 26981644 }));
+        assert_eq!(parse_stat(&line), Some(StatFields { state: 'S', ppid: 77, pgid: 88, sid: 99, start_ticks: 26981644 }));
         assert_eq!(
             parse_stat(&stat_line("cat", 1, 2, 3, 4)),
-            Some(StatFields { ppid: 1, pgid: 2, sid: 3, start_ticks: 4 })
+            Some(StatFields { state: 'S', ppid: 1, pgid: 2, sid: 3, start_ticks: 4 })
         );
+        let zombie = stat_line("sh", 1, 2, 3, 4).replacen(") S ", ") Z ", 1);
+        assert_eq!(parse_stat(&zombie).map(|s| (s.state, s.is_live())), Some(('Z', false)));
+        assert!(parse_stat(&stat_line("sh", 1, 2, 3, 4)).unwrap().is_live());
     }
 
     #[test]
@@ -785,6 +811,72 @@ mod tests {
             got,
             vec![("alive".to_string(), ChildState::Running), ("gone".to_string(), ChildState::Ended)]
         );
+    }
+
+    /// A leader that exited but was never reaped still has a stat line with
+    /// its start ticks. It reads ended, on a sweep and on a restore, and a
+    /// zombie in a sid keeps no ended record alive and is no member.
+    #[test]
+    fn a_zombie_leader_reads_ended_and_zombies_count_as_gone() {
+        let zombie = |sid: u32, ticks: u64| StatFields { state: 'Z', ..stat(sid, ticks) };
+        let mut l = Ledger::new();
+        l.insert("s", spawn("zombie-leader", ident(70, 5, 70)));
+        l.insert("s", spawn("zombie-member", ident(71, 5, 71)));
+        l.mark_ended(&ident(71, 5, 71), Some(0), None);
+        l.insert("s", spawn("live-member", ident(72, 5, 72)));
+        l.mark_ended(&ident(72, 5, 72), Some(0), None);
+        // 70 is a zombie leader with a live process (83) left in its sid;
+        // 71's sid holds only a zombie; 72's a live process.
+        let scan = [(70, zombie(70, 5)), (83, stat(70, 9)), (81, zombie(71, 9)), (82, stat(72, 9))];
+        l.apply_sweep(&scan);
+        let got: Vec<(String, ChildState)> = l.records.iter().map(|r| (r.tool_id.clone(), r.state)).collect();
+        assert_eq!(
+            got,
+            vec![("zombie-leader".to_string(), ChildState::Ended), ("live-member".to_string(), ChildState::Ended)],
+            "the zombie leader reads ended; a sid with only a zombie keeps nothing"
+        );
+        let mut listing = l.list(None, None);
+        attach_members(&mut listing, &scan);
+        let members: Vec<Option<Vec<ChildMember>>> = listing.sessions[0].children.iter().map(|c| c.members.clone()).collect();
+        assert_eq!(
+            members,
+            vec![Some(vec![ChildMember { pid: 83, start_ticks: 9 }]), Some(vec![ChildMember { pid: 82, start_ticks: 9 }])],
+            "zombies are no members"
+        );
+
+        let mut carried = Ledger::new();
+        carried.insert("s", spawn("carried-zombie", ident(73, 5, 73)));
+        let mut new = Ledger::new();
+        new.restore(carried.snapshot(), BOOT, |pid| (pid == 73).then(|| zombie(73, 5)));
+        assert_eq!(new.records[0].state, ChildState::Ended, "restored as ended");
+        assert_eq!((new.records[0].exit_code, new.records[0].signal), (None, None), "code and signal unknown");
+    }
+
+    /// The same with a real zombie: a child that exits and isn't reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_unreaped_child_reads_ended_after_a_sweep_and_a_restore() {
+        let Some(boot) = boot_id() else { return };
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        let identity = identify(pid).expect("readable while unreaped");
+        let t0 = Instant::now();
+        while read_stat(pid).is_some_and(|s| s.is_live()) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "never became a zombie");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(read_stat(pid).map(|s| (s.state, s.start_ticks)), Some(('Z', identity.start_ticks)));
+
+        let mut l = Ledger::new();
+        l.insert("s", spawn("zombie", identity.clone()));
+        l.apply_sweep(&scan_proc());
+        assert_eq!(l.records[0].state, ChildState::Ended, "after a sweep");
+        let mut restored = Ledger::new();
+        let mut carried = Ledger::new();
+        carried.insert("s", spawn("zombie", identity));
+        restored.restore(carried.snapshot(), boot, read_stat);
+        assert_eq!(restored.records[0].state, ChildState::Ended, "after a restore");
+        child.wait().unwrap();
     }
 
     #[test]
