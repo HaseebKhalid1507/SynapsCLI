@@ -516,10 +516,16 @@ live in the system prompt):
   background, one session at a time per host. No turn and no keep-warm
   request of that session goes out before its hook has run: a turn that
   comes first waits for it (and goes ahead of other sessions' background
-  hooks), while Cancel and End still act at once. A manual `/compact`
-  builds its own prompt and does not wait. A session restored Parked runs
-  the hook once it is unparked. The order is strict: a hook that a turn, a
-  keep-warm ping or a session's creation waits for goes before background
+  hooks), while Cancel and End still act at once; a due keep-warm ping
+  waits with its timer off and goes out once the hook has run. A manual
+  `/compact` builds its own prompt and does not wait. A session restored
+  Parked runs the hook once it is unparked; a park takes a hook not yet
+  called out of line, a park that does not happen (held by running or
+  uncollected workers) leaves it in place. While a daemon reload has
+  checkpointed the session (until the exec, or until the daemon reports
+  that it failed), nothing starts at all; work that waited for both the
+  reload and the hook runs once, after both. The order is strict: a hook
+  that a turn or a session's creation waits for goes before background
   ones, which run in arrival order only while no such hook waits, so the
   background hooks of idle sessions can be held back for as long as others
   keep arriving. `startup.extensions_ready_timeout_secs` bounds extension
