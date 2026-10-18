@@ -274,7 +274,8 @@ impl DaemonState {
             Ok(true) => {
                 let mut heals = self.json_heals.lock().unwrap_or_else(|e| e.into_inner());
                 heals.1 += 1;
-                if heals.0.is_none_or(|at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
+                // `map_or`, not `is_none_or`: the crate's MSRV is 1.80.
+                if heals.0.map_or(true, |at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
                     tracing::info!(
                         path = %self.paths.json.display(),
                         pid = info.pid,
