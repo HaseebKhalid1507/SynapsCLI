@@ -2625,7 +2625,8 @@ impl SessionActor {
     /// `tool_use` without its result: an in-flight tool call and unsigned
     /// thinking are dropped. (Rebuilding the call isn't safe: with extended
     /// thinking a `tool_use` turn needs its signed thinking block.) A tool
-    /// the response called instead gets a note after it, worded like the
+    /// the response called instead gets a host-authored note after it
+    /// (`engine::interrupt::tool_in_flight_note_message`), worded like the
     /// engine's canceled `tool_result`, so the next turn doesn't blindly
     /// repeat a non-idempotent action; clients get the same note. The
     /// engine's late publication is not applied: its stream is gone with the
@@ -2644,12 +2645,10 @@ impl SessionActor {
             })));
         }
         if !tools.is_empty() {
-            let note = tools_in_flight_note(reason, &tools);
-            self.conv.api_messages.push(std::sync::Arc::new(serde_json::json!({
-                "role": "user",
-                "content": note
-            })));
-            self.emit(SessionEventWire::SystemNotice(note));
+            let note = crate::engine::interrupt::tool_in_flight_note_message(reason, &tools);
+            let text = note["content"].as_str().unwrap_or_default().to_owned();
+            self.conv.api_messages.push(note);
+            self.emit(SessionEventWire::SystemNotice(text));
         }
     }
 
@@ -4615,44 +4614,6 @@ async fn await_stopped_workers(
         .filter(|(_, s)| s.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload)
         .map(|(id, _)| id.clone())
         .collect()
-}
-
-/// The note `keep_streamed_partial` records for tool calls that may have
-/// run: the engine's canceled-`tool_result` wording
-/// (`canceled_tool_result_content`), hedged to "may have already started"
-/// because the actor can't tell whether the call began.
-fn tools_in_flight_note(reason: crate::engine::interrupt::InterruptReason, tools: &[String]) -> String {
-    let phrase = reason.cancel_cause().map_or("Canceled", |c| c.phrase());
-    let names = tools.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
-    let (call, was, it, its) = if tools.len() == 1 {
-        ("tool call", "was", "It", "its")
-    } else {
-        ("tool calls", "were", "They", "their")
-    };
-    format!(
-        "[{phrase} while the {call} {names} {was} running. {it} may have already started and \
-         partially applied {its} effects.]"
-    )
-}
-
-#[cfg(test)]
-mod tools_in_flight_note_tests {
-    use super::tools_in_flight_note;
-    use crate::engine::interrupt::InterruptReason;
-
-    #[test]
-    fn names_the_tools_and_hedges_like_the_engine() {
-        assert_eq!(
-            tools_in_flight_note(InterruptReason::User, &["bash".into()]),
-            "[Canceled by user while the tool call `bash` was running. It may have already \
-             started and partially applied its effects.]"
-        );
-        assert_eq!(
-            tools_in_flight_note(InterruptReason::Driver, &["read".into(), "bash".into()]),
-            "[Canceled (session driver revoked) while the tool calls `read`, `bash` were \
-             running. They may have already started and partially applied their effects.]"
-        );
-    }
 }
 
 #[cfg(test)]

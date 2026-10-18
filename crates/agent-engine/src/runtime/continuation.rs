@@ -910,6 +910,16 @@ pub fn restore_window(messages: &[SharedMessage], state: &SharedContinuation) {
     }
 }
 
+/// A message's `_synaps_context` as a context-archive marker candidate: any
+/// of them, malformed ones included (those fail closed on restore), except
+/// the host's tool-in-flight note, a different host record with its own
+/// schema (`engine::interrupt::TOOL_NOTE_SCHEMA`).
+fn archive_marker_candidate(message: &SharedMessage) -> Option<&Value> {
+    message
+        .get("_synaps_context")
+        .filter(|c| c["schema"] != crate::engine::interrupt::TOOL_NOTE_SCHEMA)
+}
+
 /// Capture only host marker syntax, without authorizing mode or touching a
 /// filesystem. Missing/malformed references remain pending and fail validation.
 fn restore_window_syntactic(messages: &[SharedMessage], state: &SharedContinuation) {
@@ -920,7 +930,7 @@ fn restore_window_syntactic(messages: &[SharedMessage], state: &SharedContinuati
         return;
     }
     s.initialized = true;
-    if let Some(marker) = messages.iter().find_map(|m| m.get("_synaps_context")) {
+    if let Some(marker) = messages.iter().find_map(archive_marker_candidate) {
         s.restore_pending = true;
         if marker["schema"] == MARKER {
             s.latest_archive = marker["archive"]
@@ -948,7 +958,7 @@ pub async fn validate_restored_history(
     // Inspect this actual request even if reset/another request initialized the
     // state already. A loaded marker must never bypass verification because an
     // earlier empty head (or legacy binding) set `initialized` first.
-    let mut markers = messages.iter().filter_map(|m| m.get("_synaps_context"));
+    let mut markers = messages.iter().filter_map(archive_marker_candidate);
     let Some(marker) = markers.next() else {
         let mut s = state
             .lock()
@@ -1183,6 +1193,7 @@ pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &mut [Shar
 fn is_user_request(message: &Value) -> bool {
     message["role"] == "user"
         && message["_synaps_context"]["schema"] != MARKER
+        && message["_synaps_context"]["schema"] != crate::engine::interrupt::TOOL_NOTE_SCHEMA
         && (message["content"].is_string()
             || message["content"]
                 .as_array()
@@ -2790,6 +2801,39 @@ mod budget_tests {
         let wire = wire_messages(&m).expect("host keys present");
         assert!(wire.iter().all(|x| x.get(TURN_KEY).is_none()));
         assert_eq!(wire.last().unwrap()["content"], "continue");
+    }
+
+    /// The host's tool-in-flight note (a cancel whose drain timed out) is
+    /// not a user request: an event wake after it keeps the turn start on
+    /// the real prompt, the note is stripped of its host key on the wire,
+    /// and it is not taken for a context-archive marker on restore.
+    #[test]
+    fn tool_in_flight_note_is_host_authored_not_a_turn_start_or_marker() {
+        use crate::engine::interrupt::{
+            append_marker, tool_in_flight_note_message, InterruptReason,
+        };
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        let mut m = vec![charter(), user("REAL TASK")];
+        record_turn_start(&state, &mut m);
+        let id = state.lock().unwrap().turn_start.clone().expect("turn recorded");
+        m.push(assistant("Let me look"));
+        m.push(tool_in_flight_note_message(InterruptReason::User, &["bash".into()]));
+        append_marker(&mut m, InterruptReason::User);
+        m.push(event(1, 50));
+        let wake = Arc::new(Mutex::new(ContinuationState::default()));
+        record_turn_start(&wake, &mut m);
+        assert_eq!(wake.lock().unwrap().turn_start.as_deref(), Some(id.as_str()));
+        assert_eq!(turn_id(&m[1]), Some(id.as_str()), "still the real prompt");
+        assert!(turn_id(&m[3]).is_none(), "the note never starts a turn");
+        assert!(!is_user_request(&m[3]));
+
+        let wire = wire_messages(&m).expect("host keys present");
+        assert!(wire.iter().all(|x| x.get("_synaps_context").is_none()));
+        assert_eq!(wire[3]["content"], m[3]["content"], "the note's text is still sent");
+
+        let restored = Arc::new(Mutex::new(ContinuationState::default()));
+        restore_window_syntactic(&m, &restored);
+        assert!(!restored.lock().unwrap().restore_pending, "no archive marker here");
     }
 
     #[test]

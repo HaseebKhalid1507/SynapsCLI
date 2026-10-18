@@ -102,6 +102,57 @@ pub fn interruption_label(text: &str) -> Option<&str> {
     is_interruption_marker(text).then(|| &text[1..text.len() - 1])
 }
 
+/// `_synaps_context.schema` of the host note a cancel records when the
+/// engine never reported a tool call the interrupted response made
+/// (`session::actor` `keep_streamed_partial`). Host-authored: never a user
+/// request to continuation (`is_user_request`), stripped from provider
+/// wires with every `_synaps_context`, shown as a system line on replay.
+pub const TOOL_NOTE_SCHEMA: &str = "synaps-tool-in-flight-note/1";
+
+/// The note's text: the engine's canceled-`tool_result` wording
+/// (`canceled_tool_result_content`), hedged to "may have already started"
+/// because the actor can't tell whether the call began.
+pub fn tool_in_flight_note(reason: InterruptReason, tools: &[String]) -> String {
+    let phrase = reason.cancel_cause().map_or("Canceled", |c| c.phrase());
+    let names = tools.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
+    let (call, was, it, its) = if tools.len() == 1 {
+        ("tool call", "was", "It", "its")
+    } else {
+        ("tool calls", "were", "They", "their")
+    };
+    format!(
+        "[{phrase} while the {call} {names} {was} running. {it} may have already started and \
+         partially applied {its} effects.]"
+    )
+}
+
+/// The note as a history message, tagged host-authored.
+pub fn tool_in_flight_note_message(reason: InterruptReason, tools: &[String]) -> SharedMessage {
+    std::sync::Arc::new(json!({
+        "role": "user",
+        "_synaps_context": {"schema": TOOL_NOTE_SCHEMA},
+        "content": tool_in_flight_note(reason, tools)
+    }))
+}
+
+/// [`tool_in_flight_note`] text → the text without its brackets, for
+/// display (the display tail carries text only, like the marker). `None`
+/// for anything else.
+pub fn tool_in_flight_note_label(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix('[')?.strip_suffix(']')?;
+    let mut phrases = InterruptReason::ALL
+        .iter()
+        .filter_map(|r| r.cancel_cause().map(|c| c.phrase()))
+        .chain(["Canceled"]);
+    (inner.ends_with(" effects.")
+        && phrases.any(|p| {
+            inner
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with(" while the tool call"))
+        }))
+    .then_some(inner)
+}
+
 fn marker_of(message: &Value) -> bool {
     message["role"] == "user"
         && message["content"]
@@ -184,6 +235,33 @@ pub fn recover_crashed_turn(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn tool_note_names_the_tools_hedges_like_the_engine_and_is_recognised() {
+        let one = tool_in_flight_note(InterruptReason::User, &["bash".into()]);
+        assert_eq!(
+            one,
+            "[Canceled by user while the tool call `bash` was running. It may have already \
+             started and partially applied its effects.]"
+        );
+        let two = tool_in_flight_note(InterruptReason::Driver, &["read".into(), "bash".into()]);
+        assert_eq!(
+            two,
+            "[Canceled (session driver revoked) while the tool calls `read`, `bash` were \
+             running. They may have already started and partially applied their effects.]"
+        );
+        for note in [&one, &two] {
+            assert_eq!(tool_in_flight_note_label(note), Some(&note[1..note.len() - 1]));
+            assert!(!is_interruption_marker(note), "never mistaken for a marker");
+        }
+        let msg = tool_in_flight_note_message(InterruptReason::User, &["bash".into()]);
+        assert_eq!(msg["role"], "user");
+        assert_eq!(msg["_synaps_context"]["schema"], TOOL_NOTE_SCHEMA);
+        assert_eq!(msg["content"], one.as_str());
+        for other in ["[Request interrupted by user]", "[Canceled by user]", "hello", "[x effects.]"] {
+            assert_eq!(tool_in_flight_note_label(other), None, "{other}");
+        }
+    }
 
     const ALL: [InterruptReason; 7] = InterruptReason::ALL;
 

@@ -893,7 +893,14 @@ async fn slow_engine_finalize_keeps_the_streamed_partial_with_persistence() {
 #[serial]
 async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
     use agent_engine::extensions::hooks::events::HookKind;
-    let _h = Home::new();
+    let h = Home::new();
+    // Context management records each turn's starting request
+    // (`_synaps_turn`), which the note must never become.
+    std::fs::write(
+        h.dir.path().join(".synaps-cli").join("config"),
+        "context_management.mode = auto\n",
+    )
+    .unwrap();
     let round = sse_text_then_tool(
         "Let me look",
         "toolu_rd",
@@ -901,7 +908,7 @@ async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
         r#"{"path":"/nonexistent/synaps-interrupt-fixture"}"#,
     );
     let bodies: &'static [&'static str] = Box::leak(Box::new([round, SSE_HI]));
-    let (url, _, _) = capture_stub(bodies, None).await;
+    let (url, hits, seen_bodies) = capture_stub(bodies, None).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
     // Parks the engine right before the tool runs: `ToolUse` has gone out.
@@ -939,7 +946,50 @@ async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
         )),
         "clients get the same note: {seen:#?}"
     );
+    // Host-authored, not a user request.
+    assert_eq!(
+        msgs[2]["_synaps_context"]["schema"],
+        agent_engine::engine::interrupt::TOOL_NOTE_SCHEMA
+    );
     gate.release.notify_one();
+
+    // An event wakes the next turn (no new user prompt): its turn start is
+    // still the original prompt, never the note, and the note reaches the
+    // provider without its host key.
+    use tokio::io::AsyncWriteExt;
+    let reg = agent_engine::events::registry::find_session_registration(handle.id.as_str())
+        .expect("registered");
+    let event = agent_engine::events::types::Event::simple(
+        "test",
+        "build finished",
+        Some(agent_engine::events::types::Severity::High),
+    );
+    let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
+    c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
+    c.shutdown().await.unwrap();
+    let woke = until(&mut a, |e| {
+        matches!(
+            e,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done))
+        )
+    })
+    .await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(woke.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::TurnStarted { trigger: agent_engine::session::TurnTrigger::EventAuto, .. }
+    )));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let msgs = last_conversation(&woke).api_messages;
+    let starts: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.get("_synaps_turn").is_some())
+        .map(|m| text_of(m))
+        .collect();
+    assert_eq!(starts, vec!["check the file".to_string()], "turn start stays the real prompt");
+    let body = serde_json::to_string(&seen_bodies.lock().unwrap()[1]).unwrap();
+    assert!(!body.contains("_synaps_context"), "host key never on the wire: {body}");
+    assert!(body.contains("may have already started"), "the note's text is sent");
     end(&mut a).await;
 }
 
