@@ -230,6 +230,8 @@ async fn run_queued(
         return false;
     }
     let id = (**journal_id.load()).clone();
+    #[cfg(any(test, feature = "testing"))]
+    testing::note_call();
     crate::extensions::loader::emit_session_start(&bus, &id).await;
     drop(permit);
     true
@@ -240,8 +242,57 @@ async fn run_queued(
 pub(crate) async fn run_at_create(host: &EngineHost, bus: &Arc<HookBus>, session_id: &str) {
     let ticket = StartTicket::new(true);
     let permit = host.session_start_gate().acquire(&ticket).await;
+    #[cfg(any(test, feature = "testing"))]
+    testing::note_call();
     crate::extensions::loader::emit_session_start(bus, session_id).await;
     drop(permit);
+}
+
+/// Test-only controls (`cfg(test)` / the `testing` feature). Set only by
+/// code, like `cache_keepwarm::testing::IntervalOverride`: no binary input
+/// (env, config, argv) reaches them. Process-wide, so tests that use them
+/// must be `#[serial]`.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static REQUEUE_AFTER_TURN: AtomicBool = AtomicBool::new(false);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// The next turn to end (in any session of this process) puts a fresh
+    /// `on_session_start` back in line, as if it had not run yet. With the
+    /// keep-warm period that turn starts, this reaches a ping that is due
+    /// while the hook is pending, which no production path does today: a
+    /// period needs an accepted request, and that request waited for the
+    /// hook. One-shot.
+    pub fn requeue_after_next_turn() {
+        REQUEUE_AFTER_TURN.store(true, Ordering::SeqCst);
+    }
+
+    /// Consume the request above (the actor, at a turn's end).
+    pub(crate) fn take_requeue() -> bool {
+        REQUEUE_AFTER_TURN.swap(false, Ordering::SeqCst)
+    }
+
+    /// `on_session_start` calls made through the gate in this process.
+    pub fn calls() -> u64 {
+        CALLS.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn note_call() {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Holds the host's session-start gate while alive: every hook in line
+    /// waits (not yet called, so a park can still withdraw it).
+    #[must_use = "the gate is released when the hold drops"]
+    pub struct GateHold(#[allow(dead_code)] super::GatePermit);
+
+    /// Take the gate now, ahead of background hooks (waits for a running one).
+    pub async fn hold_gate(host: &crate::host::EngineHost) -> GateHold {
+        let ticket = super::StartTicket::new(true);
+        GateHold(host.session_start_gate().acquire(&ticket).await)
+    }
 }
 
 /// How many waiters are in line at `gate` (tests).

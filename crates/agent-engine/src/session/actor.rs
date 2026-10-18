@@ -1007,6 +1007,10 @@ impl SessionActor {
         self.flush_saves().await;
         self.emit(SessionEventWire::Idle);
         self.cache_keepwarm_on_idle().await;
+        #[cfg(any(test, feature = "testing"))]
+        if super::session_start::testing::take_requeue() {
+            self.queue_session_start();
+        }
     }
 
     /// Wall 1 — actor-owned context-head checkpoint persistence.
@@ -5103,6 +5107,8 @@ impl SessionTask {
         let queue = Arc::clone(&self.0.event_queue);
         let reason = loop {
             let actor = &mut self.0;
+            // Read before the select: its arms borrow fields of `actor`.
+            let keepwarm_at = actor.cache_keepwarm_timer();
             tokio::select! {
                 cmd = actor.cmd_rx.recv() => match cmd {
                     Some(cmd) => {
@@ -5128,9 +5134,7 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(
-                    (!actor.keepwarm_awaits_start).then(|| actor.cache_keepwarm.deadline()).flatten()
-                ), if actor.reload_fence.is_none() => {
+                _ = super::cache_keepwarm::keepwarm_timer(keepwarm_at), if actor.reload_fence.is_none() => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {

@@ -166,6 +166,19 @@ pub mod testing {
             super::INTERVAL_OVERRIDE_MS.store(0, Ordering::Relaxed);
         }
     }
+
+    static DUE_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// How many times an actor in this process looked at a possibly due
+    /// ping (`on_cache_keepwarm_due`). A timer left armed with a past
+    /// deadline shows here as a fast-growing count.
+    pub fn due_checks() -> u64 {
+        DUE_CHECKS.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn note_due_check() {
+        DUE_CHECKS.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Evidence about the TTL the server honours for this session.
@@ -1205,8 +1218,21 @@ impl SessionActor {
         }
     }
 
+    /// The deadline of the actor's keep-warm timer arm (`keepwarm_timer`).
+    /// Off while a due ping waits for `on_session_start`: its deadline has
+    /// passed, so an armed timer would wake the loop again and again;
+    /// `session_start_finished` looks at the ping once the hook has run.
+    pub(crate) fn cache_keepwarm_timer(&self) -> Option<Instant> {
+        if self.keepwarm_awaits_start {
+            return None;
+        }
+        self.cache_keepwarm.deadline()
+    }
+
     /// `select!` arm: a ping may be due.
     pub(crate) async fn on_cache_keepwarm_due(&mut self) {
+        #[cfg(any(test, feature = "testing"))]
+        testing::note_due_check();
         // Fenced for a reload: the exec would discard the ping's result.
         if self.reload_fence.is_some()
             || self.cache_keepwarm.period.is_none()
