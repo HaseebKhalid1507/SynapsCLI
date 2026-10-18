@@ -379,6 +379,11 @@ define_settings! {
         "Token count where a context rollover becomes due (auto = window-aware default: 180k on 200k, 400k on 1m). Takes effect next launch.",
         |_app, value| config_edit("context_management.rollover_tokens", value);
 
+    "context_management.target_tokens", "Rollover target", Context,
+        EditorKind::Text { numeric: false },
+        "Context size a rollover aims for, as reported by the provider when known (auto = min(100k, 2/3 of pressure)). Must stay below the pressure threshold. Takes effect next launch.",
+        |_app, value| config_edit("context_management.target_tokens", value);
+
     "context_management.reserve_tokens", "Reserve tokens", Context,
         EditorKind::Text { numeric: true },
         "Minimum free tokens kept before any model round (1–1000000, default 16000). Takes effect next launch.",
@@ -1037,6 +1042,10 @@ mod tests {
             assert!(is_ok(d("context_management.pressure_tokens", "auto")));
             assert!(is_ok(d("context_management.pressure_tokens", "120000")));
             assert!(is_err(d("context_management.pressure_tokens", "lots")));
+            assert!(is_ok(d("context_management.target_tokens", "auto")));
+            assert!(is_ok(d("context_management.target_tokens", "90000")));
+            assert!(is_err(d("context_management.target_tokens", "0")));
+            assert!(is_err(d("context_management.target_tokens", "lots")));
             assert!(is_err(d("context_management.finish_rounds", "9")));
             assert!(is_ok(d("compaction_exclude", "thinking, tool_results")));
             assert!(is_err(d("compaction_exclude", "thinking, secrets")));

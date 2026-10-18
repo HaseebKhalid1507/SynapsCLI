@@ -626,6 +626,13 @@ impl StreamMethods {
             &continuation,
             &memory_backend
         ))?;
+        // Host-owned identity of the request that started this turn; later
+        // steered/pushed messages must not displace it at rollover.
+        // Tags a genuinely new turn's request with a stable id (host metadata,
+        // stripped from every provider wire) or keeps a resumed turn's start.
+        if context_enabled {
+            super::continuation::record_turn_start(&continuation, &mut messages);
+        }
         if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
             return Err(crate::RuntimeError::Config(
                 "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
@@ -1094,6 +1101,9 @@ impl StreamMethods {
 
             // ═══ CONTEXT CONTINUATION: pre-request assessment ═══
             let mut context_advisory = None;
+            // (estimated footprint, usage records before the call) for this
+            // round's request; pairs with the provider-reported usage below.
+            let mut calibration_probe = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
                 use agent_core::core::context_policy::{assess_context, ContextAction};
@@ -1112,6 +1122,7 @@ impl StreamMethods {
                     thinking_budget as u64,
                     max_tool_output as u64,
                 );
+                calibration_probe = Some((assessment.used_tokens(), usage_counters.records()));
                 let decision = {
                     let mut s = continuation
                         .lock()
@@ -1190,11 +1201,36 @@ impl StreamMethods {
                                         super::context::estimate_history(&messages),
                                     )),
                             );
+                        // Aim the successor at the configured footprint, measured
+                        // like `used_tokens` (system + schemas + messages) and
+                        // calibrated to the provider-reported count when known.
+                        let target = {
+                            let s = continuation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let thresholds =
+                                agent_core::core::context_policy::ContextThresholds::resolve(
+                                    &s.config,
+                                    context_window,
+                                );
+                            match thresholds {
+                                Ok(t) => super::continuation::successor_budget(
+                                    t.target_tokens(&s.config),
+                                    t.pressure_tokens,
+                                    assessment.used_tokens().saturating_sub(
+                                        super::context::estimate_history(&messages),
+                                    ),
+                                    s.calibration_for(&model),
+                                ),
+                                Err(_) => super::continuation::SuccessorBudget::UNBOUNDED,
+                            }
+                        };
                         match super::continuation::rollover_for_boundary(
                             &messages,
                             &continuation,
                             &memory_backend,
                             history_budget,
+                            target,
                             &cancel,
                             time_checkpoint,
                             &worker_manifest,
@@ -1336,6 +1372,26 @@ impl StreamMethods {
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
             segment_has_provider_round = true;
+            // Only a request that booked provider usage yields a sample. The
+            // Anthropic transport reads omitted cache fields as zero (it cannot
+            // tell them from a real zero); an implausible ratio clears the
+            // sample so selection falls back to the conservative estimator.
+            if let Some((estimated_tokens, before)) = calibration_probe {
+                if usage_counters.records() > before {
+                    // A booked zero count is a sample too: it fails the
+                    // plausibility check and clears any stale ratio.
+                    continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_calibration(
+                            &model,
+                            super::continuation::TokenCalibration {
+                                provider_tokens: usage_counters.latest_context_tokens(),
+                                estimated_tokens,
+                            },
+                        );
+                }
+            }
             if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
                 finish_budget_exceeded!(dimension);
             }

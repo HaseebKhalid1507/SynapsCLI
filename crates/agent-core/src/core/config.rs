@@ -150,6 +150,10 @@ pub struct ContextManagementConfig {
     /// Maximum extra Plan/WrapUp rounds after rollover becomes due. Default: 2.
     /// Zero disables extensions; phase reports cannot renew this allowance.
     pub finish_rounds: u32,
+    /// Footprint a rollover successor aims for (system prompt + tool schemas +
+    /// retained messages). `None`/`auto` = min(100,000, 2/3 of pressure).
+    /// An explicit value must be positive and below the pressure threshold.
+    pub target_tokens: Option<u64>,
 }
 
 impl Default for ContextManagementConfig {
@@ -160,6 +164,7 @@ impl Default for ContextManagementConfig {
             rollover_tokens: None,
             reserve_tokens: 16_000,
             finish_rounds: 2,
+            target_tokens: None,
         }
     }
 }
@@ -180,6 +185,14 @@ impl ContextManagementConfig {
         if let (Some(pressure), Some(rollover)) = (self.pressure_tokens, self.rollover_tokens) {
             if pressure >= rollover {
                 return Err("pressure_tokens must be below rollover_tokens");
+            }
+        }
+        if self.target_tokens == Some(0) {
+            return Err("target_tokens must be positive");
+        }
+        if let (Some(target), Some(pressure)) = (self.target_tokens, self.pressure_tokens) {
+            if target >= pressure {
+                return Err("target_tokens must be below pressure_tokens");
             }
         }
         if !(1..=Self::MAX_RESERVE_TOKENS).contains(&self.reserve_tokens) {
@@ -210,6 +223,13 @@ impl ContextManagementConfig {
         {
             return Err("rollover_tokens must not exceed the context window");
         }
+        if let Some(target) = self.target_tokens {
+            let (pressure, _) =
+                crate::core::context_policy::ContextThresholds::bands(self, context_window_tokens);
+            if target >= pressure {
+                return Err("target_tokens must be below pressure_tokens");
+            }
+        }
         Ok(())
     }
 }
@@ -225,7 +245,9 @@ fn parse_context_management_config_key(
         "context_management.mode" => {
             config.mode = ContextManagementMode::parse(value).ok_or("expected off or auto")?;
         }
-        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+        "context_management.pressure_tokens"
+        | "context_management.rollover_tokens"
+        | "context_management.target_tokens" => {
             let tokens = if value.eq_ignore_ascii_case("auto") {
                 None
             } else {
@@ -235,10 +257,10 @@ fn parse_context_management_config_key(
                         .map_err(|_| "expected auto or an unsigned token count")?,
                 )
             };
-            if key == "context_management.pressure_tokens" {
-                config.pressure_tokens = tokens;
-            } else {
-                config.rollover_tokens = tokens;
+            match key {
+                "context_management.pressure_tokens" => config.pressure_tokens = tokens,
+                "context_management.rollover_tokens" => config.rollover_tokens = tokens,
+                _ => config.target_tokens = tokens,
             }
         }
         "context_management.reserve_tokens" => {
@@ -1160,6 +1182,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "context_management.rollover_tokens",
     "context_management.reserve_tokens",
     "context_management.finish_rounds",
+    "context_management.target_tokens",
     "startup.quick_start",
     "startup.extensions_ready_timeout_secs",
     "daemon.idle_exit_secs",
@@ -2424,6 +2447,7 @@ mod tests {
                 rollover_tokens: Some(400_000),
                 reserve_tokens: 24_000,
                 finish_rounds: 3,
+                target_tokens: None,
             }
         );
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
@@ -2488,6 +2512,41 @@ mod tests {
             duplicate.context_management,
             super::ContextManagementConfig::default()
         );
+    }
+
+    #[test]
+    fn context_management_target_tokens_parses_and_validates() {
+        assert_eq!(
+            super::load_config_from_str("")
+                .context_management
+                .target_tokens,
+            None
+        );
+        let parsed = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.target_tokens = 120000\ncontext_window = 1m\n",
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.context_management.target_tokens, Some(120_000));
+        let auto = super::load_config_from_str(
+            "context_management.target_tokens = 5000\ncontext_management.target_tokens = auto\n",
+        );
+        assert_eq!(auto.context_management.target_tokens, None);
+        for fields in [
+            "target_tokens = 0",
+            "target_tokens = nope",
+            "target_tokens = 250000",
+            "pressure_tokens = 200000\ncontext_management.target_tokens = 200000",
+        ] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\ncontext_management.{fields}\ncontext_window = 1m\n"
+            ));
+            assert_eq!(
+                parsed.context_management,
+                super::ContextManagementConfig::default(),
+                "{fields}"
+            );
+            assert!(!parsed.warnings.is_empty(), "{fields}");
+        }
     }
 
     #[test]

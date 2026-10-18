@@ -70,6 +70,16 @@ fn user(content: String) -> SharedMessage {
     Arc::new(json!({"role":"user", "content":content}))
 }
 
+/// A message as the user wrote it: without the host's turn-identity tag,
+/// which turn admission adds to the request that starts a turn.
+fn untagged(message: &SharedMessage) -> serde_json::Value {
+    let mut message = (**message).clone();
+    if let Some(object) = message.as_object_mut() {
+        object.remove("_synaps_turn");
+    }
+    message
+}
+
 fn final_history(events: &[StreamEvent]) -> &[SharedMessage] {
     events
         .iter()
@@ -116,7 +126,7 @@ async fn small_repeated_checkpoints_self_heal_and_preserve_round_budget() {
     )));
     assert!(rt.context_management_status().contains("window 1"));
     let history = final_history(&events);
-    assert_eq!(history.first(), Some(&pinned));
+    assert_eq!(history.first().map(untagged), Some((*pinned).clone()));
     for id in 0..6 {
         let id = format!("cp_{id}");
         let blocks = history
@@ -171,7 +181,8 @@ async fn retained_over_capacity_history_stops_before_network() {
     let pinned = user("Do not discard these requirements. ".repeat(25000));
     let events = drive_runtime_history_turn(&rt, vec![pinned.clone()]).await;
     assert_eq!(hits.load(Ordering::SeqCst), 0);
-    assert_eq!(final_history(&events), &[pinned]);
+    let retained: Vec<_> = final_history(&events).iter().map(untagged).collect();
+    assert_eq!(retained, vec![(*pinned).clone()]);
     assert!(events.iter().any(|event| matches!(event, StreamEvent::Session(SessionEvent::Error(e)) if e.message.contains("hard capacity requires a smaller request"))));
     assert!(!events.iter().any(|event| matches!(event, StreamEvent::Session(SessionEvent::Notice(s)) if s.starts_with("Context rollover deferred:"))));
 }
@@ -227,7 +238,7 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
         assert_eq!(hits.load(Ordering::SeqCst), usize::from(accept));
         if accept {
             assert!(rt.context_management_status().contains("window 2"));
-            let retained = final_history(&events);
+            let retained: Vec<_> = final_history(&events).iter().map(untagged).collect();
             assert!(retained.contains(&history[0]) && retained.contains(&history[2]));
             assert!(!retained.contains(&history[1]));
         } else {
