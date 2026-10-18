@@ -82,6 +82,30 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// RAII: no provider credential or endpoint can come from the environment.
+/// Clears `ANTHROPIC_API_KEY` and the remote-broker pair
+/// (`SYNAPS_AUTH_ENDPOINT` + `SYNAPS_MACHINE_TOKEN`), and points the Anthropic
+/// base URL at the discard port, so a test that runs a real worker can't
+/// reach a live provider or broker from a developer shell. Pair it with
+/// [`BaseDirGuard`] (no `auth.json`) and the same
+/// `#[serial_test::serial(synaps_base_dir)]` key.
+pub(crate) struct OfflineProviderEnv {
+    _guards: [EnvVarGuard; 4],
+}
+
+impl OfflineProviderEnv {
+    pub(crate) fn new() -> Self {
+        Self {
+            _guards: [
+                EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+                EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+                EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+                EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", "http://127.0.0.1:9"),
+            ],
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::EnvVarGuard;

@@ -476,8 +476,9 @@ mod tests {
     /// These tests launch a real worker thread. Run unpinned, it read the
     /// developer's real `auth.json` (and could reach the provider), and wrote
     /// `logs/subagents` and `subagent-history` under the real `~/.synaps-cli`,
-    /// after the test returned. Pin an empty base dir (no credentials: the
-    /// worker fails at auth, offline) and keep it until the worker has exited.
+    /// after the test returned. Pin an empty base dir and clear the
+    /// environment's provider credentials/endpoints (`OfflineProviderEnv`), so
+    /// the worker fails at auth, offline; keep both until it has exited.
     fn join_worker(registry: &Mutex<SubagentRegistry>, handle_id: &str) {
         let thread = registry
             .lock()
@@ -493,6 +494,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_blank_agent_uses_system_prompt() {
         let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
         let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
@@ -522,6 +524,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_inline_name_labels_the_handle() {
         let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
         let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
