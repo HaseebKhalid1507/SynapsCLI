@@ -23,6 +23,23 @@ This string is the **single canonical representation** used everywhere:
 **Invariant**: the formatted string produced for a given `Event` is identical
 regardless of which mode (chat, RPC, server) drains it.
 
+**Sanitising.** The rendering is a prompt-injection boundary, so nothing an
+event carries can break out of its envelope or forge another event tag:
+- Every attribute value (`id`, `type`, `source`, `channel`): `"` becomes `'`,
+  `<` and `>` are dropped, and control characters become spaces.
+- Text and `Data:` first lose every closing `</event>` tag (any ASCII case,
+  whitespace after `</` and before `>`). Anything still readable as an event
+  tag then has its `<` written as `&lt;`: an opener (`<event`, `< EVENT x>`),
+  `< /event>`, or a closer that the removal reassembled. Other tags (`<b>`,
+  `<events>`) and comparisons (`1 < 2`) are left alone.
+- An event without these characters renders exactly as before.
+
+**Ids at intake.** Events from outside the process (the event socket and the
+inbox) must carry a plain-token id: 1 to 128 ASCII letters, digits, `.`, `_`,
+`:` or `-`. Uuids qualify. Any other id is replaced by a fresh uuid and a
+warning is logged (its length, never its bytes). The event is still
+delivered.
+
 ---
 
 ## Mode Policy Table
