@@ -467,3 +467,53 @@ async fn children_query_is_answered_before_and_after_attach() {
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 }
+
+/// 4b: `thinking_options` is a control frame (before Attach and attached).
+/// No model = what a new session on this daemon gets; a malformed id gets
+/// `options: null`; "thinking_options" is in `Welcome.features`.
+#[tokio::test]
+#[serial]
+async fn thinking_options_query_is_answered_before_and_after_attach() {
+    use agent_engine::runtime::openai::catalog::validation::{thinking_options_for_model, OptionsBasis};
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => assert!(w.features.iter().any(|f| f == "thinking_options"), "{:?}", w.features),
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::ThinkingOptions { id: Some(21), model: None, warm: false }).await;
+    match c.recv().await {
+        Some(DaemonFrame::ThinkingOptionsResult { id, model, options }) => {
+            assert_eq!(id, Some(21));
+            assert_eq!(model, d.state.host.new_session_model());
+            assert_eq!(options.expect("answered").levels, thinking_options_for_model(&model));
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::ThinkingOptions { id: Some(22), model: Some("a b".into()), warm: false }).await;
+    assert!(matches!(
+        c.recv().await,
+        Some(DaemonFrame::ThinkingOptionsResult { id: Some(22), options: None, model }) if model == "a b"
+    ));
+    c.send(&ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Mirror })).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Attached(_))));
+    c.send(&ClientFrame::ThinkingOptions { id: Some(23), model: Some("xai-auth/grok-4.5".into()), warm: false }).await;
+    loop {
+        match c.recv().await {
+            Some(DaemonFrame::Event(_)) => continue,
+            Some(DaemonFrame::ThinkingOptionsResult { id, options, .. }) => {
+                let options = options.expect("answered");
+                assert_eq!((id, options.basis, options.exact), (Some(23), OptionsBasis::Static, true));
+                assert_eq!(options.default_level.as_deref(), Some("high"));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    c.send(&ClientFrame::Bye).await;
+    d.shutdown_token().cancel();
+    d.wait().await;
+}

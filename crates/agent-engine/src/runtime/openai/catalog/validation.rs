@@ -345,34 +345,62 @@ pub fn reasoning_type_for_model(model: &str) -> &'static str {
     "unverified"
 }
 
+/// Which evidence decided a thinking-options list (the daemon's
+/// `thinking_options` answer reports it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionsBasis {
+    /// A live catalog row for this exact id (capability cache) decided or
+    /// changed the list.
+    Live,
+    /// An exact static table row (or mode manifest) decided it.
+    Static,
+    /// No exact row: the conservative set, or `adaptive` only on routes
+    /// where an unknown id gets only the provider default.
+    Fallback,
+}
+
+/// Whether the capability cache holds a row fetched live for `runtime_id`.
+fn live_row(runtime_id: &str) -> bool {
+    capability_cache::get(runtime_id).is_some_and(|m| m.source == super::CatalogSource::Live)
+}
+
 /// Dynamic thinking options for the settings UI, derived from exact
 /// catalog/static capabilities for the provider-qualified model id.
 pub fn thinking_options_for_model(model: &str) -> Vec<String> {
+    thinking_options_with_basis(model).0
+}
+
+/// [`thinking_options_for_model`] plus the [`OptionsBasis`] that decided it.
+pub fn thinking_options_with_basis(model: &str) -> (Vec<String>, OptionsBasis) {
+    use OptionsBasis::*;
     let owned = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if let Some(model_id) = model.strip_prefix("muse/") {
         // Exactly what validation authorizes: adaptive + the live effort set
         // (`off` appears only when the catalog advertised `none`).
         let mut opts = vec!["adaptive".to_string()];
-        if let Some(levels) = muse_supported_levels(model_id) {
-            if levels.contains(&ReasoningLevel::Off) {
-                opts.insert(0, "off".to_string());
-            }
-            opts.extend(
-                levels
-                    .iter()
-                    .filter(|l| **l != ReasoningLevel::Off)
-                    .map(|l| l.as_str().to_string()),
-            );
+        let Some(levels) = muse_supported_levels(model_id) else {
+            return (opts, Fallback);
+        };
+        if levels.contains(&ReasoningLevel::Off) {
+            opts.insert(0, "off".to_string());
         }
-        return opts;
+        opts.extend(
+            levels
+                .iter()
+                .filter(|l| **l != ReasoningLevel::Off)
+                .map(|l| l.as_str().to_string()),
+        );
+        return (opts, Live);
     }
     if let Some(model_id) = model.strip_prefix("openai-codex/") {
         if let Some(levels) = codex_supported_levels(model, model_id) {
             let mut opts = vec!["off".to_string(), "adaptive".to_string()];
             opts.extend(levels.iter().map(|l| l.as_str().to_string()));
-            return opts;
+            let basis = if live_row(model) { Live } else { Static };
+            return (opts, basis);
         }
-        return owned(CONSERVATIVE_OPTIONS);
+        return (owned(CONSERVATIVE_OPTIONS), Fallback);
     }
     if let Some(model_id) = model.strip_prefix("xai-auth/") {
         return match xai_static_capability(model_id) {
@@ -387,12 +415,13 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
                 }
                 opts.push("adaptive".to_string());
                 opts.extend(supported.iter().map(|l| l.as_str().to_string()));
-                opts
+                (opts, Static)
             }
-            Some(XaiReasoningCapability::NonReasoning) => owned(&["off", "adaptive"]),
-            // Intrinsic reasoning without effort control, or unknown id:
-            // only the provider default is expressible.
-            _ => owned(&["adaptive"]),
+            Some(XaiReasoningCapability::NonReasoning) => (owned(&["off", "adaptive"]), Static),
+            // Intrinsic reasoning without effort control: only the provider
+            // default is expressible.
+            Some(XaiReasoningCapability::IntrinsicReasoning) => (owned(&["adaptive"]), Static),
+            None => (owned(&["adaptive"]), Fallback),
         };
     }
     if let Some(capability) = kimi_route_capability(model) {
@@ -408,12 +437,13 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
                 }
                 opts.push("adaptive".to_string());
                 opts.extend(supported.iter().map(|l| l.as_str().to_string()));
-                opts
+                (opts, Static)
             }
-            Some(KimiReasoningCapability::ToggleableThinking) => owned(&["off", "adaptive"]),
-            // Always-thinking without effort control, or unknown id: only
-            // the provider default is expressible.
-            _ => owned(&["adaptive"]),
+            Some(KimiReasoningCapability::ToggleableThinking) => (owned(&["off", "adaptive"]), Static),
+            // Always-thinking without effort control: only the provider
+            // default is expressible.
+            Some(KimiReasoningCapability::AlwaysThinking) => (owned(&["adaptive"]), Static),
+            None => (owned(&["adaptive"]), Fallback),
         };
     }
     if let Some(model_id) = anthropic_model_id(model) {
@@ -424,42 +454,106 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
             .map(|entry| entry.reasoning);
         let specials_authorized = super::anthropic_mode_capabilities(model).is_some()
             && !matches!(live, Some(ReasoningSupport::None));
+        // A live row that carried capability evidence (the same filter
+        // `anthropic_capability` applies) decided or changed the list.
+        let qualified = format!("anthropic/{model_id}");
+        let live_evidence = live_row(&qualified)
+            && capability_cache::get(&qualified).is_some_and(|m| !matches!(m.reasoning, ReasoningSupport::Unknown));
+        let exact = if live_evidence { Live } else { Static };
+        let full = || {
+            owned(&[
+                "off",
+                "adaptive",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode",
+            ])
+        };
         return match anthropic_capability(model_id) {
             // Thinking-capable (adaptive effort or legacy budget tiers). Generic
             // live true preserves exact static authority but cannot invent it.
-            Some(ReasoningSupport::AnthropicAdaptive { .. }) if specials_authorized => owned(&[
-                "off",
-                "adaptive",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-                "ultracode",
-            ]),
-            Some(ReasoningSupport::AnthropicAdaptive { .. }) => owned(CONSERVATIVE_OPTIONS),
+            Some(ReasoningSupport::AnthropicAdaptive { .. }) if specials_authorized => (full(), exact),
+            Some(ReasoningSupport::AnthropicAdaptive { .. }) => (owned(CONSERVATIVE_OPTIONS), exact),
             // Explicit live false revokes both special modes.
-            Some(ReasoningSupport::None) => owned(&["off", "adaptive"]),
-            _ if specials_authorized => owned(&[
-                "off",
-                "adaptive",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-                "ultracode",
-            ]),
-            _ => owned(CONSERVATIVE_OPTIONS),
+            Some(ReasoningSupport::None) => (owned(&["off", "adaptive"]), exact),
+            Some(_) if specials_authorized => (full(), exact),
+            Some(_) => (owned(CONSERVATIVE_OPTIONS), exact),
+            // The mode manifest is an exact static row of its own.
+            None if specials_authorized => (full(), Static),
+            None => (owned(CONSERVATIVE_OPTIONS), Fallback),
         };
     }
-    owned(CONSERVATIVE_OPTIONS)
+    (owned(CONSERVATIVE_OPTIONS), Fallback)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ReasoningLevel::*;
+
+    /// 4b: the basis per route (wire note §3.2), and the old function is
+    /// the same list for every row.
+    #[test]
+    fn options_basis_per_route() {
+        use super::super::{CatalogModel, CatalogProviderKind, CatalogSource};
+        use OptionsBasis::*;
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        let live_row = |provider: &str, name: &str, id: &str, kind: CatalogProviderKind, reasoning: ReasoningSupport| {
+            let mut m = CatalogModel::new(provider, name, id).unwrap();
+            m.provider_kind = kind;
+            m.source = CatalogSource::Live;
+            m.reasoning = reasoning;
+            capability_cache::insert(m);
+        };
+        live_row(
+            "openai-codex",
+            "OpenAI Codex",
+            "gpt-basis-live-zz1",
+            CatalogProviderKind::OpenAiCodex,
+            ReasoningSupport::CodexNamed {
+                multi_agent_reasoning_effort: None,
+                supported: vec![Low, High],
+                default_level: Some(High),
+                multi_agent_version: None,
+            },
+        );
+        live_row("anthropic", "Anthropic", "claude-basis-live-zz1", CatalogProviderKind::Anthropic, ReasoningSupport::None);
+        let models = crate::runtime::openai::catalog::parse_muse_catalog_models(
+            r#"{"models":[{"id":"muse-basis-live-zz1","reasoning_effort_variants":[{"effort":"low"},{"effort":"high"}]}]}"#,
+        )
+        .unwrap();
+        capability_cache::replace_provider("muse", &models);
+
+        let rows: &[(&str, &[&str], OptionsBasis)] = &[
+            ("muse/muse-basis-live-zz1", &["adaptive", "low", "high"], Live),
+            ("muse/muse-basis-absent-zz2", &["adaptive"], Fallback),
+            ("openai-codex/gpt-basis-live-zz1", &["off", "adaptive", "low", "high"], Live),
+            ("openai-codex/gpt-5.6-luna", &[], Static),
+            ("openai-codex/gpt-basis-absent-zz2", CONSERVATIVE_OPTIONS, Fallback),
+            ("xai-auth/grok-4.5", &[], Static),
+            ("xai-auth/grok-basis-absent-zz2", &["adaptive"], Fallback),
+            ("kimi/kimi-k3", &[], Static),
+            ("kimi/kimi-basis-absent-zz2", &["adaptive"], Fallback),
+            ("anthropic/claude-basis-live-zz1", &["off", "adaptive"], Live),
+            ("anthropic/claude-opus-4-7", CONSERVATIVE_OPTIONS, Static),
+            ("claude-opus-4-7", CONSERVATIVE_OPTIONS, Static),
+            ("anthropic/claude-fable-5", &["off", "adaptive", "low", "medium", "high", "xhigh", "max", "ultracode"], Static),
+            ("anthropic/claude-basis-absent-zz2", CONSERVATIVE_OPTIONS, Fallback),
+            ("groq/llama-3.3-70b-versatile", CONSERVATIVE_OPTIONS, Fallback),
+        ];
+        for (model, want, basis) in rows {
+            let (levels, got) = thinking_options_with_basis(model);
+            assert_eq!(got, *basis, "{model}");
+            if !want.is_empty() {
+                assert_eq!(levels, *want, "{model}");
+            }
+            assert_eq!(levels, thinking_options_for_model(model), "{model}");
+        }
+        capability_cache::replace_provider("muse", &[]);
+    }
 
     #[test]
     fn muse_levels_follow_exact_live_catalog_and_fail_closed_otherwise() {

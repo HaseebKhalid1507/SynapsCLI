@@ -170,6 +170,22 @@ pub enum ClientFrame {
         #[serde(default)]
         members: bool,
     },
+    /// Control query (no session, also on an attached connection): the
+    /// thinking levels this daemon would offer for `model`. Reply:
+    /// `ThinkingOptionsResult`. Feature "thinking_options".
+    ThinkingOptions {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+        /// `None` = the model a new session on this daemon gets (the config
+        /// as of the last boot or reload; the reply echoes the resolved id).
+        #[serde(default)]
+        model: Option<String>,
+        /// Opt-in: first run the bounded Muse catalog warm-up for a `muse/`
+        /// id with no live row (the reply then comes from a task).
+        #[serde(default)]
+        warm: bool,
+    },
     Bye,
 }
 
@@ -211,6 +227,12 @@ impl std::fmt::Debug for ClientFrame {
                 .field("session_id", session_id)
                 .field("sid", sid)
                 .field("members", members)
+                .finish(),
+            Self::ThinkingOptions { id, model, warm } => f
+                .debug_struct("ThinkingOptions")
+                .field("id", id)
+                .field("model", model)
+                .field("warm", warm)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -347,6 +369,28 @@ pub enum DaemonFrame {
     /// Answer to `Children`. Only sent on request, so an old client (whose
     /// `DaemonFrame` has no catch-all) never receives one.
     ChildList(ChildListReply),
+    /// Answer to `ThinkingOptions`. Only sent on request.
+    ThinkingOptionsResult {
+        #[serde(default)]
+        id: Option<u64>,
+        /// The id asked about (the resolved one when the query had none).
+        model: String,
+        /// `None` for a malformed id.
+        options: Option<ThinkingOptionsWire>,
+    },
+}
+
+/// The levels a model offers, with the evidence behind them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingOptionsWire {
+    /// Canonical level names, in the order the settings UI shows them.
+    pub levels: Vec<String>,
+    /// True when an exact row decided (`basis` live or static).
+    pub exact: bool,
+    pub basis: crate::runtime::openai::catalog::validation::OptionsBasis,
+    /// The level a model switch applies when none was chosen, if any.
+    #[serde(default)]
+    pub default_level: Option<String>,
 }
 
 /// The `child_list` reply: the ledger view plus what a client needs to
@@ -1141,6 +1185,19 @@ mod tests {
         crate::session::handle::echo::meta_for(&SessionId::from("wire-1"))
     }
 
+    fn thinking_options_sample() -> DaemonFrame {
+        DaemonFrame::ThinkingOptionsResult {
+            id: Some(8),
+            model: "muse/muse-wonder-1.0".into(),
+            options: Some(ThinkingOptionsWire {
+                levels: ["adaptive", "low", "medium", "high", "xhigh"].map(String::from).to_vec(),
+                exact: true,
+                basis: crate::runtime::openai::catalog::validation::OptionsBasis::Live,
+                default_level: Some("high".into()),
+            }),
+        }
+    }
+
     fn child_list_sample() -> ChildListReply {
         use crate::session::children::*;
         let child = ChildIdentity { pid: 3646188, start_ticks: 26981650, boot_id: "b".into(), sid: 3646188, pgid: 3646188 };
@@ -1718,6 +1775,8 @@ mod tests {
             }),
             ClientFrame::Children { id: Some(7), session_id: Some("s".into()), sid: Some(42), members: true },
             ClientFrame::Children { id: None, session_id: None, sid: None, members: false },
+            ClientFrame::ThinkingOptions { id: Some(8), model: Some("muse/muse-wonder-1.0".into()), warm: true },
+            ClientFrame::ThinkingOptions { id: None, model: None, warm: false },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1765,6 +1824,8 @@ mod tests {
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
             DaemonFrame::AuthState { report: auth_state_report() },
             DaemonFrame::ChildList(child_list_sample()),
+            thinking_options_sample(),
+            DaemonFrame::ThinkingOptionsResult { id: None, model: "a b".into(), options: None },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -1952,6 +2013,35 @@ mod tests {
         assert_eq!(w["features"], serde_json::json!(["children"]));
     }
 
+    /// The `thinking_options` names PD vendors (4/4b v1.1 §3.1).
+    #[test]
+    fn thinking_options_frames_keep_the_agreed_names() {
+        let q = serde_json::to_value(&ClientFrame::ThinkingOptions {
+            id: Some(8),
+            model: Some("muse/muse-wonder-1.0".into()),
+            warm: false,
+        })
+        .unwrap();
+        assert_eq!(q, serde_json::json!({"type":"thinking_options","id":8,"model":"muse/muse-wonder-1.0","warm":false}));
+        let bare: ClientFrame = decode_line(r#"{"type":"thinking_options","model":null}"#).unwrap();
+        assert!(matches!(bare, ClientFrame::ThinkingOptions { id: None, model: None, warm: false }));
+        assert_eq!(
+            serde_json::to_value(&thinking_options_sample()).unwrap(),
+            serde_json::json!({"type":"thinking_options_result","id":8,"model":"muse/muse-wonder-1.0",
+                "options":{"levels":["adaptive","low","medium","high","xhigh"],"exact":true,"basis":"live","default_level":"high"}})
+        );
+        for (basis, name) in [
+            (crate::runtime::openai::catalog::validation::OptionsBasis::Live, "live"),
+            (crate::runtime::openai::catalog::validation::OptionsBasis::Static, "static"),
+            (crate::runtime::openai::catalog::validation::OptionsBasis::Fallback, "fallback"),
+        ] {
+            assert_eq!(serde_json::to_value(basis).unwrap(), serde_json::json!(name));
+        }
+        let none = serde_json::to_value(&DaemonFrame::ThinkingOptionsResult { id: Some(9), model: "a b".into(), options: None }).unwrap();
+        assert_eq!(none, serde_json::json!({"type":"thinking_options_result","id":9,"model":"a b","options":null}));
+        assert_eq!(crate::daemon::control_queries::FEATURE_THINKING_OPTIONS, "thinking_options");
+    }
+
     /// Old peers: a pre-4/4b client decodes the new Welcome (it ignores
     /// `features`), a new client reads an old Welcome as no features, and a
     /// pre-4/4b daemon rejects `children` as an unknown variant (conn.rs
@@ -2010,6 +2100,7 @@ mod tests {
         }
         for query in [
             ClientFrame::Children { id: Some(1), session_id: None, sid: None, members: false },
+            ClientFrame::ThinkingOptions { id: Some(2), model: None, warm: false },
         ] {
             let line = encode_line(&query).unwrap();
             let err = decode_line::<OldClientFrame>(line.trim_end()).unwrap_err();

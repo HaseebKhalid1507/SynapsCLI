@@ -380,6 +380,17 @@ impl EngineHost {
         Ok(runtime)
     }
 
+    /// The model a new session on this host gets right now (no `--model`,
+    /// no `--continue`): the runtime default with the host's config snapshot
+    /// applied, the same step `foreground_runtime_for` runs for `create`.
+    /// The snapshot is the one loaded at boot (a daemon reload re-boots);
+    /// session create does not re-read the config file either.
+    pub fn new_session_model(&self) -> String {
+        let mut runtime = Runtime::from_parts(RuntimeParts::without_reaper(self.parts.clone()));
+        runtime.apply_config_model(&self.config());
+        runtime.model().to_string()
+    }
+
     /// A worker (subagent) runtime. Shares credential source and token cache
     /// (so NO broker re-install and NO cache eviction) and takes a CLONE of
     /// the cached worker registry template. Does NOT share: the HTTP client

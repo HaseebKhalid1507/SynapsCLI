@@ -2859,6 +2859,15 @@ impl Runtime {
         self.apply_config_inner(config, false);
     }
 
+    /// The step of `apply_config` that picks the model: the config's `model`,
+    /// else the runtime default. `EngineHost::new_session_model` runs the
+    /// same step, so it names what a new session gets.
+    pub(crate) fn apply_config_model(&mut self, config: &crate::config::SynapsConfig) {
+        if let Some(ref model) = config.model {
+            self.set_model(model.clone());
+        }
+    }
+
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
         // #112: apply memory backend config early (binding is immutable once set).
         self.apply_memory_backend_config(&config.memory_backend);
@@ -2875,9 +2884,7 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        if let Some(ref model) = config.model {
-            self.set_model(model.clone());
-        }
+        self.apply_config_model(config);
         // Named level takes priority over raw budget.
         // Config-specified thinking is an explicit user choice — preserve across model switches.
         if let Some(level) = config.thinking_level {

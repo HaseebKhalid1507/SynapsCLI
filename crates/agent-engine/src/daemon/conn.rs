@@ -314,6 +314,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Children { id, session_id, sid, members })) => {
                 let _ = tx.send(super::control_queries::children_reply(id, session_id, sid, members).await).await;
             }
+            Ok(Read::Frame(ClientFrame::ThinkingOptions { id, model, warm })) => {
+                thinking_options(&state, &tx, id, model, warm).await;
+            }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
@@ -572,6 +575,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Children { id, session_id, sid, members })) => {
                 let _ = tx.send(super::control_queries::children_reply(id, session_id, sid, members).await).await;
             }
+            Ok(Read::Frame(ClientFrame::ThinkingOptions { id, model, warm })) => {
+                thinking_options(&state, &tx, id, model, warm).await;
+            }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 state.request_shutdown(force);
@@ -680,6 +686,29 @@ fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> 
 fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
     snapshot.replay.retain(|env| client_decodes(caps, &env.event));
     snapshot
+}
+
+/// `thinking_options`: no model = what a new session gets (config as of the
+/// last boot or reload). With `warm`, the reply comes from a task (match it
+/// by `id`).
+async fn thinking_options(
+    state: &Arc<DaemonState>,
+    tx: &mpsc::Sender<DaemonFrame>,
+    id: Option<u64>,
+    model: Option<String>,
+    warm: bool,
+) {
+    let model = model.unwrap_or_else(|| state.host.new_session_model());
+    if !warm {
+        let _ = tx.send(super::control_queries::thinking_options_reply(id, model)).await;
+        return;
+    }
+    let (host, tx) = (Arc::clone(&state.host), tx.clone());
+    tokio::spawn(async move {
+        let frame =
+            super::control_queries::thinking_options_answer(id, model, true, || super::control_queries::host_broker(&host)).await;
+        let _ = tx.send(frame).await;
+    });
 }
 
 fn reload_bye(state: &DaemonState) -> ByeReason {
