@@ -1547,6 +1547,37 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
     }
 }
 
+/// Warning for an `auth.*` key no parser reads (a typo would otherwise
+/// silently leave traffic on the default account), with a did-you-mean.
+fn unknown_auth_key_warning(key: &str) -> Option<String> {
+    const EXACT: [&str; 2] = ["auth.remote_endpoint", "auth.machine_token"];
+    const FAMILIES: [&str; 2] = ["auth.account", "auth.auto"];
+    if EXACT.contains(&key) || FAMILIES.iter().any(|f| key.starts_with(&format!("{f}."))) {
+        return None;
+    }
+    // A family typo keeps its suffix: `auth.acount.x` → `auth.account.x`.
+    let (head, rest) = match key.match_indices('.').nth(1) {
+        Some((i, _)) => key.split_at(i),
+        None => (key, ""),
+    };
+    let suggestion = EXACT
+        .iter()
+        .map(|k| (levenshtein(key, k), k.to_string()))
+        .chain(
+            FAMILIES
+                .iter()
+                .filter(|_| !rest.is_empty())
+                .map(|f| (levenshtein(head, f), format!("{f}{rest}"))),
+        )
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k);
+    Some(match suggestion {
+        Some(s) => format!("unknown key '{key}' (did you mean '{s}'?)"),
+        None => format!("unknown key '{key}' — ignored"),
+    })
+}
+
 /// Parse auth.* configuration keys and update the AuthConfig.
 fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
     let v = val.trim();
@@ -1983,6 +2014,9 @@ fn apply_config_content_with(
                         let (_, warnings) =
                             crate::core::auth::AccountPolicy::from_config_map(&one);
                         config.warnings.extend(warnings);
+                    }
+                    if let Some(warning) = unknown_auth_key_warning(key) {
+                        config.warnings.push(warning);
                     }
                 } else if key.starts_with("events.") {
                     if let Err(diagnostic) = parse_events_config_key(&mut config.events, key, val)
@@ -4404,6 +4438,27 @@ api_retries = 5
         let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
         assert_eq!(cfg.shell.max_sessions, 8);
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    #[test]
+    fn unknown_auth_keys_warn_with_a_suggestion() {
+        let cfg = load_config_from_str(
+            "auth.acount.anthropic = work\nauth.remote_endpont = x\nauth.bogus = 1\n\
+             auth.account.anthropic = work\nauth.machine_token = t\n",
+        );
+        let w = &cfg.warnings;
+        assert!(
+            w.contains(&"unknown key 'auth.acount.anthropic' (did you mean 'auth.account.anthropic'?)".into()),
+            "{w:?}"
+        );
+        assert!(
+            w.contains(&"unknown key 'auth.remote_endpont' (did you mean 'auth.remote_endpoint'?)".into()),
+            "{w:?}"
+        );
+        assert!(w.contains(&"unknown key 'auth.bogus' — ignored".into()), "{w:?}");
+        assert_eq!(w.iter().filter(|w| w.contains("auth.")).count(), 3, "{w:?}");
+        assert_eq!(cfg.auth.accounts.get("anthropic").map(String::as_str), Some("work"));
+        assert!(!cfg.auth.accounts.contains_key("acount.anthropic"));
     }
 
     /// Every listed family key is accepted by its parser for some value
