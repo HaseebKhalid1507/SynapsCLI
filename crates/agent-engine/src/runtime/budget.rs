@@ -117,7 +117,7 @@ impl TurnBudget {
 
     /// Role defaults overlaid with the typed config. Unset fields keep the
     /// compiled defaults; `unlimited` clears a round, tool-call or
-    /// tool-result-byte limit (the parser rejects `0` for those); `0`
+    /// tool-result-byte limit (`0` means none allowed, deprecated); `0`
     /// seconds means no wall-clock limit.
     pub fn from_config(role: TurnRole, config: &agent_core::config::TurnBudgetsConfig) -> Self {
         let overrides = match role {
@@ -675,22 +675,43 @@ mod tests {
     }
 
     #[test]
-    fn zero_in_config_never_means_unlimited() {
+    fn zero_in_config_means_none_allowed_for_every_role() {
         let cfg = agent_core::config::load_config_from_str(
-            "turn_budget.autonomous.max_provider_rounds = 0\n\
+            "turn_budget.foreground.max_provider_rounds = 0\n\
+             turn_budget.foreground.max_tool_calls = 0\n\
+             turn_budget.foreground.max_accumulated_tool_result_bytes = 0\n\
+             turn_budget.autonomous.max_provider_rounds = 0\n\
              turn_budget.autonomous.max_tool_calls = 0\n\
              turn_budget.autonomous.max_accumulated_tool_result_bytes = 0\n\
-             turn_budget.worker.max_provider_rounds = 0\n",
+             turn_budget.worker.max_provider_rounds = 0\n\
+             turn_budget.worker.max_tool_calls = 0\n\
+             turn_budget.worker.max_accumulated_tool_result_bytes = 0\n",
         )
         .turn_budgets;
-        assert_eq!(
-            TurnBudget::from_config(TurnRole::Autonomous, &cfg),
-            TurnBudget::for_role(TurnRole::Autonomous)
-        );
-        assert_eq!(
-            TurnBudget::from_config(TurnRole::Worker, &cfg),
-            TurnBudget::for_role(TurnRole::Worker)
-        );
+        for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+            let budget = TurnBudget::from_config(role, &cfg);
+            assert_eq!(budget.max_provider_rounds, Some(0), "{role:?}");
+            assert_eq!(budget.max_tool_calls, Some(0), "{role:?}");
+            assert_eq!(budget.max_accumulated_tool_result_bytes, Some(0), "{role:?}");
+            let mut meter = TurnBudgetMeter::new(budget);
+            assert_eq!(meter.remaining_tool_calls(), 0);
+            assert_eq!(
+                meter.charge_tool_result_bytes(1),
+                Err(BudgetDimension::ToolResultBytes)
+            );
+            // Renewals cannot turn a zero round allowance into rounds.
+            loop {
+                match meter.begin_round() {
+                    Ok(()) => panic!("{role:?}: a zero round limit allows no rounds"),
+                    Err(BudgetDimension::ProviderRounds) => {
+                        if meter.try_renew_rounds().is_none() {
+                            break;
+                        }
+                    }
+                    Err(other) => panic!("unexpected {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

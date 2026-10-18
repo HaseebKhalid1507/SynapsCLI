@@ -777,12 +777,12 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) -> Resu
     Ok(())
 }
 
-/// A configured per-turn count limit: a positive number, or `unlimited`.
+/// A configured per-turn count limit: a number, or `unlimited`.
 ///
 /// Used for `turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
-/// `max_accumulated_tool_result_bytes`. `0` is rejected with a startup
-/// warning (the role default stays): it once meant "none allowed" and must
-/// never silently mean "no limit".
+/// `max_accumulated_tool_result_bytes`. `Max(0)` means "none allowed" (the
+/// 0.10.2 meaning of `0`); the parser still accepts `0` for one release, with
+/// a deprecation warning, and will reject it later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnLimit<T> {
     Max(T),
@@ -797,6 +797,14 @@ impl<T> TurnLimit<T> {
             TurnLimit::Unlimited => None,
         }
     }
+
+    /// Convert the limit value, keeping `Unlimited`.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> TurnLimit<U> {
+        match self {
+            TurnLimit::Max(v) => TurnLimit::Max(f(v)),
+            TurnLimit::Unlimited => TurnLimit::Unlimited,
+        }
+    }
 }
 
 /// Typed per-role turn-budget overrides (Task 23, spec §8.1). Every field
@@ -805,17 +813,18 @@ impl<T> TurnLimit<T> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnBudgetOverrides {
     /// Provider rounds per turn: N or `unlimited`. Unset = the role default
-    /// (foreground unlimited, autonomous 24, worker 64 per allowance). `0` is
-    /// rejected.
+    /// (foreground unlimited, autonomous 24, worker 64 per allowance). `0` =
+    /// none allowed (deprecated).
     pub max_provider_rounds: Option<TurnLimit<u32>>,
     /// Tool calls per turn: N or `unlimited`. Unset = the role default
-    /// (autonomous 96, otherwise unlimited). `0` is rejected.
+    /// (autonomous 96, otherwise unlimited). `0` = none allowed (deprecated).
     pub max_tool_calls: Option<TurnLimit<u32>>,
     /// Wall-clock limit for one turn, in seconds. Unset = no limit (the
     /// default for every role); `0` also means no limit.
     pub max_elapsed_secs: Option<u64>,
     /// Accumulated tool-result bytes per turn: N or `unlimited`. Unset = the
-    /// role default (autonomous 8 MiB, otherwise unlimited). `0` is rejected.
+    /// role default (autonomous 8 MiB, otherwise unlimited). `0` = none
+    /// allowed (deprecated).
     pub max_accumulated_tool_result_bytes: Option<TurnLimit<usize>>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
@@ -834,39 +843,32 @@ pub struct TurnBudgetsConfig {
     pub worker: TurnBudgetOverrides,
 }
 
-/// Why a `turn_budget.*` line was not applied.
-enum TurnBudgetKeyError {
-    /// Malformed key or value; printed to stderr like the other families.
-    Invalid(String),
-    /// A count limit set to `0`. Surfaced as a startup warning so nobody
-    /// who wrote `0` silently gets a different limit than they meant.
-    Zero(String),
-}
-
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing). `Err` carries the diagnostic.
+/// the default (parity with shell.* parsing). `Err` carries the stderr
+/// diagnostic. `Ok(Some(warning))`: applied, with a deprecation warning for
+/// `config.warnings` (shown at TUI startup, in watcher logs and on stderr
+/// for headless hosts).
 fn parse_turn_budget_config_key(
     budgets: &mut TurnBudgetsConfig,
     key: &str,
     val: &str,
-) -> Result<(), TurnBudgetKeyError> {
-    use TurnBudgetKeyError::{Invalid, Zero};
+) -> Result<Option<String>, String> {
     let Some(rest) = key.strip_prefix("turn_budget.") else {
-        return Ok(());
+        return Ok(None);
     };
     let Some((role, field)) = rest.split_once('.') else {
-        return Err(Invalid(format!(
+        return Err(format!(
             "Warning: invalid turn_budget key '{key}' (expected turn_budget.<role>.<field>)"
-        )));
+        ));
     };
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
         "autonomous" => &mut budgets.autonomous,
         "worker" => &mut budgets.worker,
         other => {
-            return Err(Invalid(format!(
+            return Err(format!(
                 "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|worker)"
-            )));
+            ));
         }
     };
     macro_rules! set {
@@ -874,14 +876,16 @@ fn parse_turn_budget_config_key(
             match val.parse::<$ty>() {
                 Ok(parsed) => $slot = Some(parsed),
                 Err(_) => {
-                    return Err(Invalid(format!(
+                    return Err(format!(
                         "Warning: invalid value for {key}: '{val}', using default"
-                    )))
+                    ))
                 }
             }
         };
     }
-    // Count limits: a positive number or `unlimited`; `0` is rejected.
+    // Count limits: a number or `unlimited`. `0` keeps its 0.10.2 meaning
+    // ("none allowed") for one release, with a deprecation warning.
+    let mut deprecation = None;
     macro_rules! set_limit {
         ($slot:expr, $ty:ty) => {
             if val.trim_matches('"').eq_ignore_ascii_case("unlimited") {
@@ -889,18 +893,18 @@ fn parse_turn_budget_config_key(
             } else {
                 match val.parse::<$ty>() {
                     Ok(0) => {
-                        return Err(Zero(format!(
-                            "{key} = 0 is not accepted (0 no longer means \"none allowed\" and \
-                             is not read as \"no limit\"); using the role default. Set \
-                             {key} = unlimited for no limit, or a positive number"
-                        )))
+                        $slot = Some(TurnLimit::Max(0));
+                        deprecation = Some(format!(
+                            "{key} = 0 means \"none allowed\". `0` will be rejected in a \
+                             future release; use `unlimited` for no limit, or a positive number"
+                        ));
                     }
                     Ok(parsed) => $slot = Some(TurnLimit::Max(parsed)),
                     Err(_) => {
-                        return Err(Invalid(format!(
+                        return Err(format!(
                             "Warning: invalid value for {key}: '{val}' (expected a positive \
                              number or unlimited), using default"
-                        )))
+                        ))
                     }
                 }
             }
@@ -917,10 +921,10 @@ fn parse_turn_budget_config_key(
         "max_cost_usd" => set!(overrides.max_cost_usd, f64),
         "max_round_renewals" => set!(overrides.max_round_renewals, u32),
         other => {
-            return Err(Invalid(format!("Warning: unknown turn_budget field '{other}'")))
+            return Err(format!("Warning: unknown turn_budget field '{other}'"))
         }
     }
-    Ok(())
+    Ok(deprecation)
 }
 
 /// Continuous-memory settings surface (Task A2, spec §12). Every field is
@@ -1969,9 +1973,9 @@ fn apply_config_content_with(
                     }
                 } else if key.starts_with("turn_budget.") {
                     match parse_turn_budget_config_key(&mut config.turn_budgets, key, val) {
-                        Ok(()) => {}
-                        Err(TurnBudgetKeyError::Invalid(diagnostic)) => family_diagnostic(diagnostic),
-                        Err(TurnBudgetKeyError::Zero(warning)) => config.warnings.push(warning),
+                        Ok(None) => {}
+                        Ok(Some(warning)) => config.warnings.push(warning),
+                        Err(diagnostic) => family_diagnostic(diagnostic),
                     }
                 } else if key.starts_with("memory.") {
                     if let Err(diagnostic) = parse_memory_config_key(&mut config.memory, key, val)
@@ -2874,10 +2878,10 @@ mod tests {
     }
 
     #[test]
-    fn turn_budget_zero_count_limits_are_rejected_with_a_visible_warning() {
-        // `0` used to mean "none allowed" and briefly meant "no limit". It
-        // must never silently become unlimited: warn (startup-visible) and
-        // keep the role default.
+    fn turn_budget_zero_count_limits_keep_none_allowed_with_a_deprecation_warning() {
+        // 0.10.2 read `0` as "none allowed". For one release it keeps that
+        // meaning in every role (also where the default is unlimited), and
+        // says it will be rejected later.
         for role in ["foreground", "autonomous", "worker"] {
             for field in [
                 "max_provider_rounds",
@@ -2885,17 +2889,29 @@ mod tests {
                 "max_accumulated_tool_result_bytes",
             ] {
                 let key = format!("turn_budget.{role}.{field}");
-                let config = super::load_config_from_str(&format!("{key} = 0\n"));
-                assert_eq!(config.turn_budgets, super::TurnBudgetsConfig::default(), "{key}");
+                let content = format!("{key} = 0\n");
+                let config = super::load_config_from_str(&content);
+                let overrides = match role {
+                    "foreground" => &config.turn_budgets.foreground,
+                    "autonomous" => &config.turn_budgets.autonomous,
+                    _ => &config.turn_budgets.worker,
+                };
+                let parsed = match field {
+                    "max_provider_rounds" => overrides.max_provider_rounds.map(|l| l.map(|v| v as usize)),
+                    "max_tool_calls" => overrides.max_tool_calls.map(|l| l.map(|v| v as usize)),
+                    _ => overrides.max_accumulated_tool_result_bytes,
+                };
+                assert_eq!(parsed, Some(super::TurnLimit::Max(0)), "{key}");
                 assert!(
-                    config
-                        .warnings
-                        .iter()
-                        .any(|w| w.contains(&key) && w.contains("unlimited")),
+                    config.warnings.iter().any(|w| w.contains(&key)
+                        && w.contains("none allowed")
+                        && w.contains(
+                            "`0` will be rejected in a future release; use `unlimited` for no limit, or a positive number"
+                        )),
                     "{key}: {:?}",
                     config.warnings
                 );
-                assert!(!super::config_content_problems(&format!("{key} = 0\n")).is_empty());
+                assert!(!super::config_content_problems(&content).is_empty());
             }
         }
     }

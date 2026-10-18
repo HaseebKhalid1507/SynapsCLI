@@ -812,6 +812,7 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
         mcp_discovery: crate::McpDiscovery::Background,
     })
     .await?;
+    host.report_config_warnings();
     // Sidecars spawn once per daemon: discover before accepting (bounded by
     // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

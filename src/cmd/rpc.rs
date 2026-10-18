@@ -1127,6 +1127,7 @@ pub async fn run(
     })
     .await
     .context("engine boot failed")?;
+    agent_engine::host::report_config_warnings(&boot.config);
 
     // Refuse to continue a session another process has live; lock ours.
     let session_lock = setup::lock_session(&boot.session.id, boot.continued, "rpc")

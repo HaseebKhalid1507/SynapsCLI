@@ -302,6 +302,13 @@ impl EngineHost {
         self.config.load()
     }
 
+    /// Headless hosts (`synaps chat`, `rpc`, daemon) have no startup notice
+    /// area: print config warnings (unknown keys, bad or deprecated values)
+    /// to stderr and the log. The TUI shows them as notices instead.
+    pub fn report_config_warnings(&self) {
+        report_config_warnings(&self.config());
+    }
+
     pub fn ext_manager(&self) -> &Arc<RwLock<crate::extensions::manager::ExtensionManager>> {
         &self.ext_manager
     }
@@ -734,6 +741,14 @@ impl EngineHost {
             }
         }
         delivered
+    }
+}
+
+/// Print `config.warnings` to stderr and the log (headless hosts).
+pub fn report_config_warnings(config: &crate::SynapsConfig) {
+    for warning in &config.warnings {
+        tracing::warn!(%warning, "config warning");
+        eprintln!("synaps: config warning: {warning}");
     }
 }
 
