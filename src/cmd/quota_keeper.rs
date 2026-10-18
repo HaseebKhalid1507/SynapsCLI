@@ -507,7 +507,8 @@ pub(crate) fn observation_from_error(now_ms: u64, e: &BrokerError) -> qk::UsageO
         | BrokerError::UnsupportedAccount { .. }
         | BrokerError::InvalidAccount(_)
         | BrokerError::RegistrationRequired { .. }
-        | BrokerError::Denied(_) => qk::ObservationOutcome::Unsupported { detail },
+        | BrokerError::Denied(_)
+        | BrokerError::BrokerTooOld(_) => qk::ObservationOutcome::Unsupported { detail },
         BrokerError::Transport(msg) => {
             let m = msg.to_ascii_lowercase();
             if m.contains("malformed") || m.contains("exceeded") {

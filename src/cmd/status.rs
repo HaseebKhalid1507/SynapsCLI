@@ -110,6 +110,7 @@ fn summary_from_broker_error(e: &BrokerError) -> UsageErrorSummary {
         BrokerError::UnsupportedAccount { .. } => "unsupported_account",
         BrokerError::InvalidAccount(_) => "invalid_account",
         BrokerError::NoAccountAvailable { .. } => "no_account_available",
+        BrokerError::BrokerTooOld(_) => "broker_too_old",
         _ => "broker_error",
     };
     UsageErrorSummary::other(kind, e.to_string())
@@ -1186,6 +1187,13 @@ mod usage_tests {
         let s = summary_from_broker_error(&BrokerError::Credential("refresh failed".into()));
         assert_eq!(s.kind, "credential");
         assert_eq!(s.http_status, None);
+    }
+
+    #[test]
+    fn an_old_broker_is_named_as_the_cause() {
+        let s = summary_from_broker_error(&BrokerError::BrokerTooOld("per-account usage".into()));
+        assert_eq!(s.kind, "broker_too_old");
+        assert!(s.message.contains("broker is older than this client"), "{}", s.message);
     }
 }
 

@@ -201,6 +201,9 @@ pub enum BrokerError {
     InvalidAccount(String),
     /// Automatic selection found no account with proven capacity.
     NoAccountAvailable { provider: String, reason: String },
+    /// The remote broker predates an operation this client needs; the
+    /// payload names what is unavailable. Upgrade the broker host.
+    BrokerTooOld(String),
     /// A locked token refresh failed; the kind tells a per-account cooldown,
     /// a busy refresh lock or a transient network/provider failure apart
     /// from an unusable login. Message is secret-free.
@@ -256,11 +259,19 @@ impl std::fmt::Display for BrokerError {
             Self::NoAccountAvailable { provider, reason } => {
                 write!(f, "no account with proven capacity for '{provider}': {reason}")
             }
+            Self::BrokerTooOld(what) => write!(
+                f,
+                "broker is older than this client; {what} unavailable (upgrade the broker host)"
+            ),
         }
     }
 }
 
 impl std::error::Error for BrokerError {}
+
+#[cfg(test)]
+#[path = "broker_remote_compat_tests.rs"]
+mod remote_compat_tests;
 
 // ── Vended types ─────────────────────────────────────────────────────────────
 
@@ -3485,11 +3496,29 @@ impl CredentialBroker for RemoteBroker {
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
             404 => {
-                drop(resp);
-                Err(BrokerError::UnknownAccount {
-                    provider: cred.provider.as_str().to_string(),
-                    label: cred.account.label_str().to_string(),
-                })
+                // A current broker's 404 carries a JSON error; a broker that
+                // predates the route (0.10.2) answers an empty one. Only
+                // emptiness is inspected, never the content.
+                let route_missing = read_body_capped(resp, 1024)
+                    .await
+                    .is_ok_and(|body| body.trim().is_empty());
+                if !route_missing {
+                    return Err(BrokerError::UnknownAccount {
+                        provider: cred.provider.as_str().to_string(),
+                        label: cred.account.label_str().to_string(),
+                    });
+                }
+                if cred.provider != OAuthProviderId::Anthropic || !cred.account.is_default() {
+                    return Err(BrokerError::BrokerTooOld("per-account usage".into()));
+                }
+                // The old broker's `/usage` serves its default Anthropic slot.
+                let body = self.anthropic_usage().await?.to_string();
+                super::usage::parse_anthropic_usage(
+                    &body,
+                    cred.account.label_str(),
+                    crate::epoch_millis(),
+                )
+                .map_err(super::usage::UsageError::into_broker_error)
             }
             s if !(200..300).contains(&s) => {
                 // Broker-controlled error body: dropped unread (spec §5.1).
