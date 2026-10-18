@@ -317,7 +317,9 @@ pub struct StartupConfig {
     /// the attach path sets `await_extensions=false` (fast cold start; a tool
     /// from a slow extension may be unavailable on turn 1). Default: true.
     pub quick_start: bool,
-    /// Max seconds to wait for extensions when Quick Start is off. Default: 30.
+    /// Max seconds to wait for extension discovery when Quick Start is off.
+    /// Default: 30. It does not bound the session's `on_session_start` call,
+    /// which then waits its turn at the host's one-at-a-time gate.
     pub extensions_ready_timeout_secs: u64,
 }
 

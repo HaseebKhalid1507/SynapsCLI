@@ -330,7 +330,7 @@ define_settings! {
 
     "startup.extensions_ready_timeout_secs", "Extensions-ready wait", Startup,
         EditorKind::Text { numeric: true },
-        "Max seconds to wait for extensions when Quick Start is off. Takes effect next launch.",
+        "Max seconds to wait for extension discovery when Quick Start is off. Takes effect next launch.",
         |_app, value| match value.parse::<u64>() {
             Ok(_) => SettingApply::Local(Ok(())),
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),

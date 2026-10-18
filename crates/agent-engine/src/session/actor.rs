@@ -667,7 +667,9 @@ impl SessionActor {
         // `await_extensions=false` (TUI, a reload's restore): a spawned task
         // runs it (`session_start` below), so boot never blocks on it.
         // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
-        // the wait on extension discovery; the const remains the fallback.
+        // the wait on extension discovery only; the const remains the
+        // fallback. `run_at_create` then waits its turn at the gate, behind a
+        // running hook and older foreground ones (see `session_start`).
         let ext_ready_timeout = extensions_ready_timeout(&config);
         if cfg.await_extensions {
             if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())

@@ -518,7 +518,14 @@ live in the system prompt):
   comes first waits for it (and goes ahead of other sessions' background
   hooks), while Cancel and End still act at once. A manual `/compact`
   builds its own prompt and does not wait. A session restored Parked runs
-  the hook once it is unparked.
+  the hook once it is unparked. The order is strict: a hook that a turn, a
+  keep-warm ping or a session's creation waits for goes before background
+  ones, which run in arrival order only while no such hook waits, so the
+  background hooks of idle sessions can be held back for as long as others
+  keep arriving. `startup.extensions_ready_timeout_secs` bounds extension
+  discovery only, not this wait: a session created with
+  `await_extensions = true` waits for the hook that is running and for any
+  older foreground ones, each bounded by the handler timeout.
 - **`before_message`** — content is re-evaluated per turn and **attached to
   the newest user message** as a trailing text block on the outgoing request,
   positioned **after** the conversational cache breakpoint: the cache marker

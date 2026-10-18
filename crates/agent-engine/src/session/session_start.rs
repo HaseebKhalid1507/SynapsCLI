@@ -6,6 +6,19 @@
 //! once) would queue there, and the tail would pass the handler timeout and
 //! lose its injection for the whole session. A hook that a turn, or the
 //! session's own creation, waits for is served before background ones.
+//!
+//! The priority is strict, with no aging: when the gate frees, the first
+//! foreground hook in line goes next, and background hooks go in arrival
+//! order only while no foreground hook waits. So background hooks of idle
+//! sessions can wait as long as foreground hooks keep arriving; a background
+//! hook moves up as soon as its own session's turn or keep-warm ping needs
+//! it (`StartTicket::prefer`). A finite reload wave drains either way.
+//!
+//! `startup.extensions_ready_timeout_secs` bounds the wait for extension
+//! discovery only, not the wait at this gate: a session created with
+//! `await_extensions = true` (`run_at_create`) then waits for the hook that
+//! is running and for any older foreground hooks in line, each call bounded
+//! by the handler timeouts of its extensions (5 s per handler).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
