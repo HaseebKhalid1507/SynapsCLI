@@ -88,7 +88,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
       - run: cargo build --no-default-features --locked
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-      - run: cargo test --workspace --no-default-features --locked
+      - run: cargo test --workspace --no-default-features --locked --no-fail-fast
       - run: bash scripts/cargo-test-nonzero.sh -p synaps-engine --no-default-features --locked --lib tools::registry::tests::hardened_build_excludes_command_exec_tools -- --exact
 
   # Every other job runs on Linux, so macOS-only breakage (e.g. `libc::mode_t`
