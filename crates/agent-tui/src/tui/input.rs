@@ -1009,6 +1009,16 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         use synaps_cli::tools::ConfirmChoice;
         let repeat = matches!(&event, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Repeat);
         let typed = matches!(&event, Event::Key(_) | Event::Paste(_));
+        // Any typed event other than Enter/Esc cancels a pending "Allow
+        // all" — even when the guard swallows it (prA I-R4-4: keys typed
+        // right after the first Enter land inside its fresh guard).
+        let enter_or_esc = matches!(
+            &event,
+            Event::Key(k) if matches!(k.code, KeyCode::Enter | KeyCode::Esc)
+        );
+        if typed && !enter_or_esc {
+            app.secret_prompts.cancel_allow_all_pending();
+        }
         if repeat || !app.secret_prompts.input_armed() {
             // Only typing restarts the guard; mouse motion, resize or focus
             // events must not keep the dialog dead.
@@ -1018,11 +1028,6 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
             return InputAction::None;
         }
         if let Event::Key(key) = event {
-            // The second Enter of "Allow all" must be the very next key:
-            // anything but Enter/Esc cancels the pending step (then acts).
-            if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                app.secret_prompts.cancel_allow_all_pending();
-            }
             let answered = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Allow)

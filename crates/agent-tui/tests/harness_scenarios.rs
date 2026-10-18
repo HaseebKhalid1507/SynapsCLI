@@ -2415,3 +2415,23 @@ fn scenario_mouse_and_resize_do_not_restart_the_guard() {
     h.key(KeyCode::Char('y'), KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()), "armed 450 ms after open");
 }
+
+/// prA I-R4-4: keys typed straight after the first Enter on Allow all land
+/// inside its fresh guard; they must still cancel the pending step. So
+/// ←, Enter, "abc" at 50 ms, a 500 ms pause, Enter → nothing armed.
+#[test]
+fn scenario_typing_inside_the_pending_guard_cancels_allow_all() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.snapshot().contains("Press Enter again"));
+    for c in "abc".chars() {
+        h.age_confirm_guard(50);
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    h.age_confirm_guard(500);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(rx.try_recv().is_err(), "Allow all must not be armed");
+    assert!(h.secret_prompt_active());
+}
