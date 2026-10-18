@@ -410,12 +410,10 @@ impl AuthMethods {
             AccountSelector::Account(account) => {
                 // Explicit: exactly this credential, never a fallback.
                 let cred = CredentialRef::new(OAuthProviderId::Anthropic, account.clone());
-                let token = broker.access_token_for(&cred).await.map_err(|e| {
-                    RuntimeError::Auth(format!(
-                        "Token refresh failed for account '{}': {}. Run `synaps login` (or `synaps login --account {}`) to re-authenticate, or check auth.remote_endpoint / broker reachability.",
-                        cred.account, e, cred.account
-                    ))
-                })?;
+                let token = broker
+                    .access_token_for(&cred)
+                    .await
+                    .map_err(|e| vend_error(&cred, &e))?;
                 PinnedToken {
                     credential: cred,
                     token,
@@ -517,6 +515,39 @@ impl AuthMethods {
             })
     }
 }
+/// A failed explicit-account vend.
+fn vend_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> RuntimeError {
+    let reason = e.to_string();
+    RuntimeError::Auth(if has_login_advice(&reason) {
+        format!(
+            "Token refresh failed for account '{}': {} Or check auth.remote_endpoint / broker reachability.",
+            credential.account,
+            sentence(&reason)
+        )
+    } else {
+        format!(
+            "Token refresh failed for account '{}': {}. Run `synaps login` (or `synaps login --account {}`) to re-authenticate, or check auth.remote_endpoint / broker reachability.",
+            credential.account, reason, credential.account
+        )
+    })
+}
+
+/// The reason already says which `synaps login` to run (core texts for a
+/// missing or removed slot, provider labels such as Kimi's or Muse's).
+fn has_login_advice(reason: &str) -> bool {
+    reason.contains("synaps login")
+}
+
+/// `text` as a sentence: trimmed, ending in exactly one period.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with('.') {
+        text.to_string()
+    } else {
+        format!("{text}.")
+    }
+}
+
 /// Terminal auth error for a failed 401 recovery that says WHY. Only an
 /// unusable login tells the user to run `synaps login`; a cooldown, a busy
 /// refresh lock or a network/provider failure says so instead. Safe to
@@ -550,6 +581,11 @@ fn recovery_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> R
                 credential.account,
                 f.message()
             ),
+            RefreshFailureKind::Credential if has_login_advice(f.message()) => format!(
+                "OAuth recovery failed for '{}': {}",
+                credential.account,
+                sentence(f.message())
+            ),
             RefreshFailureKind::Credential => format!(
                 "OAuth recovery failed for '{}': {}. Run `synaps login --account {}` to \
                  re-authenticate.",
@@ -558,6 +594,12 @@ fn recovery_error(credential: &CredentialRef, e: &crate::auth::BrokerError) -> R
                 credential.account
             ),
         },
+        other if has_login_advice(&other.to_string()) => format!(
+            "OAuth recovery failed for '{}': {} Or check auth.remote_endpoint / broker \
+             reachability.",
+            credential.account,
+            sentence(&other.to_string())
+        ),
         other => format!(
             "OAuth recovery failed for '{}': {}. Run `synaps login --account {}` to \
              re-authenticate, or check auth.remote_endpoint / broker reachability.",
@@ -1845,6 +1887,39 @@ mod tests {
         let cred_fail = msg(K::Credential, "invalid_grant: revoked");
         assert!(cred_fail.contains("synaps login --account work"), "{cred_fail}");
         assert!(cred_fail.contains("invalid_grant"), "{cred_fail}");
+    }
+
+    /// m8: core texts for a missing / removed slot (and provider labels such
+    /// as Kimi's or Muse's) already say which `synaps login` to run; the
+    /// runtime must not append a second copy.
+    #[test]
+    fn login_advice_is_printed_once() {
+        use crate::auth::{BrokerError, RefreshFailure, RefreshFailureKind as K};
+        let cred = work_cred();
+        let once = |m: &str| {
+            assert_eq!(m.matches("synaps login").count(), 1, "{m}");
+            assert!(!m.contains(".."), "{m}");
+        };
+        let missing = "No credentials for anthropic@work at /x/auth.json. Run `synaps login \
+                       --provider anthropic --account work`.";
+        for e in [
+            BrokerError::Refresh(RefreshFailure::new(K::Credential, missing)),
+            BrokerError::Refresh(RefreshFailure::new(
+                K::Credential,
+                "credential was removed while its token was being refreshed; run `synaps login`",
+            )),
+            BrokerError::Credential(missing.into()),
+        ] {
+            once(&recovery_error(&cred, &e).to_string());
+            once(&vend_error(&cred, &e).to_string());
+        }
+        // Without advice in the reason, the runtime still adds it.
+        let plain = BrokerError::Refresh(RefreshFailure::new(K::Credential, "invalid_grant: revoked"));
+        let m = recovery_error(&cred, &plain).to_string();
+        assert!(m.contains("synaps login --account work"), "{m}");
+        let m = vend_error(&cred, &BrokerError::Credential("invalid_grant".into())).to_string();
+        assert!(m.contains("synaps login --account work"), "{m}");
+        assert!(m.contains("broker reachability"), "{m}");
     }
 
     /// A refused recovery is still a terminal auth error, but it says WHY:
