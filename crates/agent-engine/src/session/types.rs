@@ -221,7 +221,7 @@ impl SessionMemoryMode {
             return Ok(None);
         }
         Ok(Some(serde_json::from_value(v.clone()).unwrap_or_else(|_| {
-            tracing::warn!(value = %v, "unknown session memory mode; treating as off");
+            tracing::warn!(mode = %v, "unknown session memory mode; treating as off");
             Self::Off
         })))
     }
