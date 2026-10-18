@@ -1203,6 +1203,7 @@ pub(crate) fn record_turn_start(state: &SharedContinuation, messages: &mut [Shar
 fn is_user_request(message: &Value) -> bool {
     message["role"] == "user"
         && message["_synaps_context"]["schema"] != MARKER
+        && !crate::engine::interrupt::is_tool_in_flight_note(message)
         && (message["content"].is_string()
             || message["content"]
                 .as_array()
@@ -2833,6 +2834,71 @@ mod budget_tests {
         let wire = wire_messages(&m).expect("host keys present");
         assert!(wire.iter().all(|x| x.get(TURN_KEY).is_none()));
         assert_eq!(wire.last().unwrap()["content"], "continue");
+    }
+
+    /// The host's tool-in-flight note (a cancel whose drain timed out) is
+    /// not a user request: an event wake after it keeps the turn start on
+    /// the real prompt. It carries no host key at all (recognised by its
+    /// exact text), so it is sent as plain text and is no archive marker.
+    #[test]
+    fn tool_in_flight_note_is_host_authored_not_a_turn_start_or_marker() {
+        use crate::engine::interrupt::{
+            append_marker, tool_in_flight_note_message, InterruptReason,
+        };
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        let mut m = vec![charter(), user("REAL TASK")];
+        record_turn_start(&state, &mut m);
+        let id = state.lock().unwrap().turn_start.clone().expect("turn recorded");
+        m.push(assistant("Let me look"));
+        m.push(tool_in_flight_note_message(InterruptReason::User, &["bash".into()]));
+        append_marker(&mut m, InterruptReason::User);
+        m.push(event(1, 50));
+        let wake = Arc::new(Mutex::new(ContinuationState::default()));
+        record_turn_start(&wake, &mut m);
+        assert_eq!(wake.lock().unwrap().turn_start.as_deref(), Some(id.as_str()));
+        assert_eq!(turn_id(&m[1]), Some(id.as_str()), "still the real prompt");
+        assert!(turn_id(&m[3]).is_none(), "the note never starts a turn");
+        assert!(!is_user_request(&m[3]));
+
+        assert!(m.iter().all(|x| x.get("_synaps_context").is_none()), "untagged");
+        let wire = wire_messages(&m).expect("the turn id is a host key");
+        assert_eq!(wire[3]["content"], m[3]["content"], "the note's text is sent");
+
+        let restored = Arc::new(Mutex::new(ContinuationState::default()));
+        restore_window_syntactic(&m, &restored);
+        assert!(!restored.lock().unwrap().restore_pending, "no archive marker here");
+    }
+
+    /// A resumed history holding the note passes restore validation
+    /// unchanged under Axel memory: the archive-marker readers never see
+    /// it. (A `_synaps_context`-tagged note made 0.10.2's readers stop
+    /// every turn: "restored context archive marker is invalid".)
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resumed_history_with_the_tool_note_passes_axel_restore_validation() {
+        use crate::engine::interrupt::{
+            append_marker, tool_in_flight_note_message, InterruptReason,
+        };
+        let env = crate::test_env::BaseDirGuard::new();
+        let mut rt = crate::Runtime::new_headless();
+        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
+            kind: agent_core::config::MemoryBackendKind::Axel,
+            executable: Some(env.path().join("missing-service")),
+            brain: Some(env.path().join("brain.r8")),
+            user_scope: false,
+        });
+        let mut messages = vec![user("REAL TASK"), assistant("Let me look")];
+        messages.push(tool_in_flight_note_message(InterruptReason::User, &["bash".into()]));
+        append_marker(&mut messages, InterruptReason::User);
+        rt.reset_context_continuation("synthetic-resumed", &messages);
+        assert!(!rt.continuation.lock().unwrap().restore_pending);
+        for _ in 0..2 {
+            validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
+                .await
+                .expect("no archive marker: nothing to verify, the turn may run");
+            assert!(!rt.continuation.lock().unwrap().restore_pending);
+        }
+        assert!(!env.path().join("brain.r8").exists(), "nothing fetched");
     }
 
     #[test]

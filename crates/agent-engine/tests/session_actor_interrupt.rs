@@ -55,6 +55,65 @@ fn sse_tool(id: &str, name: &str, input: &str) -> &'static str {
     )
 }
 
+/// One complete assistant round: a text block, then a call to `name` with
+/// `input` (JSON text) — the model narrating what it is about to run.
+fn sse_text_then_tool(text: &str, id: &str, name: &str, input: &str) -> &'static str {
+    let text = serde_json::to_string(text).unwrap();
+    let escaped = serde_json::to_string(input).unwrap();
+    Box::leak(
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{id}\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+                "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":1,",
+                "\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":1,",
+                "\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{escaped}}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",",
+                "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            id = id,
+            name = name,
+            text = text,
+            escaped = escaped,
+        )
+        .into_boxed_str(),
+    )
+}
+
+/// A started reply whose usage (`message_delta`) arrives between its text
+/// deltas: "A", then usage, then "B" and "C", and no terminal event. With a
+/// tiny `max_session_cost` the actor cancels on that usage from INSIDE its
+/// stream handler, so "B" and "C" can only reach it through the cancel's
+/// drain — deterministically, whether they are already queued or not.
+const SSE_TEXT_USAGE_TEXT: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_utu\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"A\"}}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null,",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"C\"}}\n\n",
+);
+
 fn sse_read_missing() -> &'static str {
     sse_tool(
         "toolu_read",
@@ -638,12 +697,42 @@ async fn legacy_abort_context_session_is_migrated_on_continue() {
     end(&mut a).await;
 }
 
-/// `on_message_complete` handler that holds the engine between "the final
-/// response came back" and "the turn ended" until released: the exact
-/// window in which Esc lands a moment too late.
+/// Hook handler that holds the engine at its hook point until released —
+/// for `on_message_complete`, between "the final response came back" and
+/// "the turn ended": the exact window in which Esc lands a moment too late.
+/// One-shot: only the first call is held, so a later turn passes straight
+/// through instead of waiting out the hook bus's 5 s `HANDLER_TIMEOUT`.
+/// (That timeout also bounds the held call: tests that need the actor's 1 s
+/// cancel drain to expire first rely on 1 s < 5 s.)
 struct GateHook {
+    armed: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+impl GateHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Subscribe to `kind` on `host`'s hook bus.
+    async fn install(
+        self: &Arc<Self>,
+        host: &agent_engine::EngineHost,
+        kind: agent_engine::extensions::hooks::events::HookKind,
+    ) {
+        let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
+        perms.grant(kind.required_permission());
+        host.parts()
+            .hook_bus
+            .subscribe(kind, self.clone(), None, None, perms)
+            .await
+            .unwrap();
+    }
 }
 
 #[async_trait::async_trait]
@@ -655,8 +744,10 @@ impl agent_engine::extensions::runtime::ExtensionHandler for GateHook {
         &self,
         _event: &agent_engine::extensions::hooks::events::HookEvent,
     ) -> agent_engine::extensions::hooks::events::HookResult {
-        self.entered.notify_one();
-        self.release.notified().await;
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         agent_engine::extensions::hooks::events::HookResult::Continue
     }
     async fn shutdown(&self) {}
@@ -675,17 +766,8 @@ async fn cancel_that_races_a_finished_answer_marks_nothing() {
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let gate = Arc::new(GateHook {
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
-    let mut perms = agent_engine::extensions::permissions::PermissionSet::new();
-    perms.grant(HookKind::OnMessageComplete.required_permission());
-    host.parts()
-        .hook_bus
-        .subscribe(HookKind::OnMessageComplete, gate.clone(), None, None, perms)
-        .await
-        .unwrap();
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::OnMessageComplete).await;
     let handle = host.create_session(cfg()).await.unwrap();
     let mut a = attach(&handle).await;
 
@@ -715,6 +797,250 @@ async fn cancel_that_races_a_finished_answer_marks_nothing() {
     assert!(!msgs.iter().any(|m| m["content"]
         .as_str()
         .is_some_and(is_interruption_marker)));
+    end(&mut a).await;
+}
+
+/// Esc while the engine is slow to finish the cancelled turn (#250): the
+/// provider call was cut, the engine has the partial reply, but it is held
+/// in `on_message_complete` past the actor's drain budget, so its
+/// post-cancel history never reaches the actor. The partial reply the
+/// client already saw must still be kept as an assistant message before the
+/// marker, so the next request is first / assistant "hi" / marker + second,
+/// not one user turn with the reply silently gone. The session still goes
+/// Idle within the drain budget, without waiting for the engine.
+async fn slow_engine_finalize_keeps_the_streamed_partial(persist: bool) {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let _h = Home::new();
+    let bodies: &'static [&'static str] = Box::leak(Box::new([SSE_PREFIX, SSE_HI]));
+    // Hits: 0 = the cancelled round (held open), 1 = the next turn.
+    let (url, hits, seen_bodies) = capture_stub(bodies, Some(0)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::OnMessageComplete).await;
+    let handle = host
+        .create_session(SessionConfig { persist, ..cfg() })
+        .await
+        .unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("first")).await.unwrap();
+    until(&mut a, is_text).await;
+    let seen = cancel(&mut a).await;
+    // Idle came without the engine: it is parked in on_message_complete
+    // with the partial reply and the gate is still closed. The only clock is
+    // the hook bus's 5 s HANDLER_TIMEOUT, which the 1 s drain beats.
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("the cancelled turn reached on_message_complete");
+    assert_eq!(aborted(&seen), vec![true], "partial work kept: {seen:#?}");
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(|m| text_of(m)).collect();
+    assert_eq!(msgs.len(), 3, "{texts:#?}");
+    assert_eq!(msgs[0]["content"], "first");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], json!([{"type": "text", "text": "hi"}]));
+    assert!(text_of(&msgs[2]).contains(InterruptReason::User.marker()));
+    assert_tools_paired(&msgs);
+    // Let the engine finish now: its late publication must change nothing.
+    gate.release.notify_one();
+
+    a.send(submit("second")).await.unwrap();
+    until(&mut a, |e| {
+        matches!(
+            e,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done))
+        )
+    })
+    .await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let next = strip_cache_control(&seen_bodies.lock().unwrap()[1]["messages"]);
+    assert_eq!(
+        next,
+        json!([
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": InterruptReason::User.marker()},
+                {"type": "text", "text": "second"}
+            ]}
+        ]),
+        "next request: first / partial reply / marker + second"
+    );
+    end(&mut a).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_keeps_the_streamed_partial_without_persistence() {
+    slow_engine_finalize_keeps_the_streamed_partial(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_keeps_the_streamed_partial_with_persistence() {
+    slow_engine_finalize_keeps_the_streamed_partial(true).await;
+}
+
+/// Esc while a tool call is in flight and the engine is too slow to report
+/// back (the drain times out). The engine's own record would have carried
+/// the call and a canceled result saying it may have run; the fallback keeps
+/// only text, so it must at least say which tool was running and that it
+/// may have applied its effects, or the next turn may repeat a
+/// non-idempotent action. Same note to clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let h = Home::new();
+    // Context management records each turn's starting request
+    // (`_synaps_turn`), which the note must never become.
+    std::fs::write(
+        h.dir.path().join(".synaps-cli").join("config"),
+        "context_management.mode = auto\n",
+    )
+    .unwrap();
+    let round = sse_text_then_tool(
+        "Let me look",
+        "toolu_rd",
+        "read",
+        r#"{"path":"/nonexistent/synaps-interrupt-fixture"}"#,
+    );
+    let bodies: &'static [&'static str] = Box::leak(Box::new([round, SSE_HI]));
+    let (url, hits, seen_bodies) = capture_stub(bodies, None).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    // Parks the engine right before the tool runs: `ToolUse` has gone out.
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::BeforeToolCall).await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("check the file")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("the engine reached the tool call");
+    let seen = cancel(&mut a).await;
+
+    assert_eq!(aborted(&seen), vec![true], "{seen:#?}");
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(|m| text_of(m)).collect();
+    assert_eq!(msgs.len(), 4, "{texts:#?}");
+    assert_eq!(msgs[0]["content"], "check the file");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], json!([{"type": "text", "text": "Let me look"}]));
+    let note = text_of(&msgs[2]);
+    assert_eq!(msgs[2]["role"], "user");
+    assert!(note.contains("`read`"), "{note}");
+    assert!(
+        note.contains("may have already started and partially applied its effects"),
+        "{note}"
+    );
+    assert_eq!(msgs[3]["content"], InterruptReason::User.marker());
+    assert_tools_paired(&msgs);
+    assert!(
+        seen.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n == &note
+        )),
+        "clients get the same note: {seen:#?}"
+    );
+    // A plain message, recognised by its exact text (no host key a
+    // rolled-back 0.10.2 would take for an archive marker).
+    assert!(msgs.iter().all(|m| m.get("_synaps_context").is_none()), "{msgs:#?}");
+    assert!(agent_engine::engine::interrupt::is_tool_in_flight_note(&msgs[2]));
+    gate.release.notify_one();
+
+    // An event wakes the next turn (no new user prompt): its turn start is
+    // still the original prompt, never the note, and the note reaches the
+    // provider without its host key.
+    use tokio::io::AsyncWriteExt;
+    let reg = agent_engine::events::registry::find_session_registration(handle.id.as_str())
+        .expect("registered");
+    let event = agent_engine::events::types::Event::simple(
+        "test",
+        "build finished",
+        Some(agent_engine::events::types::Severity::High),
+    );
+    let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
+    c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
+    c.shutdown().await.unwrap();
+    let woke = until(&mut a, |e| {
+        matches!(
+            e,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Done))
+        )
+    })
+    .await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(woke.iter().any(|e| matches!(
+        e.event,
+        SessionEventWire::TurnStarted { trigger: agent_engine::session::TurnTrigger::EventAuto, .. }
+    )));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let msgs = last_conversation(&woke).api_messages;
+    let starts: Vec<String> = msgs
+        .iter()
+        .filter(|m| m.get("_synaps_turn").is_some())
+        .map(|m| text_of(m))
+        .collect();
+    assert_eq!(starts, vec!["check the file".to_string()], "turn start stays the real prompt");
+    assert!(msgs.iter().all(|m| m.get("_synaps_context").is_none()), "{msgs:#?}");
+    let body = serde_json::to_string(&seen_bodies.lock().unwrap()[1]).unwrap();
+    assert!(!body.contains("_synaps_context"), "no host key anywhere: {body}");
+    assert!(body.contains("may have already started"), "the note's text is sent");
+    end(&mut a).await;
+}
+
+/// Text the actor only receives during the cancel's drain (queued behind
+/// the event that cancelled) reached clients; when the engine is too slow
+/// to publish, the kept partial must include it too — history matches the
+/// screen, tail included. The cost cap cancels on the usage that arrives
+/// between "A" and "B C" (see `SSE_TEXT_USAGE_TEXT`), so "B" and "C" go
+/// through the drain by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn slow_engine_finalize_keeps_text_received_during_the_drain() {
+    use agent_engine::extensions::hooks::events::HookKind;
+    let _h = Home::new();
+    let bodies: &'static [&'static str] = Box::leak(Box::new([SSE_TEXT_USAGE_TEXT]));
+    let (url, _, _) = capture_stub(bodies, Some(0)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let gate = GateHook::new();
+    gate.install(&host, HookKind::OnMessageComplete).await;
+    let handle = host
+        .create_session(SessionConfig {
+            max_session_cost: Some(1e-9),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let mut a = attach(&handle).await;
+
+    a.send(submit("spend")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let shown: String = seen
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(t))) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, "ABC", "clients saw the whole reply");
+    let msgs = last_conversation(&seen).api_messages;
+    let texts: Vec<String> = msgs.iter().map(|m| text_of(m)).collect();
+    assert_eq!(msgs.len(), 3, "{texts:#?}");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(
+        msgs[1]["content"],
+        json!([{"type": "text", "text": "ABC"}]),
+        "history matches the screen"
+    );
+    assert_eq!(msgs[2]["content"], InterruptReason::CostCap.marker());
+    gate.release.notify_one();
     end(&mut a).await;
 }
 

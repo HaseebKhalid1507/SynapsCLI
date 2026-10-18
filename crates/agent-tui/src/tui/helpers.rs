@@ -183,7 +183,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 /// prepends the identical sentinel `cap_resumed_display` produced at
 /// 741b6b60 (same text, same position).
 pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app: &mut App) {
-    use agent_engine::engine::interrupt::interruption_label;
+    use agent_engine::engine::interrupt::{interruption_label, tool_in_flight_note_label};
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
@@ -198,7 +198,13 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
             // the user typed: show it as the aborted line it replaced.
             DisplayItem::User { text } => match interruption_label(text) {
                 Some(label) => ChatMessage::Error(label.to_lowercase()),
-                None => ChatMessage::User(text.clone()),
+                // The host's note about a tool that may have run (a cancel
+                // the engine never reported back on): a system line, as it
+                // was shown live, not something the user typed.
+                None => match tool_in_flight_note_label(text) {
+                    Some(note) => ChatMessage::System(note.to_string()),
+                    None => ChatMessage::User(text.clone()),
+                },
             },
             DisplayItem::Thinking { text } => ChatMessage::Thinking(text.clone()),
             DisplayItem::Text { text } => ChatMessage::Text(text.clone()),
@@ -551,6 +557,31 @@ mod tests {
             super::apply_display_tail(&tail, &mut via_tail);
             assert_eq!(transcript_repr(&old), transcript_repr(&via_tail), "fixture {name} via tail");
         }
+    }
+
+    /// The host's tool-in-flight note replays as a system line (as it was
+    /// shown live), never as text the user typed; the marker stays an error.
+    #[test]
+    fn tool_in_flight_note_replays_as_a_system_line() {
+        use agent_engine::engine::interrupt::{
+            tool_in_flight_note, tool_in_flight_note_message, InterruptReason,
+        };
+        let note = tool_in_flight_note(InterruptReason::User, &["bash".into()]);
+        let history = vec![
+            j(serde_json::json!({"role": "user", "content": "clean up"})),
+            j(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "Let me look"}]})),
+            tool_in_flight_note_message(InterruptReason::User, &["bash".into()]),
+            j(serde_json::json!({"role": "user", "content": InterruptReason::User.marker()})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        let repr = transcript_repr(&app);
+        assert_eq!(repr[..3], ["U|clean up".to_string(), "T|Let me look".into(), format!("S|{}", &note[1..note.len() - 1])]);
+        assert!(!repr.iter().any(|l| l.starts_with("U|[")), "{repr:#?}");
+        assert!(matches!(
+            app.transcript.messages().last().map(|m| &m.msg),
+            Some(ChatMessage::Error(_))
+        ));
     }
 
     #[test]

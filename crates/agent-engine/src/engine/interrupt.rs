@@ -102,6 +102,29 @@ pub fn interruption_label(text: &str) -> Option<&str> {
     is_interruption_marker(text).then(|| &text[1..text.len() - 1])
 }
 
+/// The note a cancel records when the engine never reported back on a tool
+/// call the interrupted response made (`session::actor`
+/// `keep_streamed_partial`): the engine's canceled-`tool_result` wording,
+/// hedged to "may have already started" because the actor can't tell
+/// whether the call began. A plain user-role message, recognised by its
+/// exact text like the interruption marker (never by a host key a
+/// rolled-back 0.10.2 would take for an archive marker); the generator and
+/// the matcher live in `agent_core::core::host_note`, which archive
+/// projection (agent-core) uses too.
+pub fn tool_in_flight_note(reason: InterruptReason, tools: &[String]) -> String {
+    let phrase = reason.cancel_cause().map_or("Canceled", |c| c.phrase());
+    agent_core::core::host_note::tool_in_flight_note_text(phrase, tools)
+}
+
+/// The note as a history message.
+pub fn tool_in_flight_note_message(reason: InterruptReason, tools: &[String]) -> SharedMessage {
+    std::sync::Arc::new(json!({"role": "user", "content": tool_in_flight_note(reason, tools)}))
+}
+
+/// Exactly a generated note (text / message): never a user request, never
+/// archived or captured as the user's words, a system line on replay.
+pub use agent_core::core::host_note::{is_tool_in_flight_note, tool_in_flight_note_label};
+
 fn marker_of(message: &Value) -> bool {
     message["role"] == "user"
         && message["content"]
@@ -184,6 +207,78 @@ pub fn recover_crashed_turn(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn tool_note_names_the_tools_hedges_like_the_engine_and_is_recognised() {
+        let one = tool_in_flight_note(InterruptReason::User, &["bash".into()]);
+        assert_eq!(
+            one,
+            "[Canceled by user while the tool call `bash` was running. It may have already \
+             started and partially applied its effects.]"
+        );
+        let two = tool_in_flight_note(InterruptReason::Driver, &["read".into(), "bash".into()]);
+        assert_eq!(
+            two,
+            "[Canceled (session driver revoked) while the tool calls `read`, `bash` were \
+             running. They may have already started and partially applied their effects.]"
+        );
+        for note in [&one, &two] {
+            assert_eq!(tool_in_flight_note_label(note), Some(&note[1..note.len() - 1]));
+            assert!(!is_interruption_marker(note), "never mistaken for a marker");
+        }
+        // Every reason's note is recognised (the phrase lists agree).
+        for reason in InterruptReason::ALL {
+            let note = tool_in_flight_note(reason, &["x".into()]);
+            assert!(tool_in_flight_note_label(&note).is_some(), "{reason:?}: {note}");
+        }
+        // A plain message, untagged: recognised by its text alone.
+        let msg = tool_in_flight_note_message(InterruptReason::User, &["bash".into()]);
+        assert_eq!(*msg, json!({"role": "user", "content": one}));
+        assert!(is_tool_in_flight_note(&msg));
+        assert!(!is_tool_in_flight_note(&json!({"role": "assistant", "content": one})));
+        assert!(!is_tool_in_flight_note(&json!({"role": "user", "content": [{"type": "text", "text": one}]})));
+    }
+
+    /// Only the exact generated sentence is the note: nothing free-form in
+    /// the middle, a single line, a known cancel phrase.
+    #[test]
+    fn tool_note_matcher_is_exact() {
+        let one = tool_in_flight_note(InterruptReason::User, &["bash".into()]);
+        let not_notes = [
+            "[Request interrupted by user]".to_string(),
+            "[Canceled by user]".into(),
+            "hello".into(),
+            "[x effects.]".into(),
+            // Multi-line, or anything inserted, removed or reworded.
+            one.replace(" was running.", " was\nrunning."),
+            format!("{one}\n"),
+            format!("{one} please"),
+            one.replace("`bash`", "`bash` and also rm -rf /"),
+            one.replace("`bash`", "`bash`, `ls`"),
+            one.replace("It may", "They may"),
+            one.replace("Canceled by user", "Canceled by someone"),
+            one.replace("tool call `bash` was", "tool calls `bash` were"),
+            one.replace("`bash`", "``"),
+            one.replace("`bash`", "`ba\nsh`"),
+            "[Canceled by user while the tool call `a` was running. Anything at all goes here \
+             effects.]"
+                .into(),
+        ];
+        for text in &not_notes {
+            assert_eq!(tool_in_flight_note_label(text), None, "{text:?}");
+        }
+        // Whatever the model put in a tool name never reaches the note.
+        for bad in ["a`b".to_string(), "a\nb".into(), "z".repeat(200)] {
+            let note = tool_in_flight_note(InterruptReason::User, std::slice::from_ref(&bad));
+            assert!(note.contains("(an unrecognised tool)"), "{note}");
+            assert!(!note.contains(bad.as_str()), "{note}");
+            assert!(tool_in_flight_note_label(&note).is_some(), "{bad:?}: {note}");
+            assert!(is_tool_in_flight_note(&tool_in_flight_note_message(
+                InterruptReason::User,
+                std::slice::from_ref(&bad)
+            )));
+        }
+    }
 
     const ALL: [InterruptReason; 7] = InterruptReason::ALL;
 

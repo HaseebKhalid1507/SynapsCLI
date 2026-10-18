@@ -362,7 +362,10 @@ fn screen_text(text: &str) -> String {
 
 #[allow(dead_code)] // merge(112): used by capture pipeline
 pub(super) fn capture_text(message: &Value) -> Option<String> {
-    if message.get("_synaps_context").is_some() || !visible(message) {
+    if message.get("_synaps_context").is_some()
+        || crate::engine::interrupt::is_tool_in_flight_note(message)
+        || !visible(message)
+    {
         return None;
     }
     let content = message.get("content")?;
@@ -487,6 +490,12 @@ mod tests {
             &json!({"role":"user","_synaps_context":{},"content":"private working note"})
         )
         .is_none());
+        // The host's tool-in-flight note is not something the user said.
+        let note = crate::engine::interrupt::tool_in_flight_note_message(
+            crate::engine::interrupt::InterruptReason::User,
+            &["bash".into()],
+        );
+        assert!(capture_text(&note).is_none());
     }
 
     #[test]
