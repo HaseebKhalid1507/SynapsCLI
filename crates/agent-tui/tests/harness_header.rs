@@ -298,3 +298,68 @@ fn running_workers_show_done_over_total_and_one_bar_each() {
     assert_eq!(bars.len(), 3, "one bar per worker: {r:?}");
     assert_eq!(bars[0], '▁', "the finished worker's bar lies flat: {r:?}");
 }
+
+/// 04-tui M3: a failed turn's label ("✗ 401") survived `/new`, so the new
+/// session showed the old session's failure until its first turn.
+#[test]
+fn a_new_session_drops_the_failed_turn_label() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.feed_event(turn());
+    h.feed_event(session(WireSessionStreamEvent::Error {
+        message: "unauthorized".into(),
+        outcome: TurnOutcome::ProviderFailed {
+            code: "401".into(),
+            correlation_id: "c1".into(),
+        },
+    }));
+    assert_eq!(right(&mut h), "✗ 401");
+    h.feed_event(W::Cleared { session_id: "next".into() }.into());
+    let line = header(&mut h);
+    assert!(!line.contains('✗'), "/new clears the failure: {line:?}");
+}
+
+/// 04-tui M2: the header cut the reconnect status at "…", so the countdown
+/// ("4s left, attempt 2") was shown nowhere. It shows when there is room.
+#[test]
+fn the_reconnect_countdown_shows_when_there_is_room() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.set_status_text(Some("reconnecting… (4s left, attempt 2)"));
+    let line = header(&mut h);
+    assert!(
+        line.contains("reconnecting \u{b7} 4s left, attempt 2"),
+        "{line:?}"
+    );
+    // Too narrow for it: the word alone, as before.
+    h.resize(40, 20);
+    let line = header(&mut h);
+    assert!(line.contains("reconnecting"), "{line:?}");
+    assert!(!line.contains("attempt"), "{line:?}");
+    assert!(line.contains("synaps"), "the wordmark stays: {line:?}");
+}
+
+/// 04-tui M1: at 80 columns a long worker name in the banner ran under the
+/// right-hand clock, which overwrote it. The name is cut with `…` so the
+/// banner and the clock both read.
+#[test]
+fn a_long_worker_name_is_cut_not_overwritten_at_80_columns() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut h = TestHarness::boot_with_size(80, 24);
+    h.feed_event(turn());
+    h.feed_event(agent(WireAgentEvent::SubagentStart {
+        subagent_id: 1,
+        agent_name: "code-reviewer-specialist".into(),
+        task_preview: "review".into(),
+    }));
+    h.key(KeyCode::Up, KeyModifiers::ALT);
+    let line = header(&mut h);
+    assert!(line.contains("\u{25c9} code-rev"), "{line:?}");
+    assert!(!line.contains("code-reviewer-specialist"), "cut: {line:?}");
+    assert!(line.contains('\u{2026}'), "with an ellipsis: {line:?}");
+    assert!(line.contains("sa_1"), "{line:?}");
+    assert!(line.contains("Esc back"), "the hint is intact: {line:?}");
+    let (hint, clock) = (line.find("Esc back"), line.find("0:00"));
+    assert!(
+        matches!((hint, clock), (Some(a), Some(b)) if a < b),
+        "the clock is intact, after the banner: {line:?}"
+    );
+}

@@ -660,6 +660,10 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::Cleared { .. } => {
             super::watch::reset(app);
+            // The old session's failed-turn label ("✗ 401") goes with it.
+            if matches!(app.activity, Activity::Failed(_)) {
+                app.activity = Activity::Idle;
+            }
             app.transcript.clear();
             app.invalidate();
             app.api_messages_len = 0;

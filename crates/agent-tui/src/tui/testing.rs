@@ -822,6 +822,13 @@ impl TestHarness {
         self
     }
 
+    /// Force the transient status line (`connecting…`, `reconnecting… (…)`,
+    /// …) the run loop sets around daemon reconnects.
+    pub fn set_status_text(&mut self, text: Option<&str>) -> &mut Self {
+        self.app.status_text = text.map(str::to_string);
+        self
+    }
+
     // ── Session envelopes (PLAN-phase3 §5.1 layer 2) ─────────────────────────
 
     /// Feed session events through the PRODUCTION presentation arm

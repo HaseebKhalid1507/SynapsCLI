@@ -499,6 +499,34 @@ fn idle_right(t: &Theme, label: &str, width: usize, left_w: usize) -> Vec<Span<'
     }
 }
 
+/// The detail after a status word: `reconnecting… (4s left, attempt 2)`
+/// gives `4s left, attempt 2`.
+fn busy_detail(status_text: Option<&str>) -> Option<&str> {
+    let rest = status_text?.split_once('\u{2026}')?.1.trim();
+    let rest = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(rest)
+        .trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// The worker banner in at most `room` cells: the agent name is cut with
+/// `…` first; anything still too wide is clipped by the caller.
+fn fit_banner(b: &super::watch::Banner, room: usize) -> Vec<Span<'static>> {
+    let full = super::draw::watch_banner_spans(b);
+    let over = spans_width(&full).saturating_sub(room);
+    if over == 0 {
+        return full;
+    }
+    let name_room = display_width(&b.agent_name).saturating_sub(over).max(2);
+    let cut = super::watch::Banner {
+        agent_name: truncate(&b.agent_name, name_room),
+        ..b.clone()
+    };
+    super::draw::watch_banner_spans(&cut)
+}
+
 /// Draw the header row.
 pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, model: &RenderModel) {
     let t = THEME.load();
@@ -513,30 +541,50 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, model: &RenderModel) {
 
     frame.render_widget(Block::default().style(Style::default().bg(t.bg)), area);
 
+    let width = area.width as usize;
     let mut left = vec![Span::raw("  ")];
     left.extend(wordmark(&t, &state, tick));
     for pill in &model.sidecar_pills {
         left.push(Span::raw(" "));
         left.push(super::draw::sidecar_pill_span(pill, model.spinner_frame));
     }
-    // Worker view: say whose thread this is and how to get back.
-    if let Some(b) = &model.watch_banner {
-        left.push(Span::raw(" "));
-        left.extend(super::draw::watch_banner_spans(b));
-    }
+    let base_w = spans_width(&left);
+    let banner_w = model
+        .watch_banner
+        .as_ref()
+        .map_or(0, |b| 1 + spans_width(&super::draw::watch_banner_spans(b)));
 
     let mut right = right_cluster(&t, &state, snap.turn_elapsed_secs, tick);
+    // The reconnect countdown ("4s left, attempt 2"), when it fits (M2).
+    if let (HeaderState::Busy(word), Some(detail)) =
+        (&state, busy_detail(model.status_text.as_deref()))
+    {
+        let busy = HeaderState::Busy(format!("{word} \u{b7} {detail}"));
+        let wide = right_cluster(&t, &busy, snap.turn_elapsed_secs, tick);
+        if base_w + spans_width(&wide) + 3 <= width {
+            right = wide;
+        }
+    }
     if right.is_empty() {
-        right = idle_right(
-            &t,
-            &snap.session_label,
-            area.width as usize,
-            spans_width(&left),
-        );
+        right = idle_right(&t, &snap.session_label, width, base_w + banner_w);
+    }
+    let right_w = spans_width(&right);
+
+    // Worker view: say whose thread this is and how to get back. The name
+    // gives way so the right-hand cluster never draws over it (M1).
+    if let Some(b) = &model.watch_banner {
+        left.push(Span::raw(" "));
+        let room = width.saturating_sub(base_w + 1 + right_w + 1);
+        left.extend(fit_banner(b, room));
     }
 
-    let (left_w, right_w) = (spans_width(&left), spans_width(&right));
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    let left_w = spans_width(&left);
+    // Clip the left side to its share: the two never overlap.
+    let left_area = Rect {
+        width: area.width.saturating_sub(right_w as u16),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(Line::from(left)), left_area);
     if !right.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
