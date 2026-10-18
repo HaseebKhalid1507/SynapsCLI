@@ -488,6 +488,7 @@ mod tests {
         "ice",
         "forest",
         "lavender",
+        "paper",
     ];
 
     #[test]
