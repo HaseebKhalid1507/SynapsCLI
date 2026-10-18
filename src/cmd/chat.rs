@@ -902,7 +902,7 @@ mod actor {
                 StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
                 }
-                StreamEvent::Session(SessionEvent::Notice(text)) => {
+                StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
                     eprintln!("\x1b[2m{}\x1b[0m", text);
                 }
                 StreamEvent::Session(SessionEvent::Done) => {

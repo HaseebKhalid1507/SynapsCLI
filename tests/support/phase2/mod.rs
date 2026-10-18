@@ -764,7 +764,7 @@ pub fn surfaced_error_strings(events: &[StreamEvent]) -> Vec<String> {
         .iter()
         .filter_map(|e| match e {
             StreamEvent::Session(SessionEvent::Error(err)) => Some(err.message.clone()),
-            StreamEvent::Session(SessionEvent::Notice(n)) => Some(n.clone()),
+            StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) => Some(n.clone()),
             _ => None,
         })
         .collect()

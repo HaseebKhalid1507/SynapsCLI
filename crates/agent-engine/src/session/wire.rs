@@ -582,7 +582,14 @@ pub enum WireSessionStreamEvent {
     },
     Done,
     Error { message: String, outcome: TurnOutcome },
-    Notice { text: String },
+    /// `retry`: a `SessionEvent::Retry`. Omitted when false, so a plain
+    /// notice's frame is unchanged and peers that predate the flag read a
+    /// retry as a plain notice.
+    Notice {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        retry: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,7 +697,8 @@ impl From<StreamEvent> for WireStreamEvent {
                 },
                 SessionEvent::Done => WireSessionStreamEvent::Done,
                 SessionEvent::Error(TurnError { message, outcome }) => WireSessionStreamEvent::Error { message, outcome },
-                SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text },
+                SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text, retry: false },
+                SessionEvent::Retry(text) => WireSessionStreamEvent::Notice { text, retry: true },
                 // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire.
                 // Drop it silently — the actor handles persistence before forwarding.
                 SessionEvent::ContextHeadCheckpoint { .. } => WireSessionStreamEvent::Done,
@@ -746,7 +754,8 @@ impl From<WireStreamEvent> for StreamEvent {
                 },
                 WireSessionStreamEvent::Done => SessionEvent::Done,
                 WireSessionStreamEvent::Error { message, outcome } => SessionEvent::Error(TurnError { message, outcome }),
-                WireSessionStreamEvent::Notice { text } => SessionEvent::Notice(text),
+                WireSessionStreamEvent::Notice { text, retry: false } => SessionEvent::Notice(text),
+                WireSessionStreamEvent::Notice { text, retry: true } => SessionEvent::Retry(text),
             }),
             WireStreamEvent::Agent(a) => Self::Agent(match a {
                 WireAgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
@@ -1024,6 +1033,7 @@ mod tests {
             StreamEvent::Session(SessionEvent::Error(TurnError::budget(BudgetDimension::ToolCalls))),
             StreamEvent::Session(SessionEvent::Error(TurnError { message: "c".into(), outcome: TurnOutcome::Canceled })),
             StreamEvent::Session(SessionEvent::Notice("n".into())),
+            StreamEvent::Session(SessionEvent::Retry("r".into())),
             StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id: 1, agent_name: "a".into(), task_preview: "p".into() }),
             StreamEvent::Agent(AgentEvent::SubagentUpdate { subagent_id: 1, agent_name: "a".into(), status: "s".into() }),
             StreamEvent::Agent(AgentEvent::SubagentDone {
@@ -1034,6 +1044,29 @@ mod tests {
             }),
             StreamEvent::Agent(AgentEvent::SteeringDelivered { message: "m".into() }),
         ]
+    }
+
+    /// 04-tui I4: a retry rides on the existing `notice` frame with a flag,
+    /// so a peer that predates it decodes it as a plain notice (it never
+    /// becomes a malformed frame), and a plain notice's bytes are unchanged.
+    #[test]
+    fn a_retry_is_a_flagged_notice_on_the_wire() {
+        let retry = StreamEvent::Session(SessionEvent::Retry("⚠ Rate limited — retrying (1/5)".into()));
+        let json = serde_json::to_value(WireStreamEvent::from(retry)).unwrap();
+        assert_eq!(json["session"], "notice", "{json}");
+        assert_eq!(json["retry"], true, "{json}");
+        let back: WireStreamEvent = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(StreamEvent::from(back), StreamEvent::Session(SessionEvent::Retry(t)) if t.starts_with("⚠ Rate limited")),
+            "a retry stays a retry"
+        );
+        let plain = StreamEvent::Session(SessionEvent::Notice("n".into()));
+        let json = serde_json::to_value(WireStreamEvent::from(plain)).unwrap();
+        assert!(json.get("retry").is_none(), "a plain notice is unchanged: {json}");
+        // An older daemon's notice has no flag: a plain notice.
+        let old: WireStreamEvent =
+            serde_json::from_value(serde_json::json!({"kind": "session", "session": "notice", "text": "x"})).unwrap();
+        assert!(matches!(StreamEvent::from(old), StreamEvent::Session(SessionEvent::Notice(t)) if t == "x"));
     }
 
     fn fixtures() -> Vec<SessionEventWire> {
@@ -1143,8 +1176,8 @@ mod tests {
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 18 StreamEvent leaves.
-        assert_eq!(all.len(), 36 + 18);
+        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 19 StreamEvent leaves.
+        assert_eq!(all.len(), 36 + 19);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);

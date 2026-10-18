@@ -203,6 +203,7 @@ fn each_phase_of_a_turn_has_its_own_indicator() {
     // The provider pushed back: retrying + ripple.
     h.feed_event(session(WireSessionStreamEvent::Notice {
         text: "⏳ API error, retrying (1/3)…".into(),
+        retry: true,
     }));
     let r = right(&mut h);
     assert!(r.starts_with("retrying"), "retry label missing: {r:?}");
@@ -218,6 +219,39 @@ fn each_phase_of_a_turn_has_its_own_indicator() {
         !line.contains("retrying"),
         "retry label after done: {line:?}"
     );
+}
+
+/// 04-tui I4: `retrying` showed only for notices that began with ⏳, so a
+/// 429 ("⚠ Rate limited — …"), the most common retry, and the OpenAI
+/// incomplete-response retry never showed it. The state now comes from the
+/// typed retry flag the engine sets where it retries, not from the text.
+#[test]
+fn retrying_follows_the_typed_retry_signal_not_the_text() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.feed_event(turn());
+    for text in [
+        "⚠ Rate limited — resuming in 42s (1/10)",
+        "⚠ Rate limited — retrying (2/10)",
+        "Response incomplete — retrying response (1/3); incomplete output discarded, no tools replayed.",
+        "⚠ Gemini rate limited — resuming in 7s (1/5)",
+    ] {
+        h.feed_event(session(WireSessionStreamEvent::Notice {
+            text: text.into(),
+            retry: true,
+        }));
+        let r = right(&mut h);
+        assert!(r.starts_with("retrying"), "{text:?}: {r:?}");
+        assert!(h.main_transcript_text().contains(text), "it still prints as a notice");
+        h.feed_event(llm(WireLlmEvent::ResponseStart));
+        assert!(!right(&mut h).starts_with("retrying"), "the retry went out");
+    }
+    // A status notice is not a retry, whatever its text looks like.
+    h.feed_event(session(WireSessionStreamEvent::Notice {
+        text: "⏳ looks like a retry".into(),
+        retry: false,
+    }));
+    let r = right(&mut h);
+    assert!(!r.starts_with("retrying"), "{r:?}");
 }
 
 #[test]

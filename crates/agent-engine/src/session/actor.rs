@@ -3206,7 +3206,7 @@ impl SessionActor {
                     return;
                 }
             }
-            StreamEvent::Session(SessionEvent::Notice(_)) => {}
+            StreamEvent::Session(SessionEvent::Notice(_) | SessionEvent::Retry(_)) => {}
             StreamEvent::Session(SessionEvent::Done) => {
                 self.clear_stream();
                 self.publish_subagent_rows();

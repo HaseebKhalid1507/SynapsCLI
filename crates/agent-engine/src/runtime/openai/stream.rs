@@ -86,7 +86,7 @@ async fn wait_stream_retry(
     if !suppress_stream_deltas {
         let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseReset));
     }
-    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
         "Response incomplete — retrying response ({retry}/{max_retries}); incomplete output discarded, no tools replayed."
     ))));
     tokio::select! {
@@ -5598,7 +5598,7 @@ mod send_retry_tests {
         let waiter = cancel.clone();
         let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if matches!(event, StreamEvent::Session(crate::SessionEvent::Notice(_))) {
+                if matches!(event, StreamEvent::Session(crate::SessionEvent::Retry(_))) {
                     waiter.cancel();
                     break;
                 }
@@ -6135,7 +6135,10 @@ mod send_retry_tests {
     fn notices(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+            if let StreamEvent::Session(
+                crate::SessionEvent::Notice(n) | crate::SessionEvent::Retry(n),
+            ) = ev
+            {
                 out.push(n);
             }
         }
@@ -6704,6 +6707,23 @@ mod send_retry_tests {
 
     /// Backoff doubles per attempt but caps at 2^6 — a 10-deep budget must
     /// never sleep 512s on its final attempt.
+    /// 04-tui I4: the incomplete-response retry is a typed retry (the
+    /// header's "retrying"), not a notice the client has to recognise.
+    #[tokio::test]
+    async fn a_stream_retry_is_a_typed_retry_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = cancel.clone();
+        let task = tokio::spawn(async move { wait_stream_retry(&tx, &waiting, 1, 3, true).await.is_ok() });
+        let ev = rx.recv().await.expect("the retry is announced");
+        cancel.cancel();
+        assert!(!task.await.unwrap(), "cancel ends the wait");
+        assert!(
+            matches!(&ev, StreamEvent::Session(crate::SessionEvent::Retry(t)) if t.starts_with("Response incomplete — retrying")),
+            "{ev:?}"
+        );
+    }
+
     #[test]
     fn retry_delay_is_exponential_with_a_capped_tail() {
         assert_eq!(retry_delay(1).as_secs(), 1);

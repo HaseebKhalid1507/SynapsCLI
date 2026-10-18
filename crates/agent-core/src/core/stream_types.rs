@@ -79,6 +79,12 @@ pub enum SessionEvent {
     Error(TurnError),
     /// Transient status line — display-only, never persisted.
     Notice(String),
+    /// The provider pushed back (429, 5xx, a stream error, a refusal, an
+    /// incomplete response) and a retry is pending. Shown like
+    /// [`Notice`](Self::Notice); clients also show a retrying state, which
+    /// they must not infer from notice text. On the session wire it is a
+    /// `notice` with `retry: true`, so older peers read it as a notice.
+    Retry(String),
 }
 
 /// Budget dimension placeholder (spec §5.2). The full turn-budget system is

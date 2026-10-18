@@ -97,7 +97,7 @@ pub(super) fn apply_transcript_event(
             }
             store.push_msg(ChatMessage::User(message.clone()));
         }
-        StreamEvent::Session(SessionEvent::Notice(text)) => {
+        StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
             // Display-only retry/status notice — system line, not transcript.
             // Notice text can echo API error bodies; strip control chars
             // (esp. ESC) so a hostile payload can't inject terminal escapes.
@@ -169,10 +169,9 @@ fn track_activity(app: &mut App, event: &StreamEvent) {
                 app.activity = Activity::Waiting;
             }
         }
-        // Retry notices all lead with ⏳ (runtime/api.rs).
-        StreamEvent::Session(SessionEvent::Notice(text)) if text.starts_with('\u{23f3}') => {
-            app.activity = Activity::Retry;
-        }
+        // The engine types its retries (04-tui I4: the text prefix missed
+        // rate limits and the OpenAI retry).
+        StreamEvent::Session(SessionEvent::Retry(_)) => app.activity = Activity::Retry,
         StreamEvent::Llm(LlmEvent::ResponseStart) if app.tools_in_flight == 0 => {
             app.activity = Activity::Waiting;
         }
@@ -331,7 +330,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
         }
         // Transcript-only events: fully handled by `apply_transcript_event`.
         StreamEvent::Llm(_)
-        | StreamEvent::Session(SessionEvent::Notice(_))
+        | StreamEvent::Session(SessionEvent::Notice(_) | SessionEvent::Retry(_))
         | StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {}
     }
 }
