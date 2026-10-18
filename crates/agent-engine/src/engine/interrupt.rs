@@ -267,6 +267,17 @@ mod tests {
         for text in &not_notes {
             assert_eq!(tool_in_flight_note_label(text), None, "{text:?}");
         }
+        // Whatever the model put in a tool name never reaches the note.
+        for bad in ["a`b".to_string(), "a\nb".into(), "z".repeat(200)] {
+            let note = tool_in_flight_note(InterruptReason::User, std::slice::from_ref(&bad));
+            assert!(note.contains("(an unrecognised tool)"), "{note}");
+            assert!(!note.contains(bad.as_str()), "{note}");
+            assert!(tool_in_flight_note_label(&note).is_some(), "{bad:?}: {note}");
+            assert!(is_tool_in_flight_note(&tool_in_flight_note_message(
+                InterruptReason::User,
+                std::slice::from_ref(&bad)
+            )));
+        }
     }
 
     const ALL: [InterruptReason; 7] = InterruptReason::ALL;

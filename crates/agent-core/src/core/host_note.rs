@@ -22,12 +22,29 @@ pub const CANCEL_PHRASES: &[&str] = &[
     "Canceled",
 ];
 
+/// How the note names a tool whose name isn't a plausible tool name.
+pub const UNRECOGNISED_TOOL: &str = "(an unrecognised tool)";
+
+/// A name the note may quote: what tool wire names look like
+/// (`ToolRegistry` exposes `[A-Za-z0-9_-]{1,128}`), plus `.` and `:` for
+/// runtime-style names. The name comes straight from the model's call, so
+/// anything else (a backtick, a newline, an overlong string) is never
+/// copied into a user-role message: it reads [`UNRECOGNISED_TOOL`].
+pub fn is_plausible_tool_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
 /// The note a cancel records for tool calls the interrupted response made
 /// when the engine never reported back on them: the engine's canceled
 /// `tool_result` wording, hedged to "may have already started" because the
 /// host can't tell whether the call began. One line.
 pub fn tool_in_flight_note_text(phrase: &str, tools: &[String]) -> String {
-    let names = tools.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
+    let names = tools
+        .iter()
+        .map(|t| if is_plausible_tool_name(t) { format!("`{t}`") } else { UNRECOGNISED_TOOL.into() })
+        .collect::<Vec<_>>()
+        .join(", ");
     let (call, was, it, its) = if tools.len() == 1 {
         ("tool call", "was", "It", "its")
     } else {
@@ -41,29 +58,38 @@ pub fn tool_in_flight_note_text(phrase: &str, tools: &[String]) -> String {
 
 /// `text` without its brackets iff it is exactly a note
 /// [`tool_in_flight_note_text`] generates: a single line, a known phrase,
-/// one or more non-empty backticked tool names, and nothing else. Checked
-/// by regenerating the note from the names it contains, so there is no
-/// free-form part. `None` for anything else.
+/// one or more names that are each a backticked plausible tool name or
+/// [`UNRECOGNISED_TOOL`], and nothing else. Checked by regenerating the
+/// note from the names it contains, so there is no free-form part. `None`
+/// for anything else.
 pub fn tool_in_flight_note_label(text: &str) -> Option<&str> {
-    if text.contains(['\n', '\r']) || !text.starts_with('[') || !text.ends_with(']') {
+    if text.contains(['\n', '\r']) {
         return None;
     }
-    let mut parts = text.split('`');
-    parts.next()?; // the lead-in before the first name
-    let mut tools = Vec::new();
-    while let (Some(name), Some(_between)) = (parts.next(), parts.next()) {
-        if name.is_empty() {
-            return None;
+    for phrase in CANCEL_PHRASES {
+        for (call, was) in [("tool call", "was"), ("tool calls", "were")] {
+            let Some(rest) = text.strip_prefix(&format!("[{phrase} while the {call} ")) else {
+                continue;
+            };
+            let Some(end) = rest.find(&format!(" {was} running. ")) else {
+                continue;
+            };
+            // A plausible name has no space or comma, so ", " splits items.
+            let tools: Option<Vec<String>> = rest[..end]
+                .split(", ")
+                .map(|item| match item.strip_prefix('`').and_then(|i| i.strip_suffix('`')) {
+                    Some(name) if is_plausible_tool_name(name) => Some(name.to_string()),
+                    // Regenerates as the fallback item.
+                    None if item == UNRECOGNISED_TOOL => Some(String::new()),
+                    _ => None,
+                })
+                .collect();
+            if tools.is_some_and(|tools| tool_in_flight_note_text(phrase, &tools) == text) {
+                return Some(&text[1..text.len() - 1]);
+            }
         }
-        tools.push(name.to_string());
     }
-    if tools.is_empty() {
-        return None;
-    }
-    CANCEL_PHRASES
-        .iter()
-        .any(|phrase| tool_in_flight_note_text(phrase, &tools) == text)
-        .then(|| &text[1..text.len() - 1])
+    None
 }
 
 /// A user-role history message whose string content is exactly a
@@ -101,5 +127,38 @@ mod tests {
             assert_eq!(tool_in_flight_note_label(&text), None, "{text:?}");
         }
         assert!(!is_tool_in_flight_note(&json!({"role": "assistant", "content": note})));
+    }
+
+    /// A tool name comes straight from the model's call: one that isn't a
+    /// plausible tool name (a backtick, a newline, too long) never reaches
+    /// the note; it reads "(an unrecognised tool)", and the note is still
+    /// recognised exactly.
+    #[test]
+    fn implausible_tool_names_become_the_fallback_and_stay_recognised() {
+        for bad in ["a`b".to_string(), "a\nb".into(), "a".repeat(200), String::new(), "rm -rf /".into()] {
+            let note = tool_in_flight_note_text("Canceled by user", std::slice::from_ref(&bad));
+            assert_eq!(
+                note,
+                "[Canceled by user while the tool call (an unrecognised tool) was running. It \
+                 may have already started and partially applied its effects.]",
+                "{bad:?}"
+            );
+            assert!(tool_in_flight_note_label(&note).is_some(), "{bad:?}");
+        }
+        let mixed = tool_in_flight_note_text("Canceled", &["read".into(), "x`y".into()]);
+        assert_eq!(
+            mixed,
+            "[Canceled while the tool calls `read`, (an unrecognised tool) were running. They \
+             may have already started and partially applied their effects.]"
+        );
+        assert!(tool_in_flight_note_label(&mixed).is_some());
+        // Plausible names, including MCP/extension style, are kept.
+        let kept = tool_in_flight_note_text("Canceled", &["mcp__fs.read:v2-x".into(), "a".repeat(128)]);
+        assert!(kept.contains("`mcp__fs.read:v2-x`") && kept.contains(&format!("`{}`", "a".repeat(128))));
+        assert!(tool_in_flight_note_label(&kept).is_some());
+        // A hand-written name that isn't plausible is not the note.
+        let forged = "[Canceled while the tool call `a b` was running. It may have already started \
+                      and partially applied its effects.]";
+        assert_eq!(tool_in_flight_note_label(forged), None);
     }
 }
