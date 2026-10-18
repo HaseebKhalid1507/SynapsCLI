@@ -41,12 +41,40 @@ pub fn read_local_broker_token() -> Option<String> {
     read_token_at(&local_broker_token_path()).ok().flatten()
 }
 
+/// Largest token file a client will read (the auto token is 65 bytes).
+const MAX_CLIENT_TOKEN_FILE: u64 = 4096;
+
+/// Client read of the token file: never follows a symlink, refuses anything
+/// but a regular file, and caps the size, so whatever `auth-broker.token`
+/// points at is never sent as a bearer.
 fn read_token_at(path: &Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(s.trim().to_string()).filter(|t| !t.is_empty())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    use std::io::Read;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(invalid(path, "is a symlink; refusing to follow it"));
     }
+    if !meta.is_file() {
+        return Err(invalid(path, "is not a regular file"));
+    }
+    if meta.len() > MAX_CLIENT_TOKEN_FILE {
+        return Err(invalid(path, "is larger than 4 KiB; not a machine token"));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut s = String::new();
+    opts.open(path)?
+        .take(MAX_CLIENT_TOKEN_FILE)
+        .read_to_string(&mut s)?;
+    Ok(Some(s.trim().to_string()).filter(|t| !t.is_empty()))
 }
 
 /// How [`load_or_create_broker_token`] obtained the token.
@@ -225,10 +253,18 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// The machine token a client presents to a broker. For a loopback
-/// endpoint it can be re-read from the local broker's token file after a
-/// 401 (prA I2): a long-lived client (daemon, TUI) started before the broker
-/// first ran, or across a token rotation, recovers without a restart.
+/// The machine token a client presents to a broker, with its provenance.
+///
+/// - Explicit (`auth.machine_token` / `SYNAPS_MACHINE_TOKEN`, i.e. a
+///   non-empty configured token): fixed. Never replaced by, and never sent
+///   alongside, the local file token (prA N1) — even on a loopback endpoint,
+///   which may be an `ssh -L` tunnel to a remote broker.
+/// - None configured + loopback endpoint: the local broker's
+///   `<base_dir>/auth-broker.token`, read now and re-read after a 401
+///   (prA I2), so a long-lived client started before the broker's first run,
+///   or across a rotation, recovers without a restart.
+/// - None configured + remote endpoint: empty, never reads the file.
+///
 /// Clones share the current value.
 #[derive(Clone)]
 pub struct MachineToken {
@@ -237,12 +273,23 @@ pub struct MachineToken {
 }
 
 impl MachineToken {
-    /// `token` as configured; reloadable iff `endpoint` is loopback.
+    /// `token` is the EXPLICITLY configured token ("" = none configured).
     pub fn for_endpoint(endpoint: &str, token: impl Into<String>) -> Self {
-        Self {
-            current: std::sync::Arc::new(std::sync::RwLock::new(token.into())),
-            reload_from: is_loopback_endpoint(endpoint).then(local_broker_token_path),
+        let token = token.into().trim().to_string();
+        if !token.is_empty() || !is_loopback_endpoint(endpoint) {
+            return Self::fixed(token);
         }
+        let path = local_broker_token_path();
+        let initial = read_token_at(&path).ok().flatten().unwrap_or_default();
+        Self {
+            current: std::sync::Arc::new(std::sync::RwLock::new(initial)),
+            reload_from: Some(path),
+        }
+    }
+
+    /// Whether this token comes from the local broker token file.
+    pub fn is_from_local_file(&self) -> bool {
+        self.reload_from.is_some()
     }
 
     /// Fixed token, never reloaded.
@@ -429,6 +476,24 @@ mod tests {
         assert!(err.to_string().contains("another user"), "{err}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn client_read_refuses_symlinks_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "secret-elsewhere\n").unwrap();
+        let link = dir.path().join(LOCAL_BROKER_TOKEN_FILE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_token_at(&link).is_err(), "symlink never followed");
+        let big = dir.path().join("big.token");
+        std::fs::write(&big, "a".repeat(5000)).unwrap();
+        assert!(read_token_at(&big).is_err(), "over 4 KiB refused");
+        let ok = dir.path().join("ok.token");
+        std::fs::write(&ok, "tok\n").unwrap();
+        assert_eq!(read_token_at(&ok).unwrap().as_deref(), Some("tok"));
+        assert_eq!(read_token_at(&dir.path().join("missing")).unwrap(), None);
+    }
+
     /// prA I2: a loopback client re-reads the token file after a 401.
     #[test]
     fn machine_token_reloads_only_for_loopback_and_only_when_changed() {
@@ -444,10 +509,13 @@ mod tests {
         assert!(tok.reload_after_unauthorized());
         assert_eq!(shared.get(), "fresh", "clones share the reloaded token");
         assert!(!tok.reload_after_unauthorized(), "unchanged → no retry");
-        let remote = MachineToken::for_endpoint("https://jade.jade:8181", "x");
+        let remote = MachineToken::for_endpoint("https://jade.jade:8181", "");
         assert!(!remote.reload_after_unauthorized());
-        assert!(MachineToken::for_endpoint("http://127.0.0.1:8181", "x")
-            .reload_from
-            .is_some());
+        // prA N1: an explicit token is fixed, even on loopback.
+        let explicit = MachineToken::for_endpoint("http://127.0.0.1:8181", "x");
+        assert!(!explicit.is_from_local_file());
+        assert!(!explicit.reload_after_unauthorized());
+        assert_eq!(explicit.get(), "x");
+        assert!(MachineToken::for_endpoint("http://127.0.0.1:8181", "").is_from_local_file());
     }
 }

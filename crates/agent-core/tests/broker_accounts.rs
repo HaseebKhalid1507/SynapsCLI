@@ -825,19 +825,17 @@ async fn generic_codex_headroom_does_not_authorize_a_model_not_reported_availabl
         .is_some());
 }
 
-/// prA I2: a long-lived client that started before the loopback broker
-/// generated (or rotated) its token re-reads `<base_dir>/auth-broker.token`
-/// after a 401 and retries once — no restart needed. A non-loopback broker
-/// never triggers a local file read.
-#[tokio::test]
-#[serial_test::serial]
-async fn remote_broker_rereads_local_token_file_after_401_on_loopback() {
-    let home = install_store();
+/// Fake loopback broker: records every Authorization header; answers 200
+/// only for `Bearer <accept>`, and 401 for the first `fail_first` calls.
+async fn recording_broker(
+    accept: &'static str,
+    fail_first: usize,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let hits = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = hits.clone();
     let app = Router::new().route(
         "/capabilities",
-        get(move |headers: axum::http::HeaderMap| {
+        get(move |headers: HeaderMap| {
             let seen = seen.clone();
             async move {
                 let auth = headers
@@ -845,34 +843,74 @@ async fn remote_broker_rereads_local_token_file_after_401_on_loopback() {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                seen.lock().unwrap().push(auth.clone());
-                if auth == "Bearer rotated-token" {
-                    (axum::http::StatusCode::OK, axum::Json(serde_json::json!([])))
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(auth.clone());
+                    seen.len()
+                };
+                if n > fail_first && auth == format!("Bearer {accept}") {
+                    (StatusCode::OK, Json(json!([])))
                 } else {
-                    (
-                        axum::http::StatusCode::UNAUTHORIZED,
-                        axum::Json(serde_json::json!({"error": "bad machine auth"})),
-                    )
+                    (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad machine auth"})))
                 }
             }
         }),
     );
-    let base = spawn(app).await;
-    // The client was configured (at startup) with the old token.
-    let remote = RemoteBroker::new(&base, "stale-token", reqwest::Client::new(), TokenCache::new());
+    (spawn(app).await, hits)
+}
+
+/// prA I2: a zero-config client (no token configured) that started before
+/// the loopback broker generated or rotated its token re-reads
+/// `<base_dir>/auth-broker.token` after a 401 and retries once.
+#[tokio::test]
+#[serial_test::serial]
+async fn zero_config_client_rereads_local_token_file_after_401() {
+    let home = install_store();
+    let (base, hits) = recording_broker("rotated-token", 0).await;
+    let remote = RemoteBroker::new(&base, "", reqwest::Client::new(), TokenCache::new());
     let err = remote.capabilities().await.unwrap_err();
     assert!(err.to_string().contains("auth.machine_token"), "actionable: {err}");
-    // The broker (re)generated its token file; the next call recovers.
     std::fs::write(home.path().join("auth-broker.token"), "rotated-token\n").unwrap();
     assert!(remote.capabilities().await.is_ok());
+    assert_eq!(
+        hits.lock().unwrap().clone(),
+        vec!["Bearer", "Bearer", "Bearer rotated-token"],
+        "exactly one retry, with the re-read token"
+    );
+}
+
+/// prA N1 (leak): an explicit token on a loopback endpoint — e.g. an
+/// `ssh -L 9000:127.0.0.1:8181` tunnel to a REMOTE broker — is never
+/// swapped for the local file token, which must never cross the tunnel.
+#[tokio::test]
+#[serial_test::serial]
+async fn explicit_token_on_loopback_never_sends_the_local_file_token() {
+    let home = install_store();
+    std::fs::write(home.path().join("auth-broker.token"), "LOCAL-FILE-SECRET\n").unwrap();
+    let (base, hits) = recording_broker("remote-only-token", 0).await;
+    let remote = RemoteBroker::new(&base, "explicit-but-wrong", reqwest::Client::new(), TokenCache::new());
+    assert!(remote.capabilities().await.is_err());
+    assert!(remote.capabilities().await.is_err());
     let seen = hits.lock().unwrap().clone();
     assert_eq!(
         seen,
-        vec![
-            "Bearer stale-token".to_string(),
-            "Bearer stale-token".to_string(),
-            "Bearer rotated-token".to_string(),
-        ],
-        "exactly one retry, with the re-read token"
+        vec!["Bearer explicit-but-wrong", "Bearer explicit-but-wrong"],
+        "no retry and no file token on an explicit-token client"
     );
+    assert!(!seen.iter().any(|h| h.contains("LOCAL-FILE-SECRET")));
+}
+
+/// prA N1 (replacement): a stale local file never replaces a correct
+/// explicit token, even after a transient 401.
+#[tokio::test]
+#[serial_test::serial]
+async fn stale_local_file_never_replaces_a_correct_explicit_token() {
+    let home = install_store();
+    std::fs::write(home.path().join("auth-broker.token"), "stale-file-token\n").unwrap();
+    let (base, hits) = recording_broker("correct-token", 1).await;
+    let remote = RemoteBroker::new(&base, "correct-token", reqwest::Client::new(), TokenCache::new());
+    assert!(remote.capabilities().await.is_err(), "transient 401");
+    assert!(remote.capabilities().await.is_ok(), "still the correct token");
+    let seen = hits.lock().unwrap().clone();
+    assert_eq!(seen, vec!["Bearer correct-token", "Bearer correct-token"]);
 }
