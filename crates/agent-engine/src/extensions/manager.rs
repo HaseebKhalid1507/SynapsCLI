@@ -931,8 +931,38 @@ impl ExtensionManager {
     /// `SYNAPS_*` host namespace except this extension's own scoped override.
     /// Third-party secrets an extension legitimately needs (`GITHUB_TOKEN`,
     /// and friends) are unaffected.
+    ///
+    /// The credential set is derived from the provider registries (every
+    /// `env_vars` entry of the broker's static table and the engine catalog)
+    /// plus the credential sources read outside those tables, with the
+    /// original hand-written list kept as a floor. Drift tests below fail if a
+    /// registered or hand-read credential env var is not covered.
     fn denied_secret_env(var: &str, id: &str) -> Option<&'static str> {
-        const HOST_CREDENTIALS: &[&str] = &[
+        let up = var.trim().to_ascii_uppercase();
+        if up.is_empty() {
+            return Some("secret_env must not be empty");
+        }
+        let own_prefix = format!(
+            "SYNAPS_EXTENSION_{}_",
+            id.replace('-', "_").to_ascii_uppercase()
+        );
+        if up.starts_with("SYNAPS_") && !up.starts_with(&own_prefix) {
+            return Some(
+                "SYNAPS_* is the host namespace; declare your own SYNAPS_EXTENSION_<ID>_<KEY> variable instead",
+            );
+        }
+        if Self::is_host_credential_env(&up) {
+            return Some(
+                "that variable holds a host credential; extensions are never handed the host's own provider keys",
+            );
+        }
+        None
+    }
+
+    /// `up` must already be trimmed and upper-cased.
+    fn is_host_credential_env(up: &str) -> bool {
+        // Floor: the original #207 list. Never shrink it.
+        const FLOOR: &[&str] = &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
@@ -945,25 +975,25 @@ impl ExtensionManager {
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
         ];
-        let up = var.trim().to_ascii_uppercase();
-        if up.is_empty() {
-            return Some("secret_env must not be empty");
-        }
-        if HOST_CREDENTIALS.contains(&up.as_str()) {
-            return Some(
-                "that variable holds a host credential; extensions are never handed the host's own provider keys",
-            );
-        }
-        let own_prefix = format!(
-            "SYNAPS_EXTENSION_{}_",
-            id.replace('-', "_").to_ascii_uppercase()
-        );
-        if up.starts_with("SYNAPS_") && !up.starts_with(&own_prefix) {
-            return Some(
-                "SYNAPS_* is the host namespace; declare your own SYNAPS_EXTENSION_<ID>_<KEY> variable instead",
-            );
-        }
-        None
+        // Credential sources that are not rows in a provider registry.
+        // (`SYNAPS_*` entries are also caught by the namespace rule; they are
+        // listed so relaxing that rule can never expose them.)
+        const OTHER_SOURCES: &[&str] = &[
+            agent_core::auth::muse::API_KEY_ENV,
+            "LOCAL_API_KEY",
+            "OPENAI_CODEX_ACCESS_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "SYNAPS_MACHINE_TOKEN",
+            "SYNAPS_BROKER_TOKEN",
+        ];
+        FLOOR.contains(&up)
+            || OTHER_SOURCES.contains(&up)
+            || agent_core::auth::static_providers::STATIC_PROVIDERS
+                .iter()
+                .any(|s| s.env_vars.contains(&up))
+            || crate::runtime::openai::registry::providers()
+                .iter()
+                .any(|s| s.env_vars.contains(&up))
     }
 
     fn resolve_config(
@@ -2903,6 +2933,97 @@ mod secret_env_allowlist_tests {
                 "{var} should be allowed"
             );
         }
+    }
+
+    /// 01 I1: the denylist is built from the provider registries, so a new
+    /// provider (or credential source) cannot drift out of it.
+    #[test]
+    fn every_registered_provider_env_var_is_denied() {
+        let mut vars: Vec<&str> = Vec::new();
+        for spec in agent_core::auth::static_providers::STATIC_PROVIDERS {
+            vars.extend(spec.env_vars.iter().copied());
+        }
+        for spec in crate::runtime::openai::registry::providers() {
+            vars.extend(spec.env_vars.iter().copied());
+        }
+        vars.extend([
+            agent_core::auth::muse::API_KEY_ENV,
+            "META_API_KEY",
+            "KIMI_API_KEY",
+            "MOONSHOT_API_KEY",
+            "OPENAI_CODEX_ACCESS_TOKEN",
+            "LOCAL_API_KEY",
+            "TOGETHER_API_KEY",
+            "CEREBRAS_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+        ]);
+        assert!(vars.len() > 20, "registry walk found too few vars");
+        for var in vars {
+            let reason = ExtensionManager::denied_secret_env(var, "some-ext")
+                .unwrap_or_else(|| panic!("{var} must be denied as secret_env"));
+            assert!(reason.contains("host credential"), "{var}: {reason}");
+        }
+    }
+
+    /// Drift guard for credential env vars read by hand rather than through
+    /// a registry: scan the auth/config sources for `env::var("…")` literals
+    /// and `*_ENV: &str = "…"` consts whose names look like secrets, and
+    /// require every one to be refused. `SYNAPS_*` names are refused by the
+    /// namespace rule, which is fine.
+    #[test]
+    fn credential_env_reads_in_auth_sources_are_denied() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in [
+            "crates/agent-core/src/core/auth",
+            "crates/agent-engine/src/runtime",
+            "crates/agent-engine/src/runtime/openai",
+        ] {
+            for e in std::fs::read_dir(root.join(dir)).unwrap() {
+                let p = e.unwrap().path();
+                if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        files.push(root.join("crates/agent-core/src/core/config.rs"));
+        files.push(root.join("src/cmd/auth_broker.rs"));
+
+        fn quoted_after<'a>(s: &'a str, pat: &str) -> Vec<&'a str> {
+            let mut out = Vec::new();
+            let mut rest = s;
+            while let Some(i) = rest.find(pat) {
+                rest = &rest[i + pat.len()..];
+                if let Some(end) = rest.find('"') {
+                    out.push(&rest[..end]);
+                }
+            }
+            out
+        }
+
+        let mut seen = 0;
+        for f in files {
+            let src = std::fs::read_to_string(&f).unwrap();
+            let mut names = quoted_after(&src, "env::var(\"");
+            names.extend(quoted_after(&src, "env::var_os(\""));
+            names.extend(quoted_after(&src, "_ENV: &str = \""));
+            for name in names {
+                let up = name.to_ascii_uppercase();
+                let looks_secret = ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+                    .iter()
+                    .any(|w| up.contains(w));
+                if !looks_secret || up.is_empty() {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    ExtensionManager::denied_secret_env(name, "some-ext").is_some(),
+                    "{} reads credential env var {name}, which extensions may still request via secret_env",
+                    f.display()
+                );
+            }
+        }
+        assert!(seen > 0, "source scan matched nothing; the patterns rotted");
     }
 
     #[test]
