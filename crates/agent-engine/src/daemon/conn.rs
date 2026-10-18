@@ -23,6 +23,50 @@ use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How many distinct differing client versions one daemon image notes at
+/// info; later ones (and repeats) go to debug.
+const CLIENT_VERSION_NOTES_MAX: usize = 32;
+
+/// Client versions this daemon image has already noted at info. A reload
+/// execs a fresh image, which starts empty. Kept as hashes, so the memory
+/// is bounded whatever a client sends.
+static CLIENT_VERSION_NOTES: std::sync::Mutex<ClientVersionNotes> =
+    std::sync::Mutex::new(ClientVersionNotes { seen: Vec::new() });
+
+struct ClientVersionNotes {
+    seen: Vec<u64>,
+}
+
+impl ClientVersionNotes {
+    /// True the first time `client` is seen, while the set has room.
+    fn first_sight(&mut self, client: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        client.hash(&mut hasher);
+        let key = hasher.finish();
+        if self.seen.contains(&key) || self.seen.len() >= CLIENT_VERSION_NOTES_MAX {
+            return false;
+        }
+        self.seen.push(key);
+        true
+    }
+}
+
+/// A client on the same protocol but another binary version is allowed.
+/// Say so once per distinct version (clients may reconnect many times a
+/// minute), then at debug.
+fn note_client_version(notes: &std::sync::Mutex<ClientVersionNotes>, client: &str, daemon: &str) {
+    if client == daemon {
+        return;
+    }
+    let first = notes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).first_sight(client);
+    if first {
+        tracing::info!(client = %client, daemon = %daemon, "daemon: client binary version differs (same protocol; allowed)");
+    } else {
+        tracing::debug!(client = %client, daemon = %daemon, "daemon: client binary version differs (same protocol; allowed)");
+    }
+}
+
 type Reader = BufReader<OwnedReadHalf>;
 
 /// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
@@ -197,9 +241,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         return;
     }
     let daemon_version = binary_version();
-    if hello.client_version != daemon_version {
-        tracing::info!(client = %hello.client_version, daemon = %daemon_version, "daemon: client binary version differs (same protocol; allowed)");
-    }
+    note_client_version(&CLIENT_VERSION_NOTES, &hello.client_version, &daemon_version);
     // Per connection, from this Hello only (a reconnect after a reload
     // brings its own).
     let accepted = AcceptedEvents::negotiate(&hello.accepted_events);
@@ -820,5 +862,50 @@ mod tests {
         assert!(refused_while_draining(&SessionCommand::Resume { id: 1, query: "q".into() }));
         assert!(!refused_while_draining(&SessionCommand::Steer { text: "x".into() }));
         assert!(!refused_while_draining(&SessionCommand::Cancel));
+    }
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A reconnecting client on another binary version is noted at info once
+    /// per version, then at debug; the set of noted versions is bounded.
+    #[test]
+    fn a_differing_client_version_is_noted_once_per_version_and_the_notes_are_bounded() {
+        let notes = std::sync::Mutex::new(ClientVersionNotes { seen: Vec::new() });
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                note_client_version(&notes, "0.10.1", "0.10.2");
+            }
+            note_client_version(&notes, "0.10.2", "0.10.2");
+            for n in 0..CLIENT_VERSION_NOTES_MAX {
+                note_client_version(&notes, &format!("9.9.{n}"), "0.10.2");
+            }
+        });
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let level = |l: &str| out.lines().filter(|line| line.contains(l) && line.contains("client binary version differs")).count();
+        // 0.10.1 once, then 31 of the 32 new ones: the cap is 32 versions.
+        assert_eq!(level("INFO"), CLIENT_VERSION_NOTES_MAX, "{out}");
+        assert_eq!(level("DEBUG"), 2 + 1, "{out}");
+        assert!(out.lines().filter(|l| l.contains("INFO")).all(|l| l.contains("client=0.10.1") || l.contains("client=9.9.")), "{out}");
+        assert!(out.lines().any(|l| l.contains("DEBUG") && l.contains("client=9.9.31")), "the version past the cap goes to debug: {out}");
+        assert!(!out.contains("client=0.10.2"), "the same version is never noted: {out}");
+        assert_eq!(notes.lock().unwrap().seen.len(), CLIENT_VERSION_NOTES_MAX);
     }
 }
