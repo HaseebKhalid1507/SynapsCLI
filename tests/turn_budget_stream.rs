@@ -384,10 +384,15 @@ fn per_role_defaults_and_auto_turn_composition() {
     let fg = TurnBudget::for_role(TurnRole::Foreground);
     let auto = TurnBudget::for_role(TurnRole::Autonomous);
     let worker = TurnBudget::for_role(TurnRole::Worker);
+    // Interactive turns are unlimited by default (#219); unattended
+    // autonomous turns and workers keep finite round caps.
+    assert_eq!(fg.max_provider_rounds, None);
+    assert_eq!(fg.max_tool_calls, None);
+    assert_eq!(fg.max_accumulated_tool_result_bytes, None);
+    assert_eq!(auto.max_provider_rounds, Some(24));
+    assert_eq!(auto.max_tool_calls, Some(96));
+    assert_eq!(worker.max_provider_rounds, Some(64));
     for budget in [&fg, &auto, &worker] {
-        assert_eq!(budget.max_provider_rounds, None);
-        assert_eq!(budget.max_tool_calls, None);
-        assert_eq!(budget.max_accumulated_tool_result_bytes, None);
         assert_eq!(budget.max_elapsed, None);
     }
     assert!(fg.max_context_tokens.is_none() && fg.max_cost_usd.is_none());

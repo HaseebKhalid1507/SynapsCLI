@@ -6,14 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **Turns have no round, tool-call or tool-result-byte limit by default.**
-  Every role used to stop a turn at a compiled cap (foreground 128 rounds /
-  512 tool calls / 32 MiB of tool results; worker 64 / 256 / 16 MiB;
-  autonomous 24 / 96 / 8 MiB), even while it was making progress. A limit
-  now applies only when configured: `turn_budget.<role>.max_provider_rounds`,
-  `max_tool_calls` or `max_accumulated_tool_result_bytes` = N (`0` also
-  means no limit). Round renewals apply only once a round limit is set.
-  `/budget status` shows `off` for an unset limit.
+- **Interactive turns have no round, tool-call or tool-result-byte limit by
+  default.** Foreground turns used to stop at a compiled cap (128 rounds /
+  512 tool calls / 32 MiB of tool results) even while they were making
+  progress. A limit now applies only when configured:
+  `turn_budget.foreground.max_provider_rounds`, `max_tool_calls` or
+  `max_accumulated_tool_result_bytes` = N. `/budget status` shows `off` for
+  an unset limit. Unattended roles stay bounded by default: autonomous
+  (watcher) turns stop at 24 rounds / 96 tool calls / 8 MiB, and subagent
+  workers at 64 rounds x (1 + 2 renewals) = 192 rounds (their tool-call and
+  tool-result-byte limits are off). Override per role under
+  `turn_budget.autonomous.*` / `turn_budget.worker.*`.
 
 ### Upgrade notes
 

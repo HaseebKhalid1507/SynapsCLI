@@ -246,7 +246,9 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Bind notes independently of worker settings and memory-context consent.
     runtime.apply_memory_backend_config(&synaps_cli::config::load_config().memory_backend);
     // Task 23: headless autonomous workers run under the AUTONOMOUS turn
-    // budget (typed config overrides applied) — the tightest role.
+    // budget (typed config overrides applied) — the tightest role, finite by
+    // default (24 rounds / 96 tool calls / 8 MiB per turn). The session
+    // limits below are also enforced mid-turn by cancelling the stream.
     runtime.set_turn_budget(synaps_cli::runtime::budget::TurnBudget::from_config(
         synaps_cli::runtime::budget::TurnRole::Autonomous,
         &synaps_cli::config::load_config().turn_budgets,

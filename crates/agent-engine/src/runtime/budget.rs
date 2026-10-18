@@ -18,23 +18,23 @@ use agent_core::BudgetDimension;
 /// Per-turn limits (spec §8.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnBudget {
-    /// Provider rounds per turn (per renewal). `None` (the default for every
-    /// role) means no limit. Opt in with `turn_budget.<role>.max_provider_rounds`
-    /// (`0` also means no limit).
+    /// Provider rounds per turn (per renewal). `None` means no limit — the
+    /// foreground default. Autonomous (24) and worker (64, x3 with renewals)
+    /// turns are bounded by default. Set with
+    /// `turn_budget.<role>.max_provider_rounds`.
     pub max_provider_rounds: Option<u32>,
-    /// Tool calls per turn. `None` (the default for every role) means no
-    /// limit. Opt in with `turn_budget.<role>.max_tool_calls` (`0` also means
-    /// no limit).
+    /// Tool calls per turn. `None` means no limit — the foreground and worker
+    /// default; autonomous turns default to 96. Set with
+    /// `turn_budget.<role>.max_tool_calls`.
     pub max_tool_calls: Option<u32>,
     /// Wall-clock limit for one turn. `None` (the default for every role)
     /// means no limit: a turn that is still making progress is never cut off
     /// for taking long. Opt in with `turn_budget.<role>.max_elapsed_secs` or
     /// `/budget time`.
     pub max_elapsed: Option<Duration>,
-    /// Accumulated tool-result bytes per turn. `None` (the default for every
-    /// role) means no limit. Opt in with
-    /// `turn_budget.<role>.max_accumulated_tool_result_bytes` (`0` also means
-    /// no limit).
+    /// Accumulated tool-result bytes per turn. `None` means no limit — the
+    /// foreground and worker default; autonomous turns default to 8 MiB. Set
+    /// with `turn_budget.<role>.max_accumulated_tool_result_bytes`.
     pub max_accumulated_tool_result_bytes: Option<usize>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
@@ -59,11 +59,13 @@ pub enum TurnRole {
 }
 
 impl TurnBudget {
-    /// Compiled per-role defaults. No role limits rounds, tool calls,
-    /// tool-result bytes or wall-clock unless configured. Roles differ only in
-    /// round renewals, which apply once a round cap is configured: foreground
-    /// is the most generous (a human is watching), autonomous has none
-    /// (nobody is), workers sit between.
+    /// Compiled per-role defaults. No role has a wall-clock limit unless
+    /// configured. Foreground (a human is watching and can interrupt) has no
+    /// round, tool-call or tool-result-byte limit either. Unattended roles
+    /// stay bounded: an autonomous/watcher turn hard-stops at 24 rounds / 96
+    /// tool calls / 8 MiB (its session cost/token limits are only checked
+    /// between turns), and a worker stops after 64 rounds x (1 + 2 renewals)
+    /// = 192 rounds (a `timeout: 0` worker has no other bound).
     pub fn for_role(role: TurnRole) -> Self {
         match role {
             TurnRole::Foreground => Self {
@@ -78,24 +80,25 @@ impl TurnBudget {
                 max_round_renewals: 8,
             },
             TurnRole::Autonomous => Self {
-                max_provider_rounds: None,
-                max_tool_calls: None,
+                max_provider_rounds: Some(24),
+                max_tool_calls: Some(96),
                 max_elapsed: None,
-                max_accumulated_tool_result_bytes: None,
+                max_accumulated_tool_result_bytes: Some(8 * 1024 * 1024),
                 max_context_tokens: None,
                 max_cost_usd: None,
-                // Nobody is watching: no graceful extension — a configured
-                // round cap is a hard stop.
+                // Nobody is watching: no graceful extension — the round cap
+                // is a hard stop.
                 max_round_renewals: 0,
             },
             TurnRole::Worker => Self {
-                max_provider_rounds: None,
+                max_provider_rounds: Some(64),
                 max_tool_calls: None,
                 max_elapsed: None,
                 max_accumulated_tool_result_bytes: None,
                 max_context_tokens: None,
                 max_cost_usd: None,
-                // Bounded delegation under a supervising turn.
+                // Bounded delegation under a supervising turn: 64 x (1 + 2)
+                // = 192 rounds.
                 max_round_renewals: 2,
             },
         }
@@ -516,16 +519,17 @@ mod tests {
     }
 
     #[test]
-    fn role_defaults_are_unlimited_and_typed() {
+    fn role_defaults_are_typed_and_only_foreground_is_unlimited() {
         let fg = TurnBudget::for_role(TurnRole::Foreground);
         let auto = TurnBudget::for_role(TurnRole::Autonomous);
         let worker = TurnBudget::for_role(TurnRole::Worker);
-        // No role has a round, tool-call, tool-result-byte or wall-clock
-        // limit unless one is configured.
+        // Interactive turns have no round, tool-call or tool-result-byte
+        // limit unless one is configured (#219).
+        assert_eq!(fg.max_provider_rounds, None);
+        assert_eq!(fg.max_tool_calls, None);
+        assert_eq!(fg.max_accumulated_tool_result_bytes, None);
+        // No role has a wall-clock limit unless one is configured.
         for budget in [&fg, &auto, &worker] {
-            assert_eq!(budget.max_provider_rounds, None);
-            assert_eq!(budget.max_tool_calls, None);
-            assert_eq!(budget.max_accumulated_tool_result_bytes, None);
             assert_eq!(budget.max_elapsed, None);
             assert!(!budget.has_time_limit());
         }
@@ -536,6 +540,51 @@ mod tests {
         assert_eq!(auto.max_round_renewals, 0);
         assert!(worker.max_round_renewals > 0);
         assert!(fg.max_round_renewals >= worker.max_round_renewals);
+    }
+
+    #[test]
+    fn autonomous_role_keeps_finite_per_turn_defaults() {
+        // Nobody watches a watcher turn and its session limits are checked
+        // between turns, so one turn must stay bounded by default.
+        let auto = TurnBudget::for_role(TurnRole::Autonomous);
+        assert_eq!(auto.max_provider_rounds, Some(24));
+        assert_eq!(auto.max_tool_calls, Some(96));
+        assert_eq!(
+            auto.max_accumulated_tool_result_bytes,
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(auto.max_round_renewals, 0);
+
+        let mut meter = TurnBudgetMeter::new(auto);
+        for _ in 0..24 {
+            assert_eq!(meter.begin_round(), Ok(()));
+        }
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
+        assert_eq!(meter.try_renew_rounds(), None);
+        assert_eq!(meter.remaining_tool_calls(), 96);
+    }
+
+    #[test]
+    fn worker_role_keeps_a_finite_round_cap_of_192() {
+        // 64 rounds per allowance x (1 + 2 renewals) = the pre-#219 cap.
+        let worker = TurnBudget::for_role(TurnRole::Worker);
+        assert_eq!(worker.max_provider_rounds, Some(64));
+        assert_eq!(worker.max_round_renewals, 2);
+        let mut meter = TurnBudgetMeter::new(worker);
+        let mut rounds = 0u32;
+        loop {
+            match meter.begin_round() {
+                Ok(()) => rounds += 1,
+                Err(BudgetDimension::ProviderRounds) => {
+                    if meter.try_renew_rounds().is_none() {
+                        break;
+                    }
+                }
+                Err(other) => panic!("unexpected dimension {other:?}"),
+            }
+            assert!(rounds <= 10_000, "worker round cap must be finite");
+        }
+        assert_eq!(rounds, 192);
     }
 
     #[test]
@@ -642,8 +691,17 @@ mod tests {
 
     #[test]
     fn an_unlimited_meter_never_exhausts_but_still_counts() {
-        for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
-            let mut meter = TurnBudgetMeter::new(TurnBudget::for_role(role));
+        let mut unlimited = agent_core::config::TurnBudgetsConfig::default();
+        unlimited.autonomous.max_provider_rounds = Some(0);
+        unlimited.autonomous.max_tool_calls = Some(0);
+        unlimited.autonomous.max_accumulated_tool_result_bytes = Some(0);
+        unlimited.worker.max_provider_rounds = Some(0);
+        for budget in [
+            TurnBudget::for_role(TurnRole::Foreground),
+            TurnBudget::from_config(TurnRole::Autonomous, &unlimited),
+            TurnBudget::from_config(TurnRole::Worker, &unlimited),
+        ] {
+            let mut meter = TurnBudgetMeter::new(budget);
             for _ in 0..10_000 {
                 assert_eq!(meter.begin_round(), Ok(()));
                 assert_eq!(meter.remaining_tool_calls(), u32::MAX);

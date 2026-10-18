@@ -922,13 +922,18 @@ fn delegation_depth_is_bounded_before_dispatch() {
 }
 
 #[test]
-fn role_defaults_are_unlimited_for_every_role() {
-    for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+fn role_defaults_unlimited_only_for_foreground() {
+    // Interactive turns: every per-turn limit is opt-in (off by default).
+    let fg = TurnBudget::for_role(TurnRole::Foreground);
+    assert_eq!(fg.max_provider_rounds, None);
+    assert_eq!(fg.max_tool_calls, None);
+    assert_eq!(fg.max_accumulated_tool_result_bytes, None);
+    // Unattended roles keep a finite round cap.
+    for role in [TurnRole::Autonomous, TurnRole::Worker] {
         let budget = TurnBudget::for_role(role);
-        // Every per-turn limit is opt-in (off by default).
-        assert_eq!(budget.max_provider_rounds, None);
-        assert_eq!(budget.max_tool_calls, None);
-        assert_eq!(budget.max_accumulated_tool_result_bytes, None);
-        assert_eq!(budget.max_elapsed, None);
+        assert!(budget.max_provider_rounds.is_some_and(|r| r > 0));
+    }
+    for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+        assert_eq!(TurnBudget::for_role(role).max_elapsed, None);
     }
 }

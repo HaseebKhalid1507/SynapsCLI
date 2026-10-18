@@ -816,9 +816,11 @@ impl StreamMethods {
             // exhaustion is a soft checkpoint, not a turn-ending failure —
             // long, legitimate agentic tasks would otherwise die mid-flight.
             // Renew the round allowance a bounded number of times and keep
-            // going; wall-clock (re-checked by begin_round) and the finite
-            // renewal cap still bound any true runaway. Every other dimension
-            // remains a hard stop.
+            // going; the renewal cap bounds rounds only when a round cap is
+            // set. Foreground turns have none by default (a human can
+            // interrupt); autonomous and worker turns do, and a configured
+            // wall-clock (re-checked by begin_round) bounds any role. Every
+            // other dimension remains a hard stop.
             //
             // Context-aware time checkpoints: when context management is
             // enabled, a wall-clock expiry doesn't immediately kill the turn —
