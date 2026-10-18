@@ -229,6 +229,12 @@ pub enum UsedPercent {
     Unknown { reason: String },
 }
 
+/// Largest reported percentage still read as "window overrun" (exhausted)
+/// rather than garbage. Above 10x the value is more likely a unit error
+/// (basis points, a raw counter) than a real overrun, so it stays unknown;
+/// both fail closed. Shared with `quota_policy::WindowLimit::verdict`.
+pub const OVERRUN_PERCENT_MAX: f64 = 1000.0;
+
 impl UsedPercent {
     pub fn valid(&self) -> Option<f64> {
         match self {
@@ -244,10 +250,14 @@ impl UsedPercent {
             reason: reason.to_string(),
         }
     }
-    /// Validate a candidate percentage.
+    /// Validate a candidate percentage. An overrun window (`100 < v <= 1000`,
+    /// e.g. Anthropic reporting 250% on a spent window) is clamped to 100 so it
+    /// classifies as exhausted; negative or absurd values stay unknown.
     pub fn from_f64(value: f64) -> Self {
         if !value.is_finite() {
             Self::unknown("not a number")
+        } else if value > 100.0 && value <= OVERRUN_PERCENT_MAX {
+            Self::Valid { percent: 100.0 }
         } else if !(0.0..=100.0).contains(&value) {
             Self::unknown("out of range")
         } else {
@@ -1706,7 +1716,12 @@ mod tests {
     fn used_percent_validation() {
         assert_eq!(UsedPercent::from_f64(0.0).valid(), Some(0.0));
         assert_eq!(UsedPercent::from_f64(100.0).valid(), Some(100.0));
-        assert_eq!(UsedPercent::from_f64(100.5), UsedPercent::unknown("out of range"));
+        // An overrun window (> 100) is spent, not unknown: clamp to 100 so
+        // it reads and classifies as exhausted. Absurd values stay unknown.
+        assert_eq!(UsedPercent::from_f64(100.5).valid(), Some(100.0));
+        assert_eq!(UsedPercent::from_f64(250.0).valid(), Some(100.0));
+        assert_eq!(UsedPercent::from_f64(1000.0).valid(), Some(100.0));
+        assert_eq!(UsedPercent::from_f64(1000.5), UsedPercent::unknown("out of range"));
         assert_eq!(UsedPercent::from_f64(-0.1), UsedPercent::unknown("out of range"));
         assert_eq!(UsedPercent::from_f64(f64::NAN), UsedPercent::unknown("not a number"));
         assert_eq!(UsedPercent::from_f64(f64::INFINITY), UsedPercent::unknown("not a number"));
@@ -1812,16 +1827,19 @@ mod tests {
         assert_eq!(sonnet.reset_at, None);
         assert!(s.notes.iter().any(|n| n == "reset timestamp unparseable"));
         let opus = s.window("seven_day_opus").unwrap();
-        assert_eq!(opus.used_percent, UsedPercent::unknown("out of range"));
+        assert_eq!(opus.used_percent.valid(), Some(100.0), "overrun is exhausted");
         assert_eq!(opus.reset_at, Some(T0), "unix seconds accepted");
         assert_eq!(s.window("one_day").unwrap().duration_secs, Some(86400));
         assert_eq!(s.window("one_day").unwrap().used_percent, UsedPercent::unknown("out of range"));
         // Unknown is not capacity.
         assert!(!s.has_proven_capacity(T0, 60_000));
-        assert!(s
-            .model_availability
-            .iter()
-            .all(|m| m.availability == Availability::Unknown));
+        // The overrun opus window is exhausted; the unparseable rest is unknown.
+        assert!(s.model_availability.iter().all(|m| m.availability
+            == if m.model.contains("opus") {
+                Availability::Exhausted
+            } else {
+                Availability::Unknown
+            }));
         // Notes never carry raw values.
         secret_free(&format!("{:?}", s.notes), &["lots", "yesterday"]);
     }
@@ -1969,7 +1987,7 @@ mod tests {
         assert_eq!(p.duration_secs, None);
         assert_eq!(p.label, "unknown");
         assert_eq!(p.reset_at, None);
-        assert_eq!(s.window("secondary").unwrap().used_percent, UsedPercent::unknown("out of range"));
+        assert_eq!(s.window("secondary").unwrap().used_percent.valid(), Some(100.0));
         assert_eq!(s.limit_reached, None);
         assert!(s.banked_resets.is_none());
         assert_eq!(s.credits.as_ref().unwrap().has_credits, None);
@@ -2229,8 +2247,11 @@ mod tests {
         let w = s.window("credits").unwrap();
         assert_eq!(w.used_percent, UsedPercent::unknown("missing"));
         assert!(!s.has_proven_capacity(T0, 60_000));
-        // Out-of-range percent stays unknown.
+        // An overrun percent is exhausted, not unknown.
         let s = parse_grok_billing(r#"{"config": {"creditUsagePercent": 140}}"#, "x", T0).unwrap();
+        assert_eq!(s.window("credits").unwrap().used_percent.valid(), Some(100.0));
+        // Negative stays unknown.
+        let s = parse_grok_billing(r#"{"config": {"creditUsagePercent": -5}}"#, "x", T0).unwrap();
         assert_eq!(s.window("credits").unwrap().used_percent, UsedPercent::unknown("out of range"));
         // Zero cap → limit is zero.
         let s = parse_grok_billing(r#"{"onDemandUsed": {"val": 0}, "onDemandCap": {"val": 0}}"#, "x", T0).unwrap();

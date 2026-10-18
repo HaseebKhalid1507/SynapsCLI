@@ -207,12 +207,38 @@ async fn send_with_retries(
                         }
                         Codex429::Generic => {}
                     }
+                } else if quota_probe && !retryable && status.is_client_error() {
+                    // Codex only: a terminal 4xx is undiagnosable without its
+                    // body. Read a bounded slice for classification; keep only
+                    // identifier-shaped type/code/param plus Synaps-authored
+                    // text (codex_wire). Provider prose is never kept (§5.1).
+                    let body = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            trace_attempt.finish_canceled(Some(status.as_u16()), None);
+                            return Err("request canceled".into());
+                        }
+                        body = read_body_for_classification(resp, super::codex_wire::CODEX_ERROR_BODY_CAP) => body,
+                    };
+                    let detail = super::codex_wire::CodexHttpErrorDetail::from_body(&body);
+                    let message = detail.user_message(label, status);
+                    tracing::warn!(error = %message, "{label} request rejected (identifiers only)");
+                    trace_attempt.finish_failed(
+                        &detail.trace_code(status.as_u16()),
+                        Some(status.as_u16()),
+                        trace_rid,
+                    );
+                    return Err(Box::new(super::codex_wire::CodexRequestRejected {
+                        message,
+                        detail,
+                    }));
                 } else {
                     // Privacy (spec §5.1): the response body is provider-controlled
                     // and may echo the full request (prompts, system text, tool
                     // schemas, credentials). Drop it unread — it must never be
                     // stored, surfaced, or logged at any level. `status` Display
-                    // uses the canonical reason phrase, never server bytes.
+                    // uses the canonical reason phrase, never server bytes. (The
+                    // Codex 4xx arm above reads it for identifiers only.)
                     drop(resp);
                 }
                 let code = format!("http_{}", status.as_u16());
@@ -789,15 +815,22 @@ pub(crate) async fn call_codex_stream_with_router(
     let mut account_id = codex_account_id_for(&pinned)?;
 
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
-    // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH). OpenAI runs
-    // the search server-side; nothing executes locally, so the local tool
-    // guard / command-exec gate are not involved. Off unless configured.
+    // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH, read from THIS
+    // process's env — the daemon's when attached). Runs server-side, so hooks
+    // can't gate it; gated by role and model (codex_wire). The session actor
+    // announces the state; each call is announced by the decoder.
     let mut tools = tools;
-    if let Some(web_search) =
-        codex_web_search_tool(std::env::var(CODEX_WEB_SEARCH_ENV).ok().as_deref())
-    {
-        tools.push(web_search);
-    }
+    let web_search = super::codex_wire::codex_web_search_for_request(
+        &cfg.model,
+        codex_request_role,
+        super::codex_wire::engine_env,
+    );
+    // web_search is always the last tool. Cleared on the one resend without
+    // it, so that resend can't loop; the rejection is learned only if the
+    // resend then succeeds (`web_search_pending`).
+    let mut web_search_index = web_search.as_ref().map(|_| tools.len());
+    let mut web_search_pending = false;
+    tools.extend(web_search);
     // Codex already receives the effective system prompt in `instructions`.
     // Do not also prepend it to `input`: that doubles prompt tokens and repeats
     // context/checkpoint guidance. Pass history to the translator unchanged;
@@ -813,7 +846,7 @@ pub(crate) async fn call_codex_stream_with_router(
     let prompt_cache_key = codex_prompt_cache_key(&instructions, input_items.first());
     insert_codex_multi_agent_mode(&mut input_items, &plan);
     let input = serde_json::Value::Array(input_items);
-    let body = build_codex_body(
+    let mut body = build_codex_body(
         &cfg.model,
         &plan,
         input,
@@ -834,8 +867,10 @@ pub(crate) async fn call_codex_stream_with_router(
 
     // Serialize ONCE. These exact bytes are digested for the trace AND are
     // the request body of every attempt — retries resend the identical
-    // buffer, so one wire digest is honest for all attempt records.
-    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+    // buffer, so one wire digest is honest for all attempt records. The one
+    // exception (hosted web_search rejected) re-serializes and opens a new
+    // trace record for the new bytes.
+    let mut body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
     // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
     let tracer = tr::begin_openai_tracer(
         trace,
@@ -858,6 +893,9 @@ pub(crate) async fn call_codex_stream_with_router(
     if let Some(tracer) = &tracer {
         tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
+    // Whether this request holds a tracer (and, on a `/trace next` context,
+    // the one-shot gate): only then may a web_search resend reopen it.
+    let traced = tracer.is_some();
     let mut attempt = tr::StreamAttempt::new(tracer);
     let mut stream_retry = 0u32;
     // Account switches spent on this logical request. Bounded by
@@ -900,7 +938,12 @@ pub(crate) async fn call_codex_stream_with_router(
         )
         .await;
         let resp = match sent {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                if std::mem::take(&mut web_search_pending) {
+                    super::codex_wire::confirm_web_search_rejected(&cfg.model, tx);
+                }
+                resp
+            }
             Err(error) => match error.downcast::<super::account_routing::CodexQuotaExhausted>() {
                 // A 429 that proved exhaustion arrives before any response
                 // body was streamed: nothing was produced on this attempt, so
@@ -941,7 +984,39 @@ pub(crate) async fn call_codex_stream_with_router(
                         }
                     }
                 }
-                Err(other) => return Err(other),
+                Err(other) => {
+                    // A pre-inference 400 pointing at hosted web_search: drop
+                    // it, re-serialize, and resend once under a fresh trace
+                    // record (one-shot `/trace next` gates are reopened for
+                    // it; content capture is not redone).
+                    super::codex_wire::hosted_search_retry(
+                        other,
+                        &mut web_search_index,
+                        &cfg.model,
+                    )?;
+                    web_search_pending = true;
+                    super::codex_wire::strip_web_search_tool(&mut body);
+                    body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+                    if traced {
+                        trace.reopen_one_shot_for_resend();
+                    }
+                    attempt = tr::StreamAttempt::new(
+                        tr::begin_openai_tracer(
+                            trace,
+                            &cfg.provider,
+                            &cfg.model,
+                            crate::runtime::trace::TransportKind::OpenAiResponses,
+                            &url,
+                            Some(body_bytes.as_ref()),
+                            messages,
+                            system_prompt.as_deref(),
+                            tools_schema,
+                            tr::renamed_tool_losses(&name_map),
+                        )
+                        .await,
+                    );
+                    continue;
+                }
             },
         };
         // Direct HTTP: upstream status and provider request id are observed.
@@ -1206,8 +1281,8 @@ pub(crate) const CODEX_WEB_SEARCH_ENV: &str = "SYNAPS_CODEX_WEB_SEARCH";
 /// - anything else (unset, `off`, typos) → no hosted tool.
 ///
 /// The hosted tool's `web_search_call` output items are not function calls:
-/// the Responses stream parser already ignores them (only `function_call`
-/// items become tool uses), and the model's answer text carries the cited URLs.
+/// they never become tool uses; each completed one is announced as a notice
+/// with its query (`codex_wire::announce_web_search_call`).
 pub(crate) fn codex_web_search_tool(value: Option<&str>) -> Option<Value> {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("live" | "on" | "true" | "1" | "yes") => Some(json!({ "type": "web_search" })),
@@ -1536,7 +1611,7 @@ fn parse_tool_arguments(raw: &str) -> Value {
 /// uppercase, whitespace, or symbols outside the identifier charset — or
 /// longer than 64 bytes — is replaced so free-text (which can echo request
 /// content) and secret-shaped tokens can never leak into the log stream.
-fn sanitize_error_identifier(raw: Option<&str>) -> &str {
+pub(crate) fn sanitize_error_identifier(raw: Option<&str>) -> &str {
     match raw {
         None => "absent",
         Some(s) => {
@@ -1859,6 +1934,7 @@ impl CodexSseDecoder {
                         .unwrap_or(0) as usize;
                     self.observe_message_item(idx, item);
                     self.backfill_message_suffix(idx, item, tx, text_acc);
+                    super::codex_wire::announce_web_search_call(self.provider_label, item, tx);
                     self.complete_tool_from_item(idx, item, tx);
                 }
             }
@@ -6762,6 +6838,90 @@ mod send_retry_tests {
         assert_no_banned(&msg, "the surfaced error");
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_no_banned(&logs, "tracing output");
+    }
+
+    /// Answer every request with `status` and a fixed body.
+    async fn spawn_fixed_body_provider(status: StatusCode, body: String) -> String {
+        let app = Router::new().fallback(move || {
+            let body = body.clone();
+            async move { (status, [("content-type", "application/json")], body).into_response() }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Codex 4xx: identifiers and Synaps-authored text only. Every probe is
+    /// plain prose that a quote/length/charset sanitizer lets through; none
+    /// of it may reach the error string, the net.rs classification log, or
+    /// any captured tracing output.
+    #[tokio::test]
+    async fn codex_4xx_never_surfaces_provider_prose_in_error_or_logs() {
+        const PROSE: &str = "ZZPROSE";
+        let probes = [
+            // Apostrophe flips naive quote parsing; the echo follows it.
+            "The model can't accept 'ZZPROSE echo of the user prompt, it's long' here".to_string(),
+            // Short quoted span with a secret.
+            format!("Invalid 'input[0]': '{PROSE} AKIAIOSFODNN7EXAMPLE pls'"),
+            // Unquoted prose echo.
+            format!("Your request about {PROSE} my private quarterly notes was rejected"),
+            // Curly / guillemet quotes.
+            format!("Bad value \u{2018}{PROSE} one\u{2019} and \u{201c}{PROSE} two\u{201d} \u{ab}x\u{bb}"),
+            // Secret glued to punctuation.
+            format!("{PROSE} key:sk-proj-abc123 password=hunter2 https://h/x?token=abc"),
+            // Bidi override and zero-width characters.
+            format!("{PROSE}\u{202e}gnirts\u{202c} s\u{200b}k-\u{2066}live\u{2069}"),
+        ];
+        for prose in probes {
+            let body = serde_json::json!({"error": {
+                "message": prose,
+                "type": "invalid_request_error",
+                "code": "unsupported_value",
+                "param": "reasoning.effort",
+            }})
+            .to_string();
+            let url = spawn_fixed_body_provider(StatusCode::BAD_REQUEST, body).await;
+            let client = reqwest::Client::new();
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+            let err = send_with_retries(
+                SendTarget {
+                    label: "codex",
+                    url: &url,
+                    quota_probe: true,
+                },
+                || client.post(&url).body("{}"),
+                &tokio_util::sync::CancellationToken::new(),
+                3,
+                &mut 0,
+                &mut tr::StreamAttempt::new(None),
+            )
+            .await
+            .expect_err("400 must fail fast");
+            // Run the error through the route classifier too: it logs.
+            let runtime =
+                super::super::net::provider_error_to_runtime_for("openai-codex/gpt-5.6-sol", err);
+            let msg = runtime.to_string();
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            for (where_, text) in [("error", &msg), ("logs", &logs)] {
+                for banned in [
+                    PROSE, "can't", "AKIA", "sk-", "hunter2", "token=", "private", "gnirts",
+                    "\u{202e}", "\u{200b}", "\u{2066}", "\u{2018}", "\u{201c}",
+                ] {
+                    assert!(
+                        !text.contains(banned),
+                        "provider prose `{banned}` leaked into {where_} for probe {prose:?}: {text}"
+                    );
+                }
+            }
+            // Identifiers and our own explanation do surface.
+            assert!(
+                msg.contains("[invalid_request_error/unsupported_value, param reasoning.effort]"),
+                "{msg}"
+            );
+            assert!(msg.contains("/effort"), "static explanation missing: {msg}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

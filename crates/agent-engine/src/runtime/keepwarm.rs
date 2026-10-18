@@ -329,13 +329,16 @@ pub(crate) fn classify_failure(err: &RuntimeError, status: u16) -> PingFailure {
         return PingFailure::Fatal(format!("HTTP {status}"));
     }
     match err {
-        RuntimeError::Api(_) | RuntimeError::ApiStatus(_) | RuntimeError::Timeout => {
-            PingFailure::Transient(if status == 0 {
-                "network".to_string()
-            } else {
-                format!("HTTP {status}")
-            })
-        }
+        // `NetworkTimeout` (upload/header deadline, stream idle) is a network
+        // blip like the `Api(timeout)` it replaced: back off, don't end the period.
+        RuntimeError::Api(_)
+        | RuntimeError::ApiStatus(_)
+        | RuntimeError::Timeout
+        | RuntimeError::NetworkTimeout(_) => PingFailure::Transient(if status == 0 {
+            "network".to_string()
+        } else {
+            format!("HTTP {status}")
+        }),
         other => PingFailure::Fatal(other.to_string()),
     }
 }
@@ -1532,6 +1535,20 @@ mod tests {
             classify_failure(&RuntimeError::Config("x".into()), 0),
             PingFailure::Fatal(_)
         ));
+    }
+
+    /// 3f2be9a3 split upload/header and stream-idle timeouts into
+    /// `NetworkTimeout`. A slow ping is a network blip: back off and retry,
+    /// never end the keep-warm period.
+    #[test]
+    fn network_timeout_is_transient() {
+        for msg in ["upload/header deadline", "stream idle"] {
+            assert_eq!(
+                classify_failure(&RuntimeError::NetworkTimeout(msg), 0),
+                PingFailure::Transient("network".to_string()),
+                "{msg}"
+            );
+        }
     }
 
     #[test]

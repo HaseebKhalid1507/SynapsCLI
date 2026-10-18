@@ -355,11 +355,13 @@ pub fn parse_muse_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String
             push_unique(&mut supported, effort);
         }
         let mut variant_levels = Vec::new();
-        for (name, variant) in meta.variants.unwrap_or_default() {
-            let effort = variant
-                .get("reasoningEffort")
-                .and_then(|e| e.as_str())
-                .unwrap_or(name.as_str());
+        // Only an explicit `reasoningEffort` counts. A preset's NAME may
+        // describe speed or a tool profile; treating `max` as an effort
+        // would authorize a wire value Meta can reject.
+        for variant in meta.variants.unwrap_or_default().into_values() {
+            let Some(effort) = variant.get("reasoningEffort").and_then(|e| e.as_str()) else {
+                continue;
+            };
             if let Some(level) = parse_muse_effort(effort.trim()) {
                 push_unique(&mut variant_levels, level);
             }
@@ -528,6 +530,29 @@ mod tests {
         assert_eq!(bad.reasoning, ReasoningSupport::Unknown);
         assert_eq!(bad.input_modalities, vec![Modality::Text]);
         assert_eq!(bad.context_tokens, None);
+    }
+
+    /// A preset's NAME is not an effort. `max` here is a speed/tool preset
+    /// with no `reasoningEffort`; counting it would authorize (and send)
+    /// `reasoning.effort:"max"`, which Meta can reject with a 400.
+    #[test]
+    fn variant_name_without_reasoning_effort_is_not_an_effort() {
+        let wire = r#"{"object":"list","data":[
+            {"id":"muse-preset-zz1","object":"model","metadata":{"muse-code":{
+              "variants":{"max":{"speed":"fast"},"high":{"tools":"minimal"},
+                          "careful":{"reasoningEffort":"medium"}}}}},
+            {"id":"muse-preset-zz2","object":"model","metadata":{"muse-code":{
+              "variants":{"high":{},"low":{"temperature":0.1}}}}}
+        ]}"#;
+        let models = parse_muse_catalog_models(wire).unwrap();
+        assert_eq!(
+            models[0].reasoning,
+            ReasoningSupport::NamedEffort {
+                supported: vec![ReasoningLevel::Medium],
+                default_level: None,
+            }
+        );
+        assert_eq!(models[1].reasoning, ReasoningSupport::Unknown);
     }
 
     #[test]

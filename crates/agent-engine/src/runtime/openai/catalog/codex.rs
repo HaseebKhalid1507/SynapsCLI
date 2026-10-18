@@ -742,6 +742,26 @@ mod tests {
     const FIXTURE: &str = include_str!("fixtures/openai_codex_models.json");
 
     #[test]
+    fn catalog_rows_never_gate_hosted_web_search() {
+        use crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason as reason;
+        // Real row shape (2026-10 live cache). `use_responses_lite` is
+        // upstream's request-format switch and `supports_search_tool` is
+        // tool_search; Synaps sends full Responses requests, so neither keeps
+        // hosted web_search off (only spark and a learned rejection do).
+        let body = r#"{"models":[
+            {"slug":"gpt-zz-live-lite","visibility":"list","use_responses_lite":true,
+             "supports_search_tool":true,"web_search_tool_type":"text_and_image"},
+            {"slug":"gpt-zz-live-full","visibility":"list","use_responses_lite":false,
+             "supports_search_tool":false,"web_search_tool_type":"text"},
+            {"slug":"gpt-zz-live-silent","visibility":"list"}
+        ]}"#;
+        assert_eq!(parse_codex_catalog_models(body).unwrap().len(), 3);
+        assert_eq!(reason("gpt-zz-live-lite"), None);
+        assert_eq!(reason("gpt-zz-live-full"), None);
+        assert_eq!(reason("gpt-zz-live-silent"), None);
+    }
+
+    #[test]
     fn input_modalities_use_only_exact_observed_static_and_fixture_rows() {
         for models in [
             codex_static_catalog_models(),
