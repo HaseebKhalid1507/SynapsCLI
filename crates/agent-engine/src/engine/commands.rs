@@ -421,21 +421,26 @@ pub fn workers_command(arg: &str, runtime: &mut crate::Runtime) -> CommandResult
             let cancelled = if *target == "all" {
                 registry.cancel_running(WorkerCancelScope::All)
             } else {
-                match registry.get_mut(target) {
-                    None => {
-                        return CommandResult::Error(format!("no worker {target} (see /workers)"))
-                    }
-                    Some(h) if h.status() != SubagentStatus::Running => {
-                        return CommandResult::Error(format!(
-                            "{target} is already {} — nothing to cancel",
-                            h.status().as_str()
-                        ))
-                    }
-                    Some(h) => {
-                        h.cancel();
-                        vec![target.to_string()]
-                    }
+                let Some(h) = registry.get_mut(target) else {
+                    return CommandResult::Error(format!("no worker {target} (see /workers)"));
+                };
+                // One decision with the worker's own completion (see
+                // `cancel_if_running`): a worker that just finished keeps
+                // its result.
+                if !h.cancel_if_running() {
+                    let (stopping, status) = {
+                        let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+                        (s.cancel_requested, s.public_status())
+                    };
+                    return CommandResult::Error(if stopping {
+                        format!("{target} is already being cancelled")
+                    } else if status == SubagentStatus::Running {
+                        format!("{target} is finishing — nothing to cancel")
+                    } else {
+                        format!("{target} is already {} — nothing to cancel", status.as_str())
+                    });
                 }
+                vec![target.to_string()]
             };
             if cancelled.is_empty() {
                 CommandResult::Output("No running workers to cancel.".into())
@@ -1374,6 +1379,58 @@ mod tests {
             panic!("already reconciled must be refused")
         };
         assert!(e.contains("not awaiting"), "{e}");
+    }
+
+    /// `/workers cancel sa_N` racing the worker's own completion: the
+    /// status check and the cancel are one decision, so a worker that
+    /// completed in between keeps its result (and the user is told it
+    /// already finished) instead of being relabelled Cancelled.
+    #[test]
+    fn workers_cancel_never_relabels_a_worker_that_completed_meanwhile() {
+        use crate::runtime::subagent::SubagentStatus;
+        let mut runtime = crate::Runtime::new_headless();
+        for round in 0..20_000 {
+            let h = worker_handle("sa_1", SubagentStatus::Running);
+            let state = std::sync::Arc::clone(&h.state);
+            {
+                let mut registry = runtime.subagent_registry().lock().unwrap();
+                registry.remove("sa_1");
+                registry.register(h);
+            }
+            let go = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let worker = {
+                let (go, state) = (go.clone(), state.clone());
+                // Sweep where the completion lands relative to the command.
+                let spin = round % 4_000;
+                std::thread::spawn(move || {
+                    go.wait();
+                    for _ in 0..spin {
+                        std::hint::spin_loop();
+                    }
+                    let mut s = state.write().unwrap();
+                    if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
+                        s.status = SubagentStatus::Completed;
+                    }
+                })
+            };
+            go.wait();
+            let reply = handle_engine_command("workers", "cancel sa_1", &mut runtime);
+            worker.join().unwrap();
+            let s = state.read().unwrap();
+            assert!(
+                !(s.status == SubagentStatus::Completed && s.cancel_requested),
+                "round {round}: completed AND flagged cancelled"
+            );
+            match reply {
+                Some(CommandResult::Output(text)) => {
+                    assert!(s.cancel_requested && text.contains("Cancelled sa_1"), "{text}")
+                }
+                Some(CommandResult::Error(e)) => {
+                    assert!(!s.cancel_requested && e.contains("already completed"), "{e}")
+                }
+                _ => panic!("round {round}: unexpected reply"),
+            }
+        }
     }
 
     #[test]

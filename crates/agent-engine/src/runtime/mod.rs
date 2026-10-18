@@ -3217,6 +3217,9 @@ impl Runtime {
     ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
     {
         use crate::extensions::context_provider as ext_cp;
+        if memory_context::provider_unavailable_for_test() {
+            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+        }
         if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
             || self
                 .memory_backend_reconfigure_denied
@@ -3356,6 +3359,27 @@ impl Runtime {
             ),
         }
         Some(result)
+    }
+
+    /// Restore a session's own `/memory` choice on a rebuilt runtime (unpark,
+    /// daemon reload) instead of the operator default. The choice was the
+    /// user's explicit command for this session, so it is re-granted under
+    /// the same `ExplicitCommand` proof the command minted; `Off` grants
+    /// nothing (the runtime was built without the default). A failed grant
+    /// is logged and leaves memory off.
+    pub(crate) fn restore_session_memory_mode(&self, mode: crate::session::SessionMemoryMode) {
+        let Some(lease) = mode.lease_mode() else {
+            return;
+        };
+        if let Err(e) =
+            self.memory_context_enable(lease, memory_context::mint_explicit_command_proof())
+        {
+            tracing::warn!(
+                mode = lease.as_str(),
+                error = %e,
+                "session memory mode not restored; memory stays off"
+            );
+        }
     }
 
     /// Install a one-shot recall lease (`/memory once`, spec §7.3) under

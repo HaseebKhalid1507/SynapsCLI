@@ -176,6 +176,53 @@ pub fn park_grace() -> Option<std::time::Duration> {
 
 pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often a detached idle session re-checks a park its workers hold
+/// (`can_park_ignoring_keepwarm`).
+pub const WORKER_PARK_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(any(test, feature = "testing"))]
+static WORKER_PARK_RECHECK_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// [`WORKER_PARK_RECHECK`], or the test override. Code-only, like
+/// `cache_keepwarm::interval_override`: no binary input can reach it.
+fn worker_park_recheck() -> std::time::Duration {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let ms = WORKER_PARK_RECHECK_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    WORKER_PARK_RECHECK
+}
+
+/// Test-only controls (`cfg(test)` / `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// Replaces the worker park re-check interval for every session in
+    /// this process while alive (tests that use it must be `#[serial]`).
+    #[must_use = "the override is cleared when the guard drops"]
+    pub struct WorkerParkRecheck(());
+
+    impl WorkerParkRecheck {
+        pub fn set(interval: Duration) -> Self {
+            let ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX).max(1);
+            super::WORKER_PARK_RECHECK_OVERRIDE_MS.store(ms, Ordering::Relaxed);
+            Self(())
+        }
+    }
+
+    impl Drop for WorkerParkRecheck {
+        fn drop(&mut self) {
+            super::WORKER_PARK_RECHECK_OVERRIDE_MS.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// `SYNAPS_DAEMON_PROMPT_ABANDON_SECS`: how long a pending host confirmation on
 /// a NON-driver session survives after the LAST client detaches before it is
 /// fail-closed answered `None` (deny) so `can_park()` can proceed. This bounds
@@ -315,6 +362,41 @@ fn subagent_steer_event(handle_id: &str, agent_name: &str, text: &str) -> crate:
     }
 }
 
+/// The MAIN-conversation note for a worker the user cancelled with
+/// `/workers cancel`: its completion wake is withheld, so without this the
+/// main agent would wait for it (or dispatch the work again).
+pub(crate) fn subagent_user_cancel_event(
+    handle_id: &str,
+    agent_name: &str,
+) -> crate::events::types::Event {
+    use crate::events::types::{Event, EventContent, EventSource, Severity};
+    Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        source: EventSource {
+            source_type: "user".to_string(),
+            name: "user".to_string(),
+            callback: None,
+        },
+        channel: None,
+        sender: None,
+        content: EventContent {
+            text: format!(
+                "User cancelled subagent '{agent_name}' ({handle_id}) with /workers cancel. It stops at \
+                 its next step and sends no completion wake; do not wait for it. Its partial output is \
+                 readable with subagent_collect (handle_id \"{handle_id}\") only while this session \
+                 stays loaded: the handle does not survive the session being parked."
+            ),
+            content_type: "subagent_cancelled".to_string(),
+            severity: Some(Severity::Low),
+            data: Some(serde_json::json!({ "handle_id": handle_id, "agent_name": agent_name })),
+            disclosure: None,
+        },
+        expects_response: false,
+        reply_to: None,
+    }
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -339,6 +421,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::KeepWarm { .. } => "keep_warm",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
+        SessionCommand::ReloadAborted => "reload_aborted",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -367,6 +450,10 @@ pub struct SessionActor {
     pub(crate) cache_keepwarm: super::cache_keepwarm::KeepWarmState,
     /// Armed on last-detach-while-idle / idle-while-detached.
     pub(crate) park_deadline: Option<tokio::time::Instant>,
+    /// `park_deadline` when it was armed as a worker re-check (workers held
+    /// the park), not as the reconnect grace: a re-check that finds the
+    /// session parkable arms the grace instead of parking.
+    pub(crate) park_recheck_at: Option<tokio::time::Instant>,
     /// (P11) Armed when the last client detaches while a pending host prompt is
     /// held on a NON-driver session; a re-attach cancels it, expiry denies the
     /// prompt(s) so `can_park()` can proceed. `None` = no abandoned prompt (or
@@ -451,6 +538,28 @@ pub struct SessionActor {
     pub(crate) driver_interrupted_owner: Option<String>,
     /// 200 ms cadence for `driver_tick()`, always present.
     pub(crate) driver_tick_interval: tokio::time::Interval,
+    /// Set by a reload checkpoint until the `execv` (or until the daemon
+    /// reports it failed): see [`ReloadFence`].
+    pub(crate) reload_fence: Option<ReloadFence>,
+    /// Shared with the handle: `config.memory_mode`, readable by a reload
+    /// that gets no checkpoint reply.
+    pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
+    /// This runtime's memory has been seen active (a grant took effect).
+    /// Only then does "memory is off" mean consent was revoked; see
+    /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
+    pub(crate) memory_seen_active: bool,
+}
+
+/// A reload checkpoint wrote this session's reload record; until the
+/// `execv` replaces the process nothing may start new work the record does
+/// not know about. Queue wakes stay queued (the record carries the wakes it
+/// owes), and keep-warm pings, driver ticks and parking wait. Lifted by
+/// `ReloadAborted` (the exec failed) or, as a backstop, at `deadline`.
+pub(crate) struct ReloadFence {
+    pub(crate) deadline: tokio::time::Instant,
+    /// What the checkpoint recorded: re-announced to this image when the
+    /// exec does not happen.
+    pub(crate) workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
 impl SessionActor {
@@ -464,7 +573,14 @@ impl SessionActor {
     ) -> Result<(SessionHandle, SessionTask)> {
         // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
         // one-shot memory binding scopes to the session's project (§4).
-        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
+        // A session that made its own `/memory` choice (carried by a reload)
+        // gets that, not the operator default.
+        let mut runtime = host
+            .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
+            .await?;
+        if let Some(mode) = cfg.memory_mode {
+            runtime.restore_session_memory_mode(mode);
+        }
         let config: crate::SynapsConfig = (**host.config()).clone();
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
@@ -647,11 +763,13 @@ impl SessionActor {
                 presence,
                 name,
                 cache_keepwarm,
+                memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
 
-        let actor = SessionActor {
+        let mut actor = SessionActor {
             id,
             meta,
             config: cfg,
@@ -668,6 +786,7 @@ impl SessionActor {
                 cache_keepwarm,
             ),
             park_deadline: None,
+            park_recheck_at: None,
             prompt_abandon_deadline: None,
             stream: None,
             cancel: None,
@@ -714,7 +833,12 @@ impl SessionActor {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval
             },
+            reload_fence: None,
+            memory_mode_slot: memory_mode,
+            memory_seen_active: false,
         };
+        // Whether the build's grant (default or restored choice) took.
+        actor.observe_memory();
         Ok((handle, SessionTask(actor)))
     }
 
@@ -857,6 +981,10 @@ impl SessionActor {
     /// hands off on `Idle` must never see the previous state. Per-round
     /// saves stay in the background; this waits once per turn.
     pub(crate) async fn announce_idle(&mut self) {
+        // A turn may have revoked memory consent (the `memory_context`
+        // tool): keep the handle's slot current for a reload that gets no
+        // checkpoint reply.
+        self.sync_memory_choice();
         self.flush_saves().await;
         self.emit(SessionEventWire::Idle);
         self.cache_keepwarm_on_idle().await;
@@ -926,7 +1054,11 @@ impl SessionActor {
     pub(crate) fn reload_record(&self) -> SessionReloadRecord {
         let view = self.view.load();
         SessionReloadRecord {
-            config: self.config.clone(),
+            // A consent revocation since the last record counts.
+            config: SessionConfig {
+                memory_mode: self.effective_memory_mode(),
+                ..self.config.clone()
+            },
             keep_warm: self.keep_warm,
             lifecycle: SessionLifecycle::from_u8(
                 self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
@@ -983,6 +1115,23 @@ impl SessionActor {
 
     /// `can_park` minus the keep-warm deferral.
     pub(crate) fn can_park_ignoring_keepwarm(&self) -> bool {
+        self.can_park_but_for_workers() && !self.workers_hold_park()
+    }
+
+    /// Whether parking would cost a worker (`SubagentRegistry::holds_park`):
+    /// the park waits and re-checks every [`WORKER_PARK_RECHECK`].
+    fn workers_hold_park(&self) -> bool {
+        self.runtime.is_live()
+            && self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .holds_park()
+    }
+
+    /// Every park condition except the session's workers.
+    fn can_park_but_for_workers(&self) -> bool {
         self.attached.is_empty()
             && !self.streaming
             && self.compact.is_none()
@@ -1296,6 +1445,9 @@ impl SessionActor {
     /// spawned tasks. Mirrors the TUI's `tick()` (TUI :695-1027).
     pub(crate) async fn driver_tick(&mut self) {
         use crate::extensions::session_driver::Outcome;
+        if self.reload_fence.is_some() {
+            return;
+        }
 
         // ── 1. Cleanup cancelled stream setup ────────────────────────────
         // (e.g. the grant's deadline cancelled the driver token before the
@@ -1830,14 +1982,31 @@ impl SessionActor {
             return;
         }
         if !self.can_park() {
-            self.park_deadline = None;
+            // Only workers in the way: look again later (a worker finishing
+            // or being collected does not always pass through here).
+            let workers_only = self.can_park_but_for_workers()
+                && !self.cache_keepwarm.active()
+                && park_grace().is_some();
+            self.park_deadline = if workers_only {
+                self.park_deadline.or_else(|| {
+                    let at = tokio::time::Instant::now() + worker_park_recheck();
+                    self.park_recheck_at = Some(at);
+                    Some(at)
+                })
+            } else {
+                None
+            };
             return;
         }
         match park_grace() {
             Some(grace) => {
-                if self.park_deadline.is_none() {
-                    self.park_deadline = Some(tokio::time::Instant::now() + grace);
-                }
+                // The earlier of a pending deadline and a fresh grace: a
+                // grace armed at detach keeps counting, while a far-off
+                // worker re-check gives way once the workers let go.
+                let due = tokio::time::Instant::now() + grace;
+                // A re-check due before the grace stays a re-check: when it
+                // fires it arms the grace rather than parking early.
+                self.park_deadline = Some(self.park_deadline.map_or(due, |d| d.min(due)));
             }
             None => self.park_deadline = None,
         }
@@ -1903,6 +2072,9 @@ impl SessionActor {
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
+        // Fired by a worker re-check (not the grace, not an explicit Park)?
+        let recheck = self.park_deadline.is_some() && self.park_deadline == self.park_recheck_at;
+        self.park_recheck_at = None;
         self.park_deadline = None;
         if self.is_parked() {
             if self.attached.is_empty() {
@@ -1921,7 +2093,17 @@ impl SessionActor {
             return std::ops::ControlFlow::Break(EndReason::Idle);
         }
         if !self.can_park() {
+            // Re-arms a re-check while only workers hold the park.
+            self.rearm_park();
             return std::ops::ControlFlow::Continue(());
+        }
+        if recheck {
+            // The workers let go: now the reconnect grace runs, from here.
+            // A re-check is not the user's grace having elapsed.
+            if let Some(grace) = park_grace() {
+                self.park_deadline = Some(tokio::time::Instant::now() + grace);
+                return std::ops::ControlFlow::Continue(());
+            }
         }
         self.state = AttachState::Parking;
         self.set_lifecycle(SessionLifecycle::Parking);
@@ -1947,6 +2129,9 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         self.turn_replay.clear();
+        // The unparked runtime is built from `config.memory_mode`: a
+        // revocation made without `/memory` must be recorded first.
+        self.sync_memory_choice();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
         let conv = self.conv.park_take();
@@ -2013,8 +2198,14 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            // §4: cwd before apply_config — see `create`.
-            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
+            // §4: cwd before apply_config — see `create`. The session's own
+            // `/memory` choice, if it made one, instead of the default.
+            let mut runtime = host
+                .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
+                .await?;
+            if let Some(mode) = cfg.memory_mode {
+                runtime.restore_session_memory_mode(mode);
+            }
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
@@ -2082,6 +2273,9 @@ impl SessionActor {
         }
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // A fresh runtime: whether its grant took effect is its own.
+        self.memory_seen_active = false;
+        self.observe_memory();
         self.publish_view().await;
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
@@ -2132,6 +2326,8 @@ impl SessionActor {
         }
         if !keep_subagent_tick(self.streaming, running) {
             self.subagent_tick = None;
+            // The last worker finished: a park it held may be due now.
+            self.rearm_park();
         }
     }
 
@@ -2192,6 +2388,9 @@ impl SessionActor {
         // any foreground turn that starts while armed.)
         let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
         // Stamp this turn's worker launches before the stream can start any.
+        // A grant made since the last turn (e.g. while the session was
+        // being rebuilt) is seen before this turn can revoke it.
+        self.observe_memory();
         self.turn_worker_generation = self
             .runtime
             .subagent_registry()
@@ -2568,7 +2767,14 @@ impl SessionActor {
                 return;
             }
         };
-        let event = subagent_steer_event(handle_id, &agent_name, &text);
+        self.note_in_main_conversation(subagent_steer_event(handle_id, &agent_name, &text));
+    }
+
+    /// Tell the MAIN agent something the user did to its workers: the note
+    /// travels like a drained event (steered into a live turn, buffered while
+    /// busy, injected while idle) but never starts a turn on its own; clients
+    /// render it from `External`.
+    pub(crate) fn note_in_main_conversation(&mut self, event: crate::events::types::Event) {
         let formatted = crate::events::format_event_for_agent(&event);
         if self.busy() {
             let into_turn = self
@@ -2783,11 +2989,14 @@ impl SessionActor {
                 );
             }
             if let WorkerCancelScope::Turn(_) = scope {
+                // Still running and staying so: not the ones just cancelled
+                // (they read as running until their next step).
                 let spared = registry
-                    .list_active()
+                    .display_rows()
                     .iter()
-                    .filter(|(_, _, status)| {
-                        *status == crate::runtime::subagent::SubagentStatus::Running
+                    .filter(|r| {
+                        r.status == crate::runtime::subagent::SubagentStatus::Running
+                            && !r.cancel_requested
                     })
                     .count();
                 drop(registry);
@@ -3003,6 +3212,10 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
+        if self.reload_fence.is_some() {
+            // Fenced for a reload: the record carries what is queued.
+            return;
+        }
         if self.is_parked() {
             if self.event_queue.is_empty() {
                 return;
@@ -4032,19 +4245,19 @@ impl SessionActor {
         }
         // Workers cannot survive the exec either (they are threads of this
         // process). Flag + cancel them BEFORE `cancel_turn` (whose own
-        // cancel would otherwise label them user-cancelled).
-        let stopping = match reason {
-            CheckpointReason::Reload => self
-                .runtime
-                .subagent_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .stop_for_reload(),
-            CheckpointReason::HostRequest => Vec::new(),
-        };
+        // cancel would otherwise label them user-cancelled). This also
+        // fences new launches: a worker the turn registers before its
+        // cancel lands is stopped at birth as the reload's.
+        let reload = matches!(reason, CheckpointReason::Reload);
+        if reload {
+            self.stop_workers_for_reload();
+        }
         if self.streaming {
             self.cancel_turn(interrupt).await;
         }
+        // Again after the turn cancel: every worker to await, including
+        // any the cancelled turn registered meanwhile.
+        let stopping = if reload { self.stop_workers_for_reload() } else { Vec::new() };
         let stopped_workers = await_stopped_workers(self.id.as_str(), stopping).await;
         self.abort_compaction();
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
@@ -4074,8 +4287,14 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         let mut record = self.reload_record();
-        if matches!(reason, CheckpointReason::Reload) {
+        if reload {
             record.workers = self.reload_carried_workers();
+            // Recorded: from here to the exec, nothing may start work the
+            // record does not carry (a queued wake must stay queued).
+            self.reload_fence = Some(ReloadFence {
+                deadline: tokio::time::Instant::now() + budgets::RELOAD_FENCE_TIMEOUT,
+                workers: record.workers.clone(),
+            });
         }
         let record = serde_json::to_value(record).unwrap_or_default();
         self.emit(SessionEventWire::QueryResult {
@@ -4115,6 +4334,16 @@ impl SessionActor {
     /// parent is woken once per worker — it was waiting for completions the
     /// exec destroyed.
     pub(crate) fn adopt_workers(&mut self, workers: Vec<crate::runtime::subagent::CarriedWorker>) {
+        self.adopt_carried_workers(workers, false);
+    }
+
+    /// [`Self::adopt_workers`]; `failed_reload`: this image's own exec
+    /// failed (`ReloadAborted`), so the notice must not say it reloaded.
+    fn adopt_carried_workers(
+        &mut self,
+        workers: Vec<crate::runtime::subagent::CarriedWorker>,
+        failed_reload: bool,
+    ) {
         if workers.is_empty() {
             return;
         }
@@ -4155,13 +4384,89 @@ impl SessionActor {
         );
         if !stopped.is_empty() {
             self.emit(SessionEventWire::SystemNotice(format!(
-                "daemon reloaded — worker{} {} stopped by the reload; subagent_resume continues {} from {} archive",
+                "{} — worker{} {} stopped by the reload; subagent_resume continues {} from {} archive",
+                if failed_reload { "daemon reload failed" } else { "daemon reloaded" },
                 if stopped.len() == 1 { "" } else { "s" },
                 stopped.join(", "),
                 if stopped.len() == 1 { "it" } else { "them" },
                 if stopped.len() == 1 { "its" } else { "their" },
             )));
         }
+    }
+
+    /// `stop_for_reload` on this session's registry (fences new launches).
+    fn stop_workers_for_reload(
+        &self,
+    ) -> Vec<(String, Arc<std::sync::RwLock<crate::runtime::subagent::SubagentState>>)> {
+        self.runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stop_for_reload()
+    }
+
+    /// Host-only (`SessionCommand::ReloadAborted`): the reload this session
+    /// checkpointed for did not exec, so the old image keeps serving it.
+    /// Lift the reload fence, hand the workers the checkpoint stopped back
+    /// to the parent, and deliver what queued up meanwhile.
+    pub(crate) async fn reload_aborted(&mut self) {
+        self.lift_reload_fence(
+            "daemon reload failed — this session continues on the running daemon",
+        )
+        .await;
+    }
+
+    /// Lift the reload fence (see [`Self::reload_aborted`]), telling the
+    /// user `notice` (the reload did not happen).
+    async fn lift_reload_fence(&mut self, notice: &str) {
+        let Some(fence) = self.reload_fence.take() else {
+            return;
+        };
+        self.emit(SessionEventWire::SystemNotice(notice.to_string()));
+        let workers = if self.runtime.is_live() {
+            // From the LIVE registry, not only the checkpoint's snapshot: a
+            // worker registered after it was stopped at birth by the
+            // registry's reload fence and is owed its wake too. Snapshot
+            // entries the registry no longer holds ride along.
+            let mut carried = self.reload_carried_workers();
+            carried.extend(
+                fence
+                    .workers
+                    .into_iter()
+                    .filter(|w| !carried.iter().any(|c| c.id == w.id))
+                    .collect::<Vec<_>>(),
+            );
+            let mut registry = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            registry.lift_reload_fence();
+            // The queue the record assumed lost is still here: only the
+            // reload's own stops owe a wake.
+            registry.rewake_after_failed_exec(carried)
+        } else {
+            Vec::new()
+        };
+        tracing::info!(session = %self.id, "reload did not exec: fence lifted");
+        self.adopt_carried_workers(workers, true);
+        self.rearm_park();
+        if !self.event_queue.is_empty() {
+            self.on_queue_wake().await;
+        }
+    }
+
+    /// Backstop: no exec and no `ReloadAborted` within
+    /// [`budgets::RELOAD_FENCE_TIMEOUT`] of the checkpoint.
+    async fn reload_fence_expired(&mut self) {
+        tracing::warn!(
+            session = %self.id,
+            "reload fence expired with no exec and no abort from the daemon; lifting it"
+        );
+        self.lift_reload_fence(
+            "daemon reload never completed or reported back — this session continues on the running daemon",
+        )
+        .await;
     }
 
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.
@@ -4180,6 +4485,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // Only the daemon's reload sends a reload checkpoint (it stops
+            // every worker and fences the session for the exec after it).
+            if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "checkpoint(reload) is host-only; use `synaps daemon reload`".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             if is_input_command(&cmd) && self.input_owner != Some(c) {
                 let reason = match self.input_owner {
                     Some(o) => format!("input owned by client #{}", o.0),
@@ -4192,6 +4507,22 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
+        }
+        // A reload checkpointed this session: nothing may start work or
+        // change what the reload record captured until the exec (or until
+        // the daemon reports it failed). The wake sources are fenced in the
+        // select loop; commands are fenced here.
+        if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            let reason = super::RELOADING_REFUSAL.to_string();
+            match from {
+                Some(c) => self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason,
+                }),
+                None => self.emit(SessionEventWire::SystemNotice(reason)),
+            }
+            return ControlFlow::Continue(());
         }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {
@@ -4206,6 +4537,7 @@ impl SessionActor {
                     | SessionCommand::Cancel
                     | SessionCommand::Checkpoint { .. }
                     | SessionCommand::Park
+                    | SessionCommand::ReloadAborted
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
             );
@@ -4338,6 +4670,7 @@ impl SessionActor {
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
+            SessionCommand::ReloadAborted => self.reload_aborted().await,
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();
@@ -4558,6 +4891,14 @@ async fn prompt_abandon_timer(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// The reload fence's backstop deadline; pends forever when unfenced.
+async fn reload_fence_timer(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 200 ms cadence, gated on driver state — `None` driver+pending → pending forever.
 async fn driver_tick_timer(
     has_driver: bool,
@@ -4594,6 +4935,21 @@ impl SessionTask {
         Arc::clone(self.0.runtime.subagent_registry())
     }
 
+    /// Test seam: a clone of this session's runtime. Clones share the
+    /// memory-consent state, so a harness can revoke consent the way the
+    /// `memory_context` tool's capability does (`memory_context_disable`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn runtime_for_harness(&self) -> crate::Runtime {
+        (*self.0.runtime).clone()
+    }
+
+    /// Test seam: this session's event queue (what a worker's finalizer
+    /// pushes its completion wake into).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn event_queue(&self) -> Arc<crate::events::EventQueue> {
+        Arc::clone(&self.0.event_queue)
+    }
+
     /// Unbiased select (the TUI loop is unbiased too).
     pub async fn run(mut self) {
         let queue = Arc::clone(&self.0.event_queue);
@@ -4610,12 +4966,13 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
-                _ = queue.notified() => actor.on_queue_wake().await,
+                // A reload fence keeps the wake (and its permit) queued.
+                _ = queue.notified(), if actor.reload_fence.is_none() => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
-                _ = park_timer(actor.park_deadline) => {
+                _ = park_timer(actor.park_deadline), if actor.reload_fence.is_none() => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
                     }
@@ -4623,7 +4980,7 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()) => {
+                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if actor.reload_fence.is_none() => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
@@ -4639,8 +4996,11 @@ impl SessionTask {
                         actor.publish_view().await;
                     }
                 },
-                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval) => {
+                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
                     actor.driver_tick().await;
+                }
+                _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {
+                    actor.reload_fence_expired().await;
                 }
                 _ = revoked_turn_timer(actor.revoked_turn_deadline) => {
                     actor.finish_revoked_turn(false).await;

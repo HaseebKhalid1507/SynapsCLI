@@ -183,6 +183,23 @@ impl SubagentRegistry {
         self.reload_woken.insert(worker.id.clone(), worker.clone());
     }
 
+    /// A reload that did not exec: what of its record still owes the parent
+    /// a wake in THIS image. Only the workers the reload stopped — their
+    /// finalizers withheld the completion wake, expecting the next image to
+    /// post one. A completion it carried as `wake_lost` is still queued
+    /// here (or still coming from its finalizer), and a reload wake an
+    /// earlier image posted is still queued too: re-posting either would
+    /// wake the parent twice. Everything else keeps its record, `wake` off.
+    pub fn rewake_after_failed_exec(&self, carried: Vec<CarriedWorker>) -> Vec<CarriedWorker> {
+        carried
+            .into_iter()
+            .map(|w| {
+                let wake = w.wake && w.stopped_by_reload && !self.reload_woken.contains_key(&w.id);
+                CarriedWorker { wake, ..w }
+            })
+            .collect()
+    }
+
     /// Whether a daemon reload (not the user) stopped `id`'s run.
     pub fn was_stopped_by_reload(&self, id: &str) -> bool {
         self.stopped_by_reload.contains(id)
@@ -191,13 +208,33 @@ impl SubagentRegistry {
             })
     }
 
+    /// The reload did not exec: launches work again, under the launch fence
+    /// that was there before the reload (a revoked driver's stays). A no-op
+    /// without a reload fence.
+    pub fn lift_reload_fence(&mut self) {
+        if let Some(previous) = self.reload_fence.take() {
+            self.set_spawn_cancellation(previous);
+        }
+    }
+
     /// Stop every running worker for a daemon reload: cancel it, flagged so
     /// the carried record and the next image say "stopped by reload", not
     /// "cancelled by user". Returns every worker whose finalizer has not
     /// settled, to await before the exec: the ones stopped here, one whose
     /// user cancel is already in flight, and one finishing on its own (its
     /// completion wake must reach the queue the reload carries).
+    ///
+    /// Installs the reload fence (idempotent): a worker registered from now
+    /// until [`Self::lift_reload_fence`] is stopped at birth, flagged the
+    /// same way. Call again after the turn cancel to collect those too.
     pub fn stop_for_reload(&mut self) -> Vec<(String, Arc<RwLock<SubagentState>>)> {
+        if self.reload_fence.is_none() {
+            let fence = crate::CancellationToken::new();
+            fence.cancel();
+            let previous = self.spawn_cancellation.take();
+            self.set_spawn_cancellation(Some(fence));
+            self.reload_fence = Some(previous);
+        }
         let mut awaited = Vec::new();
         for h in self.handles.values_mut() {
             let stop = {
@@ -453,6 +490,99 @@ mod tests {
         assert_eq!(*woken[0], by("sa_11"), "the stuck worker's stop, as posted");
         assert_eq!(*woken[1], by("sa_12"), "the lost completion, as posted");
         assert!(!again.iter().any(|w| w.id == "sa_10" && w.needs_wake()));
+    }
+
+    /// A worker registered after the reload stopped the others (a turn's
+    /// `subagent_start` racing the checkpoint) is stopped at birth, as the
+    /// reload's doing: carried and announced like the rest, never labelled
+    /// a user cancel that owes nobody a wake. A failed exec lifts the fence
+    /// and restores the launch fence that was there before.
+    #[test]
+    fn a_worker_registered_after_the_reload_stop_is_stopped_by_the_reload() {
+        let mut registry = SubagentRegistry::new();
+        registry.register(make_handle("sa_1"));
+        assert_eq!(registry.stop_for_reload().len(), 1);
+
+        let late = make_handle("sa_2");
+        let late_state = Arc::clone(&late.state);
+        registry.register_with_cancellation(late, None);
+        {
+            let s = late_state.read().unwrap();
+            assert!(s.cancel_requested && s.stopped_by_reload, "stopped at birth, by the reload");
+        }
+        // Even when the turn's own launch token is already cancelled (the
+        // checkpoint's `cancel_turn`), the reload's label wins.
+        let turn = crate::CancellationToken::new();
+        turn.cancel();
+        let racing = make_handle("sa_3");
+        let racing_state = Arc::clone(&racing.state);
+        registry.register_with_cancellation(racing, Some(&turn));
+        assert!(racing_state.read().unwrap().stopped_by_reload);
+        // The turn cancel after the stop leaves them the reload's.
+        assert!(registry.cancel_running(super::super::WorkerCancelScope::All).is_empty());
+        // Both are awaited before the exec (their archives) and carried.
+        let awaited: Vec<String> = registry.stop_for_reload().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(awaited, ["sa_1", "sa_2", "sa_3"]);
+        let carried = registry.reload_carry(&Default::default());
+        for id in ["sa_2", "sa_3"] {
+            let w = carried.iter().find(|w| w.id == id).unwrap();
+            assert!(w.stopped_by_reload && w.needs_wake(), "{w:?}");
+        }
+
+        // Failed exec: launches work again.
+        registry.lift_reload_fence();
+        let after = make_handle("sa_4");
+        let after_state = Arc::clone(&after.state);
+        registry.register(after);
+        assert!(!after_state.read().unwrap().cancel_requested);
+
+        // The fence that was there before the reload comes back (a revoked
+        // driver's cancelled launch fence keeps cancelling late launches).
+        let mut fenced = SubagentRegistry::new();
+        let driver = crate::CancellationToken::new();
+        driver.cancel();
+        fenced.set_spawn_cancellation(Some(driver));
+        fenced.stop_for_reload();
+        fenced.lift_reload_fence();
+        let late = make_handle("sa_9");
+        let late_state = Arc::clone(&late.state);
+        fenced.register(late);
+        let s = late_state.read().unwrap();
+        assert!(s.cancel_requested && !s.stopped_by_reload, "the driver's fence, not the reload's");
+    }
+
+    /// A failed exec re-announces only the workers that reload stopped: the
+    /// completions it carried are still in this image's queue, and so is a
+    /// reload wake posted earlier.
+    #[test]
+    fn a_failed_exec_rewakes_only_the_workers_the_reload_stopped() {
+        let mut registry = SubagentRegistry::new();
+        registry.register(make_handle("sa_1"));
+        registry.register(make_finished_handle("sa_2"));
+        let stopped_earlier = CarriedWorker {
+            id: "sa_3".into(),
+            subagent_id: 3,
+            agent: String::new(),
+            status: "cancelled".into(),
+            archive_path: Some("/a/sa_3.json".into()),
+            stopped_by_reload: true,
+            wake_lost: false,
+            wake: true,
+            elapsed_secs: 0,
+            preview: String::new(),
+        };
+        registry.adopt_carried(&stopped_earlier);
+        registry.note_reload_wake(&stopped_earlier);
+        registry.stop_for_reload();
+        let queued: std::collections::HashSet<String> = ["sa_3".to_string()].into();
+        let carried = registry.reload_carry(&queued);
+        assert_eq!(carried.iter().filter(|w| w.needs_wake()).count(), 3, "{carried:?}");
+
+        let rewake = registry.rewake_after_failed_exec(carried.clone());
+        let woken: Vec<&str> =
+            rewake.iter().filter(|w| w.needs_wake()).map(|w| w.id.as_str()).collect();
+        assert_eq!(woken, ["sa_1"], "only this reload's own stop: {rewake:?}");
+        assert_eq!(rewake.len(), carried.len(), "every record is kept");
     }
 
     #[test]

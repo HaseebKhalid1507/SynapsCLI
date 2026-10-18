@@ -126,8 +126,27 @@ impl SessionActor {
             return;
         }
         crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
+        // `/workers cancel`: which workers this command stops (a cancel
+        // already in flight is not this command's).
+        let cancelling = cmd == "workers" && arg.trim_start().starts_with("cancel");
+        let uncancelled = if cancelling { self.uncancelled_workers() } else { Vec::new() };
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
+        if cancelling {
+            let after = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .display_rows();
+            for (id, agent) in &cancelled_by_command(uncancelled, &after) {
+                self.note_in_main_conversation(super::actor::subagent_user_cancel_event(id, agent));
+            }
+        }
+        if cmd == "memory" {
+            self.note_memory_choice(&arg);
+            self.observe_memory();
+        }
         if view_changed {
             self.publish_view().await;
         }
@@ -138,6 +157,123 @@ impl SessionActor {
             self.compact(custom_instructions, "manual").await;
         }
         self.emit(SessionEventWire::QueryResult { id, value });
+    }
+
+    /// The memory choice a rebuilt runtime must honour: the recorded one,
+    /// or `Off` once memory is effectively off while a recorded on-mode or
+    /// the operator's durable default would grant it again. Consent can be
+    /// revoked without `/memory` — the model's `memory_context` tool
+    /// (`action: "disable"`), a lease expiry, a host-side revoke — and
+    /// recording `Off` is always the safe direction. On-modes are recorded
+    /// only from `/memory` ([`Self::note_memory_choice`]): the tool cannot
+    /// enable (that needs the command's ExplicitCommand proof), so no other
+    /// path may make one sticky.
+    ///
+    /// Off counts as a revocation only once memory was seen active in this
+    /// runtime (`memory_seen_active`): a grant that never took effect — an
+    /// extension-backed provider not registered yet after a reload or
+    /// unpark — leaves the choice alone, so the next rebuild retries it.
+    pub(crate) fn effective_memory_mode(&self) -> Option<super::SessionMemoryMode> {
+        use crate::runtime::memory_context::DurableStatus;
+        let recorded = self.config.memory_mode;
+        if !self.runtime.is_live() {
+            return recorded;
+        }
+        let off = matches!(self.runtime.memory_context_status().durable, DurableStatus::Off);
+        let would_grant = match recorded {
+            Some(mode) => mode.lease_mode().is_some(),
+            None => self.memory_default_is_durable(),
+        };
+        if off && would_grant && self.memory_seen_active {
+            Some(super::SessionMemoryMode::Off)
+        } else {
+            recorded
+        }
+    }
+
+    /// The operator's confirmed `memory.default_mode` grants a durable
+    /// session lease (`recall_once` is a one-shot, not a mode).
+    fn memory_default_is_durable(&self) -> bool {
+        let memory = &self.host.config().memory;
+        memory.default_mode_confirmed
+            && matches!(
+                memory.default_mode.as_str(),
+                "recall_each_prompt" | "capture_only" | "capture_and_recall"
+            )
+    }
+
+    /// Latch `memory_seen_active` if this runtime's memory is active now.
+    /// Called where a grant can take effect: the runtime's build, `/memory`,
+    /// each turn's start and end.
+    pub(crate) fn observe_memory(&mut self) {
+        use crate::runtime::memory_context::DurableStatus;
+        if self.runtime.is_live()
+            && matches!(
+                self.runtime.memory_context_status().durable,
+                DurableStatus::Active { .. }
+            )
+        {
+            self.memory_seen_active = true;
+        }
+    }
+
+    /// Record [`Self::effective_memory_mode`] (config + the handle's slot).
+    /// A revocation recorded here (not by `/memory`) is told to the user.
+    pub(crate) fn sync_memory_choice(&mut self) {
+        self.observe_memory();
+        let mode = self.effective_memory_mode();
+        if mode != self.config.memory_mode {
+            self.config.memory_mode = mode;
+            *self
+                .memory_mode_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+            if mode == Some(super::SessionMemoryMode::Off) {
+                self.emit(SessionEventWire::SystemNotice(
+                    "memory stays off for this session: its consent was revoked, and a park or daemon reload keeps it off (/memory on turns it back on)"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    /// `(id, agent)` of every worker with no cancel requested, sorted.
+    fn uncancelled_workers(&self) -> Vec<(String, String)> {
+        let mut workers: Vec<(String, String)> = self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows()
+            .into_iter()
+            .filter(|r| !r.cancel_requested)
+            .map(|r| (r.handle_id, r.agent_name))
+            .collect();
+        workers.sort();
+        workers
+    }
+
+    /// `/memory on|recall|capture|off` that took effect becomes the
+    /// session's own choice (`SessionConfig::memory_mode`): a rebuilt
+    /// runtime restores it rather than the operator default. A failed grant
+    /// leaves the previous choice in place.
+    fn note_memory_choice(&mut self, arg: &str) {
+        use crate::runtime::memory_context::DurableStatus;
+        let Some(choice) = super::SessionMemoryMode::from_command_arg(arg) else {
+            return;
+        };
+        let took = match (self.runtime.memory_context_status().durable, choice.lease_mode()) {
+            (DurableStatus::Off, None) => true,
+            (DurableStatus::Active { mode, .. }, Some(want)) => mode == want,
+            _ => false,
+        };
+        if took {
+            self.config.memory_mode = Some(choice);
+            *self
+                .memory_mode_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(choice);
+        }
     }
 
     /// `/saveas <name>` | `/saveas` (clear). Force-saves even with no
@@ -369,11 +505,49 @@ impl SessionActor {
     }
 }
 
+/// Of the workers that had no cancel requested before a `/workers cancel`,
+/// those that have one now. A worker that left the registry meanwhile
+/// (reaped at a turn end that raced the command) was not cancelled by it.
+fn cancelled_by_command(
+    before: Vec<(String, String)>,
+    after: &[crate::runtime::subagent::SubagentDisplayRow],
+) -> Vec<(String, String)> {
+    before
+        .into_iter()
+        .filter(|(id, _)| after.iter().any(|r| &r.handle_id == id && r.cancel_requested))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! `/resume`'s reasoning restore is the runtime's `restore_session_reasoning`
     //! + the clamp line above; pin the two behaviours the TUI tests pinned.
     use crate::Runtime;
+
+    fn row(id: &str, cancel_requested: bool) -> crate::runtime::subagent::SubagentDisplayRow {
+        serde_json::from_value(serde_json::json!({
+            "subagent_id": 0, "agent_name": "a", "status": "running",
+            "cancel_requested": cancel_requested, "elapsed_secs": 0.0,
+            "finished_elapsed": null, "handle_id": id,
+        }))
+        .unwrap()
+    }
+
+    /// `/workers cancel` tells the main agent only about workers the command
+    /// flagged: one reaped from the registry while it ran (it completed; its
+    /// wake is the truth) is not "cancelled by the user".
+    #[test]
+    fn the_cancel_note_names_only_workers_the_command_flagged() {
+        let before: Vec<(String, String)> = ["sa_1", "sa_2", "sa_3"]
+            .iter()
+            .map(|id| (id.to_string(), "a".to_string()))
+            .collect();
+        // sa_1 flagged; sa_2 reaped meanwhile; sa_3 untouched.
+        let after = [row("sa_1", true), row("sa_3", false)];
+        let named: Vec<String> =
+            super::cancelled_by_command(before, &after).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(named, ["sa_1"]);
+    }
 
     #[tokio::test]
     async fn restore_session_reasoning_keeps_explicit_provenance() {

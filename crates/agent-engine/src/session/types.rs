@@ -182,6 +182,71 @@ pub struct SessionConfig {
     /// host-owned circuit breaker for an actor-resident autonomous driver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_cost: Option<f64>,
+    /// The session's explicit `/memory` choice, recorded by the actor so a
+    /// rebuilt runtime (unpark, daemon reload) restores it instead of
+    /// re-applying the operator's `memory.default_mode`. `None` = no choice
+    /// yet: the default applies. Host-recorded: the daemon drops a value a
+    /// client sends at create.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "SessionMemoryMode::deserialize_lenient"
+    )]
+    pub memory_mode: Option<SessionMemoryMode>,
+}
+
+/// A durable `/memory` mode the user chose for a session
+/// (`SessionConfig::memory_mode`). `/memory once` is a one-shot lease, not
+/// a mode, and is not recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryMode {
+    Off,
+    RecallEachPrompt,
+    CaptureOnly,
+    CaptureAndRecall,
+}
+
+impl SessionMemoryMode {
+    /// `SessionConfig::memory_mode` reader: a value this build does not know
+    /// (a newer image's mode) reads as `Off` — the consent-safe direction —
+    /// rather than an error that would fail the whole reload state and
+    /// rehydrate no session at all. Null (or a missing field) is no choice.
+    fn deserialize_lenient<'de, D>(d: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(d)?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+            tracing::warn!(mode = %v, "unknown session memory mode; treating as off");
+            Self::Off
+        })))
+    }
+
+    /// The mode `/memory <arg>` sets, if it sets one.
+    pub fn from_command_arg(arg: &str) -> Option<Self> {
+        match arg.trim() {
+            "off" => Some(Self::Off),
+            "recall" => Some(Self::RecallEachPrompt),
+            "capture" => Some(Self::CaptureOnly),
+            "on" => Some(Self::CaptureAndRecall),
+            _ => None,
+        }
+    }
+
+    /// The lease mode to grant; `None` for `Off`.
+    pub fn lease_mode(self) -> Option<crate::runtime::memory_context::MemoryContextMode> {
+        use crate::runtime::memory_context::MemoryContextMode as M;
+        match self {
+            Self::Off => None,
+            Self::RecallEachPrompt => Some(M::RecallEachPrompt),
+            Self::CaptureOnly => Some(M::CaptureOnly),
+            Self::CaptureAndRecall => Some(M::CaptureAndRecall),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -224,6 +289,7 @@ impl Default for SessionConfig {
             keep_warm: false,
             name: None,
             max_session_cost: None,
+            memory_mode: None,
         }
     }
 }
@@ -618,6 +684,12 @@ pub enum SessionCommand {
     /// against their archives and wakes the parent once per worker.
     #[serde(skip)]
     AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): the reload this session checkpointed for
+    /// did not exec (the exec failed, or the reload stopped after the
+    /// checkpoints). The checkpoint's reload fence lifts, and the workers
+    /// the reload stopped are announced to this same image.
+    #[serde(skip)]
+    ReloadAborted,
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -652,6 +724,36 @@ pub struct SessionReloadRecord {
     /// the next image can re-register their ids and wake the parent.
     #[serde(default)]
     pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+}
+
+/// What a session tells a client whose command a daemon reload refused.
+pub const RELOADING_REFUSAL: &str = "daemon reloading; retry in a moment";
+
+impl SessionCommand {
+    /// Refused while a daemon reload has checkpointed the session (its
+    /// reload fence is up) until the exec, or until the daemon reports the
+    /// exec failed: anything that starts a turn (a `Steer` with no turn
+    /// running is a `Submit`), changes the conversation or journal the
+    /// record points at, launches or steers work, or changes a setting the
+    /// record already carries. Cancel, answers, queries, saves and
+    /// attach/detach stay open.
+    pub fn refused_while_reloading(&self) -> bool {
+        matches!(
+            self,
+            Self::Submit { .. }
+                | Self::SubmitPrepared { .. }
+                | Self::Steer { .. }
+                | Self::SubagentSteer { .. }
+                | Self::Compact { .. }
+                | Self::NewSession
+                | Self::Resume { .. }
+                | Self::EngineCommand { .. }
+                | Self::PluginCommand { .. }
+                | Self::DriverStart { .. }
+                | Self::Set { .. }
+                | Self::KeepWarm { .. }
+        )
+    }
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -705,6 +807,7 @@ impl std::fmt::Debug for SessionCommand {
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
                 .finish(),
+            Self::ReloadAborted => f.write_str("ReloadAborted"),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }

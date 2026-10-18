@@ -246,6 +246,7 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::Park
         // Its wakes reach the event queue like any other event.
         | SessionCommand::AdoptWorkers { .. }
+        | SessionCommand::ReloadAborted
         | SessionCommand::HostEvent(_) => Effect::Untouched,
         SessionCommand::DriverStart { .. } => Effect::DriverOwned,
         SessionCommand::End { .. } => Effect::SessionEnd,

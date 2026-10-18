@@ -546,3 +546,229 @@ async fn parked_session_is_evicted_after_age_and_continue_rebuilds_it() {
         .unwrap();
     let _ = b.next_event().await;
 }
+
+/// Parking drops the runtime and with it the worker registry: a background
+/// worker still running would be killed (its handle's shutdown channel
+/// drops) and reported as a truncated completion nobody can collect. A
+/// detached session therefore does not park while a worker runs, nor while
+/// a finished worker's result waits to be collected; it parks once the
+/// parent has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_detached_session_does_not_park_under_its_workers() {
+    use agent_engine::tools::{SubagentHandle, SubagentState, SubagentStatus};
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+
+    // A background worker, running when the turn ends.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let state = Arc::new(std::sync::RwLock::new(SubagentState::new()));
+    registry.lock().unwrap().register(SubagentHandle::new(
+        "sa_1".into(),
+        1,
+        "reviewer".into(),
+        "review it all".into(),
+        MODEL.into(),
+        String::new(),
+        0,
+        Arc::clone(&state),
+        None,
+        Some(shutdown_tx),
+        None,
+    ));
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    detach(&mut a).await;
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(2500)).await,
+        "parked over a running worker"
+    );
+    assert!(!state.read().unwrap().cancel_requested, "the worker was not stopped");
+    assert!(
+        matches!(shutdown_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+        "its shutdown channel is intact"
+    );
+
+    // It finishes; the parent has not collected it yet: still live.
+    {
+        let mut s = state.write().unwrap();
+        s.status = SubagentStatus::Completed;
+        s.finished_at = Some(std::time::Instant::now());
+        s.finalization_started = true;
+        s.finalization_ready = true;
+        s.completion_settled = true;
+    }
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(2500)).await,
+        "parked over an uncollected result"
+    );
+
+    // Collected: nothing left to lose, the session parks.
+    registry.lock().unwrap().get_mut("sa_1").unwrap().mark_collected();
+    let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    detach(&mut b).await;
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await,
+        "parks once the worker is collected"
+    );
+    handle
+        .send(SessionCommand::End { reason: EndReason::HostShutdown })
+        .await
+        .unwrap();
+}
+
+/// A fake running worker `sa_N` over `state` (no thread).
+fn fake_worker(
+    registry: &std::sync::Mutex<agent_engine::runtime::subagent::SubagentRegistry>,
+    id: &str,
+    state: &Arc<std::sync::RwLock<agent_engine::tools::SubagentState>>,
+) {
+    registry.lock().unwrap().register(agent_engine::tools::SubagentHandle::new(
+        id.into(),
+        id.trim_start_matches("sa_").parse().unwrap(),
+        "reviewer".into(),
+        "review".into(),
+        MODEL.into(),
+        String::new(),
+        0,
+        Arc::clone(state),
+        None,
+        None,
+        None,
+    ));
+}
+
+fn finish(state: &Arc<std::sync::RwLock<agent_engine::tools::SubagentState>>) {
+    let mut s = state.write().unwrap();
+    s.status = agent_engine::tools::SubagentStatus::Completed;
+    s.finished_at = Some(std::time::Instant::now());
+    s.finalization_started = true;
+    s.finalization_ready = true;
+    s.completion_settled = true;
+}
+
+/// The last running worker finishing (and collected) re-arms the park from
+/// the subagent tick: the session parks within a tick, not at the next
+/// worker re-check (set far out here to prove it is not what parks it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_last_worker_finishing_re_arms_the_park() {
+    use agent_engine::session::actor::testing::WorkerParkRecheck;
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _r = WorkerParkRecheck::set(Duration::from_secs(600));
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    // Running through the turn: the 1 Hz subagent tick outlives it.
+    let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
+    fake_worker(&registry, "sa_1", &state);
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut a).await;
+    assert!(!wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await);
+
+    registry.lock().unwrap().get_mut("sa_1").unwrap().mark_collected();
+    finish(&state);
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(4)).await,
+        "the tick re-armed the park when the last worker finished"
+    );
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}
+
+/// A park held by a finished, uncollected worker is re-checked on its own:
+/// once the result is collected (in a turn, or here directly — nothing
+/// else re-arms the park), the next re-check parks the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_park_held_by_workers_is_rechecked() {
+    use agent_engine::session::actor::testing::WorkerParkRecheck;
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _r = WorkerParkRecheck::set(Duration::from_millis(300));
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    // Finished on its own after the turn, result not collected yet.
+    let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
+    fake_worker(&registry, "sa_2", &state);
+    finish(&state);
+    detach(&mut a).await;
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await,
+        "held while the result waits"
+    );
+
+    registry.lock().unwrap().get_mut("sa_2").unwrap().mark_collected();
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(3)).await,
+        "the re-check parked it"
+    );
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}
+
+/// A worker re-check that finds the session parkable does not park it on
+/// the spot: the reconnect grace still runs first, from the re-check. (The
+/// re-check used to park at once, seconds after a detach or a collecting
+/// wake turn, well inside the grace.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_worker_recheck_still_honours_the_reconnect_grace() {
+    use agent_engine::session::actor::testing::WorkerParkRecheck;
+    let _h = Home::new();
+    let _g = Grace::set("2");
+    let _r = WorkerParkRecheck::set(Duration::from_millis(300));
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hello")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let state = Arc::new(std::sync::RwLock::new(agent_engine::tools::SubagentState::new()));
+    fake_worker(&registry, "sa_3", &state);
+    finish(&state);
+    detach(&mut a).await;
+    // Collected right away: the next re-check (300 ms) finds it parkable.
+    registry.lock().unwrap().get_mut("sa_3").unwrap().mark_collected();
+    assert!(
+        !wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_millis(1500)).await,
+        "parked inside the 2 s reconnect grace"
+    );
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(4)).await,
+        "parks once the grace has run"
+    );
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}

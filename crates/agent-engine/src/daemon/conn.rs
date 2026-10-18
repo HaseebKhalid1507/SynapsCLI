@@ -48,8 +48,13 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::SubmitPrepared { .. }
         | C::PluginCommand { .. }
         | C::Resume { .. }
-        | C::Checkpoint { .. }
         | C::KeepWarm { .. } => Ok(()),
+        // A reload checkpoint stops every worker and fences the session
+        // for the exec that follows: only the daemon's own reload sends it.
+        C::Checkpoint { reason: crate::session::CheckpointReason::Reload } => {
+            Err("checkpoint(reload): host-only (use `synaps daemon reload`)")
+        }
+        C::Checkpoint { .. } => Ok(()),
         C::Detach { client } if *client == own => Ok(()),
         C::Detach { .. } => Err("detach: not your client id"),
         C::Attach { .. } => Err("attach: already attached (one session per connection)"),
@@ -60,9 +65,25 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::Resync { .. } => Err("resync: not a client command"),
         C::Park => Err("park: not a client command"),
         C::AdoptWorkers { .. } => Err("adopt_workers: not a client command"),
+        C::ReloadAborted => Err("reload_aborted: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
         C::DriverStart { .. } => Ok(()),
     }
+}
+
+/// Refused at the connection while a reload is in progress — from the drain
+/// on, before the session is even checkpointed. `SessionCommand::
+/// refused_while_reloading` minus what the drain must still allow: a
+/// `Steer`, `Set` or engine command for the turn the drain is waiting to
+/// finish. The actor's reload fence refuses those once it has checkpointed
+/// (it alone knows whether a `Steer` would start a turn).
+fn refused_while_draining(cmd: &SessionCommand) -> bool {
+    use SessionCommand as C;
+    cmd.refused_while_reloading()
+        && !matches!(
+            cmd,
+            C::Steer { .. } | C::SubagentSteer { .. } | C::Set { .. } | C::EngineCommand { .. } | C::KeepWarm { .. }
+        )
 }
 
 enum Read {
@@ -248,7 +269,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         // Tell the requester, flush, close — then exec.
                         let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                         drop(tx);
-                        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(crate::session::budgets::RELOAD_BYE_FLUSH_SECS),
+                            writer,
+                        )
+                        .await;
                         let e = super::reload::exec(&state, &state.paths, prepared).await;
                         tracing::error!(error = %e, "daemon: reload did not exec");
                         return;
@@ -298,6 +323,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
         },
         Attach::Create { mut config, mode } => {
+            // Recorded by the actor from `/memory` (and carried by reload's
+            // rehydrate, which does not come through here); a client turns
+            // memory on or off with `/memory`, not by create config.
+            config.memory_mode = None;
             if config.cwd.is_none() {
                 config.cwd = Some(hello.cwd.clone());
             }
@@ -490,10 +519,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
                     continue;
                 }
-                if state.reloading.load(Ordering::SeqCst)
-                    && matches!(cmd, SessionCommand::Submit { .. } | SessionCommand::SubmitPrepared { .. } | SessionCommand::Compact { .. })
-                {
-                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "daemon reloading; retry in a moment".into() }).await;
+                if state.reloading.load(Ordering::SeqCst) && refused_while_draining(&cmd) {
+                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
                 }
                 match handle.send_from(client, cmd).await {
@@ -594,5 +621,35 @@ fn reload_bye(state: &DaemonState) -> ByeReason {
     ByeReason::Reloading {
         generation: state.reload_generation.load(Ordering::SeqCst),
         retry_after_ms: super::reload::RETRY_AFTER_MS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::CheckpointReason;
+
+    /// A reload checkpoint stops every worker and fences the session until
+    /// an exec that only the daemon's own reload performs: no client may
+    /// send one. A host-request checkpoint stays a client command.
+    #[test]
+    fn a_reload_checkpoint_is_host_only() {
+        let own = ClientId(1);
+        let reload = SessionCommand::Checkpoint { reason: CheckpointReason::Reload };
+        assert!(client_may_send(&reload, own).is_err());
+        let host = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
+        assert!(client_may_send(&host, own).is_ok());
+    }
+
+    /// The drain gate refuses work that would start after the record, and
+    /// leaves what the turn being drained still needs.
+    #[test]
+    fn the_drain_gate_keeps_steering_the_running_turn() {
+        let submit = SessionCommand::Submit { text: "x".into(), attachments: vec![] };
+        assert!(refused_while_draining(&submit));
+        assert!(refused_while_draining(&SessionCommand::NewSession));
+        assert!(refused_while_draining(&SessionCommand::Resume { id: 1, query: "q".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Steer { text: "x".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Cancel));
     }
 }

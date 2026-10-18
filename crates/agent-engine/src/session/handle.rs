@@ -56,6 +56,10 @@ pub struct SessionHandle {
     /// Lives here so a daemon reload whose checkpoint did not confirm still
     /// carries the user's explicit choice.
     cache_keepwarm: super::cache_keepwarm::OverrideSlot,
+    /// The session's explicit `/memory` choice, written by the actor. Here
+    /// for the same reason as `cache_keepwarm`: a reload whose checkpoint
+    /// did not confirm must not re-grant memory the user turned off.
+    memory_mode: MemoryModeSlot,
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
@@ -80,7 +84,11 @@ pub struct SessionEndpoints {
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
     pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
     pub cache_keepwarm: super::cache_keepwarm::OverrideSlot,
+    pub memory_mode: MemoryModeSlot,
 }
+
+/// The session's explicit `/memory` choice, readable without the actor.
+pub type MemoryModeSlot = Arc<std::sync::Mutex<Option<super::SessionMemoryMode>>>;
 
 impl SessionHandle {
     /// Mint a handle + the actor's ends. Used by `SessionActor` (A1) and the
@@ -94,6 +102,7 @@ impl SessionHandle {
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
         let cache_keepwarm = super::cache_keepwarm::OverrideSlot::default();
+        let memory_mode = MemoryModeSlot::default();
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
@@ -105,6 +114,7 @@ impl SessionHandle {
             presence: Arc::clone(&presence),
             name: Arc::clone(&name),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
+            memory_mode: Arc::clone(&memory_mode),
             placeholder_config: None,
         };
         (
@@ -118,6 +128,7 @@ impl SessionHandle {
                 presence,
                 name,
                 cache_keepwarm,
+                memory_mode,
             },
         )
     }
@@ -169,6 +180,14 @@ impl SessionHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .map(|m| m.to_string())
+    }
+
+    /// The session's explicit `/memory` choice, if it made one.
+    pub fn memory_mode(&self) -> Option<super::SessionMemoryMode> {
+        *self
+            .memory_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
@@ -512,6 +531,11 @@ pub mod locked_placeholder {
             prompt_inspection: None,
         };
         let (handle, ep) = SessionHandle::new(meta, view);
+        // It never answers a checkpoint: a reload records it from the
+        // handle, which must carry its memory choice like a live actor's.
+        *ep.memory_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config.memory_mode;
         let handle = handle.with_placeholder_config(config.clone());
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);

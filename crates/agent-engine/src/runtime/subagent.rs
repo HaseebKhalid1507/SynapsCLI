@@ -527,6 +527,34 @@ impl SubagentHandle {
         }
     }
 
+    /// Cancel this worker only if it is still running, decided under the
+    /// state write lock the worker thread records its completion under
+    /// (`Running` → `Completed` only while no cancel is requested): either
+    /// the worker completed first and keeps its result, or the cancel wins
+    /// and it never completes. Checking the status under one lock and
+    /// cancelling under another let a worker finish in between and still
+    /// be flagged — its finalizer then relabelled the result Cancelled and
+    /// suppressed its wake. Returns whether this call cancelled it; `false`
+    /// when it already finished, is finalizing, or a cancel is in flight.
+    pub fn cancel_if_running(&mut self) -> bool {
+        let cancel = {
+            let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+            let cancel = matches!(s.status, SubagentStatus::Running)
+                && !s.finalization_started
+                && !s.cancel_requested;
+            if cancel {
+                s.cancel_requested = true;
+            }
+            cancel
+        };
+        if cancel {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        cancel
+    }
+
     /// True if the subagent is no longer running.
     pub fn is_finished(&self) -> bool {
         !matches!(self.status(), SubagentStatus::Running)
@@ -568,6 +596,21 @@ impl SubagentHandle {
                 .await
                 .map_err(|_| "subagent result channel dropped".to_string()),
             None => Err("no result receiver — already collected or never set".to_string()),
+        }
+    }
+}
+
+/// A handle dropped while its worker still runs (a registry dropped with
+/// its runtime, a collect abandoned mid-wait) takes the shutdown channel
+/// with it, which kills the worker; its stream then ends quietly and the
+/// run would read as a truncated "completed". Flag the cancel first, under
+/// the lock the worker records its completion with, so the finalizer labels
+/// it cancelled. A finished or finalizing worker is left alone.
+impl Drop for SubagentHandle {
+    fn drop(&mut self) {
+        let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+        if matches!(s.status, SubagentStatus::Running) && !s.finalization_started {
+            s.cancel_requested = true;
         }
     }
 }
@@ -624,6 +667,11 @@ pub struct SubagentRegistry {
     // are cancelled before their thread can start inference.
     spawn_cancellation: Option<crate::CancellationToken>,
     spawn_epoch: u64,
+    /// `Some(fence before)` from a daemon reload's
+    /// [`Self::stop_for_reload`] until [`Self::lift_reload_fence`] (a failed
+    /// exec): every registration in between is stopped at birth, flagged as
+    /// the reload's (carried and announced like the workers it stopped).
+    reload_fence: Option<Option<crate::CancellationToken>>,
     /// Foreground turn generation, advanced by the session at every turn
     /// start and stamped on each handle at registration. `0` until a
     /// frontend opts in by calling [`Self::begin_turn`].
@@ -656,6 +704,7 @@ impl SubagentRegistry {
             reload_woken: HashMap::new(),
             spawn_cancellation: None,
             spawn_epoch: 0,
+            reload_fence: None,
             turn_generation: 0,
             archived: HashMap::new(),
             retained_watch: HashMap::new(),
@@ -742,21 +791,11 @@ impl SubagentRegistry {
         let mut cancelled: Vec<String> = self
             .handles
             .values_mut()
-            .filter(|h| h.status() == SubagentStatus::Running)
-            .filter(|h| {
-                !h.state
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .cancel_requested
-            })
             .filter(|h| match scope {
                 WorkerCancelScope::All => true,
                 WorkerCancelScope::Turn(generation) => h.launch_turn == generation,
             })
-            .map(|h| {
-                h.cancel();
-                h.id.clone()
-            })
+            .filter_map(|h| h.cancel_if_running().then(|| h.id.clone()))
             .collect();
         cancelled.sort();
         cancelled
@@ -788,7 +827,17 @@ impl SubagentRegistry {
         mut handle: SubagentHandle,
         origin: Option<&crate::CancellationToken>,
     ) -> String {
-        if origin.is_some_and(|c| c.is_cancelled())
+        if self.reload_fence.is_some() {
+            // Launched while a reload stops this session's workers: the
+            // reload stops it too (not the user, whatever cancelled the
+            // launching turn), so it is carried and its parent woken.
+            handle
+                .state
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .stopped_by_reload = true;
+            handle.cancel();
+        } else if origin.is_some_and(|c| c.is_cancelled())
             || self
                 .spawn_cancellation
                 .as_ref()
@@ -841,6 +890,25 @@ impl SubagentRegistry {
                 handle.make_tombstone();
             }
         }
+    }
+
+    /// Whether parking the session now would cost a worker. Parking drops
+    /// this registry: a running worker's handle takes its shutdown channel
+    /// with it (the worker is killed and reads as a truncated completion),
+    /// and a finished one's result is no longer collectable by id. So: any
+    /// worker still running, or one that finished on its own within
+    /// [`FINISHED_HANDLE_TTL`] (the registry's own retention) and whose
+    /// result the parent has not collected yet. A cancelled worker owes no
+    /// result.
+    pub fn holds_park(&self) -> bool {
+        self.handles.values().any(|h| {
+            if h.status() == SubagentStatus::Running {
+                return true;
+            }
+            let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+            let fresh = s.finished_at.map_or(true, |t| t.elapsed() < FINISHED_HANDLE_TTL);
+            fresh && !h.collected && !s.cancel_requested
+        })
     }
 
     /// Returns (id, agent_name, status) for every tracked handle.
@@ -1169,6 +1237,80 @@ mod tests {
 
     fn make_handle(id: &str) -> SubagentHandle {
         make_test_handle(id).handle
+    }
+
+    /// What `tools/subagent/start.rs` does when the worker's run returns:
+    /// `Completed`, only while still running with no cancel requested.
+    fn complete_like_the_worker_thread(state: &Arc<RwLock<SubagentState>>) {
+        let mut s = state.write().unwrap();
+        if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
+            s.status = SubagentStatus::Completed;
+        }
+    }
+
+    /// Dropping a running worker's handle drops its shutdown channel, which
+    /// kills the worker; its stream then ends quietly and it would read as a
+    /// truncated "completed". The drop flags the cancel first, so the
+    /// finalizer labels it cancelled. A finished (or finalizing) worker's
+    /// drop changes nothing.
+    #[test]
+    fn dropping_a_running_handle_flags_its_cancel() {
+        let mut registry = SubagentRegistry::new();
+        let running = make_handle("sa_1");
+        let running_state = Arc::clone(&running.state);
+        let finished = make_finished_handle("sa_2");
+        let finished_state = Arc::clone(&finished.state);
+        let finalizing = make_handle("sa_3");
+        let finalizing_state = Arc::clone(&finalizing.state);
+        finalizing_state.write().unwrap().finalization_started = true;
+        for h in [running, finished, finalizing] {
+            registry.register(h);
+        }
+        drop(registry);
+        assert!(running_state.read().unwrap().cancel_requested, "a killed run is a cancel");
+        assert!(!finished_state.read().unwrap().cancel_requested, "its completion stands");
+        assert!(!finalizing_state.read().unwrap().cancel_requested, "already deciding");
+        // The worker thread, finishing after the kill, cannot claim Completed.
+        complete_like_the_worker_thread(&running_state);
+        assert_eq!(running_state.read().unwrap().status, SubagentStatus::Running);
+    }
+
+    /// A cancel racing the worker's own completion must decide under the
+    /// lock the worker records it with: either the worker completed first
+    /// (its result stands, no cancel flag) or the cancel won (it never
+    /// completes). Status read and cancel taken under separate locks let a
+    /// worker complete in between and still be flagged — the finalizer then
+    /// relabels the finished work Cancelled and drops its result.
+    #[test]
+    fn cancel_running_never_flags_a_worker_that_completed_meanwhile() {
+        for round in 0..5_000 {
+            let mut registry = SubagentRegistry::new();
+            let h = make_handle("sa_1");
+            let state = Arc::clone(&h.state);
+            registry.register(h);
+            let go = Arc::new(std::sync::Barrier::new(2));
+            let worker = {
+                let (go, state) = (Arc::clone(&go), Arc::clone(&state));
+                // Sweep where the completion lands relative to the cancel.
+                let spin = round % 4_000;
+                std::thread::spawn(move || {
+                    go.wait();
+                    for _ in 0..spin {
+                        std::hint::spin_loop();
+                    }
+                    complete_like_the_worker_thread(&state);
+                })
+            };
+            go.wait();
+            let cancelled = registry.cancel_running(WorkerCancelScope::All);
+            worker.join().unwrap();
+            let s = state.read().unwrap();
+            assert!(
+                !(s.status == SubagentStatus::Completed && s.cancel_requested),
+                "round {round}: completed AND flagged cancelled"
+            );
+            assert_eq!(cancelled.is_empty(), !s.cancel_requested, "round {round}");
+        }
     }
 
     fn make_finished_handle(id: &str) -> SubagentHandle {
