@@ -133,6 +133,8 @@ fn refused_while_draining(cmd: &SessionCommand) -> bool {
         )
 }
 
+// One frame per read, matched at once: boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum Read {
     Frame(ClientFrame),
     Eof,

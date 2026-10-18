@@ -140,6 +140,9 @@ mod tests {
         assert_eq!(xai.levels, crate::runtime::openai::catalog::validation::thinking_options_for_model("xai-auth/grok-4.5"));
     }
 
+    // The guard serializes the process-global Muse cache across tests; this
+    // test's runtime is current-thread, so nothing else here waits on it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn warm_is_opt_in_and_goes_through_the_given_broker_once() {
         let _guard = muse::test_cache_guard();

@@ -520,7 +520,7 @@ impl AcceptedEvents {
     }
 
     fn allows_name(&self, name: Option<&str>) -> bool {
-        name.is_none_or(|n| self.0.contains(&n))
+        name.map_or(true, |n| self.0.contains(&n))
     }
 
     /// Whether `event` may be sent on this connection.
@@ -2112,7 +2112,7 @@ mod tests {
         let bare: ClientFrame = decode_line(r#"{"type":"children"}"#).unwrap();
         assert!(matches!(bare, ClientFrame::Children { id: None, session_id: None, sid: None, members: false }));
 
-        let r = serde_json::to_value(&DaemonFrame::ChildList(child_list_sample())).unwrap();
+        let r = serde_json::to_value(DaemonFrame::ChildList(child_list_sample())).unwrap();
         let child = serde_json::json!({"pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188});
         assert_eq!(
             r,
@@ -2154,7 +2154,7 @@ mod tests {
         let bare: ClientFrame = decode_line(r#"{"type":"thinking_options","model":null}"#).unwrap();
         assert!(matches!(bare, ClientFrame::ThinkingOptions { id: None, model: None, warm: false }));
         assert_eq!(
-            serde_json::to_value(&thinking_options_sample()).unwrap(),
+            serde_json::to_value(thinking_options_sample()).unwrap(),
             serde_json::json!({"type":"thinking_options_result","id":8,"model":"muse/muse-wonder-1.0",
                 "options":{"levels":["adaptive","low","medium","high","xhigh"],"exact":true,"basis":"live","default_level":"high"}})
         );
