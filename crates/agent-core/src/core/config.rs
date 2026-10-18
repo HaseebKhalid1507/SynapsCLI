@@ -1552,8 +1552,21 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
 fn unknown_auth_key_warning(key: &str) -> Option<String> {
     const EXACT: [&str; 2] = ["auth.remote_endpoint", "auth.machine_token"];
     const FAMILIES: [&str; 2] = ["auth.account", "auth.auto"];
-    if EXACT.contains(&key) || FAMILIES.iter().any(|f| key.starts_with(&format!("{f}."))) {
+    const PLACEHOLDERS: [&str; 2] = ["<provider>", "<key>"];
+    if EXACT.contains(&key) {
         return None;
+    }
+    for (family, placeholder) in FAMILIES.iter().zip(PLACEHOLDERS) {
+        match key.strip_prefix(family) {
+            // `auth.account` or `auth.account.` (no provider): name the shape.
+            Some("") | Some(".") => {
+                return Some(format!(
+                    "unknown key '{key}' (did you mean '{family}.{placeholder}'?)"
+                ))
+            }
+            Some(rest) if rest.starts_with('.') && !rest[1..].trim().is_empty() => return None,
+            _ => {}
+        }
     }
     // A family typo keeps its suffix: `auth.acount.x` → `auth.account.x`.
     let (head, rest) = match key.match_indices('.').nth(1) {
@@ -1606,7 +1619,7 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
                         .insert(provider.to_string(), v.to_string());
                 }
             }
-            if let Some(key) = key.strip_prefix("auth.auto.") {
+            if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
                 auth_config.auto.insert(key.to_string(), v.to_string());
             }
             // Other unknown auth.* keys preserved (not rejected)
@@ -2003,12 +2016,14 @@ fn apply_config_content_with(
                     parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
-                    if let Some(key) = key.strip_prefix("auth.auto.") {
+                    if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
                         let (_, warnings) = crate::auth::AutoSelectionPolicy::from_config_map(
                             &BTreeMap::from([(key.to_string(), val.trim().to_string())]));
                         config.warnings.extend(warnings);
                     }
-                    if let Some(provider) = key.strip_prefix("auth.account.") {
+                    if let Some(provider) =
+                        key.strip_prefix("auth.account.").filter(|p| !p.trim().is_empty())
+                    {
                         let mut one = BTreeMap::new();
                         one.insert(provider.trim().to_string(), val.trim().to_string());
                         let (_, warnings) =
@@ -4438,6 +4453,27 @@ api_retries = 5
         let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
         assert_eq!(cfg.shell.max_sessions, 8);
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    #[test]
+    fn bare_or_empty_auth_family_keys_warn() {
+        let cfg = load_config_from_str(
+            "auth.account = work\nauth.account. = work\nauth.auto = on\nauth.auto. = 1\n",
+        );
+        let w = &cfg.warnings;
+        for key in ["auth.account", "auth.account."] {
+            assert!(
+                w.contains(&format!("unknown key '{key}' (did you mean 'auth.account.<provider>'?)")),
+                "{key}: {w:?}"
+            );
+        }
+        for key in ["auth.auto", "auth.auto."] {
+            assert!(
+                w.contains(&format!("unknown key '{key}' (did you mean 'auth.auto.<key>'?)")),
+                "{key}: {w:?}"
+            );
+        }
+        assert!(cfg.auth.accounts.is_empty() && cfg.auth.auto.is_empty());
     }
 
     #[test]
