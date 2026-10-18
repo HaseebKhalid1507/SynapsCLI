@@ -36,6 +36,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo build --features testing
 
+  # The `--no-default-features` build (no bash/shell_* tools). No other job
+  # compiles it, so its cfg gates rot silently without this. The registry test
+  # is the only check that the gated tools are really absent.
+  hardened-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo build --no-default-features --locked
+      - run: cargo test --workspace --no-default-features --locked --no-run
+      - run: cargo test -p synaps-engine --no-default-features --locked --lib tools::registry
+
   # Every other job runs on Linux, so macOS-only breakage (e.g. `libc::mode_t`
   # is u16 there, u32 on Linux) first surfaced in the v0.10.0 release build.
   # This compiles what a release compiles — workspace libs + bins — on a Mac.

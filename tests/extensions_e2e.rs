@@ -143,6 +143,7 @@ async fn time_extension_continues_for_non_message_hooks() {
 
 static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "command-exec")]
 #[tokio::test(flavor = "current_thread")]
 async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
     let fixture = std::env::current_dir()

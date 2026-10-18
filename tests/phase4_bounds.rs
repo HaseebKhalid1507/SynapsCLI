@@ -30,9 +30,11 @@ use synaps_cli::tools::ledger::CallLedger;
 use synaps_cli::tools::output::{
     active_ui_forwarder_count, delta_channel_with_budgets, spawn_ui_forwarder, OutputBudgets,
 };
+#[cfg(feature = "command-exec")]
+use synaps_cli::tools::{bash_intermediary_snapshot, BashTool};
 use synaps_cli::tools::{
-    bash_intermediary_snapshot, BashTool, ConcurrencyKey, SubagentRegistry, SubagentStartTool,
-    Tool, ToolCapabilities, ToolChannels, ToolContext, ToolLimits, ToolOrigin,
+    ConcurrencyKey, SubagentRegistry, SubagentStartTool, Tool, ToolCapabilities, ToolChannels,
+    ToolContext, ToolLimits, ToolOrigin,
 };
 use synaps_cli::{BudgetDimension, Result, TurnOutcome, Value};
 use tokio_util::sync::CancellationToken;
@@ -563,6 +565,7 @@ async fn synthetic_one_gib_slow_consumer_stays_under_fixed_retention_ceiling() {
     );
 }
 
+#[cfg(feature = "command-exec")]
 #[tokio::test]
 async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
     let before = bash_intermediary_snapshot();

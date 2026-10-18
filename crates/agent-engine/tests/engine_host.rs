@@ -94,7 +94,8 @@ async fn worker_runtime_fresh_hookbus_and_private_registry() {
     let reg = w.tools_shared();
     let reg = reg.read().await;
     assert!(reg.get("subagent").is_none());
-    assert!(reg.get("bash").is_some());
+    // `bash` exists only when the command-exec feature is compiled in.
+    assert_eq!(reg.get("bash").is_some(), cfg!(feature = "command-exec"));
 }
 
 #[tokio::test]

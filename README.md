@@ -73,6 +73,13 @@ cargo build --release && ./target/release/synaps
 
 Linux and macOS. Windows is not supported.
 
+`cargo build --release --no-default-features` drops the `command-exec` feature:
+the `bash` tool is compiled out and the `shell_*` tools are never registered.
+That is all it removes. It is not a sandbox. The agent can still start
+processes indirectly: `write`/`edit` can change shell rc files, `mcp.json`,
+plugin manifests or watcher configs; a watcher's `wake_if` runs through `sh -c`;
+and extensions, MCP servers and plugin commands all spawn processes.
+
 *New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
 
 ---
