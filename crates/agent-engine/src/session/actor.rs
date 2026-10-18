@@ -1010,7 +1010,7 @@ impl SessionActor {
         self.emit(SessionEventWire::Idle);
         self.cache_keepwarm_on_idle().await;
         #[cfg(any(test, feature = "testing"))]
-        if super::session_start::testing::take_requeue() {
+        if super::session_start::testing::take_requeue(&self.journal_id.load()) {
             self.queue_session_start();
         }
     }

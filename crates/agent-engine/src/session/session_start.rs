@@ -286,6 +286,8 @@ async fn run_queued(
 /// injection lock.
 async fn emit_keyed(bus: &Arc<HookBus>, journal_id: &arc_swap::ArcSwap<String>, ticket: &StartTicket) {
     let id = (**journal_id.load()).clone();
+    #[cfg(any(test, feature = "testing"))]
+    testing::note_call(&id);
     crate::extensions::loader::emit_session_start(bus, &id).await;
     if ticket.has_ended() {
         bus.clear_session_injection(&id).await;
@@ -303,8 +305,6 @@ where
     if !ticket.begin() {
         return false;
     }
-    #[cfg(any(test, feature = "testing"))]
-    testing::note_call();
     call().await;
     drop(permit);
     true
@@ -316,44 +316,61 @@ pub(crate) async fn run_at_create(host: &EngineHost, bus: &Arc<HookBus>, session
     let ticket = StartTicket::new(true);
     let permit = host.session_start_gate().acquire(&ticket).await;
     #[cfg(any(test, feature = "testing"))]
-    testing::note_call();
+    testing::note_call(session_id);
     crate::extensions::loader::emit_session_start(bus, session_id).await;
     drop(permit);
 }
 
 /// Test-only controls (`cfg(test)` / the `testing` feature). Set only by
 /// code, like `cache_keepwarm::testing::IntervalOverride`: no binary input
-/// (env, config, argv) reaches them. Process-wide, so tests that use them
-/// must be `#[serial]`.
+/// (env, config, argv) reaches them.
+///
+/// Both controls are scoped to one session, named by its journal id (the
+/// key its hook gets): only `#[serial]` tests are serialized, and the other
+/// tests of the same binary run their own sessions meanwhile, so an
+/// unscoped flag or count could be taken or moved by them. The requeue slot
+/// holds one session at a time, so tests that set it must be `#[serial]`
+/// with each other.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, MutexGuard};
 
-    static REQUEUE_AFTER_TURN: AtomicBool = AtomicBool::new(false);
-    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static REQUEUE_AFTER_TURN: Mutex<Option<String>> = Mutex::new(None);
+    static CALLS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
-    /// The next turn to end (in any session of this process) puts a fresh
-    /// `on_session_start` back in line, as if it had not run yet. With the
-    /// keep-warm period that turn starts, this reaches a ping that is due
-    /// while the hook is pending, which no production path does today: a
-    /// period needs an accepted request, and that request waited for the
-    /// hook. One-shot.
-    pub fn requeue_after_next_turn() {
-        REQUEUE_AFTER_TURN.store(true, Ordering::SeqCst);
+    fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Consume the request above (the actor, at a turn's end).
-    pub(crate) fn take_requeue() -> bool {
-        REQUEUE_AFTER_TURN.swap(false, Ordering::SeqCst)
+    /// The next turn of `session` to end puts a fresh `on_session_start`
+    /// back in line, as if it had not run yet. With the keep-warm period
+    /// that turn starts, this reaches a ping that is due while the hook is
+    /// pending, which no production path does today: a period needs an
+    /// accepted request, and that request waited for the hook. One-shot.
+    pub fn requeue_after_next_turn(session: &str) {
+        *lock(&REQUEUE_AFTER_TURN) = Some(session.to_string());
     }
 
-    /// `on_session_start` calls made through the gate in this process.
-    pub fn calls() -> u64 {
-        CALLS.load(Ordering::SeqCst)
+    /// Consume the request above if it names `session` (its actor, at a
+    /// turn's end).
+    pub(crate) fn take_requeue(session: &str) -> bool {
+        let mut slot = lock(&REQUEUE_AFTER_TURN);
+        if slot.as_deref() == Some(session) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
     }
 
-    pub(super) fn note_call() {
-        CALLS.fetch_add(1, Ordering::SeqCst);
+    /// `on_session_start` calls made through the gate for `session`.
+    pub fn calls(session: &str) -> u64 {
+        lock(&CALLS).get(session).copied().unwrap_or(0)
+    }
+
+    pub(super) fn note_call(session: &str) {
+        *lock(&CALLS).entry(session.to_string()).or_insert(0) += 1;
     }
 
     /// Holds the host's session-start gate while alive: every hook in line

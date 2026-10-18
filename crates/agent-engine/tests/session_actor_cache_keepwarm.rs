@@ -1244,28 +1244,29 @@ async fn period_with_a_pending_hook(
         .await
         .unwrap();
     let hold = start_seam::hold_gate(&host).await;
-    let calls = start_seam::calls();
-    start_seam::requeue_after_next_turn();
+    let sid = handle.journal_id();
+    let calls = start_seam::calls(&sid);
+    start_seam::requeue_after_next_turn(&sid);
     turn(&mut t, "hello").await;
     let st = keepwarm(&mut t, 700, "status").await;
     assert_eq!(st["active"], true, "the turn started a period: {st}");
     // The first ping is due one 300 ms interval after the turn's request.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(pings(&bodies), 0, "no ping before on_session_start has run");
-    assert_eq!(start_seam::calls(), calls, "the hook is still in line");
+    assert_eq!(start_seam::calls(&sid), calls, "the hook is still in line");
     (t, handle, bodies, hold, calls)
 }
 
 /// Wait (bounded) until `n` hooks have run since `base`.
-async fn hooks_run(base: u64, n: u64, for_: Duration) -> bool {
+async fn hooks_run(sid: &str, base: u64, n: u64, for_: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + for_;
     while tokio::time::Instant::now() < deadline {
-        if start_seam::calls() >= base + n {
+        if start_seam::calls(sid) >= base + n {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    start_seam::calls() >= base + n
+    start_seam::calls(sid) >= base + n
 }
 
 /// Held: no ping, no busy loop (the timer is off, so a passed deadline does
@@ -1277,7 +1278,7 @@ async fn a_due_ping_waits_for_a_pending_session_start_hook_without_spinning() {
     let h = Home::new();
     write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
     let _interval = fast_pings();
-    let (mut t, _handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
 
     let checks = due_checks();
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1293,7 +1294,7 @@ async fn a_due_ping_waits_for_a_pending_session_start_hook_without_spinning() {
         wait_pings(&bodies, 1, PATIENCE).await,
         "the held ping goes out once the hook has run"
     );
-    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
     end(&mut t).await;
 }
 
@@ -1305,12 +1306,12 @@ async fn keepwarm_off_while_a_ping_waits_for_the_hook_sends_nothing() {
     let h = Home::new();
     write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
     let _interval = fast_pings();
-    let (mut t, _handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
 
     let st = keepwarm(&mut t, 710, "off").await;
     assert_eq!(st["active"], false, "{st}");
     drop(hold);
-    assert!(hooks_run(calls, 1, PATIENCE).await, "the hook runs");
+    assert!(hooks_run(&handle.journal_id(), calls, 1, PATIENCE).await, "the hook runs");
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(pings(&bodies), 0, "keep-warm was turned off before the hook ran");
 
@@ -1332,7 +1333,7 @@ async fn a_turn_while_a_ping_waits_for_the_hook_goes_first_and_alone() {
     let h = Home::new();
     write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
     let _interval = fast_pings();
-    let (mut t, _handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
 
     let before = bodies.lock().unwrap().len();
     t.send(submit("second")).await.unwrap();
@@ -1351,7 +1352,7 @@ async fn a_turn_while_a_ping_waits_for_the_hook_goes_first_and_alone() {
         assert!(!next.contains(PING_MARK), "the turn's request comes first, not the held ping");
         assert!(next.contains("second"), "it is the second turn's request");
     }
-    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
     end(&mut t).await;
 }
 
@@ -1378,13 +1379,13 @@ async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
     );
     drop(hold);
     tokio::time::sleep(Duration::from_millis(900)).await;
-    assert_eq!(start_seam::calls(), calls, "no hook runs while parked");
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls, "no hook runs while parked");
     assert_eq!(pings(&bodies), 0, "no ping while parked");
 
     let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
         .await
         .unwrap();
-    assert!(hooks_run(calls, 1, PATIENCE).await, "the hook runs after the unpark");
+    assert!(hooks_run(&handle.journal_id(), calls, 1, PATIENCE).await, "the hook runs after the unpark");
     let st = keepwarm(&mut t, 720, "status").await;
     assert_eq!(st["last_end"], "parked by request", "{st}");
     let before = bodies.lock().unwrap().len();
@@ -1394,6 +1395,6 @@ async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
         let next = all.get(before).expect("the turn sent its request");
         assert!(!next.contains(PING_MARK) && next.contains("after"), "the turn's own request");
     }
-    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once in all");
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once in all");
     end(&mut t).await;
 }

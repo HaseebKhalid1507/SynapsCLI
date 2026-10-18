@@ -1746,8 +1746,9 @@ async fn hook_pending_after_a_turn(
     host: &Arc<EngineHost>,
 ) -> (start_seam::GateHold, u64) {
     let hold = start_seam::hold_gate(host).await;
-    let calls = start_seam::calls();
-    start_seam::requeue_after_next_turn();
+    let sid = actor.handle.journal_id();
+    let calls = start_seam::calls(&sid);
+    start_seam::requeue_after_next_turn(&sid);
     actor
         .send(SessionCommand::Submit {
             text: "first".into(),
@@ -1758,11 +1759,11 @@ async fn hook_pending_after_a_turn(
     (hold, calls)
 }
 
-/// Wait (bounded) until `n` hooks have run since `base`.
-async fn hooks_run(base: u64, n: u64) -> bool {
+/// Wait (bounded) until `n` hooks of session `sid` have run since `base`.
+async fn hooks_run(sid: &str, base: u64, n: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
-        if start_seam::calls() >= base + n {
+        if start_seam::calls(sid) >= base + n {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1801,17 +1802,17 @@ async fn a_driver_start_while_on_session_start_is_pending_is_rejected_before_any
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(hits.load(SeqCst), sent, "no request while the hook is pending");
-    assert_eq!(start_seam::calls(), calls, "the hook still waits");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls, "the hook still waits");
 
     drop(hold);
-    assert!(hooks_run(calls, 1).await, "the hook runs");
+    assert!(hooks_run(&actor.handle.journal_id(), calls, 1).await, "the hook runs");
     // With the hook done, a driver arms and runs its turn as usual.
     actor.arm().await;
     actor
         .until(|e| matches!(e, SessionEventWire::DriverTurnOutcome { .. }))
         .await;
     assert!(hits.load(SeqCst) > sent, "the driver turn sent its request");
-    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
     actor.send(SessionCommand::Cancel).await;
     actor.end().await;
 }
@@ -1823,9 +1824,10 @@ async fn an_armed_driver_finding_on_session_start_pending_is_revoked_before_its_
     let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
     let mut actor = session(&host).await;
     let hold = start_seam::hold_gate(&host).await;
-    let calls = start_seam::calls();
+    let sid = actor.handle.journal_id();
+    let calls = start_seam::calls(&sid);
     // The driver's first turn ends with a fresh hook in line, behind the hold.
-    start_seam::requeue_after_next_turn();
+    start_seam::requeue_after_next_turn(&sid);
     actor.arm().await;
 
     let seen = actor
@@ -1848,10 +1850,10 @@ async fn an_armed_driver_finding_on_session_start_pending_is_revoked_before_its_
     assert_eq!(hits.load(SeqCst), sent, "no request after the revocation");
 
     drop(hold);
-    assert!(hooks_run(calls, 1).await, "the hook runs");
+    assert!(hooks_run(&actor.handle.journal_id(), calls, 1).await, "the hook runs");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(hits.load(SeqCst), sent, "the revoked driver sends nothing");
-    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
     actor.end().await;
 }
 
@@ -1896,6 +1898,6 @@ async fn a_turn_waiting_for_on_session_start_outlasts_a_rejected_driver_start() 
         "only the waiting turn runs: {seen:?}"
     );
     assert_eq!(hits.load(SeqCst), sent + 1, "the waiting turn sent its request once");
-    assert_eq!(start_seam::calls(), calls + 1, "the hook ran once");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
     actor.end().await;
 }
