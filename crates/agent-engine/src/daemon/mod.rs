@@ -10,6 +10,7 @@
 
 pub mod close;
 pub mod conn;
+pub mod control_queries;
 pub mod lifecycle;
 pub mod listener;
 pub mod pin;

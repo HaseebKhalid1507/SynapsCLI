@@ -374,3 +374,96 @@ fn auth_state_cli_without_a_daemon_lists_accounts_and_refuses_to_clear() {
         "auth state wrote the credential store"
     );
 }
+
+/// 4/4b: `Welcome.features` lists "children", and the `children` query is a
+/// control frame answered before Attach and on an attached connection, from
+/// the process-wide ledger (session filter, sid filter, unknown session).
+#[tokio::test]
+#[serial]
+async fn children_query_is_answered_before_and_after_attach() {
+    use agent_engine::session::children;
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let me = children::identify(std::process::id()).expect("own stat");
+    // A live process leading its own session, for the second session's
+    // record. A made-up identity would be dropped by the ledger's sweep
+    // (a live pid with other start_ticks is a reused pid).
+    let mut sleeper = std::process::Command::new("setsid").args(["sleep", "30"]).spawn().expect("setsid sleep");
+    let other = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(id) = children::identify(sleeper.id()).filter(|id| id.sid == id.pid) {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "the setsid child never led its session");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_ne!(other.sid, me.sid);
+    let spawn = |tool_id: &str, child: children::ChildIdentity| children::ChildSpawn {
+        tool_id: tool_id.into(),
+        tool_name: "bash".into(),
+        handle_id: None,
+        shell_session_id: None,
+        child,
+    };
+    assert!(children::record_spawn("hs-children-a", spawn("t-me", me.clone())));
+    assert!(children::record_spawn("hs-children-b", spawn("t-other", other.clone())));
+
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => assert!(w.features.iter().any(|f| f == "children"), "{:?}", w.features),
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: Some(11), session_id: Some("hs-children-a".into()), sid: None, members: true })
+        .await;
+    match c.recv().await {
+        Some(DaemonFrame::ChildList(r)) => {
+            assert_eq!((r.id, r.supported, r.boot_id.as_deref()), (Some(11), true, Some(me.boot_id.as_str())));
+            assert_eq!(r.sessions.len(), 1);
+            let entry = &r.sessions[0].children[0];
+            assert_eq!((entry.tool_id.as_str(), &entry.child), ("t-me", &me));
+            let members = entry.members.as_ref().expect("members asked for");
+            assert!(members.iter().any(|m| m.pid == me.pid && m.start_ticks == me.start_ticks));
+            assert!(r.host.is_empty(), "the host list comes only without a session filter");
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: None, session_id: None, sid: Some(me.sid), members: false }).await;
+    match c.recv().await {
+        Some(DaemonFrame::ChildList(r)) => {
+            let ids: Vec<&str> = r.sessions.iter().map(|s| s.session_id.as_str()).collect();
+            assert!(ids.contains(&"hs-children-a") && !ids.contains(&"hs-children-b"), "{ids:?}");
+            assert!(r.sessions.iter().flat_map(|s| &s.children).all(|e| e.child.sid == me.sid && e.members.is_none()));
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: Some(12), session_id: Some("hs-no-such".into()), sid: None, members: false })
+        .await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::ChildList(r)) if r.id == Some(12) && r.sessions.is_empty()));
+
+    // On an attached connection too.
+    c.send(&ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Mirror })).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Attached(_))));
+    c.send(&ClientFrame::Children { id: Some(13), session_id: Some("hs-children-b".into()), sid: None, members: false })
+        .await;
+    loop {
+        match c.recv().await {
+            Some(DaemonFrame::Event(_)) => continue,
+            Some(DaemonFrame::ChildList(r)) => {
+                assert_eq!(r.id, Some(13));
+                let entry = &r.sessions[0].children[0];
+                assert_eq!((entry.tool_id.as_str(), &entry.child, entry.state), ("t-other", &other, children::ChildState::Running));
+                break;
+            }
+            frame => panic!("{frame:?}"),
+        }
+    }
+    c.send(&ClientFrame::Bye).await;
+    d.shutdown_token().cancel();
+    d.wait().await;
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}

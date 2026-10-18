@@ -209,6 +209,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
         generation: state.generation,
         daemon_build: crate::session::wire::build_id().to_string(),
+        features: super::control_queries::daemon_features(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -309,6 +310,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             // `synaps auth state`: the host broker's in-memory account state.
             Ok(Read::Frame(ClientFrame::AuthState(query))) => {
                 let _ = tx.send(auth_state_reply(&state, &query)).await;
+            }
+            Ok(Read::Frame(ClientFrame::Children { id, session_id, sid, members })) => {
+                let _ = tx.send(super::control_queries::children_reply(id, session_id, sid, members).await).await;
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
@@ -564,6 +568,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
+            }
+            Ok(Read::Frame(ClientFrame::Children { id, session_id, sid, members })) => {
+                let _ = tx.send(super::control_queries::children_reply(id, session_id, sid, members).await).await;
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;

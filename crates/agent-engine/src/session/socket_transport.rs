@@ -877,6 +877,7 @@ mod tests {
                         progressive_tool_disclosure: true,
                         generation: 1,
                         daemon_build: String::new(),
+                        features: vec![],
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1197,6 +1198,7 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: String::new(),
+                features: vec![],
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();

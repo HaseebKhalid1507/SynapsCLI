@@ -154,6 +154,22 @@ pub enum ClientFrame {
     /// predates this frame answers `Error` "malformed frame: unknown variant
     /// `auth_state`, ..." and keeps the connection usable.
     AuthState(agent_core::auth::AuthStateQuery),
+    /// Control query (no session, also on an attached connection): the
+    /// daemon's child-process ledger. Reply: `ChildList`. Feature "children".
+    Children {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+        /// One session's records; `None` = every session plus the host list.
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        /// Only records whose `child.sid` equals this (filters, attributes nothing).
+        #[serde(default)]
+        sid: Option<u32>,
+        /// Also scan `/proc` for the live processes in each record's sid.
+        #[serde(default)]
+        members: bool,
+    },
     Bye,
 }
 
@@ -189,6 +205,13 @@ impl std::fmt::Debug for ClientFrame {
                 .field("on", on)
                 .finish(),
             Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
+            Self::Children { id, session_id, sid, members } => f
+                .debug_struct("Children")
+                .field("id", id)
+                .field("session_id", session_id)
+                .field("sid", sid)
+                .field("members", members)
+                .finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -321,6 +344,26 @@ pub enum DaemonFrame {
     AuthState {
         report: agent_core::auth::AuthStateReport,
     },
+    /// Answer to `Children`. Only sent on request, so an old client (whose
+    /// `DaemonFrame` has no catch-all) never receives one.
+    ChildList(ChildListReply),
+}
+
+/// The `child_list` reply: the ledger view plus what a client needs to
+/// compare identities (`boot_id`) and display start times (`clk_tck`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildListReply {
+    #[serde(default)]
+    pub id: Option<u64>,
+    /// False off Linux (or without a boot id): no records are kept.
+    pub supported: bool,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    pub clk_tck: u64,
+    #[serde(default)]
+    pub sessions: Vec<super::children::SessionChildren>,
+    #[serde(default)]
+    pub host: Vec<super::children::HostChild>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +407,10 @@ pub struct Welcome {
     /// semver the reload gate parses.
     #[serde(default)]
     pub daemon_build: String,
+    /// Optional control frames this daemon answers ("children", ...), on
+    /// every Welcome including the ones after a reload. Old daemons omit it.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 fn one() -> u64 {
@@ -1094,6 +1141,33 @@ mod tests {
         crate::session::handle::echo::meta_for(&SessionId::from("wire-1"))
     }
 
+    fn child_list_sample() -> ChildListReply {
+        use crate::session::children::*;
+        let child = ChildIdentity { pid: 3646188, start_ticks: 26981650, boot_id: "b".into(), sid: 3646188, pgid: 3646188 };
+        ChildListReply {
+            id: Some(7),
+            supported: true,
+            boot_id: Some("b".into()),
+            clk_tck: 100,
+            sessions: vec![SessionChildren {
+                session_id: "s".into(),
+                truncated: false,
+                children: vec![ChildEntry {
+                    tool_id: "toolu_1".into(),
+                    tool_name: "bash".into(),
+                    handle_id: Some("sa_12".into()),
+                    shell_session_id: None,
+                    child: child.clone(),
+                    state: ChildState::Running,
+                    exit_code: None,
+                    signal: None,
+                    members: Some(vec![ChildMember { pid: 3646201, start_ticks: 26981702 }]),
+                }],
+            }],
+            host: vec![HostChild { owner_kind: HostOwnerKind::McpServer, owner_id: "figma".into(), child }],
+        }
+    }
+
     fn prompt() -> PromptRequest {
         PromptRequest {
             id: 3,
@@ -1642,6 +1716,8 @@ mod tests {
                 account: Some("b".into()),
                 clear: true,
             }),
+            ClientFrame::Children { id: Some(7), session_id: Some("s".into()), sid: Some(42), members: true },
+            ClientFrame::Children { id: None, session_id: None, sid: None, members: false },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1659,6 +1735,7 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: "abc1234".into(),
+                features: vec!["children".into()],
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -1687,6 +1764,7 @@ mod tests {
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
             DaemonFrame::AuthState { report: auth_state_report() },
+            DaemonFrame::ChildList(child_list_sample()),
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -1822,11 +1900,120 @@ mod tests {
             progressive_tool_disclosure: false,
             generation: 1,
             daemon_build: String::new(),
+            features: vec![],
         })
         .unwrap()
         .to_lowercase();
         for bad in ["token", "secret", "api_key", "apikey", "password", "credential"] {
             assert!(!w.contains(bad), "{bad} in Welcome");
+        }
+    }
+
+    /// The names PD vendors (4/4b v1.1). Changing one breaks the app.
+    #[test]
+    fn children_frames_keep_the_agreed_names() {
+        let q: serde_json::Value = serde_json::to_value(&ClientFrame::Children {
+            id: Some(7),
+            session_id: Some("s".into()),
+            sid: Some(42),
+            members: true,
+        })
+        .unwrap();
+        assert_eq!(q, serde_json::json!({"type":"children","id":7,"session_id":"s","sid":42,"members":true}));
+        // Every field is optional on the way in.
+        let bare: ClientFrame = decode_line(r#"{"type":"children"}"#).unwrap();
+        assert!(matches!(bare, ClientFrame::Children { id: None, session_id: None, sid: None, members: false }));
+
+        let r = serde_json::to_value(&DaemonFrame::ChildList(child_list_sample())).unwrap();
+        let child = serde_json::json!({"pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188});
+        assert_eq!(
+            r,
+            serde_json::json!({
+                "type":"child_list","id":7,"supported":true,"boot_id":"b","clk_tck":100,
+                "sessions":[{"session_id":"s","truncated":false,"children":[{
+                    "tool_id":"toolu_1","tool_name":"bash","handle_id":"sa_12","shell_session_id":null,
+                    "child":child,"state":"running","exit_code":null,"signal":null,
+                    "members":[{"pid":3646201,"start_ticks":26981702}]}]}],
+                "host":[{"owner_kind":"mcp_server","owner_id":"figma","child":child}]
+            })
+        );
+        let w = serde_json::to_value(&Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: false,
+            generation: 2,
+            daemon_build: String::new(),
+            features: vec![crate::daemon::control_queries::FEATURE_CHILDREN.into()],
+        })
+        .unwrap();
+        assert_eq!(w["features"], serde_json::json!(["children"]));
+    }
+
+    /// Old peers: a pre-4/4b client decodes the new Welcome (it ignores
+    /// `features`), a new client reads an old Welcome as no features, and a
+    /// pre-4/4b daemon rejects `children` as an unknown variant (conn.rs
+    /// answers that with `Error{"malformed frame: ..."}` and keeps the
+    /// connection).
+    #[test]
+    fn children_and_features_are_compatible_with_old_decoders() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldWelcome {
+            protocol_version: u32,
+            daemon_version: String,
+            pid: u32,
+            profile: Option<String>,
+            sessions: Vec<SessionMeta>,
+            progressive_tool_disclosure: bool,
+            #[serde(default = "one")]
+            generation: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldDaemonFrame {
+            Welcome(OldWelcome),
+            Pong { pid: u32, uptime_s: u64, sessions: usize },
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldClientFrame {
+            Ping,
+            Sessions,
+            Purge,
+            Bye,
+        }
+        let new = encode_line(&DaemonFrame::Welcome(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![meta()],
+            progressive_tool_disclosure: true,
+            generation: 3,
+            daemon_build: String::new(),
+            features: vec!["children".into()],
+        }))
+        .unwrap();
+        match decode_line::<OldDaemonFrame>(new.trim_end()).unwrap() {
+            OldDaemonFrame::Welcome(w) => assert_eq!((w.generation, w.sessions.len()), (3, 1)),
+            OldDaemonFrame::Pong { .. } => panic!("welcome expected"),
+        }
+        let old = r#"{"type":"welcome","protocol_version":3,"daemon_version":"v","pid":1,"profile":null,"sessions":[],"progressive_tool_disclosure":true,"generation":1}"#;
+        match decode_line::<DaemonFrame>(old).unwrap() {
+            DaemonFrame::Welcome(w) => assert!(w.features.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        for query in [
+            ClientFrame::Children { id: Some(1), session_id: None, sid: None, members: false },
+        ] {
+            let line = encode_line(&query).unwrap();
+            let err = decode_line::<OldClientFrame>(line.trim_end()).unwrap_err();
+            assert!(err.contains("unknown variant"), "{err}");
         }
     }
 }

@@ -1173,6 +1173,7 @@ mod state_tests {
                     progressive_tool_disclosure: false,
                     generation: 1,
                     daemon_build: "oldbld1".into(),
+                    features: vec![],
                 });
                 w.write_all(encode_line(&welcome).unwrap().as_bytes())
                     .await
