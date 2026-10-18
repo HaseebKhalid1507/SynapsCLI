@@ -47,15 +47,15 @@ pub async fn exchange_code_for_tokens(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        // Truncate error body — server responses may contain sensitive data
-        // (tokens, internal errors). Status code alone is usually sufficient.
+        // Server responses may contain sensitive data (a proxy echoing the
+        // code/verifier, internal errors): keep only the OAuth error fields.
+        // Byte slicing here also panicked on a non-ASCII body.
         let text = resp.text().await.unwrap_or_default();
-        let truncated = if text.len() > 200 {
-            &text[..200]
-        } else {
-            &text
-        };
-        return Err(format!("Token exchange failed ({}): {}", status, truncated));
+        return Err(format!(
+            "Token exchange failed ({}): {}",
+            status,
+            sanitize_oauth_error_body(&text)
+        ));
     }
 
     let token_resp: TokenResponse = resp
@@ -944,6 +944,11 @@ mod tests {
         // Multi-byte chars at the cap boundary never panic.
         let long = format!(r#"{{"error":"{}"}}"#, "é".repeat(500));
         assert_eq!(s(&long).chars().count(), 120);
+        // The pre-sanitizer exchange path byte-sliced at 200, which panics
+        // when a multi-byte char straddles the cut.
+        let straddle = format!("{}é{}", "a".repeat(199), "b".repeat(50));
+        assert!(!straddle.is_char_boundary(200));
+        assert_eq!(s(&straddle), "<non-JSON error body omitted>");
     }
     /// Failure: a refresh error propagates and persists nothing — the stored
     /// credential is untouched so a later retry can still present it.
