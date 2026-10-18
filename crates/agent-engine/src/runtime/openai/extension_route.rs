@@ -339,6 +339,7 @@ pub(crate) async fn route_extension_provider(
                         tx_events: None,
                     },
                     capabilities: ToolCapabilities {
+                        session_allow_all: None,
                         launch_cancel: None,
                         memory_backend: memory_backend.cloned(),
                         watcher_exit_path: None,

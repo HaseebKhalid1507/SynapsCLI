@@ -177,6 +177,7 @@ mod tests {
             "sa_288",
             &meta,
             "cancelled",
+            None,
             "partial words",
             &[],
         )

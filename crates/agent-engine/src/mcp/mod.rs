@@ -113,6 +113,56 @@ pub const MCP_CONFIG_MAX_ARG_BYTES: usize = 4096;
 pub const MCP_CONFIG_MAX_ENV_KEY_BYTES: usize = 128;
 pub const MCP_CONFIG_MAX_ENV_VALUE_BYTES: usize = 4096;
 
+/// Expand `${VAR}` / `${VAR:-default}` references in an `mcp.json` `env`
+/// value against `lookup` (the parent process env at spawn time).
+///
+/// MCP children are spawned with a CLEARED environment (H3: never leak host
+/// secrets such as `ANTHROPIC_API_KEY`/`AWS_*` to third-party servers). This
+/// is the explicit, per-variable opt-in for forwarding a parent value — the
+/// same `${VAR}` syntax Claude Code / Gemini CLI accept in their `mcpServers`
+/// `env` maps, so configs stay portable. Semantics:
+///   * `${VAR}`           → parent value, or "" when unset
+///   * `${VAR:-fallback}` → parent value, or `fallback` when unset/empty
+///   * anything else (incl. a lone `$`, `$VAR`, unterminated `${`) is literal
+///
+/// Only the FIRST expansion level is applied: a parent value containing `${…}`
+/// is copied verbatim (no recursion, so no expansion loops).
+pub fn expand_env_value(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            // Unterminated: keep the remainder literally.
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let inner = &after[..end];
+        let (name, fallback) = match inner.split_once(":-") {
+            Some((n, f)) => (n, Some(f)),
+            None => (inner, None),
+        };
+        let is_ident = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if is_ident {
+            match lookup(name) {
+                Some(v) if !(v.is_empty() && fallback.is_some()) => out.push_str(&v),
+                _ => out.push_str(fallback.unwrap_or("")),
+            }
+        } else {
+            // Not a variable reference (e.g. `${}` or `${a-b}`): literal.
+            out.push_str(&rest[start..start + 2 + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn safe_str(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -543,6 +593,40 @@ mod tests {
         let server = &config.mcp_servers["test"];
         assert_eq!(server.command, "echo");
         assert_eq!(server.args, vec!["hi"]);
+    }
+
+    #[test]
+    fn expand_env_value_forwards_parent_vars_and_defaults() {
+        let lookup = |k: &str| match k {
+            "BASE_URL" => Some("http://api:3000".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(expand_env_value("${BASE_URL}", lookup), "http://api:3000");
+        assert_eq!(expand_env_value("${BASE_URL}/v1", lookup), "http://api:3000/v1");
+        assert_eq!(expand_env_value("a=${BASE_URL};b=${BASE_URL}", lookup), "a=http://api:3000;b=http://api:3000");
+        // Unset: empty (or the fallback).
+        assert_eq!(expand_env_value("${MISSING}", lookup), "");
+        assert_eq!(expand_env_value("${MISSING:-dflt}", lookup), "dflt");
+        assert_eq!(expand_env_value("${EMPTY:-dflt}", lookup), "dflt");
+        assert_eq!(expand_env_value("${EMPTY}", lookup), "");
+        // Literal forms are untouched.
+        assert_eq!(expand_env_value("plain", lookup), "plain");
+        assert_eq!(expand_env_value("$BASE_URL", lookup), "$BASE_URL");
+        assert_eq!(expand_env_value("${BASE_URL", lookup), "${BASE_URL");
+        assert_eq!(expand_env_value("${}", lookup), "${}");
+        assert_eq!(expand_env_value("${a-b}", lookup), "${a-b}");
+        assert_eq!(expand_env_value("cost $5", lookup), "cost $5");
+    }
+
+    #[test]
+    fn expand_env_value_does_not_recurse() {
+        let lookup = |k: &str| match k {
+            "OUTER" => Some("${INNER}".to_string()),
+            "INNER" => Some("leak".to_string()),
+            _ => None,
+        };
+        assert_eq!(expand_env_value("${OUTER}", lookup), "${INNER}");
     }
 
     #[test]

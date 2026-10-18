@@ -40,12 +40,52 @@ pub struct SecretPromptRequest {
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
+/// Which button of a `Confirm` dialog is focused / was chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmChoice {
+    /// Answer "y": allow this one call.
+    Allow,
+    /// Answer [`CONFIRM_ANSWER_ALLOW_ALL`]: allow this call and latch the
+    /// session so later extension confirms are auto-approved. Only offered
+    /// for `Confirm tool call` prompts (not `activate_tools`).
+    AllowAll,
+    /// Answer `None`: deny (the default focus, so a bare Enter fails closed).
+    Deny,
+}
+
+/// The answer string [`ConfirmChoice::AllowAll`] sends. The runtime's
+/// `resolve_before_tool_call_result` matches on it (re-exported there as
+/// `runtime::CONFIRM_ANSWER_ALLOW_ALL`); defined here so the tools module
+/// does not depend on the runtime module.
+pub const CONFIRM_ANSWER_ALLOW_ALL: &str = "always";
+
 pub struct PendingSecretPrompt {
     pub kind: PromptKind,
     pub title: String,
     pub prompt: String,
     pub buffer: String,
+    /// `Confirm` only: the focused button. Starts on `Deny`.
+    pub confirm_focus: ConfirmChoice,
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+}
+
+impl PendingSecretPrompt {
+    /// Whether the "Allow all (session)" button is offered: only the
+    /// runtime's per-tool-call gate (`Confirm tool call`), never the
+    /// `activate_tools` gate, whose runtime only accepts y/yes.
+    pub fn offers_allow_all(&self) -> bool {
+        self.kind == PromptKind::Confirm
+            && self.title == crate::session::types::CONFIRM_PROMPT_TITLE
+    }
+
+    /// Buttons in display order.
+    pub fn confirm_choices(&self) -> &'static [ConfirmChoice] {
+        if self.offers_allow_all() {
+            &[ConfirmChoice::Allow, ConfirmChoice::AllowAll, ConfirmChoice::Deny]
+        } else {
+            &[ConfirmChoice::Allow, ConfirmChoice::Deny]
+        }
+    }
 }
 
 pub struct SecretPromptQueue {
@@ -89,6 +129,7 @@ impl SecretPromptQueue {
                 title: req.title,
                 prompt: req.prompt,
                 buffer: String::new(),
+                confirm_focus: ConfirmChoice::Deny,
                 response_tx: req.response_tx,
             });
         }
@@ -112,6 +153,71 @@ impl SecretPromptQueue {
         if let Some(active) = self.active.as_mut() {
             active.buffer.pop();
         }
+    }
+
+    /// `Confirm` dialog: move focus to the next / previous button, wrapping.
+    /// No-op for `Secret` prompts.
+    pub fn move_confirm_focus(&mut self, forward: bool) {
+        if let Some(active) = self.active.as_mut() {
+            if active.kind != PromptKind::Confirm {
+                return;
+            }
+            let choices = active.confirm_choices();
+            let i = choices
+                .iter()
+                .position(|c| *c == active.confirm_focus)
+                .unwrap_or(choices.len() - 1);
+            let n = choices.len();
+            active.confirm_focus = choices[if forward { (i + 1) % n } else { (i + n - 1) % n }];
+        }
+    }
+
+    /// `Confirm` dialog: the focused button (`Deny` when no confirm is active).
+    pub fn confirm_focus(&self) -> ConfirmChoice {
+        self.active
+            .as_ref()
+            .filter(|a| a.kind == PromptKind::Confirm)
+            .map_or(ConfirmChoice::Deny, |a| a.confirm_focus)
+    }
+
+    /// `Confirm` dialog: whether the "Allow all (session)" button is offered.
+    pub fn confirm_offers_allow_all(&self) -> bool {
+        self.active.as_ref().is_some_and(|a| a.offers_allow_all())
+    }
+
+    /// `Confirm` dialog: answer with `choice`. `AllowAll` on a prompt that
+    /// does not offer it degrades to `Allow` (never to a stray string the
+    /// gate would treat as a deny). Returns the choice actually sent, or
+    /// `None` when no confirm dialog is active.
+    pub fn confirm_answer(&mut self, choice: ConfirmChoice) -> Option<ConfirmChoice> {
+        let active = self.active.as_mut()?;
+        if active.kind != PromptKind::Confirm {
+            return None;
+        }
+        let choice = match choice {
+            ConfirmChoice::AllowAll if !active.offers_allow_all() => ConfirmChoice::Allow,
+            c => c,
+        };
+        match choice {
+            ConfirmChoice::Deny => self.cancel(),
+            ConfirmChoice::Allow | ConfirmChoice::AllowAll => {
+                active.buffer.clear();
+                active.buffer.push_str(if choice == ConfirmChoice::Allow {
+                    "y"
+                } else {
+                    CONFIRM_ANSWER_ALLOW_ALL
+                });
+                self.submit();
+            }
+        }
+        Some(choice)
+    }
+
+    /// `Confirm` dialog: activate the focused button (Enter). Deny is the
+    /// default focus, so an un-navigated Enter denies (fail-closed).
+    pub fn confirm_activate_focused(&mut self) -> Option<ConfirmChoice> {
+        let choice = self.confirm_focus();
+        self.confirm_answer(choice)
     }
 
     pub fn submit(&mut self) {

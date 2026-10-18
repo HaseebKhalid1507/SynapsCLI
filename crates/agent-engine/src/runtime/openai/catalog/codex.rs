@@ -21,10 +21,14 @@ pub const MODELS_PATH: &str = "/codex/models";
 /// each model's `minimal_client_version`: an unknown or too-old version
 /// (e.g. SynapsCLI's own crate version) yields an empty catalog. This value
 /// is therefore decoupled from `CARGO_PKG_VERSION` and pinned to the lowest
-/// official Codex CLI release that exposes the newest generation
-/// (`gpt-6-astra` requires >= 0.153.0). Bump deliberately when a new model
-/// raises the floor; never derive it from SynapsCLI's version.
-pub const CODEX_CLIENT_VERSION: &str = "0.153.3";
+/// official Codex CLI release that exposes the newest generation. Observed
+/// live (2026-10-04): `gpt-6-astra` is listed from 0.153.0, `gpt-6-sol` /
+/// `gpt-6-luna` from 0.155.0 and `gpt-6.1-sol` only from 0.159.0 (its row
+/// still reports minimal_client_version 0.153.0 — the backend gates it
+/// separately, so trust the observed floor, not that field). Bump
+/// deliberately when a new model raises the floor; never derive it from
+/// SynapsCLI's version.
+pub const CODEX_CLIENT_VERSION: &str = "0.159.0";
 
 // ─── Static capability table ─────────────────────────────────────────────────
 //
@@ -44,6 +48,14 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
         ReasoningLevel,
         Option<CodexMultiAgentVersion>,
     ) = match model_id {
+        // GPT-6.1 generation. Live row (2026-10-04, client_version >= 0.159.0):
+        // default low, full ladder through Ultra, multi-agent v2 with
+        // multi_agent_reasoning_effort xhigh (Ultra requests use xhigh).
+        "gpt-6.1-sol" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Low,
+            Some(CodexMultiAgentVersion::V2),
+        ),
         // GPT-6 generation. Live row (2026-09): default medium, full ladder
         // through Ultra, multi-agent v2 (Ultra requests use xhigh).
         "gpt-6-astra" => (
@@ -72,7 +84,8 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     };
     Some(ReasoningSupport::CodexNamed {
         supported: supported.to_vec(),
-        multi_agent_reasoning_effort: (model_id == "gpt-6-astra").then_some(XHigh),
+        multi_agent_reasoning_effort: matches!(model_id, "gpt-6-astra" | "gpt-6.1-sol")
+            .then_some(XHigh),
         default_level: Some(default_level),
         multi_agent_version,
     })
@@ -81,6 +94,7 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
 /// Build the static catalog models with static capability data attached.
 pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
+        ("gpt-6.1-sol", "GPT-6.1-Sol"),
         ("gpt-6-astra", "GPT-6-Astra"),
         ("gpt-5.6-sol", "GPT-5.6-Sol"),
         ("gpt-5.6-terra", "GPT-5.6-Terra"),
@@ -101,7 +115,8 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
         // gpt-5.4 was not observed, and spark explicitly advertises text only.
         if matches!(
             id,
-            "gpt-6-astra"
+            "gpt-6.1-sol"
+                | "gpt-6-astra"
                 | "gpt-5.6-sol"
                 | "gpt-5.6-terra"
                 | "gpt-5.6-luna"
@@ -734,8 +749,10 @@ mod tests {
         ] {
             for model in models {
                 let expected = match model.id.as_str() {
-                    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
-                    | "gpt-5.5" | "gpt-5.4-mini" => vec![Modality::Text, Modality::Image],
+                    "gpt-6.1-sol" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra"
+                    | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.4-mini" => {
+                        vec![Modality::Text, Modality::Image]
+                    }
                     // 5.4 unobserved; spark explicitly text-only.
                     "gpt-5.4" | "gpt-5.3-codex-spark" => vec![Modality::Text],
                     _ => panic!("unexpected selectable fixture row"),
@@ -1634,6 +1651,40 @@ mod tests {
     }
 
     #[test]
+    fn static_gpt_6_1_sol_plans_max_offline_and_ultra_as_xhigh() {
+        // Offline / pre-catalog sessions must still authorize the bridge's
+        // `thinking = max` for gpt-6.1-sol (live row: default low, full ladder,
+        // multi-agent v2, multi_agent_reasoning_effort xhigh).
+        let max = plan_codex_execution(
+            "openai-codex/gpt-6.1-sol",
+            ReasoningLevel::Max,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("gpt-6.1-sol max plan");
+        assert_eq!(max.mode, CodexExecutionMode::Max);
+        assert_eq!(max.wire_effort, Some(CodexWireEffort::Max));
+        assert!(!max.automatic_delegation());
+
+        let ultra = plan_codex_execution(
+            "openai-codex/gpt-6.1-sol",
+            ReasoningLevel::Ultra,
+            CodexRequestRole::Foreground,
+            None,
+        )
+        .expect("gpt-6.1-sol ultra plan");
+        assert_eq!(ultra.wire_effort, Some(CodexWireEffort::XHigh));
+        assert_eq!(ultra.multi_agent_version, Some(CodexMultiAgentVersion::V2));
+
+        let models = codex_static_catalog_models();
+        let row = models
+            .iter()
+            .find(|m| m.id == "gpt-6.1-sol")
+            .expect("static gpt-6.1-sol row");
+        assert!(row.input_modalities.contains(&Modality::Image));
+    }
+
+    #[test]
     fn validate_sol_ultra_ok() {
         assert!(validate_codex_level("gpt-5.6-sol", ReasoningLevel::Ultra, None).is_ok());
     }
@@ -1796,6 +1847,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",

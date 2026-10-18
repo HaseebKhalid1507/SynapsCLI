@@ -1,5 +1,4 @@
 //! Shared test helpers for tool unit tests.
-#![cfg(test)]
 
 use super::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
@@ -12,6 +11,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
             watcher_exit_path: None,

@@ -38,9 +38,9 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(crate::tools::bash::BashTool),
-            #[cfg(windows)]
+        #[allow(unused_mut)]
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            #[cfg(all(windows, feature = "command-exec"))]
             Arc::new(crate::tools::powershell::PowerShellTool),
             Arc::new(crate::tools::read::ReadTool),
             Arc::new(crate::tools::write::WriteTool),
@@ -61,9 +61,6 @@ impl ToolRegistry {
             // subagent registries exclude it so a delegated model can never
             // steer the session's memory-context leases.
             Arc::new(crate::tools::memory_context::MemoryContextTool),
-            Arc::new(crate::tools::shell::ShellStartTool),
-            Arc::new(crate::tools::shell::ShellSendTool),
-            Arc::new(crate::tools::shell::ShellEndTool),
             // Task 17 discovery/authorization gateways (spec §7.2). Present
             // in the primary runtime registry only; subagent registries
             // (`without_subagent*`) deliberately exclude them so recursive
@@ -83,6 +80,16 @@ impl ToolRegistry {
             Arc::new(crate::tools::forum::ForumReadTool),
             Arc::new(crate::tools::forum::ForumForgetTool),
         ];
+        // Arbitrary command-execution tools are only present when the
+        // `command-exec` feature is enabled (default). A `--no-default-features`
+        // build omits `bash` from the binary and never registers `shell_*`.
+        #[cfg(feature = "command-exec")]
+        {
+            tools.push(Arc::new(crate::tools::bash::BashTool));
+            tools.push(Arc::new(crate::tools::shell::ShellStartTool));
+            tools.push(Arc::new(crate::tools::shell::ShellSendTool));
+            tools.push(Arc::new(crate::tools::shell::ShellEndTool));
+        }
         Self::from_tools(tools)
     }
 
@@ -135,9 +142,9 @@ impl ToolRegistry {
 
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
     pub fn without_subagent() -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(crate::tools::bash::BashTool),
-            #[cfg(windows)]
+        #[allow(unused_mut)]
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            #[cfg(all(windows, feature = "command-exec"))]
             Arc::new(crate::tools::powershell::PowerShellTool),
             Arc::new(crate::tools::read::ReadTool),
             Arc::new(crate::tools::write::WriteTool),
@@ -145,13 +152,17 @@ impl ToolRegistry {
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
-            Arc::new(crate::tools::shell::ShellStartTool),
-            Arc::new(crate::tools::shell::ShellSendTool),
-            Arc::new(crate::tools::shell::ShellEndTool),
             Arc::new(crate::tools::forum::ForumPostTool),
             Arc::new(crate::tools::forum::ForumReadTool),
             Arc::new(crate::tools::forum::ForumForgetTool),
         ];
+        #[cfg(feature = "command-exec")]
+        {
+            tools.push(Arc::new(crate::tools::bash::BashTool));
+            tools.push(Arc::new(crate::tools::shell::ShellStartTool));
+            tools.push(Arc::new(crate::tools::shell::ShellSendTool));
+            tools.push(Arc::new(crate::tools::shell::ShellEndTool));
+        }
         Self::from_tools(tools)
     }
 
@@ -1067,6 +1078,7 @@ mod tests {
         assert_eq!(translated["nested:obj"]["inner/key"], "nested");
     }
 
+    #[cfg(feature = "command-exec")]
     #[test]
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
@@ -1101,6 +1113,7 @@ mod tests {
         assert!(registry.get("subagent_models").is_some());
     }
 
+    #[cfg(feature = "command-exec")]
     #[test]
     fn test_disable_removes_tools_from_registry_and_schema() {
         let mut registry = ToolRegistry::new();
@@ -1118,6 +1131,7 @@ mod tests {
         assert_eq!(registry.tools_schema().len(), before - 2);
     }
 
+    #[cfg(feature = "command-exec")]
     #[test]
     fn test_disable_empty_and_unknown_are_noops() {
         let mut registry = ToolRegistry::new();
@@ -1129,6 +1143,7 @@ mod tests {
         assert!(registry.get("bash").is_some());
     }
 
+    #[cfg(feature = "command-exec")]
     #[test]
     fn test_tool_registry_without_subagent() {
         let registry = ToolRegistry::without_subagent();
@@ -1155,6 +1170,29 @@ mod tests {
         assert!(registry.get("grep").is_some());
         assert!(registry.get("find").is_some());
         assert!(registry.get("ls").is_some());
+    }
+
+    // Hardened build (`--no-default-features`): the arbitrary command-execution
+    // surface must be entirely absent — `bash` is not compiled into the binary
+    // and the interactive `shell_*` tools are never registered — while the rest
+    // of the built-in tools remain available.
+    #[cfg(not(feature = "command-exec"))]
+    #[test]
+    fn hardened_build_excludes_command_exec_tools() {
+        let registry = ToolRegistry::new();
+        assert!(registry.get("bash").is_none(), "bash must be absent in a hardened build");
+        assert!(registry.get("shell_start").is_none());
+        assert!(registry.get("shell_send").is_none());
+        assert!(registry.get("shell_end").is_none());
+        // Non-exec built-ins are still present.
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("ls").is_some());
+        assert!(registry.get("subagent").is_some());
+
+        let without_sub = ToolRegistry::without_subagent();
+        assert!(without_sub.get("bash").is_none());
+        assert!(without_sub.get("shell_start").is_none());
+        assert!(without_sub.get("read").is_some());
     }
 
     #[test]
@@ -1259,7 +1297,7 @@ mod tests {
         assert!(registry.get("subagent_collect").is_none());
         assert!(registry.get("subagent_resume").is_none());
         // Built-ins remain.
-        assert!(registry.get("bash").is_some());
+        assert!(registry.get("ls").is_some());
         assert!(registry.get("read").is_some());
     }
 
@@ -1273,12 +1311,12 @@ mod tests {
         // Extension tool present.
         assert!(merged.get("alpha:do_thing").is_some());
         // Built-ins still present.
-        assert!(merged.get("bash").is_some());
         assert!(merged.get("read").is_some());
         // Subagent tools still absent.
         assert!(merged.get("subagent_start").is_none());
     }
 
+    #[cfg(feature = "command-exec")]
     #[test]
     fn forum_membership_preserves_worker_bounds_and_foreground_disclosure() {
         use crate::tools::activation::{SessionId, SessionToolSet};
@@ -1357,9 +1395,9 @@ mod tests {
 
         let merged = ToolRegistry::without_subagent_with_extensions(&other);
 
-        // Only one instance of `bash`, and it's the built-in (no extension_id).
-        let bash = merged.get("bash").expect("bash present");
-        assert!(bash.extension_id().is_none());
+        // Only one instance of `read`, and it's the built-in (no extension_id).
+        let read = merged.get("read").expect("read present");
+        assert!(read.extension_id().is_none());
         // No subagent tools leaked from `other`.
         assert!(merged.get("subagent_start").is_none());
         assert!(merged.get("subagent").is_none());
@@ -1461,8 +1499,8 @@ mod tests {
 
         let merged = ToolRegistry::without_subagent_with_extensions(&other);
         assert!(merged.get("ext:custom").is_some());
-        assert!(merged.get("bash").is_some());
-        assert!(merged.get("bash").unwrap().extension_id().is_none());
+        assert!(merged.get("read").is_some());
+        assert!(merged.get("read").unwrap().extension_id().is_none());
     }
 
     /// Two distinct runtime names declaring the same capability identity.

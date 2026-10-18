@@ -62,6 +62,8 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("bridge.heartbeat_mirror", "internal sidecar plumbing"),
     ("bridge.heartbeat_timeout_ms", "internal sidecar plumbing"),
     ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
+    ("subagent_max_concurrent", "legacy flat alias of subagent.max_concurrent (edit that row)"),
+    ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
     ("provider.*", "owned by the Providers tab (API keys)"),

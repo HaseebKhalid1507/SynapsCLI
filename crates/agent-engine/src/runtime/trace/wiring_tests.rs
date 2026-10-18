@@ -127,6 +127,7 @@ fn auth() -> Arc<RwLock<AuthState>> {
         refresh_token: None,
         token_expires: Some(9_999_999_999_999),
         auth_file_mtime: None,
+        bound_credential: None,
     }))
 }
 

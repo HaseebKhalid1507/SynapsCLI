@@ -121,6 +121,16 @@ pub(super) struct AuthState {
     /// was rotated externally (`synaps login`, cron, sync) and the fast path
     /// must reload. `None` disables the check (remote / never loaded).
     pub(super) auth_file_mtime: Option<std::time::SystemTime>,
+    /// Which credential `auth_token` was vended for:
+    /// `"<local | remote:<endpoint>#<principal fingerprint>>|<storage_key>"`
+    /// (see `runtime/auth.rs::anthropic_binding`). The principal fingerprint
+    /// is an opaque SHA-256 prefix of the machine token — never the token
+    /// itself, never an access token. `None` = unknown/legacy (api_key
+    /// harnesses, scrubbed). The pre-stream refresh refuses to serve a
+    /// cached token whose binding no longer matches the selected account on
+    /// the current source, so a config/source/principal switch can never
+    /// silently keep the previous account's token.
+    pub(super) bound_credential: Option<String>,
 }
 
 /// Redacting Debug — never print the access or refresh token.
@@ -142,6 +152,7 @@ impl std::fmt::Debug for AuthState {
             )
             .field("token_expires", &self.token_expires)
             .field("auth_file_mtime", &self.auth_file_mtime)
+            .field("bound_credential", &self.bound_credential)
             .finish()
     }
 }

@@ -1319,7 +1319,8 @@ mod tests {
 
         #[test]
         fn pinned_codex_protocol_version_meets_astra_floor() {
-            // gpt-6-astra publishes minimal_client_version 0.153.0.
+            // gpt-6-astra publishes minimal_client_version 0.153.0, but the
+            // live backend only lists gpt-6.1-sol from client_version 0.159.0.
             let parse = |v: &str| -> (u64, u64, u64) {
                 let mut it = v.split('.').map(|p| p.parse::<u64>().expect("numeric"));
                 (
@@ -1328,7 +1329,7 @@ mod tests {
                     it.next().unwrap_or(0),
                 )
             };
-            assert!(parse(codex::CODEX_CLIENT_VERSION) >= parse("0.153.0"));
+            assert!(parse(codex::CODEX_CLIENT_VERSION) >= parse("0.159.0"));
         }
 
         #[test]

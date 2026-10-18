@@ -12,7 +12,6 @@ use crate::{Result, RuntimeError, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Provider-reported usage from a non-streaming response body. Only fields
@@ -364,9 +363,8 @@ impl ApiMethods {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     if let Some(t) = tracer.as_mut() {
-                                        let delay = Duration::from_millis(
-                                            1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                                        );
+                                        let delay =
+                                            super::telemetry::network_retry_delay(non_429_attempts);
                                         t.attempt_failed(
                                             clock,
                                             crate::runtime::trace::RetryClass::Other,
@@ -377,9 +375,8 @@ impl ApiMethods {
                                         );
                                     }
                                     last_err = e.to_string();
-                                    let delay = Duration::from_millis(
-                                        1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                                    );
+                                    let delay =
+                                        super::telemetry::network_retry_delay(non_429_attempts);
                                     tracing::warn!(
                                         "API retry {}/{} after {:?}: {}",
                                         non_429_attempts,
@@ -489,9 +486,7 @@ impl ApiMethods {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
-                        let delay = Duration::from_millis(
-                            1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                        );
+                        let delay = super::telemetry::network_retry_delay(non_429_attempts);
                         if let Some(t) = tracer.as_mut() {
                             t.attempt_failed(
                                 clock,
@@ -775,9 +770,8 @@ impl ApiMethods {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
-                                    let delay = Duration::from_millis(
-                                        1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                                    );
+                                    let delay =
+                                        super::telemetry::network_retry_delay(non_429_attempts);
                                     if let Some(t) = tracer.as_mut() {
                                         t.attempt_failed(
                                             clock,
@@ -884,9 +878,7 @@ impl ApiMethods {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
-                        let delay = Duration::from_millis(
-                            1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                        );
+                        let delay = super::telemetry::network_retry_delay(non_429_attempts);
                         if let Some(t) = tracer.as_mut() {
                             t.attempt_failed(
                                 clock,

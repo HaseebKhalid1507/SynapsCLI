@@ -1115,10 +1115,12 @@ impl SubagentStatus {
         }
     }
 
-    /// Returns the failure reason string if this is a `Failed` variant.
+    /// Human reason for unsuccessful terminal states, also persisted in archives.
     pub fn failure_reason(&self) -> Option<&str> {
         match self {
             SubagentStatus::Failed(r) => Some(r.as_str()),
+            SubagentStatus::TimedOut => Some("worker timed out"),
+            SubagentStatus::Cancelled => Some("worker was cancelled"),
             _ => None,
         }
     }

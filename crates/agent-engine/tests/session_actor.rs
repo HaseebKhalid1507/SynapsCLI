@@ -799,7 +799,7 @@ async fn pending_prompt_denied_and_parks_after_abandon_deadline() {
         .unwrap();
     a.send(submit("go")).await.unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
-    let pid = prompt_id(seen.last().unwrap()).unwrap();
+    let _pid = prompt_id(seen.last().unwrap()).unwrap();
 
     // Detach the only client and stay gone → the deadline (1 s) expires with
     // zero clients → the prompt is denied (`None`) → the tool returns
