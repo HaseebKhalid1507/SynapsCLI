@@ -1613,3 +1613,38 @@ async fn codex_spark_never_gets_web_search_and_lite_rows_still_do() {
     .await;
     assert!(body_has_web_search(&bodies.lock().unwrap()[0]));
 }
+
+#[tokio::test]
+async fn codex_untraced_continuation_resend_stays_untraced_under_one_shot_gate() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let armed = h.trace.clone().with_one_shot_request_gate();
+    // Request 1 (spark: no web_search) holds the one-shot gate.
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &armed,
+        "gpt-5.3-codex-spark",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await;
+    result.expect("first request succeeds");
+    // Request 2 is an untraced continuation that hits a web_search 400 and
+    // resends; the resend must not borrow the spent gate.
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &armed,
+        "gpt-zz-ws-untraced",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await;
+    result.expect("resend succeeds");
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        3,
+        "1 + rejected send + resend"
+    );
+    let records = h.sink.records();
+    assert_schema_valid_and_content_free(&records);
+    assert_eq!(records.len(), 1, "only the gate-holding request is traced");
+}

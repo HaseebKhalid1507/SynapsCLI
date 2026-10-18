@@ -893,6 +893,9 @@ pub(crate) async fn call_codex_stream_with_router(
     if let Some(tracer) = &tracer {
         tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
+    // Whether this request holds a tracer (and, on a `/trace next` context,
+    // the one-shot gate): only then may a web_search resend reopen it.
+    let traced = tracer.is_some();
     let mut attempt = tr::StreamAttempt::new(tracer);
     let mut stream_retry = 0u32;
     // Account switches spent on this logical request. Bounded by
@@ -994,7 +997,9 @@ pub(crate) async fn call_codex_stream_with_router(
                     web_search_pending = true;
                     super::codex_wire::strip_web_search_tool(&mut body);
                     body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
-                    trace.reopen_one_shot_for_resend();
+                    if traced {
+                        trace.reopen_one_shot_for_resend();
+                    }
                     attempt = tr::StreamAttempt::new(
                         tr::begin_openai_tracer(
                             trace,
