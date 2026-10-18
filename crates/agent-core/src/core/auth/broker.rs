@@ -1710,6 +1710,11 @@ pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 /// client's 90s read timeout that xAI streams already get.
 pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Gemini (Code Assist) sends no data chunk while it thinks (thought
+/// streaming is off), and a hard prompt can think silently for minutes;
+/// its stream has no retry, so it gets a longer idle limit.
+pub const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
         let cloud_backend = Arc::new(ProductionCloudBackend::new(http.clone()));
@@ -1806,7 +1811,16 @@ impl LocalBroker {
         self
     }
 
-    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`].
+    /// Idle (between-bytes) limit for `provider_key`'s no-redirect client.
+    fn stream_idle_timeout_for(&self, provider_key: &str) -> Duration {
+        if provider_key == "google-gemini" {
+            GEMINI_STREAM_IDLE_TIMEOUT.max(self.stream_idle_timeout)
+        } else {
+            self.stream_idle_timeout
+        }
+    }
+
+    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`] (not Gemini's).
     #[doc(hidden)]
     pub fn with_stream_idle_timeout_for_tests(mut self, idle: Duration) -> Self {
         self.stream_idle_timeout = idle;
@@ -2532,7 +2546,7 @@ impl LocalBroker {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .read_timeout(self.stream_idle_timeout)
+                .read_timeout(self.stream_idle_timeout_for(provider_key))
                 .build()
                 .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
             match request.method {
@@ -5090,6 +5104,21 @@ mod tests {
             assert!(msg.contains(&status.to_string()), "status lost: {msg}");
             assert_no_hostile_bytes(&msg);
         }
+    }
+
+    /// R2-I1: Gemini can think silently for minutes before its first data
+    /// chunk, so its no-redirect client idles longer than everyone else's.
+    #[test]
+    fn gemini_gets_the_longer_stream_idle_timeout() {
+        let broker = LocalBroker::new(reqwest::Client::new());
+        assert_eq!(broker.stream_idle_timeout_for("google-gemini"), Duration::from_secs(300));
+        for key in ["muse", "kimi-code", "openai-codex", "anthropic"] {
+            assert_eq!(broker.stream_idle_timeout_for(key), Duration::from_secs(90), "{key}");
+        }
+        let short = LocalBroker::new(reqwest::Client::new())
+            .with_stream_idle_timeout_for_tests(Duration::from_millis(10));
+        assert_eq!(short.stream_idle_timeout_for("muse"), Duration::from_millis(10));
+        assert!(short.stream_idle_timeout_for("google-gemini") >= Duration::from_secs(300));
     }
 
     async fn spawn_remote_broker_body(status: u16, body: String) -> RemoteBroker {
