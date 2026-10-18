@@ -1,3 +1,4 @@
+use super::util::path_arg_never_option;
 use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
@@ -38,7 +39,7 @@ impl Tool for FindTool {
                 },
                 "type": {
                     "type": "string",
-                    "description": "Filter by type: \"f\" for files, \"d\" for directories"
+                    "description": "Filter by type: \"f\" for files, \"d\" for directories, \"l\" for symlinks"
                 }
             },
             "required": ["pattern"]
@@ -46,31 +47,7 @@ impl Tool for FindTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let pattern = params["pattern"]
-            .as_str()
-            .ok_or_else(|| RuntimeError::Tool("Missing pattern parameter".to_string()))?;
-        let path = resolve_path_in(
-            params["path"].as_str().unwrap_or("."),
-            ctx.capabilities.cwd.as_deref(),
-        );
-        let file_type = params["type"].as_str();
-
-        let mut cmd = Command::new("find");
-        if let Some(env) = &ctx.capabilities.env {
-            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-        }
-        cmd.arg(&path);
-
-        cmd.args(["-not", "-path", "*/.git/*"]);
-        cmd.args(["-not", "-path", "*/node_modules/*"]);
-        cmd.args(["-not", "-path", "*/target/*"]);
-
-        if let Some(t) = file_type {
-            cmd.arg("-type").arg(t);
-        }
-
-        cmd.arg("-name").arg(pattern);
-
+        let mut cmd = build_command(&params, &ctx)?;
         let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
             .await
             .map_err(|_| RuntimeError::Tool("Find timed out after 10s".to_string()))?
@@ -85,6 +62,45 @@ impl Tool for FindTool {
         }
     }
 }
+
+/// Build the `find` argv. Split out so the argv can be checked (and run in a temp
+/// dir) by tests.
+fn build_command(params: &Value, ctx: &ToolContext) -> Result<Command> {
+    let pattern = params["pattern"]
+        .as_str()
+        .ok_or_else(|| RuntimeError::Tool("Missing pattern parameter".to_string()))?;
+    let path = path_arg_never_option(resolve_path_in(
+        params["path"].as_str().unwrap_or("."),
+        ctx.capabilities.cwd.as_deref(),
+    ));
+    let file_type = params["type"].as_str();
+    if let Some(t) = file_type {
+        if !matches!(t, "f" | "d" | "l") {
+            return Err(RuntimeError::Tool(format!(
+                "Invalid type {t:?}: use \"f\", \"d\" or \"l\""
+            )));
+        }
+    }
+
+    let mut cmd = Command::new("find");
+    if let Some(env) = &ctx.capabilities.env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
+    cmd.arg(&path);
+
+    cmd.args(["-not", "-path", "*/.git/*"]);
+    cmd.args(["-not", "-path", "*/node_modules/*"]);
+    cmd.args(["-not", "-path", "*/target/*"]);
+
+    if let Some(t) = file_type {
+        cmd.arg("-type").arg(t);
+    }
+
+    cmd.arg("-name").arg(pattern);
+
+    Ok(cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::create_tool_context;
@@ -127,5 +143,59 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn first_arg(cmd: &Command) -> String {
+        cmd.as_std()
+            .get_args()
+            .next()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// 01 I3: with no session cwd, a `path` starting with `-` must never
+    /// become find's first argv (GNU find would parse it as an expression).
+    #[test]
+    fn leading_dash_path_is_never_an_expression() {
+        let ctx = create_tool_context();
+        assert!(ctx.capabilities.cwd.is_none());
+        for p in ["-delete", "-exec", "--help", "-fprint"] {
+            let cmd = build_command(&json!({"pattern": "*", "path": p}), &ctx).unwrap();
+            let first = first_arg(&cmd);
+            assert!(!first.starts_with('-'), "{p} became argv[1] {first:?}");
+            assert_eq!(first, format!("./{p}"));
+        }
+        // Ordinary paths are untouched.
+        let cmd = build_command(&json!({"pattern": "*", "path": "src"}), &ctx).unwrap();
+        assert_eq!(first_arg(&cmd), "src");
+    }
+
+    /// End to end, confined to a temp dir: `path:"-delete"` must not delete
+    /// anything. Pre-fix this ran `find -delete …` and emptied the cwd.
+    #[tokio::test]
+    async fn path_dash_delete_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let ctx = create_tool_context();
+        let mut cmd = build_command(&json!({"pattern": "*", "path": "-delete"}), &ctx).unwrap();
+        cmd.current_dir(dir.path());
+        let _ = cmd.output().await.unwrap();
+        assert!(victim.exists(), "find path:-delete removed files");
+    }
+
+    #[test]
+    fn type_is_restricted_to_f_d_l() {
+        let ctx = create_tool_context();
+        for t in ["f", "d", "l"] {
+            assert!(build_command(&json!({"pattern": "*", "type": t}), &ctx).is_ok());
+        }
+        for t in ["-delete", "x", "fd", ""] {
+            assert!(
+                build_command(&json!({"pattern": "*", "type": t}), &ctx).is_err(),
+                "type {t:?} must be rejected"
+            );
+        }
     }
 }
