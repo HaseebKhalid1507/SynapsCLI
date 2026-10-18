@@ -64,8 +64,12 @@ whole-request ratio blends the two and over-sizes the successor when the fixed
 part is large (~10% over a 100k target with a 59k fixed part). When no
 messages-only ratio exists (the
 provider count does not exceed the fixed part) or it lies outside 0.5–2.0, the
-whole target is converted at the whole-request ratio as before. If the fixed
-part counts somewhat lower on the provider side, the error is an undershoot.
+whole target is converted at the whole-request ratio as before. The fixed
+part is assumed to count about 1:1, and the sample's messages and the
+successor's are assumed to have comparable messages-only ratios. With a fixed
+part lower in provider units, comparable message ratios, and a successor
+smaller than the sampled request, this approximation biases downward; other
+shapes can overshoot.
 A sample applies only to the model whose request
 produced it (switching models falls back to the estimator until that model
 reports usage), and only when the provider count is nonzero and the

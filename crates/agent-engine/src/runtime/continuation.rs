@@ -383,12 +383,15 @@ impl SuccessorBudget {
 /// so it takes `overhead_tokens` of the target as is and only the rest is
 /// converted, at the messages' own ratio. (The whole-request ratio blends a
 /// 1:1 fixed part into the messages' ratio, so a successor sized by it
-/// settled ~10% over a 100k target with a 59k fixed part.) If the fixed part
-/// counts somewhat lower on the provider side, as a conservative estimator
-/// does, the messages ratio reads slightly high, but the successor then
-/// also carries that much less fixed part; while the sample's messages
-/// outweigh the successor's (the usual case at a rollover), the net error is
-/// an undershoot, the safe direction. When no messages ratio exists
+/// settled ~10% over a 100k target with a 59k fixed part.) This also assumes
+/// the sample's messages and the successor's have comparable messages-only
+/// ratios. If the fixed part counts somewhat lower on the provider side, as a
+/// conservative estimator does, the messages ratio reads slightly high, but
+/// the successor then also carries that much less fixed part. With a fixed
+/// part lower in provider units, comparable message ratios, and a successor
+/// smaller than the sampled request (the usual case at a rollover), this
+/// approximation biases downward; other shapes can overshoot. When no
+/// messages ratio exists
 /// (the provider count does not exceed the fixed part) or it falls outside
 /// [`TokenCalibration`]'s bounds, the whole-request ratio is used as before.
 ///
