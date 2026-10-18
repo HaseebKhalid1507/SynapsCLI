@@ -203,7 +203,18 @@ pub struct DaemonState {
     /// `old id → new id` for one generation (ids differ only if a
     /// LinkedSuccessor compaction happened since boot).
     pub reload_aliases: Mutex<HashMap<String, String>>,
+    /// The `daemon.json` record this image wrote. A Ping that finds the
+    /// file missing or naming another pid puts this back
+    /// ([`Self::heal_daemon_json`]); reload takes its recorded exe from here.
+    pub info: Mutex<DaemonInfo>,
+    /// Rate limit for the heal's INFO line: when it was last logged, and the
+    /// heals since then.
+    pub json_heals: Mutex<(Option<Instant>, u64)>,
 }
+
+/// At most one `daemon.json rewritten` line per this interval; heals in
+/// between are counted in the next line.
+const JSON_HEAL_LOG_EVERY: Duration = Duration::from_secs(600);
 
 impl DaemonState {
     pub fn uptime_s(&self) -> u64 {
@@ -226,6 +237,56 @@ impl DaemonState {
     /// Exec failed: arm a fresh token so new connections are served again.
     pub fn reset_announce(&self) {
         *self.reload_announce.lock().unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
+    }
+
+    /// The `daemon.json` record this image holds (a copy).
+    pub fn daemon_info(&self) -> DaemonInfo {
+        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the in-memory record (reload: the generation and exe it
+    /// writes; put back when the exec fails).
+    pub fn set_daemon_info(&self, info: DaemonInfo) {
+        *self.info.lock().unwrap_or_else(|e| e.into_inner()) = info;
+    }
+
+    /// Ping: if `daemon.json` is missing or names another pid, write this
+    /// image's record back. Only while this image holds the flock and has
+    /// not begun to shut down; the record comes from memory, never from
+    /// disk. One INFO line per [`JSON_HEAL_LOG_EVERY`].
+    ///
+    /// The shutdown check runs under the `lock_fd` mutex: [`Daemon::wait`]
+    /// cancels `shutdown` before it takes that mutex to unlink the files, so
+    /// a Ping still in flight at shutdown can't write the file back after
+    /// the unlink. During a reload's hand-off the record already names the
+    /// new generation and exe, so a heal there writes what the reload wrote.
+    pub fn heal_daemon_json(&self) {
+        let lock = self.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(lock) = lock.as_ref() else {
+            return;
+        };
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        let info = self.daemon_info();
+        match registry::heal_daemon_json(&self.paths, &info, lock) {
+            Ok(false) => {}
+            Ok(true) => {
+                let mut heals = self.json_heals.lock().unwrap_or_else(|e| e.into_inner());
+                heals.1 += 1;
+                if heals.0.is_none_or(|at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
+                    tracing::info!(
+                        path = %self.paths.json.display(),
+                        pid = info.pid,
+                        generation = info.generation,
+                        heals = heals.1,
+                        "daemon: daemon.json rewritten (it was missing or named another pid)"
+                    );
+                    *heals = (Some(Instant::now()), 0);
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "daemon: daemon.json heal failed"),
+        }
     }
 
     /// B4: ONE session map — `EngineHost` owns it; these delegate.
@@ -356,6 +417,18 @@ impl Daemon {
         let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
         let listener = listener::bind(&paths.sock)?;
 
+        let info = DaemonInfo {
+            pid: std::process::id(),
+            protocol_version: crate::session::wire::PROTOCOL_VERSION,
+            daemon_version: crate::session::wire::binary_version(),
+            profile: opts.profile.clone(),
+            started_at: chrono::Utc::now(),
+            socket: paths.sock.to_string_lossy().into_owned(),
+            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
+            generation,
+        };
+        registry::write_daemon_json(&paths, &info)?;
+
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
         let state = Arc::new(DaemonState {
             host,
@@ -372,19 +445,9 @@ impl Daemon {
             reload_announce: Mutex::new(CancellationToken::new()),
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
+            info: Mutex::new(info.clone()),
+            json_heals: Mutex::new((None, 0)),
         });
-
-        let info = DaemonInfo {
-            pid: std::process::id(),
-            protocol_version: crate::session::wire::PROTOCOL_VERSION,
-            daemon_version: crate::session::wire::binary_version(),
-            profile: opts.profile.clone(),
-            started_at: chrono::Utc::now(),
-            socket: paths.sock.to_string_lossy().into_owned(),
-            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
-            generation,
-        };
-        registry::write_daemon_json(&paths, &info)?;
 
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every

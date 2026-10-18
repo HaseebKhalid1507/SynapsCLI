@@ -67,6 +67,25 @@ pub fn read_daemon_json(paths: &DaemonPaths) -> Option<DaemonInfo> {
     serde_json::from_str(&s).ok()
 }
 
+/// The lock holder puts its own `daemon.json` (and `daemon.pid`) back when
+/// the file is missing, unreadable, or names another pid: an older `synaps`
+/// that lists sessions unlinks every run-dir `*.json` it cannot parse as a
+/// session card. `info` is the record the daemon holds in memory; the write
+/// is [`write_daemon_json`]'s (tmp + rename, 0600). Anything at the path
+/// that is not a regular file (a symlink, a directory, a socket) is left
+/// alone, as [`cleanup_metadata`] does. Returns whether it wrote.
+pub fn heal_daemon_json(paths: &DaemonPaths, info: &DaemonInfo, _lock: &DaemonLock) -> io::Result<bool> {
+    match std::fs::symlink_metadata(&paths.json) {
+        Ok(m) if !m.file_type().is_file() => return Ok(false),
+        Ok(_) if read_daemon_json(paths).is_some_and(|on_disk| on_disk.pid == info.pid) => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    write_daemon_json(paths, info)?;
+    Ok(true)
+}
+
 /// Held for the daemon's lifetime; dropping releases the flock.
 pub struct DaemonLock {
     file: File,
@@ -296,6 +315,72 @@ mod tests {
         let _listener = UnixListener::bind(&p.pid).unwrap();
         assert!(!reap_stale(&p));
         assert!(p.json.is_dir() && p.pid.exists());
+    }
+
+    fn info_for(p: &DaemonPaths, pid: u32) -> DaemonInfo {
+        DaemonInfo {
+            pid,
+            protocol_version: 3,
+            daemon_version: "1.2.3".into(),
+            profile: None,
+            started_at: chrono::Utc::now(),
+            socket: p.sock.to_string_lossy().into_owned(),
+            exe: Some("/opt/synaps".into()),
+            generation: 4,
+        }
+    }
+
+    #[test]
+    fn the_lock_holder_heals_a_missing_or_foreign_daemon_json() {
+        let (_d, p) = paths();
+        let ours = info_for(&p, 4_000_001);
+        let lock = DaemonLock::try_acquire(&p).unwrap().unwrap();
+        // Missing: written, with daemon.pid, 0600.
+        assert!(heal_daemon_json(&p, &ours, &lock).unwrap());
+        assert_eq!(read_daemon_json(&p), Some(ours.clone()));
+        assert_eq!(std::fs::read_to_string(&p.pid).unwrap(), "4000001\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p.json).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Ours already: no write (same inode).
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&p.json).unwrap().ino()
+        };
+        assert!(!heal_daemon_json(&p, &ours, &lock).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&p.json).unwrap().ino(), ino);
+        }
+        // Another pid, or not a DaemonInfo: replaced.
+        write_daemon_json(&p, &info_for(&p, 4_000_002)).unwrap();
+        assert!(heal_daemon_json(&p, &ours, &lock).unwrap());
+        assert_eq!(read_daemon_json(&p), Some(ours.clone()));
+        std::fs::write(&p.json, b"not json").unwrap();
+        assert!(heal_daemon_json(&p, &ours, &lock).unwrap());
+        assert_eq!(read_daemon_json(&p), Some(ours.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_heal_leaves_symlinks_and_directories_alone() {
+        let (d, p) = paths();
+        let ours = info_for(&p, 4_000_003);
+        let lock = DaemonLock::try_acquire(&p).unwrap().unwrap();
+        let target = d.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &p.json).unwrap();
+        assert!(!heal_daemon_json(&p, &ours, &lock).unwrap());
+        assert!(std::fs::symlink_metadata(&p.json).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_file(&p.json).unwrap();
+        std::fs::create_dir(&p.json).unwrap();
+        assert!(!heal_daemon_json(&p, &ours, &lock).unwrap());
+        assert!(p.json.is_dir());
     }
 
     #[test]
