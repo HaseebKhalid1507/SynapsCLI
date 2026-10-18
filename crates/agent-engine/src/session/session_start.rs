@@ -19,6 +19,14 @@
 //! `await_extensions = true` (`run_at_create`) then waits for the hook that
 //! is running and for any older foreground hooks in line, each call bounded
 //! by the handler timeouts of its extensions (5 s per handler).
+//!
+//! The gate serializes the extensions' side too: a call already made is not
+//! abandoned when its session ends or parks, so the gate passes on only once
+//! the call has returned, and the next hook never queues behind it in the
+//! same extension process. (A session that ends drops the injection that
+//! call brings.) The limit that remains is the handler timeout itself: a
+//! handler that runs past it fails open for its session, and its extension
+//! may still be working on the call when the next hook is sent.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -40,6 +48,8 @@ pub(crate) struct StartTicket {
     /// A turn (or the session's creation) waits for this hook.
     foreground: AtomicBool,
     phase: AtomicU8,
+    /// The session has ended: nothing reads its injection any more.
+    ended: AtomicBool,
 }
 
 impl StartTicket {
@@ -47,7 +57,17 @@ impl StartTicket {
         Arc::new(Self {
             foreground: AtomicBool::new(foreground),
             phase: AtomicU8::new(WAITING),
+            ended: AtomicBool::new(false),
         })
+    }
+
+    /// The session is ending (see [`SessionStart::end`]).
+    fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
+    }
+
+    fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
     }
 
     /// A turn now waits for this hook: it goes ahead of background hooks
@@ -199,11 +219,26 @@ impl SessionStart {
         matches!(self, Self::Done)
     }
 
+    /// The session is ending: call this before `on_session_end` clears the
+    /// session's keyed injection (`finish`); dropping does the same. A hook
+    /// not yet called leaves the line. One already called is not abandoned:
+    /// its task finishes the call while it holds the gate (bounded by the
+    /// handler timeout, as any hook call), then drops the injection it got,
+    /// since nothing reads it now. That task holds only the host, the hook
+    /// bus, the journal id and its ticket: no actor handle and no lease, so
+    /// it keeps nothing of the session alive, and it ends with the process.
+    pub(crate) fn end(&mut self) {
+        if let Self::Queued { task, ticket } = self {
+            ticket.end();
+            if ticket.withdraw() {
+                task.abort();
+            }
+        }
+    }
+
     /// The session parks: a hook not yet called leaves the line (nothing
-    /// held, nothing queued) and waits for the unpark. One already running
-    /// finishes. (A session that ends drops this, which stops the wait; a
-    /// hook already called may still be answered by its extension, and
-    /// nothing reads that answer.)
+    /// held, nothing queued) and waits for the unpark. One already called
+    /// finishes, holding the gate, and counts as run.
     pub(crate) fn withdraw_for_park(&mut self) {
         if let Self::Queued { task, ticket } = self {
             if ticket.withdraw() {
@@ -215,10 +250,10 @@ impl SessionStart {
 }
 
 impl Drop for SessionStart {
+    /// As [`Self::end`]: a call already made finishes in its task (the
+    /// handle is dropped, which detaches it); one not yet made is withdrawn.
     fn drop(&mut self) {
-        if let Self::Queued { task, .. } = self {
-            task.abort();
-        }
+        self.end();
     }
 }
 
@@ -238,11 +273,23 @@ async fn run_queued(
             "extensions_ready timed out — on_session_start may miss late extensions"
         );
     }
-    call_in_line(host.session_start_gate(), &ticket, || async {
-        let id = (**journal_id.load()).clone();
-        crate::extensions::loader::emit_session_start(&bus, &id).await;
+    call_in_line(host.session_start_gate(), &ticket, || {
+        emit_keyed(&bus, &journal_id, &ticket)
     })
     .await
+}
+
+/// The hook, keyed on the session's current journal id. If the session
+/// ended meanwhile, the injection is dropped again: either the session's
+/// own end clear (`on_session_end`, after [`StartTicket::end`]) comes after
+/// this set, or this check sees the end, since both go through the bus's
+/// injection lock.
+async fn emit_keyed(bus: &Arc<HookBus>, journal_id: &arc_swap::ArcSwap<String>, ticket: &StartTicket) {
+    let id = (**journal_id.load()).clone();
+    crate::extensions::loader::emit_session_start(bus, &id).await;
+    if ticket.has_ended() {
+        bus.clear_session_injection(&id).await;
+    }
 }
 
 /// Wait for `ticket`'s turn at `gate`, then make the call while holding it.
@@ -452,6 +499,143 @@ mod tests {
         .await;
         assert!(free.is_ok(), "the gate is free again");
         assert!(hook.called.await.is_err(), "the hook was never called");
+    }
+
+    /// An `on_session_start` handler that injects `INJECTED`, answering only
+    /// once released: an extension still working on the call.
+    struct GatedHook {
+        called: Mutex<Option<oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for GatedHook {
+        fn id(&self) -> &str {
+            "gated"
+        }
+
+        async fn handle(
+            &self,
+            _event: &crate::extensions::hooks::events::HookEvent,
+        ) -> crate::extensions::hooks::events::HookResult {
+            if let Some(tx) = self.called.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = self.release.lock().await.take() {
+                let _ = rx.await;
+            }
+            crate::extensions::hooks::events::HookResult::Inject {
+                content: INJECTED.into(),
+            }
+        }
+
+        async fn shutdown(&self) {}
+    }
+
+    const INJECTED: &str = "session-start context";
+
+    /// A session `id` whose hook is in line at `gate` on the production
+    /// path (`emit_keyed`), with a handler that waits for its release.
+    async fn keyed_start(
+        gate: &Arc<SessionStartGate>,
+        id: &str,
+    ) -> (SessionStart, Arc<HookBus>, Blocking) {
+        let bus = Arc::new(HookBus::new());
+        let (called_tx, called) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel::<()>();
+        let mut permissions = crate::extensions::permissions::PermissionSet::new();
+        permissions.grant(crate::extensions::permissions::Permission::SessionLifecycle);
+        bus.subscribe(
+            crate::extensions::hooks::events::HookKind::OnSessionStart,
+            Arc::new(GatedHook {
+                called: Mutex::new(Some(called_tx)),
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }),
+            None,
+            None,
+            permissions,
+        )
+        .await
+        .expect("subscribe");
+        let ticket = StartTicket::new(false);
+        let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(id.to_string()));
+        let (gate, b, t) = (Arc::clone(gate), Arc::clone(&bus), Arc::clone(&ticket));
+        let task = tokio::spawn(async move {
+            call_in_line(&gate, &t, || emit_keyed(&b, &journal_id, &t)).await
+        });
+        (SessionStart::Queued { task, ticket }, bus, Blocking { called, release })
+    }
+
+    /// Wait until the gate is free: the call in flight has fully returned.
+    async fn gate_free(gate: &SessionStartGate) {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.acquire(&StartTicket::new(false)),
+        )
+        .await
+        .expect("the gate frees");
+    }
+
+    /// The session's end, as `finish` does it: the ticket first, then
+    /// `on_session_end`, which clears the keyed injection.
+    async fn end_session(start: &mut SessionStart, bus: &Arc<HookBus>, id: &str) {
+        start.end();
+        crate::extensions::loader::emit_session_end(bus, id, None, Duration::from_secs(1)).await;
+    }
+
+    /// Control: a session that does not end keeps what its hook injected.
+    #[tokio::test]
+    async fn a_live_session_keeps_its_injection() {
+        let gate = Arc::new(SessionStartGate::new());
+        let (start, bus, mut hook) = keyed_start(&gate, "live").await;
+        (&mut hook.called).await.expect("the hook is called");
+        let _ = hook.release.send(());
+        gate_free(&gate).await;
+        assert_eq!(bus.session_injection_for("live").await.as_deref(), Some(INJECTED));
+        drop(start);
+    }
+
+    /// The hook answers after the session ended (its end clear already ran):
+    /// the hook's own task drops the injection.
+    #[tokio::test]
+    async fn an_injection_that_lands_after_the_end_is_dropped() {
+        let gate = Arc::new(SessionStartGate::new());
+        let (mut start, bus, mut hook) = keyed_start(&gate, "late").await;
+        (&mut hook.called).await.expect("the hook is called");
+        end_session(&mut start, &bus, "late").await;
+        drop(start);
+        let _ = hook.release.send(());
+        gate_free(&gate).await;
+        assert_eq!(bus.session_injection_for("late").await, None);
+    }
+
+    /// The hook answers between the ticket's end and the end clear: the
+    /// task drops it at once, and the end clear finds nothing.
+    #[tokio::test]
+    async fn an_injection_that_lands_during_the_end_is_dropped() {
+        let gate = Arc::new(SessionStartGate::new());
+        let (mut start, bus, mut hook) = keyed_start(&gate, "during").await;
+        (&mut hook.called).await.expect("the hook is called");
+        start.end();
+        let _ = hook.release.send(());
+        gate_free(&gate).await;
+        assert_eq!(bus.session_injection_for("during").await, None);
+        crate::extensions::loader::emit_session_end(&bus, "during", None, Duration::from_secs(1)).await;
+        assert_eq!(bus.session_injection_for("during").await, None);
+    }
+
+    /// The hook answered before the session ended (its actor had not taken
+    /// the result yet): the session's end clear drops it.
+    #[tokio::test]
+    async fn an_injection_that_landed_before_the_end_is_dropped() {
+        let gate = Arc::new(SessionStartGate::new());
+        let (mut start, bus, mut hook) = keyed_start(&gate, "early").await;
+        (&mut hook.called).await.expect("the hook is called");
+        let _ = hook.release.send(());
+        gate_free(&gate).await;
+        assert_eq!(bus.session_injection_for("early").await.as_deref(), Some(INJECTED));
+        end_session(&mut start, &bus, "early").await;
+        assert_eq!(bus.session_injection_for("early").await, None);
     }
 
     #[tokio::test]

@@ -4856,6 +4856,10 @@ impl SessionActor {
 
     async fn finish(&mut self, reason: EndReason) {
         self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::SessionEnding);
+        // Before on_session_end clears the keyed injection (STEP 2): a hook
+        // not yet called leaves the line; one in flight finishes holding the
+        // gate and drops what it injects (`SessionStart::end`).
+        self.session_start.end();
         self.lifecycle.store(
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
