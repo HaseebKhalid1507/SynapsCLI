@@ -153,6 +153,56 @@ impl SessionActor {
         self.emit(SessionEventWire::QueryResult { id, value });
     }
 
+    /// The memory choice a rebuilt runtime must honour: the recorded one,
+    /// or `Off` once memory is effectively off while a recorded on-mode or
+    /// the operator's durable default would grant it again. Consent can be
+    /// revoked without `/memory` — the model's `memory_context` tool
+    /// (`action: "disable"`), a lease expiry, a host-side revoke — and
+    /// recording `Off` is always the safe direction. On-modes are recorded
+    /// only from `/memory` ([`Self::note_memory_choice`]): the tool cannot
+    /// enable (that needs the command's ExplicitCommand proof), so no other
+    /// path may make one sticky.
+    pub(crate) fn effective_memory_mode(&self) -> Option<super::SessionMemoryMode> {
+        use crate::runtime::memory_context::DurableStatus;
+        let recorded = self.config.memory_mode;
+        if !self.runtime.is_live() {
+            return recorded;
+        }
+        let off = matches!(self.runtime.memory_context_status().durable, DurableStatus::Off);
+        let would_grant = match recorded {
+            Some(mode) => mode.lease_mode().is_some(),
+            None => self.memory_default_is_durable(),
+        };
+        if off && would_grant {
+            Some(super::SessionMemoryMode::Off)
+        } else {
+            recorded
+        }
+    }
+
+    /// The operator's confirmed `memory.default_mode` grants a durable
+    /// session lease (`recall_once` is a one-shot, not a mode).
+    fn memory_default_is_durable(&self) -> bool {
+        let memory = &self.host.config().memory;
+        memory.default_mode_confirmed
+            && matches!(
+                memory.default_mode.as_str(),
+                "recall_each_prompt" | "capture_only" | "capture_and_recall"
+            )
+    }
+
+    /// Record [`Self::effective_memory_mode`] (config + the handle's slot).
+    pub(crate) fn sync_memory_choice(&mut self) {
+        let mode = self.effective_memory_mode();
+        if mode != self.config.memory_mode {
+            self.config.memory_mode = mode;
+            *self
+                .memory_mode_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+        }
+    }
+
     /// `(id, agent)` of every worker with no cancel requested, sorted.
     fn uncancelled_workers(&self) -> Vec<(String, String)> {
         let mut workers: Vec<(String, String)> = self

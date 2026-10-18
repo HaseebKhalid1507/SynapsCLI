@@ -173,3 +173,76 @@ async fn memory_off_survives_a_daemon_reload() {
     assert!(status.contains("mode off"), "/memory off was undone by the reload: {status}");
     end(&mut t).await;
 }
+
+/// Consent revoked without `/memory`: the model's `memory_context` tool
+/// (`action: "disable"`) revokes through its capability, which calls
+/// `memory_context_disable` on the session runtime — as the harness does
+/// here. Memory being off is recorded as the session's choice when it
+/// parks and in the reload record, so neither re-grants the default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn consent_revoked_outside_slash_memory_survives_park_and_reload() {
+    let _h = home_with_memory_default();
+    let _g = Grace::zero();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let runtime = task.runtime_for_harness();
+    tokio::spawn(task.run());
+    let mut t = attach(&handle).await;
+    assert!(memory(&mut t, 1, "status").await.contains("mode capture_and_recall"));
+    t.send(submit("hello")).await.unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    runtime.memory_context_disable();
+    assert!(memory(&mut t, 2, "status").await.contains("mode off"));
+    t = park_and_unpark(&handle, t).await;
+    let status = memory(&mut t, 3, "status").await;
+    assert!(status.contains("mode off"), "the revocation was undone by the unpark: {status}");
+    drop(runtime);
+
+    handle
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
+        .await
+        .unwrap();
+    let seen = until(&mut t, |e| {
+        matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
+    })
+    .await;
+    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else {
+        unreachable!()
+    };
+    let record: SessionReloadRecord = serde_json::from_value(value["record"].clone()).unwrap();
+    assert_eq!(
+        record.config.memory_mode,
+        Some(agent_engine::session::SessionMemoryMode::Off),
+        "the reload record carries the revocation"
+    );
+    end(&mut t).await;
+}
+
+/// A revocation after an explicit `/memory on` is the session's latest
+/// word too: the recorded on-mode must not be re-granted on unpark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_revocation_after_slash_memory_on_is_not_re_granted() {
+    let _h = home_with_memory_default();
+    let _g = Grace::zero();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let runtime = task.runtime_for_harness();
+    tokio::spawn(task.run());
+    let mut t = attach(&handle).await;
+    assert!(memory(&mut t, 1, "recall").await.contains("mode recall_each_prompt"));
+    t.send(submit("hello")).await.unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    runtime.memory_context_disable();
+    drop(runtime);
+    t = park_and_unpark(&handle, t).await;
+    let status = memory(&mut t, 2, "status").await;
+    assert!(status.contains("mode off"), "{status}");
+    end(&mut t).await;
+}

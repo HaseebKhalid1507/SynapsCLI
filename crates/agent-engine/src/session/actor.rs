@@ -925,6 +925,10 @@ impl SessionActor {
     /// hands off on `Idle` must never see the previous state. Per-round
     /// saves stay in the background; this waits once per turn.
     pub(crate) async fn announce_idle(&mut self) {
+        // A turn may have revoked memory consent (the `memory_context`
+        // tool): keep the handle's slot current for a reload that gets no
+        // checkpoint reply.
+        self.sync_memory_choice();
         self.flush_saves().await;
         self.emit(SessionEventWire::Idle);
         self.cache_keepwarm_on_idle().await;
@@ -994,7 +998,11 @@ impl SessionActor {
     pub(crate) fn reload_record(&self) -> SessionReloadRecord {
         let view = self.view.load();
         SessionReloadRecord {
-            config: self.config.clone(),
+            // A consent revocation since the last record counts.
+            config: SessionConfig {
+                memory_mode: self.effective_memory_mode(),
+                ..self.config.clone()
+            },
             keep_warm: self.keep_warm,
             lifecycle: SessionLifecycle::from_u8(
                 self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
@@ -2047,6 +2055,9 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         self.turn_replay.clear();
+        // The unparked runtime is built from `config.memory_mode`: a
+        // revocation made without `/memory` must be recorded first.
+        self.sync_memory_choice();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
         let conv = self.conv.park_take();
@@ -4818,6 +4829,14 @@ impl SessionTask {
         &self,
     ) -> Arc<std::sync::Mutex<crate::runtime::subagent::SubagentRegistry>> {
         Arc::clone(self.0.runtime.subagent_registry())
+    }
+
+    /// Test seam: a clone of this session's runtime. Clones share the
+    /// memory-consent state, so a harness can revoke consent the way the
+    /// `memory_context` tool's capability does (`memory_context_disable`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn runtime_for_harness(&self) -> crate::Runtime {
+        (*self.0.runtime).clone()
     }
 
     /// Test seam: this session's event queue (what a worker's finalizer
