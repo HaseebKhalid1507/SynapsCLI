@@ -517,3 +517,33 @@ async fn thinking_options_query_is_answered_before_and_after_attach() {
     d.shutdown_token().cancel();
     d.wait().await;
 }
+
+/// C4a: `Welcome.accepted_events` is computed per connection, from that
+/// connection's own Hello: unknown names never appear in it, and a second
+/// connection's opt-in is its own.
+#[tokio::test]
+#[serial]
+async fn accepted_events_echo_is_per_connection_and_drops_unknown_names() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let echo = |f: Option<DaemonFrame>| match f {
+        Some(DaemonFrame::Welcome(w)) => w.accepted_events,
+        other => panic!("{other:?}"),
+    };
+    let mut unknown = Raw::connect(&sock).await;
+    unknown.send(&ClientFrame::Hello(Hello::new(ClientKind::Test).with_accepted_events(["bogus", "tool_child_zz"]))).await;
+    assert!(echo(unknown.recv().await).is_empty());
+    let mut all = Raw::connect(&sock).await;
+    all.send(&ClientFrame::Hello(Hello::new(ClientKind::Test).with_accepted_events(OPTIONAL_EVENTS.iter().copied().chain(["bogus"])))).await;
+    let want: Vec<String> = OPTIONAL_EVENTS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(echo(all.recv().await), want);
+    let mut none = Raw::connect(&sock).await;
+    none.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    assert!(echo(none.recv().await).is_empty());
+    for c in [&mut unknown, &mut all, &mut none] {
+        c.send(&ClientFrame::Bye).await;
+    }
+    d.shutdown_token().cancel();
+    d.wait().await;
+}

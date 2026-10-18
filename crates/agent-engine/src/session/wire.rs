@@ -257,6 +257,12 @@ pub struct Hello {
     /// Set when re-connecting after `Reloading`/EOF (C3/A4).
     #[serde(default)]
     pub reconnect_of: Option<ClientReconnect>,
+    /// Optional event kinds this connection wants, one name per kind
+    /// ([`OPTIONAL_EVENTS`]). Unknown names are ignored; an optional event
+    /// not listed here is never sent on this connection. Legacy frames
+    /// decode as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_events: Vec<String>,
 }
 
 /// Who this connection used to be, so the daemon can restore ownership by
@@ -283,7 +289,18 @@ impl Hello {
             env: Some(env),
             env_stripped,
             reconnect_of: None,
+            accepted_events: Vec::new(),
         }
+    }
+
+    /// Opt in to optional event kinds by name (see [`OPTIONAL_EVENTS`]).
+    pub fn with_accepted_events<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.accepted_events = names.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Ask for `Full` (mirror) or `Digest` (digest + display tail) history.
@@ -455,6 +472,52 @@ pub struct Welcome {
     /// every Welcome including the ones after a reload. Old daemons omit it.
     #[serde(default)]
     pub features: Vec<String>,
+    /// The optional events this daemon will send on this connection: the
+    /// known subset of `Hello.accepted_events`, in [`OPTIONAL_EVENTS`] order.
+    /// Omitted when empty (and by old daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_events: Vec<String>,
+}
+
+/// Event kinds sent only to connections that name them in
+/// `Hello.accepted_events`: one name per kind, no groups. Every other event
+/// goes to every attached client as before, so an old client (which shows
+/// an unknown event as "unknown event from a newer daemon") never sees one.
+pub const OPTIONAL_EVENTS: &[&str] = &[];
+
+/// The opt-in name of an optional event kind; `None` = always sent.
+pub fn optional_event_name(event: &SessionEventWire) -> Option<&'static str> {
+    let _ = event;
+    None
+}
+
+/// The optional events one connection gets, negotiated from its Hello.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedEvents(Vec<&'static str>);
+
+impl AcceptedEvents {
+    pub fn negotiate(requested: &[String]) -> Self {
+        Self::from_known(requested, OPTIONAL_EVENTS)
+    }
+
+    /// What was asked for and is known, in `known` order, once each.
+    fn from_known(requested: &[String], known: &[&'static str]) -> Self {
+        Self(known.iter().copied().filter(|k| requested.iter().any(|r| r == k)).collect())
+    }
+
+    /// The Welcome echo.
+    pub fn names(&self) -> Vec<String> {
+        self.0.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn allows_name(&self, name: Option<&str>) -> bool {
+        name.is_none_or(|n| self.0.contains(&n))
+    }
+
+    /// Whether `event` may be sent on this connection.
+    pub fn allows(&self, event: &SessionEventWire) -> bool {
+        self.allows_name(optional_event_name(event))
+    }
 }
 
 fn one() -> u64 {
@@ -1795,6 +1858,7 @@ mod tests {
                 generation: 1,
                 daemon_build: "abc1234".into(),
                 features: vec!["children".into()],
+                accepted_events: vec![],
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -1962,6 +2026,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features: vec![],
+            accepted_events: vec![],
         })
         .unwrap()
         .to_lowercase();
@@ -2008,6 +2073,7 @@ mod tests {
             generation: 2,
             daemon_build: String::new(),
             features: vec![crate::daemon::control_queries::FEATURE_CHILDREN.into()],
+            accepted_events: vec![],
         })
         .unwrap();
         assert_eq!(w["features"], serde_json::json!(["children"]));
@@ -2087,6 +2153,7 @@ mod tests {
             generation: 3,
             daemon_build: String::new(),
             features: vec!["children".into()],
+            accepted_events: vec![],
         }))
         .unwrap();
         match decode_line::<OldDaemonFrame>(new.trim_end()).unwrap() {
@@ -2105,6 +2172,68 @@ mod tests {
             let line = encode_line(&query).unwrap();
             let err = decode_line::<OldClientFrame>(line.trim_end()).unwrap_err();
             assert!(err.contains("unknown variant"), "{err}");
+        }
+    }
+
+    /// C4a: `accepted_events` (the names PD vendors), the negotiation rule
+    /// and old peers.
+    #[test]
+    fn accepted_events_are_exact_names_and_compatible_with_old_peers() {
+        let known: &[&'static str] = &["tool_child", "tool_child_ended"];
+        let ask = |names: &[&str]| {
+            AcceptedEvents::from_known(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>(), known).names()
+        };
+        assert_eq!(ask(&["tool_child_ended", "bogus", "tool_child_ended"]), vec!["tool_child_ended"]);
+        assert_eq!(ask(&["tool_child_ended", "tool_child"]), vec!["tool_child", "tool_child_ended"], "daemon order");
+        assert!(ask(&["bogus", ""]).is_empty());
+        let only_ended = AcceptedEvents::from_known(&["tool_child_ended".to_string()], known);
+        assert!(only_ended.allows_name(None), "ordinary events always pass");
+        assert!(only_ended.allows_name(Some("tool_child_ended")));
+        assert!(!only_ended.allows_name(Some("tool_child")), "no implied groups");
+        assert!(!AcceptedEvents::default().allows_name(Some("tool_child_ended")));
+        assert!(AcceptedEvents::default().allows(&SessionEventWire::SystemNotice("x".into())));
+        // Every optional event this daemon knows has a distinct name.
+        let mut names = OPTIONAL_EVENTS.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), OPTIONAL_EVENTS.len());
+
+        // Hello: the field name; empty is omitted; a legacy Hello is empty;
+        // Hello stays lenient (no deny_unknown_fields), so a released daemon,
+        // whose Hello is this one without the field, accepts the new frame.
+        let mut v = serde_json::to_value(Hello::new(ClientKind::Test).with_accepted_events(["tool_child"])).unwrap();
+        assert_eq!(v["accepted_events"], serde_json::json!(["tool_child"]));
+        let plain = serde_json::to_value(Hello::new(ClientKind::Test)).unwrap();
+        assert!(plain.get("accepted_events").is_none(), "{plain}");
+        let legacy: Hello = serde_json::from_value(plain).unwrap();
+        assert!(legacy.accepted_events.is_empty());
+        v["zz_from_a_newer_client"] = serde_json::json!(1);
+        let lenient: Hello = serde_json::from_value(v).unwrap();
+        assert_eq!(lenient.accepted_events, vec!["tool_child".to_string()]);
+
+        // Welcome: the echo is present when non-empty and omitted when empty;
+        // an old Welcome decodes as no echo.
+        let welcome = |accepted_events: Vec<String>| {
+            serde_json::to_value(&Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "v".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![],
+                progressive_tool_disclosure: false,
+                generation: 1,
+                daemon_build: String::new(),
+                features: vec![],
+                accepted_events,
+            })
+            .unwrap()
+        };
+        assert_eq!(welcome(vec!["tool_child_ended".into()])["accepted_events"], serde_json::json!(["tool_child_ended"]));
+        assert!(welcome(vec![]).get("accepted_events").is_none());
+        let old = r#"{"type":"welcome","protocol_version":3,"daemon_version":"v","pid":1,"profile":null,"sessions":[],"progressive_tool_disclosure":true,"generation":1}"#;
+        match decode_line::<DaemonFrame>(old).unwrap() {
+            DaemonFrame::Welcome(w) => assert!(w.accepted_events.is_empty()),
+            other => panic!("{other:?}"),
         }
     }
 }

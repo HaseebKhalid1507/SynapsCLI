@@ -200,6 +200,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     if hello.client_version != daemon_version {
         tracing::info!(client = %hello.client_version, daemon = %daemon_version, "daemon: client binary version differs (same protocol; allowed)");
     }
+    // Per connection, from this Hello only (a reconnect after a reload
+    // brings its own).
+    let accepted = AcceptedEvents::negotiate(&hello.accepted_events);
     let welcome = Welcome {
         protocol_version: PROTOCOL_VERSION,
         daemon_version,
@@ -210,6 +213,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         generation: state.generation,
         daemon_build: crate::session::wire::build_id().to_string(),
         features: super::control_queries::daemon_features(),
+        accepted_events: accepted.names(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -470,7 +474,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
     let caps = hello.client.capabilities;
-    let skip = move |env: &Envelope| -> bool { !forwarded(history, caps, env) };
+    let accepted = accepted.clone();
+    let skip = move |env: &Envelope| -> bool { !accepted.allows(&env.event) || !forwarded(history, caps, env) };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {

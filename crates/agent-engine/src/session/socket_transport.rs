@@ -878,6 +878,7 @@ mod tests {
                         generation: 1,
                         daemon_build: String::new(),
                         features: vec![],
+                        accepted_events: vec![],
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1199,6 +1200,7 @@ mod tests {
                 generation: 1,
                 daemon_build: String::new(),
                 features: vec![],
+                accepted_events: vec![],
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
