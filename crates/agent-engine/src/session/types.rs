@@ -704,6 +704,36 @@ pub struct SessionReloadRecord {
     pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
+/// What a session tells a client whose command a daemon reload refused.
+pub const RELOADING_REFUSAL: &str = "daemon reloading; retry in a moment";
+
+impl SessionCommand {
+    /// Refused while a daemon reload has checkpointed the session (its
+    /// reload fence is up) until the exec, or until the daemon reports the
+    /// exec failed: anything that starts a turn (a `Steer` with no turn
+    /// running is a `Submit`), changes the conversation or journal the
+    /// record points at, launches or steers work, or changes a setting the
+    /// record already carries. Cancel, answers, queries, saves and
+    /// attach/detach stay open.
+    pub fn refused_while_reloading(&self) -> bool {
+        matches!(
+            self,
+            Self::Submit { .. }
+                | Self::SubmitPrepared { .. }
+                | Self::Steer { .. }
+                | Self::SubagentSteer { .. }
+                | Self::Compact { .. }
+                | Self::NewSession
+                | Self::Resume { .. }
+                | Self::EngineCommand { .. }
+                | Self::PluginCommand { .. }
+                | Self::DriverStart { .. }
+                | Self::Set { .. }
+                | Self::KeepWarm { .. }
+        )
+    }
+}
+
 impl std::fmt::Debug for SessionCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

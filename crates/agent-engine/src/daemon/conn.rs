@@ -66,6 +66,21 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
     }
 }
 
+/// Refused at the connection while a reload is in progress — from the drain
+/// on, before the session is even checkpointed. `SessionCommand::
+/// refused_while_reloading` minus what the drain must still allow: a
+/// `Steer`, `Set` or engine command for the turn the drain is waiting to
+/// finish. The actor's reload fence refuses those once it has checkpointed
+/// (it alone knows whether a `Steer` would start a turn).
+fn refused_while_draining(cmd: &SessionCommand) -> bool {
+    use SessionCommand as C;
+    cmd.refused_while_reloading()
+        && !matches!(
+            cmd,
+            C::Steer { .. } | C::SubagentSteer { .. } | C::Set { .. } | C::EngineCommand { .. } | C::KeepWarm { .. }
+        )
+}
+
 enum Read {
     Frame(ClientFrame),
     Eof,
@@ -495,10 +510,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
                     continue;
                 }
-                if state.reloading.load(Ordering::SeqCst)
-                    && matches!(cmd, SessionCommand::Submit { .. } | SessionCommand::SubmitPrepared { .. } | SessionCommand::Compact { .. })
-                {
-                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "daemon reloading; retry in a moment".into() }).await;
+                if state.reloading.load(Ordering::SeqCst) && refused_while_draining(&cmd) {
+                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
                 }
                 match handle.send_from(client, cmd).await {

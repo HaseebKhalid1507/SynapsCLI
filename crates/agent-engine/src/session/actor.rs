@@ -4312,6 +4312,18 @@ impl SessionActor {
             return;
         };
         let workers = if self.runtime.is_live() {
+            // From the LIVE registry, not only the checkpoint's snapshot: a
+            // worker registered after it was stopped at birth by the
+            // registry's reload fence and is owed its wake too. Snapshot
+            // entries the registry no longer holds ride along.
+            let mut carried = self.reload_carried_workers();
+            carried.extend(
+                fence
+                    .workers
+                    .into_iter()
+                    .filter(|w| !carried.iter().any(|c| c.id == w.id))
+                    .collect::<Vec<_>>(),
+            );
             let mut registry = self
                 .runtime
                 .subagent_registry()
@@ -4320,7 +4332,7 @@ impl SessionActor {
             registry.lift_reload_fence();
             // The queue the record assumed lost is still here: only the
             // reload's own stops owe a wake.
-            registry.rewake_after_failed_exec(fence.workers)
+            registry.rewake_after_failed_exec(carried)
         } else {
             Vec::new()
         };
@@ -4370,6 +4382,22 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
+        }
+        // A reload checkpointed this session: nothing may start work or
+        // change what the reload record captured until the exec (or until
+        // the daemon reports it failed). The wake sources are fenced in the
+        // select loop; commands are fenced here.
+        if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            let reason = super::RELOADING_REFUSAL.to_string();
+            match from {
+                Some(c) => self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason,
+                }),
+                None => self.emit(SessionEventWire::SystemNotice(reason)),
+            }
+            return ControlFlow::Continue(());
         }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {

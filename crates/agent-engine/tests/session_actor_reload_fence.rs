@@ -263,3 +263,90 @@ async fn a_failed_exec_wakes_the_parent_once_per_worker() {
     assert!(sa8[0].contains("by a daemon reload, not by the user"), "{sa8:#?}");
     end(&mut f.client).await;
 }
+
+fn refusals(seen: &[Envelope]) -> Vec<(String, String)> {
+    seen.iter()
+        .filter_map(|e| match &e.event {
+            SessionEventWire::Refused { command, reason, .. } => Some((command.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The fence covers commands too. A client that missed the checkpoint's
+/// cancel sends `Steer`, which with no turn running starts one: under the
+/// fence that turn would run after the record, and any worker it launched
+/// would be stopped at birth and never announced. Every command that starts
+/// a turn or changes what the record captured is refused, and the user is
+/// told why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn commands_that_start_work_are_refused_while_fenced() {
+    let _h = Home::new();
+    let mut f = fixture().await;
+    checkpoint_for_reload(&mut f).await;
+
+    for cmd in [
+        SessionCommand::Steer { text: "and also".into() },
+        submit("hello again"),
+        SessionCommand::NewSession,
+        SessionCommand::Resume { id: 3, query: "other".into() },
+        SessionCommand::Compact { instructions: None },
+        SessionCommand::EngineCommand { id: 4, name: "memory".into(), arg: "off".into() },
+    ] {
+        f.client.send_from_self(cmd).await.unwrap();
+    }
+    let window = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&window), 0, "a turn started under the fence: {window:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1);
+    let refused = refusals(&window);
+    let names: Vec<&str> = refused.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(
+        names,
+        ["steer", "submit", "new_session", "resume", "compact", "engine_command"],
+        "{window:#?}"
+    );
+    assert!(refused.iter().all(|(_, r)| r == "daemon reloading; retry in a moment"), "{refused:?}");
+    assert!(
+        !window.iter().any(|e| matches!(e.event, SessionEventWire::Cleared { .. })),
+        "the conversation was replaced under the fence"
+    );
+
+    // Lifted: the same Steer starts its turn.
+    f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    f.client.send_from_self(SessionCommand::Steer { text: "and also".into() }).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut f.client).await;
+}
+
+/// A worker registered after the checkpoint took its snapshot (whatever
+/// launched it) is stopped at birth by the registry's reload fence. A failed
+/// exec announces it from the live registry, exactly once — not only the
+/// workers the snapshot knew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_exec_announces_a_worker_registered_after_the_snapshot() {
+    let _h = Home::new();
+    let mut f = fixture().await;
+    let workers = checkpoint_for_reload(&mut f).await;
+    assert!(workers.iter().all(|w| w.id != "sa_9"));
+
+    let late = Arc::new(RwLock::new(SubagentState::new()));
+    fake_worker(&f, "sa_9", "latecomer", &late);
+    {
+        let s = late.read().unwrap();
+        assert!(s.cancel_requested && s.stopped_by_reload, "stopped at birth by the reload");
+    }
+    settle(&late);
+
+    f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    let later = drain_for(&mut f.client, Duration::from_millis(500)).await;
+    assert_eq!(started(&later), 0);
+    let sa9 = mentions(&f.bodies, "sa_9");
+    assert_eq!(sa9.len(), 1, "{sa9:#?}");
+    assert!(sa9[0].contains("by a daemon reload, not by the user"), "{sa9:#?}");
+    end(&mut f.client).await;
+}
