@@ -740,6 +740,7 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
+            prompt_bridge.set_owns_input(to == Some(me));
             if from == Some(me) && to != Some(me) {
                 let who = to
                     .map(|c| format!("client #{}", c.0))

@@ -358,6 +358,10 @@ pub(crate) struct PromptBridge {
     /// Confirm prompts shown view-only (`ViewOnly`), in arrival order:
     /// id and title, until a `PromptResolved` clears them.
     waiting: Vec<(u64, String)>,
+    /// Whether this client owns input. Only the owner may arm "Allow all"
+    /// (the actor refuses anyone else), so a non-owner's pane never offers
+    /// the button: the confirm scope is stripped before it reaches the pane.
+    owns_input: bool,
 }
 
 impl PromptBridge {
@@ -376,7 +380,13 @@ impl PromptBridge {
             confirms: ConfirmPolicy::Answer,
             kinds: HashMap::new(),
             waiting: Vec::new(),
+            owns_input: true,
         }
+    }
+
+    /// Track input ownership (attach snapshot, `InputOwnerChanged`).
+    pub(crate) fn set_owns_input(&mut self, owns: bool) {
+        self.owns_input = owns;
     }
 
     /// Set before the first prompt is fed (attach replays pending prompts).
@@ -400,7 +410,7 @@ impl PromptBridge {
                 kind: req.kind,
                 title: req.title,
                 prompt: req.prompt,
-                confirm_scope: req.confirm_scope,
+                confirm_scope: req.confirm_scope.filter(|_| self.owns_input),
                 response_tx,
             });
         self.order.push_back(req.id);
@@ -505,6 +515,27 @@ mod tests {
         assert!(!b.on_local_answer(3), "a confirm answer is never sent");
         assert!(!b.on_local_answer(99), "nor one for a prompt never fed");
         assert!(b.answers_rx.try_recv().is_err(), "nothing queued to send");
+    }
+
+    /// prA m3: only the input owner can arm "Allow all", so a non-owner's
+    /// pane never offers it (the scope is stripped); the owner's does.
+    #[tokio::test]
+    async fn non_owner_pane_gets_no_allow_all_scope() {
+        let scoped = |id| {
+            let mut p = prompt(id, PromptKind::Confirm);
+            p.confirm_scope = Some(agent_engine::session::ConfirmScope {
+                extensions: vec!["jev".into()],
+                tool: None,
+            });
+            p
+        };
+        let (mut b, mut pane) = bridge(ConfirmPolicy::Answer);
+        b.on_prompt(scoped(1));
+        assert!(pane.try_recv().unwrap().confirm_scope.is_some(), "owner keeps it");
+        b.set_owns_input(false);
+        b.on_prompt(scoped(2));
+        let req = pane.try_recv().expect("non-owner can still answer y/n");
+        assert!(req.confirm_scope.is_none(), "no Allow-all for a non-owner");
     }
 
     /// Secret prompts are unchanged under `--no-confirm-answers`: the

@@ -990,34 +990,35 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         .is_some_and(|p| p.kind == PromptKind::Confirm);
     if is_confirm {
         // Confirm dialog: a button lightbox, no free-text field.
+        //   (first 400 ms)       → every key is ignored: the dialog opens
+        //                          asynchronously, between keystrokes, so
+        //                          text already being typed can't answer it
         //   y / Y                → Allow (answers "y")
-        //   a / A                → Allow all from <ext> this session (answers
-        //                          "always"; only when offered — a scoped
-        //                          tool-call confirm — else degrades to Allow)
         //   n / N / Esc          → Deny  (answers None)
-        //   ← → Tab BackTab h l  → move focus between the buttons
+        //   ← → Tab BackTab      → move focus between the buttons
         //   Enter                → activate the FOCUSED button; Deny is the
         //                          default focus, so a bare Enter denies.
-        // Everything else — including pastes — is swallowed so nothing can
-        // accidentally form an allow.
+        // "Allow all" has no letter key: it is armed only deliberately, by
+        // focusing its button and pressing Enter. Everything else —
+        // including pastes — is swallowed so nothing can form an allow.
         use synaps_cli::tools::ConfirmChoice;
+        if !app.secret_prompts.input_armed() {
+            return InputAction::None;
+        }
         if let Event::Key(key) = event {
             let answered = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Allow)
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
-                    app.secret_prompts.confirm_answer(ConfirmChoice::AllowAll)
-                }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Deny)
                 }
                 KeyCode::Enter => app.secret_prompts.confirm_activate_focused(),
-                KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                KeyCode::Right | KeyCode::Tab => {
                     app.secret_prompts.move_confirm_focus(true);
                     None
                 }
-                KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
+                KeyCode::Left | KeyCode::BackTab => {
                     app.secret_prompts.move_confirm_focus(false);
                     None
                 }

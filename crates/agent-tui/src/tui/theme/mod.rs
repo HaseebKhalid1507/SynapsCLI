@@ -1468,3 +1468,59 @@ mod chrome_dim_tests {
         }
     }
 }
+
+impl Theme {
+    /// Surface of the Confirm / secret-prompt lightbox.
+    pub(crate) fn prompt_surface(&self) -> Color {
+        self.raised_surface(1.32)
+    }
+
+    /// Confirm dialog button colours: `(idle label, focused label, focused
+    /// fill)`. Idle labels use the input text colour (≥ 4.5:1 on the prompt
+    /// surface on every built-in theme; `help_fg` was 1.0–2.5:1, which made
+    /// unfocused buttons near invisible). Focused = theme bg on the warning
+    /// fill.
+    pub(crate) fn confirm_button_colors(&self) -> (Color, Color, Color) {
+        (self.input_fg, self.bg, self.warning_color)
+    }
+}
+
+#[cfg(test)]
+mod confirm_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn confirm_button_labels_read_at_aa_on_every_builtin() {
+        for name in [
+            "default",
+            "night-city",
+            "neon-rain",
+            "amber",
+            "phosphor",
+            "solarized-dark",
+            "blood",
+            "ocean",
+            "rose-pine",
+            "nord",
+            "dracula",
+            "monokai",
+            "myx",
+            "gruvbox",
+            "catppuccin",
+            "tokyo-night",
+            "sunset",
+            "ice",
+            "forest",
+            "lavender",
+            "paper",
+        ] {
+            let t = Theme::builtin_for_test(name);
+            let surface = t.prompt_surface();
+            let (idle, focus_fg, focus_bg) = t.confirm_button_colors();
+            let c = wcag_contrast(idle, surface);
+            assert!(c >= 4.5, "{name}: idle button label {c:.2}:1");
+            let c = wcag_contrast(focus_fg, focus_bg);
+            assert!(c >= 4.5, "{name}: focused button label {c:.2}:1");
+        }
+    }
+}

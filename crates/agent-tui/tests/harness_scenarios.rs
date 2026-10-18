@@ -1964,7 +1964,7 @@ fn scenario_confirm_prompt_renders_dialog_not_password_box() {
         assert!(frame.contains(line), "body line {line:?} must render:\n{frame}");
     }
     assert!(
-        frame.contains("y allow") && frame.contains("n/esc deny"),
+        frame.contains("y allow") && frame.contains("n/Esc deny"),
         "footer:\n{frame}"
     );
     assert!(
@@ -2022,7 +2022,8 @@ fn scenario_confirm_prompt_renders_two_buttons_deny_focused_by_default() {
         !frame.contains("Allow all"),
         "activation gate must not offer Allow all:\n{frame}"
     );
-    assert!(frame.contains("←/→/Tab select · Enter confirm"), "footer:\n{frame}");
+    assert!(frame.contains("Tab/←/→ select"), "footer:\n{frame}");
+    assert!(!frame.contains("auto_approve_confirms"), "no off-switch advert:\n{frame}");
     assert_eq!(
         h.confirm_focus(),
         ConfirmChoice::Deny,
@@ -2043,8 +2044,8 @@ fn scenario_confirm_tool_call_offers_allow_all_button() {
     assert!(frame.contains("Tool: bash"), "tool shown before answering:\n{frame}");
     assert!(frame.contains("[ Allow (y) ]"), "{frame}");
     assert!(
-        frame.contains("[ Allow all from jev this session (a) ]"),
-        "button names the extension:\n{frame}"
+        frame.contains("[ Allow all from jev this session ]"),
+        "button names the extension (no letter key):\n{frame}"
     );
     assert!(frame.contains("[ Deny (n) ]"), "{frame}");
     // The scope is stated BEFORE the answer, not after.
@@ -2056,12 +2057,16 @@ fn scenario_confirm_tool_call_offers_allow_all_button() {
     assert!(!flat.contains("subagents"), "no claim about subagents (they run no hooks):\n{frame}");
     assert!(flat.contains("Other extensions still ask"), "{frame}");
     assert!(flat.contains("until /new or /confirms reset"), "revocation is stated:\n{frame}");
-    assert!(frame.contains("y allow · a allow all · n/esc deny"), "footer:\n{frame}");
+    assert!(
+        flat.contains("Allow all: select it, then Enter"),
+        "hint documents the deliberate action:\n{frame}"
+    );
+    assert!(!flat.contains("a allow all"), "no `a` shortcut advertised:\n{frame}");
     assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
 }
 
 /// A `Confirm tool call` with no host-stamped source cannot be latched, so
-/// "Allow all" is not offered and `a` degrades to a single Allow.
+/// "Allow all" is not offered and `a` does nothing at all.
 #[test]
 fn scenario_unattributed_tool_call_confirm_offers_no_allow_all() {
     let mut h = TestHarness::boot_with_size(100, 30);
@@ -2069,7 +2074,8 @@ fn scenario_unattributed_tool_call_confirm_offers_no_allow_all() {
     let frame = h.snapshot();
     assert!(!frame.contains("Allow all"), "{frame}");
     h.key(KeyCode::Char('a'), KeyModifiers::NONE);
-    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()));
+    assert!(h.secret_prompt_active(), "`a` is not a key here");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
@@ -2111,7 +2117,8 @@ fn scenario_confirm_tool_call_focus_cycles_three_buttons() {
 fn scenario_allow_all_announcement_comes_from_the_session() {
     let mut h = TestHarness::boot_with_size(100, 30);
     let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
-    h.key(KeyCode::Char('a'), KeyModifiers::NONE);
+    h.key(KeyCode::Left, KeyModifiers::NONE); // Deny → Allow all
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
     assert!(!h.snapshot().contains("Allow all armed"), "no local duplicate");
     h.feed_events(&[agent_engine::session::SessionEventWire::SystemNotice(
@@ -2121,26 +2128,49 @@ fn scenario_allow_all_announcement_comes_from_the_session() {
     assert!(frame.contains("Allow all armed by client #1"), "{frame}");
 }
 
+/// 04-tui C1: no letter arms "Allow all" — not `a`, not `A`, and the vim
+/// keys `h`/`l` no longer move focus onto it. Only Tab/arrows + Enter.
 #[test]
-fn scenario_confirm_tool_call_a_key_answers_always() {
+fn scenario_confirm_tool_call_letters_never_arm_allow_all() {
     let mut h = TestHarness::boot_with_size(100, 30);
     let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
-    h.key(KeyCode::Char('a'), KeyModifiers::NONE);
-    assert!(!h.secret_prompt_active());
-    assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
+    for c in ['a', 'A', 'h', 'l', 'H', 'L'] {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+        assert!(h.secret_prompt_active(), "{c:?} must not answer");
+        assert_eq!(h.confirm_focus(), ConfirmChoice::Deny, "{c:?} must not move focus");
+    }
+    h.key(KeyCode::Char('A'), KeyModifiers::SHIFT);
+    assert!(h.secret_prompt_active());
+    assert!(rx.try_recv().is_err());
 }
 
-/// On the activation gate `a` must NOT send "always" (the runtime would
-/// treat it as a deny); it degrades to a plain single allow.
+/// On the activation gate `a` does nothing (it used to silently Allow).
 #[test]
-fn scenario_activation_confirm_a_key_degrades_to_allow() {
+fn scenario_activation_confirm_a_key_does_nothing() {
     let mut h = TestHarness::boot_with_size(100, 30);
     let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
     h.key(KeyCode::Char('a'), KeyModifiers::NONE);
-    assert!(!h.secret_prompt_active());
-    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()));
-    let frame = h.snapshot();
-    assert!(!frame.contains("Allow all:"), "no latch announcement:\n{frame}");
+    assert!(h.secret_prompt_active());
+    assert!(rx.try_recv().is_err());
+}
+
+/// 04-tui C1 repro: the dialog opens while the user is typing "make a
+/// plan". The keys that arrive inside the 400 ms arming window are dropped
+/// and nothing is answered; once armed, keys work as usual.
+#[test]
+fn scenario_typing_into_a_freshly_opened_confirm_answers_nothing() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.type_str("m");
+    let mut rx = h.activate_tool_call_confirm_unarmed("jev", "bash", "jev: risk=1.8");
+    h.type_str("ake a plan y");
+    h.key(KeyCode::Tab, KeyModifiers::NONE);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active(), "nothing typed in the window answers");
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny, "focus untouched");
+    assert!(rx.try_recv().is_err(), "no Answer sent");
+    h.arm_confirm_now();
+    h.key(KeyCode::Char('n'), KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), None, "armed: n denies");
 }
 
 #[test]
@@ -2183,4 +2213,56 @@ fn scenario_secret_prompt_long_body_wraps() {
     assert!(frame.contains("deploy@prod-web-01"), "{frame}");
     assert!(frame.contains("rollout."), "wrapped tail must be visible:\n{frame}");
     assert!(frame.contains("password:"), "{frame}");
+}
+
+/// 04-tui I6: on small terminals the controls and the "Allow all" scope
+/// line always fit; the MESSAGE is what gets cut (with a marker).
+fn small_confirm_frame(w: u16, h_: u16) -> String {
+    let mut h = TestHarness::boot_with_size(w, h_);
+    let long = (1..=12)
+        .map(|i| format!("line {i}: jev risk analysis says this command touches many files"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _rx = h.activate_tool_call_confirm(
+        "jev",
+        "bash",
+        &format!("Extension: jev\nTool: bash\n\n{long}\n\nAllow this tool call?"),
+    );
+    h.snapshot()
+}
+
+fn flat(frame: &str) -> String {
+    frame
+        .split_whitespace()
+        .filter(|t| *t != "\u{2503}")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn scenario_confirm_60x15_keeps_buttons_scope_and_hints() {
+    let frame = small_confirm_frame(60, 15);
+    let f = flat(&frame);
+    assert!(frame.contains("Extension: jev"), "{frame}");
+    assert!(f.contains("Allow y") || f.contains("Allow (y)"), "allow button:\n{frame}");
+    assert!(f.contains("Deny n") || f.contains("Deny (n)"), "deny button:\n{frame}");
+    assert!(f.contains("Allow all"), "allow-all button:\n{frame}");
+    assert!(f.contains("until /new or /confirms reset"), "scope line:\n{frame}");
+    assert!(f.contains("Other extensions still ask"), "scope line end:\n{frame}");
+    assert!(f.contains("y allow"), "hints:\n{frame}");
+    assert!(f.contains("message cut to fit"), "message is what gets cut:\n{frame}");
+    assert!(!frame.contains("line 12"), "{frame}");
+}
+
+#[test]
+fn scenario_confirm_40x12_keeps_buttons_scope_and_hints() {
+    let frame = small_confirm_frame(40, 12);
+    let f = flat(&frame);
+    assert!(f.contains("[Allow y]"), "compact allow:\n{frame}");
+    assert!(f.contains("[Allow all: jev]"), "compact allow-all:\n{frame}");
+    assert!(f.contains("[Deny n]"), "compact deny:\n{frame}");
+    assert!(f.contains("until /new or /confirms reset"), "scope line:\n{frame}");
+    assert!(f.contains("Other extensions still ask"), "scope line end:\n{frame}");
+    assert!(f.contains("y allow"), "hints:\n{frame}");
+    assert!(f.contains("select + Enter"), "allow-all hint:\n{frame}");
 }

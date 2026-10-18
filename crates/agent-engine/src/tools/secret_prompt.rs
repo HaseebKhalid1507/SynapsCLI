@@ -63,7 +63,8 @@ pub enum ConfirmChoice {
     /// Answer [`CONFIRM_ANSWER_ALLOW_ALL`]: allow this call and latch the
     /// source extension(s) so their later confirms are auto-approved. Only
     /// offered for `Confirm tool call` prompts that carry a [`ConfirmScope`]
-    /// (not `activate_tools`).
+    /// (not `activate_tools`), and only reachable deliberately: focus the
+    /// button (Tab / arrows) and press Enter. No letter key selects it.
     AllowAll,
     /// Answer `None`: deny (the default focus, so a bare Enter fails closed).
     Deny,
@@ -75,6 +76,11 @@ pub enum ConfirmChoice {
 /// does not depend on the runtime module.
 pub const CONFIRM_ANSWER_ALLOW_ALL: &str = "always";
 
+/// A `Confirm` dialog ignores every key for this long after it becomes
+/// active, so keystrokes already in flight (typing a steer when the dialog
+/// pops up) can never answer it.
+pub const CONFIRM_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
 pub struct PendingSecretPrompt {
     pub kind: PromptKind,
     pub title: String,
@@ -83,10 +89,18 @@ pub struct PendingSecretPrompt {
     pub buffer: String,
     /// `Confirm` only: the focused button. Starts on `Deny`.
     pub confirm_focus: ConfirmChoice,
+    /// When this prompt became the active one (see [`CONFIRM_ARM_DELAY`]).
+    pub activated_at: std::time::Instant,
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
 impl PendingSecretPrompt {
+    /// `Confirm` only: whether keys are accepted yet. `Secret` prompts are
+    /// always armed (they are typed into, not answered by a single key).
+    pub fn input_armed(&self) -> bool {
+        self.kind != PromptKind::Confirm || self.activated_at.elapsed() >= CONFIRM_ARM_DELAY
+    }
+
     /// Whether the "Allow all" button is offered: only the runtime's
     /// per-tool-call gate (`Confirm tool call`) with a known source scope,
     /// never the `activate_tools` gate (its runtime only accepts y/yes) and
@@ -153,6 +167,7 @@ impl SecretPromptQueue {
                 confirm_scope: req.confirm_scope,
                 buffer: String::new(),
                 confirm_focus: ConfirmChoice::Deny,
+                activated_at: std::time::Instant::now(),
                 response_tx: req.response_tx,
             });
         }
@@ -203,24 +218,38 @@ impl SecretPromptQueue {
             .map_or(ConfirmChoice::Deny, |a| a.confirm_focus)
     }
 
+    /// Whether the active prompt accepts keys yet (see [`CONFIRM_ARM_DELAY`]).
+    pub fn input_armed(&self) -> bool {
+        self.active.as_ref().map_or(true, |a| a.input_armed())
+    }
+
+    /// Test/harness seam: treat the active prompt as opened long enough ago
+    /// that the arming delay has passed.
+    #[doc(hidden)]
+    pub fn arm_now_for_tests(&mut self) {
+        if let Some(a) = self.active.as_mut() {
+            if let Some(t) = std::time::Instant::now().checked_sub(CONFIRM_ARM_DELAY * 2) {
+                a.activated_at = t;
+            }
+        }
+    }
+
     /// `Confirm` dialog: whether the "Allow all (session)" button is offered.
     pub fn confirm_offers_allow_all(&self) -> bool {
         self.active.as_ref().is_some_and(|a| a.offers_allow_all())
     }
 
     /// `Confirm` dialog: answer with `choice`. `AllowAll` on a prompt that
-    /// does not offer it degrades to `Allow` (never to a stray string the
-    /// gate would treat as a deny). Returns the choice actually sent, or
-    /// `None` when no confirm dialog is active.
+    /// does not offer it does nothing (never a silent single Allow).
+    /// Returns the choice actually sent, or `None` when nothing was sent.
     pub fn confirm_answer(&mut self, choice: ConfirmChoice) -> Option<ConfirmChoice> {
         let active = self.active.as_mut()?;
         if active.kind != PromptKind::Confirm {
             return None;
         }
-        let choice = match choice {
-            ConfirmChoice::AllowAll if !active.offers_allow_all() => ConfirmChoice::Allow,
-            c => c,
-        };
+        if choice == ConfirmChoice::AllowAll && !active.offers_allow_all() {
+            return None;
+        }
         match choice {
             ConfirmChoice::Deny => self.cancel(),
             ConfirmChoice::Allow | ConfirmChoice::AllowAll => {
@@ -332,8 +361,19 @@ mod tests {
         .confirm_offers_allow_all());
         assert!(!confirm(crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE, Some(scope))
             .confirm_offers_allow_all());
-        // Without a scope, `a` degrades to a single Allow.
+        // Without a scope, AllowAll does nothing (no silent single Allow).
         let mut q = confirm(title, None);
-        assert_eq!(q.confirm_answer(ConfirmChoice::AllowAll), Some(ConfirmChoice::Allow));
+        assert_eq!(q.confirm_answer(ConfirmChoice::AllowAll), None);
+        assert!(q.is_active(), "prompt still waiting for a real answer");
+    }
+
+    #[test]
+    fn confirm_ignores_input_until_armed_secret_never_waits() {
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None };
+        let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
+        assert!(!q.input_armed(), "a fresh confirm is not armed");
+        q.arm_now_for_tests();
+        assert!(q.input_armed());
+        assert!(SecretPromptQueue::new().input_armed(), "no prompt → nothing to guard");
     }
 }

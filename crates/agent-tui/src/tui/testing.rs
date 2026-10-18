@@ -547,7 +547,43 @@ impl TestHarness {
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         self.app.secret_prompts.poll_requests(&rx);
         input::reconcile_secret_prompt(&mut self.app);
+        // Scenarios answer right away; the 400 ms confirm arming delay is
+        // exercised explicitly by `activate_tool_call_confirm_unarmed`.
+        self.app.secret_prompts.arm_now_for_tests();
         response_rx
+    }
+
+    /// Like [`Self::activate_tool_call_confirm`] but WITHOUT skipping the
+    /// confirm arming delay: keys sent right away must be ignored.
+    pub fn activate_tool_call_confirm_unarmed(
+        &mut self,
+        extension: &str,
+        tool: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        use synaps_cli::tools::SecretPromptRequest;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest {
+            kind: synaps_cli::tools::PromptKind::Confirm,
+            title: agent_engine::session::CONFIRM_PROMPT_TITLE.to_string(),
+            prompt: prompt.to_string(),
+            confirm_scope: Some(agent_engine::session::ConfirmScope {
+                extensions: vec![extension.to_string()],
+                tool: Some(tool.to_string()),
+            }),
+            response_tx,
+        })
+        .expect("prompt request send is infallible on a fresh channel");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        self.app.secret_prompts.poll_requests(&rx);
+        input::reconcile_secret_prompt(&mut self.app);
+        response_rx
+    }
+
+    /// Let the active confirm's arming delay elapse (without sleeping).
+    pub fn arm_confirm_now(&mut self) {
+        self.app.secret_prompts.arm_now_for_tests();
     }
 
     /// Inject and activate a `Confirm` prompt (the `activate_tools` y/yes
@@ -820,6 +856,7 @@ impl TestHarness {
         }
         self.app.secret_prompts.poll_requests(&self.secret_prompt_rx);
         input::reconcile_secret_prompt(&mut self.app);
+        self.app.secret_prompts.arm_now_for_tests();
         self
     }
 
