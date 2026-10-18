@@ -630,7 +630,7 @@ where
             .map_err(RefreshFailure::from)
         }
     };
-    ensure_gated_locked_policy(
+    ensure_gated_locked_policy_with(
         refresh_gate(&gate_key),
         Some(lock_path),
         load,
@@ -638,6 +638,7 @@ where
         save,
         rejected,
         |last_refresh_ms| forced_refresh_allowed(cred, last_refresh_ms, crate::epoch_millis()),
+        expected_seat.is_none(),
     )
     .await
 }
@@ -835,9 +836,17 @@ impl RefreshFileLock {
     }
 
     /// CAS a parked rotation into the store. Applied or stale (the slot was
-    /// re-logged-in or removed) deletes the sidecar; a failed save keeps it
-    /// and fails, so the spent refresh token it replaced is never used.
-    async fn apply_pending<S, SFut>(&self, save: &S) -> std::result::Result<(), RefreshFailure>
+    /// re-logged-in or removed) deletes the sidecar. Otherwise the sidecar is
+    /// kept and this fails (with the parked credential, so the caller may
+    /// serve its access token), so the spent refresh token it replaced is
+    /// never used:
+    /// - store missing (moved aside): ActionRequired, never deleted;
+    /// - corrupt store: ActionRequired, keeping the repair text;
+    /// - anything else: Other, retry shortly.
+    async fn apply_pending<S, SFut>(
+        &self,
+        save: &S,
+    ) -> std::result::Result<(), (RefreshFailure, Option<OAuthCredentials>)>
     where
         S: Fn(&str, &OAuthCredentials) -> SFut,
         SFut: std::future::Future<Output = std::result::Result<CasOutcome, RefreshFailure>>,
@@ -851,16 +860,39 @@ impl RefreshFileLock {
             let cred = serde_json::from_value::<OAuthCredentials>(v.get("credential")?.clone()).ok()?;
             Some((expected, cred))
         });
-        if let Some((expected, cred)) = parked {
-            save(&expected, &cred).await.map_err(|e| {
-                RefreshFailure::other(format!(
-                    "a refreshed login is waiting in {} and could not be applied yet ({e}); retry shortly",
+        let Some((expected, cred)) = parked else {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        };
+        let failure = match save(&expected, &cred).await {
+            Ok(CasOutcome::Saved | CasOutcome::Replaced | CasOutcome::Removed) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(());
+            }
+            Ok(CasOutcome::StoreMissing) => RefreshFailure::new(
+                RefreshFailureKind::ActionRequired,
+                format!(
+                    "the credential store no longer exists; this account's refreshed login is \
+                     kept in {}. Put the store back (or repair it) to keep using it; logging in \
+                     again replaces it.",
                     path.display()
-                ))
-            })?;
-        }
-        let _ = std::fs::remove_file(&path);
-        Ok(())
+                ),
+            ),
+            Err(e) if e.kind == RefreshFailureKind::ActionRequired => RefreshFailure::new(
+                RefreshFailureKind::ActionRequired,
+                format!(
+                    "{} This account's refreshed login is kept in {} and is applied once the \
+                     store can be written.",
+                    e.message(),
+                    path.display()
+                ),
+            ),
+            Err(e) => RefreshFailure::other(format!(
+                "a refreshed login is waiting in {} and could not be applied yet ({e}); retry shortly",
+                path.display()
+            )),
+        };
+        Err((failure, Some(cred)))
     }
 
     fn stamp_refreshed(&self, now_ms: u64) -> std::io::Result<()> {
@@ -1010,6 +1042,7 @@ where
 /// the held lock file, `None` without a lock or stamp). An expired
 /// credential always refreshes without consulting `may_force`. Every
 /// successful save stamps the lock file before the lock is released.
+#[cfg(test)]
 async fn ensure_gated_locked_policy<Load, Refresh, RFut, RErr, Save, SFut, MayForce>(
     gate: Arc<Mutex<()>>,
     lock_path: Option<PathBuf>,
@@ -1018,6 +1051,34 @@ async fn ensure_gated_locked_policy<Load, Refresh, RFut, RErr, Save, SFut, MayFo
     save: Save,
     rejected: Option<&str>,
     may_force: MayForce,
+) -> std::result::Result<OAuthCredentials, RefreshFailure>
+where
+    Load: Fn() -> std::result::Result<OAuthCredentials, RefreshFailure>,
+    Refresh: Fn(String) -> RFut,
+    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, RErr>>,
+    RErr: Into<RefreshFailure>,
+    Save: Fn(&str, &OAuthCredentials) -> SFut,
+    SFut: std::future::Future<Output = std::result::Result<CasOutcome, RefreshFailure>>,
+    MayForce: Fn(Option<u64>) -> std::result::Result<(), RefreshFailure>,
+{
+    ensure_gated_locked_policy_with(gate, lock_path, load, refresh, save, rejected, may_force, false)
+        .await
+}
+
+/// [`ensure_gated_locked_policy`] plus `serve_parked`: while a parked
+/// sidecar can't be applied, hand out its still-valid ACCESS token (never
+/// its refresh token). Only for callers without a seat expectation: the
+/// parked credential never went through `load`'s seat check.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_gated_locked_policy_with<Load, Refresh, RFut, RErr, Save, SFut, MayForce>(
+    gate: Arc<Mutex<()>>,
+    lock_path: Option<PathBuf>,
+    load: Load,
+    refresh: Refresh,
+    save: Save,
+    rejected: Option<&str>,
+    may_force: MayForce,
+    serve_parked: bool,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
     Load: Fn() -> std::result::Result<OAuthCredentials, RefreshFailure>,
@@ -1044,7 +1105,19 @@ where
     // A rotation an earlier save could not persist: apply it before
     // anything else, so its spent refresh token is never sent again.
     if let Some(lock) = &file_lock {
-        lock.apply_pending(&save).await?;
+        if let Err((failure, parked)) = lock.apply_pending(&save).await {
+            let usable = parked.filter(|p| {
+                serve_parked
+                    && !is_token_expired(p)
+                    && !rejected.is_some_and(|r| !r.is_empty() && r == p.access)
+            });
+            let Some(mut parked) = usable else {
+                return Err(failure);
+            };
+            tracing::warn!(error = %failure, "serving the parked access token until its refresh can be saved");
+            parked.refresh.clear();
+            return Ok(parked);
+        }
     }
     for _ in 0..MAX_CAS_ROUNDS {
         // Re-read under both locks: a preceding waiter (or another process)
@@ -1081,6 +1154,15 @@ where
                     lock.record_refreshed(crate::epoch_millis());
                 }
                 return Ok(fresh);
+            }
+            CasOutcome::StoreMissing => {
+                // The file vanished mid-refresh (moved aside): park the only
+                // live token rather than drop it.
+                let err = RefreshFailure::new(
+                    RefreshFailureKind::ActionRequired,
+                    "the credential store no longer exists",
+                );
+                return park_unsaved_rotation(file_lock.as_ref(), &old_refresh, fresh, err);
             }
             CasOutcome::Removed => {
                 return Err(
@@ -2089,6 +2171,128 @@ mod rejected_token_tests {
         assert!(!pending.exists());
     }
 
+    /// Round 3: an expired stored credential, a parked sidecar and a save
+    /// that keeps failing with `save_err`.
+    async fn blocked_apply(
+        save_out: fn() -> Result<CasOutcome, RefreshFailure>,
+        parked_expires: u64,
+        rejected: Option<&str>,
+        serve_parked: bool,
+    ) -> (Result<OAuthCredentials, RefreshFailure>, bool, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("auth.json.anthropic.refresh.lock");
+        let file_lock = RefreshFileLock {
+            file: std::fs::File::create(&lock).unwrap(),
+            path: lock.clone(),
+        };
+        let mut parked = credential("parked-access");
+        parked.refresh = "parked-r".into();
+        parked.expires = parked_expires;
+        file_lock.park_pending("r0", &parked).unwrap();
+        drop(file_lock);
+        let mut stale = credential("old-access");
+        stale.expires = 0;
+        let refreshes = AtomicUsize::new(0);
+        let out = ensure_gated_locked_policy_with(
+            Arc::new(Mutex::new(())),
+            Some(lock.clone()),
+            || Ok(stale.clone()),
+            |_| {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, String>(credential("never")) }
+            },
+            |_: &str, _: &OAuthCredentials| std::future::ready(save_out()),
+            rejected,
+            |_| Ok(()),
+            serve_parked,
+        )
+        .await;
+        (out, pending_path(&lock).exists(), refreshes.load(Ordering::SeqCst))
+    }
+
+    /// R2-m3a: while the sidecar can't be applied, its still-valid access
+    /// token is served (never its refresh token); the sidecar stays and the
+    /// spent token is not sent.
+    #[tokio::test]
+    async fn parked_access_token_is_served_while_the_sidecar_cannot_be_applied() {
+        let busy = || Err(StoreError::Busy("timed out waiting for auth.json.lock".into()).into());
+        let live = crate::epoch_millis() + 3_600_000;
+        let (out, kept, refreshes) = blocked_apply(busy, live, None, true).await;
+        let served = out.expect("parked access token served");
+        assert_eq!(served.access, "parked-access");
+        assert!(served.refresh.is_empty(), "the parked refresh token never leaves");
+        assert!(kept);
+        assert_eq!(refreshes, 0);
+        // Not served: seat-pinned callers, a parked token that was just
+        // rejected, an expired one.
+        for (expires, rejected, serve) in [
+            (live, None, false),
+            (live, Some("parked-access"), true),
+            (0, None, true),
+        ] {
+            let (out, kept, refreshes) = blocked_apply(busy, expires, rejected, serve).await;
+            assert!(out.is_err());
+            assert!(kept);
+            assert_eq!(refreshes, 0);
+        }
+    }
+
+    /// R2-m3b: a corrupt store behind the sidecar is ActionRequired with the
+    /// mv text, not "retry shortly".
+    #[tokio::test]
+    async fn sidecar_blocked_by_a_corrupt_store_is_action_required() {
+        let corrupt = || {
+            Err(StoreError::Corrupt(
+                "/x/auth.json is not valid JSON; Move it aside with `mv '/x/auth.json' '/x/auth.json.broken-1'`"
+                    .into(),
+            )
+            .into())
+        };
+        let (out, kept, _) = blocked_apply(corrupt, 0, None, false).await;
+        let err = out.unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::ActionRequired, "{err}");
+        assert!(err.message().contains("mv '/x/auth.json'"), "{err}");
+        assert!(!err.message().contains("retry shortly"), "{err}");
+        assert!(kept);
+    }
+
+    /// R2-m3c: after the user follows the mv advice, the store is missing.
+    /// The sidecar (the only live refresh token) is kept and the user is
+    /// told, never deleted as "removed".
+    #[tokio::test]
+    async fn sidecar_is_kept_when_the_store_is_missing() {
+        let (out, kept, refreshes) =
+            blocked_apply(|| Ok(CasOutcome::StoreMissing), 0, None, false).await;
+        let err = out.unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::ActionRequired, "{err}");
+        assert!(err.message().contains("no longer exists"), "{err}");
+        assert!(kept, "the only live token survives");
+        assert_eq!(refreshes, 0);
+    }
+
+    /// A store that vanishes between the provider exchange and the save
+    /// parks the rotation instead of dropping it.
+    #[tokio::test]
+    async fn rotation_is_parked_when_the_store_vanishes_mid_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("auth.json.anthropic.refresh.lock");
+        let mut stale = credential("old-access");
+        stale.expires = 0;
+        let fresh = ensure_gated_locked_policy(
+            Arc::new(Mutex::new(())),
+            Some(lock.clone()),
+            || Ok(stale.clone()),
+            |_| async { Ok::<_, String>(credential("rotated")) },
+            |_: &str, _: &OAuthCredentials| std::future::ready(Ok(CasOutcome::StoreMissing)),
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh.access, "rotated");
+        assert!(pending_path(&lock).exists());
+    }
+
     /// A sidecar the store has moved past (re-login, removal) is dropped;
     /// one that can't be applied yet blocks the refresh instead of spending
     /// the old token.
@@ -2120,7 +2324,8 @@ mod rejected_token_tests {
                 std::future::ready(Err(StoreError::Busy("busy".into()).into()))
             })
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .0;
         assert_eq!(err.kind, RefreshFailureKind::Other);
         assert!(pending_path(&lock).exists());
     }

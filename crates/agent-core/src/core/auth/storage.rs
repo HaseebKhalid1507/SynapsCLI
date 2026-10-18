@@ -134,13 +134,28 @@ pub(crate) fn remove_key_at(path: &Path, key: &str) -> std::result::Result<bool,
     // NOTE: the per-credential refresh lock file (`<auth>.<key>.refresh.lock`)
     // is deliberately NOT unlinked here: unlinking a lock file another
     // process may hold defeats flock (a re-created file is a new inode).
-    if !path.exists() {
-        return Ok(false);
-    }
-    with_locked_root(path, false, |root| {
-        let removed = root.remove(key).is_some();
-        Ok((removed, removed))
-    })
+    // The parked-refresh sidecar IS removed: it is a regular file holding a
+    // live refresh token for the account being removed.
+    let removed = if path.exists() {
+        with_locked_root(path, false, |root| {
+            let removed = root.remove(key).is_some();
+            Ok((removed, removed))
+        })?
+    } else {
+        false
+    };
+    let _ = std::fs::remove_file(refresh_pending_path(path, key));
+    Ok(removed)
+}
+
+/// `<auth>.<key>.refresh.pending`: a rotation whose save failed, parked
+/// beside the account's refresh lock (see `token.rs`).
+pub(crate) fn refresh_pending_path(auth_path: &Path, key: &str) -> PathBuf {
+    let file_name = auth_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("auth.json");
+    auth_path.with_file_name(format!("{file_name}.{key}.refresh.pending"))
 }
 
 /// Non-secret metadata stored beside a credential (`label`, `identity`,
@@ -280,6 +295,9 @@ pub enum CasOutcome {
     /// The slot now holds a different credential (re-login while the refresh
     /// was in flight). Nothing was written.
     Replaced,
+    /// The credential file itself is gone (e.g. moved aside by the user).
+    /// Nothing was written.
+    StoreMissing,
 }
 
 /// Write a rotated credential only if the slot still holds the credential
@@ -314,7 +332,7 @@ pub(crate) fn save_provider_auth_if_refresh_matches_typed_at(
         .cloned()
         .ok_or_else(|| "credential did not serialize to an object".to_string())?;
     if !path.exists() {
-        return Ok(CasOutcome::Removed);
+        return Ok(CasOutcome::StoreMissing);
     }
     with_locked_root_typed(path, false, wait, |root| {
         let Some(entry) = root.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
@@ -1800,11 +1818,12 @@ mod tests {
             CasOutcome::Removed
         );
         assert!(read_root(&path).get(key).is_none());
-        // Missing file: nothing is created either.
+        // Missing file: nothing is created either (and the caller can tell
+        // a missing store from a removed slot).
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             save_provider_auth_if_refresh_matches_at(&path, key, "x", &creds("x", None)).unwrap(),
-            CasOutcome::Removed
+            CasOutcome::StoreMissing
         );
         assert!(!path.exists());
     }
@@ -2017,5 +2036,35 @@ mod corrupt_store_error_tests {
     #[test]
     fn shell_quoting_survives_a_quote_in_the_path() {
         assert_eq!(shell_quote("/a/it's/auth.json"), r#"'/a/it'\''s/auth.json'"#);
+    }
+}
+
+/// R2-m1: removing an account also removes its parked refresh sidecar (a
+/// live refresh token for an account the user removed).
+#[cfg(test)]
+mod remove_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_slot_deletes_its_refresh_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"anthropic@work":{"type":"oauth"},"anthropic":{"type":"oauth"}}"#)
+            .unwrap();
+        let work = refresh_pending_path(&path, "anthropic@work");
+        let other = refresh_pending_path(&path, "anthropic");
+        assert_eq!(
+            work,
+            dir.path().join("auth.json.anthropic@work.refresh.pending")
+        );
+        std::fs::write(&work, "{}").unwrap();
+        std::fs::write(&other, "{}").unwrap();
+        assert!(remove_key_at(&path, "anthropic@work").unwrap());
+        assert!(!work.exists(), "removed slot's sidecar is gone");
+        assert!(other.exists(), "other slots keep theirs");
+        // Even when the slot was already gone from the store.
+        std::fs::write(&work, "{}").unwrap();
+        assert!(!remove_key_at(&path, "anthropic@work").unwrap());
+        assert!(!work.exists());
     }
 }
