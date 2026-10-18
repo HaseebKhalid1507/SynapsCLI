@@ -75,11 +75,21 @@ pub async fn exchange_code_for_tokens(
     })
 }
 
-/// Refresh an expired OAuth token.
+/// Refresh an expired OAuth token. Failures are typed at the source: no
+/// response or an unusable success body is transient, a status is
+/// classified by [`status_kind`].
 pub async fn refresh_token(
     client: &Client,
     refresh: &str,
-) -> std::result::Result<OAuthCredentials, String> {
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
+    refresh_token_at(client, TOKEN_URL, refresh).await
+}
+
+pub(crate) async fn refresh_token_at(
+    client: &Client,
+    url: &str,
+    refresh: &str,
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
@@ -87,28 +97,33 @@ pub async fn refresh_token(
     });
 
     let resp = client
-        .post(TOKEN_URL)
+        .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Token refresh request failed: {}", e))?;
+        .map_err(|e| RefreshFailure::transport(format!("Token refresh request failed: {}", e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Token refresh failed ({}): {}",
-            status,
-            sanitize_oauth_error_body(&text)
+        return Err(RefreshFailure::status(
+            status.as_u16(),
+            format!(
+                "Token refresh failed ({}): {}",
+                status,
+                sanitize_oauth_error_body(&text)
+            ),
         ));
     }
 
+    // A 200 whose body is not a token response (captive portal HTML, a
+    // connection cut mid-body) says nothing about the login.
     let token_resp: TokenResponse = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
+        .map_err(|e| RefreshFailure::bad_response(format!("Failed to parse refresh response: {}", e)))?;
 
     let expires = now_millis() + (token_resp.expires_in * 1000) - (5 * 60 * 1000);
 
@@ -305,23 +320,42 @@ impl From<RefreshFailure> for String {
     }
 }
 
-/// Classify a provider `refresh` error string. Transport failures (the
-/// request never got a status: "... request failed: <reqwest error>", Muse's
-/// "transport error"), timeouts and 5xx / 429 statuses are transient;
-/// everything else (e.g. `invalid_grant`) is a credential failure.
-fn classify_provider_refresh_error(message: String) -> RefreshFailure {
-    let transient = message.contains("request failed:")
-        || message.contains("transport error")
-        || message.contains("timed out")
-        || [" (5", " (429", "HTTP error 5", "HTTP error 429"]
-            .iter()
-            .any(|p| message.contains(p));
-    let kind = if transient {
-        RefreshFailureKind::Transient
-    } else {
-        RefreshFailureKind::Credential
-    };
-    RefreshFailure::new(kind, message)
+/// Kind of a non-success token-endpoint status: request timeout, too
+/// early, rate limit and 5xx are transient; every other status (400
+/// `invalid_grant`, 401, 403, ...) means the login was rejected.
+pub fn status_kind(status: u16) -> RefreshFailureKind {
+    match status {
+        408 | 425 | 429 | 500..=599 => RefreshFailureKind::Transient,
+        _ => RefreshFailureKind::Credential,
+    }
+}
+
+impl RefreshFailure {
+    /// The request produced no usable response (connect, TLS, timeout, a
+    /// body cut mid-transfer).
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::new(RefreshFailureKind::Transient, message)
+    }
+
+    /// The token endpoint answered `status`; see [`status_kind`].
+    pub fn status(status: u16, message: impl Into<String>) -> Self {
+        Self::new(status_kind(status), message)
+    }
+
+    /// A success status whose body is not a usable token response.
+    pub fn bad_response(message: impl Into<String>) -> Self {
+        Self::new(RefreshFailureKind::Transient, message)
+    }
+
+    /// The stored login is missing or was rejected.
+    pub fn credential(message: impl Into<String>) -> Self {
+        Self::new(RefreshFailureKind::Credential, message)
+    }
+
+    /// A local or configuration failure (pinning, client build).
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::new(RefreshFailureKind::Other, message)
+    }
 }
 
 /// [`ensure_fresh_credential`] for a slot whose stored credential the caller
@@ -476,7 +510,7 @@ fn load_checked(
 /// Gate → per-credential cross-process lock → CAS save, plus the forced
 /// refresh rate limit. `refresh` is the provider exchange (injected so the
 /// whole production composition is testable without a network).
-async fn refresh_credential_locked<Refresh, RFut>(
+async fn refresh_credential_locked<Refresh, RFut, RErr>(
     cred: &CredentialRef,
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
@@ -485,7 +519,8 @@ async fn refresh_credential_locked<Refresh, RFut>(
 ) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
     Refresh: Fn(String) -> RFut,
-    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
+    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, RErr>>,
+    RErr: Into<RefreshFailure>,
 {
     let key = cred.storage_key();
     let gate_key = format!("{}|{}", path.display(), key);
@@ -741,7 +776,7 @@ where
 /// the held lock file, `None` without a lock or stamp). An expired
 /// credential always refreshes without consulting `may_force`. Every
 /// successful save stamps the lock file before the lock is released.
-async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save, MayForce>(
+async fn ensure_gated_locked_policy<Load, Refresh, RFut, RErr, Save, MayForce>(
     gate: Arc<Mutex<()>>,
     lock_path: Option<PathBuf>,
     load: Load,
@@ -753,7 +788,8 @@ async fn ensure_gated_locked_policy<Load, Refresh, RFut, Save, MayForce>(
 where
     Load: Fn() -> std::result::Result<OAuthCredentials, String>,
     Refresh: Fn(String) -> RFut,
-    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, String>>,
+    RFut: std::future::Future<Output = std::result::Result<OAuthCredentials, RErr>>,
+    RErr: Into<RefreshFailure>,
     Save: Fn(&str, &OAuthCredentials) -> std::result::Result<CasOutcome, String>,
     MayForce: Fn(Option<u64>) -> std::result::Result<(), RefreshFailure>,
 {
@@ -791,7 +827,7 @@ where
         let mut fresh = tokio::time::timeout(REFRESH_HTTP_DEADLINE, refresh(old_refresh.clone()))
             .await
             .map_err(|_| RefreshFailure::new(RefreshFailureKind::Transient, "token refresh timed out"))?
-            .map_err(classify_provider_refresh_error)?;
+            .map_err(Into::into)?;
         if fresh.account_id.is_none() {
             fresh.account_id = creds.account_id.clone();
         }
@@ -1657,7 +1693,7 @@ mod rejected_token_tests {
             |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 tokio::task::yield_now().await;
-                Ok(credential("new"))
+                Ok::<_, String>(credential("new"))
             },
             |_, fresh| {
                 *store.lock().unwrap() = fresh.clone();
@@ -1724,7 +1760,7 @@ mod rejected_token_tests {
             Arc::new(Mutex::new(())),
             None,
             || Ok(credential("rejected")),
-            |_| async { Ok(credential("new")) },
+            |_| async { Ok::<_, String>(credential("new")) },
             |_, _| Ok(CasOutcome::Removed),
             Some("rejected"),
             |_| Ok(()),
@@ -1763,7 +1799,7 @@ mod rejected_token_tests {
                 |old_refresh| async move {
                     self.refresh_calls.fetch_add(1, Ordering::SeqCst);
                     tokio::task::yield_now().await;
-                    Ok(OAuthCredentials {
+                    Ok::<_, String>(OAuthCredentials {
                         auth_type: "oauth".into(),
                         refresh: format!("{old_refresh}-rotated"),
                         access: "fresh-access".into(),
@@ -1838,7 +1874,7 @@ mod rejected_token_tests {
             || Ok(credential("rejected")),
             |_| async {
                 refreshes.fetch_add(1, Ordering::SeqCst);
-                Ok(credential("never"))
+                Ok::<_, String>(credential("never"))
             },
             |_, _| Ok(CasOutcome::Saved),
             Some("rejected"),
@@ -1864,7 +1900,7 @@ mod rejected_token_tests {
                     c.expires = 0;
                     Ok(c)
                 },
-                |_| async { Ok(credential("new")) },
+                |_| async { Ok::<_, String>(credential("new")) },
                 |_, _| Ok(CasOutcome::Saved),
                 Some(rejected),
                 |_| Err("cooldown".to_string().into()),
@@ -1908,7 +1944,7 @@ mod rejected_token_tests {
     ) -> Result<OAuthCredentials, String> {
         refresh_credential_locked(cred, path, None, Some(rejected), |old| async move {
             let n = calls.fetch_add(1, Ordering::SeqCst);
-            Ok(OAuthCredentials {
+            Ok::<_, String>(OAuthCredentials {
                 auth_type: "oauth".into(),
                 refresh: format!("{old}-rotated"),
                 access: format!("minted-{n}"),
@@ -2095,18 +2131,195 @@ mod rejected_token_tests {
         assert!(f.message().contains("not refreshing again for 48s"), "{f}");
         assert!(forced_refresh_allowed(&a, Some(now - 60_000), now).is_ok());
 
-        let kind = |m: &str| classify_provider_refresh_error(m.to_string()).kind;
-        use RefreshFailureKind::{Credential, Transient};
-        assert_eq!(kind("Token refresh request failed: error sending request"), Transient);
-        assert_eq!(kind("Token refresh failed (503 Service Unavailable): <error body omitted>"), Transient);
-        assert_eq!(kind("Token refresh failed (429 Too Many Requests): rate_limited"), Transient);
-        assert_eq!(kind("transport error"), Transient);
-        assert_eq!(kind("Token refresh failed (400 Bad Request): invalid_grant: revoked"), Credential);
-        assert_eq!(
-            kind("your saved Meta login is no longer valid (HTTP 401); run `synaps login --provider muse` again"),
-            Credential
-        );
+        use RefreshFailureKind::Credential;
         // Storage/slot strings are credential failures.
         assert_eq!(RefreshFailure::from("No credentials".to_string()).kind, Credential);
+    }
+}
+
+/// Minimal loopback HTTP server for refresh-classification tests: answers
+/// every request with one canned raw response, then closes the connection.
+#[cfg(test)]
+pub(crate) mod fake_http {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `HTTP/1.1 <status>` response with a JSON content type and an exact
+    /// `Content-Length`.
+    pub(crate) fn response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn request_complete(got: &[u8]) -> bool {
+        let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+        let len = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        got.len() >= end + 4 + len
+    }
+
+    /// Serve `raw` to every connection; returns `http://127.0.0.1:<port>`.
+    pub(crate) async fn serve(raw: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let raw = raw.clone();
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request_complete(&got) {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = sock.write_all(raw.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A loopback URL nothing listens on (connection refused).
+    pub(crate) async fn dead_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+}
+
+/// m1: refresh failures are classified where they are produced (status code
+/// and error type), never by matching message text.
+#[cfg(test)]
+mod source_classification_tests {
+    use super::fake_http::{dead_url, response, serve};
+    use super::*;
+    use RefreshFailureKind::{Credential, Transient};
+
+    #[test]
+    fn status_kinds() {
+        for s in [408, 425, 429, 500, 502, 503, 504] {
+            assert_eq!(status_kind(s), Transient, "{s}");
+        }
+        for s in [400, 401, 403, 404] {
+            assert_eq!(status_kind(s), Credential, "{s}");
+        }
+    }
+
+    async fn anthropic(raw: String) -> RefreshFailure {
+        let url = format!("{}/v1/oauth/token", serve(raw).await);
+        refresh_token_at(&Client::new(), &url, "rt").await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn anthropic_refresh_failures_are_typed_at_the_source() {
+        // A captive portal answering 200 with HTML: not a login problem.
+        let portal = anthropic(response("200 OK", "<html>sign in to wifi</html>")).await;
+        assert_eq!(portal.kind, Transient, "{portal}");
+        // A body cut mid-transfer (declared 200 bytes, sent 10).
+        let cut = anthropic(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\
+             Connection: close\r\n\r\n{\"access_t"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(cut.kind, Transient, "{cut}");
+        let timeout = anthropic(response("408 Request Timeout", "{}")).await;
+        assert_eq!(timeout.kind, Transient, "{timeout}");
+        let busy = anthropic(response("503 Service Unavailable", "<html/>")).await;
+        assert_eq!(busy.kind, Transient, "{busy}");
+        // A real rejection stays a credential failure, sanitized.
+        let revoked = anthropic(response(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"revoked"}"#,
+        ))
+        .await;
+        assert_eq!(revoked.kind, Credential, "{revoked}");
+        assert!(revoked.message().contains("invalid_grant"), "{revoked}");
+        // No network at all.
+        let url = format!("{}/v1/oauth/token", dead_url().await);
+        let down = refresh_token_at(&Client::new(), &url, "rt").await.unwrap_err();
+        assert_eq!(down.kind, Transient, "{down}");
+    }
+
+    /// Kind follows the typed provider error, even when the text would
+    /// have fooled the old substring matcher.
+    #[test]
+    fn provider_errors_carry_their_kind() {
+        use super::super::google_gemini::GeminiAuthError as G;
+        assert_eq!(G::TokenRequestFailed(503).refresh_failure().kind, Transient);
+        assert_eq!(G::TokenRequestFailed(400).refresh_failure().kind, Credential);
+        assert_eq!(G::Transport.refresh_failure().kind, Transient);
+        assert_eq!(G::EmptyRefreshToken.refresh_failure().kind, Credential);
+
+        use super::super::muse::MuseAuthError as M;
+        assert_eq!(M::LoginRejected(401).refresh_failure().kind, Credential);
+        assert_eq!(M::HttpStatus(503).refresh_failure().kind, Transient);
+        assert_eq!(M::Transport.refresh_failure().kind, Transient);
+        assert_eq!(M::InvalidMintResponse.refresh_failure().kind, Transient);
+        assert_eq!(M::OnboardingRequired.refresh_failure().kind, Credential);
+
+        use super::super::kimi_code::KimiAuthError as K;
+        assert_eq!(K::Unauthorized.refresh_failure().kind, Credential);
+        assert_eq!(K::HttpStatus(502).refresh_failure().kind, Transient);
+        assert_eq!(K::Transport.refresh_failure().kind, Transient);
+
+        use super::super::github_copilot::CopilotAuthError as C;
+        assert_eq!(C::SessionMintRejected(401).refresh_failure().kind, Credential);
+        assert_eq!(C::HttpStatus(500).refresh_failure().kind, Transient);
+        assert_eq!(C::Transport.refresh_failure().kind, Transient);
+    }
+
+    #[tokio::test]
+    async fn gemini_503_is_transient_and_invalid_grant_is_credential() {
+        use super::super::google_gemini::{refresh_with_registration_typed, GeminiRegistration};
+        let reg = GeminiRegistration::test("client-id", None).unwrap();
+        let run = |raw: String| {
+            let reg = &reg;
+            async move {
+                let url = format!("{}/token", serve(raw).await);
+                refresh_with_registration_typed(&Client::new(), &url, true, reg, "rt")
+                    .await
+                    .unwrap_err()
+            }
+        };
+        let busy = run(response("503 Service Unavailable", "{}")).await;
+        assert_eq!(busy.kind, Transient, "{busy}");
+        assert!(busy.message().contains("(HTTP 503)"), "{busy}");
+        let revoked = run(response("400 Bad Request", r#"{"error":"invalid_grant"}"#)).await;
+        assert_eq!(revoked.kind, Credential, "{revoked}");
+    }
+
+    #[tokio::test]
+    async fn xai_discovery_failure_is_transient() {
+        let url = format!("{}/.well-known/openid-configuration", dead_url().await);
+        let err = super::super::xai::discover_at(&url).await.unwrap_err();
+        assert_eq!(err.kind, Transient, "{err}");
+        assert!(err.message().contains("discovery failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_failures_are_typed() {
+        let run = |raw: String| async move {
+            let url = format!("{}/oauth/token", serve(raw).await);
+            super::super::openai_codex::token_request_at(&Client::new(), &url, &[("a", "b")])
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(run(response("502 Bad Gateway", "")).await.kind, Transient);
+        assert_eq!(run(response("200 OK", "<html/>")).await.kind, Transient);
+        let revoked = run(response("401 Unauthorized", r#"{"error":"invalid_grant"}"#)).await;
+        assert_eq!(revoked.kind, Credential);
     }
 }

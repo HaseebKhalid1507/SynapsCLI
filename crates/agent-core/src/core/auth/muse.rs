@@ -182,6 +182,31 @@ impl fmt::Display for MuseAuthError {
     }
 }
 
+impl MuseAuthError {
+    /// Typed re-mint failure: only a rejected or unfinished Meta login is a
+    /// credential failure; transport, 5xx / 429 and unusable mint bodies are
+    /// transient.
+    pub fn refresh_failure(&self) -> super::RefreshFailure {
+        use super::token::RefreshFailureKind as K;
+        let kind = match self {
+            Self::HttpStatus(code) => super::token::status_kind(*code),
+            Self::LoginRejected(_)
+            | Self::OnboardingRequired
+            | Self::PaymentRequired
+            | Self::EmptyAccessToken
+            | Self::AccessDenied
+            | Self::Expired => K::Credential,
+            Self::Transport
+            | Self::ResponseTooLarge
+            | Self::InvalidMintResponse
+            | Self::InvalidTokenResponse
+            | Self::EmptyApiKey => K::Transient,
+            _ => K::Other,
+        };
+        super::RefreshFailure::new(kind, self.to_string())
+    }
+}
+
 impl fmt::Debug for MuseAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "MuseAuthError({self})")
@@ -760,12 +785,12 @@ pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, S
 pub async fn refresh_token(
     _client: &Client,
     oauth_access_token: &str,
-) -> Result<OAuthCredentials, String> {
-    let http = ProductionHttp::new().map_err(|e| e.to_string())?;
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let http = ProductionHttp::new().map_err(|e| e.refresh_failure())?;
     mint_credentials(&http, &ProductionClock, oauth_access_token)
         .await
         .map(|(creds, _)| creds)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.refresh_failure())
 }
 
 // ── Production adapters ──────────────────────────────────────────────────────

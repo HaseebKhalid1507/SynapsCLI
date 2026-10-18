@@ -152,6 +152,20 @@ impl fmt::Debug for KimiAuthError {
     }
 }
 
+impl KimiAuthError {
+    /// Typed refresh failure (after `refresh_with`'s own retries).
+    pub fn refresh_failure(&self) -> super::RefreshFailure {
+        use super::token::RefreshFailureKind as K;
+        let kind = match self {
+            Self::HttpStatus(code) => super::token::status_kind(*code),
+            Self::Unauthorized | Self::AccessDenied | Self::Expired => K::Credential,
+            Self::Transport | Self::ResponseTooLarge | Self::InvalidTokenResponse => K::Transient,
+            _ => K::Other,
+        };
+        super::RefreshFailure::new(kind, self.to_string())
+    }
+}
+
 impl From<KimiAuthError> for String {
     fn from(value: KimiAuthError) -> Self {
         value.to_string()
@@ -808,12 +822,15 @@ pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, S
 
 /// Broker refresh: rotate the token pair (no browser). The caller persists
 /// the rotated credentials via the provider single-flight gate.
-pub async fn refresh_token(_client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
-    let http = ProductionHttp::new().map_err(|e| e.to_string())?;
+pub async fn refresh_token(
+    _client: &Client,
+    refresh: &str,
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let http = ProductionHttp::new().map_err(|e| e.refresh_failure())?;
     let clock = ProductionClock;
     refresh_with(&http, &clock, refresh)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.refresh_failure())
 }
 
 // ── Production adapters ──────────────────────────────────────────────────────

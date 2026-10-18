@@ -8,7 +8,10 @@ pub mod anthropic {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         crate::auth::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         crate::auth::refresh_token(client, refresh).await
     }
 }
@@ -23,7 +26,10 @@ pub mod openai_codex {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         super::super::openai_codex::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         super::super::openai_codex::refresh_token(client, refresh).await
     }
 }
@@ -37,7 +43,10 @@ pub mod xai {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         super::super::xai::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         super::super::xai::refresh_token(client, refresh).await
     }
 }
@@ -51,7 +60,10 @@ pub mod github_copilot {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         super::super::github_copilot::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         super::super::github_copilot::refresh_token(client, refresh).await
     }
 }
@@ -65,7 +77,10 @@ pub mod google_gemini {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         super::super::google_gemini::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         super::super::google_gemini::refresh_token(client, refresh).await
     }
 }
@@ -79,7 +94,10 @@ pub mod kimi_code {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         super::super::kimi_code::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         super::super::kimi_code::refresh_token(client, refresh).await
     }
 }
@@ -93,7 +111,10 @@ pub mod muse {
     pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
         super::super::muse::login_into(persist_key).await
     }
-    pub async fn refresh(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    pub async fn refresh(
+        client: &Client,
+        refresh: &str,
+    ) -> Result<OAuthCredentials, crate::auth::RefreshFailure> {
         super::super::muse::refresh_token(client, refresh).await
     }
 }

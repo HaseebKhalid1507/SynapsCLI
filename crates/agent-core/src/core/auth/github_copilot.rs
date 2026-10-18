@@ -152,6 +152,27 @@ impl fmt::Debug for CopilotAuthError {
     }
 }
 
+impl CopilotAuthError {
+    /// Typed refresh (session re-mint) failure.
+    pub fn refresh_failure(&self) -> super::RefreshFailure {
+        use super::token::RefreshFailureKind as K;
+        let kind = match self {
+            Self::HttpStatus(code) => super::token::status_kind(*code),
+            Self::SessionMintRejected(_)
+            | Self::EmptyGitHubToken
+            | Self::AccessDenied
+            | Self::Expired => K::Credential,
+            Self::Transport
+            | Self::ResponseTooLarge
+            | Self::InvalidSessionResponse
+            | Self::InvalidTokenResponse
+            | Self::EmptySessionToken => K::Transient,
+            _ => K::Other,
+        };
+        super::RefreshFailure::new(kind, self.to_string())
+    }
+}
+
 impl From<CopilotAuthError> for String {
     fn from(value: CopilotAuthError) -> Self {
         value.to_string()
@@ -783,12 +804,12 @@ pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, S
 pub async fn refresh_token(
     _client: &Client,
     github_token: &str,
-) -> Result<OAuthCredentials, String> {
-    let http = ProductionHttp::new().map_err(|e| e.to_string())?;
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let http = ProductionHttp::new().map_err(|e| e.refresh_failure())?;
     let clock = ProductionClock;
     mint_credentials(&http, &clock, github_token)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.refresh_failure())
 }
 
 // ── Production adapters ──────────────────────────────────────────────────────

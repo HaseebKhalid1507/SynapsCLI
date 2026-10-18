@@ -309,7 +309,7 @@ pub async fn refresh(
     client: &Client,
     id: OAuthProviderId,
     refresh: &str,
-) -> Result<OAuthCredentials, String> {
+) -> Result<OAuthCredentials, super::token::RefreshFailure> {
     match registry()
         .get(id)
         .expect("typed built-in provider")

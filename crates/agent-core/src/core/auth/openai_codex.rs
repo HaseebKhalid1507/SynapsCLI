@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use super::{
     generate_code_challenge, generate_code_verifier, generate_state, open_browser,
     save_provider_auth, start_callback_server_at, CallbackOutcome, CallbackResult,
-    OAuthCredentials, CALLBACK_HOST,
+    OAuthCredentials, RefreshFailure, CALLBACK_HOST,
 };
 
 const PROVIDER: &str = "openai-codex";
@@ -25,7 +25,7 @@ const SCOPE: &str = "openid profile email offline_access";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 #[derive(Debug, Deserialize)]
-struct CodexTokenResponse {
+pub(crate) struct CodexTokenResponse {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
@@ -112,14 +112,14 @@ pub async fn login_into(
 pub async fn refresh_token(
     client: &Client,
     refresh: &str,
-) -> std::result::Result<OAuthCredentials, String> {
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     let params = [
         ("grant_type", "refresh_token"),
         ("client_id", CLIENT_ID),
         ("refresh_token", refresh),
     ];
-    let token = token_request(client, &params).await?;
-    credentials_from_token(token)
+    let token = token_request_at(client, TOKEN_URL, &params).await?;
+    credentials_from_token(token).map_err(RefreshFailure::other)
 }
 
 async fn exchange_code_for_tokens(
@@ -148,23 +148,38 @@ async fn token_request(
     client: &Client,
     params: &[(&str, &str)],
 ) -> std::result::Result<CodexTokenResponse, String> {
+    token_request_at(client, TOKEN_URL, params)
+        .await
+        .map_err(String::from)
+}
+
+/// Token-endpoint POST, failures typed at the source (no response or an
+/// unusable success body is transient; a status goes by `status_kind`).
+pub(crate) async fn token_request_at(
+    client: &Client,
+    url: &str,
+    params: &[(&str, &str)],
+) -> std::result::Result<CodexTokenResponse, RefreshFailure> {
     let resp = client
-        .post(TOKEN_URL)
+        .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Token request failed: {}", e))?;
+        .map_err(|e| RefreshFailure::transport(format!("Token request failed: {}", e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Token request failed ({}): {}", status, text));
+        return Err(RefreshFailure::status(
+            status.as_u16(),
+            format!("Token request failed ({}): {}", status, text),
+        ));
     }
 
     resp.json()
         .await
-        .map_err(|e| format!("Failed to parse token response: {}", e))
+        .map_err(|e| RefreshFailure::bad_response(format!("Failed to parse token response: {}", e)))
 }
 
 fn credentials_from_token(
