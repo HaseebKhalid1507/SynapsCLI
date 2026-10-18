@@ -133,8 +133,13 @@ impl SessionActor {
         let (value, view_changed) =
             engine_command_reply(&cmd, &arg, &mut self.runtime, &mut self.conv.session);
         if cancelling {
-            let still = self.uncancelled_workers();
-            for (id, agent) in uncancelled.iter().filter(|w| !still.contains(w)) {
+            let after = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .display_rows();
+            for (id, agent) in &cancelled_by_command(uncancelled, &after) {
                 self.note_in_main_conversation(super::actor::subagent_user_cancel_event(id, agent));
             }
         }
@@ -471,11 +476,49 @@ impl SessionActor {
     }
 }
 
+/// Of the workers that had no cancel requested before a `/workers cancel`,
+/// those that have one now. A worker that left the registry meanwhile
+/// (reaped at a turn end that raced the command) was not cancelled by it.
+fn cancelled_by_command(
+    before: Vec<(String, String)>,
+    after: &[crate::runtime::subagent::SubagentDisplayRow],
+) -> Vec<(String, String)> {
+    before
+        .into_iter()
+        .filter(|(id, _)| after.iter().any(|r| &r.handle_id == id && r.cancel_requested))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! `/resume`'s reasoning restore is the runtime's `restore_session_reasoning`
     //! + the clamp line above; pin the two behaviours the TUI tests pinned.
     use crate::Runtime;
+
+    fn row(id: &str, cancel_requested: bool) -> crate::runtime::subagent::SubagentDisplayRow {
+        serde_json::from_value(serde_json::json!({
+            "subagent_id": 0, "agent_name": "a", "status": "running",
+            "cancel_requested": cancel_requested, "elapsed_secs": 0.0,
+            "finished_elapsed": null, "handle_id": id,
+        }))
+        .unwrap()
+    }
+
+    /// `/workers cancel` tells the main agent only about workers the command
+    /// flagged: one reaped from the registry while it ran (it completed; its
+    /// wake is the truth) is not "cancelled by the user".
+    #[test]
+    fn the_cancel_note_names_only_workers_the_command_flagged() {
+        let before: Vec<(String, String)> = ["sa_1", "sa_2", "sa_3"]
+            .iter()
+            .map(|id| (id.to_string(), "a".to_string()))
+            .collect();
+        // sa_1 flagged; sa_2 reaped meanwhile; sa_3 untouched.
+        let after = [row("sa_1", true), row("sa_3", false)];
+        let named: Vec<String> =
+            super::cancelled_by_command(before, &after).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(named, ["sa_1"]);
+    }
 
     #[tokio::test]
     async fn restore_session_reasoning_keeps_explicit_provenance() {

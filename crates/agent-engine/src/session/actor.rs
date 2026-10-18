@@ -341,7 +341,8 @@ pub(crate) fn subagent_user_cancel_event(
             text: format!(
                 "User cancelled subagent '{agent_name}' ({handle_id}) with /workers cancel. It stops at \
                  its next step and sends no completion wake; do not wait for it. Its partial output is \
-                 readable with subagent_collect (handle_id \"{handle_id}\")."
+                 readable with subagent_collect (handle_id \"{handle_id}\") only while this session \
+                 stays loaded: the handle does not survive the session being parked."
             ),
             content_type: "subagent_cancelled".to_string(),
             severity: Some(Severity::Low),
