@@ -1,9 +1,12 @@
 //! Staged, re-checked, all-or-nothing commit of the planned file contents.
 //!
 //! 1. Stage: every new content goes into a sibling temp file created with
-//!    `O_EXCL` and mode `0666` (the kernel applies the umask, so `umask()`
-//!    is never called in this multi-threaded process); an existing file's
-//!    mode is copied onto its temp.
+//!    `O_EXCL`. The temp of an existing file (or of a restore) is created
+//!    owner-only (`0600`) and gets the file's mode on its descriptor only
+//!    after every byte is written, so private content is never staged
+//!    under broader permissions. A new file's temp is created `0666` (the
+//!    kernel applies the umask, so `umask()` is never called in this
+//!    multi-threaded process): the mode it is published with.
 //! 2. Re-check: every existing target must still be the same inode with the
 //!    same bytes we planned against, and every new target must still be
 //!    absent. A mismatch removes the temps; nothing was changed.
@@ -122,8 +125,10 @@ fn stage(
 }
 
 /// Write `bytes` to a file created at `tmp` exclusively: an existing path,
-/// a symlink included, is never followed, reused or removed. A file this
-/// call did create is removed again if writing it fails.
+/// a symlink included, is never followed, reused or removed. With `mode`
+/// (an existing file's bits) the file is owner-only until the bytes are
+/// written, then gets `mode`; without, it is `0666 & ~umask` throughout.
+/// A file this call did create is removed again if writing it fails.
 #[cfg_attr(not(test), allow(unused_variables))]
 pub(crate) fn write_new(
     tmp: &Path,
@@ -136,7 +141,7 @@ pub(crate) fn write_new(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o666);
+        options.mode(if mode.is_some() { 0o600 } else { 0o666 });
     }
     let mut file = options.open(tmp)?;
     let written: std::io::Result<()> = (|| {
