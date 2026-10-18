@@ -198,3 +198,29 @@ async fn reload_reports_the_previous_version_with_daemon_json_deleted() {
 
     shutdown(&d).await;
 }
+
+/// `daemon start --detach` against a running daemon whose `daemon.json` was
+/// deleted names the running daemon's pid (the CLI pings first, so the
+/// daemon has put the file back), not "pid ?". `daemon stop` reads the pid
+/// for its kill fallback the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn start_detach_names_the_running_daemon_with_daemon_json_deleted() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+
+    std::fs::remove_file(&d.paths.json).unwrap();
+    let mut cmd = Command::new(bin());
+    cmd.args(["daemon", "start", "--detach"]);
+    synaps_env(&mut cmd, &guard, &d.run);
+    let out = cmd.stdin(Stdio::null()).output().expect("run synaps daemon start");
+    assert!(out.status.success(), "{:?} {}", out.status, String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("daemon already running (pid {})", d.child.id())),
+        "{stdout}"
+    );
+
+    shutdown(&d).await;
+}
