@@ -377,22 +377,19 @@ fn handle_key(
             };
         }
     }
-    // Subagent thread views (super::watch). Ctrl-↑/↓ are reserved core keys
-    // (never plugin-bindable); they must precede the history arms below,
-    // which match Up/Down with any modifier.
+    // Subagent thread views (super::watch). Ctrl-↑/↓ and Alt-↑/↓ (macOS
+    // takes Ctrl-↑/↓ for Mission Control) are reserved core keys (never
+    // plugin-bindable); they must precede the history arms below, which
+    // match Up/Down with any modifier.
     let watching = super::watch::focused(app).is_some();
     match (code, modifiers) {
-        (KeyCode::Up, KeyModifiers::CONTROL) => {
-            if !super::watch::cycle(app, super::watch::Step::Up, std::time::Instant::now()) {
-                app.toasts.upsert(
-                    super::toast::Toast::new("watch", "no subagents to watch").titled("Subagents"),
-                );
-                app.request_redraw();
-            }
-            return InputAction::None;
-        }
-        (KeyCode::Down, KeyModifiers::CONTROL) => {
-            super::watch::cycle(app, super::watch::Step::Down, std::time::Instant::now());
+        (KeyCode::Up | KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            let step = if code == KeyCode::Up {
+                super::watch::Step::Up
+            } else {
+                super::watch::Step::Down
+            };
+            super::watch::switch(app, step, std::time::Instant::now());
             return InputAction::None;
         }
         // Esc in a worker view returns to main — it never aborts main's turn.

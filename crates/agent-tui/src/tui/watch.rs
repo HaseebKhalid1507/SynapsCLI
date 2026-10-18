@@ -1,10 +1,11 @@
 //! Watching a subagent in its own thread view, and steering it from there.
 //!
-//! - **Switching.** Ctrl-↑ from the main thread focuses the newest worker
-//!   (the tray's bottom row); more Ctrl-↑ walk to older ones. Ctrl-↓ walks
-//!   back down, and past the newest returns to main. Esc also returns to
-//!   main. `/watch [name|sa_N|N|main]` does the same by name. The workers on
-//!   offer are the running ones plus any whose view is already open.
+//! - **Switching.** Alt-↑ or Ctrl-↑ (macOS takes Ctrl-↑/↓ for Mission
+//!   Control) from the main thread focuses the newest worker (the tray's
+//!   bottom row); more ↑ walk to older ones. ↓ walks back down, and past
+//!   the newest returns to main. Esc also returns to main. `/watch
+//!   [name|sa_N|N|main]` does the same by name. The workers on offer are
+//!   the running ones plus any whose view is already open.
 //! - **Feeding.** While a worker view is focused, its watch journal is paged
 //!   with `SessionQuery::SubagentWatch` (one query in flight, every
 //!   [`POLL_INTERVAL`], straight away while a page reports `more`). Each
@@ -78,9 +79,9 @@ pub(crate) struct Candidate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// Ctrl-↑: toward older workers (up the tray).
+    /// Alt/Ctrl-↑: toward older workers (up the tray).
     Up,
-    /// Ctrl-↓: toward newer workers, then main.
+    /// Alt/Ctrl-↓: toward newer workers, then main.
     Down,
 }
 
@@ -150,26 +151,54 @@ pub(crate) fn candidates(app: &App) -> Vec<Candidate> {
     out
 }
 
-/// Ctrl-↑ / Ctrl-↓. Returns `false` when there was nowhere to go.
-pub(crate) fn cycle(app: &mut App, step: Step, now: Instant) -> bool {
+/// Ctrl-↑/↓ or Alt-↑/↓: switch views, and say so when there is nowhere
+/// further to go (04-tui M10: both ends were silent).
+pub(crate) fn switch(app: &mut App, step: Step, now: Instant) {
+    let edge = match cycle(app, step, now) {
+        Moved::Yes => return,
+        Moved::Oldest(c) => format!(
+            "{} ({}) is the oldest subagent \u{2014} Alt-\u{2193} or Esc goes back",
+            c.agent_name, c.handle_id
+        ),
+        Moved::No if candidates(app).is_empty() => "no subagents to watch".to_string(),
+        Moved::No => {
+            "already on the main thread \u{2014} Alt-\u{2191} watches a subagent".to_string()
+        }
+    };
+    app.toasts
+        .upsert(super::toast::Toast::new("watch", edge).titled("Subagents"));
+    app.request_redraw();
+}
+
+/// Where [`cycle`] went.
+enum Moved {
+    Yes,
+    /// Up on the oldest worker: stayed on it.
+    Oldest(Candidate),
+    /// Nowhere to go (no workers, or Down on main).
+    No,
+}
+
+fn cycle(app: &mut App, step: Step, now: Instant) -> Moved {
     let list = candidates(app);
     let at = focused(app).and_then(|id| list.iter().position(|c| c.handle_id == id));
     let target = match (step, at) {
         (Step::Up, None) => list.len().checked_sub(1),
-        (Step::Up, Some(i)) => Some(i.saturating_sub(1)),
+        (Step::Up, Some(0)) => return Moved::Oldest(list[0].clone()),
+        (Step::Up, Some(i)) => Some(i - 1),
         (Step::Down, None) => None,
         (Step::Down, Some(i)) if i + 1 < list.len() => Some(i + 1),
         (Step::Down, Some(_)) => {
             focus_main(app);
-            return true;
+            return Moved::Yes;
         }
     };
     match target {
         Some(i) => {
             focus_worker(app, &list[i], now);
-            true
+            Moved::Yes
         }
-        None => false,
+        None => Moved::No,
     }
 }
 
@@ -419,7 +448,7 @@ pub(crate) fn command(app: &mut App, arg: &str, now: Instant) {
             }
             let here = focused(app).map(str::to_string);
             let mut text = String::from(
-                "subagents \u{2014} Ctrl-\u{2191}/\u{2193} to switch, /watch <name|sa_N>, /watch main:",
+                "subagents \u{2014} Alt-\u{2191}/\u{2193} (or Ctrl) to switch, /watch <name|sa_N>, /watch main:",
             );
             for c in &list {
                 let mark = if here.as_deref() == Some(c.handle_id.as_str()) {
@@ -823,22 +852,25 @@ mod tests {
     fn ctrl_up_opens_the_newest_and_walks_older_ctrl_down_walks_back_to_main() {
         let mut app = app();
         let now = Instant::now();
-        assert!(!cycle(&mut app, Step::Up, now), "nothing to watch");
-        assert!(!cycle(&mut app, Step::Down, now), "already on main");
+        assert!(matches!(cycle(&mut app, Step::Up, now), Moved::No), "nothing to watch");
+        assert!(matches!(cycle(&mut app, Step::Down, now), Moved::No), "already on main");
 
         app.subagent_rows = vec![
             row(1, "a", SubagentStatus::Running),
             row(2, "b", SubagentStatus::Running),
         ];
-        assert!(cycle(&mut app, Step::Up, now));
+        assert!(matches!(cycle(&mut app, Step::Up, now), Moved::Yes));
         assert_eq!(focused(&app), Some("sa_2"), "newest first (tray bottom)");
-        assert!(cycle(&mut app, Step::Up, now));
+        assert!(matches!(cycle(&mut app, Step::Up, now), Moved::Yes));
         assert_eq!(focused(&app), Some("sa_1"));
-        assert!(cycle(&mut app, Step::Up, now));
+        assert!(
+            matches!(cycle(&mut app, Step::Up, now), Moved::Oldest(c) if c.handle_id == "sa_1"),
+            "the oldest is the end"
+        );
         assert_eq!(focused(&app), Some("sa_1"), "stops at the oldest");
-        assert!(cycle(&mut app, Step::Down, now));
+        assert!(matches!(cycle(&mut app, Step::Down, now), Moved::Yes));
         assert_eq!(focused(&app), Some("sa_2"));
-        assert!(cycle(&mut app, Step::Down, now));
+        assert!(matches!(cycle(&mut app, Step::Down, now), Moved::Yes));
         assert_eq!(focused(&app), None, "past the newest is main");
         assert!(
             app.transcript.is_empty(),

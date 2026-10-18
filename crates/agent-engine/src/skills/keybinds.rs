@@ -121,6 +121,9 @@ impl KeybindRegistry {
                 KeyModifiers::CONTROL,
                 "Watch newer subagent / main",
             ),
+            // The same on Alt: macOS takes Ctrl-↑/↓ for Mission Control.
+            (KeyCode::Up, KeyModifiers::ALT, "Watch older subagent"),
+            (KeyCode::Down, KeyModifiers::ALT, "Watch newer subagent / main"),
             (KeyCode::Up, KeyModifiers::NONE, "History up"),
             (KeyCode::Down, KeyModifiers::NONE, "History down"),
             (KeyCode::Left, KeyModifiers::NONE, "Cursor left"),
@@ -797,6 +800,21 @@ mod tests {
             script: None,
             description: Some(cmd.to_string()),
         }
+    }
+
+    /// 04-tui I7: Alt-↑/↓ switch subagent views (macOS takes Ctrl-↑/↓ for
+    /// Mission Control), so a plugin can't take them either.
+    #[test]
+    fn alt_arrows_are_reserved_for_subagent_views() {
+        let mut reg = KeybindRegistry::new();
+        reg.register_plugin(
+            "p",
+            &[mk_kb("A-Up", "x"), mk_kb("A-Down", "y")],
+            std::path::Path::new("/tmp"),
+        );
+        assert!(reg.match_key(KeyCode::Up, KeyModifiers::ALT).is_none());
+        assert!(reg.match_key(KeyCode::Down, KeyModifiers::ALT).is_none());
+        assert_eq!(reg.collisions().len(), 2);
     }
 
     #[test]

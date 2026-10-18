@@ -565,15 +565,15 @@
     "id": "watch-command",
     "command": "/watch",
     "title": "Watch and steer a subagent",
-    "summary": "Open a running subagent in its own thread view; Enter there steers it. Ctrl-Up/Ctrl-Down switch views.",
+    "summary": "Open a running subagent in its own thread view; Enter there steers it. Alt-Up/Alt-Down (or Ctrl-Up/Ctrl-Down) switch views.",
     "category": "Sessions",
     "topic": "Command",
     "protected": true,
     "common": false,
     "aliases": [],
-    "keywords": ["watch", "subagent", "worker", "agent", "thread", "steer", "observe", "ctrl-up", "ctrl-down"],
+    "keywords": ["watch", "subagent", "worker", "agent", "thread", "steer", "observe", "ctrl-up", "ctrl-down", "alt-up", "alt-down", "mission control"],
     "lines": [
-      "Ctrl-Up from the main thread opens the newest subagent (the tray's bottom row) in its own view; more Ctrl-Up walk to older ones. Ctrl-Down walks back down, and past the newest returns to the main thread. Esc also returns to main (it never cancels the main turn there).",
+      "Alt-Up (or Ctrl-Up) from the main thread opens the newest subagent (the tray's bottom row) in its own view; more Up walk to older ones. Alt-Down (or Ctrl-Down) walks back down, and past the newest returns to the main thread. Esc also returns to main (it never cancels the main turn there). On macOS, Ctrl-Up/Down are taken by Mission Control by default: use Alt (Option; in Terminal.app turn on \"Use Option as Meta key\") or /watch.",
       "/watch lists the subagents you can watch (or opens the only one). /watch <name>, /watch sa_N or /watch N opens one; /watch main goes back.",
       "A subagent's view shows what it streams: text, thinking, tool calls and results, live. Scrolling, selection and Ctrl-O act on the view you are in, and the main thread keeps its own scroll position.",
       "Enter with text in a running subagent's view steers that subagent (input owner only); slash commands still run as usual. The steer is also noted in the main conversation, so the main agent knows you redirected its worker. A finished subagent's view is read-only and stays watchable for 15 minutes."

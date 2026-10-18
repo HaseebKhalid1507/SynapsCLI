@@ -393,3 +393,58 @@ fn a_slash_command_in_a_worker_view_answers_there_and_main_never_moves() {
     assert_eq!(rows, main_rows, "main view unmoved:\n{frame}");
     assert!(!h.scroll_pinned(), "main was not snapped to the bottom");
 }
+
+fn alt(h: &mut TestHarness, code: KeyCode) {
+    h.key(code, KeyModifiers::ALT);
+}
+
+/// 04-tui I7: macOS takes Ctrl-↑/↓ for Mission Control before the terminal
+/// sees them. Alt-↑/↓ switch views the same way.
+#[test]
+fn alt_arrows_walk_the_workers_and_back_to_main() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 1, "scout");
+    start(&mut h, 2, "fixer");
+    alt(&mut h, KeyCode::Up);
+    assert_eq!(h.watched().as_deref(), Some("sa_2"), "newest first");
+    alt(&mut h, KeyCode::Up);
+    assert_eq!(h.watched().as_deref(), Some("sa_1"));
+    alt(&mut h, KeyCode::Down);
+    assert_eq!(h.watched().as_deref(), Some("sa_2"));
+    alt(&mut h, KeyCode::Down);
+    assert_eq!(h.watched(), None, "past the newest: main");
+    assert!(h.take_actions().is_empty(), "switching views sends nothing");
+}
+
+/// 04-tui M10: at either end there was no feedback — Up on the oldest
+/// re-focused it silently, Down on main did nothing.
+#[test]
+fn switching_past_either_end_says_so() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    start(&mut h, 1, "scout");
+    alt(&mut h, KeyCode::Up);
+    alt(&mut h, KeyCode::Up);
+    assert_eq!(h.watched().as_deref(), Some("sa_1"));
+    let frame = h.snapshot();
+    assert!(frame.contains("oldest subagent"), "{frame}");
+
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    alt(&mut h, KeyCode::Down);
+    assert_eq!(h.watched(), None);
+    let frame = h.snapshot();
+    assert!(frame.contains("already on the main thread"), "{frame}");
+}
+
+/// 04-tui I7: the footer advertises a binding macOS doesn't swallow.
+#[test]
+fn the_footer_advertises_alt_arrows_for_agents() {
+    let mut h = TestHarness::boot_with_size(160, 30);
+    start(&mut h, 1, "scout");
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("alt+\u{2191}\u{2193} agents"), "{footer:?}");
+    alt(&mut h, KeyCode::Up);
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap_or("");
+    assert!(footer.contains("alt+\u{2191}\u{2193} agents"), "{footer:?}");
+}
