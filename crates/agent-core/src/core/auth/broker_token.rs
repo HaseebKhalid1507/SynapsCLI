@@ -254,6 +254,9 @@ fn sweep_stale_temp_files(path: &Path, age: std::time::Duration) {
 
 /// Create `path` only if absent (hard link of a complete temp file). On a
 /// filesystem without hard links, fall back to an exclusive create.
+/// That fallback reopens a small window in which a concurrent starter can
+/// read the file before the token is written (it then fails on "empty"
+/// and a restart fixes it); accepted for such filesystems only.
 fn write_new_exclusive(path: &Path, token: &str) -> std::io::Result<()> {
     let tmp = write_temp(path, token)?;
     let linked = std::fs::hard_link(&tmp, path);

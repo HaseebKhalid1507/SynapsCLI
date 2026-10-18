@@ -2377,3 +2377,41 @@ fn scenario_ownership_lost_drops_allow_all_from_the_open_prompt() {
     h.key(KeyCode::Char('n'), KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), None);
 }
+
+/// prA R3 minor: once "Allow all" asks for confirmation, the second Enter
+/// must be the very next key — any other key cancels the step.
+#[test]
+fn scenario_other_key_cancels_pending_allow_all() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.snapshot().contains("Press Enter again"));
+    h.arm_confirm_now();
+    h.key(KeyCode::Char('x'), KeyModifiers::NONE);
+    assert!(!h.snapshot().contains("Press Enter again"), "x cancelled the step");
+    h.arm_confirm_now();
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active(), "Enter only asks again");
+    assert!(rx.try_recv().is_err(), "Allow all not armed");
+}
+
+/// prA R3 minor: only typing restarts the guard; mouse and resize events
+/// arriving while the dialog is unarmed don't keep it dead.
+#[test]
+fn scenario_mouse_and_resize_do_not_restart_the_guard() {
+    use crossterm::event::{Event, MouseEvent, MouseEventKind};
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm_unarmed("jev", "bash", "jev: risk=1.8");
+    h.age_confirm_guard(300);
+    h.event(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 3,
+        row: 3,
+        modifiers: KeyModifiers::NONE,
+    }));
+    h.event(Event::Resize(100, 30));
+    h.age_confirm_guard(150);
+    h.key(KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()), "armed 450 ms after open");
+}

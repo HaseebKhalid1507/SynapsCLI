@@ -248,9 +248,13 @@ impl SecretPromptQueue {
         }
     }
 
-    /// Input ownership moved away while this prompt is on screen: remove the
-    /// "Allow all" button (only the owner may arm it).
+    /// Input ownership moved away: remove the "Allow all" button from the
+    /// prompt on screen AND from every prompt already queued behind it
+    /// (only the owner may arm it).
     pub fn drop_allow_all(&mut self) {
+        for queued in self.pending.iter_mut() {
+            queued.confirm_scope = None;
+        }
         if let Some(a) = self.active.as_mut() {
             a.confirm_scope = None;
             a.allow_all_pending = false;
@@ -459,6 +463,34 @@ mod tests {
         q.arm_now_for_tests();
         assert_eq!(q.confirm_activate_focused(), Some(ConfirmChoice::AllowAll));
         assert!(!q.is_active());
+    }
+
+    #[test]
+    fn dropping_allow_all_strips_queued_prompts_too() {
+        let scope = || Some(ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut keep = Vec::new();
+        for _ in 0..2 {
+            let (response_tx, r) = tokio::sync::oneshot::channel();
+            keep.push(r);
+            tx.send(SecretPromptRequest {
+                kind: PromptKind::Confirm,
+                title: crate::session::CONFIRM_PROMPT_TITLE.into(),
+                prompt: "p".into(),
+                confirm_scope: scope(),
+                response_tx,
+            })
+            .unwrap();
+        }
+        let mut q = SecretPromptQueue::new();
+        q.poll_requests(&rx);
+        assert!(q.confirm_offers_allow_all());
+        q.drop_allow_all();
+        assert!(!q.confirm_offers_allow_all());
+        q.confirm_answer(ConfirmChoice::Deny);
+        assert!(q.is_active(), "the queued prompt is now active");
+        assert!(!q.confirm_offers_allow_all(), "queued prompt lost its button too");
     }
 
     #[test]

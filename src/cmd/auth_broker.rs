@@ -327,10 +327,10 @@ fn deny_machine_auth(
     peer: Option<std::net::IpAddr>,
 ) -> axum::response::Response {
     let presented = headers.get("authorization").is_some();
-    let reason = if presented { "wrong" } else { "missing" };
     let peer_label = peer.map_or_else(|| "a client".to_string(), |ip| ip.to_string());
-    // Rate-limited (prA R2-m6): a retrying old client can't flood the log.
-    let key = format!("{reason}|{peer_label}");
+    // Rate-limited (prA R2-m6) per (reason, route, peer): a retrying old
+    // client can't flood the log, and each route still names its peer.
+    let key = denial_key(presented, route, peer);
     if let Some(suppressed) = denial_advisory_due(&DENIAL_LOG, &key, std::time::Instant::now(), DENIAL_LOG_EVERY) {
         let also = if suppressed > 0 {
             format!(" ({suppressed} similar denials suppressed in the last minute)")
@@ -365,7 +365,14 @@ fn deny_machine_auth(
         .into_response()
 }
 
-/// One advisory per (reason, peer) per this interval.
+/// Rate-limit key for a 401 advisory: (missing|wrong token, route, peer).
+fn denial_key(presented: bool, route: &str, peer: Option<std::net::IpAddr>) -> String {
+    let reason = if presented { "wrong" } else { "missing" };
+    let peer = peer.map_or_else(|| "-".to_string(), |ip| ip.to_string());
+    format!("{reason}|{route}|{peer}")
+}
+
+/// One advisory per (reason, route, peer) per this interval.
 const DENIAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 type DenialLog = std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>;
@@ -868,11 +875,12 @@ async fn token(
 /// static key ever appears in a response — the broker attaches it upstream.
 async fn proxy(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<auth::ProxyRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/proxy", None);
+        return deny_machine_auth(&st, &headers, "/proxy", Some(peer.ip()));
     }
     if let Err(e) = request.validate() {
         // BrokerError Display is secret-free by contract.
@@ -910,9 +918,13 @@ async fn proxy(
 /// behind the boundary and calls the pinned usage URL; clients receive usage
 /// JSON only. No token, refresh token, or URL choice ever crosses this
 /// endpoint — it is deliberately not a general OAuth proxy.
-async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::response::Response {
+async fn usage(
+    State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/usage", None);
+        return deny_machine_auth(&st, &headers, "/usage", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.anthropic_usage().await {
@@ -926,11 +938,12 @@ async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::respo
 /// explicit policy selection (an `auto` policy is not a snapshot target).
 async fn usage_snapshot(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<UsageSnapshotQuery>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/usage/snapshot", None);
+        return deny_machine_auth(&st, &headers, "/usage/snapshot", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
@@ -974,11 +987,12 @@ async fn usage_snapshot(
 /// this host stops advertising it. Machine-auth; labels only.
 async fn accounts_cooldown(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(report): Json<CooldownReport>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/accounts/cooldown", None);
+        return deny_machine_auth(&st, &headers, "/accounts/cooldown", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     let Some(provider_id) = broker_provider(&report.provider) else {
@@ -1016,11 +1030,12 @@ struct CloudCatalogRequest {
 
 async fn cloud_catalog(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CloudCatalogRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/cloud/catalog", None);
+        return deny_machine_auth(&st, &headers, "/cloud/catalog", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -1043,11 +1058,12 @@ struct CloudInvokeRequest {
 
 async fn cloud_invoke(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CloudInvokeRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/cloud/invoke", None);
+        return deny_machine_auth(&st, &headers, "/cloud/invoke", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -1088,10 +1104,11 @@ async fn cloud_invoke(
 /// Non-secret provider capability/status list.
 async fn capabilities(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return deny_machine_auth(&st, &headers, "/capabilities", None);
+        return deny_machine_auth(&st, &headers, "/capabilities", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.capabilities().await {
@@ -1936,6 +1953,17 @@ mod tests {
         assert_eq!(host_header_hostname("[::1]:8181").as_deref(), Some("[::1]"));
         assert_eq!(host_header_hostname("LOCALHOST").as_deref(), Some("LOCALHOST"));
         assert_eq!(host_header_hostname(""), None);
+    }
+
+    #[test]
+    fn denial_key_is_per_reason_route_and_peer() {
+        let a: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        let k = denial_key(false, "/usage", Some(a));
+        assert_eq!(k, "missing|/usage|127.0.0.1");
+        assert_ne!(k, denial_key(false, "/capabilities", Some(a)), "per route");
+        assert_ne!(k, denial_key(false, "/usage", Some(b)), "per peer");
+        assert_ne!(k, denial_key(true, "/usage", Some(a)), "per reason");
     }
 
     #[test]
