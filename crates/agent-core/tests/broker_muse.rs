@@ -395,6 +395,28 @@ async fn muse_transient_mint_failure_is_a_retryable_error() {
     assert_eq!(mint.calls(), 1);
 }
 
+/// The mint says the Meta account needs a plan / payment method: a
+/// billing problem, not the login. The caller gets that instruction (typed
+/// ActionRequired), not the upstream 401 ("sign in again"), and no retry.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_payment_required_is_not_sign_in_again() {
+    use agent_core::auth::RefreshFailureKind;
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[(StatusCode::OK, r#"{"require_payment":true}"#)]);
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = muse_broker(upstream, mint.spawn().await);
+    let err = broker.proxy(responses_request("muse")).await.unwrap_err();
+    let BrokerError::Refresh(failure) = &err else {
+        panic!("expected a refresh error, got {err:?}");
+    };
+    assert_eq!(failure.kind, RefreshFailureKind::ActionRequired, "{err}");
+    assert!(err.to_string().contains("payment method"), "{err}");
+    assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no inference retry");
+}
+
 /// The stream path surfaces the same retryable refresh error.
 #[tokio::test]
 #[serial_test::serial]

@@ -202,9 +202,10 @@ impl MuseAuthError {
         use super::token::RefreshFailureKind as K;
         let kind = match self {
             Self::HttpStatus(code) => super::token::status_kind(*code),
+            // Billing: re-login does not help, and the text says what does.
+            Self::PaymentRequired => K::ActionRequired,
             Self::LoginRejected(_)
             | Self::OnboardingRequired
-            | Self::PaymentRequired
             | Self::EmptyAccessToken
             | Self::AccessDenied
             | Self::Expired => K::Credential,

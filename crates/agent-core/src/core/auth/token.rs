@@ -2661,6 +2661,8 @@ mod source_classification_tests {
         assert_eq!(M::Transport.refresh_failure().kind, Transient);
         assert_eq!(M::InvalidMintResponse.refresh_failure().kind, Transient);
         assert_eq!(M::OnboardingRequired.refresh_failure().kind, Credential);
+        // Billing, not the login: never "sign in again".
+        assert_eq!(M::PaymentRequired.refresh_failure().kind, RefreshFailureKind::ActionRequired);
 
         use super::super::kimi_code::KimiAuthError as K;
         assert_eq!(K::Unauthorized.refresh_failure().kind, Credential);
