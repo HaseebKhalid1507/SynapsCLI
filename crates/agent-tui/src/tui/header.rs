@@ -310,7 +310,12 @@ fn build_label(version: &str, hash: &str) -> String {
 /// This build, as the idle header shows it (see [`build_label`]).
 pub(crate) fn build() -> &'static str {
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BUILD.get_or_init(|| build_label(env!("CARGO_PKG_VERSION"), env!("GIT_HASH")))
+    // The same identity the version-skew check compares (04-tui M8): the
+    // engine's `SYNAPS_BUILD_ID`, which packagers can set.
+    BUILD.get_or_init(|| {
+        let this = agent_engine::session::transport::BinaryId::this();
+        build_label(&this.version, &this.build)
+    })
 }
 
 /// This build, as `/status` reports it (the header drops it when the row
@@ -977,8 +982,18 @@ mod tests {
         assert!(build().starts_with(concat!("v", env!("CARGO_PKG_VERSION"))));
     }
 
-    /// Packaged builds (`GIT_HASH=release`, see build.rs) show the version
-    /// alone; checkouts show the hash, `-dirty` included.
+    /// 04-tui M8: the header baked its own `GIT_HASH` (agent-tui build.rs,
+    /// which ignores `SYNAPS_BUILD_ID` and watches `../../.git/HEAD`, stale
+    /// in a worktree) while the skew check used the engine's
+    /// `SYNAPS_BUILD_ID`; the two could disagree. One source now.
+    #[test]
+    fn the_header_shows_the_build_the_skew_check_compares() {
+        let this = agent_engine::session::transport::BinaryId::this();
+        assert_eq!(build(), build_label(&this.version, &this.build));
+    }
+
+    /// Builds with no known id (and the old `release` placeholder) show
+    /// the version alone; checkouts show the hash, `-dirty` included.
     #[test]
     fn build_label_drops_the_placeholder_hash() {
         assert_eq!(build_label("0.10.2", "release"), "v0.10.2");
