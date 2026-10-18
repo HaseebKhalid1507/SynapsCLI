@@ -179,6 +179,13 @@ pub(crate) async fn handle_input_action(
         Some(m) => m,
         None => empty_ext_manager(),
     };
+    // A slash command answers in the view it was typed in (04-tui I2). The
+    // two arms below have no early return, so `end_command` always runs.
+    let in_command = matches!(
+        action,
+        InputAction::SlashCommand(..) | InputAction::StreamingInput(_)
+    );
+    let prev_command = in_command.then(|| super::watch::begin_command(app));
     // Body verbatim from mod.rs:486-1796 (original indentation preserved for
     // diff-ability of the motion; see module header for the mechanical edits).
     match action {
@@ -1760,6 +1767,9 @@ pub(crate) async fn handle_input_action(
                 synaps_cli::runtime::openai::ping::ping_all_configured(health_tx).await;
             });
         }
+    }
+    if let Some(prev) = prev_command {
+        super::watch::end_command(app, prev);
     }
     ControlFlow::Continue(())
 }

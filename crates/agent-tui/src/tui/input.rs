@@ -584,7 +584,10 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.history_index = None;
     app.input_stash.clear();
     app.clear_input();
-    app.transcript.scroll_to_bottom();
+    // Typed in a worker view, it is a command: main keeps its place (I2).
+    if super::watch::focused(app).is_none() {
+        app.transcript.scroll_to_bottom();
+    }
 
     if input.starts_with('/') && input.len() > 1 {
         let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();

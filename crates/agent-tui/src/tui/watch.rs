@@ -54,6 +54,9 @@ pub(crate) struct WatchState {
     /// The attached daemon predates watch/steer: it answered with a
     /// `malformed frame` error ([`absorb_notice`]). Cleared on reconnect.
     unsupported: bool,
+    /// A slash command is running ([`begin_command`]): its notices go to the
+    /// view it was typed in.
+    in_command: bool,
 }
 
 /// Shown when the attached daemon is an older binary without watch/steer.
@@ -273,6 +276,34 @@ pub(crate) fn notice(app: &mut App, text: String) {
         None => app.transcript.push_msg(ChatMessage::System(text)),
     }
     app.request_redraw();
+}
+
+/// A slash command starts: until [`end_command`], its System and Error
+/// output shows in the focused view (04-tui I2: typed in a worker view, it
+/// went to the hidden main transcript). Returns the previous state.
+pub(crate) fn begin_command(app: &mut App) -> bool {
+    std::mem::replace(&mut app.watch.in_command, true)
+}
+
+/// The slash command is done; `prev` is what [`begin_command`] returned.
+pub(crate) fn end_command(app: &mut App, prev: bool) {
+    app.watch.in_command = prev;
+}
+
+/// `App::push_msg`'s router: a running command's System/Error output goes
+/// to the focused worker view (`None`); anything else comes back for main.
+pub(crate) fn command_output(app: &mut App, msg: ChatMessage) -> Option<ChatMessage> {
+    if !app.watch.in_command || !matches!(msg, ChatMessage::System(_) | ChatMessage::Error(_)) {
+        return Some(msg);
+    }
+    match focused_thread_mut(app) {
+        Some(w) => {
+            w.store.push_msg(msg);
+            app.request_redraw();
+            None
+        }
+        None => Some(msg),
+    }
 }
 
 /// Every worker `/watch` can name: the candidates plus finished workers

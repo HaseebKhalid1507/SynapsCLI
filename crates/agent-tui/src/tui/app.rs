@@ -689,6 +689,9 @@ impl App {
     // signaling (`needs_redraw`) stays here on App.
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
+        let Some(msg) = super::watch::command_output(self, msg) else {
+            return;
+        };
         self.transcript.push_msg(msg);
         self.needs_redraw = true;
     }

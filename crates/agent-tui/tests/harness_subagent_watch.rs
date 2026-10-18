@@ -342,3 +342,54 @@ fn an_unknown_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
     assert!(worker.contains("unknown command: /zzz-not-a-command"), "{worker}");
     assert!(!h.main_transcript_text().contains("zzz"));
 }
+
+/// 04-tui I2: a slash command typed in a worker view printed its output into
+/// the hidden main transcript and snapped main to the bottom. Its output now
+/// shows in the worker view, and main is exactly where it was left.
+#[test]
+fn a_slash_command_in_a_worker_view_answers_there_and_main_never_moves() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    for i in 0..60 {
+        h.push_text_message(&format!("main-{i:02} the conversation so far"));
+    }
+    start(&mut h, 10, "scout");
+    h.render();
+    for _ in 0..5 {
+        h.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+    let main_frame = h.snapshot();
+    let main_rows: Vec<String> = main_frame
+        .lines()
+        .filter(|l| l.contains("main-"))
+        .map(str::to_string)
+        .collect();
+    assert!(!h.scroll_pinned(), "precondition: main scrolled up");
+    let main_before = h.main_transcript_text();
+
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(&mut h, page("sa_10", "scout", "running", vec![], 0));
+    h.type_str("/zzz-no-such-command");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    h.drive_slash_commands();
+    let worker = h.worker_transcript_text("sa_10");
+    assert!(
+        worker.contains("unknown command: /zzz-no-such-command"),
+        "the answer is in the view it was typed in: {worker}"
+    );
+    assert_eq!(h.main_transcript_text(), main_before, "main gets nothing");
+
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    let frame = h.snapshot();
+    let rows: Vec<String> = frame
+        .lines()
+        .filter(|l| l.contains("main-"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(rows, main_rows, "main view unmoved:\n{frame}");
+    assert!(!h.scroll_pinned(), "main was not snapped to the bottom");
+}
