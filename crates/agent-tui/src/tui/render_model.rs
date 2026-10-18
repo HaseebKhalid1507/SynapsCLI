@@ -168,4 +168,6 @@ pub(crate) struct SecretPromptSnap {
     pub(crate) confirm_offers_allow_all: bool,
     /// `Confirm` only: source extension(s) and tool of a tool-call confirm.
     pub(crate) confirm_scope: Option<synaps_cli::tools::ConfirmScope>,
+    /// `Confirm` only: "Allow all" awaits its second Enter.
+    pub(crate) confirm_allow_all_pending: bool,
 }

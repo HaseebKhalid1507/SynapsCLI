@@ -586,6 +586,13 @@ impl TestHarness {
         self.app.secret_prompts.arm_now_for_tests();
     }
 
+    /// Pretend `ms` milliseconds passed for the active confirm's input guard.
+    pub fn age_confirm_guard(&mut self, ms: u64) {
+        self.app
+            .secret_prompts
+            .age_input_guard_for_tests(std::time::Duration::from_millis(ms));
+    }
+
     /// Inject and activate a `Confirm` prompt (the `activate_tools` y/yes
     /// gate shape). Returns the answer receiver.
     pub fn activate_confirm_prompt(

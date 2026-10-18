@@ -741,6 +741,10 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
             prompt_bridge.set_owns_input(to == Some(me));
+            if to != Some(me) {
+                // A prompt already on screen loses its Allow-all button too.
+                app.secret_prompts.drop_allow_all();
+            }
             if from == Some(me) && to != Some(me) {
                 let who = to
                     .map(|c| format!("client #{}", c.0))

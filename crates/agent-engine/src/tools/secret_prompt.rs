@@ -89,8 +89,13 @@ pub struct PendingSecretPrompt {
     pub buffer: String,
     /// `Confirm` only: the focused button. Starts on `Deny`.
     pub confirm_focus: ConfirmChoice,
-    /// When this prompt became the active one (see [`CONFIRM_ARM_DELAY`]).
+    /// Start of the current input guard (see [`CONFIRM_ARM_DELAY`]): set
+    /// when the prompt becomes active, and restarted by every key ignored
+    /// while unarmed and when "Allow all" asks for its confirmation.
     pub activated_at: std::time::Instant,
+    /// `Confirm` only: Enter was pressed on "Allow all" once; a second
+    /// Enter (after a fresh guard) arms it, Esc or moving focus cancels.
+    pub allow_all_pending: bool,
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
@@ -168,6 +173,7 @@ impl SecretPromptQueue {
                 buffer: String::new(),
                 confirm_focus: ConfirmChoice::Deny,
                 activated_at: std::time::Instant::now(),
+                allow_all_pending: false,
                 response_tx: req.response_tx,
             });
         }
@@ -193,8 +199,9 @@ impl SecretPromptQueue {
         }
     }
 
-    /// `Confirm` dialog: move focus to the next / previous button, wrapping.
-    /// No-op for `Secret` prompts.
+    /// `Confirm` dialog: move focus to the next / previous button. Focus
+    /// does NOT wrap (from the default Deny, "forward" stays put). Moving
+    /// cancels a pending "Allow all" confirmation. No-op for `Secret`.
     pub fn move_confirm_focus(&mut self, forward: bool) {
         if let Some(active) = self.active.as_mut() {
             if active.kind != PromptKind::Confirm {
@@ -205,8 +212,51 @@ impl SecretPromptQueue {
                 .iter()
                 .position(|c| *c == active.confirm_focus)
                 .unwrap_or(choices.len() - 1);
-            let n = choices.len();
-            active.confirm_focus = choices[if forward { (i + 1) % n } else { (i + n - 1) % n }];
+            let j = if forward {
+                (i + 1).min(choices.len() - 1)
+            } else {
+                i.saturating_sub(1)
+            };
+            active.confirm_focus = choices[j];
+            active.allow_all_pending = false;
+        }
+    }
+
+    /// Restart the input guard: the dialog ignores keys for another
+    /// [`CONFIRM_ARM_DELAY`] (called for every key ignored while unarmed, so
+    /// typing that runs past the window keeps the dialog dead until a pause).
+    pub fn restart_input_guard(&mut self) {
+        if let Some(a) = self.active.as_mut() {
+            a.activated_at = std::time::Instant::now();
+        }
+    }
+
+    /// `Confirm` dialog: whether "Allow all" is waiting for its second Enter.
+    pub fn allow_all_pending(&self) -> bool {
+        self.active.as_ref().is_some_and(|a| a.allow_all_pending)
+    }
+
+    /// Esc while "Allow all" awaits confirmation: cancel just that step.
+    /// Returns whether there was one to cancel.
+    pub fn cancel_allow_all_pending(&mut self) -> bool {
+        match self.active.as_mut() {
+            Some(a) if a.allow_all_pending => {
+                a.allow_all_pending = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Input ownership moved away while this prompt is on screen: remove the
+    /// "Allow all" button (only the owner may arm it).
+    pub fn drop_allow_all(&mut self) {
+        if let Some(a) = self.active.as_mut() {
+            a.confirm_scope = None;
+            a.allow_all_pending = false;
+            if a.confirm_focus == ConfirmChoice::AllowAll {
+                a.confirm_focus = ConfirmChoice::Deny;
+            }
         }
     }
 
@@ -224,7 +274,18 @@ impl SecretPromptQueue {
     }
 
     /// Test/harness seam: treat the active prompt as opened long enough ago
-    /// that the arming delay has passed.
+    /// that the arming delay has passed. Not compiled into production.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn age_input_guard_for_tests(&mut self, by: std::time::Duration) {
+        if let Some(a) = self.active.as_mut() {
+            if let Some(t) = a.activated_at.checked_sub(by) {
+                a.activated_at = t;
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
     pub fn arm_now_for_tests(&mut self) {
         if let Some(a) = self.active.as_mut() {
@@ -267,8 +328,21 @@ impl SecretPromptQueue {
 
     /// `Confirm` dialog: activate the focused button (Enter). Deny is the
     /// default focus, so an un-navigated Enter denies (fail-closed).
+    /// "Allow all" takes two Enters: the first only asks for confirmation
+    /// and restarts the input guard; the second (once armed) answers.
     pub fn confirm_activate_focused(&mut self) -> Option<ConfirmChoice> {
         let choice = self.confirm_focus();
+        if choice == ConfirmChoice::AllowAll {
+            let active = self.active.as_mut()?;
+            if !active.offers_allow_all() {
+                return None;
+            }
+            if !active.allow_all_pending {
+                active.allow_all_pending = true;
+                active.activated_at = std::time::Instant::now();
+                return None;
+            }
+        }
         self.confirm_answer(choice)
     }
 
@@ -365,6 +439,39 @@ mod tests {
         let mut q = confirm(title, None);
         assert_eq!(q.confirm_answer(ConfirmChoice::AllowAll), None);
         assert!(q.is_active(), "prompt still waiting for a real answer");
+    }
+
+    #[test]
+    fn focus_does_not_wrap_and_allow_all_needs_two_enters() {
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None };
+        let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
+        q.arm_now_for_tests();
+        q.move_confirm_focus(true);
+        assert_eq!(q.confirm_focus(), ConfirmChoice::Deny, "no wrap past the end");
+        q.move_confirm_focus(false);
+        assert_eq!(q.confirm_focus(), ConfirmChoice::AllowAll);
+        assert_eq!(q.confirm_activate_focused(), None, "first Enter only asks");
+        assert!(q.allow_all_pending());
+        assert!(!q.input_armed(), "the confirmation gets its own fresh guard");
+        assert!(q.cancel_allow_all_pending());
+        assert!(!q.allow_all_pending());
+        assert_eq!(q.confirm_activate_focused(), None);
+        q.arm_now_for_tests();
+        assert_eq!(q.confirm_activate_focused(), Some(ConfirmChoice::AllowAll));
+        assert!(!q.is_active());
+    }
+
+    #[test]
+    fn dropping_allow_all_moves_focus_off_it() {
+        let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None };
+        let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
+        q.move_confirm_focus(false);
+        assert_eq!(q.confirm_focus(), ConfirmChoice::AllowAll);
+        q.drop_allow_all();
+        assert!(!q.confirm_offers_allow_all());
+        assert_eq!(q.confirm_focus(), ConfirmChoice::Deny);
+        q.move_confirm_focus(false);
+        assert_eq!(q.confirm_focus(), ConfirmChoice::Allow, "two buttons now");
     }
 
     #[test]

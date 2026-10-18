@@ -762,6 +762,7 @@ pub(crate) fn build_render_model(
         confirm_focus: p.confirm_focus,
         confirm_offers_allow_all: p.offers_allow_all(),
         confirm_scope: p.confirm_scope.clone(),
+        confirm_allow_all_pending: p.allow_all_pending,
     });
 
     // ── 13. Runtime strings ───────────────────────────────────────────────────
@@ -1812,21 +1813,27 @@ fn render_confirm_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSn
         .map_or(0, |t| word_wrapped_rows(t, tw));
     let wide_hint = if scope.is_some() {
         "y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button · \
-         Allow all: select it, then Enter"
+         Allow all: select it, Enter, then Enter again"
     } else {
         "y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button"
     };
     let narrow_hint = if scope.is_some() {
-        "y allow · n deny · Tab select · Enter press · Allow all: select + Enter"
+        "y allow · n deny · Tab select · Enter press · Allow all: select + Enter twice"
     } else {
         "y allow · n deny · Tab select · Enter press"
     };
-    let hint_text = if word_wrapped_rows(wide_hint, tw) <= 2 {
-        wide_hint
-    } else {
-        narrow_hint
+    let pending_text = scope.filter(|_| prompt.confirm_allow_all_pending).map(|s| {
+        format!(
+            "Press Enter again to allow all from {} for this session · Esc cancels",
+            s.extensions_label()
+        )
+    });
+    let hint_text: String = match &pending_text {
+        Some(t) => t.clone(),
+        None if word_wrapped_rows(wide_hint, tw) <= 2 => wide_hint.to_string(),
+        None => narrow_hint.to_string(),
     };
-    let hint_rows = word_wrapped_rows(hint_text, tw);
+    let hint_rows = word_wrapped_rows(&hint_text, tw);
 
     // ── Vertical budget ──
     let max_h = usize::from(area.height);
@@ -1958,9 +1965,13 @@ fn render_confirm_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSn
     if gap_rows > 0 {
         take(1);
     }
+    let hint_style = if pending_text.is_some() {
+        Style::default().fg(warn).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.dim)
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint_text, Style::default().fg(p.dim))))
-            .wrap(wrap),
+        Paragraph::new(Line::from(Span::styled(hint_text, hint_style))).wrap(wrap),
         take(hint_rows),
     );
     paint_prompt_bar(frame, modal_area, warn, surface);

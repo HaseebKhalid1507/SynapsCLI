@@ -990,19 +990,26 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         .is_some_and(|p| p.kind == PromptKind::Confirm);
     if is_confirm {
         // Confirm dialog: a button lightbox, no free-text field.
-        //   (first 400 ms)       → every key is ignored: the dialog opens
-        //                          asynchronously, between keystrokes, so
-        //                          text already being typed can't answer it
+        //   (guard)              → every key/paste is ignored until there has
+        //                          been 400 ms with no input: each ignored key
+        //                          restarts the guard, so typing that runs on
+        //                          past the dialog opening never answers it.
+        //                          Held-key repeats are always ignored.
         //   y / Y                → Allow (answers "y")
-        //   n / N / Esc          → Deny  (answers None)
-        //   ← → Tab BackTab      → move focus between the buttons
+        //   n / N                → Deny  (answers None)
+        //   Esc                  → Deny, or cancel a pending "Allow all"
+        //   ← → Tab BackTab      → move focus (no wrap-around)
         //   Enter                → activate the FOCUSED button; Deny is the
         //                          default focus, so a bare Enter denies.
-        // "Allow all" has no letter key: it is armed only deliberately, by
-        // focusing its button and pressing Enter. Everything else —
-        // including pastes — is swallowed so nothing can form an allow.
+        //                          On "Allow all" the first Enter only asks
+        //                          "Press Enter again…" (fresh 400 ms guard);
+        //                          the second Enter arms it.
+        // "Allow all" has no letter key. Everything else — including pastes
+        // — is swallowed so nothing can form an allow.
         use synaps_cli::tools::ConfirmChoice;
-        if !app.secret_prompts.input_armed() {
+        let repeat = matches!(&event, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Repeat);
+        if repeat || !app.secret_prompts.input_armed() {
+            app.secret_prompts.restart_input_guard();
             return InputAction::None;
         }
         if let Event::Key(key) = event {
@@ -1010,6 +1017,7 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Allow)
                 }
+                KeyCode::Esc if app.secret_prompts.cancel_allow_all_pending() => None,
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.secret_prompts.confirm_answer(ConfirmChoice::Deny)
                 }

@@ -2058,7 +2058,7 @@ fn scenario_confirm_tool_call_offers_allow_all_button() {
     assert!(flat.contains("Other extensions still ask"), "{frame}");
     assert!(flat.contains("until /new or /confirms reset"), "revocation is stated:\n{frame}");
     assert!(
-        flat.contains("Allow all: select it, then Enter"),
+        flat.contains("Allow all: select it, Enter, then Enter again"),
         "hint documents the deliberate action:\n{frame}"
     );
     assert!(!flat.contains("a allow all"), "no `a` shortcut advertised:\n{frame}");
@@ -2080,8 +2080,9 @@ fn scenario_unattributed_tool_call_confirm_offers_no_allow_all() {
 
 #[test]
 fn scenario_confirm_prompt_arrow_then_enter_allows() {
-    // Two-button gate: Right from Deny wraps to Allow; Left from Deny → Allow.
-    for nav in [KeyCode::Right, KeyCode::Left, KeyCode::Tab, KeyCode::BackTab] {
+    // Two-button gate, focus does not wrap: Left/BackTab from Deny → Allow;
+    // Right/Tab from Deny stays on Deny.
+    for nav in [KeyCode::Left, KeyCode::BackTab] {
         let mut h = TestHarness::boot_with_size(100, 30);
         let mut rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
         h.key(nav, KeyModifiers::NONE);
@@ -2091,24 +2092,108 @@ fn scenario_confirm_prompt_arrow_then_enter_allows() {
         assert!(!h.secret_prompt_active(), "Enter on Allow resolves");
         assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()), "{nav:?}+Enter allows");
     }
+    for nav in [KeyCode::Right, KeyCode::Tab] {
+        let mut h = TestHarness::boot_with_size(100, 30);
+        let _rx = h.activate_confirm_prompt("Confirm tool activation", CONFIRM_BODY);
+        h.key(nav, KeyModifiers::NONE);
+        assert_eq!(h.confirm_focus(), ConfirmChoice::Deny, "{nav:?}: no wrap-around");
+    }
 }
 
+/// prA N2: focus doesn't wrap, and "Allow all" takes Enter, a fresh guard,
+/// then Enter again. Deny → (Left) Allow all → (Left) Allow → (Left) Allow.
 #[test]
-fn scenario_confirm_tool_call_focus_cycles_three_buttons() {
+fn scenario_confirm_tool_call_focus_and_two_step_allow_all() {
     let mut h = TestHarness::boot_with_size(100, 30);
     let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
-    // Deny → (Right) Allow → (Right) AllowAll → (Right) Deny → (Left) AllowAll
     h.key(KeyCode::Right, KeyModifiers::NONE);
-    assert_eq!(h.confirm_focus(), ConfirmChoice::Allow);
-    h.key(KeyCode::Right, KeyModifiers::NONE);
-    assert_eq!(h.confirm_focus(), ConfirmChoice::AllowAll);
-    h.key(KeyCode::Right, KeyModifiers::NONE);
-    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny, "no wrap past Deny");
     h.key(KeyCode::Left, KeyModifiers::NONE);
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Allow, "no wrap past Allow");
+    h.key(KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(h.confirm_focus(), ConfirmChoice::AllowAll);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active(), "first Enter only asks");
+    assert!(rx.try_recv().is_err());
+    let frame = h.snapshot();
+    let flat: String = frame.split_whitespace().filter(|t| *t != "\u{2503}").collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("Press Enter again to allow all from jev for this session · Esc cancels"),
+        "inline confirmation:\n{frame}"
+    );
+    // Within the fresh guard the second Enter is ignored (and restarts it).
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active() && rx.try_recv().is_err());
+    // Esc (once armed) cancels just the confirmation, not the dialog.
+    h.arm_confirm_now();
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active(), "Esc cancels the confirmation step only");
+    assert!(!h.snapshot().contains("Press Enter again"));
+    // Enter, pause, Enter arms it.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    h.arm_confirm_now();
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(!h.secret_prompt_active());
     assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
+}
+
+/// prA N2 (d): the common edit-then-submit sequence `←` then Enter, typed
+/// after the guard has passed, never arms Allow all on its own.
+#[test]
+fn scenario_left_then_enter_past_guard_arms_nothing_without_confirmation() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active(), "nothing answered");
+    assert!(rx.try_recv().is_err(), "no Answer sent, latch not armed");
+    // Even a third key typed past a later guard is just more typing: `x`
+    // is ignored, and Enter after it (guard restarted) is ignored too.
+    h.key(KeyCode::Char('x'), KeyModifiers::NONE);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active() && rx.try_recv().is_err());
+}
+
+/// prA N2: typing that runs on past 400 ms keeps the dialog dead — each
+/// ignored key restarts the guard — until there is a 400 ms pause.
+#[test]
+fn scenario_continuous_typing_never_answers_the_confirm() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm_unarmed("jev", "bash", "jev: risk=1.8");
+    // 300 ms between keys: 2.4 s of typing in total, never a 400 ms pause.
+    for c in "say yes y".chars() {
+        h.age_confirm_guard(300);
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    h.age_confirm_guard(300);
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    h.age_confirm_guard(300);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(h.secret_prompt_active());
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny);
+    assert!(rx.try_recv().is_err(), "no Answer while typing continued");
+    // A real pause, then a deliberate `y`.
+    h.age_confirm_guard(450);
+    h.key(KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Some("y".to_string()));
+}
+
+/// Held-key repeats never answer the dialog, even once armed.
+#[test]
+fn scenario_key_repeat_is_ignored_by_the_confirm() {
+    use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState};
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
+    h.event(Event::Key(KeyEvent {
+        code: KeyCode::Char('y'),
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Repeat,
+        state: KeyEventState::NONE,
+    }));
+    assert!(h.secret_prompt_active());
+    assert!(rx.try_recv().is_err());
 }
 
 /// Arming "Allow all" is announced by the session (a SystemNotice every
@@ -2118,6 +2203,8 @@ fn scenario_allow_all_announcement_comes_from_the_session() {
     let mut h = TestHarness::boot_with_size(100, 30);
     let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
     h.key(KeyCode::Left, KeyModifiers::NONE); // Deny → Allow all
+    h.key(KeyCode::Enter, KeyModifiers::NONE); // asks for confirmation
+    h.arm_confirm_now();
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Some("always".to_string()));
     assert!(!h.snapshot().contains("Allow all armed"), "no local duplicate");
@@ -2172,6 +2259,7 @@ fn scenario_typing_into_a_freshly_opened_confirm_answers_nothing() {
     h.key(KeyCode::Char('n'), KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), None, "armed: n denies");
 }
+
 
 #[test]
 fn scenario_confirm_prompt_toggle_twice_then_enter_denies() {
@@ -2264,5 +2352,28 @@ fn scenario_confirm_40x12_keeps_buttons_scope_and_hints() {
     assert!(f.contains("until /new or /confirms reset"), "scope line:\n{frame}");
     assert!(f.contains("Other extensions still ask"), "scope line end:\n{frame}");
     assert!(f.contains("y allow"), "hints:\n{frame}");
-    assert!(f.contains("select + Enter"), "allow-all hint:\n{frame}");
+    assert!(f.contains("select + Enter twice"), "allow-all hint:\n{frame}");
+}
+
+/// prA R2-m3: when input ownership moves away while a tool-call confirm is
+/// on screen, that prompt loses its Allow-all button (only the owner may
+/// arm it); Allow / Deny still work.
+#[test]
+fn scenario_ownership_lost_drops_allow_all_from_the_open_prompt() {
+    use agent_engine::session::{ClientId, OwnerChangeReason, SessionEventWire};
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let mut rx = h.activate_tool_call_confirm("jev", "bash", "jev: risk=1.8");
+    h.key(KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(h.confirm_focus(), ConfirmChoice::AllowAll);
+    assert!(h.snapshot().contains("Allow all from jev"));
+    h.feed_events(&[SessionEventWire::InputOwnerChanged {
+        from: Some(ClientId(1)),
+        to: Some(ClientId(3)),
+        reason: OwnerChangeReason::Takeover,
+    }]);
+    let frame = h.snapshot();
+    assert!(!frame.contains("Allow all from jev"), "{frame}");
+    assert_eq!(h.confirm_focus(), ConfirmChoice::Deny, "focus moved off it");
+    h.key(KeyCode::Char('n'), KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), None);
 }
