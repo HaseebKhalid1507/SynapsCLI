@@ -268,7 +268,7 @@ impl DeviceAuthorization {
 }
 
 /// Outcome of one device-token poll (secret-safe; token only on Authorized).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DevicePollOutcome {
     Pending,
     SlowDown,
@@ -276,6 +276,22 @@ pub enum DevicePollOutcome {
     Denied,
     Expired,
     OtherError,
+}
+
+impl fmt::Debug for DevicePollOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::SlowDown => f.write_str("SlowDown"),
+            Self::Authorized { .. } => f
+                .debug_struct("Authorized")
+                .field("access_token", &"[REDACTED]")
+                .finish(),
+            Self::Denied => f.write_str("Denied"),
+            Self::Expired => f.write_str("Expired"),
+            Self::OtherError => f.write_str("OtherError"),
+        }
+    }
 }
 
 /// A minted Model API key plus the non-secret account facts the mint echoes.
@@ -1362,5 +1378,16 @@ mod tests {
         assert!(ProductionHttp::new().is_ok());
         assert_eq!(MAX_RESPONSE_BODY_BYTES, 64 * 1024);
         assert!(USER_AGENT.starts_with("SynapsCLI/"));
+    }
+
+    #[test]
+    fn device_poll_outcome_debug_redacts_token() {
+        let o = DevicePollOutcome::Authorized {
+            access_token: "oauth-secret-123".into(),
+        };
+        let dbg = format!("{o:?}");
+        assert!(!dbg.contains("oauth-secret-123"), "{dbg}");
+        assert!(dbg.contains("Authorized") && dbg.contains("REDACTED"), "{dbg}");
+        assert_eq!(format!("{:?}", DevicePollOutcome::Pending), "Pending");
     }
 }
