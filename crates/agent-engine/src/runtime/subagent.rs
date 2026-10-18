@@ -859,6 +859,25 @@ impl SubagentRegistry {
         }
     }
 
+    /// Whether parking the session now would cost a worker. Parking drops
+    /// this registry: a running worker's handle takes its shutdown channel
+    /// with it (the worker is killed and reads as a truncated completion),
+    /// and a finished one's result is no longer collectable by id. So: any
+    /// worker still running, or one that finished on its own within
+    /// [`FINISHED_HANDLE_TTL`] (the registry's own retention) and whose
+    /// result the parent has not collected yet. A cancelled worker owes no
+    /// result.
+    pub fn holds_park(&self) -> bool {
+        self.handles.values().any(|h| {
+            if h.status() == SubagentStatus::Running {
+                return true;
+            }
+            let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+            let fresh = s.finished_at.map_or(true, |t| t.elapsed() < FINISHED_HANDLE_TTL);
+            fresh && !h.collected && !s.cancel_requested
+        })
+    }
+
     /// Returns (id, agent_name, status) for every tracked handle.
     pub fn list_active(&self) -> Vec<(String, String, SubagentStatus)> {
         self.handles

@@ -176,6 +176,10 @@ pub fn park_grace() -> Option<std::time::Duration> {
 
 pub const DEFAULT_PARK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often a detached idle session re-checks a park its workers hold
+/// (`can_park_ignoring_keepwarm`).
+pub const WORKER_PARK_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `SYNAPS_DAEMON_PROMPT_ABANDON_SECS`: how long a pending host confirmation on
 /// a NON-driver session survives after the LAST client detaches before it is
 /// fail-closed answered `None` (deny) so `can_park()` can proceed. This bounds
@@ -1000,6 +1004,23 @@ impl SessionActor {
 
     /// `can_park` minus the keep-warm deferral.
     pub(crate) fn can_park_ignoring_keepwarm(&self) -> bool {
+        self.can_park_but_for_workers() && !self.workers_hold_park()
+    }
+
+    /// Whether parking would cost a worker (`SubagentRegistry::holds_park`):
+    /// the park waits and re-checks every [`WORKER_PARK_RECHECK`].
+    fn workers_hold_park(&self) -> bool {
+        self.runtime.is_live()
+            && self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .holds_park()
+    }
+
+    /// Every park condition except the session's workers.
+    fn can_park_but_for_workers(&self) -> bool {
         self.attached.is_empty()
             && !self.streaming
             && self.compact.is_none()
@@ -1850,7 +1871,17 @@ impl SessionActor {
             return;
         }
         if !self.can_park() {
-            self.park_deadline = None;
+            // Only workers in the way: look again later (a worker finishing
+            // or being collected does not always pass through here).
+            let workers_only = self.can_park_but_for_workers()
+                && !self.cache_keepwarm.active()
+                && park_grace().is_some();
+            self.park_deadline = if workers_only {
+                self.park_deadline
+                    .or_else(|| Some(tokio::time::Instant::now() + WORKER_PARK_RECHECK))
+            } else {
+                None
+            };
             return;
         }
         match park_grace() {
@@ -1941,6 +1972,8 @@ impl SessionActor {
             return std::ops::ControlFlow::Break(EndReason::Idle);
         }
         if !self.can_park() {
+            // Re-arms a re-check while only workers hold the park.
+            self.rearm_park();
             return std::ops::ControlFlow::Continue(());
         }
         self.state = AttachState::Parking;
@@ -2152,6 +2185,8 @@ impl SessionActor {
         }
         if !keep_subagent_tick(self.streaming, running) {
             self.subagent_tick = None;
+            // The last worker finished: a park it held may be due now.
+            self.rearm_park();
         }
     }
 
