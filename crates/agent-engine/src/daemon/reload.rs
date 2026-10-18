@@ -894,10 +894,11 @@ mod tests {
     }
 
     /// A `memory_mode` this image does not know (written by a newer one)
-    /// reads as no choice instead of failing the session's config — and with
-    /// it the whole reload state, so no session would be rehydrated.
+    /// reads as `Off` — the consent-safe reading — instead of failing the
+    /// session's config and with it the whole reload state, so no session
+    /// would be rehydrated. A missing or null value stays no choice.
     #[test]
-    fn an_unknown_memory_mode_reads_as_no_choice() {
+    fn an_unknown_memory_mode_reads_as_off() {
         use crate::session::SessionMemoryMode;
         let cfg = |v: serde_json::Value| {
             serde_json::from_value::<SessionConfig>(serde_json::json!({ "memory_mode": v }))
@@ -907,9 +908,14 @@ mod tests {
             cfg(serde_json::json!("capture_and_recall")).unwrap().memory_mode,
             Some(SessionMemoryMode::CaptureAndRecall)
         );
-        assert_eq!(cfg(serde_json::json!("recall_forever")).unwrap().memory_mode, None);
-        assert_eq!(cfg(serde_json::json!(7)).unwrap().memory_mode, None);
+        assert_eq!(
+            cfg(serde_json::json!("recall_forever")).unwrap().memory_mode,
+            Some(SessionMemoryMode::Off)
+        );
+        assert_eq!(cfg(serde_json::json!(7)).unwrap().memory_mode, Some(SessionMemoryMode::Off));
         assert_eq!(cfg(serde_json::Value::Null).unwrap().memory_mode, None);
+        let missing = serde_json::from_value::<SessionConfig>(serde_json::json!({})).unwrap();
+        assert_eq!(missing.memory_mode, None);
         let rs: ReloadState = serde_json::from_value(serde_json::json!({
             "generation": 2,
             "written_at": "2026-10-14T18:17:03Z",
@@ -920,7 +926,7 @@ mod tests {
             "expected_clients": 0
         }))
         .expect("the reload state still parses");
-        assert_eq!(rs.sessions[0].config.memory_mode, None);
+        assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
     }
 
     /// Likewise the session's `/memory` choice: a reload without a

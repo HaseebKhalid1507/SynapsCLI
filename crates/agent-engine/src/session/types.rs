@@ -209,9 +209,9 @@ pub enum SessionMemoryMode {
 
 impl SessionMemoryMode {
     /// `SessionConfig::memory_mode` reader: a value this build does not know
-    /// (a newer image's mode) is no choice — the operator default applies —
+    /// (a newer image's mode) reads as `Off` — the consent-safe direction —
     /// rather than an error that would fail the whole reload state and
-    /// rehydrate no session at all.
+    /// rehydrate no session at all. Null (or a missing field) is no choice.
     fn deserialize_lenient<'de, D>(d: D) -> Result<Option<Self>, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -220,10 +220,10 @@ impl SessionMemoryMode {
         if v.is_null() {
             return Ok(None);
         }
-        Ok(serde_json::from_value(v.clone()).ok().or_else(|| {
-            tracing::warn!(value = %v, "unknown session memory mode; treating as no choice");
-            None
-        }))
+        Ok(Some(serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+            tracing::warn!(value = %v, "unknown session memory mode; treating as off");
+            Self::Off
+        })))
     }
 
     /// The mode `/memory <arg>` sets, if it sets one.
