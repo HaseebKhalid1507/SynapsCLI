@@ -299,32 +299,73 @@ async fn ensure_credential_checked_at(
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
 ) -> std::result::Result<OAuthCredentials, String> {
+    // Cheap pre-check without gate, file lock or task: the common
+    // fresh-token path stays a single file read. The locked core re-loads
+    // and re-decides under both locks.
+    let creds = load_checked(path, cred, expected_seat)?;
+    let rejected_now = rejected.is_some_and(|r| !r.is_empty() && r == creds.access);
+    if !rejected_now && !is_token_expired(&creds) {
+        return Ok(creds);
+    }
+    let (client, cred, path) = (client.clone(), cred.clone(), path.to_path_buf());
+    let (seat, rejected) = (expected_seat.cloned(), rejected.map(str::to_string));
+    run_detached(async move {
+        refresh_credential_locked(&client, &cred, &path, seat.as_ref(), rejected.as_deref()).await
+    })
+    .await
+}
+
+/// Run the locked refresh on a DETACHED task. If the caller is cancelled
+/// (Esc mid-request, a dropped turn) after the provider has rotated the
+/// refresh token but before the CAS save, the task still persists it —
+/// dropping a rotated refresh token would log the user out.
+async fn run_detached<T, F>(fut: F) -> std::result::Result<T, String>
+where
+    F: std::future::Future<Output = std::result::Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(fut)
+        .await
+        .map_err(|e| format!("credential refresh task failed: {e}"))?
+}
+
+fn load_checked(
+    path: &Path,
+    cred: &CredentialRef,
+    expected_seat: Option<&SeatIdentity>,
+) -> std::result::Result<OAuthCredentials, String> {
+    let creds = load_provider_auth_at(path, &cred.storage_key())?.ok_or_else(|| {
+        format!(
+            "No credentials for {} at {}. Run `synaps login --provider {} --account {}`.",
+            cred,
+            path.display(),
+            cred.provider,
+            cred.account
+        )
+    })?;
+    // Seat pairing is re-checked on every load, including the re-load
+    // after a CAS `Replaced` (re-login mid-refresh): the replacement is
+    // a different seat and was never proven.
+    if let Some(expected) = expected_seat {
+        if SeatIdentity::of(cred.provider, &creds) != *expected {
+            return Err(SEAT_CHANGED.to_string());
+        }
+    }
+    Ok(creds)
+}
+
+async fn refresh_credential_locked(
+    client: &Client,
+    cred: &CredentialRef,
+    path: &Path,
+    expected_seat: Option<&SeatIdentity>,
+    rejected: Option<&str>,
+) -> std::result::Result<OAuthCredentials, String> {
     let key = cred.storage_key();
     let provider = cred.provider;
     let gate_key = format!("{}|{}", path.display(), key);
     let lock_path = refresh_lock_path(path, &key);
-    let load_path = path.to_path_buf();
-    let load_key = key.clone();
-    let load = move || {
-        let creds = load_provider_auth_at(&load_path, &load_key)?.ok_or_else(|| {
-            format!(
-                "No credentials for {} at {}. Run `synaps login --provider {} --account {}`.",
-                cred,
-                load_path.display(),
-                provider,
-                cred.account
-            )
-        })?;
-        // Seat pairing is re-checked on every load, including the re-load
-        // after a CAS `Replaced` (re-login mid-refresh): the replacement is
-        // a different seat and was never proven.
-        if let Some(expected) = expected_seat {
-            if SeatIdentity::of(provider, &creds) != *expected {
-                return Err(SEAT_CHANGED.to_string());
-            }
-        }
-        Ok(creds)
-    };
+    let load = || load_checked(path, cred, expected_seat);
     let refresh = |refresh: String| async move {
         super::provider::refresh(client, provider, &refresh).await
     };
@@ -1111,6 +1152,90 @@ mod tests {
             super::SeatVendError::SeatChanged.to_string(),
             super::SEAT_CHANGED
         );
+    }
+
+    /// Cancel safety: the caller of a refresh is dropped (Esc) while the
+    /// provider exchange is in flight; the detached task still completes
+    /// and persists the rotated token, so it is never lost.
+    #[tokio::test]
+    async fn detached_refresh_persists_after_caller_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let cred = named("a");
+        let key = cred.storage_key();
+        save_provider_auth_at(&path, &key, &expired_creds("a-r")).unwrap();
+        let (task_path, task_key) = (path.clone(), key.clone());
+        let caller = super::run_detached(async move {
+            let gate = super::refresh_gate(&format!("{}|{}", task_path.display(), task_key));
+            let lock = refresh_lock_path(&task_path, &task_key);
+            ensure_fresh_gated_locked(
+                gate,
+                Some(lock),
+                || {
+                    load_provider_auth_at(&task_path, &task_key)?
+                        .ok_or_else(|| "missing".to_string())
+                },
+                |old| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Ok(OAuthCredentials {
+                        auth_type: "oauth".into(),
+                        refresh: format!("{old}-rotated"),
+                        access: format!("{old}-access"),
+                        expires: crate::epoch_millis() + 3_600_000,
+                        account_id: None,
+                    })
+                },
+                |old, fresh| {
+                    save_provider_auth_if_refresh_matches_at(&task_path, &task_key, old, fresh)
+                },
+            )
+            .await
+        });
+        // Cancel the caller mid-exchange, as Esc does via `await_or_cancel`.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), caller)
+                .await
+                .is_err(),
+            "caller must still be waiting when cancelled"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let stored = load_provider_auth_at(&path, &key).unwrap().unwrap();
+            if stored.refresh == "a-r-rotated" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rotated token was never persisted after cancel"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The fresh-token fast path never takes the cross-process lock: a
+    /// foreign holder does not delay a vend of an unexpired credential.
+    #[tokio::test]
+    async fn fresh_credential_skips_the_refresh_lock() {
+        use fs4::fs_std::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let cred = named("a");
+        save_provider_auth_at(&path, &cred.storage_key(), &fresh_creds("a-r")).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(refresh_lock_path(&path, &cred.storage_key()))
+            .unwrap();
+        FileExt::lock_exclusive(&holder).unwrap();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::ensure_fresh_credential_at(&reqwest::Client::new(), &cred, &path),
+        )
+        .await
+        .expect("fresh vend must not wait on the refresh lock")
+        .unwrap();
+        assert_eq!(got.refresh, "a-r");
     }
 
     #[test]
