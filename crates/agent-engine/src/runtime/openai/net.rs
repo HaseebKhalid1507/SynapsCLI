@@ -53,6 +53,14 @@ pub fn provider_error_to_runtime_for(qualified_model: &str, e: BoxedProviderErro
         return RuntimeError::Canceled;
     }
 
+    // A retryable broker refresh failure (`BrokerError::Refresh` with a
+    // transient / lock-busy / local kind, e.g. a Muse re-mint that hit the
+    // network): not a configuration problem and not a login problem.
+    if msg.starts_with("credential refresh failed (") && msg.contains("retry shortly") {
+        tracing::warn!(error = %msg, "provider credential refresh failed (retryable)");
+        return RuntimeError::ApiStatus(msg);
+    }
+
     // Upstream returned an HTTP error status or the Responses API reported a
     // terminal stream failure — API failures, not configuration errors.
     if msg.starts_with("codex request failed:")
@@ -252,6 +260,27 @@ mod tests {
             .send()
             .await
             .expect_err("must fail to connect")
+    }
+
+    /// A retryable broker refresh failure (Muse re-mint hit a network
+    /// error) is an API-side failure to retry, not "Config error", and never
+    /// tells the user to sign in again.
+    #[test]
+    fn retryable_refresh_failure_is_api_status_not_config() {
+        use agent_core::auth::{BrokerError, RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let e = BrokerError::Refresh(RefreshFailure::new(kind, "transport error"));
+            let runtime = provider_error_to_runtime_for("muse/muse-x", e.to_string().into());
+            let crate::RuntimeError::ApiStatus(msg) = &runtime else {
+                panic!("{kind:?}: {runtime:?}");
+            };
+            assert!(msg.contains("retry shortly"), "{msg}");
+            assert!(!msg.contains("synaps login"), "{msg}");
+        }
+        // A credential failure keeps its old category.
+        let e = BrokerError::Refresh(RefreshFailure::new(K::Credential, "invalid_grant"));
+        let runtime = provider_error_to_runtime_for("muse/muse-x", e.to_string().into());
+        assert!(matches!(runtime, crate::RuntimeError::Config(_)), "{runtime:?}");
     }
 
     #[tokio::test]

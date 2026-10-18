@@ -366,6 +366,52 @@ async fn muse_persistent_401_mints_at_most_once_per_cooldown() {
     );
 }
 
+/// (d) The re-mint fails for a transient reason (mint 503, or no network
+/// at all): not a login problem, so the caller gets a retryable refresh
+/// error, not the upstream 401 ("sign in again"). No inference retry, and
+/// nothing is written.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_transient_mint_failure_is_a_retryable_error() {
+    use agent_core::auth::RefreshFailureKind;
+    std::env::remove_var("META_API_KEY");
+    let home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let mint = Mint::new(&[(StatusCode::SERVICE_UNAVAILABLE, "<html>busy</html>")]);
+    for mint_url in [mint.spawn().await, dead_mint().await] {
+        let seen = Seen::default();
+        let upstream = spawn(always_401_upstream(seen.clone())).await;
+        let broker = muse_broker(upstream, mint_url.clone());
+        let err = broker.proxy(responses_request("muse")).await.unwrap_err();
+        let BrokerError::Refresh(failure) = &err else {
+            panic!("{mint_url}: expected a refresh error, got {err:?}");
+        };
+        assert_eq!(failure.kind, RefreshFailureKind::Transient, "{mint_url}: {err}");
+        let text = err.to_string();
+        assert!(text.contains("retry"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+        assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "no inference retry");
+        assert_eq!(stored_muse(home.path())["access"], "KEY-1");
+    }
+    assert_eq!(mint.calls(), 1);
+}
+
+/// The stream path surfaces the same retryable refresh error.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_stream_transient_mint_failure_is_a_retryable_error() {
+    std::env::remove_var("META_API_KEY");
+    let _home = install_store(json!({ "muse": muse_slot("KEY-1") }));
+    let seen = Seen::default();
+    let upstream = spawn(always_401_upstream(seen.clone())).await;
+    let broker = muse_broker(upstream, dead_mint().await);
+    let err = match broker.proxy_stream(responses_request("muse")).await {
+        Ok(_) => panic!("401 must not stream"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, BrokerError::Refresh(_)), "{err:?}");
+    assert_eq!(seen.auths().len(), 1);
+}
+
 /// `proxy_stream` goes through the same `send`: a refused re-mint surfaces
 /// as the upstream 401 status (the stream path's status-only error), not a
 /// credential error.

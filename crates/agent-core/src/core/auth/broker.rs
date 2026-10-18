@@ -233,7 +233,16 @@ impl std::fmt::Display for BrokerError {
             ),
             Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
-            Self::Refresh(failure) => write!(f, "credential refresh failed: {failure}"),
+            Self::Refresh(failure) => {
+                use super::token::RefreshFailureKind as K;
+                let hint = match failure.kind {
+                    K::Transient => " (network or provider error, not a login problem; retry shortly)",
+                    K::LockBusy => " (another refresh of this account is still running; retry shortly)",
+                    K::Other => " (retry shortly)",
+                    K::Credential | K::Cooldown { .. } => "",
+                };
+                write!(f, "credential refresh failed{hint}: {failure}")
+            }
             Self::UnknownAccount { provider, label } => write!(
                 f,
                 "unknown account '{label}' for provider '{provider}' (no fallback; run \
@@ -2431,12 +2440,14 @@ impl LocalBroker {
         // a peer's fresh key is adopted instead) and the request is retried
         // once. An env-supplied key is never re-minted.
         //
-        // If the re-mint is refused (forced-refresh cooldown) or fails, the
-        // caller gets the ORIGINAL upstream 401 — status and body untouched,
-        // exactly like the env-key path — not a broker error (the
-        // authenticator-gives-up convention). Only the status has been read,
-        // so `response` is still unconsumed here. This covers `proxy` and
-        // `proxy_stream`, which both go through `send`.
+        // If the re-mint is refused (forced-refresh cooldown) or the mint
+        // rejects the stored login, the caller gets the ORIGINAL upstream 401
+        // — status and body untouched, exactly like the env-key path — not a
+        // broker error (the authenticator-gives-up convention). A transient,
+        // lock-busy or local failure is a retryable `BrokerError::Refresh`
+        // instead. Only the status has been read, so `response` is still
+        // unconsumed here. This covers `proxy` and `proxy_stream`, which both
+        // go through `send`.
         if provider_key == "muse" && response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(rejected) = pinned.as_ref() {
                 tracing::info!(credential = %rejected.credential, "muse key rejected (401); re-minting once");
@@ -2451,13 +2462,32 @@ impl LocalBroker {
                             .dispatch(request, provider_key, &key, &base, &pinned)
                             .await;
                     }
+                    // A transient mint failure, a busy refresh lock or a
+                    // local failure says nothing about the login: surface it
+                    // as a retryable refresh error, not as the upstream 401
+                    // (which the runtime shows as "sign in again").
+                    Err(BrokerError::Refresh(f))
+                        if matches!(
+                            f.kind,
+                            super::token::RefreshFailureKind::Transient
+                                | super::token::RefreshFailureKind::LockBusy
+                                | super::token::RefreshFailureKind::Other
+                        ) =>
+                    {
+                        tracing::warn!(
+                            credential = %rejected.credential,
+                            reason = %f,
+                            "muse key re-mint failed; returning a retryable error"
+                        );
+                        return Err(BrokerError::Refresh(f));
+                    }
                     Err(e) => {
                         // Token-free: recovery errors carry sanitized reasons
                         // (cooldown, MuseAuthError labels, lock timeouts).
                         tracing::warn!(
                             credential = %rejected.credential,
                             reason = %e,
-                            "muse key re-mint refused or failed; returning the upstream 401"
+                            "muse key re-mint refused or rejected; returning the upstream 401"
                         );
                     }
                 }
