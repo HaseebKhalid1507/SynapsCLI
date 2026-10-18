@@ -297,7 +297,14 @@ async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, queu
     }
 
     match serde_json::from_slice::<Event>(&buf) {
-        Ok(event) => {
+        Ok(mut event) => {
+            if let Some(rejected) = event.normalize_intake_id() {
+                tracing::warn!(
+                    "socket: event id rejected ({} bytes, not a plain token), replaced by {}",
+                    rejected.len(),
+                    event.id
+                );
+            }
             tracing::info!(
                 "socket: event {} from {}",
                 event.id,

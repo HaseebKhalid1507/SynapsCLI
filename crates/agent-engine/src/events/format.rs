@@ -1,40 +1,98 @@
 use super::types::Event;
 
-/// Strip any variation of </event> tags (case-insensitive, with whitespace)
-fn regex_strip_event_close(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+/// A rendered attribute value: `"` becomes `'`, `<` and `>` are dropped and
+/// control characters become spaces. A value can neither end its attribute
+/// nor close the tag nor open another one.
+fn attr(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| match c {
+            '"' => Some('\''),
+            '<' | '>' => None,
+            c if c.is_control() => Some(' '),
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// Rendered text (content and data). Every closing `</event>` tag is
+/// removed (any ASCII case, whitespace after `</` and before `>`). Then
+/// anything that could still read as an event tag (an opener `<event`, `< event`,
+/// `< /event>`, or a closer reassembled by the removal) has its `<` replaced
+/// with `&lt;`. Matching is per character and ASCII case-insensitive, so no
+/// Unicode case mapping can shift it.
+fn sanitize_text(s: &str) -> String {
+    neutralize_event_tags(&strip_event_close(s))
+}
+
+fn strip_event_close(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
-    let lower_chars: Vec<char> = s.to_lowercase().chars().collect();
+    let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        // Check for </ event > pattern at current position
-        if i + 7 < chars.len() && lower_chars[i] == '<' && lower_chars[i + 1] == '/' {
-            // Scan for "event" after optional whitespace
-            let mut j = i + 2;
-            while j < chars.len() && lower_chars[j].is_whitespace() {
-                j += 1;
-            }
-            if j + 5 <= chars.len()
-                && lower_chars[j] == 'e'
-                && lower_chars[j + 1] == 'v'
-                && lower_chars[j + 2] == 'e'
-                && lower_chars[j + 3] == 'n'
-                && lower_chars[j + 4] == 't'
-            {
-                let mut k = j + 5;
-                while k < chars.len() && lower_chars[k].is_whitespace() {
-                    k += 1;
-                }
-                if k < chars.len() && chars[k] == '>' {
-                    i = k + 1; // skip the entire closing tag
-                    continue;
-                }
-            }
+        if let Some(end) = closer_at(&chars, i) {
+            i = end;
+            continue;
         }
-        result.push(chars[i]);
+        out.push(chars[i]);
         i += 1;
     }
-    result
+    out
+}
+
+/// `</`, whitespace, `event`, whitespace, `>` starting at `i`: the index
+/// just past it.
+fn closer_at(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'<') || chars.get(i + 1) != Some(&'/') {
+        return None;
+    }
+    let j = skip_whitespace(chars, i + 2);
+    let j = skip_whitespace(chars, event_word_end(chars, j)?);
+    (chars.get(j) == Some(&'>')).then_some(j + 1)
+}
+
+fn neutralize_event_tags(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '<' && reads_as_event_tag(&chars, i) {
+            out.push_str("&lt;");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `<`, whitespace, an optional `/`, whitespace, then the word `event` ending
+/// the text or followed by whitespace, `>` or `/`.
+fn reads_as_event_tag(chars: &[char], i: usize) -> bool {
+    let mut j = skip_whitespace(chars, i + 1);
+    if chars.get(j) == Some(&'/') {
+        j = skip_whitespace(chars, j + 1);
+    }
+    match event_word_end(chars, j) {
+        Some(k) => chars
+            .get(k)
+            .map_or(true, |c| c.is_whitespace() || *c == '>' || *c == '/'),
+        None => false,
+    }
+}
+
+fn skip_whitespace(chars: &[char], mut i: usize) -> usize {
+    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    i
+}
+
+/// `event` (ASCII case-insensitive) at `i`: the index just past it.
+fn event_word_end(chars: &[char], i: usize) -> Option<usize> {
+    let word = chars.get(i..i + 5)?;
+    word.iter()
+        .zip("event".chars())
+        .all(|(c, w)| c.to_ascii_lowercase() == w)
+        .then_some(i + 5)
 }
 
 /// Format an event as a system message the agent can understand.
@@ -52,7 +110,7 @@ pub fn format_event_for_agent(event: &Event) -> String {
         .unwrap_or("medium");
 
     let channel_attr = match &event.channel {
-        Some(ch) => format!(" channel=\"{}\"", ch.name.replace('"', "'")),
+        Some(ch) => format!(" channel=\"{}\"", attr(&ch.name)),
         None => String::new(),
     };
 
@@ -72,14 +130,16 @@ pub fn format_event_for_agent(event: &Event) -> String {
         ),
     };
 
-    // Sanitize text — strip any closing </event> tags to prevent breakout
-    let safe_text = regex_strip_event_close(&gated_text);
-    let safe_source = event.source.source_type.replace('"', "'");
-    let safe_content_type = event.content.content_type.replace('"', "'");
+    // Sanitize text and every attribute value, so neither can break out of
+    // the envelope or forge another event tag.
+    let safe_text = sanitize_text(&gated_text);
+    let safe_id = attr(&event.id);
+    let safe_source = attr(&event.source.source_type);
+    let safe_content_type = attr(&event.content.content_type);
 
     let mut out = format!(
         "<event id=\"{}\" type=\"{}\" severity=\"{}\" source=\"{}\"{}>{}",
-        event.id, safe_content_type, sev, safe_source, channel_attr, safe_text
+        safe_id, safe_content_type, sev, safe_source, channel_attr, safe_text
     );
 
     if !withheld {
@@ -87,8 +147,8 @@ pub fn format_event_for_agent(event: &Event) -> String {
             let data_str = serde_json::to_string(data).unwrap_or_default();
             // Cap data size to prevent token abuse
             let truncated: String = data_str.chars().take(1000).collect();
-            // Strip closing event tags from data (case-insensitive) to prevent breakout
-            let safe_data = regex_strip_event_close(&truncated);
+            // Same text sanitising as the content.
+            let safe_data = sanitize_text(&truncated);
             out.push_str(&format!("\nData: {}", safe_data));
         }
     }

@@ -84,8 +84,11 @@ pub const MAX_EVENT_ID_LEN: usize = 128;
 /// ASCII letters, digits, `.`, `_`, `:` or `-`. Every in-process producer
 /// mints a uuid, which qualifies.
 pub fn is_valid_event_id(id: &str) -> bool {
-    let _ = id;
-    true // red stub
+    !id.is_empty()
+        && id.len() <= MAX_EVENT_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 impl Event {
@@ -94,7 +97,10 @@ impl Event {
     /// fresh uuid, and the rejected id is returned. The event is still
     /// delivered: rendering is safe either way, this keeps ids plain tokens.
     pub fn normalize_intake_id(&mut self) -> Option<String> {
-        None // red stub
+        if is_valid_event_id(&self.id) {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.id, Uuid::new_v4().to_string()))
     }
 
     /// Create a simple event from minimal params (for CLI / quick use).

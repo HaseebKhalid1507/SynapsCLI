@@ -33,7 +33,14 @@ async fn process_file(path: &Path, queue: &EventQueue) {
         }
         match tokio::fs::read_to_string(path).await {
             Ok(content) => match serde_json::from_str::<Event>(&content) {
-                Ok(event) => {
+                Ok(mut event) => {
+                    if let Some(rejected) = event.normalize_intake_id() {
+                        tracing::warn!(
+                            "inbox: event id rejected ({} bytes, not a plain token), replaced by {}",
+                            rejected.len(),
+                            event.id
+                        );
+                    }
                     tracing::info!(
                         "Inbox event: {} from {}",
                         event.id,
