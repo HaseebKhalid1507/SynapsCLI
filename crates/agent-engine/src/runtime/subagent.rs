@@ -527,6 +527,34 @@ impl SubagentHandle {
         }
     }
 
+    /// Cancel this worker only if it is still running, decided under the
+    /// state write lock the worker thread records its completion under
+    /// (`Running` → `Completed` only while no cancel is requested): either
+    /// the worker completed first and keeps its result, or the cancel wins
+    /// and it never completes. Checking the status under one lock and
+    /// cancelling under another let a worker finish in between and still
+    /// be flagged — its finalizer then relabelled the result Cancelled and
+    /// suppressed its wake. Returns whether this call cancelled it; `false`
+    /// when it already finished, is finalizing, or a cancel is in flight.
+    pub fn cancel_if_running(&mut self) -> bool {
+        let cancel = {
+            let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+            let cancel = matches!(s.status, SubagentStatus::Running)
+                && !s.finalization_started
+                && !s.cancel_requested;
+            if cancel {
+                s.cancel_requested = true;
+            }
+            cancel
+        };
+        if cancel {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        cancel
+    }
+
     /// True if the subagent is no longer running.
     pub fn is_finished(&self) -> bool {
         !matches!(self.status(), SubagentStatus::Running)
@@ -748,21 +776,11 @@ impl SubagentRegistry {
         let mut cancelled: Vec<String> = self
             .handles
             .values_mut()
-            .filter(|h| h.status() == SubagentStatus::Running)
-            .filter(|h| {
-                !h.state
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .cancel_requested
-            })
             .filter(|h| match scope {
                 WorkerCancelScope::All => true,
                 WorkerCancelScope::Turn(generation) => h.launch_turn == generation,
             })
-            .map(|h| {
-                h.cancel();
-                h.id.clone()
-            })
+            .filter_map(|h| h.cancel_if_running().then(|| h.id.clone()))
             .collect();
         cancelled.sort();
         cancelled
@@ -1204,6 +1222,53 @@ mod tests {
 
     fn make_handle(id: &str) -> SubagentHandle {
         make_test_handle(id).handle
+    }
+
+    /// What `tools/subagent/start.rs` does when the worker's run returns:
+    /// `Completed`, only while still running with no cancel requested.
+    fn complete_like_the_worker_thread(state: &Arc<RwLock<SubagentState>>) {
+        let mut s = state.write().unwrap();
+        if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
+            s.status = SubagentStatus::Completed;
+        }
+    }
+
+    /// A cancel racing the worker's own completion must decide under the
+    /// lock the worker records it with: either the worker completed first
+    /// (its result stands, no cancel flag) or the cancel won (it never
+    /// completes). Status read and cancel taken under separate locks let a
+    /// worker complete in between and still be flagged — the finalizer then
+    /// relabels the finished work Cancelled and drops its result.
+    #[test]
+    fn cancel_running_never_flags_a_worker_that_completed_meanwhile() {
+        for round in 0..5_000 {
+            let mut registry = SubagentRegistry::new();
+            let h = make_handle("sa_1");
+            let state = Arc::clone(&h.state);
+            registry.register(h);
+            let go = Arc::new(std::sync::Barrier::new(2));
+            let worker = {
+                let (go, state) = (Arc::clone(&go), Arc::clone(&state));
+                // Sweep where the completion lands relative to the cancel.
+                let spin = round % 4_000;
+                std::thread::spawn(move || {
+                    go.wait();
+                    for _ in 0..spin {
+                        std::hint::spin_loop();
+                    }
+                    complete_like_the_worker_thread(&state);
+                })
+            };
+            go.wait();
+            let cancelled = registry.cancel_running(WorkerCancelScope::All);
+            worker.join().unwrap();
+            let s = state.read().unwrap();
+            assert!(
+                !(s.status == SubagentStatus::Completed && s.cancel_requested),
+                "round {round}: completed AND flagged cancelled"
+            );
+            assert_eq!(cancelled.is_empty(), !s.cancel_requested, "round {round}");
+        }
     }
 
     fn make_finished_handle(id: &str) -> SubagentHandle {
