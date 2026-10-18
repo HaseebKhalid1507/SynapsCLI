@@ -1844,6 +1844,39 @@ mod disclosure_tests {
     }
 
     #[test]
+    fn multi_edit_paths_are_listed_as_modified_files() {
+        let messages: Vec<crate::SharedMessage> = vec![Arc::new(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "m1", "name": "multi_edit",
+                 "input": {"edits": [
+                     {"path": "/w/MULTI_A.md", "op": "append", "text": "x"},
+                     {"path": "/w/MULTI_B.jsonl", "op": "append_jsonl", "value": {}},
+                     {"path": "/w/MULTI_A.md", "op": "append", "text": "y"},
+                     {"op": "append", "text": "no path"},
+                     "not an object"
+                 ]}},
+                {"type": "tool_use", "id": "m2", "name": "multi_edit",
+                 "input": {"edits": "not a list"}},
+            ]
+        }))];
+        let open = render_compaction_input(&messages, None, &policy(&[]));
+        let modified = open
+            .prompt_text
+            .split("<modified-files>")
+            .nth(1)
+            .and_then(|rest| rest.split("</modified-files>").next())
+            .expect("a <modified-files> section");
+        let mut listed: Vec<&str> = modified.split_whitespace().collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["/w/MULTI_A.md", "/w/MULTI_B.jsonl"]);
+
+        let closed = render_compaction_input(&messages, None, &policy(&[ContentClass::FilePaths]));
+        assert!(!closed.prompt_text.contains("MULTI_A"), "{}", closed.prompt_text);
+        assert!(!closed.prompt_text.contains("<modified-files>"));
+    }
+
+    #[test]
     fn disclosure_preview_reports_provider_model_bytes_and_classes() {
         let mut runtime = crate::Runtime::new_headless();
         runtime.set_compaction_exclusions(vec![ContentClass::Thinking]);
