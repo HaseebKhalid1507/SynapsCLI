@@ -502,9 +502,11 @@ fn run(
             new: f.content.into_bytes(),
         })
         .collect();
-    if !pending.is_empty() {
-        commit::commit(&pending, hooks)?;
-    }
+    let notes = if pending.is_empty() {
+        Vec::new()
+    } else {
+        commit::commit(&pending, hooks)?
+    };
 
     let mut out = format!(
         "multi_edit: {} file(s) written, {applied} edit(s) applied, {skipped} skipped",
@@ -521,6 +523,9 @@ fn run(
             .map(|p| p.target.display().to_string())
             .collect();
         out.push_str(&format!("\nwritten: {}", written.join(", ")));
+    }
+    for note in notes {
+        out.push_str(&format!("\nwarning: {note}"));
     }
     Ok(out)
 }

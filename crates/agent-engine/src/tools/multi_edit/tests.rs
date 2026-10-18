@@ -181,7 +181,7 @@ async fn one_clock_reading_across_files_and_jsonl_rows() {
 fn finalize_failure_restores_committed_files_and_names_each() {
     struct FailSecond;
     impl commit::Hooks for FailSecond {
-        fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
+        fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
             if index == 1 {
                 return Err(std::io::Error::other("injected rename failure"));
             }
@@ -544,7 +544,7 @@ impl commit::Hooks for TempModes {
         self.seen.push((meta.permissions().mode() & 0o7777, meta.len()));
         Ok(())
     }
-    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
+    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
         if self.fail_finalize_at == Some(index) {
             return Err(std::io::Error::other("injected rename failure"));
         }
@@ -635,7 +635,7 @@ impl commit::Hooks for SwapParent {
             self.swap();
         }
     }
-    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> std::io::Result<()> {
+    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
         if self.late && self.planted.is_none() {
             self.swap();
         }

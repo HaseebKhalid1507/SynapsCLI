@@ -74,8 +74,9 @@ pub(crate) enum Primitive {
 pub(crate) trait Hooks {
     /// Runs after every temp is staged and before the re-check.
     fn after_stage(&mut self) {}
-    /// Finalizes file `index` (rename, or link for a new file).
-    fn finalize(&mut self, _index: usize, staged: &Staged, pending: &Pending) -> std::io::Result<()> {
+    /// Finalizes file `index` (rename, or link for a new file). `Some` is a
+    /// note for the result: published, but something was left over.
+    fn finalize(&mut self, _index: usize, staged: &Staged, pending: &Pending) -> Published {
         #[cfg(test)]
         let mut unsupported = |p: Primitive| self.unsupported(p);
         #[cfg(not(test))]
@@ -101,25 +102,30 @@ pub(crate) trait Hooks {
 pub(crate) struct RealHooks;
 impl Hooks for RealHooks {}
 
+/// A file's finalize: `Ok(Some(note))` when it is published but something
+/// was left over (named in the result).
+pub(crate) type Published = std::io::Result<Option<String>>;
+
 pub(crate) fn finalize(
     staged: &Staged,
     pending: &Pending,
     unsupported: &mut dyn FnMut(Primitive) -> bool,
-) -> std::io::Result<()> {
+) -> Published {
     if pending.original.is_some() {
-        return pending.dir.rename(&staged.name, &pending.name);
+        return pending.dir.rename(&staged.name, &pending.name).map(|()| None);
     }
     create(staged, pending, unsupported)
 }
 
 /// Publish a new file without ever replacing a name that appeared in the
 /// meantime: an exclusive rename where the system has one, else a hard
-/// link (the temp name is then removed). With neither, refuse.
+/// link (the temp name is then removed; if it can't be, the file is still
+/// published and the note names the temp left over). With neither, refuse.
 fn create(
     staged: &Staged,
     pending: &Pending,
     unsupported: &mut dyn FnMut(Primitive) -> bool,
-) -> std::io::Result<()> {
+) -> Published {
     let dir = &pending.dir;
     let not_here = || std::io::Error::from(std::io::ErrorKind::Unsupported);
     let renamed = if unsupported(Primitive::RenameNoReplace) {
@@ -128,7 +134,7 @@ fn create(
         dir.rename_noreplace(&staged.name, &pending.name)
     };
     match renamed {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(None),
         Err(e) if !dir::rename_unsupported(&e) => return Err(e),
         Err(_) => {}
     }
@@ -139,8 +145,18 @@ fn create(
     };
     match linked {
         Ok(()) => {
-            let _ = remove_if_ours(dir, &staged.name, staged.identity);
-            Ok(())
+            let removed = if unsupported(Primitive::UnlinkTemp) {
+                Err(not_here().to_string())
+            } else {
+                remove_if_ours(dir, &staged.name, staged.identity)
+            };
+            Ok(removed.err().map(|why| {
+                format!(
+                    "{} published; could not remove temp {}: {why}",
+                    pending.display,
+                    pending.target.with_file_name(&staged.name).display()
+                )
+            }))
         }
         Err(e) if dir::link_unsupported(&e) => Err(std::io::Error::other(format!(
             "cannot create {} without risking an overwrite on this filesystem",
@@ -304,7 +320,9 @@ pub(crate) fn create_temp_for_test(parent: &Path, name: &str, bytes: &[u8]) -> s
     write_new(&dir, OsStr::new(name), bytes, None, &mut RealHooks).map(drop)
 }
 
-pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<(), String> {
+/// Commit every file, or none (see the module docs). `Ok` holds a note per
+/// file that was published with something left over.
+pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<Vec<String>, String> {
     let mut temps: Vec<Staged> = Vec::with_capacity(files.len());
     for p in files {
         match stage(p, &p.new, hooks) {
@@ -322,33 +340,39 @@ pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<(), Str
             return Err(format!("{e}; no file was changed"));
         }
     }
+    let mut notes = Vec::new();
     for (k, (p, staged)) in files.iter().zip(&temps).enumerate() {
-        if let Err(e) = hooks.finalize(k, staged, p) {
-            remove_all(&files[k..], &temps[k..]);
-            let mut restored = Vec::new();
-            let mut failed = Vec::new();
-            for done in &files[..k] {
-                match restore(done, hooks) {
-                    Ok(()) => restored.push(done.display.clone()),
-                    Err(why) => failed.push(format!("{} ({why})", done.display)),
-                }
+        let e = match hooks.finalize(k, staged, p) {
+            Ok(note) => {
+                notes.extend(note);
+                continue;
             }
-            let never: Vec<String> = files[k..].iter().map(|f| f.display.clone()).collect();
-            let list = |v: &[String]| {
-                if v.is_empty() {
-                    "none".to_string()
-                } else {
-                    v.join(", ")
-                }
-            };
-            return Err(format!(
-                "writing {} failed: {e}. Committed then restored: {}. Restore FAILED: {}. Never written: {}.",
-                p.display,
-                list(&restored),
-                list(&failed),
-                list(&never)
-            ));
+            Err(e) => e,
+        };
+        remove_all(&files[k..], &temps[k..]);
+        let mut restored = Vec::new();
+        let mut failed = Vec::new();
+        for done in &files[..k] {
+            match restore(done, hooks) {
+                Ok(()) => restored.push(done.display.clone()),
+                Err(why) => failed.push(format!("{} ({why})", done.display)),
+            }
         }
+        let never: Vec<String> = files[k..].iter().map(|f| f.display.clone()).collect();
+        let list = |v: &[String]| {
+            if v.is_empty() {
+                "none".to_string()
+            } else {
+                v.join(", ")
+            }
+        };
+        return Err(format!(
+            "writing {} failed: {e}. Committed then restored: {}. Restore FAILED: {}. Never written: {}.",
+            p.display,
+            list(&restored),
+            list(&failed),
+            list(&never)
+        ));
     }
-    Ok(())
+    Ok(notes)
 }
