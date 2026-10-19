@@ -399,7 +399,7 @@ impl AccountFailureKind {
     /// Only an action outside synaps fixes it (a corrupt or missing store,
     /// a billing requirement); neither a retry nor a login does.
     pub fn needs_action(self) -> bool {
-        false
+        matches!(self, Self::RefreshActionRequired | Self::CredentialStore)
     }
 }
 
@@ -637,10 +637,18 @@ pub struct Rejection {
     #[serde(with = "cred_serde")]
     pub credential: CredentialRef,
     pub reason: RejectReason,
-    /// The failed observation behind an observation verdict (`unknown`,
-    /// `auth_error`, `malformed`, `unsupported`), when it is known.
+    /// The failed observation behind the verdict, when it is known: for an
+    /// observation verdict (`unknown`, `auth_error`, `malformed`,
+    /// `unsupported`) and for a cooldown, which does not erase what the
+    /// account's last read or refresh said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<ObservationFailure>,
+    /// Diagnostics only: when this account can be used again as far as its
+    /// cooldown and its exhausted applicable windows know, i.e. the LATEST
+    /// of them (every exhausted window must reset). `None` when it has
+    /// neither, or an exhausted window has no future reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_after_ms: Option<u64>,
 }
 
 impl Rejection {
@@ -674,7 +682,9 @@ pub struct AccountFailure {
 
 impl AccountFailure {
     /// The account's failure for a rejection; `None` for an account that
-    /// was eligible but outranked (not a failure).
+    /// was eligible but outranked (not a failure). A cooling account keeps
+    /// the kind of its last failed read or refresh, with `cooling_down` set
+    /// beside it; `until_ms` is the rejection's `usable_after_ms`.
     pub fn from_rejection(rejection: &Rejection) -> Option<Self> {
         use AccountFailureKind as K;
         let mut out = Self {
@@ -682,9 +692,12 @@ impl AccountFailure {
             kind: K::QuotaUnknown,
             http_status: None,
             retry_after_s: None,
-            until_ms: None,
-            cooling_down: false,
+            until_ms: rejection.usable_after_ms,
+            cooling_down: matches!(rejection.reason, RejectReason::CoolingDown { .. }),
         };
+        if let RejectReason::Outranked { .. } = rejection.reason {
+            return None;
+        }
         if let Some(cause) = &rejection.cause {
             out.kind = cause.kind;
             out.http_status = cause.http_status;
@@ -693,14 +706,8 @@ impl AccountFailure {
         }
         out.kind = match &rejection.reason {
             RejectReason::Outranked { .. } => return None,
-            RejectReason::CoolingDown { until_ms } => {
-                out.until_ms = Some(*until_ms);
-                K::CoolingDown
-            }
-            RejectReason::Exhausted { resets_at_ms, .. } => {
-                out.until_ms = *resets_at_ms;
-                K::Exhausted
-            }
+            RejectReason::CoolingDown { .. } => K::CoolingDown,
+            RejectReason::Exhausted { .. } => K::Exhausted,
             RejectReason::Stale { .. } => K::StaleSnapshot,
             RejectReason::Malformed => K::UsageMalformed,
             RejectReason::Unknown => K::QuotaUnknown,
@@ -717,12 +724,23 @@ impl AccountFailure {
         Some(out)
     }
 
-    /// `label:kind[:status]`, the log form.
+    /// Cooling down or at a provider limit: the account counts as limited
+    /// for the top-level kind, whatever its last read said.
+    pub fn is_limited(&self) -> bool {
+        self.cooling_down || self.kind.is_limited()
+    }
+
+    /// `label:kind[:status][:cooling]`, the log form; `:cooling` marks a
+    /// cooling account whose kind is its last failed read or refresh.
     pub fn log_form(&self) -> String {
-        match self.http_status {
-            Some(status) => format!("{}:{}:{status}", self.account, self.kind),
-            None => format!("{}:{}", self.account, self.kind),
+        let mut out = format!("{}:{}", self.account, self.kind);
+        if let Some(status) = self.http_status {
+            out.push_str(&format!(":{status}"));
         }
+        if self.cooling_down && self.kind != AccountFailureKind::CoolingDown {
+            out.push_str(":cooling");
+        }
+        out
     }
 }
 
@@ -798,31 +816,43 @@ impl SelectionFailure {
         }
     }
 
-    /// Classify a `NoCapacity` result. First match wins: no accounts →
-    /// `no_credentials`; any transient failure → `usage_read_failed`; every
-    /// account limited → `all_cooling_down`; every account not limited
-    /// needs a login → `credential_rejected`; else `quota_unknown`.
+    /// Classify a `NoCapacity` result. An account counts as limited when it
+    /// is cooling down or at a provider limit, whatever its last read said.
+    /// First match wins: no accounts → `no_credentials`; a transient failure
+    /// on an account that is not limited → `usage_read_failed`; every
+    /// account limited → `all_cooling_down`; every account not limited needs
+    /// a login → `credential_rejected`; each needs a login or an action
+    /// outside synaps (at least one an action) → `action_required`; else
+    /// `quota_unknown`. The earliest reset is the earliest time some limited
+    /// account is usable again: the minimum of their `until`, skipping
+    /// accounts that also need a login or an action (their cooldown's end
+    /// alone won't make them usable).
     pub fn from_rejections(rejections: &[Rejection], now_ms: u64) -> Self {
         use SelectionFailureKind as K;
         let accounts: Vec<_> = rejections
             .iter()
             .filter_map(AccountFailure::from_rejection)
             .collect();
-        let live: Vec<_> = accounts.iter().filter(|a| !a.kind.is_limited()).collect();
+        let live: Vec<_> = accounts.iter().filter(|a| !a.is_limited()).collect();
         let kind = if accounts.is_empty() {
             K::NoCredentials
-        } else if accounts.iter().any(|a| a.kind.is_transient()) {
+        } else if live.iter().any(|a| a.kind.is_transient()) {
             K::UsageReadFailed
         } else if live.is_empty() {
             K::AllCoolingDown
         } else if live.iter().all(|a| a.kind.needs_login()) {
             K::CredentialRejected
+        } else if live
+            .iter()
+            .all(|a| a.kind.needs_login() || a.kind.needs_action())
+        {
+            K::ActionRequired
         } else {
             K::QuotaUnknown
         };
         let earliest_reset_ms = accounts
             .iter()
-            .filter(|a| a.kind.is_limited())
+            .filter(|a| a.is_limited() && !a.kind.needs_login() && !a.kind.needs_action())
             .filter_map(|a| a.until_ms)
             .filter(|t| *t > now_ms)
             .min();
@@ -844,10 +874,14 @@ impl SelectionFailure {
 
     /// Labels whose failure needs an action outside synaps, in order.
     pub fn action_labels(&self) -> Vec<&str> {
-        Vec::new()
+        self.accounts
+            .iter()
+            .filter(|a| a.kind.needs_action())
+            .map(|a| a.account.as_str())
+            .collect()
     }
 
-    /// `label:kind[:status],…` — one log field, secret-free.
+    /// `label:kind[:status][:cooling],…` — one log field, secret-free.
     pub fn accounts_field(&self) -> String {
         self.accounts
             .iter()
@@ -1053,16 +1087,37 @@ fn preference_rank(req: &SelectionRequest<'_>, cred: &CredentialRef) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// The recorded observation failure behind an observation verdict; the
-/// policy verdicts (cooling down, exhausted, …) need no cause.
+/// The recorded observation failure behind a verdict: an observation
+/// verdict, or a cooldown (checked first, so it would otherwise hide what
+/// the account's last read or refresh said). The other policy verdicts
+/// (exhausted, …) come from a good reading and need no cause.
 fn observation_cause(reason: &RejectReason, cap: &AccountCapacity) -> Option<ObservationFailure> {
     match reason {
         RejectReason::Unknown
         | RejectReason::AuthError
         | RejectReason::Malformed
-        | RejectReason::Unsupported => cap.failure.clone(),
+        | RejectReason::Unsupported
+        | RejectReason::CoolingDown { .. } => cap.failure.clone(),
         _ => None,
     }
+}
+
+/// Diagnostics only (never eligibility): when `cap` can be used again as
+/// far as its cooldown and its reading know: the latest of its future
+/// cooldown end and the resets of every applicable exhausted window, since
+/// all of them must be over. `None` when it has neither, or an exhausted
+/// window has no future reset (the time is unknown).
+fn usable_after_ms(req: &SelectionRequest<'_>, cap: &AccountCapacity) -> Option<u64> {
+    let mut latest = cap.cooldown_until_ms.filter(|t| *t > req.now_ms);
+    if let QuotaObservation::Ok { windows, .. } = &cap.observation {
+        for w in windows.iter().filter(|w| w.applies_to(req.model)) {
+            if let WindowVerdict::Exhausted { resets_at_ms } = w.verdict(req.exhausted_at_percent) {
+                let reset = resets_at_ms.filter(|t| *t > req.now_ms)?;
+                latest = Some(latest.map_or(reset, |l| l.max(reset)));
+            }
+        }
+    }
+    latest
 }
 
 /// Pick the best eligible account for `req` among `candidates`.
@@ -1088,6 +1143,7 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
             Err(reason) => rejections.push(Rejection {
                 credential: cap.credential.clone(),
                 cause: observation_cause(&reason, cap),
+                usable_after_ms: usable_after_ms(req, cap),
                 reason,
             }),
         }
@@ -1114,6 +1170,7 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
                 credential,
                 reason,
                 cause: None,
+                usable_after_ms: None,
             }],
             earliest_reset_ms: None,
         };
@@ -1181,6 +1238,7 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
                         rank: (i + 1) as u32,
                     },
                     cause: None,
+                    usable_after_ms: None,
                 });
             }
             Selection::Selected {
@@ -2812,6 +2870,31 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// "Send again after" names a time some account is usable: a cooling
+    /// account that also needs a login (or an action) is not usable when
+    /// its cooldown ends, so it never sets the earliest reset; it still
+    /// shows its own time.
+    #[test]
+    fn the_earliest_reset_skips_accounts_that_need_a_login_or_an_action() {
+        use AccountFailureKind as K;
+        let mut refused = failed(
+            "a",
+            ObservationFailure::new(K::UsageUnauthorized).with_status(401),
+        );
+        refused.cooldown_until_ms = Some(NOW + HOUR);
+        let mut broken = failed("b", ObservationFailure::new(K::CredentialStore));
+        broken.cooldown_until_ms = Some(NOW + 2 * HOUR);
+        let mut plain = ok("c", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        plain.cooldown_until_ms = Some(NOW + 3 * HOUR);
+
+        let f = failure_of(&[refused.clone(), broken.clone(), plain]);
+        assert_eq!(f.kind, SelectionFailureKind::AllCoolingDown, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, Some(NOW + 3 * HOUR));
+        assert_eq!(f.accounts[0].until_ms, Some(NOW + HOUR));
+        assert_eq!(f.accounts[1].until_ms, Some(NOW + 2 * HOUR));
+        assert_eq!(failure_of(&[refused, broken]).earliest_reset_ms, None);
     }
 
     /// r2 blocker 2: a refresh that needs action outside synaps and an

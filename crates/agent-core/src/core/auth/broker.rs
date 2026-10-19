@@ -2106,9 +2106,15 @@ impl LocalBroker {
             let (credential, seat) = match self.select_auto(provider, model).await {
                 Ok(choice) => choice,
                 Err(e) => {
-                    if let BrokerError::NoAccountAvailable { failure, .. } = &e {
-                        self.record_selection(provider, model, None, failure.clone(), None);
-                    }
+                    let failure = match &e {
+                        BrokerError::NoAccountAvailable { failure, .. } => failure.clone(),
+                        // The account list could not be read (select_auto
+                        // logged it).
+                        _ => Some(super::quota_policy::SelectionFailure::new(
+                            super::quota_policy::SelectionFailureKind::CredentialStore,
+                        )),
+                    };
+                    self.record_selection(provider, model, None, failure, None);
                     return Err(e);
                 }
             };
@@ -2360,7 +2366,19 @@ impl LocalBroker {
         match self.fresh_usage(cred).await {
             Ok((snapshot, seat)) => (capacity_from_snapshot(cred, &snapshot), Some(seat)),
             Err(err) => {
-                tracing::debug!(credential = %cred, cause = %err.failure, "usage read failed");
+                if err.failure.kind.needs_action() {
+                    // Only the user can fix this, outside synaps; the
+                    // selection failure names just the kind, so say here
+                    // what and where.
+                    tracing::warn!(
+                        credential = %cred,
+                        kind = %err.failure.kind,
+                        detail = %action_detail(cred, &err),
+                        "usage read needs action"
+                    );
+                } else {
+                    tracing::debug!(credential = %cred, cause = %err.failure, "usage read failed");
+                }
                 (AccountCapacity::failed(cred.clone(), err.failure), None)
             }
         }
@@ -2458,8 +2476,21 @@ impl LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
-        use super::quota_policy::Selection;
-        let (plan, mut seats) = self.selection_plan(provider, model).await?;
+        use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
+        let (plan, mut seats) = match self.selection_plan(provider, model).await {
+            Ok(planned) => planned,
+            // The account list itself could not be read (the only error
+            // `selection_plan` returns): still exactly one WARN for this
+            // failed selection, and the caller gets the store's own error.
+            Err(e) => {
+                log_selection_failure(
+                    provider,
+                    model,
+                    &SelectionFailure::new(SelectionFailureKind::CredentialStore),
+                );
+                return Err(e);
+            }
+        };
         match plan.selection {
             Selection::Selected {
                 credential,
@@ -2468,13 +2499,21 @@ impl LocalBroker {
                 utilization,
                 ..
             } => {
-                let seat = seats.remove(&credential.storage_key()).ok_or_else(|| {
-                    BrokerError::NoAccountAvailable {
-                        provider: provider.to_string(),
-                        reason: "selected account has no paired seat identity".into(),
-                        failure: None,
-                    }
-                })?;
+                // Every account whose usage was read has its seat, so a
+                // selected account always has one.
+                let seat = seats.remove(&credential.storage_key());
+                debug_assert!(
+                    seat.is_some(),
+                    "selected account has no paired seat identity"
+                );
+                let Some(seat) = seat else {
+                    return Err(selection_failed(
+                        provider,
+                        model,
+                        "selected account has no paired seat identity".into(),
+                        SelectionFailure::new(SelectionFailureKind::SeatChurn),
+                    ));
+                };
                 tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
                 Ok((credential, seat))
             }
@@ -2985,9 +3024,31 @@ impl UsageReadError {
     }
 }
 
-/// The observation-failure kind of a token refresh failure.
+/// What a usage read that needs action asks of the user. A refresh that
+/// needs action carries our own instructions (paths, what to move back);
+/// an unreadable stored login names the store, not the parser's message
+/// (which can quote stored values).
+fn action_detail(cred: &CredentialRef, err: &UsageReadError) -> String {
+    use super::quota_policy::AccountFailureKind as K;
+    match err.failure.kind {
+        K::CredentialStore => format!(
+            "the stored login of '{}' could not be read from {}; repair or restore the \
+             credential store",
+            cred.account.label_str(),
+            storage::auth_file_path().display()
+        ),
+        _ => err.error.to_string(),
+    }
+}
+
+/// The observation-failure kind of a token refresh failure, with the token
+/// endpoint's HTTP status when it answered with one.
 fn refresh_failure(f: &super::token::RefreshFailure) -> super::quota_policy::ObservationFailure {
-    refresh_kind_failure(f.kind)
+    let failure = refresh_kind_failure(f.kind);
+    match f.http_status() {
+        Some(status) => failure.with_status(status),
+        None => failure,
+    }
 }
 
 /// The observation-failure kind of a token refresh failure kind.
@@ -3029,18 +3090,33 @@ fn auto_vend_failure(
             credential.provider
         ));
     }
-    super::token::RefreshFailure::new(f.kind, message)
+    super::token::RefreshFailure::new(f.kind, message).with_http_status(f.http_status())
 }
 
-/// A failed automatic selection: ONE WARN naming the top-level kind and
-/// every account's `label:kind[:status]` (labels only, never identities or
-/// token material), then the typed error.
+/// A failed automatic selection: ONE WARN (see [`log_selection_failure`]),
+/// then the typed error.
 fn selection_failed(
     provider: OAuthProviderId,
     model: Option<&str>,
     reason: String,
     failure: super::quota_policy::SelectionFailure,
 ) -> BrokerError {
+    log_selection_failure(provider, model, &failure);
+    BrokerError::NoAccountAvailable {
+        provider: provider.to_string(),
+        reason,
+        failure: Some(failure),
+    }
+}
+
+/// The one `auth_selection_failed` WARN of a failed automatic selection:
+/// the top-level kind and every account's `label:kind[:status][:cooling]`
+/// (labels only, never identities or token material).
+fn log_selection_failure(
+    provider: OAuthProviderId,
+    model: Option<&str>,
+    failure: &super::quota_policy::SelectionFailure,
+) {
     tracing::warn!(
         provider = %provider,
         model = model.unwrap_or("any"),
@@ -3049,11 +3125,6 @@ fn selection_failed(
         earliest_reset_ms = ?failure.earliest_reset_ms,
         "auth_selection_failed"
     );
-    BrokerError::NoAccountAvailable {
-        provider: provider.to_string(),
-        reason,
-        failure: Some(failure),
-    }
 }
 
 // ── Bounded body handling ────────────────────────────────────────────────────
@@ -4244,7 +4315,13 @@ fn auth_state_report(
             last_refresh: super::token::last_refresh_exchange(&store, &cred.storage_key()).map(
                 |x| ObservedOutcome {
                     at_ms: x.at_ms,
-                    failure: x.failure.map(refresh_kind_failure),
+                    failure: x.failure.map(|kind| {
+                        let failure = refresh_kind_failure(kind);
+                        match x.http_status {
+                            Some(status) => failure.with_status(status),
+                            None => failure,
+                        }
+                    }),
                 },
             ),
         });

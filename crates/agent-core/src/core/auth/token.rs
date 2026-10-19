@@ -296,12 +296,14 @@ impl RefreshFailureKind {
 }
 
 /// A refresh failure: its kind plus a log-safe message (our own texts, or
-/// provider errors that went through the provider's sanitizer). Never
+/// provider errors that went through the provider's sanitizer) and, when
+/// the token endpoint answered with a failure, its HTTP status. Never
 /// carries token material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshFailure {
     pub kind: RefreshFailureKind,
     message: String,
+    http_status: Option<u16>,
 }
 
 impl RefreshFailure {
@@ -309,11 +311,24 @@ impl RefreshFailure {
         Self {
             kind,
             message: message.into(),
+            http_status: None,
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The token endpoint's HTTP status, when it answered with a failure.
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// The same failure carrying `status` (kept when a caller rewords the
+    /// message).
+    pub fn with_http_status(mut self, status: Option<u16>) -> Self {
+        self.http_status = status;
+        self
     }
 }
 
@@ -371,7 +386,7 @@ impl RefreshFailure {
 
     /// The token endpoint answered `status`; see [`status_kind`].
     pub fn status(status: u16, message: impl Into<String>) -> Self {
-        Self::new(status_kind(status), message)
+        Self::new(status_kind(status), message).with_http_status(Some(status))
     }
 
     /// A success status whose body is not a usable token response.
@@ -616,7 +631,7 @@ fn refresh_exchange_key(path: &Path, storage_key: &str) -> String {
     format!("{}|{storage_key}", path.display())
 }
 
-fn record_refresh_exchange(path: &Path, storage_key: &str, failure: Option<RefreshFailureKind>) {
+fn record_refresh_exchange(path: &Path, storage_key: &str, failure: Option<&RefreshFailure>) {
     let at_ms = crate::epoch_millis();
     REFRESH_EXCHANGES
         .lock()
@@ -625,8 +640,8 @@ fn record_refresh_exchange(path: &Path, storage_key: &str, failure: Option<Refre
             refresh_exchange_key(path, storage_key),
             RefreshExchange {
                 at_ms,
-                failure,
-                http_status: None,
+                failure: failure.map(|f| f.kind),
+                http_status: failure.and_then(RefreshFailure::http_status),
             },
         );
 }
@@ -664,7 +679,7 @@ where
         async move {
             let result: std::result::Result<OAuthCredentials, RefreshFailure> =
                 exchange.await.map_err(Into::into);
-            record_refresh_exchange(path, key, result.as_ref().err().map(|f| f.kind));
+            record_refresh_exchange(path, key, result.as_ref().err());
             result
         }
     };

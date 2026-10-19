@@ -515,11 +515,21 @@ impl AuthMethods {
             .await
             .map_err(|e| {
                 turn_auth_failed(
-                    broker_error_kind(&e),
+                    auto_selection_kind(&e),
                     None,
                     RuntimeError::Auth(auto_selection_text(&e, crate::epoch_millis())),
                 )
             })
+    }
+}
+
+/// Fixed kind of a failed automatic selection. In automatic Anthropic
+/// selection a `Credential` error comes only from listing the stored
+/// accounts, so it is a credential-store failure.
+fn auto_selection_kind(e: &crate::auth::BrokerError) -> &'static str {
+    match e {
+        crate::auth::BrokerError::Credential(_) => "credential_store",
+        other => broker_error_kind(other),
     }
 }
 
@@ -585,6 +595,12 @@ fn auto_selection_text(e: &crate::auth::BrokerError, now_ms: u64) -> String {
         BrokerError::Unauthorized => {
             format!("Automatic account selection failed: {}", sentence(&e.to_string()))
         }
+        // Listing the stored accounts failed: no account was read, and
+        // neither a login nor a retry fixes the store.
+        BrokerError::Credential(msg) => format!(
+            "Automatic account selection failed (credential_store): the credential store could \
+             not be read ({msg}); repair or restore it."
+        ),
         other => format!(
             "Automatic account selection failed: {other}. Run `synaps login`, pick an account with `synaps auth use --provider anthropic --account <label>`, or check auth.remote_endpoint / broker reachability."
         ),
@@ -600,7 +616,9 @@ fn login_command(label: &str) -> String {
     }
 }
 
-/// `label: kind (HTTP s, retry after Ns, until HH:MM UTC)`.
+/// `label: kind (HTTP s, retry after Ns, until HH:MM UTC)`. A cooling
+/// account whose kind is its last failed read or refresh says "cooling down
+/// until" (or just "cooling down" when the end is unknown).
 fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String {
     let mut extra = Vec::new();
     if let Some(status) = a.http_status {
@@ -609,11 +627,15 @@ fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String 
     if let Some(secs) = a.retry_after_s {
         extra.push(format!("retry after {secs}s"));
     }
-    if let Some(until) = a.until_ms.filter(|t| *t > now_ms) {
-        extra.push(format!(
-            "until {}",
+    let cooling = a.cooling_down && a.kind != crate::auth::AccountFailureKind::CoolingDown;
+    match a.until_ms.filter(|t| *t > now_ms) {
+        Some(until) => extra.push(format!(
+            "{}until {}",
+            if cooling { "cooling down " } else { "" },
             super::anthropic_quota::describe_reset_utc(until, now_ms)
-        ));
+        )),
+        None if cooling => extra.push("cooling down".to_string()),
+        None => {}
     }
     if extra.is_empty() {
         format!("{}: {}", a.account, a.kind)
@@ -636,7 +658,11 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
             "the chosen account's stored login kept changing while its capacity was being read"
         }
         K::RemoteNoCapacity => "the credential broker found no account with proven capacity",
-        K::ActionRequired | K::CredentialStore => "no account's usage reading proved capacity",
+        K::ActionRequired => {
+            "every Anthropic account that is not cooling down needs a new login or an action \
+             outside synaps"
+        }
+        K::CredentialStore => "the credential store could not be read, so no account was checked",
     };
     let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
     if !f.accounts.is_empty() {
@@ -671,19 +697,46 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
             commands.join(", ")
         ));
     }
+    for a in f.accounts.iter().filter(|a| a.kind.needs_action()) {
+        text.push(' ');
+        text.push_str(&action_remedy(a));
+    }
+    // "No login needed" only when no account needs a login or an action;
+    // "send again" only when sending again can help.
+    let nothing_to_fix = login.is_empty() && f.action_labels().is_empty();
     match f.kind {
-        K::NoCredentials | K::CredentialRejected => {}
+        K::NoCredentials | K::CredentialRejected | K::ActionRequired | K::CredentialStore => {}
         K::RemoteNoCapacity => text.push_str(
             " The broker host's log has each account's reason (`auth_selection_failed`); send again to retry.",
         ),
-        K::AllCoolingDown => match &earliest {
-            Some(at) => text.push_str(&format!(" No login needed; send again after {at}.")),
-            None => text.push_str(" No login needed; send again later."),
+        K::AllCoolingDown => match (&earliest, nothing_to_fix) {
+            (Some(at), true) => text.push_str(&format!(" No login needed; send again after {at}.")),
+            (None, true) => text.push_str(" No login needed; send again later."),
+            (Some(at), false) => text.push_str(&format!(" Send again after {at}.")),
+            (None, false) => {}
         },
-        _ if login.is_empty() => text.push_str(" Send again to retry; no login needed."),
+        _ if nothing_to_fix => text.push_str(" Send again to retry; no login needed."),
         _ => text.push_str(" Send again to retry."),
     }
     text
+}
+
+/// The remedy for an account whose failure needs an action outside synaps.
+/// The `usage read needs action` WARN in the synaps log has the detail.
+fn action_remedy(a: &crate::auth::AccountFailure) -> String {
+    use crate::auth::AccountFailureKind as K;
+    match a.kind {
+        K::CredentialStore => format!(
+            "{}: its stored login could not be read; repair or restore the credential store \
+             (the `usage read needs action` line in the synaps log names the file).",
+            a.account
+        ),
+        _ => format!(
+            "{}: the token refresh needs an action outside synaps; the `usage read needs \
+             action` line in the synaps log says what to do.",
+            a.account
+        ),
+    }
 }
 
 /// The account the broker chose could not be vended because its token
