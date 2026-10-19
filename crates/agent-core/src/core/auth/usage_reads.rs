@@ -97,6 +97,9 @@ impl TransientReadFailure {
 }
 
 /// What one network read produced, before the table classifies it.
+// One value per network read, moved straight into the table: boxing the
+// snapshot would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Fetched {
     Ok(UsageSnapshot, SeatIdentity),
     /// The usage request itself failed.
@@ -209,6 +212,9 @@ impl UsageReads {
     }
 
     /// Record one network read for `key` at `now_ms` and classify it.
+    // ReadError carries the broker's own error (as `usage()` returns it);
+    // one per read, so its size is no cost worth a box.
+    #[allow(clippy::result_large_err)]
     pub fn record_at(&self, key: &str, fetched: Fetched, now_ms: u64) -> ReadResult {
         let mut entries = self.entries();
         let entry = entries.entry(key.to_string()).or_default();
