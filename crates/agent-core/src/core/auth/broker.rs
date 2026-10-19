@@ -1715,6 +1715,19 @@ pub struct LocalBroker {
     /// Cached account policy keyed by the config file's modification time
     /// (env overlay is applied on every read; it is cheap and has no I/O).
     policy_cache: Arc<std::sync::Mutex<Option<CachedPolicy>>>,
+    /// What `synaps auth state` shows per slot (credential file + storage
+    /// key): the last usage read and the last successful one. Diagnostic
+    /// only; selection never reads it.
+    observations: SharedMap<SlotObservations>,
+    /// Last automatic selection per [`Self::current_key`] (provider + model).
+    selections: SharedMap<super::auth_state::SelectionState>,
+}
+
+/// One slot's recorded usage reads (`synaps auth state`).
+#[derive(Debug, Clone, Default)]
+struct SlotObservations {
+    last_usage: Option<super::auth_state::ObservedOutcome>,
+    last_usage_ok_ms: Option<u64>,
 }
 
 /// Process-shared map keyed by storage key or seat key.
@@ -1773,6 +1786,8 @@ impl LocalBroker {
             snapshots: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             snapshot_gates: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             policy_cache: Arc::new(std::sync::Mutex::new(None)),
+            observations: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            selections: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1960,6 +1975,62 @@ impl LocalBroker {
         auth_state_report(Some(self), query)
     }
 
+    /// The active cooldown of `cred`'s current seat, with its reason.
+    fn cooldown_state(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> Option<super::auth_state::CooldownState> {
+        let key = self.cooldown_key(cred);
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|c| c.until_ms > now_ms)
+            .map(|c| super::auth_state::CooldownState {
+                until_ms: c.until_ms,
+                reason: c.reason.clone(),
+            })
+    }
+
+    /// Drop the in-memory state of `creds`: cooldowns, usage readings and
+    /// their gates, `auth state` records and stickiness. With
+    /// `whole_providers` (no single account was named), also every cooldown
+    /// and selection record of those providers, including ones a previous
+    /// occupant of a slot left. Never touches the credential store.
+    fn clear_state(&self, creds: &[CredentialRef], whole_providers: &[OAuthProviderId]) {
+        let store = storage::auth_file_path().display().to_string();
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for cred in creds {
+                cooldowns.remove(&self.cooldown_key(cred));
+                cooldowns.remove(&format!("{store}|{}|{}", cred.provider, cred.storage_key()));
+            }
+            for provider in whole_providers {
+                let prefix = format!("{store}|{provider}|");
+                cooldowns.retain(|k, _| !k.starts_with(&prefix));
+            }
+        }
+        for cred in creds {
+            self.forget_snapshots(cred);
+        }
+        {
+            let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+            for cred in creds {
+                observations.remove(&Self::state_key(cred));
+            }
+        }
+        self.current_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (current, _)| !creds.contains(current));
+        let mut selections = self.selections.lock().unwrap_or_else(|e| e.into_inner());
+        for provider in whole_providers {
+            let prefix = format!("{store}|{provider}|");
+            selections.retain(|k, _| !k.starts_with(&prefix));
+        }
+    }
+
     /// Verify an explicitly addressed slot exists. Named slots that are
     /// missing are `UnknownAccount` (never a fallback); the default slot
     /// keeps the historical load-miss `Credential` error from the refresh
@@ -2022,7 +2093,15 @@ impl LocalBroker {
     ) -> Result<PinnedToken, BrokerError> {
         use super::token::{ensure_fresh_credential_for_seat, SeatVendError};
         for _ in 0..Self::MAX_AUTO_VEND_ROUNDS {
-            let (credential, seat) = self.select_auto(provider, model).await?;
+            let (credential, seat) = match self.select_auto(provider, model).await {
+                Ok(choice) => choice,
+                Err(e) => {
+                    if let BrokerError::NoAccountAvailable { failure, .. } = &e {
+                        self.record_selection(provider, model, None, failure.clone(), None);
+                    }
+                    return Err(e);
+                }
+            };
             match ensure_fresh_credential_for_seat(
                 &self.http,
                 &credential,
@@ -2039,6 +2118,7 @@ impl LocalBroker {
                             Self::current_key(provider, model),
                             (credential.clone(), seat),
                         );
+                    self.record_selection(provider, model, Some(&credential), None, None);
                     return Ok(PinnedToken {
                         credential,
                         token: AccessToken {
@@ -2055,23 +2135,50 @@ impl LocalBroker {
                 // Typed, so a transient refresh failure of the chosen seat
                 // is never reported as an unusable login.
                 Err(SeatVendError::Other(f)) => {
+                    let cause = refresh_failure(&f);
                     tracing::warn!(
                         credential = %credential,
-                        kind = %refresh_failure(&f).kind,
+                        kind = %cause.kind,
                         "automatic choice could not be vended: token refresh failed"
                     );
+                    self.record_selection(provider, model, Some(&credential), None, Some(cause));
                     return Err(BrokerError::Refresh(auto_vend_failure(&credential, f)));
                 }
             }
         }
+        let failure = super::quota_policy::SelectionFailure::new(
+            super::quota_policy::SelectionFailureKind::SeatChurn,
+        );
+        self.record_selection(provider, model, None, Some(failure.clone()), None);
         Err(selection_failed(
             provider,
             model,
             "selected credential kept changing while its capacity was being proven".into(),
-            super::quota_policy::SelectionFailure::new(
-                super::quota_policy::SelectionFailureKind::SeatChurn,
-            ),
+            failure,
         ))
+    }
+
+    /// Record the outcome of an automatic selection for `synaps auth state`.
+    fn record_selection(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+        chosen: Option<&CredentialRef>,
+        failure: Option<super::quota_policy::SelectionFailure>,
+        vend_failure: Option<super::quota_policy::ObservationFailure>,
+    ) {
+        let state = super::auth_state::SelectionState {
+            provider: provider.as_str().to_string(),
+            model: model.map(str::to_string),
+            at_ms: crate::epoch_millis(),
+            chosen: chosen.map(|c| c.account.label_str().to_string()),
+            failure,
+            vend_failure,
+        };
+        self.selections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Self::current_key(provider, model), state);
     }
 
     /// Cache key for one stored seat: credential file + slot + identity of
@@ -2164,8 +2271,42 @@ impl LocalBroker {
     /// Read-only usage for `cred`, reporting the seat whose token made the
     /// request. Token resolution happens HERE, behind the boundary, for
     /// exactly this credential; the usage helper pairs any account header
-    /// with the same token. A failure keeps its typed cause.
+    /// with the same token. A failure keeps its typed cause. Every read
+    /// (not a cache hit) is recorded for `synaps auth state`.
     async fn usage_with_seat(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
+        let result = self.read_usage_with_seat(cred).await;
+        self.record_usage(cred, result.as_ref().err().map(|e| e.failure.clone()));
+        result
+    }
+
+    /// Key of a slot's `auth state` records: credential file + storage key.
+    /// Never contains token material.
+    fn state_key(cred: &CredentialRef) -> String {
+        format!(
+            "{}|{}",
+            storage::auth_file_path().display(),
+            cred.storage_key()
+        )
+    }
+
+    fn record_usage(
+        &self,
+        cred: &CredentialRef,
+        failure: Option<super::quota_policy::ObservationFailure>,
+    ) {
+        let at_ms = crate::epoch_millis();
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = observations.entry(Self::state_key(cred)).or_default();
+        if failure.is_none() {
+            slot.last_usage_ok_ms = Some(at_ms);
+        }
+        slot.last_usage = Some(super::auth_state::ObservedOutcome { at_ms, failure });
+    }
+
+    async fn read_usage_with_seat(
         &self,
         cred: &CredentialRef,
     ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
@@ -2836,9 +2977,16 @@ impl UsageReadError {
 
 /// The observation-failure kind of a token refresh failure.
 fn refresh_failure(f: &super::token::RefreshFailure) -> super::quota_policy::ObservationFailure {
+    refresh_kind_failure(f.kind)
+}
+
+/// The observation-failure kind of a token refresh failure kind.
+fn refresh_kind_failure(
+    kind: super::token::RefreshFailureKind,
+) -> super::quota_policy::ObservationFailure {
     use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
     use super::token::RefreshFailureKind as R;
-    match f.kind {
+    match kind {
         R::Transient => ObservationFailure::new(K::RefreshTransient),
         R::LockBusy => ObservationFailure::new(K::RefreshLockBusy),
         R::Other => ObservationFailure::new(K::RefreshOther),
@@ -4004,11 +4152,11 @@ pub fn local_auth_state(
 }
 
 fn auth_state_report(
-    _broker: Option<&LocalBroker>,
+    broker: Option<&LocalBroker>,
     query: &super::auth_state::AuthStateQuery,
 ) -> Result<super::auth_state::AuthStateReport, BrokerError> {
     use super::auth_state::{
-        AccountState, AuthStateReport, IdentityKind, AUTH_STATE_SCHEMA_VERSION,
+        AccountState, AuthStateReport, IdentityKind, ObservedOutcome, AUTH_STATE_SCHEMA_VERSION,
     };
     let provider = match query.provider.as_deref() {
         Some(p) => Some(
@@ -4031,9 +4179,47 @@ fn auth_state_report(
             });
         }
     }
-    let accounts = summaries
+    let creds: Vec<CredentialRef> = summaries
         .iter()
-        .map(|summary| AccountState {
+        .filter_map(AccountSummary::credential_ref)
+        .collect();
+    let mut cleared = Vec::new();
+    if query.clear {
+        if let Some(broker) = broker {
+            let whole: Vec<OAuthProviderId> = match (&query.account, provider) {
+                (Some(_), _) => Vec::new(),
+                (None, Some(p)) => vec![p],
+                (None, None) => super::provider::DESCRIPTORS.iter().map(|d| d.id).collect(),
+            };
+            broker.clear_state(&creds, &whole);
+        }
+        cleared = creds
+            .iter()
+            .map(|c| format!("{}:{}", c.provider, c.account.label_str()))
+            .collect();
+        tracing::info!(
+            accounts = %cleared.join(","),
+            broker_active = broker.is_some(),
+            "auth_state_cleared"
+        );
+    }
+    let store = storage::auth_file_path();
+    let now_ms = crate::epoch_millis();
+    let mut accounts = Vec::with_capacity(summaries.len());
+    for summary in &summaries {
+        let Some(cred) = summary.credential_ref() else {
+            continue;
+        };
+        let observed = broker
+            .and_then(|b| {
+                b.observations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&LocalBroker::state_key(&cred))
+                    .cloned()
+            })
+            .unwrap_or_default();
+        accounts.push(AccountState {
             provider: summary.provider.clone(),
             label: summary.label.clone(),
             identity: if summary.seat_fingerprint.is_some() {
@@ -4042,21 +4228,42 @@ fn auth_state_report(
                 IdentityKind::Rotating
             },
             access_expires_ms: (summary.expires != 0).then_some(summary.expires),
-            cooldown: None,
-            last_usage: None,
-            last_usage_ok_ms: None,
-            last_refresh: None,
+            cooldown: broker.and_then(|b| b.cooldown_state(&cred, now_ms)),
+            last_usage: observed.last_usage,
+            last_usage_ok_ms: observed.last_usage_ok_ms,
+            last_refresh: super::token::last_refresh_exchange(&store, &cred.storage_key()).map(
+                |x| ObservedOutcome {
+                    at_ms: x.at_ms,
+                    failure: x.failure.map(refresh_kind_failure),
+                },
+            ),
+        });
+    }
+    let store_prefix = format!("{}|", store.display());
+    let mut selections: Vec<_> = broker
+        .map(|b| {
+            b.selections
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(k, s)| {
+                    k.starts_with(&store_prefix)
+                        && provider.map_or(true, |p| s.provider == p.as_str())
+                })
+                .map(|(_, s)| s.clone())
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
+    selections.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
     Ok(AuthStateReport {
         schema_version: AUTH_STATE_SCHEMA_VERSION,
         live: false,
-        broker_active: false,
-        generated_at_ms: crate::epoch_millis(),
-        store: storage::auth_file_path().display().to_string(),
+        broker_active: broker.is_some(),
+        generated_at_ms: now_ms,
+        store: store.display().to_string(),
         accounts,
-        selections: Vec::new(),
-        cleared: Vec::new(),
+        selections,
+        cleared,
     })
 }
 

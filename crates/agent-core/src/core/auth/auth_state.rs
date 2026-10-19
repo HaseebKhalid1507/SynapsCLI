@@ -133,9 +133,159 @@ pub struct SelectionState {
     pub vend_failure: Option<ObservationFailure>,
 }
 
+/// Keep only characters that are safe on one terminal line (a reason comes
+/// from a client report, which may be another machine).
+pub(crate) fn display_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_-.:/ ".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+fn span(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// `12s ago` (or `in 3s` for a clock that moved backwards).
+fn ago(now_ms: u64, at_ms: u64) -> String {
+    if at_ms <= now_ms {
+        format!("{} ago", span(now_ms - at_ms))
+    } else {
+        format!("in {}", span(at_ms - now_ms))
+    }
+}
+
+fn utc(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| ms.to_string())
+}
+
+fn outcome(o: &ObservedOutcome, now_ms: u64) -> String {
+    match &o.failure {
+        None => format!("ok, {}", ago(now_ms, o.at_ms)),
+        Some(f) => format!("{f}, {}", ago(now_ms, o.at_ms)),
+    }
+}
+
 /// Plain-text rendering, one block per account, then the last selections.
-pub fn render_text(_report: &AuthStateReport) -> String {
-    String::new()
+pub fn render_text(report: &AuthStateReport) -> String {
+    use std::fmt::Write;
+    let now = report.generated_at_ms;
+    let mut out = String::new();
+    let source = if report.live {
+        "live: the running daemon's broker"
+    } else {
+        "NOT LIVE: built by this command, which has served no request"
+    };
+    let _ = writeln!(out, "auth state ({source})");
+    let _ = writeln!(out, "store: {}", report.store);
+    if !report.broker_active {
+        let _ = writeln!(
+            out,
+            "no automatic selection or limit report has reached this broker yet; nothing recorded"
+        );
+    }
+    if !report.cleared.is_empty() {
+        let _ = writeln!(
+            out,
+            "cleared (in memory only; credentials untouched): {}",
+            report.cleared.join(", ")
+        );
+    }
+    if report.accounts.is_empty() {
+        let _ = writeln!(out, "no stored accounts");
+    }
+    let mut provider = "";
+    for account in &report.accounts {
+        if account.provider != provider {
+            provider = &account.provider;
+            let _ = writeln!(out, "{provider}");
+        }
+        let expiry = match account.access_expires_ms {
+            Some(t) if t > now => format!("token expires in {}", span(t - now)),
+            Some(_) => "token expired (refreshed on next use)".to_string(),
+            None => "token expiry unknown".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "  {}  identity {}  {expiry}",
+            account.label,
+            account.identity.as_str()
+        );
+        match &account.cooldown {
+            Some(c) => {
+                let _ = writeln!(
+                    out,
+                    "    cooldown  {} left (until {}): {}",
+                    span(c.until_ms.saturating_sub(now)),
+                    utc(c.until_ms),
+                    display_safe(&c.reason)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "    cooldown  none");
+            }
+        }
+        match &account.last_usage {
+            Some(u) => {
+                let last_ok = match (u.failure.is_some(), account.last_usage_ok_ms) {
+                    (true, Some(ok)) => format!(" (last ok {})", ago(now, ok)),
+                    (true, None) => " (no successful read yet)".to_string(),
+                    _ => String::new(),
+                };
+                let _ = writeln!(out, "    usage     {}{last_ok}", outcome(u, now));
+            }
+            None => {
+                let _ = writeln!(out, "    usage     not read yet");
+            }
+        }
+        match &account.last_refresh {
+            Some(r) => {
+                let _ = writeln!(out, "    refresh   {}", outcome(r, now));
+            }
+            None => {
+                let _ = writeln!(out, "    refresh   none in this process");
+            }
+        }
+    }
+    if !report.selections.is_empty() {
+        let _ = writeln!(out, "last automatic selections");
+        for s in &report.selections {
+            let model = s.model.as_deref().unwrap_or("any model");
+            let what = match (&s.chosen, &s.failure, &s.vend_failure) {
+                (Some(label), _, Some(f)) => format!("chose {label}; token not vended: {f}"),
+                (Some(label), _, None) => format!("chose {label}"),
+                (None, Some(f), _) => {
+                    let accounts = f.accounts_field();
+                    if accounts.is_empty() {
+                        format!("failed: {}", f.kind)
+                    } else {
+                        format!("failed: {} ({accounts})", f.kind)
+                    }
+                }
+                (None, None, _) => "failed".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "  {} {model}: {what}, {}",
+                s.provider,
+                ago(now, s.at_ms)
+            );
+        }
+    }
+    out
 }
 
 #[cfg(test)]

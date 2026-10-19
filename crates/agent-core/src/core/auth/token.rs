@@ -603,15 +603,42 @@ pub struct RefreshExchange {
     pub failure: Option<RefreshFailureKind>,
 }
 
+/// Process-wide, keyed by credential file + storage key; written only where
+/// an exchange with a token endpoint actually happened (a fresh-token read,
+/// a peer's rotation found under the lock or a refused forced refresh
+/// records nothing).
+static REFRESH_EXCHANGES: std::sync::Mutex<std::collections::BTreeMap<String, RefreshExchange>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn refresh_exchange_key(path: &Path, storage_key: &str) -> String {
+    format!("{}|{storage_key}", path.display())
+}
+
+fn record_refresh_exchange(path: &Path, storage_key: &str, failure: Option<RefreshFailureKind>) {
+    let at_ms = crate::epoch_millis();
+    REFRESH_EXCHANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            refresh_exchange_key(path, storage_key),
+            RefreshExchange { at_ms, failure },
+        );
+}
+
 /// The last refresh exchange of `storage_key` in the credential file at
 /// `path`, in this process.
-pub fn last_refresh_exchange(_path: &Path, _storage_key: &str) -> Option<RefreshExchange> {
-    None
+pub fn last_refresh_exchange(path: &Path, storage_key: &str) -> Option<RefreshExchange> {
+    REFRESH_EXCHANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&refresh_exchange_key(path, storage_key))
+        .copied()
 }
 
 /// Gate → per-credential cross-process lock → CAS save, plus the forced
 /// refresh rate limit. `refresh` is the provider exchange (injected so the
-/// whole production composition is testable without a network).
+/// whole production composition is testable without a network). Each
+/// exchange's outcome is recorded for `synaps auth state`.
 async fn refresh_credential_locked<Refresh, RFut, RErr>(
     cred: &CredentialRef,
     path: &Path,
@@ -625,6 +652,16 @@ where
     RErr: Into<RefreshFailure>,
 {
     let key = cred.storage_key();
+    let refresh = |old_refresh: String| {
+        let exchange = refresh(old_refresh);
+        let key = &key;
+        async move {
+            let result: std::result::Result<OAuthCredentials, RefreshFailure> =
+                exchange.await.map_err(Into::into);
+            record_refresh_exchange(path, key, result.as_ref().err().map(|f| f.kind));
+            result
+        }
+    };
     let gate_key = format!("{}|{}", path.display(), key);
     let lock_path = refresh_lock_path(path, &key);
     let load = || load_checked(path, cred, expected_seat);
