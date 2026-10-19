@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::account::{
     seat_fingerprint, Account, AccountPolicy, AccountSelector, AccountSummary, CredentialRef,
-    SeatIdentity,
+    MaterialDigest, SeatIdentity,
 };
 use super::cloud::{CloudProviderId, InvokeRequest};
 use super::provider::OAuthProviderId;
@@ -1751,6 +1751,9 @@ pub struct LocalBroker {
     observations: SharedMap<SlotObservations>,
     /// Last automatic selection per [`Self::current_key`] (provider + model).
     selections: SharedMap<super::auth_state::SelectionState>,
+    /// Refused token refreshes held per [`Self::state_key`] (see
+    /// [`REFUSED_REFRESH_HOLD`]). Memory only.
+    refresh_holds: SharedMap<RefreshHold>,
 }
 
 /// One slot's recorded usage reads (`synaps auth state`).
@@ -1780,6 +1783,29 @@ struct Cooldown {
 
 /// Cooldown applied when a limit is reported without a reset hint.
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// A refused token refresh of one slot. No Debug: `material` is
+/// secret-derived.
+struct RefreshHold {
+    /// The stored login the provider refused.
+    material: MaterialDigest,
+    failure: super::token::RefreshFailure,
+    at_ms: u64,
+}
+
+/// How long a refused refresh (`refresh_rejected` /
+/// `refresh_action_required`) of an unchanged stored login is held. While
+/// held, neither refresh site (the chosen account's vend, the usage read's
+/// pre-read refresh) asks the provider again: the account fails with the
+/// held kind. The hold ends when the stored login changes (a new login, or a
+/// refresh by another process), on `synaps auth state --clear`, on a restart,
+/// or after this window; then ONE refresh is tried and a new refusal holds
+/// it again. Bounded so that a provider wrongly refusing during an outage
+/// cannot leave every account dead until a login or a restart; one probe per
+/// account per window is no storm. Retryable refresh failures are never
+/// held.
+pub const REFUSED_REFRESH_HOLD: Duration = Duration::from_secs(15 * 60);
+
 /// Longest cooldown a client report may impose (a weekly window plus slack);
 /// anything longer is clamped so a bad report cannot bench a seat forever.
 const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
@@ -1831,6 +1857,7 @@ impl LocalBroker {
             policy_cache: Arc::new(std::sync::Mutex::new(None)),
             observations: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             selections: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            refresh_holds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -2047,7 +2074,8 @@ impl LocalBroker {
     }
 
     /// Drop the in-memory state of `creds`: cooldowns, usage readings and
-    /// their gates, `auth state` records and stickiness. With
+    /// their gates, `auth state` records, held refused refreshes and
+    /// stickiness. With
     /// `whole_providers` (no single account was named), also every cooldown
     /// and selection record of those providers, including ones a previous
     /// occupant of a slot left. Never touches the credential store.
@@ -2071,6 +2099,17 @@ impl LocalBroker {
             let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
             for cred in creds {
                 observations.remove(&Self::state_key(cred));
+            }
+        }
+        {
+            let mut holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+            for cred in creds {
+                holds.remove(&Self::state_key(cred));
+            }
+            for provider in whole_providers {
+                let slot = format!("{store}|{}", provider.as_str());
+                let named = format!("{slot}@");
+                holds.retain(|k, _| *k != slot && !k.starts_with(&named));
             }
         }
         self.current_accounts
@@ -2162,7 +2201,9 @@ impl LocalBroker {
     /// usage-read table without a request). So each account gets at most one
     /// refresh attempt and one failed read per selection, and the rounds are
     /// bounded by the number of accounts. When none is left, the selection
-    /// fails with every account's kind (S1's classified failure).
+    /// fails with every account's kind (S1's classified failure). A refused
+    /// refresh is also held across selections ([`REFUSED_REFRESH_HOLD`]): a
+    /// held account fails with its held kind and no exchange.
     async fn vend_auto(
         &self,
         provider: OAuthProviderId,
@@ -2191,6 +2232,19 @@ impl LocalBroker {
                     return Err(e);
                 }
             };
+            // A refused refresh of this login is held: no new exchange.
+            if let Some(held) = self.held_refresh(&credential) {
+                let cause = refresh_failure(&held);
+                tracing::info!(
+                    credential = %credential,
+                    kind = %cause.kind,
+                    "automatic choice not vended: its refused token refresh is held until the stored login changes; selecting again"
+                );
+                failed.insert(credential.storage_key(), cause);
+                continue;
+            }
+            // The login the refresh below may be refused for.
+            let material = Self::stored_material(&credential);
             match ensure_fresh_credential_for_seat(
                 &self.http,
                 &credential,
@@ -2228,6 +2282,7 @@ impl LocalBroker {
                 // is never reported as an unusable login.
                 Err(SeatVendError::Other(f)) => {
                     let cause = refresh_failure(&f);
+                    self.hold_refused_refresh(&credential, material, &f);
                     tracing::warn!(
                         credential = %credential,
                         kind = %cause.kind,
@@ -2341,6 +2396,9 @@ impl LocalBroker {
         &self,
         cred: &CredentialRef,
     ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), super::usage_reads::ReadError> {
+        if let Some(held) = self.held_refresh(cred) {
+            return Err(Self::held_read(cred, held).into_read_error());
+        }
         let seat = self
             .stored_seat(cred)
             .map_err(|e| UsageReadError::slot(e).into_read_error())?;
@@ -2362,11 +2420,14 @@ impl LocalBroker {
 
     /// Read-only usage for `cred` through the process-wide usage-read table,
     /// reporting the seat whose token made the request. A failure keeps its
-    /// typed cause.
+    /// typed cause. A held refused refresh answers without a request.
     async fn usage_with_seat(
         &self,
         cred: &CredentialRef,
     ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
+        if let Some(held) = self.held_refresh(cred) {
+            return Err(Self::held_read(cred, held));
+        }
         self.shared_read(cred)
             .await
             .map_err(|e| UsageReadError::from_read(&e))
@@ -2380,6 +2441,129 @@ impl LocalBroker {
             storage::auth_file_path().display(),
             cred.storage_key()
         )
+    }
+
+    /// Digest of the login stored in `cred`'s slot now; `None` when the
+    /// slot is empty or the store can't be read.
+    fn stored_material(cred: &CredentialRef) -> Option<MaterialDigest> {
+        storage::load_credential(cred)
+            .ok()
+            .flatten()
+            .map(|creds| MaterialDigest::of(cred.provider, &creds))
+    }
+
+    /// The held refused refresh of `cred`'s slot, if the provider refused
+    /// the login stored there now and [`REFUSED_REFRESH_HOLD`] has not
+    /// passed. A changed login or an ended window drops the hold, so the
+    /// next refresh asks the provider again. Without a hold for the slot
+    /// nothing is loaded.
+    fn held_refresh(&self, cred: &CredentialRef) -> Option<super::token::RefreshFailure> {
+        let key = Self::state_key(cred);
+        let (material, failure, at_ms) = {
+            let holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+            let hold = holds.get(&key)?;
+            (hold.material.clone(), hold.failure.clone(), hold.at_ms)
+        };
+        let window_ms = REFUSED_REFRESH_HOLD.as_millis() as u64;
+        let in_window = crate::epoch_millis() < at_ms.saturating_add(window_ms);
+        if in_window && Self::stored_material(cred).as_ref() == Some(&material) {
+            return Some(failure);
+        }
+        let mut holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+        if holds.get(&key).is_some_and(|h| h.at_ms == at_ms) {
+            holds.remove(&key);
+        }
+        None
+    }
+
+    /// Hold `failure` for `cred`'s slot when the provider refused the
+    /// refresh (`Credential` / `ActionRequired`) of the login `material`
+    /// digests (loaded before the refresh). Retryable kinds are never held.
+    fn hold_refused_refresh(
+        &self,
+        cred: &CredentialRef,
+        material: Option<MaterialDigest>,
+        failure: &super::token::RefreshFailure,
+    ) {
+        use super::token::RefreshFailureKind as R;
+        if !matches!(failure.kind, R::Credential | R::ActionRequired) {
+            return;
+        }
+        let Some(material) = material else {
+            return;
+        };
+        self.refresh_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                Self::state_key(cred),
+                RefreshHold {
+                    material,
+                    failure: failure.clone(),
+                    at_ms: crate::epoch_millis(),
+                },
+            );
+    }
+
+    /// A usage read of an account whose refused refresh is held: no refresh
+    /// and no request, so not recorded as a read; the failure is the held
+    /// refusal (it names the login command or remedy).
+    fn held_read(cred: &CredentialRef, held: super::token::RefreshFailure) -> UsageReadError {
+        let err = UsageReadError::refresh(held);
+        tracing::debug!(
+            credential = %cred,
+            kind = %err.failure.kind,
+            "usage read not sent: the refused token refresh is held until the stored login changes"
+        );
+        err
+    }
+
+    /// What `auth state` shows of `cred`'s held refused refresh (the same
+    /// test as [`Self::held_refresh`], dropping nothing). Never the digest.
+    fn refresh_hold_state(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> Option<super::auth_state::RefreshHoldState> {
+        let (material, failure, at_ms) = {
+            let holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+            let hold = holds.get(&Self::state_key(cred))?;
+            (hold.material.clone(), hold.failure.clone(), hold.at_ms)
+        };
+        let until_ms = at_ms.saturating_add(REFUSED_REFRESH_HOLD.as_millis() as u64);
+        (now_ms < until_ms && Self::stored_material(cred).as_ref() == Some(&material)).then(|| {
+            super::auth_state::RefreshHoldState {
+                failure: refresh_failure(&failure),
+                refused_at_ms: at_ms,
+                until_ms,
+            }
+        })
+    }
+
+    /// Test seam: move every held refused refresh `by` into the past (the
+    /// hold window's injected clock).
+    #[doc(hidden)]
+    pub fn age_refresh_holds_for_tests(&self, by: Duration) {
+        let by_ms = by.as_millis() as u64;
+        for hold in self
+            .refresh_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            hold.at_ms = hold.at_ms.saturating_sub(by_ms);
+        }
+    }
+
+    /// Test seam: the digest a held refusal of `cred` keeps, so a test can
+    /// check that it appears in no output.
+    #[doc(hidden)]
+    pub fn refresh_hold_digest_for_tests(&self, cred: &CredentialRef) -> Option<String> {
+        self.refresh_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::state_key(cred))
+            .map(|h| h.material.expose_for_tests().to_string())
     }
 
     fn record_usage(
@@ -2462,6 +2646,8 @@ impl LocalBroker {
         if let Err(e) = self.check_slot_exists(cred) {
             return UsageReadError::slot(e).into_fetched();
         }
+        // The login the refresh below may be refused for.
+        let material = Self::stored_material(cred);
         let creds = match super::token::ensure_fresh_credential_via(
             &self.http,
             cred,
@@ -2470,7 +2656,10 @@ impl LocalBroker {
         .await
         {
             Ok(creds) => creds,
-            Err(f) => return UsageReadError::refresh(f).into_fetched(),
+            Err(f) => {
+                self.hold_refused_refresh(cred, material, &f);
+                return UsageReadError::refresh(f).into_fetched();
+            }
         };
         let seat = SeatIdentity::of(cred.provider, &creds);
         let client = match UsageClient::new() {
@@ -4611,6 +4800,7 @@ fn auth_state_report(
                     }),
                 },
             ),
+            refresh_hold: broker.and_then(|b| b.refresh_hold_state(&cred, now_ms)),
         });
     }
     let store_prefix = format!("{}|", store.display());

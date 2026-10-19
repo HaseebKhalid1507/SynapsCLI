@@ -1498,3 +1498,338 @@ async fn a_reselection_does_not_repeat_an_earlier_failed_read() {
     );
     assert_eq!(token_hits.load(Ordering::SeqCst), 1);
 }
+
+// ── S2: the refused-refresh hold ────────────────────────────────────────────
+
+/// The hold window the ruling fixes (15 min).
+const HOLD_MS: u64 = 15 * 60 * 1000;
+
+/// a and b have capacity and a served the first turn; then a's token
+/// expires (same tokens, so its reading stays cached and vending it must
+/// refresh). The token endpoint answers every refresh with `status`/`body`.
+async fn a_served_then_expired(
+    status: u16,
+    body: &'static str,
+) -> (tempfile::TempDir, LocalBroker, Arc<AtomicUsize>) {
+    let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let (token_url, token_hits) = spawn_token(status, body).await;
+    let broker =
+        auto_broker(&spawn_usage(script).await).with_anthropic_token_url_for_tests(token_url);
+    assert_eq!(turn(&broker).await, anthropic("a"));
+    expire_stored(&home, "a");
+    (home, broker, token_hits)
+}
+
+/// One automatic Anthropic vend that terminates and succeeds: the account
+/// that serves.
+async fn turn(broker: &LocalBroker) -> CredentialRef {
+    tokio::time::timeout(
+        SELECTION_DEADLINE,
+        broker.access_token_pinned(OAuthProviderId::Anthropic),
+    )
+    .await
+    .expect("the selection terminates")
+    .expect("an account serves")
+    .credential
+}
+
+/// A failover lookup of a request that already used b (stickiness can't
+/// keep b): only a is left.
+async fn lookup_without_b(broker: &LocalBroker) -> Result<CredentialRef, BrokerError> {
+    tokio::time::timeout(
+        SELECTION_DEADLINE,
+        broker.access_token_pinned_excluding(OAuthProviderId::Anthropic, None, &[anthropic("b")]),
+    )
+    .await
+    .expect("the selection terminates")
+    .map(|t| t.credential)
+}
+
+/// The lookup failed because a needs a login, a refused refresh.
+fn assert_a_needs_login(result: Result<CredentialRef, BrokerError>) -> BrokerError {
+    let err = result.expect_err("a is the only account left and its login is refused");
+    let BrokerError::NoAccountAvailable {
+        failure: Some(failure),
+        ..
+    } = &err
+    else {
+        panic!("typed selection failure expected: {err:?}");
+    };
+    assert_eq!(failure.login_labels(), vec!["a"], "{failure:?}");
+    let a = failure.accounts.iter().find(|f| f.account == "a").unwrap();
+    assert_eq!(
+        serde_json::to_value(a).unwrap(),
+        json!({"account": "a", "kind": "refresh_rejected", "http_status": 400})
+    );
+    err
+}
+
+/// `label`'s entry in the `auth state` report (JSON).
+fn account_state(broker: &LocalBroker, label: &str) -> serde_json::Value {
+    let report = serde_json::to_value(broker.auth_state(&anthropic_query()).unwrap()).unwrap();
+    report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["label"] == label)
+        .unwrap_or_else(|| panic!("no {label} in {report}"))
+        .clone()
+}
+
+/// Rewrite `label`'s stored tokens; the access token still names the
+/// account for the usage mock.
+fn store_tokens(home: &tempfile::TempDir, label: &str, access: &str, refresh: &str, expires: u64) {
+    let path = home.path().join("auth.json");
+    let mut root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let entry = &mut root[format!("anthropic@{label}")];
+    entry["access"] = json!(access);
+    entry["refresh"] = json!(refresh);
+    entry["expires"] = json!(expires);
+    std::fs::write(&path, root.to_string()).unwrap();
+}
+
+/// S2 hold (2a): a refused refresh of the chosen account is held. Inside the
+/// window, with the stored login unchanged, a lookup that has only a left
+/// sends no token request and still names a's login; `auth state` shows the
+/// held kind, when it was refused and until when, and its text says it is
+/// held until the stored login changes.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_refresh_is_held_and_later_lookups_ask_the_provider_nothing() {
+    let (_home, broker, token_hits) = a_served_then_expired(400, INVALID_GRANT).await;
+    let before = agent_core::epoch_millis();
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    let after = agent_core::epoch_millis();
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "a is refreshed once");
+
+    for _ in 0..2 {
+        assert_a_needs_login(lookup_without_b(&broker).await);
+        assert_eq!(turn(&broker).await, anthropic("b"));
+    }
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        1,
+        "no refresh of a while its refusal is held"
+    );
+
+    let a = account_state(&broker, "a");
+    let hold = &a["refresh_hold"];
+    assert_eq!(
+        hold["failure"],
+        json!({"kind": "refresh_rejected", "http_status": 400}),
+        "{a}"
+    );
+    let refused_at = hold["refused_at_ms"].as_u64().expect("refused_at_ms");
+    assert!((before..=after).contains(&refused_at), "{a}");
+    assert_eq!(hold["until_ms"].as_u64(), Some(refused_at + HOLD_MS), "{a}");
+    assert!(account_state(&broker, "b").get("refresh_hold").is_none());
+    let text = render_text(&broker.auth_state(&anthropic_query()).unwrap());
+    assert!(
+        text.contains("    held      refresh refused (refresh_rejected, HTTP 400), "),
+        "{text}"
+    );
+    assert!(
+        text.contains("; held until the stored login changes or "),
+        "{text}"
+    );
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+}
+
+/// S2 hold (2b): a change of the stored login ends the hold. A new login
+/// (other tokens, still expired) is refreshed once, and refused again it is
+/// held again. A refresh by another process (a new access token with the
+/// same refresh token) ends it too: a serves with no request of ours.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_changed_stored_login_ends_the_hold() {
+    let (home, broker, token_hits) = a_served_then_expired(400, INVALID_GRANT).await;
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+
+    store_tokens(
+        &home,
+        "a",
+        "relogin-anthropic-a-access",
+        "refresh-anth-a-SECRET-relogin",
+        EXPIRED,
+    );
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        2,
+        "the new login is refreshed once"
+    );
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        2,
+        "refused again, it is held again"
+    );
+
+    store_tokens(
+        &home,
+        "a",
+        "elsewhere-anthropic-a-access",
+        "refresh-anth-a-SECRET-relogin",
+        FAR_FUTURE,
+    );
+    assert_eq!(
+        lookup_without_b(&broker).await.expect("a's login works again"),
+        anthropic("a")
+    );
+    assert_eq!(token_hits.load(Ordering::SeqCst), 2);
+    assert!(account_state(&broker, "a").get("refresh_hold").is_none());
+}
+
+/// S2 hold (2c): a retryable refresh failure (the token endpoint answers
+/// 503) is not held: the next lookup refreshes again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_retryable_refresh_failure_is_not_held() {
+    let (_home, broker, token_hits) =
+        a_served_then_expired(503, r#"{"error":"overloaded"}"#).await;
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+    assert!(account_state(&broker, "a").get("refresh_hold").is_none());
+
+    lookup_without_b(&broker)
+        .await
+        .expect_err("a's refresh fails again");
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        2,
+        "a transient failure is retried"
+    );
+    assert!(account_state(&broker, "a").get("refresh_hold").is_none());
+}
+
+/// S2 hold (2d): `auth state --clear` ends the hold, for the account and
+/// provider-wide; each clear lets exactly one refresh through.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_state_clear_ends_the_hold() {
+    let (_home, broker, token_hits) = a_served_then_expired(400, INVALID_GRANT).await;
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "held before the clear");
+
+    broker
+        .auth_state(&AuthStateQuery {
+            account: Some("a".into()),
+            clear: true,
+            ..anthropic_query()
+        })
+        .unwrap();
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 2, "account clear");
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 2, "held again");
+
+    broker
+        .auth_state(&AuthStateQuery {
+            clear: true,
+            ..anthropic_query()
+        })
+        .unwrap();
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 3, "provider-wide clear");
+}
+
+/// S2 hold (2e): the hold is bounded. One second before the window ends no
+/// request; after it exactly one refresh, and a new refusal holds again.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_hold_ends_after_its_window_with_one_retry() {
+    let (_home, broker, token_hits) = a_served_then_expired(400, INVALID_GRANT).await;
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+
+    broker.age_refresh_holds_for_tests(std::time::Duration::from_millis(HOLD_MS - 10_000));
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "inside the window");
+
+    broker.age_refresh_holds_for_tests(std::time::Duration::from_secs(20));
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 2, "one retry after it");
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 2, "refused again: held");
+}
+
+/// S2 hold, the usage read's refresh: a's token is expired from the start,
+/// so reading its usage refreshes first, and the provider refuses. The
+/// refusal is held at this site too: later lookups and `usage` send neither
+/// a token request nor a usage request for a, and a held read is not
+/// recorded as a new read.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_refresh_before_a_usage_read_is_held_too() {
+    let _home = install_accounts(&[("a", EXPIRED), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let (usage_url, usage_hits) = spawn_counted_usage(script).await;
+    let (token_url, token_hits) = spawn_token(400, INVALID_GRANT).await;
+    let broker = auto_broker(&usage_url).with_anthropic_token_url_for_tests(token_url);
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "a's refresh, refused");
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 1, "only b's usage is read");
+    let read_at = account_state(&broker, "a")["last_usage"]["at_ms"].clone();
+    assert!(read_at.is_u64(), "a's failed read is recorded");
+
+    for _ in 0..2 {
+        assert_a_needs_login(lookup_without_b(&broker).await);
+    }
+    broker
+        .usage(&anthropic("a"))
+        .await
+        .expect_err("a's login is refused");
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "no refresh while held");
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 1, "no usage request for a");
+    let a = account_state(&broker, "a");
+    assert_eq!(a["last_usage"]["at_ms"], read_at, "held reads are no reads: {a}");
+    assert_eq!(
+        a["refresh_hold"]["failure"],
+        json!({"kind": "refresh_rejected", "http_status": 400}),
+        "{a}"
+    );
+}
+
+/// S2 hold, no secrets (ruling item 3): the digest a hold keeps of the
+/// stored login appears in no `auth state` JSON or text, no log line and no
+/// error, and neither does any token.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_held_refusal_shows_no_digest_or_token_anywhere() {
+    let (_home, broker, _token_hits) = a_served_then_expired(400, INVALID_GRANT).await;
+    let capture = Capture::default();
+    let err = {
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+        assert_eq!(turn(&broker).await, anthropic("b"));
+        assert_a_needs_login(lookup_without_b(&broker).await)
+    };
+    let digest = broker
+        .refresh_hold_digest_for_tests(&anthropic("a"))
+        .expect("a's refusal is held");
+    assert_eq!(digest.len(), 64, "a sha256 hex digest");
+    let report = broker.auth_state(&anthropic_query()).unwrap();
+    let json = serde_json::to_value(&report).unwrap().to_string();
+    assert!(json.contains("refresh_hold"), "{json}");
+    for out in [
+        json,
+        render_text(&report),
+        capture.take(),
+        err.to_string(),
+        format!("{err:?}"),
+    ] {
+        assert_secret_free(&out);
+        assert!(!out.contains(&digest), "the hold's digest in {out}");
+        assert!(!out.contains(&digest[..16]), "a digest prefix in {out}");
+    }
+}
