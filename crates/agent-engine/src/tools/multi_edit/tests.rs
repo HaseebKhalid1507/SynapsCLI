@@ -909,10 +909,13 @@ fn a_temp_left_after_a_hard_link_publish_is_named_in_the_result() {
 
 /// The 1st new file is published by a hard link whose temp can't be removed
 /// (the existing seam); the 2nd file's finalize then fails. With `foreign`,
-/// a file not made by this call takes the 1st temp's name just before.
+/// a file not made by this call takes the 1st temp's name just before. The
+/// 2nd file's own temp is staged by then too, so the 1st file's temp is
+/// found by that file's name, `first`.
 #[cfg(unix)]
 struct LeftoverThenFail {
     dir: PathBuf,
+    first: &'static str,
     foreign: bool,
 }
 
@@ -921,8 +924,10 @@ impl commit::Hooks for LeftoverThenFail {
     fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
         if index == 1 {
             if self.foreign {
-                let left = leftovers(&self.dir);
-                assert_eq!(left.len(), 1, "{left:?}");
+                let lead = format!("{}.", self.first);
+                let left: Vec<String> =
+                    leftovers(&self.dir).into_iter().filter(|n| n.starts_with(&lead)).collect();
+                assert_eq!(left.len(), 1, "the 1st file's temp: {left:?}");
                 let planted = self.dir.join("planted");
                 std::fs::write(&planted, "foreign\n").unwrap();
                 std::fs::rename(&planted, self.dir.join(&left[0])).unwrap();
@@ -962,7 +967,7 @@ fn an_earlier_leftover_temp_is_reported_and_retried_when_a_later_file_fails() {
             {"path": p(&a), "op": "append", "create": true, "text": "x\n"},
             {"path": p(&b), "op": "append", "create": true, "text": "y\n"}
         ]}),
-        &mut LeftoverThenFail { dir: dir.clone(), foreign: false },
+        &mut LeftoverThenFail { dir: dir.clone(), first: "a.md", foreign: false },
     )
     .unwrap_err();
     assert!(err.contains("writing ") && err.contains("injected rename failure"), "{err}");
@@ -998,7 +1003,7 @@ fn a_taken_over_leftover_temp_is_left_alone_and_named_when_a_later_file_fails() 
             {"path": p(&a), "op": "append", "create": true, "text": "x\n"},
             {"path": p(&b), "op": "append", "create": true, "text": "y\n"}
         ]}),
-        &mut LeftoverThenFail { dir: dir.clone(), foreign: true },
+        &mut LeftoverThenFail { dir: dir.clone(), first: "a.md", foreign: true },
     )
     .unwrap_err();
     assert!(err.contains(&format!("Committed then restored: {}", p(&a))), "{err}");
