@@ -562,9 +562,18 @@ pub(crate) struct ReloadFence {
     pub(crate) workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
+/// A create that fails after taking the journal lock: a FRESH session never
+/// journaled, so its `.lock` would be litter next to no `.json` (F18). A
+/// continued session's lock file sits next to its journal and stays.
+fn release_fresh_lock(lock: Option<agent_core::session_lock::SessionLock>, continued: bool) {
+    if let (Some(lock), false) = (lock, continued) {
+        lock.release_and_remove();
+    }
+}
+
 impl SessionActor {
     /// = today's `setup::boot()` per session (foreground_runtime →
-    /// resolve_session_and_prompt → set_cwd → model override →
+    /// resolve_session_and_prompt → journal lock → set_cwd → model override →
     /// spawn_session_background → finish_session_setup) then
     /// `on_session_start` (keyed injection).
     pub(crate) async fn create(
@@ -589,13 +598,57 @@ impl SessionActor {
             cfg.system.as_deref(),
             cfg.prompt_manifest.as_deref(),
         )?;
+        // F10: acquire the per-session journal ownership lock BEFORE anything
+        // publishes or writes for this id: the `--name` save, the registry
+        // card + per-session socket (`spawn_session_background`), the START
+        // index record and `on_session_start`. A refused `--continue` of a
+        // session live in another process used to publish its own card over
+        // the owner's first, then delete it on drop: the owner stayed live
+        // (socket up, journal locked) but `synaps send` and peers lost it.
+        let lock_kind = if cfg.await_extensions { "daemon" } else { "tui" };
+        let session_lock = if sb.continued {
+            // Continuing an existing session — the lock MUST succeed.
+            // If another process holds it, refuse with an actionable error.
+            let dir = agent_core::session_lock::sessions_dir();
+            let holder = agent_core::session_lock::LockHolder {
+                pid: std::process::id(),
+                kind: lock_kind.to_string(),
+            };
+            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
+                Ok(lock) => Some(lock),
+                Err(agent_core::session_lock::SessionLockError::Held { session_id, holder }) => {
+                    let msg = agent_core::session_lock::SessionLockError::Held { session_id, holder };
+                    return Err(crate::RuntimeError::Session(msg.to_string()));
+                }
+                Err(e) => {
+                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
+                    None
+                }
+            }
+        } else {
+            // Fresh session — best-effort lock.
+            let dir = agent_core::session_lock::sessions_dir();
+            let holder = agent_core::session_lock::LockHolder {
+                pid: std::process::id(),
+                kind: lock_kind.to_string(),
+            };
+            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
+                    None
+                }
+            }
+        };
+
         // `--name` at create: apply BEFORE the registry entry is written so
         // `synaps send --session <name>` and `--continue <name>` resolve
         // from the first second — not only after a later `--continue`.
         if let Some(name) = cfg.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            sb.session
-                .set_name(name)
-                .map_err(|e| crate::RuntimeError::Session(format!("--name {name:?}: {e}")))?;
+            if let Err(e) = sb.session.set_name(name) {
+                release_fresh_lock(session_lock, sb.continued);
+                return Err(crate::RuntimeError::Session(format!("--name {name:?}: {e}")));
+            }
             if cfg.persist {
                 // Persist the name now so disk resolution (chain/name → id)
                 // agrees with the live map even before the first turn.
@@ -631,7 +684,13 @@ impl SessionActor {
         }
 
         let background =
-            crate::engine::setup::spawn_session_background(&runtime, &sb.session)?;
+            match crate::engine::setup::spawn_session_background(&runtime, &sb.session) {
+                Ok(background) => background,
+                Err(e) => {
+                    release_fresh_lock(session_lock, sb.continued);
+                    return Err(e);
+                }
+            };
         crate::engine::setup::finish_session_setup(
             &mut runtime,
             &config,
@@ -679,43 +738,6 @@ impl SessionActor {
         }
 
         let id = SessionId::from(sb.session.id.clone());
-
-        // F10: acquire the per-session journal ownership lock.
-        let lock_kind = if cfg.await_extensions { "daemon" } else { "tui" };
-        let session_lock = if sb.continued {
-            // Continuing an existing session — the lock MUST succeed.
-            // If another process holds it, refuse with an actionable error.
-            let dir = agent_core::session_lock::sessions_dir();
-            let holder = agent_core::session_lock::LockHolder {
-                pid: std::process::id(),
-                kind: lock_kind.to_string(),
-            };
-            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
-                Ok(lock) => Some(lock),
-                Err(agent_core::session_lock::SessionLockError::Held { session_id, holder }) => {
-                    let msg = agent_core::session_lock::SessionLockError::Held { session_id, holder };
-                    return Err(crate::RuntimeError::Session(msg.to_string()));
-                }
-                Err(e) => {
-                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
-                    None
-                }
-            }
-        } else {
-            // Fresh session — best-effort lock.
-            let dir = agent_core::session_lock::sessions_dir();
-            let holder = agent_core::session_lock::LockHolder {
-                pid: std::process::id(),
-                kind: lock_kind.to_string(),
-            };
-            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
-                    None
-                }
-            }
-        };
 
         let meta = SessionMeta {
             id: id.clone(),
