@@ -50,6 +50,72 @@ fn install_store() -> tempfile::TempDir {
     home
 }
 
+/// Labels the scratch stores and the usage mock know.
+const LABELS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+
+/// Expired in 1970: any use refreshes first.
+const EXPIRED: u64 = 1_000;
+
+/// Scratch store with one Anthropic account per `(label, expires)`; every
+/// access token is `anthropic-<label>-access`.
+fn install_accounts(accounts: &[(&str, u64)]) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    agent_core::config::set_base_dir_for_tests(home.path().to_path_buf());
+    let mut root = serde_json::Map::new();
+    for (label, expires) in accounts {
+        assert!(LABELS.contains(label), "unknown fixture label {label}");
+        let mut entry = oauth(
+            &format!("anthropic-{label}-access"),
+            &format!("refresh-anth-{label}-SECRET"),
+        );
+        entry["expires"] = json!(expires);
+        root.insert(format!("anthropic@{label}"), entry);
+    }
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::Value::Object(root).to_string(),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("config"), "").unwrap();
+    home
+}
+
+/// Loopback token endpoint answering every refresh with `status` and
+/// `body`, plus the number of refreshes it has answered.
+async fn spawn_token(status: u16, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = Router::new().route(
+        "/v1/oauth/token",
+        axum::routing::post(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1/oauth/token"), hits)
+}
+
+/// A usage reading with room in every window.
+fn roomy() -> Reply {
+    let reset = "2099-01-01T00:00:00Z";
+    Reply::Body(json!({
+        "five_hour": {"utilization": 10.0, "resets_at": reset},
+        "seven_day": {"utilization": 10.0, "resets_at": reset}
+    }))
+}
+
 /// What the mock answers for one account's token.
 #[derive(Clone)]
 enum Reply {
@@ -81,11 +147,10 @@ async fn spawn_counted_usage(script: Script) -> (String, Arc<AtomicUsize>) {
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                let account = if bearer.ends_with("anthropic-a-access") {
-                    "a"
-                } else {
-                    "b"
-                };
+                let account = LABELS
+                    .into_iter()
+                    .find(|l| bearer.ends_with(&format!("anthropic-{l}-access")))
+                    .unwrap_or("unknown");
                 let reply = script.lock().unwrap().get(account).cloned();
                 let response: Response = match reply {
                     Some(Reply::RateLimited(secs)) => (
@@ -251,7 +316,9 @@ async fn usage_read_failures_keep_their_kind_status_and_retry_after() {
 
 /// The top-level kind, first match wins: no_credentials > usage_read_failed >
 /// credential_rejected (every account not cooling down needs a login) >
-/// all_cooling_down (cooling down or at a limit) > quota_unknown.
+/// action_required (every such account needs a login or an action outside
+/// synaps, at least one an action) > all_cooling_down (cooling down or at a
+/// limit) > quota_unknown. A cooling account keeps its own read failure.
 #[tokio::test]
 #[serial_test::serial]
 async fn selection_failure_kind_follows_the_priority_rules() {
@@ -291,7 +358,8 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     );
     assert!(err.to_string().contains("usage_unauthorized"), "{err}");
 
-    // A cooling account doesn't count against "every account needs a login".
+    // A cooling account doesn't count against "every account needs a login",
+    // and its own refused read stays visible next to the cooldown.
     broker
         .report_cooldown(&anthropic("b"), Some(FAR_FUTURE), "test limit")
         .await
@@ -304,7 +372,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     let warn = selection_warn(&capture.take());
     assert!(warn.contains("kind=credential_rejected"), "{warn}");
     assert!(
-        warn.contains("accounts=a:usage_unauthorized:401,b:cooling_down"),
+        warn.contains("accounts=a:usage_unauthorized:401,b:usage_unauthorized:403:cooling"),
         "{warn}"
     );
 
@@ -324,7 +392,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     let warn = selection_warn(&capture.take());
     assert!(warn.contains("kind=all_cooling_down"), "{warn}");
     assert!(
-        warn.contains("accounts=a:exhausted,b:cooling_down"),
+        warn.contains("accounts=a:exhausted,b:usage_unauthorized:403:cooling"),
         "{warn}"
     );
 
@@ -348,7 +416,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     let warn = selection_warn(&capture.take());
     assert!(warn.contains("kind=quota_unknown"), "{warn}");
     assert!(
-        warn.contains("accounts=a:window_unknown,b:cooling_down"),
+        warn.contains("accounts=a:window_unknown,b:usage_unauthorized:403:cooling"),
         "{warn}"
     );
 
@@ -378,6 +446,200 @@ async fn plan_preview_logs_no_selection_failure() {
     broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
     let log = capture.take();
     assert!(!log.contains("auth_selection_failed"), "{log}");
+}
+
+/// r2 blocker 1: a cooldown does not erase what the account's last read or
+/// refresh said. Every account cooling, one with a refused usage read
+/// (401), one rate-limited (429, Retry-After 90) and one whose expired token
+/// the (loopback) token endpoint refused (400 invalid_grant): the kind stays
+/// all_cooling_down, each account keeps its own kind and status beside its
+/// cooldown, and the earliest time is the earliest cooldown end.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_cooldown_keeps_each_accounts_read_or_refresh_failure_beside_it() {
+    let _home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE), ("c", EXPIRED)]);
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", Reply::Status(401));
+    script.lock().unwrap().insert("b", Reply::RateLimited(90));
+    let (token_url, token_hits) = spawn_token(
+        400,
+        r#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#,
+    )
+    .await;
+    let broker =
+        auto_broker(&spawn_usage(script).await).with_anthropic_token_url_for_tests(token_url);
+    let now = agent_core::epoch_millis();
+    let (until_a, until_b, until_c) = (now + 3 * 3_600_000, now + 3_600_000, now + 2 * 3_600_000);
+    for (label, until) in [("a", until_a), ("b", until_b), ("c", until_c)] {
+        broker
+            .report_cooldown(&anthropic(label), Some(until), "anthropic_quota_exhausted")
+            .await
+            .unwrap();
+    }
+
+    let capture = Capture::default();
+    let err = {
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+        broker
+            .access_token_pinned(OAuthProviderId::Anthropic)
+            .await
+            .unwrap_err()
+    };
+    assert!(
+        token_hits.load(Ordering::SeqCst) >= 1,
+        "c's refresh was tried"
+    );
+    let BrokerError::NoAccountAvailable {
+        failure: Some(failure),
+        ..
+    } = &err
+    else {
+        panic!("typed selection failure expected: {err:?}");
+    };
+    assert_eq!(
+        serde_json::to_value(failure).unwrap(),
+        json!({
+            "kind": "all_cooling_down",
+            "accounts": [
+                {"account": "a", "kind": "usage_unauthorized", "http_status": 401,
+                 "until_ms": until_a, "cooling_down": true},
+                {"account": "b", "kind": "usage_rate_limited", "http_status": 429,
+                 "retry_after_s": 90, "until_ms": until_b, "cooling_down": true},
+                {"account": "c", "kind": "refresh_rejected", "http_status": 400,
+                 "until_ms": until_c, "cooling_down": true},
+            ],
+            "earliest_reset_ms": until_b,
+        })
+    );
+    assert_secret_free(&err.to_string());
+    let log = capture.take();
+    let warn = selection_warn(&log);
+    assert!(warn.contains("kind=all_cooling_down"), "{warn}");
+    assert!(
+        warn.contains(
+            "accounts=a:usage_unauthorized:401:cooling,b:usage_rate_limited:429:cooling,\
+             c:refresh_rejected:400:cooling"
+        ),
+        "{warn}"
+    );
+    assert_secret_free(&log);
+
+    // The report shows c's refused exchange with the endpoint's status,
+    // without another exchange.
+    let hits = token_hits.load(Ordering::SeqCst);
+    let report = serde_json::to_value(broker.auth_state(&anthropic_query()).unwrap()).unwrap();
+    let c = report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["label"] == "c")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        c["last_refresh"]["failure"],
+        json!({"kind": "refresh_rejected", "http_status": 400}),
+        "{c}"
+    );
+    assert_eq!(token_hits.load(Ordering::SeqCst), hits);
+}
+
+/// r2 blocker 2 / item 5: automatic selection on an unreadable store fails
+/// with the store's error (naming the file, never its content) and exactly
+/// one auth_selection_failed WARN of kind credential_store, recorded for
+/// `auth state`. A preview on the same store logs no selection failure.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unreadable_store_fails_automatic_selection_with_one_store_warn() {
+    let home = install_store();
+    let (usage_url, hits) = spawn_counted_usage(Arc::default()).await;
+    let broker = auto_broker(&usage_url);
+    let store = home.path().join("auth.json");
+    let good = std::fs::read(&store).unwrap();
+    std::fs::write(
+        &store,
+        r#"{"anthropic@a": {"type": "oauth", "refresh": "refresh-anth-a-SECRET""#,
+    )
+    .unwrap();
+
+    let capture = Capture::default();
+    let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+    let err = broker
+        .access_token_pinned(OAuthProviderId::Anthropic)
+        .await
+        .unwrap_err();
+    match &err {
+        BrokerError::Credential(msg) => {
+            assert!(
+                msg.contains("Failed to parse") && msg.contains("auth.json"),
+                "{msg}"
+            )
+        }
+        other => panic!("the store error itself expected: {other:?}"),
+    }
+    let log = capture.take();
+    let warn = selection_warn(&log);
+    assert!(warn.contains("provider=anthropic"), "{warn}");
+    assert!(warn.contains("kind=credential_store"), "{warn}");
+    assert_secret_free(&err.to_string());
+    assert_secret_free(&log);
+
+    broker
+        .plan(OAuthProviderId::Anthropic, None)
+        .await
+        .unwrap_err();
+    let log = capture.take();
+    assert!(!log.contains("auth_selection_failed"), "a preview: {log}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no usage read");
+
+    std::fs::write(&store, good).unwrap();
+    let report = serde_json::to_value(broker.auth_state(&anthropic_query()).unwrap()).unwrap();
+    let selections = report["selections"].as_array().unwrap();
+    assert_eq!(selections.len(), 1, "{report}");
+    assert_eq!(
+        selections[0]["failure"]["kind"], "credential_store",
+        "{report}"
+    );
+}
+
+/// r2 blocker 2: one account's stored login can't be read (a malformed
+/// entry) and the other is cooling down. That is an action for the user,
+/// never "quota unknown".
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unreadable_stored_login_makes_selection_action_required_not_quota_unknown() {
+    let home = install_store();
+    let store = home.path().join("auth.json");
+    let mut root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+    root["anthropic@b"]["expires"] = json!("soon");
+    std::fs::write(&store, root.to_string()).unwrap();
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", roomy());
+    let broker = auto_broker(&spawn_usage(script).await);
+    broker
+        .report_cooldown(
+            &anthropic("a"),
+            Some(agent_core::epoch_millis() + 3_600_000),
+            "anthropic_quota_exhausted",
+        )
+        .await
+        .unwrap();
+
+    let capture = Capture::default();
+    let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+    let err = broker
+        .access_token_pinned(OAuthProviderId::Anthropic)
+        .await
+        .unwrap_err();
+    let warn = selection_warn(&capture.take());
+    assert!(warn.contains("kind=action_required"), "{warn}");
+    assert!(
+        warn.contains("accounts=a:cooling_down,b:credential_store"),
+        "{warn}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("credential_store"), "{text}");
+    assert_secret_free(&text);
 }
 
 // ── `synaps auth state` ─────────────────────────────────────────────────────
@@ -637,4 +899,193 @@ async fn auth_state_clear_drops_one_accounts_memory_and_writes_nothing() {
     let rows = broker.accounts(OAuthProviderId::Anthropic).await.unwrap();
     assert!(rows.iter().all(|r| r.cooldown_until.is_none()), "{rows:?}");
     assert_eq!(snapshot_dir(home.path()), store_before);
+}
+
+/// r2 blocker 3: a cooldown's reason reaches the report only as a closed
+/// kind. Known reasons keep their name; anything else (here a token-shaped
+/// string, an email and a seat-identity-shaped string) is `other`, and none
+/// of it appears in the JSON, the text or the Debug form.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_state_reports_cooldown_reason_kinds_never_the_callers_string() {
+    const TOKEN_REASON: &str = "sk-ant-oat01-Qm9vQ2mZ7pL4kR8sT1uW3yA6bC0dE5fGhIjKl";
+    const EMAIL_REASON: &str = "victim@example.com";
+    const SEAT_REASON: &str = "cred:3f9a1c7e5b2d4f60a8c1e3b5d7f9a2c4";
+    let _home = install_accounts(&[
+        ("a", FAR_FUTURE),
+        ("b", FAR_FUTURE),
+        ("c", FAR_FUTURE),
+        ("d", FAR_FUTURE),
+        ("e", FAR_FUTURE),
+        ("f", FAR_FUTURE),
+    ]);
+    let (usage_url, hits) = spawn_counted_usage(Arc::default()).await;
+    let broker = auto_broker(&usage_url);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    let reasons = [
+        ("a", TOKEN_REASON, "other"),
+        ("b", EMAIL_REASON, "other"),
+        ("c", SEAT_REASON, "other"),
+        (
+            "d",
+            "anthropic_quota_exhausted",
+            "anthropic_quota_exhausted",
+        ),
+        ("e", "codex_quota_exhausted", "codex_quota_exhausted"),
+        ("f", "client_report", "client_report"),
+    ];
+    for (label, reason, _) in reasons {
+        broker
+            .report_cooldown(&anthropic(label), Some(until), reason)
+            .await
+            .unwrap();
+    }
+    let report = broker.auth_state(&anthropic_query()).unwrap();
+    let value = serde_json::to_value(&report).unwrap();
+    for (label, _, kind) in reasons {
+        let account = value["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == label)
+            .unwrap();
+        assert_eq!(
+            account["cooldown"],
+            json!({"until_ms": until, "reason": kind}),
+            "{account}"
+        );
+    }
+    let text = render_text(&report);
+    assert!(
+        text.contains("other") && text.contains("client_report"),
+        "{text}"
+    );
+    for out in [value.to_string(), text, format!("{report:?}")] {
+        for leak in [
+            TOKEN_REASON,
+            "Qm9vQ2mZ",
+            EMAIL_REASON,
+            "victim",
+            SEAT_REASON,
+            "3f9a1c7e5b2d4f60",
+        ] {
+            assert!(!out.contains(leak), "{leak:?} in {out}");
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no usage read");
+}
+
+/// r2 item 10: neither the report nor a clear (account-scoped or
+/// provider-wide) refreshes an expired token or reads usage, and neither
+/// writes the store. Multi-threaded on purpose: a report path that blocked
+/// on a refresh would run here (and hit the loopback token endpoint)
+/// instead of panicking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn auth_state_and_clear_never_refresh_an_expired_token_or_read_usage() {
+    let home = install_accounts(&[("a", FAR_FUTURE), ("c", EXPIRED)]);
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", roomy());
+    let (usage_url, usage_hits) = spawn_counted_usage(script).await;
+    let (token_url, token_hits) = spawn_token(503, r#"{"error":"overloaded"}"#).await;
+    let broker = auto_broker(&usage_url).with_anthropic_token_url_for_tests(token_url);
+    // One selection: a's usage is read, c's refresh is tried (503) and a
+    // is chosen. That leaves something to report and to clear.
+    let pinned = broker
+        .access_token_pinned(OAuthProviderId::Anthropic)
+        .await
+        .unwrap();
+    assert_eq!(pinned.credential, anthropic("a"));
+    let (usage_before, token_before) = (
+        usage_hits.load(Ordering::SeqCst),
+        token_hits.load(Ordering::SeqCst),
+    );
+    assert!(token_before >= 1, "the selection tried c's refresh");
+    let store_before = snapshot_dir(home.path());
+
+    let report = serde_json::to_value(broker.auth_state(&anthropic_query()).unwrap()).unwrap();
+    let c = report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["label"] == "c")
+        .unwrap()
+        .clone();
+    assert_eq!(c["access_expires_ms"], EXPIRED, "{c}");
+    assert_eq!(
+        c["last_refresh"]["failure"]["kind"], "refresh_transient",
+        "{c}"
+    );
+    for query in [
+        AuthStateQuery {
+            account: Some("c".into()),
+            clear: true,
+            ..anthropic_query()
+        },
+        AuthStateQuery {
+            clear: true,
+            ..anthropic_query()
+        },
+    ] {
+        broker.auth_state(&query).unwrap();
+    }
+    assert_eq!(
+        usage_hits.load(Ordering::SeqCst),
+        usage_before,
+        "a usage read"
+    );
+    assert_eq!(token_hits.load(Ordering::SeqCst), token_before, "a refresh");
+    assert_eq!(snapshot_dir(home.path()), store_before, "a store write");
+}
+
+/// r2 item 9: `--account b` shows only the selections that chose or
+/// considered b. Selection m1 chose a while b was cooling (b was not a
+/// failure there, so it is not shown); selection m2 failed with both.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_state_account_filter_keeps_only_selections_that_chose_or_considered_it() {
+    const M1: &str = "claude-opus-4-7";
+    const M2: &str = "claude-sonnet-4-5";
+    let _home = install_store();
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", roomy());
+    script.lock().unwrap().insert("b", roomy());
+    let broker = auto_broker(&spawn_usage(script).await);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_cooldown(&anthropic("b"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    let pinned = broker
+        .access_token_pinned_for(OAuthProviderId::Anthropic, Some(M1))
+        .await
+        .unwrap();
+    assert_eq!(pinned.credential, anthropic("a"));
+    broker
+        .report_cooldown(&anthropic("a"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    broker
+        .access_token_pinned_for(OAuthProviderId::Anthropic, Some(M2))
+        .await
+        .unwrap_err();
+
+    let models = |account: Option<&str>| -> Vec<String> {
+        let query = AuthStateQuery {
+            account: account.map(str::to_string),
+            ..anthropic_query()
+        };
+        let mut models: Vec<String> = broker
+            .auth_state(&query)
+            .unwrap()
+            .selections
+            .iter()
+            .map(|s| s.model.clone().unwrap_or_default())
+            .collect();
+        models.sort();
+        models
+    };
+    assert_eq!(models(None), vec![M1, M2]);
+    assert_eq!(models(Some("a")), vec![M1, M2]);
+    assert_eq!(models(Some("b")), vec![M2]);
 }

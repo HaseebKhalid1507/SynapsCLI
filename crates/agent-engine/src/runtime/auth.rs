@@ -636,6 +636,7 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
             "the chosen account's stored login kept changing while its capacity was being read"
         }
         K::RemoteNoCapacity => "the credential broker found no account with proven capacity",
+        K::ActionRequired | K::CredentialStore => "no account's usage reading proved capacity",
     };
     let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
     if !f.accounts.is_empty() {
@@ -1878,6 +1879,7 @@ mod tests {
             http_status: None,
             retry_after_s: None,
             until_ms: None,
+            cooling_down: false,
         }
     }
 
@@ -2038,6 +2040,128 @@ mod tests {
         );
         assert!(!text.contains("synaps login"), "{text}");
         assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+    }
+
+    /// r2 blocker 1: every account cooling, one of them with a refused
+    /// login. The kind stays all_cooling_down and the earliest time stays,
+    /// but that label's exact login command is named and the text never
+    /// says "No login needed".
+    #[tokio::test]
+    async fn all_cooling_with_one_refused_login_names_its_command_and_never_no_login_needed() {
+        let now = crate::epoch_millis();
+        let soon = now + 20 * 60 * 1000;
+        let later = now + 2 * 60 * 60 * 1000;
+        let mut c2 = account("claude2", AK::UsageUnauthorized);
+        c2.http_status = Some(401);
+        c2.cooling_down = true;
+        c2.until_ms = Some(later);
+        let mut c6 = account("claude6", AK::CoolingDown);
+        c6.cooling_down = true;
+        c6.until_ms = Some(soon);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c2, c6],
+            earliest_reset_ms: Some(soon),
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
+        let later_text = super::super::anthropic_quota::describe_reset_utc(later, now);
+        for needle in [
+            "all_cooling_down".to_string(),
+            format!("claude2: usage_unauthorized (HTTP 401, cooling down until {later_text})"),
+            "claude2 needs a new login: `synaps login --provider anthropic --account claude2`"
+                .to_string(),
+            format!("Send again after {soon_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.to_lowercase().contains("no login needed"), "{text}");
+        assert!(!text.contains("--account claude6"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+    }
+
+    /// r2 blocker 1: a cooling account whose usage read was rate limited
+    /// shows the 429 and its Retry-After beside the cooldown; no login.
+    #[tokio::test]
+    async fn a_cooling_account_with_a_usage_429_shows_status_retry_after_and_cooldown() {
+        let now = crate::epoch_millis();
+        let until = now + 40 * 60 * 1000;
+        let mut c5 = account("claude5", AK::UsageRateLimited);
+        c5.http_status = Some(429);
+        c5.retry_after_s = Some(90);
+        c5.cooling_down = true;
+        c5.until_ms = Some(until);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c5],
+            earliest_reset_ms: Some(until),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        let until_text = super::super::anthropic_quota::describe_reset_utc(until, now);
+        for needle in [
+            format!(
+                "claude5: usage_rate_limited (HTTP 429, retry after 90s, cooling down until {until_text})"
+            ),
+            format!("No login needed; send again after {until_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.contains("synaps login"), "{text}");
+    }
+
+    /// r2 blocker 2: a refresh that needs an action outside synaps, or an
+    /// unreadable store, is named with its remedy, with no "send again"
+    /// retry advice, no "no login needed" and no login command.
+    #[tokio::test]
+    async fn action_required_selection_names_condition_and_remedy_without_retry_or_login_claims() {
+        let mut c5 = account("claude5", AK::CoolingDown);
+        c5.cooling_down = true;
+        let failure = SelectionFailure {
+            kind: SK::ActionRequired,
+            accounts: vec![
+                account("claude3", AK::RefreshActionRequired),
+                account("claude4", AK::CredentialStore),
+                c5,
+            ],
+            earliest_reset_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        for needle in [
+            "action_required",
+            "claude3: the token refresh needs an action outside synaps",
+            "usage read needs action",
+            "claude4: its stored login could not be read; repair or restore the credential store",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!lower.contains("send again"), "{text}");
+        assert!(!lower.contains("no login needed"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=action_required"));
+    }
+
+    /// r2 blocker 2 / item 5: automatic selection that could not even list
+    /// the accounts (a corrupt or unreadable store) says so, with the store
+    /// remedy instead of blanket login advice.
+    #[tokio::test]
+    async fn an_unreadable_store_in_automatic_selection_gets_store_advice_not_login_advice() {
+        let (text, log) = failed_turn_start(BrokerError::Credential(
+            "Failed to parse /scratch/auth.json: expected value at line 1 column 1".into(),
+        ))
+        .await;
+        for needle in [
+            "credential_store",
+            "Failed to parse /scratch/auth.json",
+            "repair or restore",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(!lower.contains("send again"), "{text}");
+        assert!(!lower.contains("no login needed"), "{text}");
+        assert!(turn_warn(&log).contains("kind=credential_store"));
     }
 
     /// A remote broker's 503 carries no per-account detail: the text points

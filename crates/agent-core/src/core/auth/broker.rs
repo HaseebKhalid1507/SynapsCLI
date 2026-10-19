@@ -1886,6 +1886,16 @@ impl LocalBroker {
         self
     }
 
+    /// Test seam: send Anthropic token refreshes to a loopback fake token
+    /// endpoint instead of the real one; a non-loopback URL is refused at
+    /// refresh time. The request is built exactly as in production.
+    #[doc(hidden)]
+    pub fn with_anthropic_token_url_for_tests(mut self, url: impl Into<String>) -> Self {
+        self.refresh_endpoints =
+            std::mem::take(&mut self.refresh_endpoints).with_anthropic_token_url_for_tests(url);
+        self
+    }
+
     /// Capacity-based selection for `provider` regardless of the configured
     /// selector (used by the broker daemon when a remote client's own policy
     /// is `auto`). Fails closed like [`access_token_pinned_for`].
@@ -5872,7 +5882,10 @@ mod tests {
                 Some(403),
             ),
             (
-                U::UpstreamStatus { status: 503 },
+                U::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: None,
+                },
                 K::UsageUpstream,
                 Some(503),
             ),

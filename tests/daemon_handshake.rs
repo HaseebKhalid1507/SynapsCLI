@@ -253,3 +253,124 @@ async fn auth_state_reads_and_clears_the_host_broker_without_writing_credentials
     d.shutdown_token().cancel();
     d.wait().await;
 }
+
+/// r2 (r1 limit): the `synaps auth state` binary with no daemon running
+/// (autospawn off; scratch HOME, base and runtime dirs) prints the account
+/// list with nothing recorded, marked not live, with the no-daemon notice on
+/// stderr; `--clear` clears nothing and says so. The store is never written.
+/// Every token is far from expiry, so nothing here could ever refresh.
+#[test]
+#[serial]
+fn auth_state_cli_without_a_daemon_lists_accounts_and_refuses_to_clear() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let home = tempfile::tempdir().unwrap();
+    let base = home.path().join("base");
+    let run = home.path().join("run");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    let auth_json = base.join("auth.json");
+    let mut store = serde_json::Map::new();
+    for label in ["a", "b"] {
+        store.insert(
+            format!("anthropic@{label}"),
+            serde_json::json!({
+                "type": "oauth", "access": format!("anthropic-{label}-access"),
+                "refresh": format!("refresh-{label}-SECRET"), "expires": 9_999_999_999_999u64,
+            }),
+        );
+    }
+    std::fs::write(&auth_json, serde_json::Value::Object(store).to_string()).unwrap();
+    std::fs::write(base.join("config"), "").unwrap();
+    let store_before = std::fs::read(&auth_json).unwrap();
+
+    let run_cli = |args: &[&str]| -> (Option<i32>, String, String) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_synaps"))
+            .args(args)
+            .env("HOME", home.path())
+            .env("SYNAPS_BASE_DIR", &base)
+            .env("SYNAPS_RUNTIME_DIR", &run)
+            .env("SYNAPS_DAEMON_AUTOSPAWN", "0")
+            .env("TERM", "dumb")
+            .env_remove("SYNAPS_PROFILE")
+            .env_remove("SYNAPS_AUTH_ENDPOINT")
+            .env_remove("SYNAPS_MACHINE_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let out = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stdout.read_to_string(&mut s);
+            s
+        });
+        let err = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            s
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let code = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status.code();
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("synaps {args:?} did not exit within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        (code, out.join().unwrap(), err.join().unwrap())
+    };
+
+    let (code, out, err) = run_cli(&["auth", "state", "--provider", "claude", "--json"]);
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    let report: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        (report["live"].as_bool(), report["broker_active"].as_bool()),
+        (Some(false), Some(false)),
+        "{report}"
+    );
+    let mut labels: Vec<_> = report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["label"].as_str().unwrap().to_string())
+        .collect();
+    labels.sort();
+    assert_eq!(labels, vec!["a", "b"], "{report}");
+    assert!(
+        report["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a.get("cooldown").is_none() && a.get("last_usage").is_none()),
+        "{report}"
+    );
+    assert!(err.contains("no daemon running"), "{err}");
+    let mut seen = vec![out, err];
+
+    let (code, out, err) = run_cli(&["auth", "state", "--provider", "claude", "--clear"]);
+    assert!(
+        matches!(code, Some(c) if c != 0),
+        "a clear without a daemon must fail; stderr:\n{err}"
+    );
+    assert!(err.contains("nothing cleared"), "{err}");
+    seen.extend([out, err]);
+    for text in &seen {
+        for secret in ["SECRET", "anthropic-a-access", "anthropic-b-access"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+    assert_eq!(
+        std::fs::read(&auth_json).unwrap(),
+        store_before,
+        "auth state wrote the credential store"
+    );
+}

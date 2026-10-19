@@ -395,6 +395,12 @@ impl AccountFailureKind {
             Self::CoolingDown | Self::Exhausted | Self::ModelUnavailable
         )
     }
+
+    /// Only an action outside synaps fixes it (a corrupt or missing store,
+    /// a billing requirement); neither a retry nor a login does.
+    pub fn needs_action(self) -> bool {
+        false
+    }
 }
 
 impl std::fmt::Display for AccountFailureKind {
@@ -660,6 +666,10 @@ pub struct AccountFailure {
     /// Cooldown end or exhausted-window reset, epoch ms, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ms: Option<u64>,
+    /// The account is cooling down (a reported provider limit), whatever
+    /// `kind` says about its last observation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cooling_down: bool,
 }
 
 impl AccountFailure {
@@ -673,6 +683,7 @@ impl AccountFailure {
             http_status: None,
             retry_after_s: None,
             until_ms: None,
+            cooling_down: false,
         };
         if let Some(cause) = &rejection.cause {
             out.kind = cause.kind;
@@ -735,6 +746,12 @@ pub enum SelectionFailureKind {
     /// A remote broker answered "no account available" (its own log has
     /// the reason).
     RemoteNoCapacity,
+    /// Every account that is not limited needs a login or an action outside
+    /// synaps (a corrupt or missing store, a billing requirement), and at
+    /// least one needs the action.
+    ActionRequired,
+    /// The credential store could not be listed, so no account was read.
+    CredentialStore,
 }
 
 impl SelectionFailureKind {
@@ -747,6 +764,8 @@ impl SelectionFailureKind {
             Self::QuotaUnknown => "quota_unknown",
             Self::SeatChurn => "seat_churn",
             Self::RemoteNoCapacity => "remote_no_capacity",
+            Self::ActionRequired => "action_required",
+            Self::CredentialStore => "credential_store",
         }
     }
 }
@@ -821,6 +840,11 @@ impl SelectionFailure {
             .filter(|a| a.kind.needs_login())
             .map(|a| a.account.as_str())
             .collect()
+    }
+
+    /// Labels whose failure needs an action outside synaps, in order.
+    pub fn action_labels(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     /// `label:kind[:status],…` — one log field, secret-free.
@@ -2651,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_carries_the_cause_only_for_observation_verdicts() {
+    fn rejection_keeps_the_observation_cause_beside_a_cooldown() {
         use AccountFailureKind as K;
         let limited = ObservationFailure::new(K::UsageRateLimited).with_status(429);
         let mut cooling = failed("b", limited.clone());
@@ -2664,15 +2688,173 @@ mod tests {
                     rejections[0].describe(),
                     "quota unknown (usage_rate_limited, HTTP 429)"
                 );
-                // The cooldown verdict is the policy's, not the read's.
+                // The verdict stays the policy's (eligibility unchanged),
+                // but the read's failure is kept beside it (r2 blocker 1).
                 assert!(matches!(
                     rejections[1].reason,
                     RejectReason::CoolingDown { .. }
                 ));
-                assert_eq!(rejections[1].cause, None);
+                assert_eq!(rejections[1].cause.as_ref(), Some(&limited));
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// r2 blocker 1: a cooling account's failure keeps the observation kind
+    /// (login advice depends on it) with the cooldown beside it, and still
+    /// counts as limited for the top-level kind.
+    #[test]
+    fn a_cooling_accounts_failure_keeps_its_read_kind_and_counts_as_limited() {
+        use AccountFailureKind as K;
+        use SelectionFailureKind as S;
+        let mut refused = failed(
+            "a",
+            ObservationFailure::new(K::UsageUnauthorized).with_status(401),
+        );
+        refused.cooldown_until_ms = Some(NOW + 2 * HOUR);
+        let mut throttled = failed(
+            "b",
+            ObservationFailure::new(K::UsageRateLimited)
+                .with_status(429)
+                .with_retry_after(Some(90)),
+        );
+        throttled.cooldown_until_ms = Some(NOW + HOUR);
+        let mut plain = ok("c", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        plain.cooldown_until_ms = Some(NOW + 3 * HOUR);
+
+        let f = failure_of(&[refused, throttled, plain]);
+        assert_eq!(f.kind, S::AllCoolingDown, "{f:?}");
+        let a = &f.accounts[0];
+        assert_eq!(
+            (a.kind, a.http_status, a.cooling_down, a.until_ms),
+            (K::UsageUnauthorized, Some(401), true, Some(NOW + 2 * HOUR))
+        );
+        let b = &f.accounts[1];
+        assert_eq!(
+            (b.kind, b.http_status, b.retry_after_s, b.cooling_down),
+            (K::UsageRateLimited, Some(429), Some(90), true)
+        );
+        let c = &f.accounts[2];
+        assert_eq!((c.kind, c.cooling_down), (K::CoolingDown, true));
+        assert_eq!(f.login_labels(), vec!["a"]);
+        assert_eq!(f.earliest_reset_ms, Some(NOW + HOUR));
+        assert_eq!(
+            f.accounts_field(),
+            "a:usage_unauthorized:401:cooling,b:usage_rate_limited:429:cooling,c:cooling_down"
+        );
+        // Serialized with the flag; an account that is not cooling omits it.
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["accounts"][0]["cooling_down"], true);
+        let g = failure_of(&[failed("d", ObservationFailure::new(K::UsageTimeout))]);
+        assert!(serde_json::to_value(&g).unwrap()["accounts"][0]
+            .get("cooling_down")
+            .is_none());
+    }
+
+    /// r2 item 7: an account is usable again only when every exhausted
+    /// window has reset and its cooldown has ended, so its `until` is the
+    /// latest of those; the earliest reset is the minimum over accounts.
+    #[test]
+    fn an_accounts_until_is_its_latest_exhausted_reset_and_cooldown() {
+        // (a) The second exhausted window resets later than the first.
+        let later = ok(
+            "a",
+            vec![
+                win("five_hour", 5 * HOUR, 100.0, NOW + HOUR),
+                win("seven_day", 7 * DAY, 100.0, NOW + 3 * DAY),
+            ],
+        );
+        // (b) The second exhausted window resets earlier than the first.
+        let earlier = ok(
+            "b",
+            vec![
+                win("seven_day", 7 * DAY, 100.0, NOW + 2 * DAY),
+                win("five_hour", 5 * HOUR, 100.0, NOW + 2 * HOUR),
+            ],
+        );
+        // Cooling beyond its only exhausted window's reset.
+        let mut cooled = ok("c", vec![win("five_hour", 5 * HOUR, 100.0, NOW + HOUR)]);
+        cooled.cooldown_until_ms = Some(NOW + 4 * HOUR);
+        // An exhausted window without a reset makes the account's time unknown.
+        let mut unknown = ok("d", vec![win("seven_day", 7 * DAY, 100.0, NOW + DAY)]);
+        if let QuotaObservation::Ok { windows, .. } = &mut unknown.observation {
+            windows.push(WindowLimit {
+                resets_at_ms: None,
+                ..win("five_hour", 5 * HOUR, 100.0, 0)
+            });
+        }
+
+        let until = |f: &SelectionFailure, label: &str| {
+            f.accounts
+                .iter()
+                .find(|a| a.account == label)
+                .unwrap()
+                .until_ms
+        };
+        let f = failure_of(&[later.clone(), earlier.clone(), cooled.clone(), unknown]);
+        assert_eq!(until(&f, "a"), Some(NOW + 3 * DAY));
+        assert_eq!(until(&f, "b"), Some(NOW + 2 * DAY));
+        assert_eq!(until(&f, "c"), Some(NOW + 4 * HOUR));
+        assert_eq!(until(&f, "d"), None);
+        assert_eq!(f.earliest_reset_ms, Some(NOW + 4 * HOUR));
+        assert_eq!(
+            failure_of(&[later, earlier]).earliest_reset_ms,
+            Some(NOW + 2 * DAY)
+        );
+        // Eligibility is unchanged: the first exhausted window still names
+        // the verdict.
+        match select(&req(), &[cooled]) {
+            Selection::NoCapacity { rejections, .. } => {
+                assert!(matches!(
+                    rejections[0].reason,
+                    RejectReason::CoolingDown { .. }
+                ));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// r2 blocker 2: a refresh that needs action outside synaps and an
+    /// unreadable store are their own kind, never `quota_unknown`.
+    #[test]
+    fn action_required_and_store_failures_get_their_own_kind() {
+        use AccountFailureKind as K;
+        use SelectionFailureKind as S;
+        let action = ObservationFailure::new(K::RefreshActionRequired);
+        let store = ObservationFailure::new(K::CredentialStore);
+        let refused = ObservationFailure::new(K::UsageUnauthorized).with_status(401);
+        let mut cooling = ok("c", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        cooling.cooldown_until_ms = Some(NOW + HOUR);
+
+        for f in [
+            failure_of(&[failed("a", action.clone())]),
+            failure_of(&[failed("a", store.clone())]),
+            failure_of(&[
+                failed("a", action.clone()),
+                failed("b", store.clone()),
+                cooling.clone(),
+            ]),
+            failure_of(&[failed("a", action.clone()), failed("b", refused.clone())]),
+        ] {
+            assert_eq!(f.kind, S::ActionRequired, "{f:?}");
+        }
+        assert!(K::RefreshActionRequired.needs_action());
+        assert!(K::CredentialStore.needs_action());
+        assert!(
+            !K::RefreshActionRequired.needs_login() && !K::RefreshActionRequired.is_transient()
+        );
+        let f = failure_of(&[failed("a", action.clone()), failed("b", store.clone())]);
+        assert_eq!(f.action_labels(), vec!["a", "b"]);
+        assert!(f.login_labels().is_empty());
+        // A transient read elsewhere still means "capacity unproven".
+        let f = failure_of(&[
+            failed("a", action),
+            failed("b", ObservationFailure::new(K::UsageTimeout)),
+        ]);
+        assert_eq!(f.kind, S::UsageReadFailed);
+        assert_eq!(f.action_labels(), vec!["a"]);
+        assert_eq!(S::ActionRequired.as_str(), "action_required");
+        assert_eq!(S::CredentialStore.as_str(), "credential_store");
     }
 
     #[test]
@@ -2730,16 +2912,16 @@ mod tests {
             let f = failure_of(&[failed("a", ObservationFailure::new(kind))]);
             assert_eq!(f.kind, S::UsageReadFailed, "{kind}");
         }
-        // Not transient and not a login problem.
-        for kind in [
-            K::UsageMalformed,
-            K::RefreshActionRequired,
-            K::CredentialStore,
-        ] {
+        // Not transient and not a login problem: their own kind (r2
+        // blocker 2), never quota_unknown.
+        for kind in [K::RefreshActionRequired, K::CredentialStore] {
             let f = failure_of(&[failed("a", ObservationFailure::new(kind))]);
-            assert_eq!(f.kind, S::QuotaUnknown, "{kind}");
+            assert_eq!(f.kind, S::ActionRequired, "{kind}");
             assert!(f.login_labels().is_empty(), "{kind}");
         }
+        let f = failure_of(&[failed("a", ObservationFailure::new(K::UsageMalformed))]);
+        assert_eq!(f.kind, S::QuotaUnknown);
+        assert!(f.login_labels().is_empty());
         // A past reset is never reported.
         let stale_exhausted = ok("y", vec![win("primary", 5 * HOUR, 100.0, NOW - 1)]);
         assert_eq!(failure_of(&[stale_exhausted]).earliest_reset_ms, None);

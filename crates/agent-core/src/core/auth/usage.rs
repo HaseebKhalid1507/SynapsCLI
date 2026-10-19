@@ -134,8 +134,13 @@ pub enum UsageError {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_s: Option<u64>,
     },
-    /// Any other non-2xx status.
-    UpstreamStatus { status: u16 },
+    /// Any other non-2xx status. `retry_after_s`: the delta-seconds
+    /// `Retry-After` header, if sent (an HTTP-date is ignored).
+    UpstreamStatus {
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_s: Option<u64>,
+    },
     /// 3xx. Redirects are never followed.
     Redirected { status: u16 },
     Timeout,
@@ -190,7 +195,7 @@ impl UsageError {
             Self::RateLimited { retry_after_s } => ObservationFailure::new(K::UsageRateLimited)
                 .with_status(429)
                 .with_retry_after(*retry_after_s),
-            Self::UpstreamStatus { status } | Self::Redirected { status } => {
+            Self::UpstreamStatus { status, .. } | Self::Redirected { status } => {
                 ObservationFailure::new(K::UsageUpstream).with_status(*status)
             }
             Self::Timeout => ObservationFailure::new(K::UsageTimeout),
@@ -246,7 +251,7 @@ impl std::fmt::Display for UsageError {
             } => {
                 write!(f, "usage endpoint rate limited (HTTP 429)")
             }
-            Self::UpstreamStatus { status } => write!(f, "usage request failed: HTTP {status}"),
+            Self::UpstreamStatus { status, .. } => write!(f, "usage request failed: HTTP {status}"),
             Self::Redirected { status } => {
                 write!(f, "usage endpoint redirected (HTTP {status}); not followed")
             }
@@ -682,7 +687,7 @@ impl From<&UsageError> for UsageErrorSummary {
     fn from(e: &UsageError) -> Self {
         let http_status = match e {
             UsageError::Unauthorized { status }
-            | UsageError::UpstreamStatus { status }
+            | UsageError::UpstreamStatus { status, .. }
             | UsageError::Redirected { status } => Some(*status),
             UsageError::RateLimited { .. } => Some(429),
             _ => None,
@@ -1511,7 +1516,7 @@ impl Default for UsageFetchOptions {
 }
 
 /// True for `http(s)://127.0.0.1…`, `localhost`, `[::1]`.
-fn is_loopback_url(raw: &str) -> bool {
+pub(crate) fn is_loopback_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
@@ -1654,7 +1659,10 @@ async fn get_json_text(
         }
         _ => {
             drop(resp);
-            return Err(UsageError::UpstreamStatus { status });
+            return Err(UsageError::UpstreamStatus {
+                status,
+                retry_after_s: None,
+            });
         }
     }
     read_body_capped(resp, opts.max_body_bytes).await
@@ -2397,7 +2405,11 @@ mod tests {
             UsageError::InvalidEndpointOverride.into_broker_error(),
             BrokerError::Denied(_)
         ));
-        let v = serde_json::to_value(UsageError::UpstreamStatus { status: 502 }).unwrap();
+        let v = serde_json::to_value(UsageError::UpstreamStatus {
+            status: 502,
+            retry_after_s: None,
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({"kind":"upstream_status","status":502}));
         assert!(!supports_usage(OAuthProviderId::GitHubCopilot));
         assert!(!supports_usage(OAuthProviderId::GoogleGemini));
@@ -2703,6 +2715,26 @@ mod tests {
                 ),
             )
             .route(
+                "/503r",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "30")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/503date",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
                 "/302",
                 get(move || async move {
                     (
@@ -2714,7 +2746,7 @@ mod tests {
             );
         let url = spawn(app).await;
         let client = UsageClient::new().unwrap();
-        let cases: [(&str, UsageError); 8] = [
+        let cases: [(&str, UsageError); 10] = [
             ("401", UsageError::Unauthorized { status: 401 }),
             ("403", UsageError::Unauthorized { status: 403 }),
             (
@@ -2741,7 +2773,29 @@ mod tests {
                     retry_after_s: None,
                 },
             ),
-            ("500", UsageError::UpstreamStatus { status: 500 }),
+            (
+                "500",
+                UsageError::UpstreamStatus {
+                    status: 500,
+                    retry_after_s: None,
+                },
+            ),
+            // r2 item 6: a 5xx keeps its delta-seconds Retry-After too; an
+            // HTTP-date is still ignored.
+            (
+                "503r",
+                UsageError::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: Some(30),
+                },
+            ),
+            (
+                "503date",
+                UsageError::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: None,
+                },
+            ),
             ("302", UsageError::Redirected { status: 302 }),
         ];
         for (path, expected) in cases {
@@ -2752,6 +2806,14 @@ mod tests {
             secret_free(&err.to_string(), &["leak-me", "sk-ant", "tok-ZZ"]);
             secret_free(&serde_json::to_string(&err).unwrap(), &["leak-me", "sk-ant"]);
         }
+        // The selection report keeps that Retry-After with the 503.
+        let failure = UsageError::UpstreamStatus {
+            status: 503,
+            retry_after_s: Some(30),
+        }
+        .failure();
+        assert_eq!(failure.http_status, Some(503));
+        assert_eq!(failure.retry_after_s, Some(30));
     }
 
     #[tokio::test]

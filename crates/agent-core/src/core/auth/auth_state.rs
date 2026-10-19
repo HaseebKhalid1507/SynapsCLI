@@ -352,6 +352,7 @@ mod tests {
                         http_status: Some(429),
                         retry_after_s: Some(120),
                         until_ms: None,
+                        cooling_down: false,
                     }],
                     earliest_reset_ms: None,
                 }),

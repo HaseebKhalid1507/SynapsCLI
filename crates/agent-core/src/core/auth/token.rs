@@ -601,6 +601,8 @@ fn load_checked(
 pub struct RefreshExchange {
     pub at_ms: u64,
     pub failure: Option<RefreshFailureKind>,
+    /// The token endpoint's HTTP status when it answered with a failure.
+    pub http_status: Option<u16>,
 }
 
 /// Process-wide, keyed by credential file + storage key; written only where
@@ -621,7 +623,11 @@ fn record_refresh_exchange(path: &Path, storage_key: &str, failure: Option<Refre
         .unwrap_or_else(|e| e.into_inner())
         .insert(
             refresh_exchange_key(path, storage_key),
-            RefreshExchange { at_ms, failure },
+            RefreshExchange {
+                at_ms,
+                failure,
+                http_status: None,
+            },
         );
 }
 
@@ -2695,11 +2701,14 @@ mod rejected_token_tests {
         assert_eq!(err.kind, RefreshFailureKind::Transient);
         let failed = last_refresh_exchange(&path, &key).expect("failed exchange recorded");
         assert_eq!(failed.failure, Some(RefreshFailureKind::Transient));
+        // r2 item 8: the HTTP status the token endpoint answered is kept.
+        assert_eq!(failed.http_status, Some(503));
 
         let calls = AtomicUsize::new(0);
         let first = forced(&path, &a, "a-rejected", &calls).await.unwrap();
         let ok = last_refresh_exchange(&path, &key).expect("exchange recorded");
         assert_eq!(ok.failure, None);
+        assert_eq!(ok.http_status, None);
         assert!(ok.at_ms >= failed.at_ms);
 
         forced(&path, &a, &first.access, &calls).await.unwrap_err();
