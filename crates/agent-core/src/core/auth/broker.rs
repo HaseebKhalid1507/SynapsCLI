@@ -1948,6 +1948,18 @@ impl LocalBroker {
             .map(|c| c.until_ms)
     }
 
+    // ── `synaps auth state` ─────────────────────────────────────────────
+
+    /// What this broker remembers about the accounts `query` selects: no
+    /// network request, no refresh; the account list comes from the store.
+    /// With `query.clear`, their in-memory state is dropped first.
+    pub fn auth_state(
+        &self,
+        query: &super::auth_state::AuthStateQuery,
+    ) -> Result<super::auth_state::AuthStateReport, BrokerError> {
+        auth_state_report(Some(self), query)
+    }
+
     /// Verify an explicitly addressed slot exists. Named slots that are
     /// missing are `UnknownAccount` (never a fallback); the default slot
     /// keeps the historical load-miss `Credential` error from the refresh
@@ -3964,6 +3976,88 @@ pub fn preflight_cloud_capability(
         });
     }
     Ok(())
+}
+
+/// `synaps auth state` for the local broker `cache` holds for the current
+/// credential store and config (the one requests use) or, when no request
+/// has built one yet, the account list with nothing recorded. `live`: the
+/// caller is the process that serves requests (the daemon). No network
+/// request, no refresh; `query.clear` never writes the store.
+pub fn local_auth_state(
+    cache: &super::TokenCache,
+    query: &super::auth_state::AuthStateQuery,
+    live: bool,
+) -> Result<super::auth_state::AuthStateReport, BrokerError> {
+    let key = (
+        storage::auth_file_path(),
+        crate::config::resolve_read_path("config"),
+    );
+    let broker = cache
+        .local_brokers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    let mut report = auth_state_report(broker.as_deref(), query)?;
+    report.live = live;
+    Ok(report)
+}
+
+fn auth_state_report(
+    _broker: Option<&LocalBroker>,
+    query: &super::auth_state::AuthStateQuery,
+) -> Result<super::auth_state::AuthStateReport, BrokerError> {
+    use super::auth_state::{
+        AccountState, AuthStateReport, IdentityKind, AUTH_STATE_SCHEMA_VERSION,
+    };
+    let provider = match query.provider.as_deref() {
+        Some(p) => Some(
+            p.parse::<OAuthProviderId>()
+                .map_err(|_| BrokerError::UnknownProvider(p.to_string()))?,
+        ),
+        None => None,
+    };
+    let mut summaries = match provider {
+        Some(p) => storage::list_accounts(p),
+        None => storage::list_all_accounts(),
+    }
+    .map_err(BrokerError::Credential)?;
+    if let Some(label) = query.account.as_deref() {
+        summaries.retain(|s| s.label == label);
+        if summaries.is_empty() {
+            return Err(BrokerError::UnknownAccount {
+                provider: provider.map_or("any provider", |p| p.as_str()).to_string(),
+                label: label.to_string(),
+            });
+        }
+    }
+    let accounts = summaries
+        .iter()
+        .map(|summary| AccountState {
+            provider: summary.provider.clone(),
+            label: summary.label.clone(),
+            identity: if summary.seat_fingerprint.is_some() {
+                IdentityKind::Stable
+            } else {
+                IdentityKind::Rotating
+            },
+            access_expires_ms: (summary.expires != 0).then_some(summary.expires),
+            cooldown: None,
+            last_usage: None,
+            last_usage_ok_ms: None,
+            last_refresh: None,
+        })
+        .collect();
+    Ok(AuthStateReport {
+        schema_version: AUTH_STATE_SCHEMA_VERSION,
+        live: false,
+        broker_active: false,
+        generated_at_ms: crate::epoch_millis(),
+        store: storage::auth_file_path().display().to_string(),
+        accounts,
+        selections: Vec::new(),
+        cleared: Vec::new(),
+    })
 }
 
 /// remote transport. There is no third option — and no direct-read fallback.

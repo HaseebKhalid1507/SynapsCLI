@@ -595,6 +595,20 @@ fn load_checked(
     Ok(creds)
 }
 
+/// The last token refresh exchange of one credential slot in this process
+/// (`synaps auth state`). `failure: None` = the provider issued a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshExchange {
+    pub at_ms: u64,
+    pub failure: Option<RefreshFailureKind>,
+}
+
+/// The last refresh exchange of `storage_key` in the credential file at
+/// `path`, in this process.
+pub fn last_refresh_exchange(_path: &Path, _storage_key: &str) -> Option<RefreshExchange> {
+    None
+}
+
 /// Gate → per-credential cross-process lock → CAS save, plus the forced
 /// refresh rate limit. `refresh` is the provider exchange (injected so the
 /// whole production composition is testable without a network).
@@ -2621,6 +2635,40 @@ mod rejected_token_tests {
         // Account b: a's refresh stamped only a's lock file.
         forced(&path, &b, "b-rejected", &calls).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "b has its own cooldown");
+    }
+
+    /// `synaps auth state` sees each slot's last refresh exchange: its kind
+    /// when the provider refused, none when it issued a token. A forced
+    /// refresh refused by the cooldown is no exchange, and a slot's record
+    /// is its own.
+    #[tokio::test]
+    async fn refresh_exchanges_are_recorded_per_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let (a, b) = (account("a"), account("b"));
+        seed_old(&path, &[(&a, "a-rejected"), (&b, "b-rejected")]);
+        let key = a.storage_key();
+        assert_eq!(last_refresh_exchange(&path, &key), None);
+
+        let err = refresh_credential_locked(&a, &path, None, Some("a-rejected"), |_old| async {
+            Err::<OAuthCredentials, _>(RefreshFailure::status(503, "token endpoint answered 503"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::Transient);
+        let failed = last_refresh_exchange(&path, &key).expect("failed exchange recorded");
+        assert_eq!(failed.failure, Some(RefreshFailureKind::Transient));
+
+        let calls = AtomicUsize::new(0);
+        let first = forced(&path, &a, "a-rejected", &calls).await.unwrap();
+        let ok = last_refresh_exchange(&path, &key).expect("exchange recorded");
+        assert_eq!(ok.failure, None);
+        assert!(ok.at_ms >= failed.at_ms);
+
+        forced(&path, &a, &first.access, &calls).await.unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the cooldown refused it");
+        assert_eq!(last_refresh_exchange(&path, &key), Some(ok));
+        assert_eq!(last_refresh_exchange(&path, &b.storage_key()), None);
     }
 
     /// What another synaps process leaves behind after refreshing `cred`:

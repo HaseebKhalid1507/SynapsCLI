@@ -12,10 +12,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agent_core::auth::auth_state::render_text;
 use agent_core::auth::{
-    AccountPolicy, AccountSelector, CredentialBroker, CredentialRef, LocalBroker, OAuthProviderId,
+    broker_from_source, local_auth_state, AccountPolicy, AccountSelector, AuthStateQuery,
+    BrokerError, CredentialBroker, CredentialRef, CredentialSource, LocalBroker, OAuthProviderId,
+    TokenCache,
 };
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -60,10 +64,18 @@ type Script = Arc<Mutex<HashMap<&'static str, Reply>>>;
 
 /// Usage mock keyed by the bearer's account (`a` / `b`).
 async fn spawn_usage(script: Script) -> String {
+    spawn_counted_usage(script).await.0
+}
+
+/// [`spawn_usage`] plus the number of requests it has answered.
+async fn spawn_counted_usage(script: Script) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
     let app = Router::new().route(
         "/usage",
         get(move |headers: HeaderMap| {
             let script = script.clone();
+            counter.fetch_add(1, Ordering::SeqCst);
             async move {
                 let bearer = headers
                     .get("authorization")
@@ -97,7 +109,7 @@ async fn spawn_usage(script: Script) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}/usage")
+    (format!("http://{addr}/usage"), hits)
 }
 
 fn auto_broker(usage_url: &str) -> LocalBroker {
@@ -366,4 +378,263 @@ async fn plan_preview_logs_no_selection_failure() {
     broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
     let log = capture.take();
     assert!(!log.contains("auth_selection_failed"), "{log}");
+}
+
+// ── `synaps auth state` ─────────────────────────────────────────────────────
+
+const ACCOUNT_ID_A: &str = "4f1c2b9e-0d3a-4e5f-9a8b-7c6d5e4f3a2b";
+const EMAIL_A: &str = "owner-a@example.com";
+
+/// Scratch store for `auth state`: `a` records its provider account id and
+/// an email; `b` records neither.
+fn install_identified_store() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    agent_core::config::set_base_dir_for_tests(home.path().to_path_buf());
+    let mut a = oauth("anthropic-a-access", "refresh-anth-a-SECRET");
+    a["accountId"] = json!(ACCOUNT_ID_A);
+    a["identity"] = json!(EMAIL_A);
+    std::fs::write(
+        home.path().join("auth.json"),
+        json!({
+            "anthropic@a": a,
+            "anthropic@b": oauth("anthropic-b-access", "refresh-anth-b-SECRET"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("config"), "").unwrap();
+    home
+}
+
+fn anthropic_query() -> AuthStateQuery {
+    AuthStateQuery {
+        provider: Some("anthropic".into()),
+        ..AuthStateQuery::default()
+    }
+}
+
+/// Every file in `dir` with its bytes.
+fn snapshot_dir(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let bytes = if e.file_type().unwrap().is_file() {
+                std::fs::read(e.path()).unwrap()
+            } else {
+                Vec::new()
+            };
+            (e.file_name(), bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// After a cooldown report and a selection that read `a`'s usage (429) and
+/// `b`'s (ok), the report shows the cooldown with its reason, each read's
+/// kind, HTTP status and time, and the failed selection. Building it makes
+/// no usage request, and neither its JSON nor its text carries token
+/// material, the email, the account id or its prefix, or a seat identity.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_state_reports_memory_without_requests_or_secrets() {
+    let _home = install_identified_store();
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", Reply::RateLimited(120));
+    script.lock().unwrap().insert(
+        "b",
+        Reply::Body(
+            json!({"five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"}}),
+        ),
+    );
+    let (usage_url, hits) = spawn_counted_usage(script).await;
+    let broker = auto_broker(&usage_url);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_cooldown(&anthropic("b"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    broker
+        .access_token_pinned(OAuthProviderId::Anthropic)
+        .await
+        .unwrap_err();
+    let reads = hits.load(Ordering::SeqCst);
+    assert_eq!(reads, 2, "one usage read per account");
+
+    let report = broker.auth_state(&anthropic_query()).unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        reads,
+        "auth state made a usage request"
+    );
+    assert!(report.broker_active);
+    let value = serde_json::to_value(&report).unwrap();
+    let account = |label: &str| {
+        value["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == label)
+            .unwrap_or_else(|| panic!("no {label} in {value}"))
+            .clone()
+    };
+    let a = account("a");
+    assert_eq!(a["identity"], "stable", "{a}");
+    assert_eq!(a["access_expires_ms"], FAR_FUTURE, "{a}");
+    assert_eq!(
+        a["last_usage"]["failure"],
+        json!({"kind": "usage_rate_limited", "http_status": 429, "retry_after_s": 120}),
+        "{a}"
+    );
+    assert!(a.get("last_usage_ok_ms").is_none(), "{a}");
+    assert!(a.get("cooldown").is_none(), "{a}");
+    let b = account("b");
+    assert_eq!(b["identity"], "rotating", "{b}");
+    assert_eq!(
+        b["cooldown"],
+        json!({"until_ms": until, "reason": "anthropic_quota_exhausted"}),
+        "{b}"
+    );
+    assert!(b["last_usage"].get("failure").is_none(), "{b}");
+    let read_at = b["last_usage"]["at_ms"]
+        .as_u64()
+        .expect("b's read is recorded");
+    assert_eq!(b["last_usage_ok_ms"], read_at, "{b}");
+    assert!(read_at <= report.generated_at_ms && report.generated_at_ms - read_at < 60_000);
+    let selection = &value["selections"][0];
+    assert_eq!(selection["provider"], "anthropic", "{value}");
+    assert_eq!(selection["failure"]["kind"], "usage_read_failed", "{value}");
+
+    let text = render_text(&report);
+    for needle in [
+        "usage_rate_limited, HTTP 429, retry after 120s, ",
+        " ago",
+        "anthropic_quota_exhausted",
+        "failed: usage_read_failed (a:usage_rate_limited:429,b:cooling_down)",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing from:\n{text}");
+    }
+    let summaries = broker.accounts(OAuthProviderId::Anthropic).await.unwrap();
+    let a_row = summaries.iter().find(|s| s.label == "a").unwrap();
+    let fingerprint = a_row
+        .seat_fingerprint
+        .clone()
+        .expect("a has a seat fingerprint");
+    let prefix = a_row.account_id_prefix.clone().expect("a has an id prefix");
+    for out in [value.to_string(), text] {
+        assert_secret_free(&out);
+        for leak in [
+            ACCOUNT_ID_A,
+            EMAIL_A,
+            fingerprint.as_str(),
+            prefix.as_str(),
+            "id:",
+            "cred:",
+        ] {
+            assert!(!out.contains(leak), "{leak:?} in {out}");
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), reads);
+}
+
+/// `clear` for one account drops that account's cooldown in the broker
+/// requests use (not just in the report), keeps the other account's, logs
+/// one INFO line naming the account and writes nothing in the store. With
+/// no broker built yet, the report lists the accounts with nothing
+/// recorded; an unknown label is an error, never "all accounts".
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_state_clear_drops_one_accounts_memory_and_writes_nothing() {
+    let home = install_identified_store();
+    let cache = TokenCache::new();
+    let report = local_auth_state(&cache, &anthropic_query(), false).unwrap();
+    assert!(!report.live && !report.broker_active, "{report:?}");
+    assert_eq!(report.accounts.len(), 2, "{report:?}");
+    assert!(report
+        .accounts
+        .iter()
+        .all(|a| a.cooldown.is_none() && a.last_usage.is_none()));
+
+    let broker = broker_from_source(&CredentialSource::Local, &cache, reqwest::Client::new());
+    let until = agent_core::epoch_millis() + 3_600_000;
+    for label in ["a", "b"] {
+        broker
+            .report_cooldown(&anthropic(label), Some(until), "anthropic_quota_exhausted")
+            .await
+            .unwrap();
+    }
+    let store_before = snapshot_dir(home.path());
+
+    let capture = Capture::default();
+    let clear_b = AuthStateQuery {
+        account: Some("b".into()),
+        clear: true,
+        ..anthropic_query()
+    };
+    let report = {
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+        local_auth_state(&cache, &clear_b, true).unwrap()
+    };
+    assert!(report.live && report.broker_active, "{report:?}");
+    assert_eq!(report.cleared, vec!["anthropic:b".to_string()]);
+    assert_eq!(report.accounts.len(), 1, "{report:?}");
+    assert!(report.accounts[0].cooldown.is_none(), "{report:?}");
+    let log = capture.take();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("auth_state_cleared"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(
+        lines[0].contains("INFO") && lines[0].contains("accounts=anthropic:b"),
+        "{log}"
+    );
+
+    let rows = broker.accounts(OAuthProviderId::Anthropic).await.unwrap();
+    let cooldown_of = |label: &str| {
+        rows.iter()
+            .find(|r| r.label == label)
+            .unwrap()
+            .cooldown_until
+    };
+    assert_eq!(cooldown_of("a"), Some(until), "a keeps its cooldown");
+    assert_eq!(
+        cooldown_of("b"),
+        None,
+        "b's cooldown is gone from the broker"
+    );
+    assert_eq!(
+        snapshot_dir(home.path()),
+        store_before,
+        "clear wrote to the store dir"
+    );
+
+    let unknown = AuthStateQuery {
+        account: Some("zzz".into()),
+        clear: true,
+        ..anthropic_query()
+    };
+    assert!(
+        matches!(
+            local_auth_state(&cache, &unknown, true),
+            Err(BrokerError::UnknownAccount { .. })
+        ),
+        "an unknown label clears nothing"
+    );
+    let rows = broker.accounts(OAuthProviderId::Anthropic).await.unwrap();
+    assert!(rows.iter().any(|r| r.cooldown_until == Some(until)));
+
+    let clear_all = AuthStateQuery {
+        clear: true,
+        ..anthropic_query()
+    };
+    let report = local_auth_state(&cache, &clear_all, true).unwrap();
+    assert_eq!(
+        report.cleared,
+        vec!["anthropic:a".to_string(), "anthropic:b".to_string()]
+    );
+    let rows = broker.accounts(OAuthProviderId::Anthropic).await.unwrap();
+    assert!(rows.iter().all(|r| r.cooldown_until.is_none()), "{rows:?}");
+    assert_eq!(snapshot_dir(home.path()), store_before);
 }
