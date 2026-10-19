@@ -583,7 +583,7 @@ impl Tool for MultiEditTool {
     }
 
     fn description(&self) -> &str {
-        "Anchored edits across one or more files, all or nothing: every edit is checked in memory first and no file is written if any fails. Each anchor must match exactly once (or give `occurrence`). Edits to one file apply in order. Returns one line per edit (file, op, lines as of that edit, bytes)."
+        "Anchored edits across one or more files. Every edit is checked in memory first; if any check fails, no file is written. If a write fails partway, files already written are restored where possible, and any that could not be are named. Each anchor must match exactly once (or give `occurrence`). Edits to one file apply in order. Returns one line per edit (file, op, lines as of that edit, bytes)."
     }
 
     fn parameters(&self) -> Value {
