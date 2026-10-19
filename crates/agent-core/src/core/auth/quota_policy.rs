@@ -523,11 +523,12 @@ pub struct SelectionRequest<'a> {
     /// Last successful readings for accounts whose current usage read
     /// failed transiently (usage-endpoint 429, 5xx, timeout, transport).
     /// Such an account (observation [`QuotaObservation::Unknown`]) is
-    /// evaluated on its reading here instead: not past
+    /// evaluated on its reading here instead: strictly younger than
     /// [`grace_max_age_ms`](Self::grace_max_age_ms), never past an exhausted
     /// window, an exclusion or a cooldown. Graced seats rank after every
     /// fresh one, but a graced sticky seat stays (a read failure alone is no
-    /// reason to switch). Empty in [`new`](Self::new).
+    /// reason to switch: the sticky rule judges the graced reading exactly
+    /// as it would a fresh one). Empty in [`new`](Self::new).
     pub grace: &'a [AccountCapacity],
     /// Oldest graced reading that still counts. Default
     /// [`USAGE_READ_GRACE`](super::usage_reads::USAGE_READ_GRACE).
@@ -1150,6 +1151,14 @@ fn evaluate_graced(
     else {
         return Err(RejectReason::Unknown);
     };
+    // Strictly younger than the grace age (a reading exactly that old no
+    // longer counts); `evaluate` below re-checks with its inclusive bound.
+    let young = good
+        .observed_at_ms
+        .is_some_and(|t| req.now_ms.saturating_sub(t) < req.grace_max_age_ms);
+    if !young {
+        return Err(RejectReason::Unknown);
+    }
     let graced_req = SelectionRequest {
         max_snapshot_age_ms: req.grace_max_age_ms,
         grace: &[],
@@ -1303,7 +1312,9 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
     // Stickiness (SoonestReset only): keep the pinned seat unless a candidate
     // is in a strictly higher tier, or both are urgent and the candidate's
     // reset is strictly sooner. An ineligible/excluded current seat is not in
-    // `eligible`, so it can never be kept.
+    // `eligible`, so it can never be kept. A graced current seat is judged on
+    // its graced reading exactly as a fresh one: ranking graced after fresh
+    // never moves off it by itself, so a read failure alone never switches.
     if req.sticky && req.strategy == Strategy::SoonestReset {
         if let Some(current) = req.current {
             let key = current.storage_key();
@@ -1721,6 +1732,11 @@ mod tests {
         assert!(one(&young, &failed("a")).unwrap().graced);
         let old = [good("a", grace_ms + 60_000, 20.0, NOW + DAY)];
         assert_eq!(one(&old, &failed("a")), Err(RejectReason::Unknown), "past the grace age");
+        // Strictly under the grace age: a reading exactly that old is out.
+        let edge = [good("a", grace_ms, 20.0, NOW + DAY)];
+        assert_eq!(one(&edge, &failed("a")), Err(RejectReason::Unknown), "at the grace age");
+        let inside = [good("a", grace_ms - 1, 20.0, NOW + DAY)];
+        assert!(one(&inside, &failed("a")).unwrap().graced, "just under it");
         let exhausted = [good("a", 60_000, 100.0, NOW + HOUR)];
         assert_eq!(one(&exhausted, &failed("a")), Err(RejectReason::Unknown), "exhausted window");
         let cooling = AccountCapacity {
@@ -1747,6 +1763,33 @@ mod tests {
             ..anew.clone()
         };
         assert_eq!(winner(select(&sticky, &[failed("a"), b])), "a");
+
+        // A graced sticky seat is judged exactly as a fresh one would be: it
+        // stays wherever a fresh reading would stay and yields only where a
+        // fresh reading yields too (a strictly higher tier, or a strictly
+        // sooner urgent reset), never because its read failed.
+        let mut switched = 0;
+        for a_reset in [NOW + HOUR, NOW + 2 * DAY, NOW + 10 * HOUR] {
+            for b_reset in [NOW + HOUR / 2, NOW + 3 * DAY, NOW + 12 * HOUR, NOW + 5 * DAY] {
+                let a_good = good("a", 1000, 20.0, a_reset);
+                let b = good("b", 1000, 20.0, b_reset);
+                let graced = [a_good.clone()];
+                let on_grace = SelectionRequest {
+                    grace: &graced,
+                    current: Some(&current),
+                    ..fresh_req()
+                };
+                let on_fresh = SelectionRequest {
+                    current: Some(&current),
+                    ..fresh_req()
+                };
+                let g = winner(select(&on_grace, &[failed("a"), b.clone()]));
+                let f = winner(select(&on_fresh, &[a_good, b]));
+                assert_eq!(g, f, "a resets at {a_reset}, b at {b_reset}");
+                switched += usize::from(g == "b");
+            }
+        }
+        assert!(switched > 0 && switched < 12, "the cases cover staying and switching: {switched}");
     }
 
     #[test]

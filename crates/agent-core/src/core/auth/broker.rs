@@ -2432,8 +2432,9 @@ impl LocalBroker {
     /// with the seat it was read from. Anything that is not a well-formed,
     /// fresh reading is NOT capacity; a failed read keeps its typed cause. A
     /// read that failed transiently also reports that failure (and when
-    /// reads resume) and, when the slot has one, its last good reading for
-    /// the policy's grace, paired with the seat stored in the slot now.
+    /// reads resume) and, when the slot has one read from the account stored
+    /// there now, its last good reading for the policy's grace, paired with
+    /// that stored seat.
     async fn capacity_for(&self, cred: &CredentialRef) -> CandidateRead {
         use super::quota_policy::AccountCapacity;
         use super::usage_reads::ReadError;
@@ -2472,10 +2473,14 @@ impl LocalBroker {
                         grace: None,
                     };
                 };
-                let graced = self
-                    .usage_reads
-                    .last_good(&self.read_key(cred))
-                    .and_then(|good| Some((good, self.stored_seat(cred).ok()?)));
+                // Grace only on a reading of the account in the slot now: a
+                // re-login to another account id never inherits it.
+                let graced = self.stored_seat(cred).ok().and_then(|seat| {
+                    let good = self
+                        .usage_reads
+                        .last_good_for(&self.read_key(cred), &seat)?;
+                    Some((good, seat))
+                });
                 let (grace, seat) = match graced {
                     Some((good, seat)) => (Some(capacity_from_snapshot(cred, &good)), Some(seat)),
                     None => (None, None),
@@ -2533,25 +2538,13 @@ impl LocalBroker {
             if let Some(failed) = read.transient {
                 transient.insert(cred.storage_key(), failed);
             }
-            grace.extend(read.grace);
-            // A generic Codex window (including a free 30-day plan) does
-            // not prove entitlement to Astra or any other requested model.
-            if provider == OAuthProviderId::OpenAiCodex {
-                if let (Some(model), super::quota_policy::QuotaObservation::Ok { models, .. }) =
-                    (model, &mut capacity.observation)
-                {
-                    let availability = models.get_or_insert_with(Vec::new);
-                    if !availability
-                        .iter()
-                        .any(|m| super::quota_policy::model_matches(&m.model, model))
-                    {
-                        availability.push(super::quota_policy::ModelAvailability {
-                            model: model.to_string(),
-                            state: super::quota_policy::ModelState::Unknown,
-                        });
-                    }
-                }
-            }
+            // The same entitlement guard for a fresh reading and for a last
+            // good reading standing in for a failed read.
+            require_requested_model(provider, model, &mut capacity);
+            grace.extend(read.grace.map(|mut good| {
+                require_requested_model(provider, model, &mut good);
+                good
+            }));
             if let Some(seat) = seat {
                 if !seen.insert(seat.as_str().to_string()) {
                     exclude.push(cred.clone());
@@ -3208,6 +3201,30 @@ impl UsageReadError {
         match table.record_at("slot", super::usage_reads::Fetched::Usage(e), 0) {
             Err(read) => Self::from_read(&read),
             Ok(_) => unreachable!("a usage error is never a reading"),
+        }
+    }
+}
+
+/// A generic Codex window (including a free 30-day plan) does not prove
+/// entitlement to Astra or any other requested model: a requested model the
+/// reading does not list counts as unknown. Applied to every reading the
+/// policy judges, fresh or graced.
+fn require_requested_model(
+    provider: OAuthProviderId,
+    model: Option<&str>,
+    capacity: &mut super::quota_policy::AccountCapacity,
+) {
+    use super::quota_policy::{model_matches, ModelAvailability, ModelState, QuotaObservation};
+    if provider != OAuthProviderId::OpenAiCodex {
+        return;
+    }
+    if let (Some(model), QuotaObservation::Ok { models, .. }) = (model, &mut capacity.observation) {
+        let availability = models.get_or_insert_with(Vec::new);
+        if !availability.iter().any(|m| model_matches(&m.model, model)) {
+            availability.push(ModelAvailability {
+                model: model.to_string(),
+                state: ModelState::Unknown,
+            });
         }
     }
 }
