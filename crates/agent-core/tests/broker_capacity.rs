@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_core::auth::auth_state::render_text;
@@ -1832,4 +1832,170 @@ async fn a_held_refusal_shows_no_digest_or_token_anywhere() {
         assert!(!out.contains(&digest), "the hold's digest in {out}");
         assert!(!out.contains(&digest[..16]), "a digest prefix in {out}");
     }
+}
+
+/// Loopback token endpoint that refuses every refresh (400 invalid_grant)
+/// and holds each answer while `closed` is set, so callers of one slot
+/// queue behind an exchange in flight.
+struct HeldToken {
+    url: String,
+    hits: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+}
+
+async fn spawn_held_token() -> HeldToken {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicBool::new(true));
+    let (counter, held) = (hits.clone(), closed.clone());
+    let app = Router::new().route(
+        "/v1/oauth/token",
+        axum::routing::post(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let held = held.clone();
+            async move {
+                while held.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                (
+                    StatusCode::BAD_REQUEST,
+                    [("content-type", "application/json")],
+                    INVALID_GRANT,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    HeldToken {
+        url: format!("http://{addr}/v1/oauth/token"),
+        hits,
+        closed,
+    }
+}
+
+impl HeldToken {
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Wait until `n` refresh requests have arrived.
+    async fn arrived(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + SELECTION_DEADLINE;
+        while self.hits() < n {
+            assert!(tokio::time::Instant::now() < deadline, "no refresh request {n}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Once `n` requests have arrived, give the callers behind the one in
+    /// flight time to queue at the slot's gate, then answer everything.
+    async fn release_after(&self, n: usize) {
+        self.arrived(n).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        self.closed.store(false, Ordering::SeqCst);
+    }
+}
+
+/// s2-r1 blocker 1: four ordinary turns at once, over a warm reading of
+/// sticky a whose token expired, all choose a while a's refresh is in
+/// flight. The hold is decided under a's refresh gate: one token request,
+/// and every turn that waited takes the held refusal and selects b. After
+/// the window, four lookups at once that have only a left send ONE request
+/// again, and all name a's login.
+#[tokio::test]
+#[serial_test::serial]
+async fn concurrent_turns_send_one_refused_refresh_and_the_rest_take_the_hold() {
+    let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let token = spawn_held_token().await;
+    let broker = auto_broker(&spawn_usage(script).await)
+        .with_anthropic_token_url_for_tests(token.url.clone());
+    token.closed.store(false, Ordering::SeqCst);
+    assert_eq!(turn(&broker).await, anthropic("a"));
+    assert_eq!(token.hits(), 0, "a's token was fresh");
+    token.closed.store(true, Ordering::SeqCst);
+    expire_stored(&home, "a");
+
+    let (t1, t2, t3, t4, ()) = tokio::join!(
+        turn(&broker),
+        turn(&broker),
+        turn(&broker),
+        turn(&broker),
+        token.release_after(1),
+    );
+    for served in [t1, t2, t3, t4] {
+        assert_eq!(served, anthropic("b"));
+    }
+    assert_eq!(token.hits(), 1, "one refresh of a for four turns");
+    assert!(account_state(&broker, "a")["refresh_hold"].is_object());
+
+    token.closed.store(true, Ordering::SeqCst);
+    broker.age_refresh_holds_for_tests(std::time::Duration::from_millis(HOLD_MS + 1_000));
+    let (l1, l2, l3, l4, ()) = tokio::join!(
+        lookup_without_b(&broker),
+        lookup_without_b(&broker),
+        lookup_without_b(&broker),
+        lookup_without_b(&broker),
+        token.release_after(2),
+    );
+    for result in [l1, l2, l3, l4] {
+        assert_a_needs_login(result);
+    }
+    assert_eq!(token.hits(), 2, "one retry after the window, not four");
+}
+
+/// s2-r1 backlog 1: the hold is of the login actually refused. While a's
+/// refused refresh is in flight, a usage read of a queues at a's gate and
+/// a's stored login is rotated (another process refreshed it to tokens
+/// that are expired as well). The read re-reads the new login under the
+/// gate; nothing holds it, so it is refreshed once and refused, and the
+/// hold is for the new login: the next lookup asks the provider nothing.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_rotation_while_a_refresh_waits_holds_the_login_that_was_refused() {
+    let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let token = spawn_held_token().await;
+    let broker = auto_broker(&spawn_usage(script).await)
+        .with_anthropic_token_url_for_tests(token.url.clone());
+    assert_eq!(turn(&broker).await, anthropic("a"));
+    expire_stored(&home, "a");
+
+    let read = async {
+        token.arrived(1).await;
+        broker.usage(&anthropic("a")).await
+    };
+    let rotate = async {
+        token.arrived(1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        store_tokens(
+            &home,
+            "a",
+            "rotated-anthropic-a-access",
+            "refresh-anth-a-SECRET-rotated",
+            EXPIRED,
+        );
+        token.closed.store(false, Ordering::SeqCst);
+    };
+    let (looked_up, read, ()) = tokio::join!(lookup_without_b(&broker), read, rotate);
+    assert_a_needs_login(looked_up);
+    read.expect_err("the rotated login is refused too");
+    assert_eq!(token.hits(), 2, "the old login and the rotated one");
+
+    assert_a_needs_login(lookup_without_b(&broker).await);
+    assert_eq!(token.hits(), 2, "the rotated login's refusal is held");
+    assert_eq!(
+        account_state(&broker, "a")["refresh_hold"]["failure"],
+        json!({"kind": "refresh_rejected", "http_status": 400})
+    );
 }
