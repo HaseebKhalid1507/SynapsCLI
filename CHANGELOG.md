@@ -19,6 +19,18 @@ All notable changes to this project will be documented in this file.
   naming the variable; move the secret to a plugin-specific variable. See
   [docs/extensions/secrets.md](docs/extensions/secrets.md).
 
+### Added
+
+- **Slices for process scopes:** `tool_scope_slice = <name>.slice` puts the
+  systemd scopes of bash tool commands and PTY shells in that slice, and
+  `daemon_scope_slice` does the same for the daemon's own scope, so an
+  operator can cap agent tool work apart from the desktop's `app.slice`
+  (`systemctl --user set-property <name>.slice MemoryHigh=…` or a drop-in;
+  Synaps sets no limits itself). Unset, nothing changes. An invalid name
+  warns and is ignored; a slice the user manager refuses means the command
+  starts without a scope, with one warning. The daemon's slice applies at
+  its next fresh start (a reload re-execs in the same scope).
+
 ### Changed
 
 - **Interactive turns have no round, tool-call or tool-result-byte limit by
