@@ -101,8 +101,59 @@ pub struct AccountState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CooldownState {
     pub until_ms: u64,
-    /// The reporter's reason kind (e.g. `anthropic_quota_exhausted`).
-    pub reason: String,
+    /// Who reported it, as a fixed kind; never the reporter's own string.
+    pub reason: CooldownReason,
+}
+
+/// Why an account is cooling down: one of the known `report_cooldown`
+/// callers, or `other`. A report carries only this kind, never the string
+/// the reporter passed (which may come from another machine); the log line
+/// written when the cooldown is reported keeps that string. An unknown kind
+/// from a newer daemon reads as `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", from = "String")]
+pub enum CooldownReason {
+    /// The Anthropic request path saw a quota-exhausted answer.
+    AnthropicQuotaExhausted,
+    /// The Codex request path saw a quota-exhausted answer.
+    CodexQuotaExhausted,
+    /// A broker client reported a limit without a reason.
+    ClientReport,
+    /// Any other reason.
+    Other,
+}
+
+impl CooldownReason {
+    /// The kind of a reporter's reason string.
+    pub fn from_reported(reason: &str) -> Self {
+        match reason {
+            "anthropic_quota_exhausted" => Self::AnthropicQuotaExhausted,
+            "codex_quota_exhausted" => Self::CodexQuotaExhausted,
+            "client_report" => Self::ClientReport,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AnthropicQuotaExhausted => "anthropic_quota_exhausted",
+            Self::CodexQuotaExhausted => "codex_quota_exhausted",
+            Self::ClientReport => "client_report",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl From<String> for CooldownReason {
+    fn from(reason: String) -> Self {
+        Self::from_reported(&reason)
+    }
+}
+
+impl std::fmt::Display for CooldownReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// One observation: when it happened and, if it failed, why.
@@ -131,20 +182,6 @@ pub struct SelectionState {
     /// Why the chosen account's token could not be vended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vend_failure: Option<ObservationFailure>,
-}
-
-/// Keep only characters that are safe on one terminal line (a reason comes
-/// from a client report, which may be another machine).
-pub(crate) fn display_safe(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "_-.:/ ".contains(c) {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
 }
 
 fn span(ms: u64) -> String {
@@ -231,7 +268,7 @@ pub fn render_text(report: &AuthStateReport) -> String {
                     "    cooldown  {} left (until {}): {}",
                     span(c.until_ms.saturating_sub(now)),
                     utc(c.until_ms),
-                    display_safe(&c.reason)
+                    c.reason
                 );
             }
             None => {
@@ -312,7 +349,7 @@ mod tests {
                     access_expires_ms: Some(NOW + 3 * 3600 * 1000),
                     cooldown: Some(CooldownState {
                         until_ms: NOW + 41 * 60 * 1000,
-                        reason: "anthropic_quota_exhausted\u{1b}[2J".into(),
+                        reason: CooldownReason::AnthropicQuotaExhausted,
                     }),
                     last_usage: Some(ObservedOutcome {
                         at_ms: NOW - 12_000,
@@ -378,9 +415,35 @@ mod tests {
             assert!(text.contains(needle), "{needle:?} missing from:\n{text}");
         }
         assert!(
-            !text.contains('\u{1b}'),
-            "terminal control from a reason:\n{text}"
+            text.contains("): anthropic_quota_exhausted\n"),
+            "the cooldown's reason kind:\n{text}"
         );
+    }
+
+    /// r2 blocker 3: a reason is a fixed kind on the wire too; a reason
+    /// string this build does not know (a newer daemon's, or a raw string)
+    /// reads as `other`.
+    #[test]
+    fn cooldown_reasons_round_trip_as_fixed_kinds() {
+        for (wire, kind) in [
+            (
+                "anthropic_quota_exhausted",
+                CooldownReason::AnthropicQuotaExhausted,
+            ),
+            ("codex_quota_exhausted", CooldownReason::CodexQuotaExhausted),
+            ("client_report", CooldownReason::ClientReport),
+            ("other", CooldownReason::Other),
+            ("sk-ant-oat01-raw", CooldownReason::Other),
+        ] {
+            let state: CooldownState =
+                serde_json::from_value(serde_json::json!({"until_ms": 1, "reason": wire})).unwrap();
+            assert_eq!(state.reason, kind, "{wire}");
+            assert_eq!(
+                serde_json::to_value(&state).unwrap()["reason"],
+                kind.as_str(),
+                "{wire}"
+            );
+        }
     }
 
     #[test]

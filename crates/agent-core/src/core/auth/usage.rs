@@ -143,6 +143,7 @@ pub enum UsageError {
     },
     /// 3xx. Redirects are never followed.
     Redirected { status: u16 },
+    /// No answer within the timeout: no status, no `Retry-After`.
     Timeout,
     /// Transport failure; `detail` is a coarse class, never a URL or body.
     Transport { detail: String },
@@ -195,9 +196,16 @@ impl UsageError {
             Self::RateLimited { retry_after_s } => ObservationFailure::new(K::UsageRateLimited)
                 .with_status(429)
                 .with_retry_after(*retry_after_s),
-            Self::UpstreamStatus { status, .. } | Self::Redirected { status } => {
+            Self::UpstreamStatus {
+                status,
+                retry_after_s,
+            } => ObservationFailure::new(K::UsageUpstream)
+                .with_status(*status)
+                .with_retry_after(*retry_after_s),
+            Self::Redirected { status } => {
                 ObservationFailure::new(K::UsageUpstream).with_status(*status)
             }
+            // No answer arrived, so there is no status or Retry-After.
             Self::Timeout => ObservationFailure::new(K::UsageTimeout),
             Self::Transport { .. } => ObservationFailure::new(K::UsageTransport),
             Self::BodyTooLarge { .. } | Self::Malformed { .. } => {
@@ -251,6 +259,13 @@ impl std::fmt::Display for UsageError {
             } => {
                 write!(f, "usage endpoint rate limited (HTTP 429)")
             }
+            Self::UpstreamStatus {
+                status,
+                retry_after_s: Some(secs),
+            } => write!(
+                f,
+                "usage request failed: HTTP {status}, retry after {secs}s"
+            ),
             Self::UpstreamStatus { status, .. } => write!(f, "usage request failed: HTTP {status}"),
             Self::Redirected { status } => {
                 write!(f, "usage endpoint redirected (HTTP {status}); not followed")
@@ -1658,10 +1673,11 @@ async fn get_json_text(
             return Err(UsageError::RateLimited { retry_after_s });
         }
         _ => {
+            let retry_after_s = retry_after_secs(resp.headers());
             drop(resp);
             return Err(UsageError::UpstreamStatus {
                 status,
-                retry_after_s: None,
+                retry_after_s,
             });
         }
     }

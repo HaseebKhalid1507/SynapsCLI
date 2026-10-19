@@ -413,7 +413,8 @@ enum AuthAction {
         /// Restrict to one OAuth provider (e.g. claude, openai-codex)
         #[arg(long)]
         provider: Option<String>,
-        /// Restrict to one account label (or `default`)
+        /// Restrict to one account label (or `default`): its state, and only
+        /// the selections that chose it or list it as failed
         #[arg(long, value_name = "LABEL|default")]
         account: Option<String>,
         /// Machine-readable JSON (the report only; notices go to stderr)
@@ -421,6 +422,8 @@ enum AuthAction {
         json: bool,
         /// Drop the matched accounts' in-memory cooldowns, usage readings and
         /// stickiness in the running daemon first. Never touches credentials.
+        /// With --account, the selection history stays; only a clear without
+        /// --account also drops it.
         #[arg(long)]
         clear: bool,
     },

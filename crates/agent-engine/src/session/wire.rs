@@ -959,7 +959,7 @@ mod tests {
 
     /// An `AuthState` reply with every nested type present.
     fn auth_state_report() -> agent_core::auth::AuthStateReport {
-        use agent_core::auth::auth_state::{AccountState, CooldownState, IdentityKind, ObservedOutcome, SelectionState};
+        use agent_core::auth::auth_state::{AccountState, CooldownReason, CooldownState, IdentityKind, ObservedOutcome, SelectionState};
         use agent_core::auth::quota_policy::{
             AccountFailure, AccountFailureKind, ObservationFailure, SelectionFailure, SelectionFailureKind,
         };
@@ -975,7 +975,7 @@ mod tests {
                 label: "a".into(),
                 identity: IdentityKind::Stable,
                 access_expires_ms: Some(1_800_000_600_000),
-                cooldown: Some(CooldownState { until_ms: 1_800_003_600_000, reason: "anthropic_quota_exhausted".into() }),
+                cooldown: Some(CooldownState { until_ms: 1_800_003_600_000, reason: CooldownReason::AnthropicQuotaExhausted }),
                 last_usage: Some(ObservedOutcome { at_ms: 1_799_999_990_000, failure: Some(usage_429.clone()) }),
                 last_usage_ok_ms: Some(1_799_999_000_000),
                 last_refresh: Some(ObservedOutcome { at_ms: 1_799_999_500_000, failure: None }),

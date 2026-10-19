@@ -1999,7 +1999,7 @@ impl LocalBroker {
             .filter(|c| c.until_ms > now_ms)
             .map(|c| super::auth_state::CooldownState {
                 until_ms: c.until_ms,
-                reason: c.reason.clone(),
+                reason: super::auth_state::CooldownReason::from_reported(&c.reason),
             })
     }
 
@@ -4336,6 +4336,10 @@ fn auth_state_report(
                 .filter(|(k, s)| {
                     k.starts_with(&store_prefix)
                         && provider.map_or(true, |p| s.provider == p.as_str())
+                        && query
+                            .account
+                            .as_deref()
+                            .map_or(true, |label| selection_involves(s, label))
                 })
                 .map(|(_, s)| s.clone())
                 .collect()
@@ -4352,6 +4356,15 @@ fn auth_state_report(
         selections,
         cleared,
     })
+}
+
+/// `auth state --account LABEL` keeps a selection that chose `label` or
+/// lists it among the accounts that failed.
+fn selection_involves(s: &super::auth_state::SelectionState, label: &str) -> bool {
+    s.chosen.as_deref() == Some(label)
+        || s.failure
+            .as_ref()
+            .is_some_and(|f| f.accounts.iter().any(|a| a.account == label))
 }
 
 /// remote transport. There is no third option — and no direct-read fallback.
