@@ -4345,7 +4345,7 @@ fn auth_state_report(
                 .collect()
         })
         .unwrap_or_default();
-    selections.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    selections.sort_by_key(|s| std::cmp::Reverse(s.at_ms));
     Ok(AuthStateReport {
         schema_version: AUTH_STATE_SCHEMA_VERSION,
         live: false,
