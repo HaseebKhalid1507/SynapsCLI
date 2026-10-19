@@ -816,17 +816,20 @@ impl SelectionFailure {
         }
     }
 
-    /// Classify a `NoCapacity` result. An account counts as limited when it
-    /// is cooling down or at a provider limit, whatever its last read said.
-    /// First match wins: no accounts → `no_credentials`; a transient failure
-    /// on an account that is not limited → `usage_read_failed`; every
-    /// account limited → `all_cooling_down`; every account not limited needs
-    /// a login → `credential_rejected`; each needs a login or an action
-    /// outside synaps (at least one an action) → `action_required`; else
-    /// `quota_unknown`. The earliest reset is the earliest time some limited
-    /// account is usable again: the minimum of their `until`, skipping
-    /// accounts that also need a login or an action (their cooldown's end
-    /// alone won't make them usable).
+    /// Classify a `NoCapacity` result. The headline is what the user can act
+    /// on now: it is classified over accounts that aren't cooling down. A
+    /// cooling account's read failure is shown per account. An account
+    /// counts as limited when it is cooling down or at a provider limit,
+    /// whatever its last read said; only the other accounts' kinds pick the
+    /// headline. First match wins: no accounts → `no_credentials`; a
+    /// transient failure on an account that is not limited →
+    /// `usage_read_failed`; every account limited → `all_cooling_down`;
+    /// every account not limited needs a login → `credential_rejected`; each
+    /// needs a login or an action outside synaps (at least one an action) →
+    /// `action_required`; else `quota_unknown`. The earliest reset is the
+    /// earliest time some limited account is usable again: the minimum of
+    /// their `until`, skipping accounts that also need a login or an action
+    /// (their cooldown's end alone won't make them usable).
     pub fn from_rejections(rejections: &[Rejection], now_ms: u64) -> Self {
         use SelectionFailureKind as K;
         let accounts: Vec<_> = rejections
@@ -2807,6 +2810,76 @@ mod tests {
         assert!(serde_json::to_value(&g).unwrap()["accounts"][0]
             .get("cooling_down")
             .is_none());
+    }
+
+    /// r3, the B1 headline rule: the headline is what the user can act on
+    /// now, classified over the accounts that aren't cooling down; a
+    /// cooling account's read failure is shown per account (kind, status,
+    /// Retry-After, the cooling flag and `:cooling` in the WARN field).
+    /// A: every account cools, one also had a usage 429 → all_cooling_down.
+    /// B: a cooling 429 plus a live refused login → credential_rejected.
+    #[test]
+    fn the_headline_skips_a_cooling_accounts_read_failure_which_stays_per_account() {
+        use AccountFailureKind as K;
+        use SelectionFailureKind as S;
+        let throttled = || {
+            let mut c = failed(
+                "claude5",
+                ObservationFailure::new(K::UsageRateLimited)
+                    .with_status(429)
+                    .with_retry_after(Some(90)),
+            );
+            c.cooldown_until_ms = Some(NOW + HOUR);
+            c
+        };
+        let c5_kept = |f: &SelectionFailure| {
+            let c5 = &f.accounts[0];
+            assert_eq!(
+                (
+                    c5.account.as_str(),
+                    c5.kind,
+                    c5.http_status,
+                    c5.retry_after_s,
+                    c5.cooling_down,
+                    c5.until_ms
+                ),
+                (
+                    "claude5",
+                    K::UsageRateLimited,
+                    Some(429),
+                    Some(90),
+                    true,
+                    Some(NOW + HOUR)
+                ),
+                "{f:?}"
+            );
+        };
+
+        let mut plain = ok("claude6", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        plain.cooldown_until_ms = Some(NOW + 2 * HOUR);
+        let a = failure_of(&[throttled(), plain]);
+        assert_eq!(a.kind, S::AllCoolingDown, "{a:?}");
+        c5_kept(&a);
+        assert_eq!(
+            a.accounts_field(),
+            "claude5:usage_rate_limited:429:cooling,claude6:cooling_down"
+        );
+        assert_eq!(a.earliest_reset_ms, Some(NOW + HOUR));
+        assert!(a.login_labels().is_empty(), "{a:?}");
+
+        let refused = failed(
+            "claude2",
+            ObservationFailure::new(K::UsageUnauthorized).with_status(401),
+        );
+        let b = failure_of(&[throttled(), refused]);
+        assert_eq!(b.kind, S::CredentialRejected, "{b:?}");
+        c5_kept(&b);
+        assert_eq!(
+            b.accounts_field(),
+            "claude5:usage_rate_limited:429:cooling,claude2:usage_unauthorized:401"
+        );
+        assert_eq!(b.earliest_reset_ms, Some(NOW + HOUR));
+        assert_eq!(b.login_labels(), vec!["claude2"]);
     }
 
     /// r2 item 7: an account is usable again only when every exhausted

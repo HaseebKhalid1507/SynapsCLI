@@ -2162,6 +2162,218 @@ mod tests {
         assert!(!text.contains("synaps login"), "{text}");
     }
 
+    // ── The same texts from a CLASSIFIED failure (r3) ────────────────────
+    //
+    // `select` + `SelectionFailure::from_rejections` over scripted account
+    // capacities: the headline kind is computed, never injected.
+
+    fn anthropic_ref(label: &str) -> CredentialRef {
+        CredentialRef::new(
+            OAuthProviderId::Anthropic,
+            crate::auth::Account::named(label).unwrap(),
+        )
+    }
+
+    /// An account whose last read or refresh failed with `failure`, cooling
+    /// down until `until` when given.
+    fn failed_capacity(
+        label: &str,
+        failure: agent_core::auth::ObservationFailure,
+        until: Option<u64>,
+    ) -> crate::auth::quota_policy::AccountCapacity {
+        let mut cap =
+            crate::auth::quota_policy::AccountCapacity::failed(anthropic_ref(label), failure);
+        cap.cooldown_until_ms = until;
+        cap
+    }
+
+    /// An account with no reading that is cooling down until `until`.
+    fn cooling_capacity(label: &str, until: u64) -> crate::auth::quota_policy::AccountCapacity {
+        let mut cap = crate::auth::quota_policy::AccountCapacity::unobserved(anthropic_ref(label));
+        cap.cooldown_until_ms = Some(until);
+        cap
+    }
+
+    /// Run the real selection over `candidates` and classify its failure.
+    fn classified(
+        candidates: &[crate::auth::quota_policy::AccountCapacity],
+        now: u64,
+    ) -> SelectionFailure {
+        use crate::auth::quota_policy::{select, Selection, SelectionRequest};
+        let req = SelectionRequest::new(OAuthProviderId::Anthropic, now, 60_000);
+        match select(&req, candidates) {
+            Selection::NoCapacity { rejections, .. } => {
+                SelectionFailure::from_rejections(&rejections, now)
+            }
+            other => panic!("expected no capacity, got {other:?}"),
+        }
+    }
+
+    fn throttled_429() -> agent_core::auth::ObservationFailure {
+        agent_core::auth::ObservationFailure::new(AK::UsageRateLimited)
+            .with_status(429)
+            .with_retry_after(Some(90))
+    }
+
+    /// r3, the B1 headline rule: the headline is what the user can act on
+    /// now, classified over the accounts that aren't cooling down; a
+    /// cooling account's read failure is shown per account. A: claude5
+    /// cools with a usage 429, claude6 cools plainly. B: claude5 cools with
+    /// a usage 429, claude2 is not cooling and its login was refused.
+    /// Neither text may claim capacity is "not used up" or that sending
+    /// again now retries anything.
+    #[tokio::test]
+    async fn classified_cooling_429_headlines_tell_what_can_be_done_now() {
+        let now = crate::epoch_millis();
+        let t5 = now + 30 * 60 * 1000;
+        let t6 = now + 2 * 60 * 60 * 1000;
+        let t5_text = super::super::anthropic_quota::describe_reset_utc(t5, now);
+        let c5_part = format!(
+            "claude5: usage_rate_limited (HTTP 429, retry after 90s, cooling down until {t5_text})"
+        );
+
+        let a = classified(
+            &[
+                failed_capacity("claude5", throttled_429(), Some(t5)),
+                cooling_capacity("claude6", t6),
+            ],
+            now,
+        );
+        assert_eq!(a.kind, SK::AllCoolingDown, "{a:?}");
+        let (text, log) = failed_turn_start(no_account(a)).await;
+        for needle in [
+            c5_part.clone(),
+            format!("earliest reset {t5_text}"),
+            format!("send again after {t5_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!lower.contains("send again to retry"), "{text}");
+        assert!(!lower.contains("not used up"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
+
+        let b = classified(
+            &[
+                failed_capacity("claude5", throttled_429(), Some(t5)),
+                failed_capacity(
+                    "claude2",
+                    agent_core::auth::ObservationFailure::new(AK::UsageUnauthorized)
+                        .with_status(401),
+                    None,
+                ),
+            ],
+            now,
+        );
+        assert_eq!(b.kind, SK::CredentialRejected, "{b:?}");
+        let (text, log) = failed_turn_start(no_account(b)).await;
+        for needle in [
+            c5_part,
+            format!("earliest reset {t5_text}"),
+            "claude2 needs a new login: `synaps login --provider anthropic --account claude2`"
+                .to_string(),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!lower.contains("send again to retry"), "{text}");
+        assert!(!lower.contains("not used up"), "{text}");
+        assert!(!lower.contains("no login needed"), "{text}");
+        assert!(
+            turn_warn(&log).contains("kind=credential_rejected"),
+            "{log}"
+        );
+    }
+
+    /// r3: the classified form of
+    /// `all_cooling_with_one_refused_login_names_its_command_and_never_no_login_needed`.
+    #[tokio::test]
+    async fn classified_all_cooling_with_one_refused_login_names_its_command_and_never_no_login_needed(
+    ) {
+        let now = crate::epoch_millis();
+        let soon = now + 20 * 60 * 1000;
+        let later = now + 2 * 60 * 60 * 1000;
+        let f = classified(
+            &[
+                failed_capacity(
+                    "claude2",
+                    agent_core::auth::ObservationFailure::new(AK::UsageUnauthorized)
+                        .with_status(401),
+                    Some(later),
+                ),
+                cooling_capacity("claude6", soon),
+            ],
+            now,
+        );
+        assert_eq!(f.kind, SK::AllCoolingDown, "{f:?}");
+        let (text, log) = failed_turn_start(no_account(f)).await;
+        let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
+        let later_text = super::super::anthropic_quota::describe_reset_utc(later, now);
+        for needle in [
+            format!("claude2: usage_unauthorized (HTTP 401, cooling down until {later_text})"),
+            "claude2 needs a new login: `synaps login --provider anthropic --account claude2`"
+                .to_string(),
+            format!("Send again after {soon_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.to_lowercase().contains("no login needed"), "{text}");
+        assert!(!text.contains("--account claude6"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
+    }
+
+    /// r2 item 7, the case the reviewer found untested: every account is
+    /// cooling AND needs a login or an action, so cooldowns ending fixes
+    /// nothing. The text names each fix and gives no time to send again,
+    /// no retry or "later" advice and no "no login needed".
+    #[tokio::test]
+    async fn classified_all_cooling_and_all_needing_a_fix_names_each_fix_and_no_time_to_retry() {
+        let now = crate::epoch_millis();
+        let hour = 60 * 60 * 1000;
+        let f = classified(
+            &[
+                failed_capacity(
+                    "claude3",
+                    agent_core::auth::ObservationFailure::new(AK::UsageUnauthorized)
+                        .with_status(401),
+                    Some(now + hour),
+                ),
+                failed_capacity(
+                    "claude4",
+                    agent_core::auth::ObservationFailure::new(AK::CredentialStore),
+                    Some(now + 2 * hour),
+                ),
+                failed_capacity(
+                    "claude5",
+                    agent_core::auth::ObservationFailure::new(AK::RefreshActionRequired),
+                    Some(now + 3 * hour),
+                ),
+            ],
+            now,
+        );
+        assert_eq!(f.kind, SK::AllCoolingDown, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, None, "{f:?}");
+        let (text, log) = failed_turn_start(no_account(f)).await;
+        for needle in [
+            "claude3 needs a new login: `synaps login --provider anthropic --account claude3`",
+            "claude4: its stored login could not be read; repair or restore the credential store",
+            "claude5: the token refresh needs an action outside synaps",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        for banned in [
+            "send again",
+            "later",
+            "retry",
+            "no login needed",
+            "earliest reset",
+        ] {
+            assert!(!lower.contains(banned), "{banned:?} in: {text}");
+        }
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
+    }
+
     /// r2 blocker 2: a refresh that needs an action outside synaps, or an
     /// unreadable store, is named with its remedy, with no "send again"
     /// retry advice, no "no login needed" and no login command.
