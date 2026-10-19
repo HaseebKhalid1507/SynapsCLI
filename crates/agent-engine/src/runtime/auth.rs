@@ -2475,6 +2475,54 @@ mod tests {
         assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
     }
 
+    /// S2 c3 condition 1, rendered: every account's chosen-seat refresh was
+    /// refused in one selection (the broker carries each refusal as
+    /// `refresh_rejected`/400). The classified failure names every login
+    /// command, gives no time to send again, no retry or "later" advice and
+    /// no "no login needed". A guard: S1's renderer already does this; the
+    /// core test `every_chosen_accounts_refused_refresh_ends_the_selection_naming_each_login`
+    /// pins the failure the broker builds.
+    #[tokio::test]
+    async fn classified_every_refused_refresh_names_each_login_and_no_time_to_retry() {
+        let now = crate::epoch_millis();
+        let refused = || {
+            agent_core::auth::ObservationFailure::new(AK::RefreshRejected).with_status(400)
+        };
+        let f = classified(
+            &[
+                failed_capacity("claude2", refused(), None),
+                failed_capacity("claude3", refused(), None),
+            ],
+            now,
+        );
+        assert_eq!(f.kind, SK::CredentialRejected, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, None, "{f:?}");
+        let (text, log) = failed_turn_start(no_account(f)).await;
+        for needle in [
+            "claude2: refresh_rejected (HTTP 400)",
+            "claude3: refresh_rejected (HTTP 400)",
+            "claude2, claude3 need a new login: \
+             `synaps login --provider anthropic --account claude2`, \
+             `synaps login --provider anthropic --account claude3`.",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        for banned in [
+            "send again",
+            "later",
+            "retry",
+            "no login needed",
+            "earliest reset",
+        ] {
+            assert!(!lower.contains(banned), "{banned:?} in: {text}");
+        }
+        assert!(
+            turn_warn(&log).contains("kind=credential_rejected"),
+            "{log}"
+        );
+    }
+
     /// r2 blocker 2: a refresh that needs an action outside synaps, or an
     /// unreadable store, is named with its remedy, with no "send again"
     /// retry advice, no "no login needed" and no login command.

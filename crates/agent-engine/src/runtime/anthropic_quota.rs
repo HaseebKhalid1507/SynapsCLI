@@ -370,14 +370,16 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
     /// refuses to switch, so the next turn boundary re-selects away.
     async fn report_exhausted(&self, failed: &CredentialRef, evidence: &AnthropicQuotaEvidence);
 
-    /// After recognized exhaustion on `failed`, ask the broker to select
-    /// again for `model`. `Ok(None)` when the answer is the same seat or no
-    /// eligible seat exists; `Err` for any other broker failure. Called only
-    /// after [`failover_permitted`] passed.
+    /// After recognized exhaustion, ask the broker to select again for
+    /// `model`, never answering with an account in `attempted`: every
+    /// account this logical request already used, the exhausted one last.
+    /// `Ok(None)` when no other eligible account exists (or the broker's
+    /// answer was already attempted); `Err` for any other broker failure.
+    /// Called only after [`failover_permitted`] passed.
     async fn failover(
         &self,
         model: &str,
-        failed: &CredentialRef,
+        attempted: &[CredentialRef],
     ) -> Result<Option<PinnedToken>, String>;
 }
 
@@ -387,8 +389,9 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
 /// Selection policy lives in exactly one place: the broker's `Auto`
 /// selector. Failover therefore does not rebuild candidates in the runtime;
 /// it reports the exhausted seat's cooldown and asks the broker to select
-/// again, then verifies the answer is a DIFFERENT account. A broker that
-/// cannot honour the cooldown (default no-op sink) answers with the same
+/// again without the accounts the request already used, then verifies the
+/// answer is none of them. A broker that cannot honour the cooldown or the
+/// exclusion (default no-op sink, a remote broker) answers with an attempted
 /// seat, which the runtime refuses — bounded and safe, never a loop.
 ///
 /// The broker is built lazily from the request's credential source so the
@@ -467,7 +470,7 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
     async fn failover(
         &self,
         model: &str,
-        failed: &CredentialRef,
+        attempted: &[CredentialRef],
     ) -> Result<Option<PinnedToken>, String> {
         let provider = OAuthProviderId::Anthropic;
         // The gate already established `Auto`; re-check so a policy that
@@ -477,11 +480,15 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
         }
         match self
             .broker()
-            .access_token_pinned_for(provider, Some(super::auth::quota_model_key(model)))
+            .access_token_pinned_excluding(
+                provider,
+                Some(super::auth::quota_model_key(model)),
+                attempted,
+            )
             .await
         {
-            Ok(next) if next.credential != *failed => Ok(Some(next)),
-            Ok(_same_seat) => Ok(None),
+            Ok(next) if !attempted.contains(&next.credential) => Ok(Some(next)),
+            Ok(_attempted_seat) => Ok(None),
             Err(BrokerError::NoAccountAvailable { .. }) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
@@ -940,6 +947,8 @@ mod tests {
         vend_error: Mutex<Option<BrokerError>>,
         cooldowns: Mutex<Vec<(String, Option<u64>, String)>>,
         auto_calls: Mutex<Vec<Option<String>>>,
+        /// The `exclude` list of every excluding vend.
+        excluded: Mutex<Vec<Vec<CredentialRef>>>,
     }
 
     impl ScriptedBroker {
@@ -950,6 +959,7 @@ mod tests {
                 vend_error: Mutex::new(None),
                 cooldowns: Mutex::new(Vec::new()),
                 auto_calls: Mutex::new(Vec::new()),
+                excluded: Mutex::new(Vec::new()),
             })
         }
     }
@@ -988,6 +998,25 @@ mod tests {
                     expires: u64::MAX,
                 },
             })
+        }
+        /// Records the exclusion, then answers like the trait default:
+        /// the scripted pick, refused when it is excluded.
+        async fn access_token_pinned_excluding(
+            &self,
+            provider: OAuthProviderId,
+            model: Option<&str>,
+            exclude: &[CredentialRef],
+        ) -> Result<PinnedToken, BrokerError> {
+            self.excluded.lock().unwrap().push(exclude.to_vec());
+            let pinned = self.access_token_pinned_for(provider, model).await?;
+            if exclude.contains(&pinned.credential) {
+                return Err(BrokerError::NoAccountAvailable {
+                    provider: provider.as_str().into(),
+                    reason: "scripted: already attempted".into(),
+                    failure: None,
+                });
+            }
+            Ok(pinned)
         }
         async fn report_cooldown(
             &self,
@@ -1065,7 +1094,7 @@ mod tests {
         let router = BrokerAnthropicRouter::new(broker.clone());
         assert!(router.auto_selected());
         let next = router
-            .failover("anthropic/claude-opus-4-7", &seat("claude4"))
+            .failover("anthropic/claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap()
             .expect("distinct seat");
@@ -1078,7 +1107,7 @@ mod tests {
         );
         // Same seat back ⇒ no failover (a no-op cooldown sink can never loop).
         let same = router
-            .failover("claude-opus-4-7", &seat("claude2"))
+            .failover("claude-opus-4-7", &[seat("claude2")])
             .await
             .unwrap();
         assert!(same.is_none());
@@ -1089,16 +1118,41 @@ mod tests {
         let broker = ScriptedBroker::new(AccountSelector::Auto, None);
         let router = BrokerAnthropicRouter::new(broker.clone());
         assert!(router
-            .failover("claude-opus-4-7", &seat("claude4"))
+            .failover("claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap()
             .is_none());
         *broker.vend_error.lock().unwrap() = Some(BrokerError::Transport("down".into()));
         let err = router
-            .failover("claude-opus-4-7", &seat("claude4"))
+            .failover("claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap_err();
         assert!(err.contains("down"));
+    }
+
+    #[tokio::test]
+    async fn router_failover_passes_every_attempted_account_and_never_answers_one() {
+        let broker = ScriptedBroker::new(AccountSelector::Auto, Some("claude2"));
+        let router = BrokerAnthropicRouter::new(broker.clone());
+        let attempted = [seat("claude4"), seat("claude5")];
+        let next = router
+            .failover("claude-opus-4-7", &attempted)
+            .await
+            .unwrap()
+            .expect("claude2 was not attempted");
+        assert_eq!(next.credential, seat("claude2"));
+        // The broker's answer is attempted ⇒ no failover.
+        let attempted_too = [seat("claude4"), seat("claude2")];
+        assert!(router
+            .failover("claude-opus-4-7", &attempted_too)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            broker.excluded.lock().unwrap().clone(),
+            vec![attempted.to_vec(), attempted_too.to_vec()],
+            "the broker is told every attempted account, in order"
+        );
     }
 
     #[tokio::test]
@@ -1108,7 +1162,7 @@ mod tests {
         *broker.selector.lock().unwrap() = AccountSelector::Account(Account::Default);
         assert!(!router.auto_selected());
         assert!(router
-            .failover("claude-opus-4-7", &seat("claude4"))
+            .failover("claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap()
             .is_none());

@@ -699,6 +699,33 @@ pub trait CredentialBroker: Send + Sync {
         self.access_token_pinned(provider).await
     }
 
+    /// [`access_token_pinned_for`] that never answers with an account in
+    /// `exclude` (the accounts one logical request already used). Default
+    /// implementation: the ordinary selection, with an excluded answer
+    /// refused as "no account available"; a broker that can pass the
+    /// exclusion into its own selection overrides this.
+    ///
+    /// [`access_token_pinned_for`]: Self::access_token_pinned_for
+    async fn access_token_pinned_excluding(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+        exclude: &[CredentialRef],
+    ) -> Result<PinnedToken, BrokerError> {
+        let pinned = self.access_token_pinned_for(provider, model).await?;
+        if exclude.contains(&pinned.credential) {
+            return Err(BrokerError::NoAccountAvailable {
+                provider: provider.as_str().to_string(),
+                reason: format!(
+                    "the broker chose {}, which this request already used",
+                    pinned.credential.account
+                ),
+                failure: None,
+            });
+        }
+        Ok(pinned)
+    }
+
     /// Non-secret account listing for `provider`. Default: unsupported.
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
         Err(BrokerError::UnsupportedCapability {
