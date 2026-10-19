@@ -1,4 +1,6 @@
-//! Staged, re-checked, all-or-nothing commit of the planned file contents.
+//! Staged, re-checked commit of the planned file contents: every file is
+//! planned and checked before any is published; publication then rolls back
+//! best-effort, and a failed rollback is reported.
 //!
 //! Every step goes through a handle on each target's parent directory,
 //! opened during planning by a no-follow walk of the canonical parent path
@@ -294,14 +296,16 @@ fn restore(p: &Pending, hooks: &mut dyn Hooks) -> Result<(), String> {
 }
 
 /// Remove a temp, but only the file this call created: a name taken over
-/// by someone else is left alone.
+/// by someone else is left alone, outside the window between
+/// [`remove_if_ours`]'s check and its unlink.
 fn remove_temp(p: &Pending, staged: &Staged) {
     let _ = remove_if_ours(&p.dir, &staged.name, staged.identity);
 }
 
 /// Remove `name` from `dir` only while it is the regular file with
 /// `identity` (the file this call created). `Err` says why it is still
-/// there; a name that is already gone is `Ok`.
+/// there; a name that is already gone is `Ok`. The check and the unlink are
+/// separate steps: a file renamed onto `name` between them is removed.
 fn remove_if_ours(dir: &Dir, name: &OsStr, identity: Option<(u64, u64)>) -> Result<(), String> {
     match dir.lstat(name) {
         Ok(meta) if meta.kind == Kind::File && meta.identity == identity => {
@@ -326,7 +330,9 @@ pub(crate) fn create_temp_for_test(parent: &Path, name: &str, bytes: &[u8]) -> s
     write_new(&dir, OsStr::new(name), bytes, None, &mut RealHooks).map(drop)
 }
 
-/// Commit every file, or none (see the module docs). `Ok` holds a note per
+/// Publish every file (see the module docs): every file is planned and
+/// checked before any is published; publication then rolls back
+/// best-effort, and a failed rollback is reported. `Ok` holds a note per
 /// file that was published with something left over.
 pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<Vec<String>, String> {
     let mut temps: Vec<Staged> = Vec::with_capacity(files.len());

@@ -1,4 +1,6 @@
-//! `multi_edit`: anchored edits across several files, all or nothing.
+//! `multi_edit`: anchored edits across several files. Every file is planned
+//! and checked before any is published; publication then rolls back
+//! best-effort, and a failed rollback is reported.
 //!
 //! One call carries a list of edits. Every edit is validated and applied to
 //! in-memory copies first (`plan`); if any edit fails, no file is written.

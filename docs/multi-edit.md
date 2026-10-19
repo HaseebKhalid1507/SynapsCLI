@@ -1,8 +1,10 @@
 # `multi_edit`
 
-Anchored edits across one or more files in a single tool call, all or
-nothing. Every edit is checked against in-memory copies first; if any edit
-fails, no file is written and the error names the edit.
+Anchored edits across one or more files in a single tool call. Every file is
+planned and checked before any is published; publication then rolls back
+best-effort, and a failed rollback is reported. Every edit is checked against
+in-memory copies first; if any edit fails, no file is written and the error
+names the edit.
 
 `edit` is unchanged. Use `multi_edit` when a change touches several places or
 files that must stay consistent, or when an anchor might match more than once.
@@ -113,7 +115,7 @@ For each file:
    still be the same inode with the same bytes that were planned against
    (or, for a new file, still absent). Any change refuses the whole call and
    removes this call's temps; a temp name taken over by someone else is left
-   alone.
+   alone (outside the cleanup's own check-to-unlink window, below).
 3. Each temp is renamed onto its target. A new file is published only by a
    primitive that never replaces an existing name: `renameat2` with
    `RENAME_NOREPLACE` on Linux, otherwise a hard link. On a filesystem with
@@ -123,7 +125,8 @@ For each file:
 If a later file fails in step 3, the files already written are put back from
 their in-memory originals (only if they still hold what this call wrote),
 through owner-only temps like step 1, and the error lists which files were
-restored, which could not be, and which were never written.
+restored, which could not be, which were never written, and any temp an
+earlier file left over (below).
 
 - A symlink stays a symlink: its target file is edited. A dangling symlink is
   an error.
@@ -144,7 +147,11 @@ restored, which could not be, and which were never written.
   available) normally has its temp name removed. If that removal fails, the
   file is still published and the call succeeds; the result ends with
   `warning: PATH published; could not remove temp TEMP: why`, naming the
-  second link left in the directory.
+  second link left in the directory. If a later file then fails, the error
+  carries the same diagnostic: the temp is tried once more (identity-checked,
+  like every cleanup) and the error says whether it was removed or is still
+  there. The warning is for people, not a protocol: paths appear unescaped
+  (they may contain newlines), so it is not meant to be parsed.
 
 Best-effort publication and residual windows:
 
@@ -157,6 +164,9 @@ Best-effort publication and residual windows:
   the one edited.
 - A restore has its own unlocked window between reading a file back and
   putting its original back. Each file's outcome is reported exactly.
+- Cleanup checks that a temp's name still holds the file this call created,
+  then unlinks it; the two steps are separate, so a file renamed onto that
+  name in between can still be removed.
 - Nothing is atomic across files or across a crash.
 
 On systems other than Unix there are no directory handles: every step works

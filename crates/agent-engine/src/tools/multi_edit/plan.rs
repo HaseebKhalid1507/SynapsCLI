@@ -1,8 +1,9 @@
 //! Pure in-memory matching and application of one anchored edit.
 //!
 //! Everything here works on a `String` and never touches the filesystem, so
-//! the all-or-nothing rule is easy to keep: the caller applies every edit of
-//! a call to in-memory copies first and writes nothing if any edit fails.
+//! the rule that a failed edit writes nothing is easy to keep: the caller
+//! applies every edit of a call to in-memory copies first and writes
+//! nothing if any edit fails.
 
 use super::{AnchorMode, Op};
 
