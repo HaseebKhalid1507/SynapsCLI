@@ -413,6 +413,12 @@ pub(crate) fn subagent_close_cancel_event(
     event
 }
 
+/// `KeepWarm{on: true}`'s notice (`/pin on`, `daemon pin`, `--keep-warm`).
+pub const PIN_ON_NOTICE: &str = "pinned: this session stays loaded (never parked or idle-ended, \
+     and the daemon will not idle-exit while it is pinned). /pin off to undo.";
+/// `KeepWarm{on: false}`'s notice.
+pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle";
+
 /// The engine command behind `/close` (`SessionActor::close_command`).
 pub(crate) const CLOSE_COMMAND: &str = "close";
 
@@ -551,6 +557,9 @@ pub struct SessionActor {
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
     /// Mirrors `handle.name()`; `sync_name` after any rename.
     pub(crate) name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// Mirrors `handle.pinned()`; written with `keep_warm` (create seeds it
+    /// from `meta.pinned`, `KeepWarm{on}` stores it).
+    pub(crate) keep_warm_cell: Arc<std::sync::atomic::AtomicBool>,
     /// F10: per-session journal ownership lock. Held while Live, released on Park.
     pub(crate) session_lock: Option<agent_core::session_lock::SessionLock>,
     // ── E: session driver (actor-side, behind `session.drive` permission) ──
@@ -756,6 +765,7 @@ impl SessionActor {
             awaiting_input: 0,
             journal_id: sb.session.id.clone(),
             locked_by: None,
+            pinned: cfg.keep_warm,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -786,6 +796,7 @@ impl SessionActor {
                 journal_id,
                 presence,
                 name,
+                keep_warm: keep_warm_cell,
                 cache_keepwarm,
                 memory_mode,
             },
@@ -847,6 +858,7 @@ impl SessionActor {
             journal_id,
             presence,
             name,
+            keep_warm_cell,
             session_lock,
             driver: None,
             driver_pending: None,
@@ -4012,6 +4024,7 @@ impl SessionActor {
                     "auto_turns": self.consecutive_auto_turns,
                     "attached": 0,
                     "pending_prompts": 0,
+                    "pinned": self.keep_warm,
                 }),
                 SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
                 // A parked session has no live workers; a watch poll must not wake it.
@@ -4041,6 +4054,8 @@ impl SessionActor {
                 "auto_turns": self.consecutive_auto_turns,
                 "attached": self.attached.len(),
                 "pending_prompts": self.pending_prompts.len(),
+                // `/pin` status in the TUI.
+                "pinned": self.keep_warm,
             }),
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
@@ -4564,7 +4579,10 @@ impl SessionActor {
                     | SessionCommand::ReloadAborted
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
-            ) && !is_close_command(&cmd); // closing a parked session must not rebuild it
+            ) && !is_close_command(&cmd) // closing a parked session must not rebuild it
+                // Unpinning a parked session only clears the flag; pinning
+                // one wakes it (a pinned session is live by definition).
+                && !matches!(cmd, SessionCommand::KeepWarm { on: false });
             if matches!(cmd, SessionCommand::HostEvent(_)) {
                 return ControlFlow::Continue(()); // nobody attached, nothing to render
             }
@@ -4710,11 +4728,14 @@ impl SessionActor {
             }
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
+                self.meta.pinned = on; // the attach snapshot's copy
+                self.keep_warm_cell.store(on, std::sync::atomic::Ordering::Release);
                 self.rearm_park();
-                self.emit(SessionEventWire::SystemNotice(format!(
-                    "keep-warm {}",
-                    if on { "on: this session will not be parked" } else { "off" }
-                )));
+                self.emit(SessionEventWire::SystemNotice(if on {
+                    PIN_ON_NOTICE.to_string()
+                } else {
+                    PIN_OFF_NOTICE.to_string()
+                }));
             }
             SessionCommand::HostEvent(ev) => match ev {
                 HostEvent::ExtensionNotification {

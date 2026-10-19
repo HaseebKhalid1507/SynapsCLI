@@ -40,6 +40,11 @@ pub struct ScriptedTransport {
     /// When set, every input command is answered `Refused{client: me,
     /// reason}` with no side effect (B1 ownership, non-owner client).
     refuse_input: Option<String>,
+    /// `daemon_pid()`: 0 = behaves as in-process (`LocalTransport`),
+    /// anything else as a daemon session.
+    daemon_pid: u32,
+    /// The pin, as `KeepWarm{on}` left it (answered in `Status`).
+    pinned: bool,
 }
 
 impl ScriptedTransport {
@@ -65,6 +70,7 @@ impl ScriptedTransport {
             awaiting_input: 0,
             journal_id: session.id.clone(),
             locked_by: None,
+            pinned: false,
         };
         let view = Arc::new(RuntimeView::snapshot(&runtime, 0));
         Self {
@@ -79,7 +85,16 @@ impl ScriptedTransport {
             log: Arc::new(Mutex::new(ScriptedLog::default())),
             pending: Mutex::new(VecDeque::new()),
             refuse_input: None,
+            daemon_pid: 0,
+            pinned: false,
         }
+    }
+
+    /// Report `pid` as the daemon's, so the TUI treats this as a daemon
+    /// session (`/pin`).
+    pub fn with_daemon_pid(mut self, pid: u32) -> Self {
+        self.daemon_pid = pid;
+        self
     }
 
     /// Behave as the actor does for a non-owner: input commands are
@@ -317,6 +332,12 @@ impl ScriptedTransport {
             SessionCommand::Query { id, query } => {
                 let value = match query {
                     SessionQuery::View => serde_json::to_value(&*self.view).unwrap_or_default(),
+                    SessionQuery::Status => serde_json::json!({
+                        "session": self.session.id,
+                        "streaming": false,
+                        "pending_prompts": 0,
+                        "pinned": self.pinned,
+                    }),
                     SessionQuery::ContextReport => {
                         use synaps_cli::engine::commands::{context_command, CommandResult};
                         let msgs = self.api_messages.lock().unwrap().clone();
@@ -360,6 +381,16 @@ impl ScriptedTransport {
                         ..Default::default()
                     },
                 ));
+            }
+            // = the actor's `KeepWarm` arm.
+            SessionCommand::KeepWarm { on } => {
+                self.pinned = on;
+                let notice = if on {
+                    agent_engine::session::actor::PIN_ON_NOTICE
+                } else {
+                    agent_engine::session::actor::PIN_OFF_NOTICE
+                };
+                self.push_event(SessionEventWire::SystemNotice(notice.to_string()));
             }
             // Turn-machine commands: recorded only (the tape feeds the
             // envelopes a real actor would answer with).
@@ -427,5 +458,8 @@ impl ClientTransport for ScriptedTransport {
     }
     async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
         Err(TransportError::Unsupported("reconnect: scripted transport"))
+    }
+    fn daemon_pid(&self) -> u32 {
+        self.daemon_pid
     }
 }

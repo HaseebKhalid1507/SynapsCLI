@@ -231,6 +231,11 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "workers",
     "confirms",
     "keepwarm",
+    // The daemon-session pin; `keep-warm` is its older name, kept as an
+    // alias. Registered so `/keep-warm` never fuzzy-resolves to `/keepwarm`
+    // (the prompt-cache pings, which cost money).
+    "pin",
+    "keep-warm",
     "trace",
     "memory",
     "auth",
