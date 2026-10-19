@@ -1924,10 +1924,18 @@ mod tests {
     }
 
     impl LogCapture {
+        /// Formats into the capture through the daemon log file's own
+        /// filter: `with_crate_directives` over the ERROR default an unset
+        /// `RUST_LOG` gives, exactly what `init_logging` builds. A line
+        /// these tests find is a line synaps.log keeps.
         fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+            let unset = EnvFilter::builder()
+                .with_default_directive(LevelFilter::ERROR.into())
+                .parse_lossy("");
             let sink = self.0.clone();
             tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
+                .with_env_filter(crate::logging::with_crate_directives(unset))
                 .with_writer(move || LogWriter(sink.clone()))
                 .with_ansi(false)
                 .finish()
@@ -1994,6 +2002,33 @@ mod tests {
         assert_eq!(lines.len(), 1, "exactly one turn_auth_failed WARN:\n{log}");
         assert!(lines[0].contains("WARN"), "{}", lines[0]);
         lines[0].to_string()
+    }
+
+    /// The turn_auth_failed WARN reaches the daemon log, and the capture
+    /// is the real filter, not a pass-through: in the same subscriber a
+    /// WARN at a target outside the crate directives is dropped while an
+    /// ERROR there is kept (ERROR is the unset-`RUST_LOG` default).
+    #[tokio::test]
+    async fn turn_auth_failed_passes_the_daemon_log_filter_and_a_foreign_warn_does_not() {
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2],
+            earliest_reset_ms: None,
+        };
+        let (_, log) = failed_turn_start(no_account(failure)).await;
+        assert!(turn_warn(&log).contains("kind=usage_read_failed"), "{log}");
+
+        let capture = LogCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            tracing::warn!(target: "unrelated_crate::x", "foreign_warn_control");
+            tracing::error!(target: "unrelated_crate::x", "foreign_error_control");
+        }
+        let control = capture.take();
+        assert!(!control.contains("foreign_warn_control"), "{control}");
+        assert!(control.contains("foreign_error_control"), "{control}");
     }
 
     /// JR's incident: usage reads failed (endpoint 429/503) while one account

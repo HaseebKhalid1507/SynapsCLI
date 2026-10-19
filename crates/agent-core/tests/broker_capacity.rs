@@ -214,10 +214,18 @@ impl std::io::Write for CaptureWriter {
     }
 }
 
+/// Formats into `capture` through the daemon log file's own filter:
+/// `with_crate_directives` over the ERROR default that an unset `RUST_LOG`
+/// gives, exactly what `init_logging` builds. A line these tests find is a
+/// line synaps.log keeps.
 fn capture_subscriber(capture: &Capture) -> impl tracing::Subscriber + Send + Sync {
+    use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+    let unset = EnvFilter::builder()
+        .with_default_directive(LevelFilter::ERROR.into())
+        .parse_lossy("");
     let sink = capture.0.clone();
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(agent_core::logging::with_crate_directives(unset))
         .with_writer(move || CaptureWriter(sink.clone()))
         .with_ansi(false)
         .finish()
@@ -644,6 +652,63 @@ async fn an_unreadable_stored_login_makes_selection_action_required_not_quota_un
     let text = err.to_string();
     assert!(text.contains("credential_store"), "{text}");
     assert_secret_free(&text);
+}
+
+/// The auth lines these tests read reach the daemon log through its own
+/// filter (`capture_subscriber`), and that capture is not a pass-through:
+/// in the same subscriber a WARN at a target outside the crate directives
+/// is dropped, while an ERROR there is kept (the unset-`RUST_LOG`
+/// default). Also the one test that reads the `usage read needs action`
+/// WARN, which tells the user what to fix for an unreadable stored login.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_log_lines_pass_the_daemon_log_filter_and_a_foreign_warn_does_not() {
+    let home = install_store();
+    let store = home.path().join("auth.json");
+    let mut root: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+    root["anthropic@b"]["expires"] = json!("soon");
+    std::fs::write(&store, root.to_string()).unwrap();
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", roomy());
+    let broker = auto_broker(&spawn_usage(script).await);
+    broker
+        .report_cooldown(
+            &anthropic("a"),
+            Some(agent_core::epoch_millis() + 3_600_000),
+            "anthropic_quota_exhausted",
+        )
+        .await
+        .unwrap();
+
+    let capture = Capture::default();
+    {
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+        broker
+            .access_token_pinned(OAuthProviderId::Anthropic)
+            .await
+            .unwrap_err();
+        tracing::warn!(target: "unrelated_crate::x", "foreign_warn_control");
+        tracing::error!(target: "unrelated_crate::x", "foreign_error_control");
+    }
+    let log = capture.take();
+    assert!(
+        selection_warn(&log).contains("kind=action_required"),
+        "{log}"
+    );
+    let action: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("usage read needs action"))
+        .collect();
+    assert_eq!(action.len(), 1, "{log}");
+    assert!(
+        action[0].contains("WARN")
+            && action[0].contains("credential=anthropic@b")
+            && action[0].contains("kind=credential_store"),
+        "{log}"
+    );
+    assert!(!log.contains("foreign_warn_control"), "{log}");
+    assert!(log.contains("foreign_error_control"), "{log}");
 }
 
 // ── `synaps auth state` ─────────────────────────────────────────────────────
