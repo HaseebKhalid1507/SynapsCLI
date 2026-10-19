@@ -638,8 +638,11 @@ fn reload_bye(state: &DaemonState) -> ByeReason {
 /// token cache, which every session of this daemon uses. Same trust as the
 /// other control frames (the socket is the user's own). No network request,
 /// no refresh; a clear never writes the credential store.
-fn auth_state_reply(_state: &DaemonState, _query: &agent_core::auth::AuthStateQuery) -> DaemonFrame {
-    DaemonFrame::Error { session_id: None, message: "auth state: not implemented".into() }
+fn auth_state_reply(state: &DaemonState, query: &agent_core::auth::AuthStateQuery) -> DaemonFrame {
+    match agent_core::auth::local_auth_state(&state.host.parts().token_cache, query, true) {
+        Ok(report) => DaemonFrame::AuthState { report },
+        Err(e) => DaemonFrame::Error { session_id: None, message: format!("auth state: {e}") },
+    }
 }
 
 #[cfg(test)]

@@ -1029,15 +1029,75 @@ fn state_query(opts: &StateOptions) -> Result<auth::AuthStateQuery, String> {
 /// `not_live` builds the report in this process when the daemon cannot
 /// answer; it is never asked to clear.
 pub(crate) async fn state_with(
-    _sock: Option<&std::path::Path>,
-    _query: auth::AuthStateQuery,
-    _json: bool,
-    _not_live: impl FnOnce(&auth::AuthStateQuery) -> Result<auth::AuthStateReport, String>,
+    sock: Option<&std::path::Path>,
+    query: auth::AuthStateQuery,
+    json: bool,
+    not_live: impl FnOnce(&auth::AuthStateQuery) -> Result<auth::AuthStateReport, String>,
 ) -> StateOutput {
-    StateOutput {
-        error: Some("auth state: not implemented".into()),
-        ..StateOutput::default()
-    }
+    use agent_engine::session::socket_transport::{AuthStateReply, SocketTransport};
+    use agent_engine::session::TransportError;
+    let mut out = StateOutput::default();
+    let live = match sock {
+        None => {
+            out.notices.push(
+                "no daemon running: showing the account list only (a session without a daemon keeps its state in its own process)"
+                    .into(),
+            );
+            None
+        }
+        Some(sock) => match SocketTransport::auth_state(sock, query.clone()).await {
+            Ok(AuthStateReply::Report(report)) => Some(report),
+            Ok(AuthStateReply::DaemonPredates {
+                daemon_version,
+                daemon_build,
+            }) => {
+                let build = if daemon_build.is_empty() {
+                    String::new()
+                } else {
+                    format!(", build {daemon_build}")
+                };
+                out.notices.push(format!(
+                    "daemon predates auth state (daemon {daemon_version}{build}): its state cannot be read until it runs a synaps with `auth state`; showing the account list only"
+                ));
+                None
+            }
+            Err(TransportError::Protocol(message)) => {
+                out.error = Some(format!("daemon: {message}"));
+                return out;
+            }
+            Err(e) => {
+                out.error = Some(format!("daemon at {}: {e}", sock.display()));
+                return out;
+            }
+        },
+    };
+    let report = match live {
+        Some(report) => report,
+        None if query.clear => {
+            out.error =
+                Some("nothing cleared: only a running daemon that answers `auth state` holds state to clear".into());
+            return out;
+        }
+        None => match not_live(&query) {
+            Ok(report) => report,
+            Err(e) => {
+                out.error = Some(e);
+                return out;
+            }
+        },
+    };
+    out.stdout = if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => s + "\n",
+            Err(e) => {
+                out.error = Some(e.to_string());
+                return out;
+            }
+        }
+    } else {
+        auth::auth_state::render_text(&report)
+    };
+    out
 }
 
 #[cfg(test)]

@@ -55,8 +55,8 @@ pub enum AuthStateReply {
 
 /// An old daemon's reply to `AuthState` (daemon/conn.rs `Read::Bad`: serde's
 /// unknown-variant error behind "malformed frame: "), and nothing else.
-pub fn predates_auth_state(_message: &str) -> bool {
-    false
+pub fn predates_auth_state(message: &str) -> bool {
+    message.starts_with("malformed frame: unknown variant `auth_state`")
 }
 
 /// Reused line buffer for `read_frame`: a big `Attached`/`MessageHistory`
