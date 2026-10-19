@@ -558,8 +558,29 @@
     "common": true,
     "aliases": ["/exit"],
     "keywords": ["quit", "exit"],
-    "lines": ["/quit or /exit leaves SynapsCLI."],
-    "related": ["/help"]
+    "lines": [
+      "/quit or /exit leaves SynapsCLI.",
+      "Attached to a daemon session, it only detaches: the session stays loaded in the daemon (and a running turn keeps running). /close ends it."
+    ],
+    "related": ["/close", "/help"]
+  },
+  {
+    "id": "close-command",
+    "command": "/close",
+    "title": "Close this session",
+    "summary": "End this session in the daemon instead of only detaching from it; it can be continued later.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["close", "end", "session", "daemon", "detach", "quit", "unload", "idle"],
+    "lines": [
+      "/close saves this session and ends it in the daemon: it leaves `synaps daemon sessions`, every attached client exits, and nothing wakes it again. Resume it with `synaps --attach --continue <id>`.",
+      "It refuses while closing would stop work in flight: a running turn or compaction, a running worker, or an armed /auto run. /close force closes anyway; it cancels the running workers first and notes each one in the conversation, for whoever continues it.",
+      "Only the client that owns input can close the session. In-process (no daemon), /close is /quit with the same checks."
+    ],
+    "related": ["/quit", "/workers", "/keepwarm"]
   },
   {
     "id": "watch-command",

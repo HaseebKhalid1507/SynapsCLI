@@ -397,6 +397,29 @@ pub(crate) fn subagent_user_cancel_event(
     }
 }
 
+/// The MAIN-conversation note for a worker `/close force` cancelled. The
+/// session ends right after, so this is for whoever continues it later
+/// (`--continue`): the worker never finished and no wake is coming.
+pub(crate) fn subagent_close_cancel_event(
+    handle_id: &str,
+    agent_name: &str,
+) -> crate::events::types::Event {
+    let mut event = subagent_user_cancel_event(handle_id, agent_name);
+    event.content.text = format!(
+        "User closed this session with /close force while subagent '{agent_name}' ({handle_id}) was \
+         running, so it was cancelled before it finished. It sends no completion wake; do not wait for \
+         it. If its work is still needed, check what it left behind and dispatch it again."
+    );
+    event
+}
+
+/// The engine command behind `/close` (`SessionActor::close_command`).
+pub(crate) const CLOSE_COMMAND: &str = "close";
+
+fn is_close_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -414,6 +437,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Detach { .. } => "detach",
         SessionCommand::End { .. } => "end",
         SessionCommand::Resync { .. } => "resync",
+        SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND => "close",
         SessionCommand::EngineCommand { .. } => "engine_command",
         SessionCommand::PluginCommand { .. } => "plugin_command",
         SessionCommand::Resume { .. } => "resume",
@@ -4540,7 +4564,7 @@ impl SessionActor {
                     | SessionCommand::ReloadAborted
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
-            );
+            ) && !is_close_command(&cmd); // closing a parked session must not rebuild it
             if matches!(cmd, SessionCommand::HostEvent(_)) {
                 return ControlFlow::Continue(()); // nobody attached, nothing to render
             }
@@ -4627,6 +4651,12 @@ impl SessionActor {
                 self.save().await;
             }
             SessionCommand::Query { id, query } => self.query(id, query).await,
+            // `/close` ends the session, which no other engine command can.
+            SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
+                if let Some(reason) = self.close_command(id, &arg) {
+                    return ControlFlow::Break(reason);
+                }
+            }
             SessionCommand::EngineCommand { id, name, arg } => {
                 self.engine_command(id, name, arg).await
             }

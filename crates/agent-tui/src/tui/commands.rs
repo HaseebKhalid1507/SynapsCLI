@@ -455,7 +455,7 @@ async fn run_command(
         };
     }
     if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
-        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth")
+        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth" | "close")
     {
         use synaps_cli::engine::commands::persist_to_config;
         let value = match link.engine_command(cmd, arg).await {
@@ -1701,6 +1701,45 @@ mod tests {
             }
             _ => panic!("expected plugin command action"),
         }
+    }
+
+    /// `/close` is the session's to run (it ends it): the TUI forwards it
+    /// as the `close` engine command, shows the reply, and the loop then
+    /// meets the session's `Ended` (which `stream_handler` records for the
+    /// exit line). A refusal is shown as an error and nothing ends.
+    #[tokio::test]
+    async fn close_is_sent_to_the_session_which_then_ends() {
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action =
+            handle_command("close", "later", &mut app, &mut link, &system_prompt_path, &registry, &keybinds)
+                .await;
+        assert!(matches!(action, CommandAction::None));
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            crate::tui::app::ChatMessage::Error(s) if s == "usage: /close [force]"
+        )));
+
+        let action =
+            handle_command("close", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None), "the session ends it, not the TUI");
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            crate::tui::app::ChatMessage::System(s)
+                if s.starts_with("closing session ") && s.contains("--attach --continue")
+        )));
+        let env = link.next_event().await.expect("the session's end");
+        assert!(matches!(
+            env.event,
+            agent_engine::session::SessionEventWire::Ended {
+                reason: agent_engine::session::EndReason::ClientQuit
+            }
+        ));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"close"));
     }
 
     /// A `SessionLink` over the scripted in-memory actor (A5).

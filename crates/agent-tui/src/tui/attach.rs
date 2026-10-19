@@ -12,8 +12,8 @@ use std::sync::Arc;
 use agent_engine::session::socket_transport::SocketTransport;
 use agent_engine::session::wire::{Attach, Hello};
 use agent_engine::session::{
-    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, HistoryMode, SessionCommand,
-    SessionConfig, SessionId, TransportError,
+    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, EndReason, HistoryMode,
+    SessionCommand, SessionConfig, SessionId, TransportError,
 };
 use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
@@ -267,6 +267,28 @@ pub(super) fn skew_notice_once(
     Some(notice)
 }
 
+/// What a daemon-session TUI prints on stderr after it exits because the
+/// session ended under it (`Ended`): `/close` here or on another client,
+/// `daemon stop`, an eviction. The alternate screen is gone by then, so this
+/// is the only place the user can still read which session it was and how
+/// to bring it back. A session with no history (`has_history` false) has
+/// no journal, so there is nothing to continue; `None` for one the daemon
+/// ended for exactly that reason (`Idle`).
+pub(super) fn session_ended_line(reason: EndReason, session: &str, has_history: bool) -> Option<String> {
+    let what = match reason {
+        EndReason::ClientQuit => "was closed",
+        EndReason::HostShutdown => "ended: the daemon shut down",
+        EndReason::Evicted => "was evicted from the daemon",
+        EndReason::Error => "ended after an error",
+        EndReason::Idle => return None,
+    };
+    Some(if has_history {
+        format!("synaps: session {session} {what}; resume it with: synaps --attach --continue {session}")
+    } else {
+        format!("synaps: session {session} {what} (it never ran a turn, so there is nothing to resume)")
+    })
+}
+
 fn cfg_err(e: impl std::fmt::Display) -> synaps_cli::RuntimeError {
     synaps_cli::RuntimeError::Config(e.to_string())
 }
@@ -495,6 +517,26 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line a TUI leaves on stderr when its daemon session ended under
+    /// it names the session and how to continue it; a session that never
+    /// ran a turn has nothing to continue.
+    #[test]
+    fn an_ended_session_says_how_to_continue_it() {
+        let line = session_ended_line(EndReason::ClientQuit, "20261014-183459-3f61", true).unwrap();
+        assert_eq!(
+            line,
+            "synaps: session 20261014-183459-3f61 was closed; resume it with: \
+             synaps --attach --continue 20261014-183459-3f61"
+        );
+        let stop = session_ended_line(EndReason::HostShutdown, "s1", true).unwrap();
+        assert!(stop.contains("the daemon shut down") && stop.ends_with("--continue s1"), "{stop}");
+        assert!(session_ended_line(EndReason::Evicted, "s1", true).unwrap().contains("evicted"));
+        assert!(session_ended_line(EndReason::Error, "s1", true).unwrap().contains("error"));
+        let empty = session_ended_line(EndReason::ClientQuit, "s1", false).unwrap();
+        assert_eq!(empty, "synaps: session s1 was closed (it never ran a turn, so there is nothing to resume)");
+        assert_eq!(session_ended_line(EndReason::Idle, "s1", true), None);
+    }
 
     fn notice_inputs<'a>(id: &'a SessionId, warnings: &'a [String]) -> AttachNoticeInputs<'a> {
         AttachNoticeInputs {

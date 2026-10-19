@@ -638,7 +638,10 @@ pub(super) async fn handle_session_event_arm(
         SessionEventWire::Attached { .. }
         | SessionEventWire::ClientJoined { .. }
         | SessionEventWire::ClientLeft { .. } => {}
-        SessionEventWire::Ended { .. } => return ArmFlow::Ended,
+        SessionEventWire::Ended { reason } => {
+            app.session_ended = Some(reason);
+            return ArmFlow::Ended;
+        }
         SessionEventWire::Aborted { context_saved } => {
             app.transcript.end_response();
             app.header_turn_ended(None);

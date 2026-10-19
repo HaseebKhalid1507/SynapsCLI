@@ -70,6 +70,7 @@ override an operator's `SYNAPS_PROCESS_SCOPES=off`.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
+`/close [force]` → engine command `close` (ends the session; see [Closing a session](#closing-a-session-close));
 `/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query);
 `/keep-warm on|off`. Typed events render as `[aborted…]`, `[session cleared → id]`, `[compacting: …]`,
 `[compacted N messages]`, `[refused cmd: reason]`, `[input owner → …]`, `[session Parked]`.
@@ -99,6 +100,28 @@ To avoid accidental headless turns:
 
 The line client (`synaps attach`) follows the same double-press rule. The notice
 is printed to stderr so scripts piping stdout are not affected.
+
+## Closing a session (`/close`)
+
+Detaching leaves the session loaded in the daemon. It parks after the grace
+(`SYNAPS_DAEMON_PARK_GRACE_SECS`) and leaves the map an hour after that
+(`SYNAPS_DAEMON_PARKED_EVICT_SECS`), but an event queued for it (`synaps send`,
+an extension's inbox event, a worker's wake) unparks it and starts a turn. A
+session you are done with should be **closed**:
+
+- `/close` (TUI and `synaps attach`) is the engine command `close`. The actor
+  replies on its `QueryResult`, then ends exactly as the in-process quit does
+  (`End{ClientQuit}`: save, `on_session_end`, `Ended` to every client). It
+  leaves `synaps daemon sessions`; each attached TUI exits and prints
+  `synaps: session <id> was closed; resume it with: synaps --attach --continue <id>`.
+- It is an input command: only the input owner may close (others get `Refused`).
+- It refuses while closing would stop work in flight: a running turn or
+  compaction, a running worker (workers die with the session's runtime), or an
+  armed `/auto` run. The reply names them. `/close force` closes anyway: it
+  cancels the running workers first and notes each in the conversation
+  (`subagent_cancelled`), so whoever continues the session knows no wake is coming.
+- A **parked** session closes without being rebuilt.
+- In-process, `/close` is `/quit` with the same checks.
 
 ## Files (under `registry_dir()`, one set per profile: `daemon-<P>.*`)
 

@@ -220,6 +220,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "help",
     "quit",
     "exit",
+    "close",
     "settings",
     "plugins",
     "extensions",

@@ -245,6 +245,30 @@ impl ScriptedTransport {
         }
         match cmd {
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting),
+            // = `SessionActor::close_command` on an idle session (nothing
+            // runs here): the reply, then the session ends.
+            SessionCommand::EngineCommand { id, name, arg } if name == "close" => {
+                if matches!(arg.trim(), "" | "force") {
+                    let session = self.session.id.clone();
+                    self.push_event(SessionEventWire::QueryResult {
+                        id,
+                        value: serde_json::json!({
+                            "kind": "output",
+                            "text": format!(
+                                "closing session {session}; resume it with: synaps --attach --continue {session}"
+                            ),
+                        }),
+                    });
+                    self.push_event(SessionEventWire::Ended {
+                        reason: agent_engine::session::EndReason::ClientQuit,
+                    });
+                } else {
+                    self.push_event(SessionEventWire::QueryResult {
+                        id,
+                        value: serde_json::json!({ "kind": "error", "text": "usage: /close [force]" }),
+                    });
+                }
+            }
             SessionCommand::EngineCommand { id, name, arg } => {
                 let (value, view_changed) = agent_engine::session::actor_cmds::engine_command_reply(
                     &name,

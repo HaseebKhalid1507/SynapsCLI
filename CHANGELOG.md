@@ -19,6 +19,20 @@ All notable changes to this project will be documented in this file.
   naming the variable; move the secret to a plugin-specific variable. See
   [docs/extensions/secrets.md](docs/extensions/secrets.md).
 
+### Added
+
+- **`/close` ends a daemon session.** Over a socket `/quit` and Ctrl+C only
+  detach, so a finished session stayed loaded in the daemon, and every event
+  queued for it (`synaps send`, an extension's inbox event, a worker's wake)
+  woke it for another turn. `/close` (TUI and `synaps attach`) saves the
+  session and ends it: it leaves `synaps daemon sessions`, every attached
+  client exits, and the TUI prints how to continue it
+  (`synaps --attach --continue <id>`). It refuses while a turn or compaction
+  is running, a worker is running or an `/auto` run is armed, and says which;
+  `/close force` cancels those workers first and notes each in the
+  conversation. Owner-only. A parked session closes without being rebuilt.
+  See [docs/daemon-mode.md](docs/daemon-mode.md#closing-a-session-close).
+
 ### Changed
 
 - **Interactive turns have no round, tool-call or tool-result-byte limit by
