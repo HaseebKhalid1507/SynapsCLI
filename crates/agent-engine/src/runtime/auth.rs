@@ -2017,6 +2017,7 @@ mod tests {
             kind: SK::UsageReadFailed,
             accounts: vec![c2],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (_, log) = failed_turn_start(no_account(failure)).await;
         assert!(turn_warn(&log).contains("kind=usage_read_failed"), "{log}");
