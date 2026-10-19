@@ -1190,6 +1190,17 @@ pub struct SynapsConfig {
     /// terminal scope with the daemon in it. `process_scopes = off` disables;
     /// env `SYNAPS_PROCESS_SCOPES` overrides. Default on.
     pub process_scopes: bool,
+    /// The systemd slice for every scope Synaps makes for a tool command
+    /// (bash tool commands, PTY shells): `tool_scope_slice = worker-agent.slice`
+    /// passes `--slice=worker-agent.slice` to `systemd-run`, so an operator
+    /// can cap tool work on that slice apart from the desktop's
+    /// `app.slice`. Unset (the default) leaves systemd's placement as it is.
+    /// Read with the config each spawn loads. Synaps sets no limits itself.
+    pub tool_scope_slice: Option<String>,
+    /// The systemd slice for the daemon's own scope, applied when the daemon
+    /// starts (a reload re-execs in the same scope). Separate from
+    /// [`Self::tool_scope_slice`], so tools can be capped without the daemon.
+    pub daemon_scope_slice: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
@@ -1270,6 +1281,8 @@ impl Default for SynapsConfig {
             tui_background_opaque: true,
             tui_streaming_glow: false,
             process_scopes: true,
+            tool_scope_slice: None,
+            daemon_scope_slice: None,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -1293,6 +1306,43 @@ impl Default for SynapsConfig {
             warnings: Vec::new(),
         }
     }
+}
+
+/// Why `name` can't be a `tool_scope_slice` / `daemon_scope_slice` value, or
+/// `None` if it can. A slice unit name: at most 255 bytes, ending in
+/// `.slice`, only `[A-Za-z0-9:_.-]` (so no `/`), not starting with `-` and
+/// not the root slice `-.slice`; as in systemd's own check, the part before
+/// `.slice` is not empty, has no `--` and doesn't end in `-` (a `-` separates
+/// the parent slices: `worker-agent.slice` nests under `worker.slice`). The
+/// config file is not TOML, so a quoted value keeps its quotes and gets its
+/// own hint.
+pub fn scope_slice_problem(name: &str) -> Option<&'static str> {
+    if name.len() > 255 {
+        return Some("longer than 255 bytes");
+    }
+    if name.starts_with(['"', '\'']) || name.ends_with(['"', '\'']) {
+        return Some("write the name without quotes (the config file is not TOML)");
+    }
+    if !name.ends_with(".slice") {
+        return Some("expected a slice unit name ending in .slice");
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'-')) {
+        return Some("only letters, digits, ':', '_', '.' and '-' are allowed");
+    }
+    if name == "-.slice" {
+        return Some("the root slice -.slice is not allowed");
+    }
+    if name.starts_with('-') {
+        return Some("must not start with '-'");
+    }
+    let stem = &name[..name.len() - ".slice".len()];
+    if stem.is_empty() {
+        return Some("needs a name before .slice");
+    }
+    if stem.contains("--") || stem.ends_with('-') {
+        return Some("'-' separates parent slices: no '--' and no trailing '-'");
+    }
+    None
 }
 
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
@@ -1340,6 +1390,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "tui_background_opaque",
     "tui_streaming_glow",
     "process_scopes",
+    "tool_scope_slice",
+    "daemon_scope_slice",
     "agent_name",
     "identity",
     "disabled_plugins",
@@ -1951,7 +2003,14 @@ fn apply_config_content_with(
                 "true" | "1" | "on" | "yes" | "auto" => config.process_scopes = true,
                 "false" | "0" | "off" | "no" => config.process_scopes = false,
                 _ => config.warnings.push(format!(
-                    "process_scopes = {val} — expected auto or off; using auto"
+                    "process_scopes = {val} — expected auto or off; keeping the previous value (default auto)"
+                )),
+            },
+            "tool_scope_slice" | "daemon_scope_slice" => match scope_slice_problem(val) {
+                None if key == "tool_scope_slice" => config.tool_scope_slice = Some(val.to_string()),
+                None => config.daemon_scope_slice = Some(val.to_string()),
+                Some(why) => config.warnings.push(format!(
+                    "{key} = {val} — {why}; keeping the previous value (default: no slice, systemd's default placement)"
                 )),
             },
             // Read directly by the keybind registry (`read_config_value`);
@@ -2625,6 +2684,101 @@ mod tests {
         assert!(bad.process_scopes, "an invalid value keeps the default");
         assert!(bad.warnings.iter().any(|w| w.starts_with("process_scopes")));
         assert!(super::KNOWN_CONFIG_KEYS.contains(&"process_scopes"));
+    }
+
+    #[test]
+    fn an_invalid_repeated_process_scopes_keeps_the_previous_value() {
+        let c = super::load_config_from_str("process_scopes = off\nprocess_scopes = sometimes\n");
+        assert!(
+            c.warnings.iter().any(|w| w.starts_with("process_scopes = sometimes") && w.contains("keeping the previous value")),
+            "{:?}",
+            c.warnings
+        );
+        assert!(!c.process_scopes, "the earlier valid value is kept");
+    }
+
+    #[test]
+    fn an_invalid_repeated_scope_slice_keeps_the_previous_value() {
+        for key in ["tool_scope_slice", "daemon_scope_slice"] {
+            let c = super::load_config_from_str(&format!("{key} = a.slice\n{key} = worker\n"));
+            assert!(
+                c.warnings.iter().any(|w| w.starts_with(&format!("{key} = worker")) && w.contains("keeping the previous value")),
+                "{key}: {:?}",
+                c.warnings
+            );
+            let kept = if key == "tool_scope_slice" { &c.tool_scope_slice } else { &c.daemon_scope_slice };
+            assert_eq!(kept.as_deref(), Some("a.slice"), "{key}: the earlier valid value is kept");
+        }
+    }
+
+    #[test]
+    fn scope_slices_default_unset_and_parse_valid_names() {
+        let c = super::load_config_from_str("");
+        assert_eq!((c.tool_scope_slice, c.daemon_scope_slice), (None, None));
+        let c = super::load_config_from_str(
+            "tool_scope_slice = worker-agent.slice\ndaemon_scope_slice = synaps:daemon_1.slice\n",
+        );
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(c.tool_scope_slice.as_deref(), Some("worker-agent.slice"));
+        assert_eq!(c.daemon_scope_slice.as_deref(), Some("synaps:daemon_1.slice"));
+        // Each key sets only its own field.
+        let c = super::load_config_from_str("tool_scope_slice = a.slice\n");
+        assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (Some("a.slice"), None));
+        let c = super::load_config_from_str("daemon_scope_slice = d.slice\n");
+        assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (None, Some("d.slice")));
+        let longest = format!("{}.slice", "a".repeat(255 - ".slice".len()));
+        assert_eq!(super::scope_slice_problem(&longest), None);
+        for k in ["tool_scope_slice", "daemon_scope_slice"] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
+        }
+    }
+
+    #[test]
+    fn an_invalid_scope_slice_warns_and_keeps_the_default() {
+        let too_long = format!("{}.slice", "a".repeat(256 - ".slice".len()));
+        // Every invalid value the function or the parser lets through.
+        let mut accepted: Vec<String> = Vec::new();
+        for bad in [
+            "worker",            // no .slice suffix
+            "worker.service",    // another unit type
+            "a/b.slice",         // a path
+            "work er.slice",     // a space
+            "work@er.slice",     // outside [A-Za-z0-9:_.-]
+            "-.slice",           // the root slice
+            "-worker.slice",     // a leading '-'
+            "--worker.slice",
+            ".slice",            // no name
+            "worker--agent.slice",
+            "worker-.slice",
+            too_long.as_str(),   // 256 bytes
+            "",                  // empty
+            "wörker.slice",      // non-ASCII
+            "worker\0.slice",    // NUL
+            "\"worker-agent.slice\"", // quoted: the file is not TOML
+            "'worker-agent.slice'",
+            "5",                 // other types: a number, a boolean
+            "true",
+        ] {
+            if super::scope_slice_problem(bad).is_none() {
+                accepted.push(bad.to_string());
+            }
+            for key in ["tool_scope_slice", "daemon_scope_slice"] {
+                let c = super::load_config_from_str(&format!("{key} = {bad}\n"));
+                let unset = (c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()) == (None, None);
+                if !unset || !c.warnings.iter().any(|w| w.starts_with(&format!("{key} = "))) {
+                    accepted.push(format!("{key} = {bad}"));
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn a_quoted_scope_slice_says_to_drop_the_quotes() {
+        for quoted in ["\"worker-agent.slice\"", "'worker-agent.slice'", "\"worker-agent.slice", "worker-agent.slice'"] {
+            let why = super::scope_slice_problem(quoted);
+            assert!(why.is_some_and(|w| w.contains("without quotes")), "{quoted}: {why:?}");
+        }
     }
 
     #[test]
