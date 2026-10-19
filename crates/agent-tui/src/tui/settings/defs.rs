@@ -66,6 +66,8 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
+    ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
+    ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("provider.*", "owned by the Providers tab (API keys)"),
     ("keybind.*", "keybind family (keybind registry), not a single setting"),
 ];
