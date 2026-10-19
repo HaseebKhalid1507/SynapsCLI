@@ -391,7 +391,12 @@ receives it.
   error (exit 1, nothing written) that lists the running sessions; `--inbox`
   opts in to leaving it in the shared inbox instead. With no flag and zero or
   several sessions running, `synaps send` writes to the inbox and says so on
-  stderr. A failed socket write still falls back to the inbox.
+  stderr. An event addressed to a session (`--session`, `--broadcast`)
+  never falls back to the inbox: a socket that still refuses after 3 tries
+  (150 ms, then 500 ms apart; the registration is re-read between tries; 5 s
+  cap per try) is an error naming the session, exit 1. `--inbox` opts back
+  in for `--session`. Only the no-flag form, which names no session, still
+  drops to the inbox when its one session refuses.
 
 ## Reload (`synaps daemon reload`, phase 3 C3)
 

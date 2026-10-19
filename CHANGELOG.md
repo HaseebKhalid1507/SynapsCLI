@@ -60,6 +60,15 @@ All notable changes to this project will be documented in this file.
   `synaps send` with zero or several sessions running still writes to the
   inbox and now says on stderr that only a session with an attached input
   owner takes it.
+- **An event addressed to a session reaches that session or fails.** When
+  the socket write failed, `synaps send --session X` used to fall back to
+  the shared inbox, where *every* live session took it: on 2026-10-19 one
+  axon-run alert for the foreman landed in three sessions at once. It now
+  retries the socket 3 times (re-reading the registration, so a reload's
+  new socket is found), then exits 1 with the error and writes nothing.
+  `--inbox` opts back in to the drop. `--broadcast` reports each session it
+  could not reach and exits 1, instead of re-routing via the inbox. Each
+  attempt is capped at 5 s.
 
 ### Fixed
 
@@ -119,7 +128,8 @@ All notable changes to this project will be documented in this file.
 - **Scripts that `synaps send --session` a session that may not be
   running** now get exit 1 instead of a silent inbox drop. Pass the full
   session id (a short id *suffix* never matched), or add `--inbox` to keep
-  the old behaviour.
+  the old behaviour. The same holds when the session's socket refuses the
+  event: exit 1, nothing written, instead of an inbox drop.
 - **Loopback `synaps auth-broker` now requires a machine token.** With no
   `--machine-token-file` / `SYNAPS_BROKER_TOKEN` it writes one to
   `~/.synaps-cli/auth-broker.token` (0600). Same-user clients pointed at a

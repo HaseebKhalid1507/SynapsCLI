@@ -25,9 +25,12 @@
 //! ## The shared inbox
 //! `~/.synaps-cli/inbox/` is untargeted mail: a daemon session takes a file
 //! only while a client owns its input, and exactly one session takes it. So
-//! a `--session` that matches nothing is an error, not a silent inbox drop
-//! (the event would sit there undelivered with exit 0); `--inbox` opts back
-//! in to the drop.
+//! an event addressed to a session never falls back to it: a `--session`
+//! that matches nothing, or whose socket still refuses the event after
+//! [`SOCKET_ATTEMPTS`] tries, is an error (exit 1, nothing delivered), not
+//! a drop that some other session would take. `--inbox` opts back in to the
+//! drop. `--broadcast` reports each session it could not reach and exits 1.
+//! Only the no-flag form, which names no session, still uses the inbox.
 
 use chrono::Utc;
 use synaps_cli::events::registry::{
@@ -58,15 +61,35 @@ pub async fn run(
         if sessions.is_empty() {
             eprintln!("No active sessions found for broadcast.");
         }
+        let mut missed = Vec::new();
         for reg in sessions {
-            send_to_socket_or_inbox(&reg, &json, &event).await;
+            match send_with_retry(reg.clone(), &json, None).await {
+                Ok(id) => eprintln!("Event sent to session {id} via socket."),
+                Err(e) => {
+                    eprintln!("Not delivered to session {}: {e}", reg.session_id);
+                    missed.push(reg.session_id);
+                }
+            }
+        }
+        if !missed.is_empty() {
+            anyhow::bail!("broadcast missed {} session(s): {}", missed.len(), missed.join(", "));
         }
         return Ok(());
     }
 
     if let Some(query) = session {
         match find_session_registration(&query) {
-            Some(reg) => send_to_socket_or_inbox(&reg, &json, &event).await,
+            Some(reg) => match send_with_retry(reg, &json, Some(&query)).await {
+                Ok(id) => eprintln!("Event sent to session {id} via socket."),
+                Err(e) if inbox => {
+                    eprintln!("{e} — dropping to inbox (--inbox).");
+                    write_inbox(&event)?;
+                    eprintln!("{INBOX_NOTE}");
+                }
+                Err(e) => anyhow::bail!(
+                    "{e}; nothing was delivered.\nAdd --inbox to leave it in the shared inbox instead."
+                ),
+            },
             None if inbox => {
                 eprintln!("No session matching {:?} found — dropping to inbox (--inbox).", query);
                 write_inbox(&event)?;
@@ -80,7 +103,16 @@ pub async fn run(
     // No flags: try to auto-resolve to exactly one active session.
     let sessions = list_active_sessions();
     match sessions.len() {
-        1 => send_to_socket_or_inbox(&sessions[0], &json, &event).await,
+        // Nothing was addressed: if the one running session refuses, the
+        // event is still untargeted mail.
+        1 => match send_with_retry(sessions[0].clone(), &json, None).await {
+            Ok(id) => eprintln!("Event sent to session {id} via socket."),
+            Err(e) => {
+                eprintln!("{e} — writing to inbox.");
+                write_inbox(&event)?;
+                eprintln!("{INBOX_NOTE}");
+            }
+        },
         _ => {
             if sessions.is_empty() {
                 eprintln!("No active sessions — writing to inbox.");
@@ -163,23 +195,48 @@ pub(crate) async fn send_event_to_session(query: &str, event: &Event) -> anyhow:
     let reg = find_session_registration(query)
         .ok_or_else(|| anyhow::anyhow!("no running session matches {:?}", query))?;
     let json = serde_json::to_string(event)?;
-    send_via_socket(&reg.socket_path, &json).await?;
-    Ok(reg.session_id)
+    send_with_retry(reg, &json, Some(query)).await
 }
 
-async fn send_to_socket_or_inbox(reg: &SessionRegistration, json: &str, event: &Event) {
-    match send_via_socket(&reg.socket_path, json).await {
-        Ok(()) => eprintln!("Event sent to session {} via socket.", reg.session_id),
-        Err(e) => {
-            eprintln!(
-                "Warning: socket send to session {} failed ({}), falling back to inbox.",
-                reg.session_id, e
-            );
-            if let Err(ie) = write_inbox(event) {
-                eprintln!("Inbox fallback also failed: {}", ie);
+/// Socket attempts for an event addressed to one session, and the waits
+/// between them. A session that is streaming, or a daemon mid-reload, can
+/// refuse a connection for a moment; the event must still reach that
+/// session and no other.
+const SOCKET_ATTEMPTS: u32 = 3;
+const SOCKET_RETRY_WAITS_MS: [u64; 2] = [150, 500];
+/// One attempt may not hang `send` (and the script that called it).
+const SOCKET_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Deliver to `reg`'s socket, retrying. With `requery`, the registration is
+/// looked up again before each retry: a reload gives the session a new
+/// socket. Returns the session id it reached, or the last error.
+async fn send_with_retry(
+    mut reg: SessionRegistration,
+    json: &str,
+    requery: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut last = None;
+    for attempt in 0..SOCKET_ATTEMPTS {
+        if attempt > 0 {
+            let wait = SOCKET_RETRY_WAITS_MS[(attempt as usize - 1).min(SOCKET_RETRY_WAITS_MS.len() - 1)];
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            if let Some(found) = requery.and_then(find_session_registration) {
+                reg = found;
             }
         }
+        let sent = tokio::time::timeout(SOCKET_ATTEMPT_TIMEOUT, send_via_socket(&reg.socket_path, json)).await;
+        match sent {
+            Ok(Ok(())) => return Ok(reg.session_id),
+            Ok(Err(e)) => last = Some(e.to_string()),
+            Err(_) => last = Some(format!("timed out after {} s", SOCKET_ATTEMPT_TIMEOUT.as_secs())),
+        }
     }
+    anyhow::bail!(
+        "socket send to session {} failed {} times (last: {})",
+        reg.session_id,
+        SOCKET_ATTEMPTS,
+        last.unwrap_or_default()
+    )
 }
 
 async fn send_via_socket(socket_path: &str, json: &str) -> anyhow::Result<()> {
