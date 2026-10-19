@@ -1998,14 +1998,14 @@ fn apply_config_content_with(
                 "true" | "1" | "on" | "yes" | "auto" => config.process_scopes = true,
                 "false" | "0" | "off" | "no" => config.process_scopes = false,
                 _ => config.warnings.push(format!(
-                    "process_scopes = {val} — expected auto or off; using auto"
+                    "process_scopes = {val} — expected auto or off; keeping the previous value (default auto)"
                 )),
             },
             "tool_scope_slice" | "daemon_scope_slice" => match scope_slice_problem(val) {
                 None if key == "tool_scope_slice" => config.tool_scope_slice = Some(val.to_string()),
                 None => config.daemon_scope_slice = Some(val.to_string()),
                 Some(why) => config.warnings.push(format!(
-                    "{key} = {val} — {why}; using no slice (systemd's default placement)"
+                    "{key} = {val} — {why}; keeping the previous value (default: no slice, systemd's default placement)"
                 )),
             },
             // Read directly by the keybind registry (`read_config_value`);
@@ -2679,6 +2679,31 @@ mod tests {
         assert!(bad.process_scopes, "an invalid value keeps the default");
         assert!(bad.warnings.iter().any(|w| w.starts_with("process_scopes")));
         assert!(super::KNOWN_CONFIG_KEYS.contains(&"process_scopes"));
+    }
+
+    #[test]
+    fn an_invalid_repeated_process_scopes_keeps_the_previous_value() {
+        let c = super::load_config_from_str("process_scopes = off\nprocess_scopes = sometimes\n");
+        assert!(
+            c.warnings.iter().any(|w| w.starts_with("process_scopes = sometimes") && w.contains("keeping the previous value")),
+            "{:?}",
+            c.warnings
+        );
+        assert!(!c.process_scopes, "the earlier valid value is kept");
+    }
+
+    #[test]
+    fn an_invalid_repeated_scope_slice_keeps_the_previous_value() {
+        for key in ["tool_scope_slice", "daemon_scope_slice"] {
+            let c = super::load_config_from_str(&format!("{key} = a.slice\n{key} = worker\n"));
+            assert!(
+                c.warnings.iter().any(|w| w.starts_with(&format!("{key} = worker")) && w.contains("keeping the previous value")),
+                "{key}: {:?}",
+                c.warnings
+            );
+            let kept = if key == "tool_scope_slice" { &c.tool_scope_slice } else { &c.daemon_scope_slice };
+            assert_eq!(kept.as_deref(), Some("a.slice"), "{key}: the earlier valid value is kept");
+        }
     }
 
     #[test]
