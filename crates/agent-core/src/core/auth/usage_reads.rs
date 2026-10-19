@@ -11,16 +11,20 @@
 //!   same failure with no request. Holds back off 2, 4, 8, then 10 minutes;
 //!   a longer `Retry-After` wins, capped at 10 minutes. A success clears the
 //!   hold. Credential rejections are never held (their path is unchanged).
-//! * **Last good.** The slot's last successful snapshot, which automatic
-//!   selection may use in place of a read that failed transiently (see
-//!   [`USAGE_READ_GRACE`] and `quota_policy::SelectionRequest::grace`).
+//! * **Last good.** The slot's last successful snapshot and the seat it was
+//!   read from, which automatic selection may use in place of a read that
+//!   failed transiently (see [`USAGE_READ_GRACE`],
+//!   [`UsageReads::last_good_for`] and `quota_policy::SelectionRequest::grace`).
 //!
 //! Keys are the stable slot identity (credential file + storage key + usage
 //! endpoint), never the seat digest, which changes on token rotation. Last
-//! good is therefore keyed by slot: a re-login of that slot to a different
-//! subscription within the grace window could be graced on the previous
-//! occupant's reading; that is bounded by the 30-minute window and by the
-//! message path's own 429 cooldown.
+//! good is bound to the account it was read from: when the credential now in
+//! the slot carries an account id, the reading counts only for that same id
+//! (a refresh rotation keeps it; a re-login to another account drops it).
+//! Credentials without an account id cannot be told apart across rotation;
+//! for those a re-login of the slot to another subscription within the
+//! grace window could be graced on the previous occupant's reading, bounded
+//! by the 30-minute window and by the message path's own 429 cooldown.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -158,7 +162,19 @@ struct Entry {
     generation: u64,
     last: Option<ReadResult>,
     hold: Option<Hold>,
-    last_good: Option<UsageSnapshot>,
+    /// Last successful snapshot and the seat whose token read it.
+    last_good: Option<(UsageSnapshot, SeatIdentity)>,
+}
+
+/// Whether a reading taken from seat `read_from` may stand for the
+/// credential now stored in the slot (`now`): the same account id when
+/// either carries one; without ids on both sides, yes (see the module docs).
+fn same_account(read_from: &SeatIdentity, now: &SeatIdentity) -> bool {
+    match (read_from.seat_fingerprint(), now.seat_fingerprint()) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// See the module docs. [`process_table`] is the one production instance.
@@ -199,7 +215,7 @@ impl UsageReads {
         let result = match fetched {
             Fetched::Ok(snapshot, seat) => {
                 entry.hold = None;
-                entry.last_good = Some(snapshot.clone());
+                entry.last_good = Some((snapshot.clone(), seat.clone()));
                 Ok((snapshot, seat))
             }
             Fetched::Usage(e) => match TransientReadFailure::from_usage_error(&e) {
@@ -246,9 +262,14 @@ impl UsageReads {
         result
     }
 
-    /// The slot's last successful snapshot, if any.
-    pub fn last_good(&self, key: &str) -> Option<UsageSnapshot> {
-        self.entries().get(key).and_then(|e| e.last_good.clone())
+    /// The slot's last successful snapshot, if it was read from the account
+    /// now stored in the slot (`current`): never another account's reading.
+    pub fn last_good_for(&self, key: &str, current: &SeatIdentity) -> Option<UsageSnapshot> {
+        self.entries()
+            .get(key)
+            .and_then(|e| e.last_good.as_ref())
+            .filter(|(_, read_from)| same_account(read_from, current))
+            .map(|(snapshot, _)| snapshot.clone())
     }
 
     /// Drop the slot's last good reading (e.g. after a reported limit).
@@ -332,24 +353,29 @@ mod tests {
         }
     }
 
-    fn good() -> Fetched {
+    fn seat(refresh: &str, account_id: Option<&str>) -> SeatIdentity {
+        let creds = super::super::OAuthCredentials {
+            auth_type: "oauth".into(),
+            refresh: refresh.into(),
+            access: "a".into(),
+            expires: 0,
+            account_id: account_id.map(Into::into),
+        };
+        SeatIdentity::of(super::super::OAuthProviderId::Anthropic, &creds)
+    }
+
+    fn good_from(read_from: SeatIdentity) -> Fetched {
         let snapshot = super::super::usage::parse_anthropic_usage(
             r#"{"seven_day":{"utilization":10,"resets_at":"2099-01-01T00:00:00Z"}}"#,
             "a",
             1,
         )
         .unwrap();
-        let creds = super::super::OAuthCredentials {
-            auth_type: "oauth".into(),
-            refresh: "r".into(),
-            access: "a".into(),
-            expires: 0,
-            account_id: None,
-        };
-        Fetched::Ok(
-            snapshot,
-            SeatIdentity::of(super::super::OAuthProviderId::Anthropic, &creds),
-        )
+        Fetched::Ok(snapshot, read_from)
+    }
+
+    fn good() -> Fetched {
+        good_from(seat("r", None))
     }
 
     #[test]
@@ -365,7 +391,7 @@ mod tests {
         assert_eq!(holds, vec![2, 4, 8, 10, 10]);
         assert!(t.record_at("k", good(), now).is_ok());
         assert!(t.held_at("k", now).is_none(), "a success clears the hold");
-        assert!(t.last_good("k").is_some());
+        assert!(t.last_good_for("k", &seat("r", None)).is_some());
         assert_eq!(held_for(&t, limited(None), now), 2 * MIN, "and restarts the backoff");
 
         // A longer Retry-After wins, capped at 10 minutes.
@@ -412,6 +438,35 @@ mod tests {
             ));
             assert!(t.held_at("k", now).is_none());
         }
-        assert!(t.last_good("k").is_none(), "the 401 dropped the last good reading");
+        assert!(
+            t.last_good_for("k", &seat("r", None)).is_none(),
+            "the 401 dropped the last good reading"
+        );
+    }
+
+    /// Last good is bound to the account it was read from: the same account
+    /// id after a token rotation keeps it, another account id (or a switch
+    /// between id and no id) never sees it. Without ids the slot's reading
+    /// stands (bounded by the grace window; see the module docs).
+    #[test]
+    fn last_good_counts_only_for_the_account_it_was_read_from() {
+        let t = UsageReads::default();
+        assert!(t.record_at("k", good_from(seat("r1", Some("acct-1"))), 1).is_ok());
+        assert!(t.last_good_for("k", &seat("r1", Some("acct-1"))).is_some());
+        assert!(
+            t.last_good_for("k", &seat("r2-rotated", Some("acct-1"))).is_some(),
+            "a refresh rotation keeps the account"
+        );
+        assert!(
+            t.last_good_for("k", &seat("r1", Some("acct-2"))).is_none(),
+            "another account in the slot is never graced on this reading"
+        );
+        assert!(t.last_good_for("k", &seat("r1", None)).is_none());
+        assert!(t.last_good_for("other", &seat("r1", Some("acct-1"))).is_none());
+
+        let t = UsageReads::default();
+        assert!(t.record_at("k", good_from(seat("r1", None)), 1).is_ok());
+        assert!(t.last_good_for("k", &seat("r2", None)).is_some());
+        assert!(t.last_good_for("k", &seat("r1", Some("acct-1"))).is_none());
     }
 }

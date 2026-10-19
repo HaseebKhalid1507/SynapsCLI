@@ -27,21 +27,52 @@ const HOUR_S: u64 = 3600;
 /// Throwaway store with one Anthropic slot per label; slot `x` sends the
 /// bearer `x-access`.
 fn install(labels: &[&str]) -> tempfile::TempDir {
+    let slots: Vec<_> = labels.iter().map(|label| (*label, None, "1")).collect();
+    install_slots(&slots)
+}
+
+/// Like [`install`], for slots `(label, account id, refresh generation)`.
+fn install_slots(slots: &[(&str, Option<&str>, &str)]) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     agent_core::config::set_base_dir_for_tests(home.path().to_path_buf());
+    write_slots(home.path(), slots);
+    std::fs::write(home.path().join("config"), "").unwrap();
+    home
+}
+
+/// (Re)write the store: a new refresh generation is a token rotation, a new
+/// account id a re-login of the slot to another account.
+fn write_slots(dir: &std::path::Path, slots: &[(&str, Option<&str>, &str)]) {
     let mut data = serde_json::Map::new();
-    for label in labels {
-        data.insert(
-            format!("anthropic@{label}"),
-            json!({ "type": "oauth", "access": format!("{label}-access"),
-                    "refresh": format!("{label}-refresh-SECRET"), "expires": FAR_FUTURE }),
-        );
+    for (label, account_id, generation) in slots {
+        let mut slot = json!({ "type": "oauth", "access": format!("{label}-access"),
+                               "refresh": format!("{label}-refresh-{generation}-SECRET"),
+                               "expires": FAR_FUTURE });
+        if let Some(id) = account_id {
+            slot["accountId"] = json!(id);
+        }
+        data.insert(format!("anthropic@{label}"), slot);
     }
-    std::fs::write(
-        home.path().join("auth.json"),
-        serde_json::Value::Object(data).to_string(),
-    )
-    .unwrap();
+    std::fs::write(dir.join("auth.json"), serde_json::Value::Object(data).to_string()).unwrap();
+}
+
+/// Codex access token carrying `account_id` (the usage read's account header).
+fn codex_jwt(account_id: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload = json!({ "https://api.openai.com/auth": { "chatgpt_account_id": account_id } });
+    format!("h.{}.s", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap()))
+}
+
+/// Throwaway store with one Codex slot `label` on account `account_id`.
+fn install_codex(label: &str, account_id: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    agent_core::config::set_base_dir_for_tests(home.path().to_path_buf());
+    let data = json!({
+        (format!("openai-codex@{label}")): { "type": "oauth", "access": codex_jwt(account_id),
+            "refresh": format!("{label}-refresh-SECRET"), "expires": FAR_FUTURE,
+            "accountId": account_id }
+    });
+    std::fs::write(home.path().join("auth.json"), data.to_string()).unwrap();
     std::fs::write(home.path().join("config"), "").unwrap();
     home
 }
@@ -55,7 +86,9 @@ enum Answer {
 }
 
 /// Fake usage endpoint: per-account answers, per-account request counts,
-/// optional answer delay (to hold a read in flight).
+/// optional answer delay (to hold a read in flight). Anthropic reads are
+/// keyed by the bearer label (`x-access` -> `x`); Codex reads by their
+/// account header, and get a Codex-shaped body.
 #[derive(Clone, Default)]
 struct Upstream {
     answers: Arc<Mutex<HashMap<String, Answer>>>,
@@ -88,10 +121,16 @@ impl Upstream {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    let label = bearer
-                        .trim_start_matches("Bearer ")
-                        .trim_end_matches("-access")
-                        .to_string();
+                    let codex_account = headers
+                        .get("chatgpt-account-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let label = codex_account.clone().unwrap_or_else(|| {
+                        bearer
+                            .trim_start_matches("Bearer ")
+                            .trim_end_matches("-access")
+                            .to_string()
+                    });
                     *up.hits.lock().unwrap().entry(label.clone()).or_default() += 1;
                     let delay = up.delay_ms.load(Ordering::SeqCst);
                     if delay > 0 {
@@ -99,6 +138,13 @@ impl Upstream {
                     }
                     let answer = up.answers.lock().unwrap().get(&label).copied();
                     match answer.unwrap_or(Answer::Status(500)) {
+                        Answer::Ok { used, reset_in_s } if codex_account.is_some() => Json(json!({
+                            "rate_limit": { "allowed": true, "limit_reached": false,
+                                "primary_window": { "used_percent": used,
+                                    "limit_window_seconds": 7 * 24 * HOUR_S,
+                                    "reset_after_seconds": reset_in_s } }
+                        }))
+                        .into_response(),
                         Answer::Ok { used, reset_in_s } => {
                             let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
                                 (agent_core::epoch_millis() + reset_in_s * 1000) as i64,
@@ -331,4 +377,66 @@ async fn concurrent_failing_reads_from_two_brokers_send_one_request_per_account(
     let (c1, c2) = tokio::join!(chosen(&one), chosen(&two));
     assert_eq!((c1.unwrap(), c2.unwrap()), ("a".to_string(), "a".to_string()));
     assert_eq!((up.hits("a"), up.hits("b")), (1, 1), "a read in flight is shared");
+}
+
+/// Grace is bound to the account the good reading came from. A refresh
+/// rotation (same account id) keeps it; the same slot re-logged to another
+/// account id while its read is held is never chosen on the previous
+/// account's reading, so the other account (graced on its own) serves.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_slot_re_logged_to_another_account_is_never_graced_on_the_old_reading() {
+    let home = install_slots(&[("a", Some("acct-a"), "1"), ("b", Some("acct-b"), "1")]);
+    let up = Upstream::default();
+    up.set("a", URGENT);
+    up.set("b", LATER);
+    let url = up.spawn().await;
+    let broker = auto_broker(&url);
+    assert_eq!(chosen(&broker).await.unwrap(), "a");
+
+    write_slots(home.path(), &[("a", Some("acct-a"), "2"), ("b", Some("acct-b"), "1")]);
+    up.all(&["a", "b"], LIMITED);
+    past_fresh_age().await;
+    assert_eq!(
+        chosen(&broker).await.unwrap(),
+        "a",
+        "the same account after a token rotation is still graced"
+    );
+    assert_eq!((up.hits("a"), up.hits("b")), (2, 2));
+
+    write_slots(home.path(), &[("a", Some("acct-other"), "3"), ("b", Some("acct-b"), "1")]);
+    assert_eq!(chosen(&broker).await.unwrap(), "b");
+    assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "b", "a new broker too");
+    assert_eq!((up.hits("a"), up.hits("b")), (2, 2), "no request inside the hold");
+}
+
+/// Codex: a good reading that does not list the requested model (a generic
+/// window does not prove entitlement to it) keeps that model ineligible
+/// when the read then fails and the reading is graced; the same graced
+/// reading still serves a request without that model.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_codex_model_missing_from_the_good_reading_stays_ineligible_under_grace() {
+    const ASTRA: &str = "gpt-6-astra";
+    let codex = OAuthProviderId::OpenAiCodex;
+    let _home = install_codex("x", "acct-x");
+    let up = Upstream::default();
+    up.set("acct-x", LATER);
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_usage_endpoint_override(up.spawn().await)
+        .with_max_snapshot_age(Duration::from_secs(1));
+    let label = |p: agent_core::auth::PinnedToken| p.credential.account.label_str().to_string();
+    assert!(broker.access_token_auto(codex, Some(ASTRA)).await.is_err(), "unproven model");
+    assert_eq!(label(broker.access_token_auto(codex, None).await.unwrap()), "x");
+
+    up.set("acct-x", LIMITED);
+    past_fresh_age().await;
+    let err = broker.access_token_auto(codex, Some(ASTRA)).await.unwrap_err();
+    assert!(matches!(err, BrokerError::NoAccountAvailable { .. }), "{err:?}");
+    assert_eq!(
+        label(broker.access_token_auto(codex, None).await.unwrap()),
+        "x",
+        "graced for a request without that model"
+    );
+    assert_eq!(up.hits("acct-x"), 2, "one good read, one held 429");
 }
