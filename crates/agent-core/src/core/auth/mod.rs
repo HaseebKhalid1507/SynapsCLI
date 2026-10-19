@@ -45,6 +45,7 @@ pub use quota_policy::{
 mod storage;
 mod token;
 pub mod usage;
+pub mod usage_reads;
 mod xai;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────

@@ -716,9 +716,24 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
             (Some(at), false) => text.push_str(&format!(" Send again after {at}.")),
             (None, false) => {}
         },
-        // Every live transient failure asked for a wait: sending again
-        // sooner only repeats them.
-        K::UsageReadFailed if f.transient_retry_after_s().is_some() => {
+        // Failed usage reads are held: the next selection reads usage again
+        // only after the hold ends, so name that time instead of "retry".
+        K::UsageReadFailed if f.usage_read_retry_ms.is_some_and(|t| t > now_ms) => {
+            let at = super::anthropic_quota::describe_reset_utc(
+                f.usage_read_retry_ms.unwrap_or(now_ms),
+                now_ms,
+            );
+            text.push_str(&format!(" Usage is read again after {at}; send again then."));
+            if nothing_to_fix {
+                text.push_str(" No login needed.");
+            }
+        }
+        // No hold recorded, but every live transient failure asked for a
+        // wait: sending again sooner only repeats them. (A hold that has
+        // already ended means its Retry-After has too.)
+        K::UsageReadFailed
+            if f.usage_read_retry_ms.is_none() && f.transient_retry_after_s().is_some() =>
+        {
             let secs = f.transient_retry_after_s().unwrap_or_default();
             text.push_str(&format!(" Send again in {secs}s or later"));
             text.push_str(if nothing_to_fix { "; no login needed." } else { "." });
@@ -2011,6 +2026,7 @@ mod tests {
             kind: SK::UsageReadFailed,
             accounts: vec![c2, c5, c6],
             earliest_reset_ms: Some(reset),
+            usage_read_retry_ms: None,
         };
         let (text, log) = failed_turn_start(no_account(failure)).await;
         let reset_text = super::super::anthropic_quota::describe_reset_utc(reset, now);
@@ -2050,6 +2066,7 @@ mod tests {
             kind: SK::UsageReadFailed,
             accounts: vec![c2.clone(), c3, c5, c7],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (text, _) = failed_turn_start(no_account(failure)).await;
         assert!(
@@ -2064,6 +2081,7 @@ mod tests {
             kind: SK::UsageReadFailed,
             accounts: vec![c2.clone(), c6],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (text, _) = failed_turn_start(no_account(failure)).await;
         assert!(
@@ -2076,10 +2094,59 @@ mod tests {
             kind: SK::UsageReadFailed,
             accounts: vec![account("claude4", AK::RefreshRejected), c2],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (text, _) = failed_turn_start(no_account(failure)).await;
         assert!(text.contains("Send again in 120s or later."), "{text}");
         assert!(!text.contains("no login needed"), "{text}");
+    }
+
+    /// Held usage reads: the text names when usage is read again (the next
+    /// selection reads only after the hold), not a bare "retry", and says no
+    /// login is needed unless an account needs one.
+    #[tokio::test]
+    async fn held_usage_read_text_names_the_read_time_and_no_login() {
+        let now = crate::epoch_millis();
+        let retry = now + 4 * 60 * 1000;
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2.clone()],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: Some(retry),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        let at = super::super::anthropic_quota::describe_reset_utc(retry, now);
+        let want = format!("Usage is read again after {at}; send again then. No login needed.");
+        assert!(text.contains(&want), "{want:?} missing from: {text}");
+        assert!(text.contains("capacity is unproven (not used up)"), "{text}");
+        assert!(!text.contains("Send again to retry"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+
+        // An account that needs a login keeps its advice and drops "No login needed".
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![account("claude3", AK::RefreshRejected), c2.clone()],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: Some(retry),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        let held = format!("Usage is read again after {at}; send again then.");
+        assert!(text.contains(&held), "{text}");
+        assert!(text.contains("--account claude3"), "{text}");
+        assert!(!text.contains("No login needed"), "{text}");
+
+        // A read time already past falls back to S1's text.
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: Some(now.saturating_sub(1000)),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(text.contains("Send again to retry; no login needed."), "{text}");
+        assert!(!text.contains("Usage is read again"), "{text}");
     }
 
     /// Login advice names exactly the accounts with a credential kind, even
@@ -2097,6 +2164,7 @@ mod tests {
                 account("claude5", AK::CoolingDown),
             ],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (text, log) = failed_turn_start(no_account(failure)).await;
         for needle in [
@@ -2120,6 +2188,7 @@ mod tests {
             kind: SK::UsageReadFailed,
             accounts: vec![account("claude3", AK::RefreshRejected), c6],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (text, _) = failed_turn_start(no_account(failure)).await;
         assert!(text.contains("Send again to retry"), "{text}");
@@ -2141,6 +2210,7 @@ mod tests {
             kind: SK::AllCoolingDown,
             accounts: vec![c5, c6],
             earliest_reset_ms: Some(soon),
+            usage_read_retry_ms: None,
         };
         let (text, log) = failed_turn_start(no_account(failure)).await;
         let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
@@ -2173,6 +2243,7 @@ mod tests {
             kind: SK::AllCoolingDown,
             accounts: vec![c2, c6],
             earliest_reset_ms: Some(soon),
+            usage_read_retry_ms: None,
         };
         let (text, log) = failed_turn_start(no_account(failure)).await;
         let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
@@ -2206,6 +2277,7 @@ mod tests {
             kind: SK::AllCoolingDown,
             accounts: vec![c5],
             earliest_reset_ms: Some(until),
+            usage_read_retry_ms: None,
         };
         let (text, _) = failed_turn_start(no_account(failure)).await;
         let until_text = super::super::anthropic_quota::describe_reset_utc(until, now);
@@ -2447,6 +2519,7 @@ mod tests {
                 c5,
             ],
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         };
         let (text, log) = failed_turn_start(no_account(failure)).await;
         for needle in [

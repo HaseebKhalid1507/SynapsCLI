@@ -520,6 +520,18 @@ pub struct SelectionRequest<'a> {
     /// loss. Applies to [`Strategy::SoonestReset`] only; `false` in
     /// [`new`](Self::new) so other strategies are unaffected.
     pub sticky: bool,
+    /// Last successful readings for accounts whose current usage read
+    /// failed transiently (usage-endpoint 429, 5xx, timeout, transport).
+    /// Such an account (observation [`QuotaObservation::Unknown`]) is
+    /// evaluated on its reading here instead: not past
+    /// [`grace_max_age_ms`](Self::grace_max_age_ms), never past an exhausted
+    /// window, an exclusion or a cooldown. Graced seats rank after every
+    /// fresh one, but a graced sticky seat stays (a read failure alone is no
+    /// reason to switch). Empty in [`new`](Self::new).
+    pub grace: &'a [AccountCapacity],
+    /// Oldest graced reading that still counts. Default
+    /// [`USAGE_READ_GRACE`](super::usage_reads::USAGE_READ_GRACE).
+    pub grace_max_age_ms: u64,
 }
 
 impl<'a> SelectionRequest<'a> {
@@ -540,6 +552,8 @@ impl<'a> SelectionRequest<'a> {
             current: None,
             urgent_horizon_ms: DEFAULT_URGENT_HORIZON_MS,
             sticky: false,
+            grace: &[],
+            grace_max_age_ms: super::usage_reads::USAGE_READ_GRACE.as_millis() as u64,
         }
     }
 
@@ -819,6 +833,10 @@ pub struct SelectionFailure {
     /// Earliest future cooldown end or exhausted-window reset, epoch ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest_reset_ms: Option<u64>,
+    /// For `usage_read_failed`: when the held usage reads go to the network
+    /// again (epoch ms), i.e. the earliest time a new selection reads usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_read_retry_ms: Option<u64>,
 }
 
 impl SelectionFailure {
@@ -828,6 +846,7 @@ impl SelectionFailure {
             kind,
             accounts: Vec::new(),
             earliest_reset_ms: None,
+            usage_read_retry_ms: None,
         }
     }
 
@@ -884,6 +903,7 @@ impl SelectionFailure {
             kind,
             accounts,
             earliest_reset_ms,
+            usage_read_retry_ms: None,
         }
     }
 
@@ -993,6 +1013,9 @@ pub struct Eligible {
     /// (headroom proven, deadline unknown). Unknown anchoring with a known
     /// reset is treated as anchored.
     pub tier: u8,
+    /// Eligible on a last good reading because its current usage read
+    /// failed transiently (see [`SelectionRequest::grace`]).
+    pub graced: bool,
 }
 
 /// Tier for an eligible seat; see [`Eligible::tier`].
@@ -1033,7 +1056,7 @@ pub fn evaluate(
         QuotaObservation::AuthError => return Err(RejectReason::AuthError),
         QuotaObservation::Unsupported => return Err(RejectReason::Unsupported),
         QuotaObservation::Malformed => return Err(RejectReason::Malformed),
-        QuotaObservation::Unknown => return Err(RejectReason::Unknown),
+        QuotaObservation::Unknown => return evaluate_graced(req, cap),
     };
     let observed = cap
         .observed_at_ms
@@ -1105,7 +1128,40 @@ pub fn evaluate(
         budget_reset_ms,
         anchored,
         tier,
+        graced: false,
     })
+}
+
+/// An account whose current read gave no reading: eligible only on its
+/// last good reading in [`SelectionRequest::grace`], judged by the same
+/// rules (windows, models) against the grace age, with the account's own
+/// cooldown (already checked by the caller, kept for the re-check). Any
+/// rejection of that reading reports the read failure, not the old reading.
+fn evaluate_graced(
+    req: &SelectionRequest<'_>,
+    cap: &AccountCapacity,
+) -> Result<Eligible, RejectReason> {
+    let key = cap.credential.storage_key();
+    let Some(good) = req
+        .grace
+        .iter()
+        .find(|g| g.credential.storage_key() == key)
+        .filter(|g| matches!(g.observation, QuotaObservation::Ok { .. }))
+    else {
+        return Err(RejectReason::Unknown);
+    };
+    let graced_req = SelectionRequest {
+        max_snapshot_age_ms: req.grace_max_age_ms,
+        grace: &[],
+        ..req.clone()
+    };
+    let reading = AccountCapacity {
+        cooldown_until_ms: cap.cooldown_until_ms,
+        ..good.clone()
+    };
+    evaluate(&graced_req, &reading)
+        .map(|e| Eligible { graced: true, ..e })
+        .map_err(|_| RejectReason::Unknown)
 }
 
 /// Lowest-utilization ordering: known before unknown, then ascending.
@@ -1214,13 +1270,15 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
         };
     }
 
-    // Deterministic ordering.
+    // Deterministic ordering. Fresh readings first: a graced seat (last good
+    // reading, current read failed) never outranks a fresh one when choosing
+    // anew; stickiness below may still keep a graced current seat.
     eligible.sort_by(|(a, ea), (b, eb)| {
         let ka = a.credential.storage_key();
         let kb = b.credential.storage_key();
         let pa = preference_rank(req, &a.credential);
         let pb = preference_rank(req, &b.credential);
-        match req.strategy {
+        ea.graced.cmp(&eb.graced).then_with(|| match req.strategy {
             Strategy::PreferenceOrder => pa.cmp(&pb).then_with(|| ka.cmp(&kb)),
             Strategy::LowestUtilization => utilization_cmp(ea.utilization, eb.utilization)
                 .then_with(|| pa.cmp(&pb))
@@ -1239,7 +1297,7 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
                 .then_with(|| utilization_cmp(ea.utilization, eb.utilization))
                 .then_with(|| pa.cmp(&pb))
                 .then_with(|| ka.cmp(&kb)),
-        }
+        })
     });
 
     // Stickiness (SoonestReset only): keep the pinned seat unless a candidate
@@ -1637,6 +1695,58 @@ mod tests {
             select(&r2, &[b, c, a]).selected().unwrap().storage_key(),
             "openai-codex@a"
         );
+    }
+
+    /// Grace: a failed read (`Unknown`) counts on its last good reading only
+    /// under the grace age and never past an exhausted window or a cooldown;
+    /// graced seats rank after fresh ones, but a graced sticky seat stays.
+    #[test]
+    fn graced_readings_are_bounded_rank_after_fresh_and_keep_a_sticky_seat() {
+        let grace_ms = super::super::usage_reads::USAGE_READ_GRACE.as_millis() as u64;
+        let failed = |label: &str| AccountCapacity::unobserved(cred(label));
+        let good = |label: &str, age: u64, used: f64, reset: u64| AccountCapacity {
+            observed_at_ms: Some(NOW - age),
+            ..ok(label, vec![win("primary", 7 * DAY, used, reset)])
+        };
+        let fresh_req = || SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000);
+        let winner = |sel: Selection| match sel {
+            Selection::Selected { credential, .. } => credential.account.label_str().to_string(),
+            Selection::NoCapacity { rejections, .. } => panic!("no capacity: {rejections:?}"),
+        };
+        let one = |grace: &[AccountCapacity], cap: &AccountCapacity| {
+            evaluate(&SelectionRequest { grace, ..fresh_req() }, cap)
+        };
+
+        let young = [good("a", grace_ms - 60_000, 20.0, NOW + DAY)];
+        assert!(one(&young, &failed("a")).unwrap().graced);
+        let old = [good("a", grace_ms + 60_000, 20.0, NOW + DAY)];
+        assert_eq!(one(&old, &failed("a")), Err(RejectReason::Unknown), "past the grace age");
+        let exhausted = [good("a", 60_000, 100.0, NOW + HOUR)];
+        assert_eq!(one(&exhausted, &failed("a")), Err(RejectReason::Unknown), "exhausted window");
+        let cooling = AccountCapacity {
+            cooldown_until_ms: Some(NOW + HOUR),
+            ..failed("a")
+        };
+        assert!(matches!(one(&young, &cooling), Err(RejectReason::CoolingDown { .. })));
+        let auth = AccountCapacity {
+            observation: QuotaObservation::AuthError,
+            ..failed("a")
+        };
+        assert_eq!(one(&young, &auth), Err(RejectReason::AuthError), "only a failed read is graced");
+
+        // a: graced, urgent; b: fresh, far. Choosing anew: fresh b first.
+        let grace = [good("a", 60_000, 20.0, NOW + HOUR)];
+        let b = good("b", 1000, 20.0, NOW + 3 * DAY);
+        let anew = SelectionRequest { grace: &grace, ..fresh_req() };
+        assert_eq!(winner(select(&anew, &[failed("a"), b.clone()])), "b");
+        assert_eq!(winner(select(&anew, &[failed("a")])), "a", "alone, the graced seat serves");
+        // Sticky on graced a: stays (a read failure alone is no reason to switch).
+        let current = cred("a");
+        let sticky = SelectionRequest {
+            current: Some(&current),
+            ..anew.clone()
+        };
+        assert_eq!(winner(select(&sticky, &[failed("a"), b])), "a");
     }
 
     #[test]

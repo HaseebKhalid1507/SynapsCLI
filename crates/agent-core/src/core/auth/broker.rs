@@ -1710,8 +1710,11 @@ pub struct LocalBroker {
     /// reading can never be attributed to a different seat than the one it
     /// was taken from. Entries older than `max_snapshot_age` are never reused.
     snapshots: SharedMap<super::usage::UsageSnapshot>,
-    /// Single-flight gates for usage fetches, per seat key.
-    snapshot_gates: SharedMap<Arc<tokio::sync::Mutex<()>>>,
+    /// Process-wide usage-read table (single-flight per slot, held failed
+    /// reads, last good readings); see [`super::usage_reads`].
+    usage_reads: Arc<super::usage_reads::UsageReads>,
+    /// Small per-process number for the usage-read log line (not secret).
+    instance: u64,
     /// Cached account policy keyed by the config file's modification time
     /// (env overlay is applied on every read; it is cheap and has no I/O).
     policy_cache: Arc<std::sync::Mutex<Option<CachedPolicy>>>,
@@ -1761,6 +1764,12 @@ pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// its stream has no retry, so it gets a longer idle limit.
 pub const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Next per-process broker number for the usage-read log line.
+fn next_broker_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
         let cloud_backend = Arc::new(ProductionCloudBackend::new(http.clone()));
@@ -1784,7 +1793,8 @@ impl LocalBroker {
             usage_endpoint_override: None,
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshots: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            snapshot_gates: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            usage_reads: super::usage_reads::process_table(),
+            instance: next_broker_instance(),
             policy_cache: Arc::new(std::sync::Mutex::new(None)),
             observations: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             selections: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -2230,23 +2240,23 @@ impl LocalBroker {
             .cloned()
     }
 
-    fn snapshot_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.snapshot_gates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// Usage-read table key for `cred`'s slot: credential file + storage key
+    /// + usage endpoint. Stable across token rotation; no token material.
+    fn read_key(&self, cred: &CredentialRef) -> String {
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            cred.storage_key(),
+            self.usage_endpoint_override.as_deref().unwrap_or("")
+        )
     }
 
-    /// Drop every cached reading and gate for `cred`'s slot (any seat).
+    /// Drop every cached reading for `cred`'s slot (any seat). The
+    /// single-flight gate lives in the process-wide usage-read table and is
+    /// never dropped, so this cannot open a second flight.
     fn forget_snapshots(&self, cred: &CredentialRef) {
         let prefix = format!("|{}|", cred.storage_key());
         self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|k, _| !k.contains(&prefix));
-        self.snapshot_gates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|k, _| !k.contains(&prefix));
@@ -2254,25 +2264,24 @@ impl LocalBroker {
 
     /// Fresh usage snapshot for `cred` plus the seat it was read from: the
     /// short-lived cache is consulted first (never past `max_snapshot_age`,
-    /// and only for the seat currently stored in the slot), otherwise ONE
-    /// read-only fetch per seat at a time (single-flight; concurrent vends
-    /// share it). The token for the read and the reported seat come from the
-    /// same load, so the pair is exact even if the slot changes concurrently.
+    /// and only for the seat currently stored in the slot), otherwise the
+    /// process-wide usage-read table: ONE read per slot at a time across
+    /// every broker in the process, and a held failed read is answered
+    /// without a request. The token for the read and the reported seat come
+    /// from the same load, so the pair is exact even if the slot changes
+    /// concurrently.
     async fn fresh_usage(
         &self,
         cred: &CredentialRef,
-    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
-        let seat = self.stored_seat(cred).map_err(UsageReadError::slot)?;
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), super::usage_reads::ReadError> {
+        let seat = self
+            .stored_seat(cred)
+            .map_err(|e| UsageReadError::slot(e).into_read_error())?;
         let key = Self::seat_key(cred, &seat);
         if let Some(cached) = self.cached_snapshot(&key) {
             return Ok((cached, seat));
         }
-        let gate = self.snapshot_gate(&key);
-        let _held = gate.lock().await;
-        if let Some(cached) = self.cached_snapshot(&key) {
-            return Ok((cached, seat));
-        }
-        let (snapshot, used) = self.usage_with_seat(cred).await?;
+        let (snapshot, used) = self.shared_read(cred).await?;
         // One slot holds one seat: a reading for its current content
         // supersedes anything cached for a previous occupant.
         self.forget_snapshots(cred);
@@ -2284,18 +2293,16 @@ impl LocalBroker {
         Ok((snapshot, used))
     }
 
-    /// Read-only usage for `cred`, reporting the seat whose token made the
-    /// request. Token resolution happens HERE, behind the boundary, for
-    /// exactly this credential; the usage helper pairs any account header
-    /// with the same token. A failure keeps its typed cause. Every read
-    /// (not a cache hit) is recorded for `synaps auth state`.
+    /// Read-only usage for `cred` through the process-wide usage-read table,
+    /// reporting the seat whose token made the request. A failure keeps its
+    /// typed cause.
     async fn usage_with_seat(
         &self,
         cred: &CredentialRef,
     ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
-        let result = self.read_usage_with_seat(cred).await;
-        self.record_usage(cred, result.as_ref().err().map(|e| e.failure.clone()));
-        result
+        self.shared_read(cred)
+            .await
+            .map_err(|e| UsageReadError::from_read(&e))
     }
 
     /// Key of a slot's `auth state` records: credential file + storage key.
@@ -2322,28 +2329,92 @@ impl LocalBroker {
         slot.last_usage = Some(super::auth_state::ObservedOutcome { at_ms, failure });
     }
 
-    async fn read_usage_with_seat(
-        &self,
-        cred: &CredentialRef,
-    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
-        use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
-        if !supports_usage(cred.provider) {
-            return Err(UsageReadError::usage(UsageError::UnsupportedProvider {
-                provider: cred.provider.as_str().to_string(),
-            }));
+    /// One usage read for `cred` through the process-wide table, with its
+    /// INFO line (account label, outcome, failure kind/status; no token).
+    /// A read that went to the network (or joined one in flight) is
+    /// recorded for `synaps auth state`; a held read sends nothing and is
+    /// not a new read.
+    async fn shared_read(&self, cred: &CredentialRef) -> super::usage_reads::ReadResult {
+        use super::usage_reads::{ReadError, ReadPath, USAGE_READ_TARGET};
+        let key = self.read_key(cred);
+        let (result, path) = self
+            .usage_reads
+            .read(&key, || self.network_read(cred))
+            .await;
+        if path != ReadPath::NegativeCacheHit {
+            self.record_usage(cred, result.as_ref().err().map(ReadError::cause));
         }
-        self.check_slot_exists(cred).map_err(UsageReadError::slot)?;
-        let creds =
-            super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
-                .await
-                .map_err(UsageReadError::refresh)?;
+        let outcome = match (path, &result) {
+            (ReadPath::Network, Ok(_)) => "ok",
+            (ReadPath::Network, Err(_)) => "failed",
+            (ReadPath::Joined, _) => "joined",
+            (ReadPath::NegativeCacheHit, _) => "negative_cache_hit",
+        };
+        let now_ms = crate::epoch_millis();
+        let (kind, status, retry_in_s) = match &result {
+            Ok(_) => ("none", String::new(), 0),
+            Err(ReadError::Transient {
+                failure,
+                retry_at_ms,
+            }) => (
+                failure.kind,
+                failure.status.map(|s| s.to_string()).unwrap_or_default(),
+                retry_at_ms.saturating_sub(now_ms) / 1000,
+            ),
+            Err(ReadError::Other { cause, .. }) => (
+                cause.kind.as_str(),
+                cause.http_status.map(|s| s.to_string()).unwrap_or_default(),
+                0,
+            ),
+        };
+        tracing::info!(
+            target: USAGE_READ_TARGET,
+            broker = self.instance,
+            account = %cred.account.label_str(),
+            outcome = %outcome,
+            kind = %kind,
+            status = %status,
+            retry_in_s,
+            "usage read"
+        );
+        result
+    }
+
+    /// One network usage read for `cred`, reporting the seat whose token
+    /// made the request. Token resolution happens HERE, behind the boundary,
+    /// for exactly this credential; the usage helper pairs any account
+    /// header with the same token. Only [`Self::shared_read`] calls it.
+    async fn network_read(&self, cred: &CredentialRef) -> super::usage_reads::Fetched {
+        use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
+        use super::usage_reads::Fetched;
+        if !supports_usage(cred.provider) {
+            return Fetched::Usage(UsageError::UnsupportedProvider {
+                provider: cred.provider.as_str().to_string(),
+            });
+        }
+        if let Err(e) = self.check_slot_exists(cred) {
+            return UsageReadError::slot(e).into_fetched();
+        }
+        let creds = match super::token::ensure_fresh_credential_via(
+            &self.http,
+            cred,
+            &self.refresh_endpoints,
+        )
+        .await
+        {
+            Ok(creds) => creds,
+            Err(f) => return UsageReadError::refresh(f).into_fetched(),
+        };
         let seat = SeatIdentity::of(cred.provider, &creds);
-        let client = UsageClient::new().map_err(UsageReadError::usage)?;
+        let client = match UsageClient::new() {
+            Ok(client) => client,
+            Err(e) => return Fetched::Usage(e),
+        };
         let opts = UsageFetchOptions {
             endpoint_override: self.usage_endpoint_override.clone(),
             ..UsageFetchOptions::default()
         };
-        let snapshot = fetch_usage(
+        match fetch_usage(
             &client,
             cred.provider,
             cred.account.label_str(),
@@ -2351,21 +2422,30 @@ impl LocalBroker {
             &opts,
         )
         .await
-        .map_err(UsageReadError::usage)?;
-        Ok((snapshot, seat))
+        {
+            Ok(snapshot) => Fetched::Ok(snapshot, seat),
+            Err(e) => Fetched::Usage(e),
+        }
     }
 
     /// Capacity view for one account from a fresh, read-only usage snapshot,
     /// with the seat it was read from. Anything that is not a well-formed,
-    /// fresh reading is NOT capacity; a failed read keeps its typed cause.
-    async fn capacity_for(
-        &self,
-        cred: &CredentialRef,
-    ) -> (super::quota_policy::AccountCapacity, Option<SeatIdentity>) {
+    /// fresh reading is NOT capacity; a failed read keeps its typed cause. A
+    /// read that failed transiently also reports that failure (and when
+    /// reads resume) and, when the slot has one, its last good reading for
+    /// the policy's grace, paired with the seat stored in the slot now.
+    async fn capacity_for(&self, cred: &CredentialRef) -> CandidateRead {
         use super::quota_policy::AccountCapacity;
+        use super::usage_reads::ReadError;
         match self.fresh_usage(cred).await {
-            Ok((snapshot, seat)) => (capacity_from_snapshot(cred, &snapshot), Some(seat)),
-            Err(err) => {
+            Ok((snapshot, seat)) => CandidateRead {
+                capacity: capacity_from_snapshot(cred, &snapshot),
+                seat: Some(seat),
+                transient: None,
+                grace: None,
+            },
+            Err(read_err) => {
+                let err = UsageReadError::from_read(&read_err);
                 if err.failure.kind.needs_action() {
                     // Only the user can fix this, outside synaps; the
                     // selection failure names just the kind, so say here
@@ -2379,7 +2459,33 @@ impl LocalBroker {
                 } else {
                     tracing::debug!(credential = %cred, cause = %err.failure, "usage read failed");
                 }
-                (AccountCapacity::failed(cred.clone(), err.failure), None)
+                let capacity = AccountCapacity::failed(cred.clone(), err.failure);
+                let ReadError::Transient {
+                    failure,
+                    retry_at_ms,
+                } = read_err
+                else {
+                    return CandidateRead {
+                        capacity,
+                        seat: None,
+                        transient: None,
+                        grace: None,
+                    };
+                };
+                let graced = self
+                    .usage_reads
+                    .last_good(&self.read_key(cred))
+                    .and_then(|good| Some((good, self.stored_seat(cred).ok()?)));
+                let (grace, seat) = match graced {
+                    Some((good, seat)) => (Some(capacity_from_snapshot(cred, &good)), Some(seat)),
+                    None => (None, None),
+                };
+                CandidateRead {
+                    capacity,
+                    seat,
+                    transient: Some((failure, retry_at_ms)),
+                    grace,
+                }
             }
         }
     }
@@ -2394,25 +2500,40 @@ impl LocalBroker {
     ) -> Result<super::SelectionPlan, BrokerError> {
         self.selection_plan(provider, model)
             .await
-            .map(|(plan, _)| plan)
+            .map(|(plan, ..)| plan)
     }
 
+    #[allow(clippy::type_complexity)]
     async fn selection_plan(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
-    ) -> Result<(super::SelectionPlan, BTreeMap<String, SeatIdentity>), BrokerError> {
+    ) -> Result<
+        (
+            super::SelectionPlan,
+            BTreeMap<String, SeatIdentity>,
+            BTreeMap<String, (super::usage_reads::TransientReadFailure, u64)>,
+        ),
+        BrokerError,
+    > {
         use super::quota_policy::SelectionRequest;
         let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
         let mut candidates = Vec::with_capacity(summaries.len());
         let mut seats = BTreeMap::new();
+        let mut transient = BTreeMap::new();
+        let mut grace = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut exclude = Vec::new();
         for summary in &summaries {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
-            let (mut capacity, seat) = self.capacity_for(&cred).await;
+            let read = self.capacity_for(&cred).await;
+            let (mut capacity, seat) = (read.capacity, read.seat);
+            if let Some(failed) = read.transient {
+                transient.insert(cred.storage_key(), failed);
+            }
+            grace.extend(read.grace);
             // A generic Codex window (including a free 30-day plan) does
             // not prove entitlement to Astra or any other requested model.
             if provider == OAuthProviderId::OpenAiCodex {
@@ -2463,11 +2584,13 @@ impl LocalBroker {
             current: current.as_ref(),
             urgent_horizon_ms: policy.urgent_horizon_ms,
             sticky: policy.sticky,
+            grace: &grace,
             ..SelectionRequest::new(provider, now_ms, self.max_snapshot_age.as_millis() as u64)
         };
         Ok((
             super::SelectionPlan::from_candidates(&request, &candidates),
             seats,
+            transient,
         ))
     }
 
@@ -2477,7 +2600,8 @@ impl LocalBroker {
         model: Option<&str>,
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
-        let (plan, mut seats) = match self.selection_plan(provider, model).await {
+        use super::usage_reads::USAGE_READ_TARGET;
+        let (plan, mut seats, transient) = match self.selection_plan(provider, model).await {
             Ok(planned) => planned,
             // The account list itself could not be read (the only error
             // `selection_plan` returns): still exactly one WARN for this
@@ -2514,6 +2638,20 @@ impl LocalBroker {
                         SelectionFailure::new(SelectionFailureKind::SeatChurn),
                     ));
                 };
+                // A chosen account whose read failed was chosen on its last
+                // good reading (the policy's grace).
+                if let Some((failure, retry_at_ms)) = transient.get(&credential.storage_key()) {
+                    tracing::info!(
+                        target: USAGE_READ_TARGET,
+                        broker = self.instance,
+                        account = %credential.account.label_str(),
+                        outcome = %"grace",
+                        kind = %failure.kind,
+                        status = %failure.status.map(|s| s.to_string()).unwrap_or_default(),
+                        retry_in_s = retry_at_ms.saturating_sub(crate::epoch_millis()) / 1000,
+                        "usage read"
+                    );
+                }
                 tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
                 Ok((credential, seat))
             }
@@ -2528,10 +2666,19 @@ impl LocalBroker {
                 let reset = earliest_reset_ms
                     .map(|t| format!("; earliest reset at {t}"))
                     .unwrap_or_default();
-                let failure = super::quota_policy::SelectionFailure::from_rejections(
+                let mut failure = super::quota_policy::SelectionFailure::from_rejections(
                     &rejections,
                     plan.now_ms,
                 );
+                // A held usage read goes to the network again at the next
+                // selection after its hold ends: say when.
+                if failure.kind == SelectionFailureKind::UsageReadFailed {
+                    failure.usage_read_retry_ms = rejections
+                        .iter()
+                        .filter_map(|r| transient.get(&r.credential.storage_key()))
+                        .map(|(_, at)| *at)
+                        .min();
+                }
                 let reason = if detail.is_empty() {
                     format!("no {provider} account is logged in")
                 } else {
@@ -2993,11 +3140,41 @@ struct UsageReadError {
     failure: super::quota_policy::ObservationFailure,
 }
 
+/// One account's read for automatic selection.
+struct CandidateRead {
+    capacity: super::quota_policy::AccountCapacity,
+    /// Seat the reading belongs to (for a graced account: the seat stored now).
+    seat: Option<SeatIdentity>,
+    /// The read failed transiently: the failure and when reads resume.
+    transient: Option<(super::usage_reads::TransientReadFailure, u64)>,
+    /// Last good reading offered to the policy's grace.
+    grace: Option<super::quota_policy::AccountCapacity>,
+}
+
 impl UsageReadError {
-    fn usage(e: super::usage::UsageError) -> Self {
+    /// A read answered by the process-wide usage-read table (a network,
+    /// joined or held read): the same error and cause the read itself had.
+    fn from_read(e: &super::usage_reads::ReadError) -> Self {
         Self {
-            failure: e.failure(),
-            error: e.into_broker_error(),
+            error: e.to_broker_error(),
+            failure: e.cause(),
+        }
+    }
+
+    /// This failure as the table's error for a read that never reached the
+    /// usage request (slot check).
+    fn into_read_error(self) -> super::usage_reads::ReadError {
+        super::usage_reads::ReadError::Other {
+            error: self.error,
+            cause: self.failure,
+        }
+    }
+
+    /// This failure as a network read's outcome (slot check, refresh).
+    fn into_fetched(self) -> super::usage_reads::Fetched {
+        super::usage_reads::Fetched::Failed {
+            error: self.error,
+            cause: self.failure,
         }
     }
 
@@ -3020,6 +3197,17 @@ impl UsageReadError {
         Self {
             failure: ObservationFailure::new(kind),
             error,
+        }
+    }
+
+    /// A failed usage request as the selection sees it: through the
+    /// usage-read table, which keeps the request's own error and cause.
+    #[cfg(test)]
+    fn usage(e: super::usage::UsageError) -> Self {
+        let table = super::usage_reads::UsageReads::default();
+        match table.record_at("slot", super::usage_reads::Fetched::Usage(e), 0) {
+            Err(read) => Self::from_read(&read),
+            Ok(_) => unreachable!("a usage error is never a reading"),
         }
     }
 }
@@ -3437,8 +3625,10 @@ impl CredentialBroker for LocalBroker {
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), Cooldown { until_ms, reason });
         // The cached reading predates the limit report; drop it so the next
-        // selection re-reads instead of trusting stale headroom.
+        // selection re-reads instead of trusting stale headroom, and drop
+        // the slot's last good reading so grace can never outlive the limit.
         self.forget_snapshots(cred);
+        self.usage_reads.forget_last_good(&self.read_key(cred));
         Ok(())
     }
 
