@@ -757,6 +757,13 @@ pub trait CredentialBroker: Send + Sync {
         Ok(())
     }
 
+    /// When `cred`'s active cooldown ends (epoch ms), if this broker knows
+    /// of one. No network request and no token refresh. Default: none.
+    fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
+        let _ = cred;
+        None
+    }
+
     /// Execute a non-streaming provider request with the broker-owned key.
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError>;
 
@@ -1781,6 +1788,32 @@ struct Cooldown {
     reason: String,
 }
 
+/// The keys one account's cooldown is kept under
+/// ([`LocalBroker::cooldown_keys`]). Non-secret: the seat part is an
+/// identity digest, never a token.
+struct CooldownKeys {
+    /// The stored seat's key; None when the slot has no readable login.
+    seat: Option<String>,
+    /// The slot's key.
+    slot: String,
+    /// The stored seat names a provider account id.
+    identified: bool,
+}
+
+impl CooldownKeys {
+    /// Keys a report writes: the seat's, and the slot's unless the seat
+    /// names an account id.
+    fn written(&self) -> impl Iterator<Item = &str> + '_ {
+        let slot = (!self.identified).then_some(self.slot.as_str());
+        self.seat.as_deref().into_iter().chain(slot)
+    }
+
+    /// Keys a lookup or a clear reads: the seat's and the slot's.
+    fn read(&self) -> impl Iterator<Item = &str> + '_ {
+        self.seat.as_deref().into_iter().chain([self.slot.as_str()])
+    }
+}
+
 /// Cooldown applied when a limit is reported without a reset hint.
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
@@ -2075,31 +2108,50 @@ impl LocalBroker {
         config_policy.with_env_overlay()
     }
 
-    /// Limits follow the immutable seat, not an alias that can be re-used.
-    fn cooldown_key(&self, cred: &CredentialRef) -> String {
-        let seat = self
-            .stored_seat(cred)
-            .ok()
-            .map(|s| s.as_str().to_string())
-            .unwrap_or_else(|| cred.storage_key());
-        format!(
-            "{}|{}|{}",
-            storage::auth_file_path().display(),
-            cred.provider,
-            seat
-        )
+    /// Where `cred`'s cooldown is kept. Limits follow the seat, not an
+    /// alias that can be re-used: aliases of one seat share its cooldown.
+    /// A login without a provider account id has a seat derived from its
+    /// token, which a refresh rotates, so its cooldown is also kept under
+    /// its slot and survives the rotation (a new login of that kind into
+    /// the slot inherits it too; `auth state --clear` drops it). A login
+    /// into another account id has another seat and does not inherit it.
+    fn cooldown_keys(&self, cred: &CredentialRef) -> CooldownKeys {
+        let store = storage::auth_file_path().display().to_string();
+        let slot = format!("{store}|{}|{}", cred.provider, cred.storage_key());
+        let seat = self.stored_seat(cred).ok();
+        CooldownKeys {
+            identified: seat.as_ref().is_some_and(|s| s.seat_fingerprint().is_some()),
+            seat: seat.map(|s| format!("{store}|{}|{}", cred.provider, s.as_str())),
+            slot,
+        }
+    }
+
+    /// `cred`'s active cooldown: the latest one under its keys.
+    fn active_cooldown_at(&self, cred: &CredentialRef, now_ms: u64) -> Option<Cooldown> {
+        // Nothing cooling, nothing to look up: no read of the stored login
+        // (a turn asks before every request).
+        if !self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|c| c.until_ms > now_ms)
+        {
+            return None;
+        }
+        let keys = self.cooldown_keys(cred);
+        let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        keys.read()
+            .filter_map(|key| cooldowns.get(key))
+            .filter(|c| c.until_ms > now_ms)
+            .max_by_key(|c| c.until_ms)
+            .cloned()
     }
 
     /// Reading an expired cooldown is non-mutating (preview shares this path).
     fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
         let cred = CredentialRef::parse_storage_key(storage_key)?;
-        let key = self.cooldown_key(&cred);
-        self.cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .filter(|c| c.until_ms > now_ms)
-            .map(|c| c.until_ms)
+        self.active_cooldown_at(&cred, now_ms).map(|c| c.until_ms)
     }
 
     // ── `synaps auth state` ─────────────────────────────────────────────
@@ -2120,12 +2172,7 @@ impl LocalBroker {
         cred: &CredentialRef,
         now_ms: u64,
     ) -> Option<super::auth_state::CooldownState> {
-        let key = self.cooldown_key(cred);
-        self.cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .filter(|c| c.until_ms > now_ms)
+        self.active_cooldown_at(cred, now_ms)
             .map(|c| super::auth_state::CooldownState {
                 until_ms: c.until_ms,
                 reason: super::auth_state::CooldownReason::from_reported(&c.reason),
@@ -2140,11 +2187,11 @@ impl LocalBroker {
     /// occupant of a slot left. Never touches the credential store.
     fn clear_state(&self, creds: &[CredentialRef], whole_providers: &[OAuthProviderId]) {
         let store = storage::auth_file_path().display().to_string();
+        let keys: Vec<CooldownKeys> = creds.iter().map(|c| self.cooldown_keys(c)).collect();
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
-            for cred in creds {
-                cooldowns.remove(&self.cooldown_key(cred));
-                cooldowns.remove(&format!("{store}|{}|{}", cred.provider, cred.storage_key()));
+            for key in keys.iter().flat_map(|k| k.read()) {
+                cooldowns.remove(key);
             }
             for provider in whole_providers {
                 let prefix = format!("{store}|{provider}|");
@@ -3964,6 +4011,11 @@ impl CredentialBroker for LocalBroker {
             .map_err(|e| e.error)
     }
 
+    fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
+        self.active_cooldown_at(cred, crate::epoch_millis())
+            .map(|c| c.until_ms)
+    }
+
     async fn report_cooldown(
         &self,
         cred: &CredentialRef,
@@ -3978,11 +4030,19 @@ impl CredentialBroker for LocalBroker {
             .min(max_until);
         let reason = crate::truncate_str(reason, 64).to_string();
         tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
-        let key = self.cooldown_key(cred);
-        self.cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), Cooldown { until_ms, reason });
+        let keys = self.cooldown_keys(cred);
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for key in keys.written() {
+                cooldowns.insert(
+                    key.to_string(),
+                    Cooldown {
+                        until_ms,
+                        reason: reason.clone(),
+                    },
+                );
+            }
+        }
         // The cached reading predates the limit report; drop it so the next
         // selection re-reads instead of trusting stale headroom, and drop
         // the slot's last good reading so grace can never outlive the limit.

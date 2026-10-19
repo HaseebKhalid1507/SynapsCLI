@@ -343,6 +343,17 @@ impl AuthMethods {
         point: RefreshPoint,
     ) -> Result<()> {
         let selector = broker.account_selector(OAuthProviderId::Anthropic);
+        // Auto mid-turn: a seat this turn pinned that is now cooling down
+        // (another session met its limit) is not kept; the request would
+        // meet the same limit. Memory only, outside the auth lock.
+        let cooling = match (&selector, point) {
+            (AccountSelector::Auto, RefreshPoint::WithinTurn) => {
+                let bound = auth.read().await.bound_credential.clone();
+                turn_pinned_credential(source, bound.as_deref())
+                    .is_some_and(|cred| broker.active_cooldown(&cred).is_some())
+            }
+            _ => false,
+        };
         // Fast path: in-memory token still fresh AND still the selected account?
         // Local: also unchanged on disk (`recorded_mtime`, checked below).
         let recorded_mtime = {
@@ -363,7 +374,7 @@ impl AuthMethods {
                 } else {
                     !auth_guard.auth_token.is_empty() && crate::epoch_millis() < exp
                 };
-                if still_fresh && binding == BindingCheck::Matches {
+                if still_fresh && binding == BindingCheck::Matches && !cooling {
                     if source.is_remote() {
                         return Ok(());
                     }
@@ -484,7 +495,8 @@ impl AuthMethods {
     /// long agentic turn keeps one account (and its prompt cache) instead
     /// of hopping to whichever seat now has the lowest utilization, and no
     /// per-round usage fetches are spent. Only if THAT seat can no longer be
-    /// vended does Auto fall back to re-selection (Auto opted in to switching;
+    /// vended, or is cooling down (another session met its limit), does
+    /// Auto fall back to re-selection (Auto opted in to switching;
     /// the fallback is logged, never silent).
     async fn vend_auto(
         broker: &dyn CredentialBroker,
@@ -495,18 +507,29 @@ impl AuthMethods {
     ) -> Result<PinnedToken> {
         if point == RefreshPoint::WithinTurn {
             if let Some(cred) = turn_pinned_credential(source, bound) {
-                match broker.access_token_for(&cred).await {
-                    Ok(token) => {
-                        return Ok(PinnedToken {
-                            credential: cred,
-                            token,
-                        })
-                    }
-                    Err(e) => tracing::warn!(
+                // A pinned seat that is cooling down is not re-vended: the
+                // selection below never picks it while the cooldown lasts,
+                // and with no other account it says until when.
+                if let Some(until_ms) = broker.active_cooldown(&cred) {
+                    tracing::info!(
                         credential = %cred,
-                        error = %e,
-                        "Anthropic auto selection: the seat pinned for this turn could not be re-vended; re-selecting"
-                    ),
+                        until_ms,
+                        "Anthropic auto selection: the seat pinned for this turn is cooling down; re-selecting"
+                    );
+                } else {
+                    match broker.access_token_for(&cred).await {
+                        Ok(token) => {
+                            return Ok(PinnedToken {
+                                credential: cred,
+                                token,
+                            })
+                        }
+                        Err(e) => tracing::warn!(
+                            credential = %cred,
+                            error = %e,
+                            "Anthropic auto selection: the seat pinned for this turn could not be re-vended; re-selecting"
+                        ),
+                    }
                 }
             }
         }
@@ -1547,6 +1570,8 @@ mod tests {
         auto_pick: &'static str,
         /// When set, the automatic selector fails with this error instead.
         auto_error: Mutex<Option<BrokerError>>,
+        /// Storage keys of seats that are cooling down.
+        cooling: Vec<String>,
     }
 
     impl ScriptedBroker {
@@ -1558,6 +1583,7 @@ mod tests {
                 explicit_denied: Vec::new(),
                 auto_pick: "auto-pick",
                 auto_error: Mutex::new(None),
+                cooling: Vec::new(),
             }
         }
         fn explicit(&self) -> Vec<String> {
@@ -1578,6 +1604,11 @@ mod tests {
         }
         fn account_selector(&self, _p: OAuthProviderId) -> AccountSelector {
             self.selector.clone()
+        }
+        fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
+            self.cooling
+                .contains(&cred.storage_key())
+                .then_some(FRESH)
         }
         async fn access_token_for(
             &self,
@@ -1847,6 +1878,72 @@ mod tests {
             "pinned seat tried first"
         );
         assert_eq!(broker.auto().len(), 1);
+    }
+
+    /// S4: a seat this turn pinned that is now cooling down (another
+    /// session met its limit) is not kept mid-turn, fresh or stale: Auto
+    /// re-selects without re-vending it, so the turn's next request does
+    /// not meet the same limit. Without a cooldown the fresh seat is kept
+    /// with no broker call, and an explicit selector keeps its account
+    /// whatever its cooldown.
+    #[tokio::test]
+    async fn auto_within_turn_leaves_a_pinned_seat_that_is_cooling_down() {
+        let source = remote("principal-A");
+        for expires in [FRESH, STALE] {
+            let auth = bound_state(&source, &work_cred(), expires);
+            let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+            broker.cooling = vec!["anthropic@work".into()];
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("claude-opus-4-7"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .unwrap();
+            let g = auth.read().await;
+            assert_eq!(g.auth_token, "tok-auto-auto-pick", "expires {expires}");
+            assert!(g
+                .bound_credential
+                .as_deref()
+                .unwrap()
+                .ends_with("|anthropic@auto-pick"));
+            assert!(broker.explicit().is_empty(), "the cooling seat is not re-vended");
+            assert_eq!(broker.auto(), vec![Some("claude-opus-4-7".to_string())]);
+        }
+
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.cooling = vec!["anthropic@other".into()];
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let mut broker = ScriptedBroker::new(AccountSelector::Account(
+            crate::auth::Account::parse("work").unwrap(),
+        ));
+        broker.cooling = vec!["anthropic@work".into()];
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
     }
 
     /// An explicit selector with a stale token re-vends exactly that

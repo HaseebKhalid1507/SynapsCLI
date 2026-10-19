@@ -584,6 +584,72 @@ async fn a_cooling_account_is_not_read_until_its_cooldown_is_gone() {
     assert_eq!(usage_hits.load(Ordering::SeqCst), 2, "a is read again");
 }
 
+/// S4: a login without a provider account id has a seat derived from its
+/// token, so a refresh changes it; its cooldown is kept under the slot too
+/// and survives the rotation: `a` stays cooling, is neither chosen nor
+/// read, and `auth state` still shows the cooldown. It also survives the
+/// login gaining an account id (`auth identify`); `auth state --clear`
+/// drops it. (A login into another account id does not inherit it:
+/// broker_accounts' alias_cannot_bypass_cooldown_and_relogin_does_not_inherit_it.)
+#[tokio::test]
+#[serial_test::serial]
+async fn a_cooldown_survives_a_token_rotation_of_a_login_without_an_account_id() {
+    let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let (usage_url, usage_hits) = spawn_counted_usage(script).await;
+    let broker = auto_broker(&usage_url);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_cooldown(&anthropic("a"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    // Another process refreshes a's login: new access and refresh token.
+    store_tokens(
+        &home,
+        "a",
+        "rotated-anthropic-a-access",
+        "refresh-anth-a-rotated-SECRET",
+        FAR_FUTURE,
+    );
+
+    assert_eq!(account_state(&broker, "a")["cooldown"]["until_ms"], until);
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+    assert_eq!(broker.active_cooldown(&anthropic("b")), None);
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert!(
+        matches!(
+            lookup_without_b(&broker).await,
+            Err(BrokerError::NoAccountAvailable { .. })
+        ),
+        "a is still cooling down"
+    );
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 1, "a is not read");
+
+    // The same login gains its account id.
+    let path = home.path().join("auth.json");
+    let mut root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    root["anthropic@a"]["accountId"] = json!(ACCOUNT_ID_A);
+    std::fs::write(&path, root.to_string()).unwrap();
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+
+    broker
+        .auth_state(&AuthStateQuery {
+            account: Some("a".into()),
+            clear: true,
+            ..anthropic_query()
+        })
+        .unwrap();
+    assert_eq!(broker.active_cooldown(&anthropic("a")), None);
+    assert_eq!(
+        lookup_without_b(&broker).await.expect("a serves again"),
+        anthropic("a")
+    );
+}
+
 /// r2 blocker 2 / item 5: automatic selection on an unreadable store fails
 /// with the store's error (naming the file, never its content) and exactly
 /// one auth_selection_failed WARN of kind credential_store, recorded for
