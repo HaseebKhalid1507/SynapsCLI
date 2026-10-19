@@ -53,17 +53,26 @@ async fn refused_continue_leaves_the_live_owners_card_alone() {
     until(&mut a, |e| matches!(e, SessionEventWire::Ended { .. })).await;
 
     // Another process owns the session now: it holds the journal lock and
-    // has published its card.
+    // has published its card. `Ended` is emitted before the ended actor is
+    // dropped, and the drop is what releases its lock, so wait for it.
     let sessions = agent_engine::core::session_lock::sessions_dir();
-    let _owner_lock = agent_engine::core::session_lock::SessionLock::try_acquire(
-        &sessions,
-        &id,
-        agent_engine::core::session_lock::LockHolder {
-            pid: std::process::id(),
-            kind: "daemon".into(),
-        },
-    )
-    .expect("journal lock is free once the session ended");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let _owner_lock = loop {
+        match agent_engine::core::session_lock::SessionLock::try_acquire(
+            &sessions,
+            &id,
+            agent_engine::core::session_lock::LockHolder {
+                pid: std::process::id(),
+                kind: "daemon".into(),
+            },
+        ) {
+            Ok(lock) => break lock,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("the ended session never released its journal lock: {e:?}"),
+        }
+    };
     let run = registry_dir();
     let owner = SessionRegistration {
         kind: "session".into(),
