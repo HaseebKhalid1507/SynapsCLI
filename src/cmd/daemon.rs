@@ -1,11 +1,14 @@
-//! `synaps daemon {start,status,stop,sessions,purge}` (PLAN-phase2 §2.11, B4;
-//! phase 3 C2 `purge`).
+//! `synaps daemon {start,status,stop,sessions,purge,reload,close}`
+//! (PLAN-phase2 §2.11, B4; phase 3 C2 `purge`, C3 `reload`).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_engine::daemon::{self, registry, DaemonOpts, EXIT_REFUSED};
-use agent_engine::session::socket_transport::SocketTransport;
+use agent_engine::daemon::close::{resolve_session, ResolveError};
+use agent_engine::daemon::{self, registry, DaemonOpts, EXIT_REFUSED, EXIT_VERSION};
+use agent_engine::session::socket_transport::{Connected, SocketTransport};
+use agent_engine::session::wire::Hello;
+use agent_engine::session::{ClientKind, TransportError};
 use clap::{Args, Subcommand};
 
 #[derive(Args, Debug, Clone)]
@@ -78,6 +81,19 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
+    /// End one session in the daemon (saved and ended, like /close); the
+    /// others keep running. Resume it with `synaps --attach --continue <id>`.
+    Close {
+        /// Session id, id prefix, journal id, or name (see `daemon sessions`).
+        #[arg(value_name = "ID|NAME")]
+        target: String,
+        /// Close even while a turn, compaction, worker or armed /auto run is
+        /// in flight (it is cancelled).
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
@@ -109,7 +125,71 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Sessions { json }) => sessions(profile, json).await,
         Some(DaemonAction::Purge) => purge(profile).await,
         Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
+        Some(DaemonAction::Close { target, force, json }) => close(profile, target, force, json).await,
     }
+}
+
+/// `daemon close`: resolve the target against the `Welcome` listing, send
+/// `Close`, report. Exit 0 closed; 3 refused (work in flight, daemon
+/// reloading); 2 daemon too old or protocol mismatch; 1 otherwise (not
+/// found, ambiguous, no daemon, timeout).
+async fn close(profile: Option<String>, target: String, force: bool, json: bool) -> anyhow::Result<()> {
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        close_exit(json, 1, None, "no_daemon", "daemon not running");
+    }
+    let mut conn = match Connected::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
+        Ok(c) => c,
+        Err(e @ TransportError::Version { .. }) => close_exit(json, EXIT_VERSION, None, "version", &e.to_string()),
+        Err(e) => close_exit(json, 1, None, "error", &format!("cannot reach the daemon: {e}")),
+    };
+    let id = match resolve_session(&conn.welcome.sessions, &target) {
+        Ok(id) => id,
+        Err(ResolveError::NotFound) => {
+            conn.bye().await;
+            close_exit(json, 1, None, "not_found", &format!("no live session matches {target} (see `synaps daemon sessions`)"));
+        }
+        Err(ResolveError::Ambiguous(matches)) => {
+            conn.bye().await;
+            let mut text = format!("{target} matches {} sessions; use a longer prefix or the full id:", matches.len());
+            for m in &matches {
+                text.push_str(&format!("\n  {}", m.id));
+                if let Some(name) = &m.name {
+                    text.push_str(&format!("  name={name}"));
+                }
+            }
+            close_exit(json, 1, None, "ambiguous", &text);
+        }
+    };
+    let outcome = conn.close(&id, force).await;
+    conn.bye().await;
+    let sid = Some(id.as_str());
+    match outcome {
+        Ok(text) => close_exit(json, 0, sid, "closed", &text),
+        // The actor's refusal names `/close force`; here the flag is `--force`.
+        Err(TransportError::Refused(text)) => {
+            close_exit(json, EXIT_REFUSED, sid, "refused", &text.replace("/close force", "--force"))
+        }
+        Err(TransportError::UnknownSession(text)) => close_exit(json, 1, sid, "not_found", &text),
+        Err(e @ TransportError::DaemonTooOld { .. }) => close_exit(json, EXIT_VERSION, sid, "too_old", &e.to_string()),
+        Err(e) => close_exit(json, 1, sid, "error", &format!("close failed: {e}")),
+    }
+}
+
+/// One line (stdout when closed, stderr otherwise) or one JSON object on
+/// stdout, then exit with `code`.
+fn close_exit(json: bool, code: i32, session_id: Option<&str>, outcome: &str, text: &str) -> ! {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": code == 0, "session_id": session_id, "outcome": outcome, "text": text })
+        );
+    } else if code == 0 {
+        println!("{text}");
+    } else {
+        eprintln!("{text}");
+    }
+    std::process::exit(code);
 }
 
 async fn reload(

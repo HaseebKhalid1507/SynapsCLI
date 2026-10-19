@@ -8,6 +8,7 @@
 //! NEVER stubbed: the flock liveness oracle, the ready-fd pipe, socket
 //! perms 0700/0600, the spawn lock (one spawner per registry dir).
 
+pub mod close;
 pub mod conn;
 pub mod lifecycle;
 pub mod listener;
