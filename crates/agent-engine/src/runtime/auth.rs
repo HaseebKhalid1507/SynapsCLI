@@ -2293,6 +2293,55 @@ mod tests {
         assert!(turn_warn(&log).contains("kind=all_cooling_down"));
     }
 
+    /// S4 review: the seat this turn pinned is cooling down and no other
+    /// account can serve. The mid-turn re-selection ends the turn with the
+    /// usual all-cooling text (the earliest time, no login advice); the
+    /// cooling seat is not re-vended and no token is bound.
+    #[tokio::test]
+    async fn auto_within_turn_cooling_seat_with_no_other_account_gets_the_cooling_text() {
+        let now = crate::epoch_millis();
+        let until = now + 20 * 60 * 1000;
+        let mut work = account("work", AK::CoolingDown);
+        work.until_ms = Some(until);
+        work.cooling_down = true;
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![work],
+            earliest_reset_ms: Some(until),
+            usage_read_retry_ms: None,
+        };
+        let source = remote("principal-A");
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.cooling = vec!["anthropic@work".into()];
+        *broker.auto_error.lock().unwrap() = Some(no_account(failure));
+        let capture = LogCapture::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("claude-opus-4-7"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .expect_err("no account can serve")
+        };
+        let text = err.to_string();
+        let until_text = super::super::anthropic_quota::describe_reset_utc(until, now);
+        assert!(text.contains("all_cooling_down"), "{text}");
+        assert!(
+            text.contains(&format!("No login needed; send again after {until_text}.")),
+            "{text}"
+        );
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&capture.take()).contains("kind=all_cooling_down"));
+        assert!(broker.explicit().is_empty(), "the cooling seat is not re-vended");
+        assert_eq!(broker.auto(), vec![Some("claude-opus-4-7".to_string())]);
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "no token is bound");
+    }
+
     /// r2 blocker 1: every account cooling, one of them with a refused
     /// login. The kind stays all_cooling_down and the earliest time stays,
     /// but that label's exact login command is named and the text never

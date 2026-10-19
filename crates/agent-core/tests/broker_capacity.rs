@@ -589,8 +589,8 @@ async fn a_cooling_account_is_not_read_until_its_cooldown_is_gone() {
 /// and survives the rotation: `a` stays cooling, is neither chosen nor
 /// read, and `auth state` still shows the cooldown. It also survives the
 /// login gaining an account id (`auth identify`); `auth state --clear`
-/// drops it. (A login into another account id does not inherit it:
-/// broker_accounts' alias_cannot_bypass_cooldown_and_relogin_does_not_inherit_it.)
+/// drops it. (A login without an id can't be told apart from a new login
+/// by another account: a_new_login_into_the_label_inherits_the_cooldown_of_a_login_without_an_id.)
 #[tokio::test]
 #[serial_test::serial]
 async fn a_cooldown_survives_a_token_rotation_of_a_login_without_an_account_id() {
@@ -648,6 +648,84 @@ async fn a_cooldown_survives_a_token_rotation_of_a_login_without_an_account_id()
         lookup_without_b(&broker).await.expect("a serves again"),
         anthropic("a")
     );
+}
+
+/// Log `label` in again: new tokens, and `account_id` (None: no id).
+fn relogin(home: &tempfile::TempDir, label: &str, tag: &str, account_id: Option<&str>) {
+    store_tokens(
+        home,
+        label,
+        &format!("{tag}-anthropic-{label}-access"),
+        &format!("refresh-anth-{label}-{tag}-SECRET"),
+        FAR_FUTURE,
+    );
+    let path = home.path().join("auth.json");
+    let mut root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let entry = root[format!("anthropic@{label}")].as_object_mut().unwrap();
+    match account_id {
+        Some(id) => entry.insert("accountId".into(), json!(id)),
+        None => entry.remove("accountId"),
+    };
+    std::fs::write(&path, root.to_string()).unwrap();
+}
+
+/// S4 review: the slot can't tell "the same account gained an id" from
+/// "another account logged in". A login WITHOUT an account id cools down;
+/// a new login into that label by a different account (with an id)
+/// inherits the cooldown through the slot until `auth state --clear` frees
+/// it: it errs toward not using the account. Contrast: the cooldown of a
+/// login WITH an id is not inherited by a login with another id.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_new_login_into_the_label_inherits_the_cooldown_of_a_login_without_an_id() {
+    const OTHER_ACCOUNT_ID: &str = "9a8b7c6d-5e4f-4a2b-8c1d-0e9f8a7b6c5d";
+    let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let broker = auto_broker(&spawn_usage(script).await);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_cooldown(&anthropic("a"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+
+    relogin(&home, "a", "other", Some(OTHER_ACCOUNT_ID));
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+    assert_eq!(account_state(&broker, "a")["cooldown"]["until_ms"], until);
+    assert!(
+        matches!(
+            lookup_without_b(&broker).await,
+            Err(BrokerError::NoAccountAvailable { .. })
+        ),
+        "the new login of a is still cooling down"
+    );
+
+    broker
+        .auth_state(&AuthStateQuery {
+            account: Some("a".into()),
+            clear: true,
+            ..anthropic_query()
+        })
+        .unwrap();
+    assert_eq!(broker.active_cooldown(&anthropic("a")), None);
+    assert_eq!(
+        lookup_without_b(&broker)
+            .await
+            .expect("a serves after the clear"),
+        anthropic("a")
+    );
+
+    // Contrast: this login has an id; a login with another id starts clean.
+    broker
+        .report_cooldown(&anthropic("a"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+    relogin(&home, "a", "third", Some(ACCOUNT_ID_A));
+    assert_eq!(broker.active_cooldown(&anthropic("a")), None);
 }
 
 /// r2 blocker 2 / item 5: automatic selection on an unreadable store fails

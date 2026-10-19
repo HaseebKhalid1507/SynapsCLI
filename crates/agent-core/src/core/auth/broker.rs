@@ -2112,9 +2112,11 @@ impl LocalBroker {
     /// alias that can be re-used: aliases of one seat share its cooldown.
     /// A login without a provider account id has a seat derived from its
     /// token, which a refresh rotates, so its cooldown is also kept under
-    /// its slot and survives the rotation (a new login of that kind into
-    /// the slot inherits it too; `auth state --clear` drops it). A login
-    /// into another account id has another seat and does not inherit it.
+    /// its slot and survives the rotation. The slot can't tell that login
+    /// gaining an id from another account logging into the label, so any
+    /// new login into the slot inherits it too (under-use only; `auth state
+    /// --clear` drops it). The cooldown of a login WITH an account id is
+    /// kept under that id only: a login with another id does not inherit it.
     fn cooldown_keys(&self, cred: &CredentialRef) -> CooldownKeys {
         let store = storage::auth_file_path().display().to_string();
         let slot = format!("{store}|{}|{}", cred.provider, cred.storage_key());
