@@ -4,7 +4,7 @@
 //! `ClientTransport` is built on it. `echo_for_test` ships a stand-in actor
 //! so package B can build the wire before the real `SessionActor` exists.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
@@ -52,6 +52,9 @@ pub struct SessionHandle {
     /// Session name — `--name` at create / `/cmd saveas` later. Written by
     /// the actor so listings and `--continue <name>` see renames live.
     name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// The pin (`KeepWarm{on}`), written by the actor. Read without a probe
+    /// by listings and by the daemon's idle exit, which a pin holds.
+    keep_warm: Arc<AtomicBool>,
     /// Per-session `/keepwarm` override (task #444), written by the actor.
     /// Lives here so a daemon reload whose checkpoint did not confirm still
     /// carries the user's explicit choice.
@@ -83,6 +86,7 @@ pub struct SessionEndpoints {
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
     pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    pub keep_warm: Arc<AtomicBool>,
     pub cache_keepwarm: super::cache_keepwarm::OverrideSlot,
     pub memory_mode: MemoryModeSlot,
 }
@@ -101,6 +105,7 @@ impl SessionHandle {
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
+        let keep_warm = Arc::new(AtomicBool::new(meta.pinned));
         let cache_keepwarm = super::cache_keepwarm::OverrideSlot::default();
         let memory_mode = MemoryModeSlot::default();
         let handle = Self {
@@ -113,6 +118,7 @@ impl SessionHandle {
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
             name: Arc::clone(&name),
+            keep_warm: Arc::clone(&keep_warm),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
             memory_mode: Arc::clone(&memory_mode),
             placeholder_config: None,
@@ -127,6 +133,7 @@ impl SessionHandle {
                 journal_id,
                 presence,
                 name,
+                keep_warm,
                 cache_keepwarm,
                 memory_mode,
             },
@@ -174,6 +181,12 @@ impl SessionHandle {
         (**self.name.load()).clone()
     }
 
+    /// Whether the session is pinned (`KeepWarm{on}`), as last written by
+    /// the actor.
+    pub fn pinned(&self) -> bool {
+        self.keep_warm.load(Ordering::Acquire)
+    }
+
     /// The session's `/keepwarm` override (`off`/`auto`/`<N>h`), if any.
     pub fn cache_keepwarm_override(&self) -> Option<String> {
         self.cache_keepwarm
@@ -191,7 +204,7 @@ impl SessionHandle {
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
-    /// awaiting_input, journal_id) — what listings show.
+    /// awaiting_input, journal_id, name, pinned) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -201,6 +214,7 @@ impl SessionHandle {
         m.awaiting_input = p.awaiting_input;
         m.journal_id = self.journal_id();
         m.name = self.name();
+        m.pinned = self.pinned();
         m
     }
 
@@ -274,6 +288,7 @@ pub mod echo {
             awaiting_input: 0,
             journal_id: id.0.clone(),
             locked_by: None,
+            pinned: false,
         }
     }
 
@@ -511,6 +526,7 @@ pub mod locked_placeholder {
             awaiting_input: 0,
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
+            pinned: false,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),

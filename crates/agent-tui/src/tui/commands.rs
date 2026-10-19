@@ -345,6 +345,44 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
+/// `/pin` in an in-process TUI: the session ends with this process anyway.
+pub(super) const PIN_IN_PROCESS: &str = "pin: only applies to a daemon session (synaps --attach)";
+
+/// `/pin [on|off|status]`, alias `/keep-warm on|off`: the daemon session's
+/// pin (`KeepWarm`), not `/keepwarm` (prompt-cache pings). `on|off` is sent
+/// to the session, whose notice (or refusal, for a non-owner) arrives as an
+/// event. The status asks the session (`Status.pinned`) rather than track it
+/// here: another client or `synaps daemon pin` may have changed it.
+async fn pin_command(cmd: &str, arg: &str, app: &mut App, link: &mut super::session_link::SessionLink) {
+    if link.transport().daemon_pid() == 0 {
+        app.push_msg(ChatMessage::System(PIN_IN_PROCESS.to_string()));
+        return;
+    }
+    match arg.trim() {
+        a @ ("on" | "off") => {
+            let on = a == "on";
+            if let Err(e) = link.send(agent_engine::session::SessionCommand::KeepWarm { on }).await {
+                app.push_msg(ChatMessage::Error(format!("pin failed: {e}")));
+            }
+        }
+        "" | "status" => match link.query(agent_engine::session::SessionQuery::Status).await {
+            Ok(value) => match value["pinned"].as_bool() {
+                Some(true) => app.push_msg(ChatMessage::System(
+                    agent_engine::session::actor::PIN_ON_NOTICE.to_string(),
+                )),
+                Some(false) => app.push_msg(ChatMessage::System(
+                    "not pinned: this session parks when idle. /pin on keeps it loaded.".to_string(),
+                )),
+                None => app.push_msg(ChatMessage::Error(
+                    "pin: this daemon does not report the pin; `synaps daemon reload` updates it".to_string(),
+                )),
+            },
+            Err(e) => app.push_msg(ChatMessage::Error(format!("pin failed: {e}"))),
+        },
+        _ => app.push_msg(ChatMessage::Error(format!("usage: /{cmd} [on|off|status]"))),
+    }
+}
+
 /// Handle a slash command when NOT streaming. Its notices show in the view
 /// it was typed in ([`super::watch::begin_command`]).
 pub(super) async fn handle_command(
@@ -745,6 +783,7 @@ async fn run_command(
                 }
             }
         }
+        "pin" | "keep-warm" => pin_command(cmd, arg, app, link).await,
         "keepwarm" => {
             // Prompt-cache keep-warm lives on the actor (task #444):
             // `EngineCommand{keepwarm}` → status / per-session override.
@@ -1740,6 +1779,82 @@ mod tests {
             }
         ));
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"close"));
+    }
+
+    /// `/pin on|off` is the session's pin: the TUI sends `KeepWarm` and the
+    /// session's notice follows; `/pin` asks the session for its state;
+    /// `/keep-warm` is the same command, never the prompt-cache `/keepwarm`.
+    #[tokio::test]
+    async fn pin_sends_keep_warm_to_a_daemon_session_and_reports_its_state() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let has_system = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s.starts_with(want)))
+        };
+
+        handle_command("pin", "on", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        let sent = log.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "KeepWarm { on: true }"), "{sent:?}");
+        let env = link.next_event().await.expect("the session's notice");
+        assert!(
+            matches!(env.event, agent_engine::session::SessionEventWire::SystemNotice(ref n) if n.starts_with("pinned:")),
+            "{:?}",
+            env.event
+        );
+        handle_command("pin", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(has_system(&app, "pinned: this session stays loaded"));
+
+        handle_command("keep-warm", "off", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        let sent = log.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "KeepWarm { on: false }"), "{sent:?}");
+        let env = link.next_event().await.expect("the session's notice");
+        assert!(matches!(env.event, agent_engine::session::SessionEventWire::SystemNotice(ref n) if n.starts_with("unpinned")));
+        handle_command("pin", "status", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(has_system(&app, "not pinned"));
+
+        handle_command("pin", "maybe", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            ChatMessage::Error(s) if s == "usage: /pin [on|off|status]"
+        )));
+        for name in ["pin", "keep-warm", "keepwarm"] {
+            assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&name), "{name}");
+        }
+        let all = super::to_owned_commands(synaps_cli::skills::BUILTIN_COMMANDS);
+        assert_eq!(resolve_prefix("keep-warm", &all), "keep-warm", "never the prompt-cache /keepwarm");
+        assert_eq!(resolve_prefix("pin", &all), "pin", "not /ping");
+    }
+
+    /// In-process the session ends with the TUI, so there is nothing to pin.
+    #[tokio::test]
+    async fn pin_in_process_says_it_only_applies_to_a_daemon_session() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap());
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        for arg in ["", "on"] {
+            let action =
+                handle_command("pin", arg, &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+            assert!(matches!(action, CommandAction::None));
+        }
+        let said = app
+            .transcript
+            .messages()
+            .iter()
+            .filter(|m| matches!(&m.msg, ChatMessage::System(s) if s == super::PIN_IN_PROCESS))
+            .count();
+        assert_eq!(said, 2);
+        assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
     }
 
     /// A `SessionLink` over the scripted in-memory actor (A5).

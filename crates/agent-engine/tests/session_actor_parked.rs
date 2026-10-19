@@ -209,19 +209,22 @@ async fn keep_warm_never_parks_and_never_grace_disables() {
         detach(&mut a).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(handle.lifecycle(), SessionLifecycle::Live, "--keep-warm pins");
+        assert!(handle.pinned() && handle.meta_live().pinned, "the create-time pin is published");
 
-        // /keep-warm off → parks; KeepWarm on while parked wakes + pins.
+        // /pin off → parks; KeepWarm on while parked wakes + pins.
         let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
             .await
             .unwrap();
         b.send(SessionCommand::KeepWarm { on: false }).await.unwrap();
-        until(&mut b, |e| matches!(e, SessionEventWire::SystemNotice(n) if n.contains("keep-warm off"))).await;
+        until(&mut b, |e| matches!(e, SessionEventWire::SystemNotice(n) if n.starts_with("unpinned"))).await;
+        assert!(!handle.pinned());
         detach(&mut b).await;
         assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
         handle.send(SessionCommand::KeepWarm { on: true }).await.unwrap();
         assert!(wait_lifecycle(&handle, SessionLifecycle::Live, Duration::from_secs(5)).await);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+        assert!(handle.pinned());
         handle
             .send(SessionCommand::End {
                 reason: EndReason::HostShutdown,

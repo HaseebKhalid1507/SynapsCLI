@@ -33,6 +33,10 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(
         + crate::daemon::close::CLOSE_END_BUDGET.as_secs()
         + 2,
 );
+/// How long `pin` waits for the daemon's answer: its longest wait (a parked
+/// session unparking) plus a margin.
+pub const PIN_TIMEOUT: Duration =
+    Duration::from_secs(crate::daemon::pin::PIN_UNPARK_BUDGET.as_secs() + 2);
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
@@ -220,6 +224,22 @@ impl Connected {
         close_reply(frame, &self.welcome.daemon_version)
     }
 
+    /// `Pin{id, on}`: pin or unpin one session with host authority.
+    /// `Ok(on)` = the session's pin is now `on`. A refusal (daemon
+    /// reloading, session live in another process) → `Refused(text)`; no
+    /// such session → `UnknownSession`; a daemon that predates `Pin` →
+    /// `DaemonTooOld`.
+    pub async fn pin(&mut self, id: &SessionId, on: bool) -> Result<bool, TransportError> {
+        self.writer
+            .send(ClientFrame::Pin { session_id: id.clone(), on })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let frame = tokio::time::timeout(PIN_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
+            .await
+            .map_err(|_| TransportError::Protocol("pin reply timed out".into()))??;
+        pin_reply(frame, &self.welcome.daemon_version)
+    }
+
     /// Say goodbye and drop the connection.
     pub async fn bye(self) {
         let _ = self.writer.send(ClientFrame::Bye).await;
@@ -242,6 +262,25 @@ fn close_reply(frame: Option<DaemonFrame>, daemon_version: &str) -> Result<Strin
         }
         Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Protocol(message)),
         Some(other) => Err(TransportError::Protocol(format!("expected closed, got {other:?}"))),
+        None => Err(TransportError::Closed),
+    }
+}
+
+/// The daemon's answer to `Pin`, as [`Connected::pin`] reports it.
+fn pin_reply(frame: Option<DaemonFrame>, daemon_version: &str) -> Result<bool, TransportError> {
+    match frame {
+        Some(DaemonFrame::Pinned { on, .. }) => Ok(on),
+        Some(DaemonFrame::Refused { reason: RefuseReason::UnknownSession, message }) => {
+            Err(TransportError::UnknownSession(message))
+        }
+        Some(DaemonFrame::Refused { message, .. }) => Err(TransportError::Refused(message)),
+        // An older daemon cannot decode the frame; it answers with serde's
+        // "unknown variant `pin`" and keeps the connection open.
+        Some(DaemonFrame::Error { message, .. }) if message.contains("unknown variant `pin`") => {
+            Err(TransportError::DaemonTooOld { daemon_version: daemon_version.to_string(), request: "daemon pin" })
+        }
+        Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Protocol(message)),
+        Some(other) => Err(TransportError::Protocol(format!("expected pinned, got {other:?}"))),
         None => Err(TransportError::Closed),
     }
 }
@@ -439,6 +478,14 @@ impl SocketTransport {
     pub async fn close(path: &Path, id: &SessionId, force: bool, attached: bool) -> Result<String, TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         let r = c.close(id, force, attached).await;
+        c.bye().await;
+        r
+    }
+
+    /// `Pin{id, on}` on a fresh control connection (see [`Connected::pin`]).
+    pub async fn pin(path: &Path, id: &SessionId, on: bool) -> Result<bool, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let r = c.pin(id, on).await;
         c.bye().await;
         r
     }
@@ -1066,6 +1113,32 @@ mod tests {
         let other = DaemonFrame::Error { session_id: None, message: "close: no reply".into() };
         assert!(matches!(close_reply(Some(other), "1"), Err(TransportError::Protocol(_))));
         assert!(matches!(close_reply(None, "1"), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn pin_maps_each_daemon_answer_and_an_old_daemons_unknown_variant_error() {
+        let old = DaemonFrame::Error {
+            session_id: None,
+            message: "malformed frame: unknown variant `pin`, expected one of `hello`, `ping`".into(),
+        };
+        let err = pin_reply(Some(old), "0.9.0").unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { ref daemon_version, request: "daemon pin" } if daemon_version == "0.9.0"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("synaps daemon reload"), "{err}");
+
+        assert!(pin_reply(Some(DaemonFrame::Pinned { session_id: "s".into(), on: true }), "1").unwrap());
+        assert!(!pin_reply(Some(DaemonFrame::Pinned { session_id: "s".into(), on: false }), "1").unwrap());
+        let busy = DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading".into() };
+        assert!(matches!(pin_reply(Some(busy), "1"), Err(TransportError::Refused(ref m)) if m.contains("reloading")));
+        let unknown = DaemonFrame::Refused { reason: RefuseReason::UnknownSession, message: "no live session s".into() };
+        assert!(matches!(pin_reply(Some(unknown), "1"), Err(TransportError::UnknownSession(_))));
+        let other = DaemonFrame::Error { session_id: None, message: "pin: timed out".into() };
+        assert!(matches!(pin_reply(Some(other), "1"), Err(TransportError::Protocol(_))));
+        let closed = DaemonFrame::Closed { session_id: "s".into(), text: "x".into() };
+        assert!(matches!(pin_reply(Some(closed), "1"), Err(TransportError::Protocol(_))));
+        assert!(matches!(pin_reply(None, "1"), Err(TransportError::Closed)));
     }
 
     #[tokio::test]

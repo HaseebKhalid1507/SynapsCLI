@@ -287,6 +287,13 @@ async fn wait_listed_lifecycle(paths: &registry::DaemonPaths, sid: &SessionId, w
     }
 }
 
+/// `(a.pinned, b.pinned)` as `daemon sessions` lists them.
+async fn listed_pins(paths: &registry::DaemonPaths, a: &SessionId, b: &SessionId) -> (bool, bool) {
+    let metas = SocketTransport::sessions(&paths.sock).await.expect("sessions");
+    let pinned = |id: &SessionId| metas.iter().find(|m| &m.id == id).map(|m| m.pinned).expect("listed");
+    (pinned(a), pinned(b))
+}
+
 /// H3 (§5.4 `reload_preserves_parked_and_keep_warm`): reload-state carries
 /// the session as it IS — `/model` mid-session, a keep-warm pin, a
 /// non-persisted knob (`/context`), and a Parked session comes back Parked.
@@ -324,6 +331,7 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
     assert!(wait_listed_lifecycle(&d.paths, &b_id, SessionLifecycle::Parked, Duration::from_secs(10)).await, "B parks");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A pinned stays Live");
+    assert_eq!(listed_pins(&d.paths, &a_id, &b_id).await, (true, false), "the listing shows A's pin");
 
     let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
     assert_eq!(gen, 2);
@@ -344,6 +352,7 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
     assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A rehydrated Live");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A keep-warm survived (not parked after grace)");
+    assert_eq!(listed_pins(&d.paths, &a_id, &b_id).await, (true, false), "the listing shows the pin after reload");
 
     // A: model/context/system survived.
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();

@@ -291,6 +291,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let reply = super::close::close_session(&state, &session_id, force, attached).await;
                 let _ = tx.send(reply).await;
             }
+            // `daemon pin`: pin/unpin one session with host authority. A
+            // refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::Pin { session_id, on })) => {
+                tracing::info!(session = %session_id, on, "daemon: pin requested over the socket");
+                let reply = super::pin::pin_session(&state, &session_id, on).await;
+                let _ = tx.send(reply).await;
+            }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
                 agent_core::core::memstat::purge_arenas();
@@ -566,10 +573,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
             }
-            // An attached client closes its session with `/close`.
+            // An attached client closes its session with `/close` and pins
+            // it with `/pin`.
             Ok(Read::Frame(ClientFrame::Reload { .. }))
             | Ok(Read::Frame(ClientFrame::Purge))
-            | Ok(Read::Frame(ClientFrame::Close { .. })) => {
+            | Ok(Read::Frame(ClientFrame::Close { .. }))
+            | Ok(Read::Frame(ClientFrame::Pin { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,

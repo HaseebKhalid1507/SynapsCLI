@@ -12,6 +12,7 @@ pub mod close;
 pub mod conn;
 pub mod lifecycle;
 pub mod listener;
+pub mod pin;
 pub mod registry;
 pub mod reload;
 
@@ -150,9 +151,10 @@ pub struct DaemonOpts {
     /// Override the socket path (the lock/json/pid stay under `registry_dir()`).
     pub socket: Option<PathBuf>,
     pub profile: Option<String>,
-    /// Exit after this long with zero connections and no session running a
-    /// turn (idle, client-less sessions are saved on exit; `--continue`
-    /// brings them back). A turn in flight always blocks the exit.
+    /// Exit after this long with zero connections, no pinned session and no
+    /// session running a turn (idle, client-less sessions are saved on exit;
+    /// `--continue` brings them back). A turn in flight or a pin always
+    /// blocks the exit.
     pub idle_exit: Option<Duration>,
     /// Deprecated, ignored: legacy MCP was removed (every mode uses
     /// per-session MCP leases). Still forwarded so an older client can spawn
@@ -521,14 +523,19 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
     tokio::time::timeout(IDLE_PROBE_TIMEOUT, probe).await.unwrap_or(false)
 }
 
-/// Idle = zero connections AND every live session between turns, held for
-/// `idle` continuously. Clients count first so a probe is never sent while
-/// someone is attached.
+/// Idle = zero connections, no pinned session AND every live session
+/// between turns, held for `idle` continuously. Clients and pins count
+/// first so a probe is never sent while someone is attached. A pin holds
+/// the exit because exiting would end the session the user asked to keep.
 pub async fn daemon_is_idle(state: &DaemonState) -> bool {
     if state.connections.load(Ordering::SeqCst) > 0 {
         return false;
     }
-    for h in state.live_sessions() {
+    let sessions = state.live_sessions();
+    if sessions.iter().any(|h| h.pinned() && h.is_alive()) {
+        return false;
+    }
+    for h in sessions {
         if !session_is_idle(&h).await {
             return false;
         }

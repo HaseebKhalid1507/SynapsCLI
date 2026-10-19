@@ -40,6 +40,8 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// would refuse every older TUI that reconnects after a `daemon reload`.
 /// Additive `ClientFrame` variants that only a new client sends follow this
 /// rule; `Closed` only ever answers `Close`, so old clients never see it.
+/// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
+/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
 pub const PROTOCOL_VERSION: u32 = 3;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -137,6 +139,15 @@ pub enum ClientFrame {
         #[serde(default)]
         attached: bool,
     },
+    /// Control fast path: pin (`on`) or unpin one session, as `/pin on|off`
+    /// would, with host authority. `on` is required so a frame always says
+    /// which way it goes. Pinning a parked session unparks it; unpinning one
+    /// leaves it parked. Reply: `Pinned`, or `Refused{Busy|UnknownSession}`.
+    /// Not accepted on an attached connection (that client has `/pin`).
+    Pin {
+        session_id: SessionId,
+        on: bool,
+    },
     Bye,
 }
 
@@ -165,6 +176,11 @@ impl std::fmt::Debug for ClientFrame {
                 .field("session_id", session_id)
                 .field("force", force)
                 .field("attached", attached)
+                .finish(),
+            Self::Pin { session_id, on } => f
+                .debug_struct("Pin")
+                .field("session_id", session_id)
+                .field("on", on)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -282,6 +298,11 @@ pub enum DaemonFrame {
     Closed {
         session_id: SessionId,
         text: String,
+    },
+    /// Reply to `Pin`: the session's pin is now `on`.
+    Pinned {
+        session_id: SessionId,
+        on: bool,
     },
     /// `Some(Reloading{..})` before exec; `None` otherwise (today).
     Bye {
@@ -1408,6 +1429,8 @@ mod tests {
             ClientFrame::Purge,
             ClientFrame::Close { session_id: "s".into(), force: true, attached: true },
             ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
+            ClientFrame::Pin { session_id: "s".into(), on: true },
+            ClientFrame::Pin { session_id: "s".into(), on: false },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1447,6 +1470,8 @@ mod tests {
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
             DaemonFrame::Error { session_id: None, message: "e".into() },
             DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
+            DaemonFrame::Pinned { session_id: "s".into(), on: true },
+            DaemonFrame::Pinned { session_id: "s".into(), on: false },
             DaemonFrame::Bye { reason: None },
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
@@ -1495,6 +1520,33 @@ mod tests {
         }
         let err = decode_line::<OldClientFrame>(r#"{"type":"close","session_id":"s","force":true}"#).unwrap_err();
         assert!(err.contains("unknown variant `close`"), "{err}");
+    }
+
+    #[test]
+    fn pin_requires_on_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"pin","session_id":"s","on":false}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Pin { ref session_id, on: false } if session_id.as_str() == "s"));
+        assert!(decode_line::<ClientFrame>(r#"{"type":"pin","session_id":"s"}"#).is_err());
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"pin","session_id":"s","on":true}"#).unwrap_err();
+        assert!(err.contains("unknown variant `pin`"), "{err}");
+    }
+
+    #[test]
+    fn a_session_meta_without_pinned_decodes_as_not_pinned() {
+        let mut v = serde_json::to_value(meta()).unwrap();
+        v.as_object_mut().unwrap().remove("pinned");
+        let m: SessionMeta = serde_json::from_value(v).unwrap();
+        assert!(!m.pinned);
+        let mut pinned = meta();
+        pinned.pinned = true;
+        let back: SessionMeta = serde_json::from_value(serde_json::to_value(&pinned).unwrap()).unwrap();
+        assert!(back.pinned);
     }
 
     #[test]

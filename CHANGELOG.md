@@ -44,9 +44,22 @@ All notable changes to this project will be documented in this file.
   An attached client now always receives `Ended` before its connection
   closes when its session ends from elsewhere (another client's `/close`,
   `daemon close`).
+- **Pin a daemon session: `/pin [on|off|status]` and
+  `synaps daemon pin <ID|NAME> [--off] [--json]`.** A pinned session stays
+  loaded (never parked, idle-ended or evicted), and the daemon no longer
+  idle-exits while any session is pinned; before, an auto-spawned daemon
+  with no clients exited after 10 s and ended pinned sessions with it.
+  `daemon sessions` marks pinned sessions (`"pinned"` in `--json`). Pinning a
+  parked session wakes it; unpinning one leaves it parked. `--keep-warm` and
+  `/keep-warm on|off` are the same pin; `/keepwarm` (prompt-cache pings) is
+  unrelated. The pin does not survive `daemon stop` or a crash yet. See
+  [docs/daemon-mode.md](docs/daemon-mode.md#pinning-a-session-pin).
 
 ### Changed
 
+- The pin notice reads `pinned: this session stays loaded …` /
+  `unpinned: this session parks again when idle` (was `keep-warm on: …` /
+  `keep-warm off`).
 - **Interactive turns have no round, tool-call or tool-result-byte limit by
   default.** Foreground turns used to stop at a compiled cap (128 rounds /
   512 tool calls / 32 MiB of tool results) even while they were making

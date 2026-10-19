@@ -1,4 +1,4 @@
-//! `synaps daemon {start,status,stop,sessions,purge,reload,close}`
+//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin}`
 //! (PLAN-phase2 §2.11, B4; phase 3 C2 `purge`, C3 `reload`).
 
 use std::path::PathBuf;
@@ -30,7 +30,8 @@ pub(crate) struct StartArgs {
     /// Socket path override (lock/json/pid stay under the run dir).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
-    /// Exit after SECS with zero clients and zero sessions.
+    /// Exit after SECS with zero clients, no turn running and no pinned
+    /// session.
     #[arg(long, value_name = "SECS")]
     pub idle_exit: Option<u64>,
     /// Deprecated, ignored: legacy MCP was removed. Accepted so older
@@ -98,6 +99,19 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
+    /// Pin one session: it stays loaded (never parked or idle-ended) and the
+    /// daemon does not idle-exit while it is pinned. A parked session is
+    /// woken. `--off` unpins.
+    Pin {
+        /// Session id, id prefix, journal id, or name (see `daemon sessions`).
+        #[arg(value_name = "ID|NAME")]
+        target: String,
+        /// Unpin instead (the session parks again when idle).
+        #[arg(long)]
+        off: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
@@ -130,7 +144,77 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Purge) => purge(profile).await,
         Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
         Some(DaemonAction::Close { target, force, attached, json }) => close(profile, target, force, attached, json).await,
+        Some(DaemonAction::Pin { target, off, json }) => pin(profile, target, !off, json).await,
     }
+}
+
+/// `daemon pin`: resolve the target against the `Welcome` listing (as
+/// `daemon close` does), send `Pin`, report. Exit 0 done; 3 refused (daemon
+/// reloading, session live in another process); 2 daemon too old or
+/// protocol mismatch; 1 otherwise (not found, ambiguous, no daemon,
+/// timeout).
+async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> anyhow::Result<()> {
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        pin_exit(json, 1, None, "no_daemon", on, "daemon not running");
+    }
+    let mut conn = match Connected::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
+        Ok(c) => c,
+        Err(e @ TransportError::Version { .. }) => pin_exit(json, EXIT_VERSION, None, "version", on, &e.to_string()),
+        Err(e) => pin_exit(json, 1, None, "error", on, &format!("cannot reach the daemon: {e}")),
+    };
+    let id = match resolve_session(&conn.welcome.sessions, &target) {
+        Ok(id) => id,
+        Err(ResolveError::NotFound) => {
+            conn.bye().await;
+            let text = format!("no live session matches {target} (see `synaps daemon sessions`)");
+            pin_exit(json, 1, None, "not_found", on, &text);
+        }
+        Err(ResolveError::TooShort { min }) => {
+            conn.bye().await;
+            let text = format!("{target} is too short to pick a session by prefix; give at least {min} characters, the full id or the name");
+            pin_exit(json, 1, None, "too_short", on, &text);
+        }
+        Err(ResolveError::Ambiguous(matches)) => {
+            conn.bye().await;
+            let mut text = format!("{target} matches {} sessions; use a longer prefix or the full id:", matches.len());
+            for m in &matches {
+                text.push_str(&format!("\n  {}", m.id));
+                if let Some(name) = &m.name {
+                    text.push_str(&format!("  name={name}"));
+                }
+            }
+            pin_exit(json, 1, None, "ambiguous", on, &text);
+        }
+    };
+    let outcome = conn.pin(&id, on).await;
+    conn.bye().await;
+    let sid = Some(id.as_str());
+    match outcome {
+        Ok(true) => pin_exit(json, 0, sid, "pinned", true, &format!("pinned {id}")),
+        Ok(false) => pin_exit(json, 0, sid, "unpinned", false, &format!("unpinned {id}")),
+        Err(TransportError::Refused(text)) => pin_exit(json, EXIT_REFUSED, sid, "refused", on, &text),
+        Err(TransportError::UnknownSession(text)) => pin_exit(json, 1, sid, "not_found", on, &text),
+        Err(e @ TransportError::DaemonTooOld { .. }) => pin_exit(json, EXIT_VERSION, sid, "too_old", on, &e.to_string()),
+        Err(e) => pin_exit(json, 1, sid, "error", on, &format!("pin failed: {e}")),
+    }
+}
+
+/// Like [`close_exit`], plus `pinned`: the session's pin afterwards on
+/// success, `null` when nothing was confirmed.
+fn pin_exit(json: bool, code: i32, session_id: Option<&str>, outcome: &str, on: bool, text: &str) -> ! {
+    if json {
+        let pinned = if code == 0 { serde_json::Value::Bool(on) } else { serde_json::Value::Null };
+        println!(
+            "{}",
+            serde_json::json!({ "ok": code == 0, "session_id": session_id, "outcome": outcome, "pinned": pinned, "text": text })
+        );
+    } else if code == 0 {
+        println!("{text}");
+    } else {
+        eprintln!("{text}");
+    }
+    std::process::exit(code);
 }
 
 /// `daemon close`: resolve the target against the `Welcome` listing, send
@@ -418,9 +502,10 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     } else {
         for m in list {
             println!(
-                "{}  {:?}  clients={}  owner={}  model={}  cwd={}  created={}{}{}",
+                "{}  {:?}{}  clients={}  owner={}  model={}  cwd={}  created={}{}{}",
                 m.id,
                 m.lifecycle,
+                if m.pinned { "  pinned" } else { "" },
                 m.clients,
                 m.input_owner.map_or("-".into(), |c| format!("#{}", c.0)),
                 m.model,
