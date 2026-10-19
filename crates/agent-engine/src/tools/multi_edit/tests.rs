@@ -907,6 +907,116 @@ fn a_temp_left_after_a_hard_link_publish_is_named_in_the_result() {
     assert_eq!(out.lines().last(), Some(warnings[0]), "{out}");
 }
 
+/// The 1st new file is published by a hard link whose temp can't be removed
+/// (the existing seam); the 2nd file's finalize then fails. With `foreign`,
+/// a file not made by this call takes the 1st temp's name just before.
+#[cfg(unix)]
+struct LeftoverThenFail {
+    dir: PathBuf,
+    foreign: bool,
+}
+
+#[cfg(unix)]
+impl commit::Hooks for LeftoverThenFail {
+    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
+        if index == 1 {
+            if self.foreign {
+                let left = leftovers(&self.dir);
+                assert_eq!(left.len(), 1, "{left:?}");
+                let planted = self.dir.join("planted");
+                std::fs::write(&planted, "foreign\n").unwrap();
+                std::fs::rename(&planted, self.dir.join(&left[0])).unwrap();
+            }
+            return Err(std::io::Error::other("injected rename failure"));
+        }
+        commit::finalize(s, p, &mut |primitive| {
+            matches!(
+                primitive,
+                commit::Primitive::RenameNoReplace | commit::Primitive::UnlinkTemp
+            )
+        })
+    }
+}
+
+/// The temp a "<display> published; could not remove temp <temp>: <why>"
+/// diagnostic in `text` names.
+#[cfg(unix)]
+fn named_temp(text: &str, display: &str) -> PathBuf {
+    let lead = format!("{display} published; could not remove temp ");
+    let start = text.find(&lead).unwrap_or_else(|| panic!("no diagnostic for {display}: {text}")) + lead.len();
+    let len = text[start..].find(": ").unwrap_or_else(|| panic!("no cleanup error: {text}"));
+    PathBuf::from(&text[start..start + len])
+}
+
+// A temp left over by an earlier file is not forgotten when a later file
+// fails: the error carries its diagnostic, the identity-checked cleanup is
+// tried again, and the error says it then went.
+#[cfg(unix)]
+#[test]
+fn an_earlier_leftover_temp_is_reported_and_retried_when_a_later_file_fails() {
+    let d = tmpdir();
+    let dir = std::fs::canonicalize(d.path()).unwrap();
+    let (a, b) = (d.path().join("a.md"), d.path().join("b.md"));
+    let err = run_with(
+        json!({"edits": [
+            {"path": p(&a), "op": "append", "create": true, "text": "x\n"},
+            {"path": p(&b), "op": "append", "create": true, "text": "y\n"}
+        ]}),
+        &mut LeftoverThenFail { dir: dir.clone(), foreign: false },
+    )
+    .unwrap_err();
+    assert!(err.contains("writing ") && err.contains("injected rename failure"), "{err}");
+    assert!(err.contains(&format!("Committed then restored: {}", p(&a))), "{err}");
+    assert!(err.contains("Restore FAILED: none"), "{err}");
+    assert!(err.contains(&format!("Never written: {}", p(&b))), "{err}");
+    // The earlier diagnostic, whole: the temp's name and the cleanup error.
+    let lead = format!("{} published; could not remove temp ", p(&a));
+    assert!(err.contains(&lead), "the earlier leftover is not reported: {err}");
+    let temp = named_temp(&err, &p(&a));
+    assert_eq!(temp.parent(), Some(dir.as_path()), "{err}");
+    let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
+    assert!(
+        err.contains(&format!("could not remove temp {}: {unsupported}; removed on retry", temp.display())),
+        "{err}"
+    );
+    // Both targets are absent again, and the retry removed the temp.
+    assert!(!a.exists() && !b.exists());
+    assert!(!temp.exists(), "{}", temp.display());
+    assert!(leftovers(d.path()).is_empty(), "{:?}", leftovers(d.path()));
+}
+
+// The retry is identity-checked too: a file that took the temp's name in
+// the meantime is left alone, and the error names it as still there.
+#[cfg(unix)]
+#[test]
+fn a_taken_over_leftover_temp_is_left_alone_and_named_when_a_later_file_fails() {
+    let d = tmpdir();
+    let dir = std::fs::canonicalize(d.path()).unwrap();
+    let (a, b) = (d.path().join("a.md"), d.path().join("b.md"));
+    let err = run_with(
+        json!({"edits": [
+            {"path": p(&a), "op": "append", "create": true, "text": "x\n"},
+            {"path": p(&b), "op": "append", "create": true, "text": "y\n"}
+        ]}),
+        &mut LeftoverThenFail { dir: dir.clone(), foreign: true },
+    )
+    .unwrap_err();
+    assert!(err.contains(&format!("Committed then restored: {}", p(&a))), "{err}");
+    assert!(err.contains("Restore FAILED: none"), "{err}");
+    assert!(err.contains(&format!("Never written: {}", p(&b))), "{err}");
+    let lead = format!("{} published; could not remove temp ", p(&a));
+    assert!(err.contains(&lead), "the earlier leftover is not reported: {err}");
+    let temp = named_temp(&err, &p(&a));
+    assert!(
+        err.contains(&format!("could not remove temp {}: ", temp.display()))
+            && err.contains("; still there: another file has taken its name; left as is"),
+        "{err}"
+    );
+    assert!(!a.exists() && !b.exists());
+    assert_eq!(std::fs::read_to_string(&temp).unwrap(), "foreign\n", "the foreign file is kept");
+    assert_eq!(leftovers(d.path()).len(), 1, "{:?}", leftovers(d.path()));
+}
+
 // Without the exclusive rename, a hard link still creates the file without
 // replacing anything, and the temp name is removed.
 #[test]
