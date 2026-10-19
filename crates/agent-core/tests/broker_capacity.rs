@@ -330,10 +330,13 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
 
     // A transient read failure outranks a rejected login: capacity is
-    // unproven, not absent.
-    script.lock().unwrap().insert("a", Reply::Status(401));
-    script.lock().unwrap().insert("b", Reply::RateLimited(30));
-    broker
+    // unproven, not absent. On its own usage endpoint: a failed read is
+    // held process-wide per slot and endpoint, so the held 429 of `b` must
+    // not stand in for the reads below.
+    let held: Script = Arc::default();
+    held.lock().unwrap().insert("a", Reply::Status(401));
+    held.lock().unwrap().insert("b", Reply::RateLimited(30));
+    auto_broker(&spawn_usage(held).await)
         .access_token_pinned(OAuthProviderId::Anthropic)
         .await
         .unwrap_err();
@@ -345,6 +348,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     );
 
     // Every account's login rejected.
+    script.lock().unwrap().insert("a", Reply::Status(401));
     script.lock().unwrap().insert("b", Reply::Status(403));
     let err = broker
         .access_token_pinned(OAuthProviderId::Anthropic)
