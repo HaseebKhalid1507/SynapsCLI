@@ -530,8 +530,15 @@ mod tests {
         assert!(params["required"].is_array());
     }
 
+    // Runs a real worker: pin an empty base dir so it never reads the real
+    // auth.json or writes its error log under the real ~/.synaps-cli, and
+    // clear the environment's provider credentials/endpoints, so it fails
+    // at auth, offline.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_blank_agent_uses_system_prompt() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
         let tool = SubagentTool;
         let ctx = create_tool_context();
         let params = json!({

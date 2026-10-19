@@ -19,9 +19,11 @@
 //! 5. never repeats the wake: a second reload, after the parent had it,
 //!    stays silent about `sa_1`.
 //!
-//! Unix only (execv + flock).
+//! Unix only (execv + flock). Needs the `command-exec` feature: the worker's
+//! in-flight command is a `bash` tool call, and the hardened
+//! (`--no-default-features`) build has no `bash` tool.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "command-exec"))]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;

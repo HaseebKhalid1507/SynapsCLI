@@ -338,30 +338,30 @@ fn adapter_bytes(s: &body_golden::Scenario) -> (Vec<u8>, TranslationReport) {
 #[test]
 fn adapter_golden_byte_identity_all_modes() {
     let dir = body_golden::fixture_dir();
-    let default_identity = body_golden::identity_is_default();
-    for s in body_golden::scenarios() {
-        let old = body_golden::old_body_bytes(&s);
-        let (bytes_a, report_a) = adapter_bytes(&s);
-        let (bytes_b, report_b) = adapter_bytes(&s);
-        assert_eq!(
-            bytes_a, bytes_b,
-            "scenario `{}`: nondeterministic bytes",
-            s.name
-        );
-        assert_eq!(
-            report_a, report_b,
-            "scenario `{}`: nondeterministic report",
-            s.name
-        );
-        assert_eq!(
-            bytes_a,
-            old,
-            "scenario `{}`: adapter bytes diverge from legacy assembly\nold: {}\nnew: {}",
-            s.name,
-            String::from_utf8_lossy(&old),
-            String::from_utf8_lossy(&bytes_a),
-        );
-        if !s.identity_sensitive || default_identity {
+    // Pinned identity: the oauth fixture comparison can't be skipped.
+    body_golden::with_fixture_identity(|| {
+        for s in body_golden::scenarios() {
+            let old = body_golden::old_body_bytes(&s);
+            let (bytes_a, report_a) = adapter_bytes(&s);
+            let (bytes_b, report_b) = adapter_bytes(&s);
+            assert_eq!(
+                bytes_a, bytes_b,
+                "scenario `{}`: nondeterministic bytes",
+                s.name
+            );
+            assert_eq!(
+                report_a, report_b,
+                "scenario `{}`: nondeterministic report",
+                s.name
+            );
+            assert_eq!(
+                bytes_a,
+                old,
+                "scenario `{}`: adapter bytes diverge from legacy assembly\nold: {}\nnew: {}",
+                s.name,
+                String::from_utf8_lossy(&old),
+                String::from_utf8_lossy(&bytes_a),
+            );
             let path = dir.join(format!("{}.json", s.name));
             let fixture = std::fs::read(&path)
                 .unwrap_or_else(|e| panic!("missing fixture {} — {e}", path.display()));
@@ -370,24 +370,24 @@ fn adapter_golden_byte_identity_all_modes() {
                 "scenario `{}`: adapter bytes diverge from committed golden fixture",
                 s.name
             );
+            // Report expectations: supported history is lossless; oauth adds
+            // exactly the three synthesized identity segments.
+            if s.auth_type == "oauth" {
+                assert_eq!(report_a.entries.len(), 3, "scenario `{}`", s.name);
+                assert!(report_a
+                    .entries
+                    .iter()
+                    .all(|e| e.action == TranslationAction::Synthesized));
+            } else {
+                assert!(
+                    report_a.is_lossless(),
+                    "scenario `{}`: supported input must be lossless, got {:?}",
+                    s.name,
+                    report_a
+                );
+            }
         }
-        // Report expectations: supported history is lossless; oauth adds
-        // exactly the three synthesized identity segments.
-        if s.auth_type == "oauth" {
-            assert_eq!(report_a.entries.len(), 3, "scenario `{}`", s.name);
-            assert!(report_a
-                .entries
-                .iter()
-                .all(|e| e.action == TranslationAction::Synthesized));
-        } else {
-            assert!(
-                report_a.is_lossless(),
-                "scenario `{}`: supported input must be lossless, got {:?}",
-                s.name,
-                report_a
-            );
-        }
-    }
+    });
 }
 
 // ── Trace integration: report populates translation_losses ───────────────

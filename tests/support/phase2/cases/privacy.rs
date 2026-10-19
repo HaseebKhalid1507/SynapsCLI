@@ -281,6 +281,7 @@ async fn s6_slow_storage_never_delays_turn_and_overflow_is_counted() {
         capacity: 1,
         max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
         write_delay: Some(Duration::from_millis(400)),
+        write_gate: None,
     });
     let ctx = TraceContext::with_sink(Arc::new(WriterTraceSink::new(writer.clone())))
         .with_key_path(tmp.path().join("digest.key"));
@@ -335,6 +336,7 @@ async fn s6_broken_storage_never_fails_turn_and_warns_once() {
         capacity: 64,
         max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
         write_delay: None,
+        write_gate: None,
     });
     let ctx = TraceContext::with_sink(Arc::new(WriterTraceSink::new(writer.clone())))
         .with_key_path(tmp.path().join("digest.key"));
@@ -384,6 +386,7 @@ fn s6_trace_writer_shutdown_deadline_is_bounded_under_slow_storage() {
         capacity: 32,
         max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
         write_delay: Some(Duration::from_millis(300)),
+        write_gate: None,
     });
     let sink = WriterTraceSink::new(writer.clone());
     for n in 0..10 {

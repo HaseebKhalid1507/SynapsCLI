@@ -123,6 +123,8 @@ async fn reload(
     if !registry::is_alive(&paths) {
         anyhow::bail!("daemon not running");
     }
+    // A Ping first: the daemon puts a lost daemon.json back before we read it.
+    let _ = SocketTransport::ping(&paths.sock).await;
     let before = registry::read_daemon_json(&paths);
     let exe = exe.map(|p| p.canonicalize().unwrap_or(p));
     let outcome = SocketTransport::reload(&paths.sock, now, drain_secs, exe).await;
@@ -201,6 +203,7 @@ async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {
     if a.detach {
         let paths = opts.paths();
         if registry::is_alive(&paths) {
+            let _ = SocketTransport::ping(&paths.sock).await;
             let pid = registry::read_daemon_json(&paths).map(|i| i.pid);
             println!("daemon already running (pid {})", pid.map_or("?".into(), |p| p.to_string()));
             return Ok(());
@@ -220,9 +223,10 @@ async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {
 
 async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
-    let info = registry::read_daemon_json(&paths);
     let alive = registry::is_alive(&paths);
     let pong = if alive { SocketTransport::ping(&paths.sock).await.ok() } else { None };
+    // After the Ping: the daemon puts a lost daemon.json back first.
+    let info = registry::read_daemon_json(&paths);
     let state = match (info.is_some(), alive, pong.is_some()) {
         (_, true, true) => "running",
         (_, true, false) => "running (not answering)",
@@ -267,6 +271,9 @@ async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
         registry::reap_stale(&paths);
         return Ok(());
     }
+    // A Ping first: the daemon puts a lost daemon.json back, so the pid for
+    // the kill fallback below is known.
+    let _ = SocketTransport::ping(&paths.sock).await;
     let pid = registry::read_daemon_json(&paths).map(|i| i.pid);
     match SocketTransport::shutdown(&paths.sock, force).await {
         Ok(()) => {}

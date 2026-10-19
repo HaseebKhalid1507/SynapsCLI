@@ -1,5 +1,6 @@
 //! Build script. The build id the header shows is not made here: it is
-//! the engine's `SYNAPS_BUILD_ID` (agent-engine/build.rs), the same one the
+//! `SYNAPS_BUILD_ID` from the root crate's build.rs, handed to the engine at
+//! startup (`agent_engine::session::wire::set_build_id`), the same one the
 //! version-skew check compares (04-tui M8).
 //!
 //! Its job (PLAN-phase4 §3 C1): write a **curated** syntect `SyntaxSet`

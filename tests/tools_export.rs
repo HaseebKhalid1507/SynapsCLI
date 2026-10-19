@@ -44,6 +44,7 @@ fn run_export(extra_args: &[&str]) -> String {
 }
 
 /// The 29 builtin tool names from docs/tools.json (alphabetical, authoritative).
+#[cfg(feature = "command-exec")]
 const EXPECTED_TOOL_NAMES: &[&str] = &[
     "activate_tools",
     "bash",
@@ -94,6 +95,9 @@ fn export_pretty_produces_valid_json() {
 
 // ─── Test 2: Output contains all 29 builtin tools ────────────────────────────
 
+// docs/tools.json and the tool count describe the default build; the
+// hardened (--no-default-features) binary has no bash/shell_* tools.
+#[cfg(feature = "command-exec")]
 #[test]
 fn export_contains_all_24_builtin_tools() {
     let out = run_export(&[]);
@@ -201,6 +205,9 @@ fn export_pretty_is_deterministic_across_runs() {
 //   synaps tools export --pretty > docs/tools.json
 // and commit the update.
 
+// docs/tools.json and the tool count describe the default build; the
+// hardened (--no-default-features) binary has no bash/shell_* tools.
+#[cfg(feature = "command-exec")]
 #[test]
 fn export_pretty_matches_committed_docs_tools_json() {
     // Locate docs/tools.json relative to the workspace root (CARGO_MANIFEST_DIR
@@ -352,6 +359,9 @@ fn export_tools_are_in_alphabetical_order() {
 // Spawns the actual shell script to verify the shell-level contract (not just
 // the Rust-level byte comparison above).  Skipped if `bash` is not in PATH.
 
+// docs/tools.json and the tool count describe the default build; the
+// hardened (--no-default-features) binary has no bash/shell_* tools.
+#[cfg(feature = "command-exec")]
 #[test]
 fn drift_check_script_exits_zero_when_no_drift() {
     let bash = std::process::Command::new("which")

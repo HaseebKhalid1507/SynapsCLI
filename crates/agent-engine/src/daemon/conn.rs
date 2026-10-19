@@ -226,6 +226,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         };
         match frame {
             Ok(Read::Frame(ClientFrame::Ping)) => {
+                // `daemon status` and `daemon reload` read daemon.json after a Ping.
+                state.heal_daemon_json();
                 let _ = tx
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;
@@ -274,7 +276,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                             writer,
                         )
                         .await;
-                        let e = super::reload::exec(&state, &state.paths, prepared).await;
+                        let e = super::reload::exec(&state, prepared).await;
                         tracing::error!(error = %e, "daemon: reload did not exec");
                         return;
                     }
@@ -538,6 +540,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 }
             }
             Ok(Read::Frame(ClientFrame::Ping)) => {
+                // `daemon status` and `daemon reload` read daemon.json after a Ping.
+                state.heal_daemon_json();
                 let _ = tx
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;

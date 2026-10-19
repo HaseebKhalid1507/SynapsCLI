@@ -10,14 +10,45 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 pub const DEFAULT_IDENTITY: &str =
     "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
+thread_local! {
+    /// [`with_identity_for_tests`]'s pin; `None` everywhere else.
+    static IDENTITY_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Returns the configured identity string for the system prompt preamble.
 /// Falls back to `DEFAULT_IDENTITY` (the SynapsCLI identity above) if not set
 /// in config. Initialized by `load_config()` — safe to call anytime after boot.
 pub fn get_identity() -> String {
+    if let Some(pinned) = IDENTITY_OVERRIDE.with(|o| o.borrow().clone()) {
+        return pinned;
+    }
     IDENTITY
         .get()
         .cloned()
         .unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
+}
+
+/// Run `f` with [`get_identity`] pinned to `identity` on this thread.
+///
+/// `IDENTITY` is a process-wide `OnceLock` latched by whichever test first
+/// calls `load_config()`, against whatever config is ambient then (on a
+/// developer machine, the real `~/.synaps-cli/config`). A test that asserts
+/// on the identity pins it here instead, so the result does not depend on
+/// test order or on HOME. Thread-scoped, so concurrent tests don't see each
+/// other's pin; code `f` hands to another thread does not see it either.
+/// Restored on unwind.
+#[doc(hidden)]
+pub fn with_identity_for_tests<R>(identity: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            IDENTITY_OVERRIDE.with(|o| *o.borrow_mut() = prev);
+        }
+    }
+    let prev = IDENTITY_OVERRIDE.with(|o| o.borrow_mut().replace(identity.to_string()));
+    let _restore = Restore(prev);
+    f()
 }
 
 /// Provider API keys parsed from `provider.<name> = ...` lines in config.

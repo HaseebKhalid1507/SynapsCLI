@@ -95,6 +95,37 @@ pub struct WriterOptions {
     /// Test seam: artificial per-job delay inside the worker, simulating
     /// slow storage deterministically (never set in production).
     pub write_delay: Option<Duration>,
+    /// Test seam: the worker waits on this gate before each job, so a test
+    /// can hold storage "stuck" for exactly as long as it needs, with no
+    /// wall clock involved (never set in production).
+    pub write_gate: Option<WriteGate>,
+}
+
+/// A gate the writer's worker waits on before each job ([`WriterOptions::write_gate`]).
+/// Starts closed; [`open`](Self::open) releases the worker for good.
+#[derive(Debug, Clone, Default)]
+pub struct WriteGate(Arc<(StdMutex<bool>, Condvar)>);
+
+impl WriteGate {
+    /// A closed gate: the worker blocks before its next job until opened.
+    pub fn closed() -> Self {
+        Self::default()
+    }
+
+    /// Open the gate; every current and future wait returns.
+    pub fn open(&self) {
+        let (open, cv) = &*self.0;
+        *lock_recover(open) = true;
+        cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let (open, cv) = &*self.0;
+        let mut guard = lock_recover(open);
+        while !*guard {
+            guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 impl Default for WriterOptions {
@@ -105,6 +136,7 @@ impl Default for WriterOptions {
             capacity: DEFAULT_QUEUE_CAPACITY,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             write_delay: None,
+            write_gate: None,
         }
     }
 }
@@ -235,6 +267,7 @@ struct WorkerCfg {
     trace_path: Option<PathBuf>,
     max_file_bytes: u64,
     write_delay: Option<Duration>,
+    write_gate: Option<WriteGate>,
     latest_traces: Arc<Shared>,
 }
 
@@ -256,6 +289,7 @@ impl TelemetryWriter {
             trace_path: options.trace_path.or_else(default_trace_log_path),
             max_file_bytes: options.max_file_bytes,
             write_delay: options.write_delay,
+            write_gate: options.write_gate,
             latest_traces: Arc::clone(&shared),
         };
         let worker_shared = Arc::clone(&shared);
@@ -397,6 +431,9 @@ impl TelemetryWriter {
 /// This is the ONLY code that touches the log files.
 fn worker_loop(rx: Receiver<Job>, cfg: WorkerCfg, shared: Arc<Shared>) {
     while let Ok(job) = rx.recv() {
+        if let Some(gate) = &cfg.write_gate {
+            gate.wait();
+        }
         if let Some(delay) = cfg.write_delay {
             std::thread::sleep(delay);
         }
@@ -576,6 +613,7 @@ mod tests {
             capacity,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             write_delay: delay,
+            write_gate: None,
         });
         (w, telemetry, trace)
     }
@@ -772,6 +810,7 @@ mod tests {
             capacity: 16,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             write_delay: None,
+            write_gate: None,
         });
         for _ in 0..3 {
             w.enqueue_telemetry(sample_telemetry());
@@ -797,6 +836,7 @@ mod tests {
             capacity: 16,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             write_delay: None,
+            write_gate: None,
         });
         w.enqueue_trace(sample_trace()); // fail → warn #1
         w.enqueue_telemetry(sample_telemetry()); // success → latch re-arms
@@ -833,6 +873,7 @@ mod tests {
             capacity: 64,
             max_file_bytes: 64, // one record (~90B) exceeds the cap
             write_delay: None,
+            write_gate: None,
         });
         for ts in 0..3u64 {
             let mut r = sample_telemetry();

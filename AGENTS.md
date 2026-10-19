@@ -22,7 +22,7 @@ cargo test --workspace                   # all crates + integration tests
 cargo test -p synaps-engine              # single crate
 cargo test -p synaps-engine -- --test-threads=1  # required for PTY tests (TTY fd contention)
 cargo test --test extensions_e2e         # end-to-end with real extension process
-cargo clippy --all-targets -- -D warnings  # linting (CI gate)
+cargo clippy --workspace --all-targets --locked -- -D warnings  # linting (CI gate)
 ```
 
 **Build/test worker ceiling (preference):** always use at most **8 workers**

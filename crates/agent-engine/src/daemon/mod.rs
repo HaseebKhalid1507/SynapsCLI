@@ -203,6 +203,10 @@ pub struct DaemonState {
     /// `old id → new id` for one generation (ids differ only if a
     /// LinkedSuccessor compaction happened since boot).
     pub reload_aliases: Mutex<HashMap<String, String>>,
+    /// The `daemon.json` record this image wrote, and its writes. A Ping
+    /// that finds the file missing or naming another pid puts it back
+    /// ([`Self::heal_daemon_json`]); reload takes its recorded exe from here.
+    pub meta: registry::Metadata,
 }
 
 impl DaemonState {
@@ -226,6 +230,42 @@ impl DaemonState {
     /// Exec failed: arm a fresh token so new connections are served again.
     pub fn reset_announce(&self) {
         *self.reload_announce.lock().unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
+    }
+
+    /// The `daemon.json` record this image holds (a copy).
+    pub fn daemon_info(&self) -> DaemonInfo {
+        self.meta.info()
+    }
+
+    /// Ping: if `daemon.json` is missing or names another pid, write this
+    /// image's record back. Only while this image holds the flock and has
+    /// not begun to shut down; the record comes from memory, never from
+    /// disk. One INFO line per [`JSON_HEAL_LOG_EVERY`].
+    ///
+    /// The shutdown check runs under the `lock_fd` mutex: [`Daemon::wait`]
+    /// cancels `shutdown` before it takes that mutex to unlink the files, so
+    /// a Ping still in flight at shutdown can't write the file back after
+    /// the unlink. During a reload's hand-off the record already names the
+    /// new generation and exe, so a heal there writes what the reload wrote.
+    pub fn heal_daemon_json(&self) {
+        let lock = self.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(lock) = lock.as_ref() else {
+            return;
+        };
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        match self.meta.heal(lock) {
+            Ok(registry::Healed::Yes { info, log: Some(heals) }) => tracing::info!(
+                path = %self.paths.json.display(),
+                pid = info.pid,
+                generation = info.generation,
+                heals,
+                "daemon: daemon.json rewritten (it was missing or named another pid)"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "daemon: daemon.json heal failed"),
+        }
     }
 
     /// B4: ONE session map — `EngineHost` owns it; these delegate.
@@ -356,6 +396,18 @@ impl Daemon {
         let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
         let listener = listener::bind(&paths.sock)?;
 
+        let info = DaemonInfo {
+            pid: std::process::id(),
+            protocol_version: crate::session::wire::PROTOCOL_VERSION,
+            daemon_version: crate::session::wire::binary_version(),
+            profile: opts.profile.clone(),
+            started_at: chrono::Utc::now(),
+            socket: paths.sock.to_string_lossy().into_owned(),
+            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
+            generation,
+        };
+        let meta = registry::Metadata::start(paths.clone(), info.clone())?;
+
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
         let state = Arc::new(DaemonState {
             host,
@@ -372,19 +424,8 @@ impl Daemon {
             reload_announce: Mutex::new(CancellationToken::new()),
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
+            meta,
         });
-
-        let info = DaemonInfo {
-            pid: std::process::id(),
-            protocol_version: crate::session::wire::PROTOCOL_VERSION,
-            daemon_version: crate::session::wire::binary_version(),
-            profile: opts.profile.clone(),
-            started_at: chrono::Utc::now(),
-            socket: paths.sock.to_string_lossy().into_owned(),
-            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
-            generation,
-        };
-        registry::write_daemon_json(&paths, &info)?;
 
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every
@@ -429,7 +470,7 @@ impl Daemon {
         {
             let lock = self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(lock) = lock.as_ref() {
-                registry::cleanup_metadata(&self.paths, lock);
+                self.state.meta.cleanup(lock);
             }
         }
         tracing::info!("daemon: stopped");

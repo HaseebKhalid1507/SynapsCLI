@@ -5,11 +5,25 @@ use std::time::Duration;
 use synaps_cli::tools::shell::config::ShellConfig;
 use synaps_cli::tools::shell::{session::SessionOpts, SessionManager};
 
+/// The child shells' env. Interactive bash and python save their history
+/// to `$HOME/.bash_history` / `$HOME/.python_history` on exit, so a session
+/// that inherits the test's HOME wrote into the developer's real one. Give
+/// every child a throwaway HOME under cargo's target tmp dir (reused across
+/// runs, removed by `cargo clean`; the test process's own env is untouched).
+fn child_env() -> HashMap<String, String> {
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("shell_pty-home");
+    std::fs::create_dir_all(&home).expect("child HOME");
+    HashMap::from([
+        ("HOME".to_string(), home.display().to_string()),
+        ("HISTFILE".to_string(), "/dev/null".to_string()),
+    ])
+}
+
 fn default_opts() -> SessionOpts {
     SessionOpts {
         command: None,
         working_directory: None,
-        env: HashMap::new(),
+        env: child_env(),
         rows: None,
         cols: None,
         readiness_timeout_ms: None,
@@ -209,7 +223,7 @@ async fn test_working_directory() {
 async fn test_environment_variables() {
     let manager = SessionManager::new(ShellConfig::default());
 
-    let mut env = HashMap::new();
+    let mut env = child_env();
     env.insert("MY_VAR".to_string(), "test123".to_string());
 
     let mut opts = default_opts();

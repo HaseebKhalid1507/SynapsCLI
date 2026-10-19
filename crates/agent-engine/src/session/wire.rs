@@ -61,12 +61,22 @@ pub fn binary_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Which build of [`binary_version`] this is: the short commit it was built
-/// from (`-dirty` with uncommitted changes), `SYNAPS_BUILD_ID` from the
-/// build environment, or empty when unknown (build script). Two builds of
-/// one release share the version, not this.
+static BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record this process's build id. The `synaps` binary calls it first thing
+/// in `main` with the id its build script baked in (the short commit,
+/// `-dirty` with uncommitted changes, or `SYNAPS_BUILD_ID` from the build
+/// environment). It lives in the root crate, not here, so a new commit does
+/// not recompile the engine. First call wins; later calls are ignored.
+pub fn set_build_id(id: &str) {
+    let _ = BUILD_ID.set(id.trim().to_string());
+}
+
+/// Which build of [`binary_version`] this is, as set by [`set_build_id`];
+/// empty when unknown (never set: library embedders, tests, packaged builds
+/// without git). Two builds of one release share the version, not this.
 pub fn build_id() -> &'static str {
-    env!("SYNAPS_BUILD_ID")
+    BUILD_ID.get().map(String::as_str).unwrap_or("")
 }
 
 // ── client → daemon ───────────────────────────────────────────────────────────
@@ -1470,6 +1480,15 @@ mod tests {
         let f = DaemonFrame::Error { session_id: None, message: "y".repeat(RPC_MAX_FRAME_BYTES * 2) };
         let line = encode_line(&f).unwrap();
         assert!(decode_line::<DaemonFrame>(line.trim_end()).is_ok());
+    }
+
+    #[test]
+    fn build_id_is_set_once_by_the_binary() {
+        // The only caller in this test binary; `main` is the only one in `synaps`.
+        set_build_id(" abc1234-dirty \n");
+        assert_eq!(build_id(), "abc1234-dirty");
+        set_build_id("later");
+        assert_eq!(build_id(), "abc1234-dirty", "first call wins");
     }
 
     #[test]
