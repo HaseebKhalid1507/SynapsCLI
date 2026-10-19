@@ -392,6 +392,7 @@ mod tests {
                         cooling_down: false,
                     }],
                     earliest_reset_ms: None,
+                    usage_read_retry_ms: None,
                 }),
                 vend_failure: None,
             }],
