@@ -1319,6 +1319,27 @@ async fn a_refused_refresh_of_the_chosen_account_moves_the_selection_to_another(
         "the selection did not fail: {log}"
     );
     assert_secret_free(&log);
+    // `auth state --account a` says why a was passed over, without another
+    // exchange.
+    let query = AuthStateQuery {
+        account: Some("a".into()),
+        ..anthropic_query()
+    };
+    let report = serde_json::to_value(broker.auth_state(&query).unwrap()).unwrap();
+    let a = report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["label"] == "a")
+        .unwrap_or_else(|| panic!("no a in {report}"))
+        .clone();
+    assert_eq!(
+        a["last_refresh"]["failure"],
+        json!({"kind": "refresh_rejected", "http_status": 400}),
+        "{a}"
+    );
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+    assert_secret_free(&report.to_string());
 }
 
 /// S2 (ruled: ANY refresh kind, not only a refused login): a transient
@@ -1443,7 +1464,9 @@ async fn every_chosen_accounts_refused_refresh_ends_the_selection_naming_each_lo
 
 /// A re-selection after the chosen account's refused refresh reuses the
 /// selection's earlier failures: c's failed usage read is not repeated (a
-/// and b come from the reading cache).
+/// and b come from the reading cache). c's read is refused (401), not
+/// transient: a transient failure is held by the usage-read table anyway,
+/// so only a refused read shows the selection's own memory.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_reselection_does_not_repeat_an_earlier_failed_read() {
@@ -1451,7 +1474,7 @@ async fn a_reselection_does_not_repeat_an_earlier_failed_read() {
     let script: Script = Arc::default();
     script.lock().unwrap().insert("a", roomy());
     script.lock().unwrap().insert("b", roomy());
-    script.lock().unwrap().insert("c", Reply::Status(503));
+    script.lock().unwrap().insert("c", Reply::Status(401));
     let (usage_url, usage_hits) = spawn_counted_usage(script).await;
     let (token_url, token_hits) = spawn_token(400, INVALID_GRANT).await;
     let broker = auto_broker(&usage_url).with_anthropic_token_url_for_tests(token_url);

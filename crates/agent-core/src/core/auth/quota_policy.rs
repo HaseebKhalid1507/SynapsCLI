@@ -1005,17 +1005,21 @@ pub fn evaluate(
     req: &SelectionRequest<'_>,
     cap: &AccountCapacity,
 ) -> Result<Eligible, RejectReason> {
+    // A cooldown is checked before the caller's exclusion: an account a
+    // request already used and then saw limited stays "cooling down" (with
+    // its time) in the failure, not merely "excluded". Eligibility is the
+    // same either way.
+    if let Some(until) = cap.cooldown_until_ms {
+        if until > req.now_ms {
+            return Err(RejectReason::CoolingDown { until_ms: until });
+        }
+    }
     if req
         .exclude
         .iter()
         .any(|c| c.storage_key() == cap.credential.storage_key())
     {
         return Err(RejectReason::Excluded);
-    }
-    if let Some(until) = cap.cooldown_until_ms {
-        if until > req.now_ms {
-            return Err(RejectReason::CoolingDown { until_ms: until });
-        }
     }
     let (windows, models) = match &cap.observation {
         QuotaObservation::Ok { windows, models } => (windows, models),

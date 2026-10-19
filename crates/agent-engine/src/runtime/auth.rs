@@ -776,8 +776,9 @@ fn chosen_seat_refresh_text(f: &crate::auth::RefreshFailure) -> String {
         R::ActionRequired => {
             format!("Can't refresh the token for the automatically chosen Anthropic account: {msg}")
         }
-        // The broker names the account and, for a local slot, the exact
-        // login command (`auto_vend_failure`).
+        // A broker that ends the selection on the chosen seat's refused
+        // refresh (an older or remote one) names the account and, for a
+        // local slot, the exact login command.
         R::Credential if has_login_advice(f.message()) => {
             format!("Anthropic refused the login of the automatically chosen account: {msg}")
         }

@@ -1762,6 +1762,12 @@ struct SlotObservations {
 
 /// Process-shared map keyed by storage key or seat key.
 type SharedMap<T> = Arc<std::sync::Mutex<BTreeMap<String, T>>>;
+
+/// The accounts that failed earlier in one automatic selection (storage key
+/// → why): a failed refresh of the chosen seat or a failed usage read. They
+/// count as failed for the rest of that selection, without a new request.
+type FailedThisSelection = BTreeMap<String, super::quota_policy::ObservationFailure>;
+
 /// Config-derived policy tagged with the config file mtime it was read at.
 type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
 
@@ -1943,7 +1949,7 @@ impl LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<PinnedToken, BrokerError> {
-        self.vend_auto(provider, model).await
+        self.vend_auto(provider, model, &[]).await
     }
 
     /// Test seam: point typed usage fetches at a fake server.
@@ -2100,12 +2106,15 @@ impl LocalBroker {
 
     /// Resolve and vend for a request: explicit account (validated, never a
     /// fallback) or the policy; `auto` goes through capacity selection with
-    /// the token paired to the proven seat.
+    /// the token paired to the proven seat. `exclude` lists the accounts the
+    /// request already used: `auto` selects among the rest, and an explicit
+    /// account in it is refused.
     async fn resolve_and_vend(
         &self,
         provider: OAuthProviderId,
         explicit: Option<Account>,
         model: Option<&str>,
+        exclude: &[CredentialRef],
     ) -> Result<PinnedToken, BrokerError> {
         let selector = match explicit {
             Some(account) => AccountSelector::Account(account),
@@ -2114,10 +2123,20 @@ impl LocalBroker {
         match selector {
             AccountSelector::Account(account) => {
                 let credential = CredentialRef::new(provider, account);
+                if exclude.contains(&credential) {
+                    return Err(BrokerError::NoAccountAvailable {
+                        provider: provider.as_str().to_string(),
+                        reason: format!(
+                            "the selected account {} was already used by this request",
+                            credential.account
+                        ),
+                        failure: None,
+                    });
+                }
                 let token = self.access_token_for(&credential).await?;
                 Ok(PinnedToken { credential, token })
             }
-            AccountSelector::Auto => self.vend_auto(provider, model).await,
+            AccountSelector::Auto => self.vend_auto(provider, model, exclude).await,
             AccountSelector::Invalid { source, reason } => {
                 Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
             }
@@ -2131,16 +2150,33 @@ impl LocalBroker {
     /// `auto`: select on fresh usage, then vend a token for exactly the seat
     /// that usage was read from. If the slot changed in between (re-login,
     /// removal, rotation by another party) the reading is discarded and the
-    /// selection re-runs once on the new content; never a token for a seat
-    /// whose capacity was not proven.
+    /// selection re-runs on the new content, at most
+    /// [`Self::MAX_AUTO_VEND_ROUNDS`] times; never a token for a seat whose
+    /// capacity was not proven.
+    ///
+    /// A refresh failure of the chosen seat, of ANY kind, does not end the
+    /// selection while another account has proven capacity: the account
+    /// counts as failed, with its refresh kind, for the rest of this
+    /// selection and the selection runs again without it. A failed usage
+    /// read counts the same way (a held transient read is answered by the
+    /// usage-read table without a request). So each account gets at most one
+    /// refresh attempt and one failed read per selection, and the rounds are
+    /// bounded by the number of accounts. When none is left, the selection
+    /// fails with every account's kind (S1's classified failure).
     async fn vend_auto(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
+        exclude: &[CredentialRef],
     ) -> Result<PinnedToken, BrokerError> {
         use super::token::{ensure_fresh_credential_for_seat, SeatVendError};
-        for _ in 0..Self::MAX_AUTO_VEND_ROUNDS {
-            let (credential, seat) = match self.select_auto(provider, model).await {
+        let mut failed = FailedThisSelection::new();
+        let mut seat_changes = 0;
+        loop {
+            let (credential, seat) = match self
+                .select_auto(provider, model, exclude, &mut failed)
+                .await
+            {
                 Ok(choice) => choice,
                 Err(e) => {
                     let failure = match &e {
@@ -2151,7 +2187,7 @@ impl LocalBroker {
                             super::quota_policy::SelectionFailureKind::CredentialStore,
                         )),
                     };
-                    self.record_selection(provider, model, None, failure, None);
+                    self.record_selection(provider, model, None, failure);
                     return Err(e);
                 }
             };
@@ -2171,19 +2207,22 @@ impl LocalBroker {
                             Self::current_key(provider, model),
                             (credential.clone(), seat),
                         );
-                    self.record_selection(provider, model, Some(&credential), None, None);
+                    self.record_selection(provider, model, Some(&credential), None);
                     return Ok(PinnedToken {
                         credential,
                         token: AccessToken {
                             token: creds.access,
                             expires: creds.expires,
                         },
-                    })
+                    });
                 }
                 Err(SeatVendError::SeatChanged) => {
                     tracing::info!(credential = %credential, "slot changed after selection; re-selecting");
                     self.forget_snapshots(&credential);
-                    continue;
+                    seat_changes += 1;
+                    if seat_changes >= Self::MAX_AUTO_VEND_ROUNDS {
+                        break;
+                    }
                 }
                 // Typed, so a transient refresh failure of the chosen seat
                 // is never reported as an unusable login.
@@ -2192,17 +2231,16 @@ impl LocalBroker {
                     tracing::warn!(
                         credential = %credential,
                         kind = %cause.kind,
-                        "automatic choice could not be vended: token refresh failed"
+                        "automatic choice could not be vended: token refresh failed; selecting again"
                     );
-                    self.record_selection(provider, model, Some(&credential), None, Some(cause));
-                    return Err(BrokerError::Refresh(auto_vend_failure(&credential, f)));
+                    failed.insert(credential.storage_key(), cause);
                 }
             }
         }
         let failure = super::quota_policy::SelectionFailure::new(
             super::quota_policy::SelectionFailureKind::SeatChurn,
         );
-        self.record_selection(provider, model, None, Some(failure.clone()), None);
+        self.record_selection(provider, model, None, Some(failure.clone()));
         Err(selection_failed(
             provider,
             model,
@@ -2212,13 +2250,15 @@ impl LocalBroker {
     }
 
     /// Record the outcome of an automatic selection for `synaps auth state`.
+    /// A chosen account whose token could not be vended is no outcome any
+    /// more (the selection runs again without it), so `vend_failure` stays
+    /// empty; the field remains for reports from older brokers.
     fn record_selection(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
         chosen: Option<&CredentialRef>,
         failure: Option<super::quota_policy::SelectionFailure>,
-        vend_failure: Option<super::quota_policy::ObservationFailure>,
     ) {
         let state = super::auth_state::SelectionState {
             provider: provider.as_str().to_string(),
@@ -2226,7 +2266,7 @@ impl LocalBroker {
             at_ms: crate::epoch_millis(),
             chosen: chosen.map(|c| c.account.label_str().to_string()),
             failure,
-            vend_failure,
+            vend_failure: None,
         };
         self.selections
             .lock()
@@ -2530,16 +2570,23 @@ impl LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<super::SelectionPlan, BrokerError> {
-        self.selection_plan(provider, model)
+        self.selection_plan(provider, model, &[], &mut FailedThisSelection::new())
             .await
             .map(|(plan, ..)| plan)
     }
 
+    /// Read every account's capacity and rank them. `exclude` lists the
+    /// accounts the request already used. An account in `failed` failed
+    /// earlier in this selection: it counts as failed with that kind and is
+    /// not read again; a read that fails now (other than a held transient
+    /// read, which the usage-read table answers without a request) is added.
     #[allow(clippy::type_complexity)]
     async fn selection_plan(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
+        exclude: &[CredentialRef],
+        failed: &mut FailedThisSelection,
     ) -> Result<
         (
             super::SelectionPlan,
@@ -2548,22 +2595,32 @@ impl LocalBroker {
         ),
         BrokerError,
     > {
-        use super::quota_policy::SelectionRequest;
+        use super::quota_policy::{AccountCapacity, SelectionRequest};
         let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
         let mut candidates = Vec::with_capacity(summaries.len());
         let mut seats = BTreeMap::new();
         let mut transient = BTreeMap::new();
         let mut grace = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        let mut exclude = Vec::new();
+        let mut exclude = exclude.to_vec();
         for summary in &summaries {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
+            if let Some(failure) = failed.get(&cred.storage_key()) {
+                candidates.push(AccountCapacity::failed(cred, failure.clone()));
+                continue;
+            }
             let read = self.capacity_for(&cred).await;
             let (mut capacity, seat) = (read.capacity, read.seat);
-            if let Some(failed) = read.transient {
-                transient.insert(cred.storage_key(), failed);
+            match (read.transient, &capacity.failure) {
+                (Some(held), _) => {
+                    transient.insert(cred.storage_key(), held);
+                }
+                (None, Some(failure)) => {
+                    failed.insert(cred.storage_key(), failure.clone());
+                }
+                (None, None) => {}
             }
             // The same entitlement guard for a fresh reading and for a last
             // good reading standing in for a failed read.
@@ -2618,10 +2675,15 @@ impl LocalBroker {
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
+        exclude: &[CredentialRef],
+        failed: &mut FailedThisSelection,
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
         use super::usage_reads::USAGE_READ_TARGET;
-        let (plan, mut seats, transient) = match self.selection_plan(provider, model).await {
+        let (plan, mut seats, transient) = match self
+            .selection_plan(provider, model, exclude, failed)
+            .await
+        {
             Ok(planned) => planned,
             // The account list itself could not be read (the only error
             // `selection_plan` returns): still exactly one WARN for this
@@ -2822,7 +2884,10 @@ impl LocalBroker {
             .flatten();
         if let Some(provider) = oauth_provider.filter(|_| muse_env_key.is_none()) {
             if provider_key != LOCAL_PROVIDER_KEY && static_provider(provider_key).is_none() {
-                pinned = Some(self.resolve_and_vend(provider, explicit_account, None).await?);
+                pinned = Some(
+                    self.resolve_and_vend(provider, explicit_account, None, &[])
+                        .await?,
+                );
             }
         }
         let bearer = |pinned: &Option<PinnedToken>| -> Result<String, BrokerError> {
@@ -3301,30 +3366,6 @@ fn refresh_kind_failure(
     }
 }
 
-/// The refresh failure of the automatically chosen account, with that
-/// account named: the caller never learns which seat was picked. A refused
-/// login also gets the exact command that fixes it (unless the message
-/// already has one). Same kind, so retry hints are unchanged.
-fn auto_vend_failure(
-    credential: &CredentialRef,
-    f: super::token::RefreshFailure,
-) -> super::token::RefreshFailure {
-    let label = credential.account.label_str();
-    let mut message = format!("account '{label}': {}", f.message());
-    if f.kind == super::token::RefreshFailureKind::Credential && !message.contains("synaps login") {
-        let account = if credential.account.is_default() {
-            String::new()
-        } else {
-            format!(" --account {label}")
-        };
-        message.push_str(&format!(
-            "; log it in again with `synaps login --provider {}{account}`",
-            credential.provider
-        ));
-    }
-    super::token::RefreshFailure::new(f.kind, message).with_http_status(f.http_status())
-}
-
 /// A failed automatic selection: ONE WARN (see [`log_selection_failure`]),
 /// then the typed error.
 fn selection_failed(
@@ -3626,7 +3667,19 @@ impl CredentialBroker for LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<PinnedToken, BrokerError> {
-        self.resolve_and_vend(provider, None, model).await
+        self.resolve_and_vend(provider, None, model, &[]).await
+    }
+
+    /// The exclusion goes into the selection itself: `auto` selects among
+    /// the accounts the request hasn't used (one that is cooling down still
+    /// reads as cooling down in a failure).
+    async fn access_token_pinned_excluding(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+        exclude: &[CredentialRef],
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_and_vend(provider, None, model, exclude).await
     }
 
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
@@ -6089,48 +6142,6 @@ mod tests {
         }
         assert!(!json.contains("refresh"));
         assert!(!json.contains("access"));
-    }
-
-    /// The caller of an automatic vend never learns which seat was picked:
-    /// the refresh failure names it, and a refused login carries the exact
-    /// command for that slot.
-    #[test]
-    fn auto_vend_failure_names_the_chosen_account_and_its_login_command() {
-        use super::super::token::{RefreshFailure, RefreshFailureKind as R};
-        let named = CredentialRef::new(
-            OAuthProviderId::Anthropic,
-            Account::named("claude3").unwrap(),
-        );
-        let refused =
-            auto_vend_failure(&named, RefreshFailure::new(R::Credential, "invalid_grant"));
-        assert_eq!(refused.kind, R::Credential);
-        assert_eq!(
-            refused.message(),
-            "account 'claude3': invalid_grant; log it in again with \
-             `synaps login --provider anthropic --account claude3`"
-        );
-        let default = CredentialRef::new(OAuthProviderId::Anthropic, Account::Default);
-        let refused = auto_vend_failure(&default, RefreshFailure::new(R::Credential, "revoked"));
-        assert_eq!(
-            refused.message(),
-            "account 'default': revoked; log it in again with \
-             `synaps login --provider anthropic`"
-        );
-        // A message that already says which login to run gets no second one.
-        let advised = auto_vend_failure(
-            &named,
-            RefreshFailure::new(
-                R::Credential,
-                "slot removed; run `synaps login --account claude3`",
-            ),
-        );
-        assert_eq!(advised.message().matches("synaps login").count(), 1);
-        // Other kinds are named, keep their kind and get no login advice.
-        for kind in [R::Transient, R::LockBusy, R::Other, R::ActionRequired] {
-            let f = auto_vend_failure(&named, RefreshFailure::new(kind, "HTTP 503"));
-            assert_eq!(f.kind, kind);
-            assert_eq!(f.message(), "account 'claude3': HTTP 503");
-        }
     }
 
     /// No Anthropic refresh seam exists, so the refresh-failure → kind map
