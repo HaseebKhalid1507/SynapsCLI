@@ -1017,6 +1017,106 @@ fn a_taken_over_leftover_temp_is_left_alone_and_named_when_a_later_file_fails() 
     assert_eq!(leftovers(d.path()).len(), 1, "{:?}", leftovers(d.path()));
 }
 
+/// Makes a directory inside a test's own TempDir read-only while held; put
+/// back on drop, so the TempDir is removed even when the test panics.
+#[cfg(unix)]
+struct ReadOnlyDir(PathBuf);
+
+#[cfg(unix)]
+impl ReadOnlyDir {
+    fn new(dir: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        ReadOnlyDir(dir.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// The error a real unlink in read-only `dir` gets here, or `None` (with
+/// one skip line) where a read-only directory doesn't stop it, e.g. as root.
+#[cfg(unix)]
+fn unlink_error_in_read_only(dir: &Path) -> Option<String> {
+    let probe = dir.join("probe");
+    std::fs::write(&probe, "").unwrap();
+    let denied = {
+        let _read_only = ReadOnlyDir::new(dir);
+        std::fs::remove_file(&probe).err().map(|e| e.to_string())
+    };
+    let _ = std::fs::remove_file(&probe);
+    if denied.is_none() {
+        eprintln!("EACCES not real, case skipped: a read-only directory does not stop an unlink here");
+    }
+    denied
+}
+
+/// Publishes each new file by a hard link, its directory read-only from
+/// just after the link until that finalize returns: the real
+/// identity-checked unlink of the temp fails.
+#[cfg(unix)]
+struct UnlinkDenied(PathBuf);
+
+#[cfg(unix)]
+impl commit::Hooks for UnlinkDenied {
+    fn finalize(&mut self, _: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
+        let mut read_only = None;
+        let published = commit::finalize(s, p, &mut |primitive| match primitive {
+            commit::Primitive::RenameNoReplace => true,
+            commit::Primitive::Link => false,
+            commit::Primitive::UnlinkTemp => {
+                read_only = Some(ReadOnlyDir::new(&self.0));
+                false
+            }
+        });
+        drop(read_only);
+        published
+    }
+}
+
+// The real unlink of each hard-link publish's temp fails, for two files in
+// one call: both are published and counted, and each temp is named, in
+// order, with the unlink's own error, as the last lines of the result.
+#[cfg(unix)]
+#[test]
+fn temps_the_real_unlink_cannot_remove_are_each_named_on_success() {
+    use std::os::unix::fs::MetadataExt;
+    let d = tmpdir();
+    let dir = std::fs::canonicalize(d.path()).unwrap();
+    let Some(denied) = unlink_error_in_read_only(&dir) else {
+        return;
+    };
+    let (a, b) = (d.path().join("a.md"), d.path().join("b.md"));
+    let out = run_with(
+        json!({"edits": [
+            {"path": p(&a), "op": "append", "create": true, "text": "x\n"},
+            {"path": p(&b), "op": "append", "create": true, "text": "y\n"}
+        ]}),
+        &mut UnlinkDenied(dir.clone()),
+    )
+    .unwrap();
+    assert!(out.starts_with("multi_edit: 2 file(s) written, 2 edit(s) applied, 0 skipped"), "{out}");
+    let warnings: Vec<&str> = out.lines().filter(|l| l.starts_with("warning: ")).collect();
+    assert_eq!(warnings.len(), 2, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(&lines[lines.len() - 2..], &warnings[..], "the warnings come last: {out}");
+    for (warning, (f, bytes)) in warnings.iter().zip([(&a, "x\n"), (&b, "y\n")]) {
+        assert_eq!(std::fs::read_to_string(f).unwrap(), bytes);
+        let temp = named_temp(warning, &p(f));
+        assert!(warning.ends_with(&format!(": {denied}")), "{warning}");
+        assert_eq!(temp.parent(), Some(dir.as_path()), "{warning}");
+        assert_eq!(std::fs::read_to_string(&temp).unwrap(), bytes);
+        let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        assert_eq!(ino(&temp), ino(f), "the leftover is a link to {}", f.display());
+    }
+    assert_eq!(leftovers(d.path()).len(), 2, "{:?}", leftovers(d.path()));
+}
+
 // Without the exclusive rename, a hard link still creates the file without
 // replacing anything, and the temp name is removed.
 #[test]
