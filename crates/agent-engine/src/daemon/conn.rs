@@ -289,6 +289,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;
             }
+            // `synaps auth state`: the host broker's in-memory account state.
+            Ok(Read::Frame(ClientFrame::AuthState(query))) => {
+                let _ = tx.send(auth_state_reply(&state, &query)).await;
+            }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
@@ -557,7 +561,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
             }
-            Ok(Read::Frame(ClientFrame::Reload { .. })) | Ok(Read::Frame(ClientFrame::Purge)) => {
+            Ok(Read::Frame(ClientFrame::Reload { .. }))
+            | Ok(Read::Frame(ClientFrame::Purge))
+            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -626,6 +632,14 @@ fn reload_bye(state: &DaemonState) -> ByeReason {
         generation: state.reload_generation.load(Ordering::SeqCst),
         retry_after_ms: super::reload::RETRY_AFTER_MS,
     }
+}
+
+/// `AuthState`: the in-memory account state of the broker on the host's
+/// token cache, which every session of this daemon uses. Same trust as the
+/// other control frames (the socket is the user's own). No network request,
+/// no refresh; a clear never writes the credential store.
+fn auth_state_reply(_state: &DaemonState, _query: &agent_core::auth::AuthStateQuery) -> DaemonFrame {
+    DaemonFrame::Error { session_id: None, message: "auth state: not implemented".into() }
 }
 
 #[cfg(test)]

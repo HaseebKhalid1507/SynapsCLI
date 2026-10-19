@@ -177,3 +177,79 @@ async fn create_refuses_relative_or_missing_cwd() {
     d.shutdown_token().cancel();
     d.wait().await;
 }
+
+/// `synaps auth state` on a real daemon: it answers from the broker on the
+/// host's token cache (the one every session of the daemon uses), with no
+/// session. A clear for one account drops that account's cooldown in that
+/// broker and keeps the other's, writes nothing in the credential store,
+/// and the connection stays usable. The client API gets the same report.
+#[tokio::test]
+#[serial]
+async fn auth_state_reads_and_clears_the_host_broker_without_writing_credentials() {
+    use synaps_cli::auth::{
+        broker_from_source, Account, AuthStateQuery, CredentialRef, CredentialSource, OAuthProviderId,
+    };
+    let guard = HomeGuard::new();
+    let auth_json = guard.base_dir().join("auth.json");
+    let mut store: serde_json::Value = serde_json::from_str(&phase2::synthetic_auth_json()).unwrap();
+    for label in ["a", "b"] {
+        store[format!("anthropic@{label}")] = serde_json::json!({
+            "type": "oauth", "access": format!("anthropic-{label}-access"), "refresh": format!("refresh-{label}-SECRET"), "expires": 9_999_999_999_999u64,
+        });
+    }
+    std::fs::write(&auth_json, store.to_string()).unwrap();
+    let store_before = std::fs::read(&auth_json).unwrap();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+
+    let broker = broker_from_source(&CredentialSource::Local, &d.state.host.parts().token_cache, reqwest::Client::new());
+    let until = agent_core::epoch_millis() + 3_600_000;
+    for label in ["a", "b"] {
+        let cred = CredentialRef::new(OAuthProviderId::Anthropic, Account::named(label).unwrap());
+        broker.report_cooldown(&cred, Some(until), "anthropic_quota_exhausted").await.unwrap();
+    }
+    let anthropic = AuthStateQuery { provider: Some("anthropic".into()), ..AuthStateQuery::default() };
+    let cooldowns = |report: &synaps_cli::auth::AuthStateReport| {
+        let mut rows = report.accounts.iter().map(|a| (a.label.clone(), a.cooldown.as_ref().map(|c| c.until_ms))).collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))));
+    c.send(&ClientFrame::AuthState(anthropic.clone())).await;
+    let report = match c.recv().await {
+        Some(DaemonFrame::AuthState { report }) => report,
+        other => panic!("{other:?}"),
+    };
+    assert!(report.live && report.broker_active, "{report:?}");
+    assert_eq!(cooldowns(&report), vec![("a".to_string(), Some(until)), ("b".to_string(), Some(until)), ("default".to_string(), None)]);
+
+    c.send(&ClientFrame::AuthState(AuthStateQuery { account: Some("b".into()), clear: true, ..anthropic.clone() })).await;
+    match c.recv().await {
+        Some(DaemonFrame::AuthState { report }) => {
+            assert_eq!(report.cleared, vec!["anthropic:b".to_string()]);
+            assert_eq!(cooldowns(&report), vec![("b".to_string(), None)]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let rows = broker.accounts(OAuthProviderId::Anthropic).await.unwrap();
+    let cooldown_of = |label: &str| rows.iter().find(|r| r.label == label).unwrap().cooldown_until;
+    assert_eq!((cooldown_of("a"), cooldown_of("b")), (Some(until), None), "the clear reached the broker sessions use");
+
+    c.send(&ClientFrame::Ping).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Pong { sessions: 0, .. })));
+    assert_eq!(std::fs::read(&auth_json).unwrap(), store_before, "auth state wrote the credential store");
+    assert!(d.state.live_sessions().is_empty());
+
+    match agent_engine::session::socket_transport::SocketTransport::auth_state(&sock, anthropic).await {
+        Ok(agent_engine::session::socket_transport::AuthStateReply::Report(report)) => {
+            assert!(report.live, "{report:?}");
+            assert_eq!(cooldowns(&report), vec![("a".to_string(), Some(until)), ("b".to_string(), None), ("default".to_string(), None)]);
+        }
+        other => panic!("{other:?}"),
+    }
+    d.shutdown_token().cancel();
+    d.wait().await;
+}

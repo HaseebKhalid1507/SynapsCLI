@@ -113,6 +113,12 @@ pub enum ClientFrame {
     /// Control fast path: `memstat::purge_arenas()` in the daemon (bench
     /// hygiene). Reply: `Pong`. (C2)
     Purge,
+    /// Control fast path (no session): the in-memory account state of the
+    /// broker every session of this daemon shares (`synaps auth state`),
+    /// cleared first when `clear` is set. Reply: `AuthState`. A daemon that
+    /// predates this frame answers `Error` "malformed frame: unknown variant
+    /// `auth_state`, ..." and keeps the connection usable.
+    AuthState(agent_core::auth::AuthStateQuery),
     Bye,
 }
 
@@ -136,6 +142,7 @@ impl std::fmt::Debug for ClientFrame {
                 .field("exe", exe)
                 .finish(),
             Self::Purge => f.write_str("Purge"),
+            Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -251,6 +258,11 @@ pub enum DaemonFrame {
     Bye {
         #[serde(default)]
         reason: Option<ByeReason>,
+    },
+    /// Reply to `ClientFrame::AuthState`. Labels, kinds and times only:
+    /// never token material, emails, account ids or identity hashes.
+    AuthState {
+        report: agent_core::auth::AuthStateReport,
     },
 }
 
@@ -945,6 +957,51 @@ mod tests {
         crate::session::handle::echo::view_for()
     }
 
+    /// An `AuthState` reply with every nested type present.
+    fn auth_state_report() -> agent_core::auth::AuthStateReport {
+        use agent_core::auth::auth_state::{AccountState, CooldownState, IdentityKind, ObservedOutcome, SelectionState};
+        use agent_core::auth::quota_policy::{
+            AccountFailure, AccountFailureKind, ObservationFailure, SelectionFailure, SelectionFailureKind,
+        };
+        let usage_429 = ObservationFailure { kind: AccountFailureKind::UsageRateLimited, http_status: Some(429), retry_after_s: Some(120) };
+        agent_core::auth::AuthStateReport {
+            schema_version: agent_core::auth::AUTH_STATE_SCHEMA_VERSION,
+            live: true,
+            broker_active: true,
+            generated_at_ms: 1_800_000_000_000,
+            store: "/scratch/auth.json".into(),
+            accounts: vec![AccountState {
+                provider: "anthropic".into(),
+                label: "a".into(),
+                identity: IdentityKind::Stable,
+                access_expires_ms: Some(1_800_000_600_000),
+                cooldown: Some(CooldownState { until_ms: 1_800_003_600_000, reason: "anthropic_quota_exhausted".into() }),
+                last_usage: Some(ObservedOutcome { at_ms: 1_799_999_990_000, failure: Some(usage_429.clone()) }),
+                last_usage_ok_ms: Some(1_799_999_000_000),
+                last_refresh: Some(ObservedOutcome { at_ms: 1_799_999_500_000, failure: None }),
+            }],
+            selections: vec![SelectionState {
+                provider: "anthropic".into(),
+                model: Some("claude-x".into()),
+                at_ms: 1_799_999_990_000,
+                chosen: None,
+                failure: Some(SelectionFailure {
+                    kind: SelectionFailureKind::UsageReadFailed,
+                    accounts: vec![AccountFailure {
+                        account: "a".into(),
+                        kind: AccountFailureKind::UsageRateLimited,
+                        http_status: Some(429),
+                        retry_after_s: Some(120),
+                        until_ms: None,
+                    }],
+                    earliest_reset_ms: None,
+                }),
+                vend_failure: None,
+            }],
+            cleared: vec!["anthropic:b".into()],
+        }
+    }
+
     fn meta() -> SessionMeta {
         crate::session::handle::echo::meta_for(&SessionId::from("wire-1"))
     }
@@ -1370,6 +1427,12 @@ mod tests {
             }},
             ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
             ClientFrame::Purge,
+            ClientFrame::AuthState(agent_core::auth::AuthStateQuery::default()),
+            ClientFrame::AuthState(agent_core::auth::AuthStateQuery {
+                provider: Some("anthropic".into()),
+                account: Some("b".into()),
+                clear: true,
+            }),
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1411,6 +1474,7 @@ mod tests {
             DaemonFrame::Bye { reason: None },
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
+            DaemonFrame::AuthState { report: auth_state_report() },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
