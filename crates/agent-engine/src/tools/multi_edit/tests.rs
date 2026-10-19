@@ -1022,6 +1022,83 @@ fn a_taken_over_leftover_temp_is_left_alone_and_named_when_a_later_file_fails() 
     assert_eq!(leftovers(d.path()).len(), 1, "{:?}", leftovers(d.path()));
 }
 
+/// File 0 is published cleanly; files 1 and 2 by hard links whose temps
+/// can't be removed (the existing seam); file 3's finalize fails.
+#[cfg(unix)]
+struct WarnedThenFail;
+
+#[cfg(unix)]
+impl commit::Hooks for WarnedThenFail {
+    fn finalize(&mut self, index: usize, s: &commit::Staged, p: &commit::Pending) -> commit::Published {
+        match index {
+            0 => commit::finalize(s, p, &mut |_| false),
+            3 => Err(std::io::Error::other("injected rename failure")),
+            _ => commit::finalize(s, p, &mut |primitive| {
+                matches!(
+                    primitive,
+                    commit::Primitive::RenameNoReplace | commit::Primitive::UnlinkTemp
+                )
+            }),
+        }
+    }
+}
+
+// A clean first publication, then two files that each left a temp over, in
+// two directories, then a failure: each leftover is reported and retried in
+// its own file's directory, and the clean file is named in none of them.
+#[cfg(unix)]
+#[test]
+fn earlier_leftovers_in_two_directories_are_each_retried_when_a_later_file_fails() {
+    let d = tmpdir();
+    std::fs::create_dir(d.path().join("p")).unwrap();
+    std::fs::create_dir(d.path().join("q")).unwrap();
+    let p_dir = std::fs::canonicalize(d.path().join("p")).unwrap();
+    let q_dir = std::fs::canonicalize(d.path().join("q")).unwrap();
+    let a = d.path().join("p").join("a.md");
+    let b = d.path().join("p").join("b.md");
+    let c = d.path().join("q").join("c.md");
+    let e = d.path().join("q").join("e.md");
+    let err = run_with(
+        json!({"edits": [
+            {"path": p(&a), "op": "append", "create": true, "text": "w\n"},
+            {"path": p(&b), "op": "append", "create": true, "text": "x\n"},
+            {"path": p(&c), "op": "append", "create": true, "text": "y\n"},
+            {"path": p(&e), "op": "append", "create": true, "text": "z\n"}
+        ]}),
+        &mut WarnedThenFail,
+    )
+    .unwrap_err();
+    assert!(err.contains(&format!("writing {} failed: injected rename failure", p(&e))), "{err}");
+    assert!(
+        err.contains(&format!("Committed then restored: {}, {}, {}.", p(&a), p(&b), p(&c))),
+        "{err}"
+    );
+    assert!(err.contains("Restore FAILED: none"), "{err}");
+    assert!(err.contains(&format!("Never written: {}.", p(&e))), "{err}");
+    assert!(
+        !err.contains(&format!("{} published; could not remove temp", p(&a))),
+        "the clean first file is named as a leftover: {err}"
+    );
+    let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
+    for (file, dir) in [(&b, &p_dir), (&c, &q_dir)] {
+        let lead = format!("{} published; could not remove temp ", p(file));
+        assert!(err.contains(&lead), "an earlier leftover is not reported: {err}");
+        let temp = named_temp(&err, &p(file));
+        assert_eq!(temp.parent(), Some(dir.as_path()), "{err}");
+        assert!(
+            err.contains(&format!(
+                "could not remove temp {}: {unsupported}; removed on retry",
+                temp.display()
+            )),
+            "{err}"
+        );
+        assert!(!temp.exists(), "a leftover not retried in its own directory: {}", temp.display());
+    }
+    assert!(!a.exists() && !b.exists() && !c.exists() && !e.exists());
+    assert!(leftovers(&p_dir).is_empty(), "{:?}", leftovers(&p_dir));
+    assert!(leftovers(&q_dir).is_empty(), "{:?}", leftovers(&q_dir));
+}
+
 /// Makes a directory inside a test's own TempDir read-only while held; put
 /// back on drop, so the TempDir is removed even when the test panics.
 #[cfg(unix)]
