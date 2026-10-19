@@ -68,6 +68,7 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::Park => Err("park: not a client command"),
         C::AdoptWorkers { .. } => Err("adopt_workers: not a client command"),
         C::ReloadAborted => Err("reload_aborted: not a client command"),
+        C::Restored { .. } => Err("restored: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
         C::DriverStart { .. } => Ok(()),
     }
@@ -289,6 +290,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Close { session_id, force })) => {
                 tracing::info!(session = %session_id, force, "daemon: close requested over the socket");
                 let reply = super::close::close_session(&state, &session_id, force).await;
+                state.pins.changed();
                 let _ = tx.send(reply).await;
             }
             // `daemon pin`: pin/unpin one session with host authority. A
@@ -296,6 +298,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Pin { session_id, on })) => {
                 tracing::info!(session = %session_id, on, "daemon: pin requested over the socket");
                 let reply = super::pin::pin_session(&state, &session_id, on).await;
+                state.pins.changed();
                 let _ = tx.send(reply).await;
             }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
@@ -371,12 +374,17 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             // running actor (attach-if-live). Tell the client — it asked to
             // create and got the existing session instead. Detected by id
             // presence before/after so a client-less Parked target counts too.
+            let pinned = config.keep_warm;
             let before: Vec<SessionId> = if config.continue_session.is_some() {
                 state.live_sessions().into_iter().map(|h| h.id).collect()
             } else {
                 Vec::new()
             };
-            match state.create(config).await {
+            let created = state.create(config).await;
+            if pinned {
+                state.pins.changed();
+            }
+            match created {
                 Ok(h) if before.contains(&h.id) => {
                     tracing::info!(session = %h.id, "daemon: continue target is live — attaching, not creating");
                     attached_to_live = true;
@@ -541,7 +549,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
                 }
+                let pin_change = matches!(cmd, SessionCommand::KeepWarm { .. });
                 match handle.send_from(client, cmd).await {
+                    Ok(()) if pin_change => state.pins.changed(),
                     Ok(()) => {}
                     Err(TransportError::Backpressure) => {
                         let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "backpressure: command queue full".into() }).await;

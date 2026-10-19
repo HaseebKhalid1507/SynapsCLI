@@ -360,6 +360,10 @@ define_settings! {
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
         };
 
+    "daemon.restore_pinned", "Restore pinned sessions", Daemon, EditorKind::Cycler(&["on", "off"]),
+        "Bring pinned sessions (/pin) back when the daemon starts after a stop, an idle exit or a crash. Env SYNAPS_DAEMON_RESTORE_PINNED and `synaps daemon start --no-restore` override. Takes effect at the next daemon start.",
+        |_app, value| on_off("daemon.restore_pinned", value);
+
     // ── Context & cache ──────────────────────────────────────────────────
     // Config-only rows below validate through the real config parser
     // (`config_edit`), so /settings can never write a value `load_config`
@@ -1055,6 +1059,24 @@ mod tests {
             config_row_display("turn_budget.worker.max_cost_usd").as_deref(),
             Some("2.5")
         );
+        drop(temp);
+    }
+
+    #[test]
+    fn restore_pinned_is_an_on_off_daemon_row_that_defaults_on() {
+        use super::super::draw::config_row_display;
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "daemon.restore_pinned")
+            .expect("daemon.restore_pinned setting should be defined");
+        assert_eq!(def.category, Category::Daemon);
+        assert!(matches!(def.editor, EditorKind::Cycler(&["on", "off"])));
+        let _lock = config_lock();
+        let temp = TempConfig::new("");
+        assert_eq!(config_row_display("daemon.restore_pinned").as_deref(), Some("on"));
+        drop(temp);
+        let temp = TempConfig::new("daemon.restore_pinned = off\n");
+        assert_eq!(config_row_display("daemon.restore_pinned").as_deref(), Some("off"));
         drop(temp);
     }
 

@@ -13,6 +13,7 @@ pub mod conn;
 pub mod lifecycle;
 pub mod listener;
 pub mod pin;
+pub mod pins;
 pub mod registry;
 pub mod reload;
 
@@ -164,6 +165,13 @@ pub struct DaemonOpts {
     pub runtime_dir: Option<PathBuf>,
     /// Test seam / A1 hook: how `Attach::Create` builds a session.
     pub factory: Option<SessionFactory>,
+    /// Restore pinned sessions at a fresh start. `Some(false)` is
+    /// `synaps daemon start --no-restore` (this start only: the pins file is
+    /// kept). `None`: env `SYNAPS_DAEMON_RESTORE_PINNED`, else config
+    /// `daemon.restore_pinned` (default on).
+    pub restore_pinned: Option<bool>,
+    /// Test seam: the pins file (default `<active config dir>/daemon-pins.json`).
+    pub pins_file: Option<PathBuf>,
 }
 
 impl DaemonOpts {
@@ -210,6 +218,11 @@ pub struct DaemonState {
     /// that finds the file missing or naming another pid puts it back
     /// ([`Self::heal_daemon_json`]); reload takes its recorded exe from here.
     pub meta: registry::Metadata,
+    /// Pinned sessions are being restored after a start: holds the idle
+    /// exit until they exist (then their pins hold it).
+    pub restoring: AtomicBool,
+    /// The pin set across restarts (`pins.rs`): the keeper's book.
+    pub pins: pins::Pins,
 }
 
 impl DaemonState {
@@ -359,6 +372,7 @@ pub struct Daemon {
     pub paths: DaemonPaths,
     pub state: Arc<DaemonState>,
     accept: tokio::task::JoinHandle<()>,
+    pin_tasks: pins::PinTasks,
 }
 
 impl Daemon {
@@ -412,6 +426,14 @@ impl Daemon {
         let meta = registry::Metadata::start(paths.clone(), info.clone())?;
 
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
+        let pins_path = opts.pins_file.clone().unwrap_or_else(pins::default_path);
+        let pins_file = pins::load(&pins_path);
+        if let Some(f) = pins_file.as_ref().filter(|f| pins::same_profile_as(f, opts.profile.as_deref())) {
+            // Before any session can dispatch: a restored model's
+            // remembered `sa_N` must never name a new worker.
+            crate::tools::seed_next_subagent_id(f.next_subagent_id);
+        }
+        let pin_book = pins::PinBook::new(pins_path, opts.profile.clone(), pins_file);
         let state = Arc::new(DaemonState {
             host,
             paths: paths.clone(),
@@ -428,6 +450,8 @@ impl Daemon {
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
             meta,
+            restoring: AtomicBool::new(false),
+            pins: pins::Pins::new(pin_book),
         });
 
         // Before any session of this image registers: drop registrations no
@@ -454,7 +478,12 @@ impl Daemon {
         }
         signal_ready();
         tracing::info!(sock = %paths.sock.display(), pid = info.pid, generation, "daemon: listening");
-        Ok(Self { paths, state, accept })
+        // After ready: a restore `create` can take far longer than the
+        // spawner waits for the ready byte. Fresh starts only; a reload
+        // rehydrated its sessions above.
+        let restore = reload_state.is_none() && pins::restore_enabled(&opts);
+        let pin_tasks = pins::start(&state, restore);
+        Ok(Self { paths, state, accept, pin_tasks })
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -466,6 +495,9 @@ impl Daemon {
     pub async fn wait(self) {
         self.state.shutdown.cancelled().await;
         let force = self.state.force_shutdown.load(Ordering::SeqCst);
+        // The pin set's final snapshot, while every pinned session is still
+        // live: once `shutdown_all` ends them, a snapshot would drop them.
+        self.pin_tasks.finish(&self.state).await;
         lifecycle::shutdown_all(&self.state, force).await;
         self.accept.abort();
         let _ = self.accept.await;
@@ -526,9 +558,10 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
 /// Idle = zero connections, no pinned session AND every live session
 /// between turns, held for `idle` continuously. Clients and pins count
 /// first so a probe is never sent while someone is attached. A pin holds
-/// the exit because exiting would end the session the user asked to keep.
+/// the exit because exiting would end the session the user asked to keep;
+/// so does a restore of pinned sessions still running after a start.
 pub async fn daemon_is_idle(state: &DaemonState) -> bool {
-    if state.connections.load(Ordering::SeqCst) > 0 {
+    if state.connections.load(Ordering::SeqCst) > 0 || state.restoring.load(Ordering::SeqCst) {
         return false;
     }
     let sessions = state.live_sessions();
@@ -605,6 +638,9 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     }
     if opts.allow_legacy_mcp {
         cmd_args.push("--allow-legacy-mcp".into());
+    }
+    if opts.restore_pinned == Some(false) {
+        cmd_args.push("--no-restore".into());
     }
     // Scope wrapping execs in place: PID, ready FD and stdio remain intact.
     // Separate scopes do not protect against ancestor/global OOM.

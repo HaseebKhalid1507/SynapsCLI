@@ -413,6 +413,27 @@ pub(crate) fn subagent_close_cancel_event(
     event
 }
 
+/// The MAIN-conversation note for a worker that was running when the
+/// daemon stopped or crashed; the daemon brought this pinned session back
+/// (`SessionCommand::Restored`), but not the worker.
+pub(crate) fn subagent_lost_in_restart_event(
+    handle_id: &str,
+    agent_name: &str,
+) -> crate::events::types::Event {
+    let mut event = subagent_user_cancel_event(handle_id, agent_name);
+    event.source.source_type = "system".to_string();
+    event.source.name = "daemon".to_string();
+    event.content.text = format!(
+        "The Synaps daemon restarted (stopped or crashed) while subagent '{agent_name}' ({handle_id}) was \
+         running; it was lost and sends no completion wake. If its work is still needed, check what it \
+         left behind and dispatch it again."
+    );
+    event
+}
+
+/// `Restored`'s client notice.
+pub const RESTORED_NOTICE: &str = "restored after a daemon restart (pinned)";
+
 /// `KeepWarm{on: true}`'s notice (`/pin on`, `daemon pin`, `--keep-warm`).
 pub const PIN_ON_NOTICE: &str = "pinned: this session stays loaded (never parked or idle-ended, \
      and the daemon will not idle-exit while it is pinned). /pin off to undo.";
@@ -452,6 +473,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
         SessionCommand::ReloadAborted => "reload_aborted",
+        SessionCommand::Restored { .. } => "restored",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -4031,6 +4053,11 @@ impl SessionActor {
                 SessionQuery::SubagentWatch { handle_id, .. } => {
                     serde_json::json!({ "error": format!("no subagent {handle_id} in this session") })
                 }
+                // The pin keeper's snapshot reads no runtime state.
+                SessionQuery::Record => serde_json::json!({
+                    "record": serde_json::to_value(self.reload_record()).unwrap_or_default(),
+                    "workers_running": [],
+                }),
                 _ => match self.ensure_live().await {
                     Ok(()) => return Box::pin(self.query(id, query)).await,
                     Err(e) => serde_json::json!({ "error": e }),
@@ -4118,6 +4145,24 @@ impl SessionActor {
                     CommandResult::Output(text) => serde_json::json!({ "text": text }),
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 }
+            }
+            SessionQuery::Record => {
+                // Running workers die with the daemon; a restore names them
+                // in the conversation (`Restored`).
+                let running: Vec<serde_json::Value> = self
+                    .runtime
+                    .subagent_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .display_rows()
+                    .into_iter()
+                    .filter(|r| r.status == crate::runtime::subagent::SubagentStatus::Running)
+                    .map(|r| serde_json::json!({ "id": r.handle_id, "agent": r.agent_name }))
+                    .collect();
+                serde_json::json!({
+                    "record": serde_json::to_value(self.reload_record()).unwrap_or_default(),
+                    "workers_running": running,
+                })
             }
         };
         self.emit(SessionEventWire::QueryResult { id, value });
@@ -4719,6 +4764,12 @@ impl SessionActor {
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
             SessionCommand::ReloadAborted => self.reload_aborted().await,
+            SessionCommand::Restored { lost_workers } => {
+                self.emit(SessionEventWire::SystemNotice(RESTORED_NOTICE.to_string()));
+                for (handle_id, agent) in &lost_workers {
+                    self.note_in_main_conversation(subagent_lost_in_restart_event(handle_id, agent));
+                }
+            }
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();

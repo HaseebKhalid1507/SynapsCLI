@@ -216,6 +216,31 @@ fn chain_heads(roots: &RetentionRoots) -> Result<Vec<String>, RetentionError> {
     Ok(heads)
 }
 
+/// Sessions the daemon restores at its next start
+/// (`<config dir>/daemon-pins.json`, written by `agent-engine`'s
+/// `daemon::pins`): a pinned session that sat idle past the age cutoff must
+/// not lose its journal, or the restore would find nothing to continue.
+/// Both the session id and its current journal id are protected. A missing
+/// or unreadable file protects nothing (pins are not chain integrity; the
+/// daemon sets an unparsable file aside).
+fn pinned_sessions(roots: &RetentionRoots) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(roots.config_dir.join("daemon-pins.json")) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for pin in value["pins"].as_array().into_iter().flatten() {
+        for key in ["id", "journal_id"] {
+            if let Some(id) = pin[key].as_str().filter(|s| !s.is_empty()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
 /// A session's age reference: embedded `updated_at`, mtime fallback.
 fn session_age_ms(path: &Path) -> Option<u64> {
     if let Ok(raw) = fs::read_to_string(path) {
@@ -301,8 +326,10 @@ pub fn sweep_at(
 ) -> Result<SweepOutcome, RetentionError> {
     let mut outcome = SweepOutcome::default();
     // Chain protection resolves FIRST and fails closed — nothing is
-    // deleted while any chain head is unknown.
-    let protected: Vec<String> = chain_heads(roots)?;
+    // deleted while any chain head is unknown. Pinned daemon sessions are
+    // protected the same way (counted with the chain heads).
+    let mut protected: Vec<String> = chain_heads(roots)?;
+    protected.extend(pinned_sessions(roots));
     let age_cutoff = policy
         .max_age_days
         .map(|days| now_ms.saturating_sub(days as u64 * DAY_MS));

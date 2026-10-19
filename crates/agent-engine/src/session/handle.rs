@@ -526,7 +526,9 @@ pub mod locked_placeholder {
             awaiting_input: 0,
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
-            pinned: false,
+            // A pinned session that is live elsewhere stays pinned here: it
+            // holds the idle exit while the daemon retries its lock.
+            pinned: config.keep_warm,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),

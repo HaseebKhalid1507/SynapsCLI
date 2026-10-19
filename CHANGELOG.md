@@ -50,8 +50,25 @@ All notable changes to this project will be documented in this file.
   `daemon sessions` marks pinned sessions (`"pinned"` in `--json`). Pinning a
   parked session wakes it; unpinning one leaves it parked. `--keep-warm` and
   `/keep-warm on|off` are the same pin; `/keepwarm` (prompt-cache pings) is
-  unrelated. The pin does not survive `daemon stop` or a crash yet. See
+  unrelated. See
   [docs/daemon-mode.md](docs/daemon-mode.md#pinning-a-session-pin).
+- **Pinned sessions come back after the daemon restarts.** The daemon keeps
+  the pin set in `<config dir>/daemon-pins.json` and, on its next start
+  after `daemon stop`, SIGTERM, an idle exit or a crash, restores each
+  pinned session under the same id from its journal, with its model,
+  `/system` and other session settings, and pinned. Running workers, shells
+  and `/auto` runs are not restored; the conversation is told about lost
+  workers. `/close`, `daemon close`, `/pin off` and `/quit` in
+  `synaps attach` remove a session from the set. A restore that fails three
+  times (including the daemon dying during it) is dropped, and
+  `synaps daemon sessions` / `status` list it as `pin dropped: …`. A journal
+  held by another process gets a pinned placeholder; the daemon retries the
+  lock every 10 s and brings the session back once it is free. Opt out with `daemon.restore_pinned = off`,
+  `SYNAPS_DAEMON_RESTORE_PINNED=0`, or `synaps daemon start --no-restore`
+  for one start. `synaps retention sweep` keeps pinned sessions' journals.
+  `deploy/synaps-daemon.service` is a disabled systemd user unit that starts
+  the daemon at login. See
+  [docs/daemon-mode.md](docs/daemon-mode.md#pinned-sessions-across-restarts).
 
 ### Changed
 

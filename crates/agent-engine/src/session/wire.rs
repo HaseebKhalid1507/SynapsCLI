@@ -66,6 +66,9 @@ pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
 /// `synaps daemon close` sends the engine command `close` under this id and
 /// awaits its `QueryResult` (`daemon/close.rs`); attached clients never see it.
 pub const CLOSE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
+/// The daemon's pin keeper asks `Query{Record}` under this id
+/// (`daemon/pins.rs`); attached clients never see the reply.
+pub const PIN_RECORD_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 4;
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {

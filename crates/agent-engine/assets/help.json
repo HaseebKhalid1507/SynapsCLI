@@ -636,7 +636,7 @@
     "keywords": ["pin", "unpin", "keep-warm", "park", "idle", "daemon", "loaded", "idle-exit"],
     "lines": [
       "/pin (or /pin status) shows whether this session is pinned. /pin on pins it, /pin off unpins it; only the client that owns input can change it. /keep-warm on|off is the same command, and synaps --attach --keep-warm pins at attach.",
-      "A pinned session is never parked, idle-ended or evicted, and the daemon does not idle-exit while any session is pinned. It survives daemon reload, but not /close, synaps daemon close, synaps daemon stop or a crash.",
+      "A pinned session is never parked, idle-ended or evicted, and the daemon does not idle-exit while any session is pinned. It survives daemon reload, and comes back when the daemon starts again after synaps daemon stop, an idle exit or a crash (opt out: daemon.restore_pinned = off). /close and synaps daemon close end it for good.",
       "From another shell: synaps daemon pin <ID|NAME> [--off]. synaps daemon sessions marks pinned sessions.",
       "Not /keepwarm (no dash), which keeps the prompt cache warm by pinging the API and costs money. In-process (no daemon), /pin does nothing: the session ends with the TUI."
     ],

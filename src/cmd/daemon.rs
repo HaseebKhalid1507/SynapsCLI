@@ -38,6 +38,11 @@ pub(crate) struct StartArgs {
     /// clients can still spawn this daemon.
     #[arg(long, hide = true)]
     pub allow_legacy_mcp: bool,
+    /// Don't bring pinned sessions back at this start (they stay in the pins
+    /// file for the next one). Also `SYNAPS_DAEMON_RESTORE_PINNED=0` or
+    /// config `daemon.restore_pinned = off`.
+    #[arg(long)]
+    pub no_restore: bool,
     /// Print `{"binary_version","protocol_version"}` and exit 0 (the reload
     /// version gate probes the NEW binary with this).
     #[arg(long, hide = true)]
@@ -118,7 +123,15 @@ fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
         allow_legacy_mcp: a.allow_legacy_mcp,
         runtime_dir: None,
         factory: None,
+        restore_pinned: a.no_restore.then_some(false),
+        pins_file: None,
     }
+}
+
+/// Footer lines for pins the daemon gave up restoring (read from the pins
+/// file of this profile).
+fn dropped_pin_lines() -> Vec<String> {
+    daemon::pins::dropped_lines(&daemon::pins::default_path())
 }
 
 /// Exit code 3 + one-line reason when `SYNAPS_DAEMON=0`.
@@ -405,6 +418,7 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
                 "daemon_version": info.as_ref().map(|i| i.daemon_version.clone()),
                 "protocol_version": info.as_ref().map(|i| i.protocol_version),
                 "profile": info.as_ref().and_then(|i| i.profile.clone()),
+                "dropped_pins": dropped_pin_lines(),
             })
         );
     } else {
@@ -415,6 +429,9 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         }
         if let Some(p) = &pong {
             println!("uptime: {}s  sessions: {}", p.uptime_s, p.sessions);
+        }
+        for line in dropped_pin_lines() {
+            println!("{line}");
         }
     }
     if pong.is_none() {
@@ -495,6 +512,11 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
                 m.name.as_deref().map_or(String::new(), |n| format!("  name={n}")),
                 if m.journal_id != m.id.as_str() { format!("  journal={}", m.journal_id) } else { String::new() }
             );
+        }
+    }
+    if !json {
+        for line in dropped_pin_lines() {
+            println!("{line}");
         }
     }
     Ok(())
