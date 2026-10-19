@@ -24,7 +24,8 @@
 //!    hard link. With neither, the create is refused; there is no
 //!    check-then-rename. If file k fails, files 1..k-1 are restored from
 //!    their in-memory originals and the error names exactly what happened
-//!    to each file.
+//!    to each file. A temp an earlier file left over is tried once more
+//!    (identity-checked) and named in the error, removed or still there.
 //!
 //! No fsync, matching `edit`/`write`. In normal operation a file is never
 //! rewritten in place: its new content is published whole, by a rename (or
@@ -345,11 +346,11 @@ pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<Vec<Str
             return Err(format!("{e}; no file was changed"));
         }
     }
-    let mut notes = Vec::new();
+    let mut notes: Vec<(usize, String)> = Vec::new();
     for (k, (p, staged)) in files.iter().zip(&temps).enumerate() {
         let e = match hooks.finalize(k, staged, p) {
             Ok(note) => {
-                notes.extend(note);
+                notes.extend(note.map(|note| (k, note)));
                 continue;
             }
             Err(e) => e,
@@ -363,6 +364,19 @@ pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<Vec<Str
                 Err(why) => failed.push(format!("{} ({why})", done.display)),
             }
         }
+        // A temp an earlier file left over is tried again, identity-checked
+        // like every cleanup, and reported either way.
+        let leftovers: String = notes
+            .iter()
+            .map(|(j, note)| {
+                let temp = &temps[*j];
+                let outcome = match remove_if_ours(&files[*j].dir, &temp.name, temp.identity) {
+                    Ok(()) => "removed on retry".to_string(),
+                    Err(why) => format!("still there: {why}"),
+                };
+                format!(" Left over earlier: {note}; {outcome}.")
+            })
+            .collect();
         let never: Vec<String> = files[k..].iter().map(|f| f.display.clone()).collect();
         let list = |v: &[String]| {
             if v.is_empty() {
@@ -372,12 +386,12 @@ pub(crate) fn commit(files: &[Pending], hooks: &mut dyn Hooks) -> Result<Vec<Str
             }
         };
         return Err(format!(
-            "writing {} failed: {e}. Committed then restored: {}. Restore FAILED: {}. Never written: {}.",
+            "writing {} failed: {e}. Committed then restored: {}. Restore FAILED: {}. Never written: {}.{leftovers}",
             p.display,
             list(&restored),
             list(&failed),
             list(&never)
         ));
     }
-    Ok(notes)
+    Ok(notes.into_iter().map(|(_, note)| note).collect())
 }
