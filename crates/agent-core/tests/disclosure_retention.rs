@@ -603,6 +603,53 @@ fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
 }
 
 #[test]
+fn age_sweep_keeps_the_journals_of_pinned_daemon_sessions() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "old-unpinned", 10 * DAY_MS, None);
+    write_session(&h.roots, "old-pinned", 10 * DAY_MS, None);
+    write_session(&h.roots, "old-pinned-successor", 10 * DAY_MS, None);
+    std::fs::write(
+        h.roots.config_dir.join("daemon-pins.json"),
+        serde_json::json!({
+            "pins": [{ "id": "old-pinned", "journal_id": "old-pinned-successor", "config": {} }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+        },
+        now,
+    )
+    .unwrap();
+
+    assert!(!session_exists(&h.roots, "old-unpinned"), "aged out");
+    assert!(session_exists(&h.roots, "old-pinned"), "a pinned session's id is protected");
+    assert!(
+        session_exists(&h.roots, "old-pinned-successor"),
+        "and so is its current journal"
+    );
+
+    // An unparsable pins file protects nothing and does not fail the sweep.
+    std::fs::write(h.roots.config_dir.join("daemon-pins.json"), "{not json").unwrap();
+    sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+        },
+        now,
+    )
+    .unwrap();
+    assert!(!session_exists(&h.roots, "old-pinned"));
+}
+
+#[test]
 fn malformed_chain_files_fail_closed_without_destructive_sweep() {
     let h = harness();
     let now = 100 * DAY_MS;

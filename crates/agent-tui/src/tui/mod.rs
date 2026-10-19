@@ -457,6 +457,14 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
         );
         std::process::exit(agent_engine::daemon::EXIT_DAEMON_LOST);
     }
+    // A daemon session that ended under this client (`/close` here or on
+    // another client, `daemon stop`): which one, and how to bring it back.
+    // In-process, quitting always ends the session; nothing to say.
+    if let (run_setup::TransportMode::Socket, Some(reason)) = (&mode, app.session_ended) {
+        if let Some(line) = attach::session_ended_line(reason, &app.session.id, app.api_messages_len > 0) {
+            eprintln!("{line}");
+        }
+    }
 
     Ok(())
 }

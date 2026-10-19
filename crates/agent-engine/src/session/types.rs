@@ -344,6 +344,11 @@ pub struct SessionMeta {
     /// `"pid N (kind)"`. Shown in `daemon sessions`; cleared on unpark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
+    /// Pinned (`KeepWarm{on}`, `/pin`): never parked, never idle-ended, and
+    /// the daemon does not idle-exit while it is set. An older daemon omits
+    /// it (→ false); an older client ignores it.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -672,7 +677,8 @@ pub enum SessionCommand {
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
-    /// (B3) pin/unpin (`--keep-warm`, `/keep-warm on|off`).
+    /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
+    /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
     KeepWarm { on: bool },
     /// Host-only (never wire): park now if `can_park()` (reload rehydrates
     /// a Parked session Parked). A no-op otherwise.
@@ -690,6 +696,13 @@ pub enum SessionCommand {
     /// the reload stopped are announced to this same image.
     #[serde(skip)]
     ReloadAborted,
+    /// Host-only (never wire): the daemon brought this pinned session back
+    /// after a restart (`daemon/pins.rs`). The actor tells attached clients,
+    /// and tells the MAIN conversation about each worker `(handle_id,
+    /// agent)` that was running when the previous daemon stopped: it is gone
+    /// and sends no completion wake.
+    #[serde(skip)]
+    Restored { lost_workers: Vec<(String, String)> },
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -808,6 +821,10 @@ impl std::fmt::Debug for SessionCommand {
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
                 .finish(),
             Self::ReloadAborted => f.write_str("ReloadAborted"),
+            Self::Restored { lost_workers } => f
+                .debug_struct("Restored")
+                .field("lost_workers", &lost_workers.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>())
+                .finish(),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }
@@ -933,6 +950,11 @@ pub enum SessionQuery {
     /// its journal from `since` (the previous page's `next_seq`; 0 = all).
     /// Unknown handle → `{"error": ..}`.
     SubagentWatch { handle_id: String, since: u64 },
+    /// `{"record": SessionReloadRecord, "workers_running": [{id, agent}]}`:
+    /// what the daemon's pin keeper persists for a pinned session
+    /// (`daemon/pins.rs`). Read-only, unlike `Checkpoint{Reload}`, which
+    /// raises the reload fence; never wakes a parked session.
+    Record,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,57 @@
+# synaps daemon — the session daemon at login (systemd USER service example)
+#
+# DISABLED BY DEFAULT. Nothing here is installed or enabled automatically.
+# Read docs/daemon-mode.md ("Pinned sessions across restarts") first.
+#
+# Without this unit the daemon starts with the first `synaps --attach` /
+# `synaps attach` (auto-spawn) or `synaps daemon --detach`, and pinned
+# sessions come back then. With it, they come back at login; with
+# `loginctl enable-linger $USER`, at boot without a login.
+#
+# Install (user service, runs as you, uses your ~/.synaps-cli):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/synaps-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start synaps-daemon
+#   journalctl --user -u synaps-daemon -f      # stderr; the full log is ~/.synaps-cli/synaps.log.*
+# Enable at login only after it has run cleanly:
+#   systemctl --user enable synaps-daemon
+#
+# `synaps daemon stop` works as usual; systemd does not restart a clean
+# exit. A crash restarts it, and the restore's attempt cap (3, counted on
+# disk before each attempt) keeps a session that crashes the daemon from
+# looping forever. To start once without restoring pinned sessions:
+#   systemctl --user stop synaps-daemon && synaps daemon start --no-restore
+# Another profile: copy the unit and add `--profile NAME` to ExecStart.
+
+[Unit]
+Description=synaps session daemon (restores pinned sessions)
+Documentation=https://github.com/HaseebKhalid1507/SynapsCLI/blob/main/docs/daemon-mode.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust the binary path (e.g. ~/.local/bin/synaps, /usr/local/bin/synaps).
+# No --idle-exit: a daemon started here stays up until stopped.
+ExecStart=%h/.cargo/bin/synaps daemon --foreground
+# SIGTERM -> graceful: the pin set's final snapshot, then every session is
+# saved and ended (bounded), then the extensions. Never SIGKILL early: give
+# it the whole budget (restore wait 10 s + snapshot 5 s + session end ~15 s
+# + extensions 5 s, with margin).
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+# No sandboxing: sessions run your tools in your projects (NoNewPrivileges
+# would break sudo in them), and clients find the socket in the runtime
+# dir, which PrivateTmp would hide when it is under /tmp.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Intentionally NOT enabled by default. `systemctl --user enable` is your explicit step.
+WantedBy=default.target

@@ -226,6 +226,10 @@ pub(crate) struct App {
     /// F9: set when the daemon died and reconnection failed — `run_loop` uses
     /// this to exit non-zero with a stderr explanation.
     pub(crate) daemon_lost: Option<DaemonLostInfo>,
+    /// The session ended under this client (`Ended`): `/close`, `daemon
+    /// stop`, an eviction. A daemon-session TUI says so on stderr after it
+    /// exits (`attach::session_ended_line`).
+    pub(crate) session_ended: Option<agent_engine::session::EndReason>,
     /// The daemon binary the version-skew notice was last shown for
     /// (`attach::skew_notice_once`: once per daemon build, not per reconnect).
     pub(crate) skew_noticed: Option<agent_engine::session::transport::BinaryId>,
@@ -475,6 +479,7 @@ impl App {
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compacting: false,
             daemon_lost: None,
+            session_ended: None,
             skew_noticed: None,
             quit_guard: super::quit_guard::QuitGuard::new(),
             pending_events_len: 0,

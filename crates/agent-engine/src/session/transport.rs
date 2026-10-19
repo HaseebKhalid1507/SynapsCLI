@@ -38,6 +38,15 @@ pub enum TransportError {
     /// `DaemonFrame::Error` during attach).
     #[error("refused: {0}")]
     Refused(String),
+    /// The daemon has no live session under that id
+    /// (`Refused{UnknownSession}` to a control request such as `Close`).
+    #[error("unknown session: {0}")]
+    UnknownSession(String),
+    /// The daemon predates this control request: it answered the frame
+    /// with `Error{"malformed frame: unknown variant …"}`. A
+    /// `synaps daemon reload` brings it up to this binary.
+    #[error("daemon {daemon_version} predates `{request}`; run `synaps daemon reload`")]
+    DaemonTooOld { daemon_version: String, request: &'static str },
 }
 
 #[async_trait::async_trait]

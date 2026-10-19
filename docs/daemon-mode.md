@@ -12,7 +12,8 @@
 |---|---|
 | `SYNAPS_DAEMON=0` (also `false`/`off`/`no`) | Disable daemon features: `synaps daemon` and `synaps attach` exit 3 with `daemon disabled by SYNAPS_DAEMON=0`; `--attach` prints `--attach ignored: …` and runs the normal in-process TUI. Unset or `1` = on (`=1` is a no-op kept for older scripts). |
 | `SYNAPS_DAEMON_AUTOSPAWN=0` | Disable auto-spawn only: an attach with no live daemon exits 3 with `no daemon running — start it with \`synaps daemon --detach\``. Default: the first client spawns the daemon (`current_exe daemon --foreground`, same profile, inherits env), waits ≤ 15 s (`SPAWN_READY_TIMEOUT`: the daemon's ≤ 10 s extension-discovery wait plus margin) on the ready-fd, prints `starting daemon (pid N) — synaps daemon stop to end it` on stderr, then attaches. A **spawn lock** (`daemon.spawn.lock`) serialises concurrent first-clients: the loser waits, re-probes the flock, attaches to the winner's daemon. If the spawned daemon refuses/dies before it is ready (e.g. the legacy-MCP refusal, exit 3) `--attach` falls back to the in-process TUI with a `daemon unavailable: <reason> — running in-process` notice (exit 0); `synaps attach` prints the reason and exits 3. |
-| `SYNAPS_DAEMON_IDLE_EXIT_SECS` | Auto-spawned daemons (from plain `synaps` or `--attach`) exit on their own after this long with **zero clients and no turn running** — default **10 s** (the clock starts at the last disconnect; parked/idle sessions do not hold it); `0`/`never` keeps them up. Parked sessions are journaled and `--continue` brings them back; nothing is lost, only the warm extensions. A daemon started by hand (`synaps daemon`) uses its own `--idle-exit`. |
+| `SYNAPS_DAEMON_IDLE_EXIT_SECS` | Auto-spawned daemons (from plain `synaps` or `--attach`) exit on their own after this long with **zero clients, no turn running and no pinned session** — default **10 s** (the clock starts at the last disconnect; parked/idle sessions do not hold it, a [pinned](#pinning-a-session-pin) one does); `0`/`never` keeps them up. Parked sessions are journaled and `--continue` brings them back; nothing is lost, only the warm extensions. A daemon started by hand (`synaps daemon`) uses its own `--idle-exit`. |
+| `SYNAPS_DAEMON_RESTORE_PINNED=0` (also `false`/`off`/`no`) / config `daemon.restore_pinned = off` / `synaps daemon start --no-restore` | Don't bring [pinned sessions](#pinned-sessions-across-restarts) back when the daemon starts. The pins file is kept and its entries carried to the next start. Precedence: `--no-restore` (this start only) > env > config (default on). |
 | `SYNAPS_DAEMON_IDLE_END_GRACE_SECS` | A **zero-turn** session with no clients ends after this long (F18) — default **5 s**. It has nothing to keep warm, so it does not wait the full park grace. |
 | `SYNAPS_DAEMON_PARKED_EVICT_SECS` | A **parked** session stays in the daemon's map (so `--attach <ID>`/the adopt banner find it) for this long, then is evicted (`Ended(Evicted)`). Default **1 h**; `never` keeps rows forever. Nothing is lost — the journal stays and `--continue <ID>` rebuilds it, exactly as after a daemon restart. A zero-turn session never parks: it ends (`Idle`) at the park deadline (F18). |
 | `SYNAPS_DAEMON_ADOPT=0` | Disable **adopt**: by default a plain `synaps` (no subcommand, no `--attach`; only `--system`/`-s`, `--continue`, `--prompt-manifest`, `--profile` allowed) runs as the thin socket client with `--attach --new` semantics (fresh session; `--continue` still continues) against the daemon for that profile — **spawning it first if none is running**, exactly like `--attach` (jcode model). A failed spawn, or `SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon, falls back to the ordinary in-process boot with a notice. `SYNAPS_DAEMON_ADOPT=0`, or any other flag (`--no-extensions`, `--help`, attach modifiers) → in-process, untouched. |
@@ -28,21 +29,23 @@
 | Thin-client flags (`SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_ALLOC=default`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_IDLE_SECS`, `SYNAPS_CLIENT_HISTORY=full`, `SYNAPS_TUI_SCROLLBACK[_BYTES]`, `SYNAPS_TUI_SYNTECT=full`, `SYNAPS_TUI_SYNTECT_IDLE_SECS`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_ATTACH_TAIL_ITEMS`) | Phase 4 client diet — full table with defaults in [memory-budget.md](memory-budget.md#kill-switches-all-env-vars). Only read on the `--attach`/`attach` thin path; the in-process fallback (`SYNAPS_DAEMON=0`, or a failed auto-spawn) boots untouched (`tests/attach_no_daemon.rs`, `tests/daemon_autospawn.rs`). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
-| `synaps attach --keep-warm` / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | Pin: never park this session. Survives `daemon reload`. |
+| **Pin**: `/pin [on\|off\|status]` / `synaps daemon pin <ID\|NAME> [--off]` / `--keep-warm` (attach flag) / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | The session stays loaded: never parked, never idle-ended (F18), never evicted, and the daemon does not idle-exit while any session is pinned. Survives `daemon reload`. See [Pinning a session](#pinning-a-session-pin). Not `/keepwarm`, which pings the API to keep the prompt cache warm and costs money. |
 | `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does. |
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
-| `synaps daemon reload` / `stop` / `purge` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs. `Checkpoint` over the wire is owner-only. |
+| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, and `daemon close` / `daemon pin` end or pin one session whoever owns its input (host authority, like `stop`). `Checkpoint` over the wire is owner-only. |
 
 ## CLI
 
 ```
-synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--profile P]
-synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering)
+synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--no-restore] [--profile P]
+synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering); lists dropped pins
 synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s)
-synaps daemon sessions [--json]
+synaps daemon sessions [--json]      # text output ends with a `pin dropped: …` line per pin the daemon gave up restoring
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
+synaps daemon close <ID|NAME> [--force] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
+synaps daemon pin <ID|NAME> [--off] [--json]       # pin/unpin one session without attaching (§Pinning a session); exit 0/1/2/3
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
 ```
@@ -70,8 +73,9 @@ override an operator's `SYNAPS_PROCESS_SCOPES=off`.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
+`/close [force]` → engine command `close` (ends the session; see [Closing a session](#closing-a-session-close));
 `/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query);
-`/keep-warm on|off`. Typed events render as `[aborted…]`, `[session cleared → id]`, `[compacting: …]`,
+`/pin on|off` (alias `/keep-warm on|off`). Typed events render as `[aborted…]`, `[session cleared → id]`, `[compacting: …]`,
 `[compacted N messages]`, `[refused cmd: reason]`, `[input owner → …]`, `[session Parked]`.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
@@ -100,6 +104,146 @@ To avoid accidental headless turns:
 The line client (`synaps attach`) follows the same double-press rule. The notice
 is printed to stderr so scripts piping stdout are not affected.
 
+## Closing a session (`/close`)
+
+Detaching leaves the session loaded in the daemon. It parks after the grace
+(`SYNAPS_DAEMON_PARK_GRACE_SECS`) and leaves the map an hour after that
+(`SYNAPS_DAEMON_PARKED_EVICT_SECS`), but an event queued for it (`synaps send`,
+an extension's inbox event, a worker's wake) unparks it and starts a turn. A
+session you are done with should be **closed**:
+
+- `/close` (TUI and `synaps attach`) is the engine command `close`. The actor
+  replies on its `QueryResult`, then ends exactly as the in-process quit does
+  (`End{ClientQuit}`: save, `on_session_end`, `Ended` to every client). It
+  leaves `synaps daemon sessions`; each attached TUI exits and prints
+  `synaps: session <id> was closed; resume it with: synaps --attach --continue <id>`.
+- It is an input command: only the input owner may close (others get `Refused`).
+- It refuses while closing would stop work in flight: a running turn or
+  compaction, a running worker (workers die with the session's runtime), or an
+  armed `/auto` run. The reply names them. `/close force` closes anyway: it
+  cancels the running workers first and notes each in the conversation
+  (`subagent_cancelled`), so whoever continues the session knows no wake is coming.
+- A **parked** session closes without being rebuilt.
+- In-process, `/close` is `/quit` with the same checks.
+- **`synaps daemon close <ID|NAME> [--force] [--json]`** does the same from any
+  shell, without attaching: no snapshot, no ownership change, a parked session is
+  never rebuilt. The target is an id, a journal id, a name or a unique prefix of
+  an id or journal id, resolved against the daemon's listing (a name two
+  sessions share, or a prefix of several, is an error that lists them). The
+  daemon sends the session `close` (`force` with `--force`) with host authority
+  under the reserved `CLOSE_QUERY_ID`, waits for the reply and for the actor to
+  end, and answers `Closed`; the attached TUIs exit as above. Exit codes: 0
+  closed; 3 refused (work in flight: the reply names it, `--force` closes
+  anyway; or the daemon is reloading); 1 no such session, ambiguous, no daemon,
+  timeout; 2 the daemon predates `daemon close` (`synaps daemon reload`) or a
+  protocol mismatch. `--json` prints `{ok, session_id, outcome, text}`. A
+  session whose journal another process holds (`locked_by`) is only removed
+  from this daemon's list; it keeps running there.
+
+## Pinning a session (`/pin`)
+
+A detached session parks after the grace and, when the daemon has no clients and
+nothing running, the daemon idle-exits and ends it. A session you want kept
+loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
+
+- It is never parked, never idle-ended (F18) and never evicted (only parked
+  sessions are), and the daemon does not idle-exit (`--idle-exit`,
+  `daemon.idle_exit_secs`, the auto-spawn default) while any session is pinned.
+- `/pin` (or `/pin status`) in the TUI asks the session whether it is pinned;
+  `/pin on` / `/pin off` pin and unpin it (input owner only). `/keep-warm on|off`
+  is the same command; `synaps --attach --keep-warm` / `synaps attach --keep-warm`
+  pin at attach. In-process (no daemon) `/pin` only says it applies to a daemon
+  session. **`/keepwarm`** (no dash) is unrelated: it keeps the *prompt cache*
+  warm by pinging the API, which costs money.
+- **`synaps daemon pin <ID|NAME> [--off] [--json]`** does it from any shell,
+  without attaching. The target resolves like `daemon close`'s. The daemon sends
+  the session `KeepWarm{on}` with host authority and answers `Pinned{on}` once
+  the session applied it (≤ 2 s, ≤ 10 s when pinning a parked session, which
+  wakes it). Exit codes: 0 done; 3 refused (daemon reloading, or the session is
+  live in another process: pin it there); 1 no such session, ambiguous, no
+  daemon, timeout; 2 the daemon predates `daemon pin` (`synaps daemon reload`)
+  or a protocol mismatch. `--json` prints `{ok, session_id, outcome, pinned, text}`.
+- Pinning a **parked** session wakes it (a pinned session is live by
+  definition); unpinning a parked one leaves it parked.
+- `synaps daemon sessions` marks a pinned session with `pinned` after its
+  lifecycle; `--json` has `"pinned": true|false` (`SessionMeta.pinned`).
+- The pin survives `daemon reload`, and a pinned session is brought back
+  when the daemon starts again after `daemon stop`, SIGTERM, an idle exit or
+  a crash (see [Pinned sessions across restarts](#pinned-sessions-across-restarts)).
+  `/close`, `daemon close`, `/pin off` and `/quit` in `synaps attach` end
+  that: the session is not brought back.
+
+## Pinned sessions across restarts
+
+The daemon keeps the pin set in `<config dir>/daemon-pins.json` (one per
+profile) and brings every pinned session back on its next start, under the
+same id, from its journal.
+
+**What is kept:** the conversation (from the journal, which is always the
+authority), the current model, the non-persisted knobs a reload also keeps
+(`/system`, context window, retries, timeouts, tool-output cap, worker
+grants), the `/keepwarm` override, and the pin. The session's environment
+comes from its journal; the pins file never holds env. The subagent handle
+counter continues, so a model's remembered `sa_N` never names a new worker.
+
+**What is lost:** running workers, PTY and background shells, an armed
+`/auto` run, and a turn in flight (the history keeps what streamed, then
+`[Request interrupted: session stopped by the host]` after a stop, or
+`[Request interrupted: Synaps stopped unexpectedly]` after a crash). If a
+worker was running, the restored conversation is told it was lost and sends
+no completion wake. Every restored session gets the notice `restored after a
+daemon restart (pinned)`. After a crash, knob changes from the last ≤ 30 s
+may be missing (the set itself is at most ≤ 2 s stale).
+
+**When it is written.** One task in the daemon (the pin keeper) is the only
+writer: on every pin change and every 2 s, by temp file + rename (mode 0600),
+and only while the daemon holds its flock. On `daemon stop`, SIGTERM/SIGINT
+and an idle exit it takes one final snapshot while every pinned session is
+still loaded, and only then are the sessions ended, so stopping never
+empties the set. `--force` stops snapshot without asking the sessions; if the
+CLI escalates to SIGKILL, the last snapshot stands, as after a crash.
+
+**When it is read.** On a fresh start only (a reload brings back its own
+sessions), after the daemon is ready, in the background: an auto-spawning
+client is never kept waiting, and the daemon does not idle-exit while the
+restore runs (afterwards the pins hold it). Entries are restored one at a
+time, in file order. A client that attaches meanwhile is served normally;
+`--continue X` on a session being restored gets the same session.
+
+- A pin whose cwd no longer exists is dropped at once.
+- A journal held by another process (a TUI or `synaps chat` that continued
+  it): a placeholder stands in (`daemon sessions` shows it with the holder,
+  pinned, and it holds the idle exit like any pin) and no attempt is
+  counted. The daemon retries the lock every 10 s and, once that process
+  lets go, brings the session back pinned with its knobs, nobody attached.
+  An attach that gets there first brings it back pinned too, without the
+  knobs (those come only from the pins file). A holder that is just exiting
+  (the previous daemon) is waited out for about 2 s before a placeholder is
+  used at all.
+- A session that never had a turn comes back as a fresh session in the same
+  cwd. One whose journal is gone fails (an empty session must not take its
+  place).
+
+**Crash loops.** Release builds abort on a panic, so one bad session could
+take the daemon down at every start. Each attempt is counted in the file
+before the session is created, and the count resets once the session has
+been up for 60 s. After 3 attempts the pin is dropped: a WARN line in
+`<config dir>/synaps.log.*`, and `synaps daemon sessions` / `status` print
+`pin dropped: <id> (<reason>, <time>)` for 7 days or until that journal is
+pinned again. Caveat: a crash within 60 s of a restore counts against every
+session restored in that run, not just the one at fault. Diagnose with
+`synaps daemon start --no-restore` (this start only).
+
+**Starting at login.** Nothing starts the daemon on its own: after a reboot
+pinned sessions come back with the first `synaps --attach` / `synaps attach`
+(auto-spawn) or `synaps daemon --detach`. `deploy/synaps-daemon.service` is a
+disabled systemd user unit that starts it at login; with
+`loginctl enable-linger $USER` it starts at boot without a login. Once
+anything is pinned, an auto-spawned daemon no longer idle-exits.
+
+**Retention.** `synaps retention sweep` never deletes the journal of a
+session listed in the pins file (its id and its current journal id).
+
 ## Files (under `registry_dir()`, one set per profile: `daemon-<P>.*`)
 
 | File | Mode | Purpose |
@@ -109,6 +253,7 @@ is printed to stderr so scripts piping stdout are not affected.
 | `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (one INFO line `daemon.json rewritten` per 10 min). Every write of `daemon.json` and `daemon.pid` goes through that file's own `<name>.tmp`, created exclusively and without following a symlink, mode 0600, then renamed into place. One metadata lock serializes the start write, the heal, the reload's write and its restore, and the shutdown cleanup: a heal never writes back an older record than the one held, and nothing writes the files after the cleanup. `daemon status`, `daemon reload`, `daemon stop` and `daemon start --detach` Ping before they read it. |
 | `daemon.pid` | 0600 | pid |
+| `<config dir>/daemon-pins.json` (not in the run dir) | 0600 | The [pin set](#pinned-sessions-across-restarts): `{version, profile, daemon_pid, written_at, clean_shutdown, next_subagent_id, pins[], dropped[]}`; each pin carries its id, journal id, create config (no env), knobs and restore attempts. Written only by the daemon holding the flock (temp + rename). In the config dir, not the run dir: older `synaps` binaries unlink run-dir `*.json` files they can't parse, and the run dir may be a tmpfs. An unparsable file is renamed `daemon-pins.json.bad`. `reap_stale` never touches it. |
 
 ## Per-session event endpoint ownership
 
@@ -169,6 +314,8 @@ C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, clie
 D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
+C: close{session_id, force}                   → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
+C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
@@ -212,14 +359,25 @@ C: bye | socket close = Detach (turn keeps running)
   `Error{"frame exceeds 64 MiB limit"}` + close. Tested: a > 1 MiB history attaches
   (`attach_to_session_with_history_over_1mib`), a 2 MiB `ping` is answered, a 64 MiB + 10 B frame is refused.
 - Query ids ≥ `RESERVED_QUERY_ID_BASE` (2^63) belong to the transport/daemon (`DIGEST_RESYNC_QUERY_ID`,
-  `IDLE_PROBE_QUERY_ID`); `SocketTransport` never surfaces them as `QueryResult`.
+  `IDLE_PROBE_QUERY_ID`, `CHECKPOINT_QUERY_ID`, `CLOSE_QUERY_ID`); `SocketTransport` never surfaces them
+  as `QueryResult`.
+- `close` was added without a protocol bump: a daemon older than it answers the unknown frame with
+  `Error{"malformed frame: unknown variant `close`…"}` and keeps the connection open, and
+  `synaps daemon close` reports "daemon … predates `daemon close`; run `synaps daemon reload`" (exit 2).
+  A bump would refuse every older TUI that reconnects after a reload. `closed` only answers `close`, so
+  older clients never see it. On an attached connection `close` is refused like `reload`/`purge`
+  (`Error{"control frames are not accepted on an attached connection"}`); that client has `/close`.
+- `pin` (`on` required) follows the same rule: an older daemon answers "unknown variant `pin`" and
+  `synaps daemon pin` exits 2; `pinned` only answers `pin`; refused on an attached connection (that
+  client has `/pin`). `SessionMeta.pinned` is `#[serde(default)]`: an older daemon omits it (→ false).
 - First frame not `Hello` / malformed → `Refused{Protocol}`; oversize frame → `Error` + close;
   `Cmd` before `Attach` → `Error`, connection stays open.
 - **Client command whitelist** (`conn.rs::client_may_send`): an attached client may send `Submit`,
   `Steer`, `Cancel`, `Answer`, `Set`, `Compact`, `NewSession`, `Save`, `Query`, `EngineCommand`, and
   `Detach` **for its own client id only**. `Detach{other}`, `Attach`, `Resync`, `End`, `HostEvent` →
-  `Error{"refused: …"}` and nothing reaches the actor. Sessions are ended by `synaps daemon stop`, not
-  by clients. This is a footgun guard on a same-uid 0600 socket, not an auth boundary
+  `Error{"refused: …"}` and nothing reaches the actor. A client ends its session with `/close` (an
+  engine command, owner-only), `synaps daemon close` ends one from a control connection, and
+  `synaps daemon stop` ends them all. This is a footgun guard on a same-uid 0600 socket, not an auth boundary
   (`client_commands_are_whitelisted`).
 - `Attach::Create` fills `cwd` from `Hello.cwd`; it must be absolute and exist.
 
@@ -243,8 +401,9 @@ C: bye | socket close = Detach (turn keeps running)
 - Daemon SIGTERM/SIGINT/`Shutdown` → `End{HostShutdown}` to every session **concurrently** under ONE
   `TEARDOWN_TIMEOUT` (SAVE + HOOKS) budget, then `ExtensionManager::shutdown_all`, then unlink files.
   Attached clients see `Ended` before `Bye`.
-- `--idle-exit SECS`: exit after SECS of **zero connections and no session running a turn** (default:
-  never). Sessions never end on their own (no `Parked` yet), so the monitor probes each client-less
+- `--idle-exit SECS`: exit after SECS of **zero connections, no pinned session and no session running a
+  turn** (default: never). A pin is read from the handle (`SessionHandle::pinned`), no probe; tested:
+  `a_pin_holds_the_daemons_idle_exit_and_unpinning_releases_it`. Sessions never end on their own (no `Parked` yet), so the monitor probes each client-less
   session with `Query{Status}` (reserved id `IDLE_PROBE_QUERY_ID`) and treats `streaming:true`, a pending
   prompt, or **no answer within 2 s** (actor inside `compact()`/preflight, queue full) as busy — the
   daemon never exits under a running turn and never aborts one. Idle client-less sessions are ended

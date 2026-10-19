@@ -219,7 +219,9 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::NewSession
         | SessionCommand::Resume { .. }
         | SessionCommand::EngineCommand { .. }
-        | SessionCommand::PluginCommand { .. } => Effect::Fingerprint,
+        | SessionCommand::PluginCommand { .. }
+        // Notes each lost worker in the history.
+        | SessionCommand::Restored { .. } => Effect::Fingerprint,
         SessionCommand::Set { setting, .. } => match setting {
             SessionSetting::Model { .. }
             | SessionSetting::ReasoningLevel { .. }

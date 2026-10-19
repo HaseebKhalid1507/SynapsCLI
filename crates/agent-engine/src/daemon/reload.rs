@@ -341,7 +341,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
             },
-            false,
+            // The pin is on the handle too, so it survives a reload whose
+            // checkpoint did not confirm.
+            handle.pinned(),
             handle.lifecycle(),
             Vec::new(),
             // Persisted independently of the checkpoint: an explicit
@@ -627,12 +629,12 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
 /// the `SessionLockError::Held` case, where an in-process runtime holds
 /// the journal lock. Instead of aliasing to an empty impostor, register a
 /// Parked placeholder under the SAME id.
-fn is_lock_held_error(e: &str) -> bool {
+pub(super) fn is_lock_held_error(e: &str) -> bool {
     e.contains("is live in another process")
 }
 
 /// Extract `"pid N (kind)"` from the lock-held error message.
-fn parse_holder_from_error(e: &str) -> String {
+pub(super) fn parse_holder_from_error(e: &str) -> String {
     // "session X is live in another process (pid N, kind) — …"
     if let Some(start) = e.find("(pid ") {
         let after = &e[start + 1..]; // "pid N, kind) — …"
@@ -681,6 +683,38 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
     }
 }
 
+/// What a recreated session gets back after `create` (reload's rehydrate,
+/// and the pinned-session restore in `pins.rs`): the non-persisted knobs
+/// (host-originated `Set`: no owner check), the pin, and the `/keepwarm`
+/// override. The journal carries the conversation, model and name.
+pub(super) async fn apply_record(
+    h: &SessionHandle,
+    settings_replay: &[SessionSetting],
+    keep_warm: bool,
+    cache_keepwarm: Option<&str>,
+) {
+    for (i, setting) in settings_replay.iter().enumerate() {
+        let _ = h
+            .send(SessionCommand::Set {
+                id: u64::MAX - i as u64,
+                setting: setting.clone(),
+            })
+            .await;
+    }
+    if keep_warm {
+        let _ = h.send(SessionCommand::KeepWarm { on: true }).await;
+    }
+    if let Some(mode) = cache_keepwarm {
+        let _ = h
+            .send(SessionCommand::EngineCommand {
+                id: u64::MAX,
+                name: "keepwarm".into(),
+                arg: mode.to_string(),
+            })
+            .await;
+    }
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // Before any session can dispatch: ids continue where the old image
     // stopped, so `sa_1` never names two different workers.
@@ -726,27 +760,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(s.id.clone(), new_id.clone());
                 }
-                // Non-persisted knobs (host-originated `Set`: no owner check).
-                for (i, setting) in s.settings_replay.iter().enumerate() {
-                    let _ = h
-                        .send(SessionCommand::Set {
-                            id: u64::MAX - i as u64,
-                            setting: setting.clone(),
-                        })
-                        .await;
-                }
-                if s.keep_warm {
-                    let _ = h.send(SessionCommand::KeepWarm { on: true }).await;
-                }
-                if let Some(mode) = &s.cache_keepwarm {
-                    let _ = h
-                        .send(SessionCommand::EngineCommand {
-                            id: u64::MAX,
-                            name: "keepwarm".into(),
-                            arg: mode.clone(),
-                        })
-                        .await;
-                }
+                apply_record(&h, &s.settings_replay, s.keep_warm, s.cache_keepwarm.as_deref()).await;
                 // Before any Park: re-register the stopped workers and wake
                 // their parent (it was waiting on completions the exec ate).
                 if !s.workers.is_empty() {
@@ -896,6 +910,19 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// Likewise the pin: an unconfirmed checkpoint must not unpin a
+    /// session (it would park, and stop holding the daemon's idle exit).
+    #[test]
+    fn the_pin_survives_an_unconfirmed_checkpoint() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("pin-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert!(!record(&handle, None).keep_warm);
+        ep.keep_warm.store(true, std::sync::atomic::Ordering::Release);
+        let r = record(&handle, None);
+        assert!(r.keep_warm && r.config.keep_warm);
     }
 
     /// A `memory_mode` this image does not know (written by a newer one)

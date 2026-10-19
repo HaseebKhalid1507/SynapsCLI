@@ -184,6 +184,16 @@ impl Client {
             "/abort" => {
                 let _ = self.t.send(SessionCommand::Cancel).await;
             }
+            // `/close` ends the session in the daemon (`/detach` and `/quit`
+            // leave it loaded); the session refuses while work is in flight
+            // unless `force`. The loop exits on the `Ended` that follows.
+            "/close" | "/close force" => {
+                let arg = line.strip_prefix("/close").unwrap_or("").trim().to_string();
+                let _ = self
+                    .t
+                    .send(SessionCommand::EngineCommand { id: 3, name: "close".into(), arg })
+                    .await;
+            }
             "/sessions" => {
                 let _ = self.t.send(SessionCommand::Query { id: 1, query: SessionQuery::Status }).await;
             }
@@ -193,7 +203,7 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /keep-warm on|off\n"),
+            "/help" => self.out("/detach /close [force] /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /pin on|off (alias /keep-warm on|off)\n"),
             // C1 (P9): arm a driver headlessly. Mirrors the TUI's `/auto` →
             // `DriverStart` routing (dispatch.rs) but without an in-process
             // ExtensionManager: the actor validates `session.drive` on
@@ -207,7 +217,7 @@ impl Client {
                     .send(SessionCommand::DriverStart { plugin, command, arg })
                     .await;
             }
-            "/keep-warm on" | "/keep-warm off" => {
+            "/pin on" | "/pin off" | "/keep-warm on" | "/keep-warm off" => {
                 let _ = self.t.send(SessionCommand::KeepWarm { on: line.ends_with("on") }).await;
             }
             _ if line.starts_with("/cmd ") => {

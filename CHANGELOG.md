@@ -19,8 +19,62 @@ All notable changes to this project will be documented in this file.
   naming the variable; move the secret to a plugin-specific variable. See
   [docs/extensions/secrets.md](docs/extensions/secrets.md).
 
+### Added
+
+- **`/close` ends a daemon session.** Over a socket `/quit` and Ctrl+C only
+  detach, so a finished session stayed loaded in the daemon, and every event
+  queued for it (`synaps send`, an extension's inbox event, a worker's wake)
+  woke it for another turn. `/close` (TUI and `synaps attach`) saves the
+  session and ends it: it leaves `synaps daemon sessions`, every attached
+  client exits, and the TUI prints how to continue it
+  (`synaps --attach --continue <id>`). It refuses while a turn or compaction
+  is running, a worker is running or an `/auto` run is armed, and says which;
+  `/close force` cancels those workers first and notes each in the
+  conversation. Owner-only. A parked session closes without being rebuilt.
+  See [docs/daemon-mode.md](docs/daemon-mode.md#closing-a-session-close).
+- **`synaps daemon close <ID|NAME> [--force] [--json]`** ends one daemon
+  session from any shell without attaching to it, the way `/close` does (the
+  same checks; `--force` is `/close force`); the other sessions keep running.
+  The target is an id, journal id, name or unique prefix; an ambiguous one is
+  listed, not guessed. A parked session is not rebuilt, and an attached TUI
+  exits with the usual "resume it with" line. Exit 0 closed, 3 refused, 1 not
+  found/ambiguous/no daemon, 2 the daemon is too old (`synaps daemon reload`).
+  An attached client now always receives `Ended` before its connection
+  closes when its session ends from elsewhere (another client's `/close`,
+  `daemon close`).
+- **Pin a daemon session: `/pin [on|off|status]` and
+  `synaps daemon pin <ID|NAME> [--off] [--json]`.** A pinned session stays
+  loaded (never parked, idle-ended or evicted), and the daemon no longer
+  idle-exits while any session is pinned; before, an auto-spawned daemon
+  with no clients exited after 10 s and ended pinned sessions with it.
+  `daemon sessions` marks pinned sessions (`"pinned"` in `--json`). Pinning a
+  parked session wakes it; unpinning one leaves it parked. `--keep-warm` and
+  `/keep-warm on|off` are the same pin; `/keepwarm` (prompt-cache pings) is
+  unrelated. See
+  [docs/daemon-mode.md](docs/daemon-mode.md#pinning-a-session-pin).
+- **Pinned sessions come back after the daemon restarts.** The daemon keeps
+  the pin set in `<config dir>/daemon-pins.json` and, on its next start
+  after `daemon stop`, SIGTERM, an idle exit or a crash, restores each
+  pinned session under the same id from its journal, with its model,
+  `/system` and other session settings, and pinned. Running workers, shells
+  and `/auto` runs are not restored; the conversation is told about lost
+  workers. `/close`, `daemon close`, `/pin off` and `/quit` in
+  `synaps attach` remove a session from the set. A restore that fails three
+  times (including the daemon dying during it) is dropped, and
+  `synaps daemon sessions` / `status` list it as `pin dropped: …`. A journal
+  held by another process gets a pinned placeholder; the daemon retries the
+  lock every 10 s and brings the session back once it is free. Opt out with `daemon.restore_pinned = off`,
+  `SYNAPS_DAEMON_RESTORE_PINNED=0`, or `synaps daemon start --no-restore`
+  for one start. `synaps retention sweep` keeps pinned sessions' journals.
+  `deploy/synaps-daemon.service` is a disabled systemd user unit that starts
+  the daemon at login. See
+  [docs/daemon-mode.md](docs/daemon-mode.md#pinned-sessions-across-restarts).
+
 ### Changed
 
+- The pin notice reads `pinned: this session stays loaded …` /
+  `unpinned: this session parks again when idle` (was `keep-warm on: …` /
+  `keep-warm off`).
 - **Interactive turns have no round, tool-call or tool-result-byte limit by
   default.** Foreground turns used to stop at a compiled cap (128 rounds /
   512 tool calls / 32 MiB of tool results) even while they were making

@@ -345,6 +345,11 @@ pub struct DaemonConfig {
     /// Seconds a PARKED session row lingers before eviction. `0` = keep
     /// forever. Env `SYNAPS_DAEMON_PARKED_EVICT_SECS` overrides. Default: 3600.
     pub parked_evict_secs: u64,
+    /// Bring pinned sessions back when the daemon starts after a stop or a
+    /// crash (`<config dir>/daemon-pins.json`). Env
+    /// `SYNAPS_DAEMON_RESTORE_PINNED=0` and `synaps daemon start
+    /// --no-restore` override. Default: true.
+    pub restore_pinned: bool,
 }
 
 impl Default for DaemonConfig {
@@ -353,6 +358,7 @@ impl Default for DaemonConfig {
             idle_exit_secs: 10,
             prompt_abandon_secs: 3600,
             parked_evict_secs: 3600,
+            restore_pinned: true,
         }
     }
 }
@@ -441,6 +447,13 @@ fn parse_daemon_config_key(
         "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
         "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
         "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        "daemon.restore_pinned" => {
+            config.restore_pinned = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
         _ => return Err("unknown daemon key"),
     }
     Ok(())
@@ -1316,6 +1329,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon.idle_exit_secs",
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
+    "daemon.restore_pinned",
     "max_tool_output",
     "bash_timeout",
     "bash_max_timeout",
@@ -2494,6 +2508,7 @@ mod tests {
         assert_eq!(c.daemon.idle_exit_secs, 10);
         assert_eq!(c.daemon.prompt_abandon_secs, 3600);
         assert_eq!(c.daemon.parked_evict_secs, 3600);
+        assert!(c.daemon.restore_pinned, "pinned sessions come back by default");
         // No warnings for the absent keys.
         assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
     }
@@ -2506,12 +2521,14 @@ mod tests {
             "daemon.idle_exit_secs = 20\n",
             "daemon.prompt_abandon_secs = 0\n",
             "daemon.parked_evict_secs = 120\n",
+            "daemon.restore_pinned = off\n",
         ));
         assert!(!c.startup.quick_start);
         assert_eq!(c.startup.extensions_ready_timeout_secs, 45);
         assert_eq!(c.daemon.idle_exit_secs, 20);
         assert_eq!(c.daemon.prompt_abandon_secs, 0);
         assert_eq!(c.daemon.parked_evict_secs, 120);
+        assert!(!c.daemon.restore_pinned);
         assert!(
             !c.warnings.iter().any(|w| w.contains("unknown")),
             "no unknown-key warning: {:?}",
@@ -2641,6 +2658,7 @@ mod tests {
             "daemon.idle_exit_secs",
             "daemon.prompt_abandon_secs",
             "daemon.parked_evict_secs",
+            "daemon.restore_pinned",
         ] {
             assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
         }

@@ -727,6 +727,7 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             Some(cfg::CacheTtl::FiveMinutes) | None => "5m".to_string(),
         },
         "cache_diagnostics" => bool_config_display(key, false),
+        "daemon.restore_pinned" => bool_config_display(key, true),
         "cache_keepwarm" => raw_config(key)
             .and_then(|v| cfg::CacheKeepWarm::parse(&v))
             .unwrap_or_default()
