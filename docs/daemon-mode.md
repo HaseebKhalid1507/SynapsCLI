@@ -370,6 +370,29 @@ old "local TUI only" world:
   client needs to branch on it. Exposing `driver_armed` would be a one-line
   addition if explicit client-side steer/submit branching is ever wanted.
 
+## Event delivery
+
+Two transports carry an external `Event` into a session; they differ in who
+receives it.
+
+- **Per-session socket (targeted).** `synaps send --session <id|name|prefix>`,
+  the only-session case of a bare `synaps send`, `--broadcast`, agent-comms
+  and watcher `notify_session` all write to the socket on the session's
+  registry card. It always reaches that session, and wakes it even when
+  parked (unpark, then an `EventAuto` turn as under Remote steering above).
+- **Shared inbox (untargeted).** `~/.synaps-cli/inbox/*.json`. A daemon
+  session takes inbox files only while a client owns its input (a `Mirror`
+  or `Takeover` attach; `Observe` never owns input, so a keep-warm observer
+  does not count). Detached and parked sessions leave the files on disk, and
+  a session rehydrated by a reload takes none until a client reattaches. Each
+  file is claimed by rename first, so exactly one session takes it. An
+  in-process session (no daemon) always takes inbox files.
+- **`synaps send` and the inbox.** A `--session` that matches nothing is an
+  error (exit 1, nothing written) that lists the running sessions; `--inbox`
+  opts in to leaving it in the shared inbox instead. With no flag and zero or
+  several sessions running, `synaps send` writes to the inbox and says so on
+  stderr. A failed socket write still falls back to the inbox.
+
 ## Reload (`synaps daemon reload`, phase 3 C3)
 
 Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control connection:

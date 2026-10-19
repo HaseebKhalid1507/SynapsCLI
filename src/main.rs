@@ -285,7 +285,7 @@ enum Command {
         #[arg(long = "profile", value_name = "PROFILE")]
         profile: Option<String>,
     },
-    /// Send an event to the inbox (picked up by running session)
+    /// Send an event to a running session (its socket), or to the shared inbox
     Send {
         /// Message text
         message: String,
@@ -297,12 +297,18 @@ enum Command {
         channel: Option<String>,
         #[arg(long = "content-type", default_value = "message")]
         content_type: String,
-        /// Target a specific session by ID, name, or prefix
+        /// Target a specific session by ID, name, or prefix. A miss is an
+        /// error (exit 1, nothing delivered) unless --inbox is given
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
         /// Send to all active sessions
         #[arg(long)]
         broadcast: bool,
+        /// With --session: when nothing matches, leave the event in the shared
+        /// inbox instead of failing. Only a session with an attached input
+        /// owner takes inbox files, exactly once
+        #[arg(long)]
+        inbox: bool,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -995,6 +1001,7 @@ async fn async_main() -> anyhow::Result<()> {
             content_type,
             session,
             broadcast,
+            inbox,
         }) => {
             cmd::send::run(
                 message,
@@ -1004,6 +1011,7 @@ async fn async_main() -> anyhow::Result<()> {
                 content_type,
                 session,
                 broadcast,
+                inbox,
             )
             .await?;
         }

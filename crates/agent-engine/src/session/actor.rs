@@ -683,14 +683,20 @@ impl SessionActor {
             runtime.set_model(m.clone());
         }
 
-        let background =
-            match crate::engine::setup::spawn_session_background(&runtime, &sb.session) {
-                Ok(background) => background,
-                Err(e) => {
-                    release_fresh_lock(session_lock, sb.continued);
-                    return Err(e);
-                }
-            };
+        // Shared-inbox files are for whoever is at a keyboard: the gate stays
+        // shut until a client owns input (`publish_presence`), so a detached,
+        // parked or freshly rehydrated session is never woken by them.
+        let background = match crate::engine::setup::spawn_session_background_gated(
+            &runtime,
+            &sb.session,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ) {
+            Ok(background) => background,
+            Err(e) => {
+                release_fresh_lock(session_lock, sb.continued);
+                return Err(e);
+            }
+        };
         crate::engine::setup::finish_session_setup(
             &mut runtime,
             &config,
@@ -1093,7 +1099,12 @@ impl SessionActor {
         }
     }
 
+    /// Also the one place the inbox gate follows `input_owner`: every owner
+    /// change (attach, detach, takeover) publishes presence. `Observe`
+    /// clients never own input, so a keep-warm observer keeps it shut.
     pub(crate) fn publish_presence(&self) {
+        self.background
+            .set_inbox_accepting(self.input_owner.is_some());
         self.presence.store(Arc::new(super::handle::Presence {
             clients: self.attached.len(),
             input_owner: self.input_owner,

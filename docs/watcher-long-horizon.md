@@ -25,7 +25,7 @@ nice = 10                     # 0..=19
 [hooks]
 # Completion notices are OFF by default.
 notify_session = "e331"       # deliver to exactly one running session; dropped if not running
-# notify_inbox = true         # legacy: shared inbox, taken by whichever session reads first
+# notify_inbox = true         # legacy: shared inbox, taken once by a session with an attached input owner
 ```
 
 ## Behaviour
@@ -43,7 +43,10 @@ notify_session = "e331"       # deliver to exactly one running session; dropped 
   delegated almost everywhere; `cpu` often is not).
 - **Notices never broadcast.** Headless watcher agents also never pick up
   `watcher-*.json` inbox files, so one agent can't steal another's
-  completion notice.
+  completion notice. A `notify_inbox` notice is taken by exactly one
+  session, and a daemon session takes it only while a client owns its
+  input: detached and parked sessions leave it on disk. Use
+  `notify_session` to reach a session nobody is attached to.
 
 ## Not a security boundary
 

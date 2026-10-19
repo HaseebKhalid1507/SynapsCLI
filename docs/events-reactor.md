@@ -3,6 +3,11 @@
 Central reference for how runtime events flow through the agent-runtime, from
 ingestion to model injection, across all operating modes.
 
+Ingestion: a session's own socket (`synaps send --session`, agent-comms) always
+reaches its queue; a shared-inbox file is claimed by rename, so exactly one
+session takes it, and a daemon session takes one only while a client owns its
+input (see `docs/daemon-mode.md`, "Event delivery").
+
 ---
 
 ## Canonical Event Format

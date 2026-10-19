@@ -21,6 +21,13 @@
 //!
 //! Because armed-state routing is the actor's job, `send` needs no armed-state
 //! discovery and stays transport-simple. See `tests/send_remote_steering.rs`.
+//!
+//! ## The shared inbox
+//! `~/.synaps-cli/inbox/` is untargeted mail: a daemon session takes a file
+//! only while a client owns its input, and exactly one session takes it. So
+//! a `--session` that matches nothing is an error, not a silent inbox drop
+//! (the event would sit there undelivered with exit 0); `--inbox` opts back
+//! in to the drop.
 
 use chrono::Utc;
 use synaps_cli::events::registry::{
@@ -32,6 +39,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     message: String,
     source: String,
@@ -40,6 +48,7 @@ pub async fn run(
     content_type: String,
     session: Option<String>,
     broadcast: bool,
+    inbox: bool,
 ) -> anyhow::Result<()> {
     let event = build_event(message, source, severity, channel, content_type);
     let json = serde_json::to_string(&event)?;
@@ -58,10 +67,12 @@ pub async fn run(
     if let Some(query) = session {
         match find_session_registration(&query) {
             Some(reg) => send_to_socket_or_inbox(&reg, &json, &event).await,
-            None => {
-                eprintln!("No session matching {:?} found — dropping to inbox.", query);
+            None if inbox => {
+                eprintln!("No session matching {:?} found — dropping to inbox (--inbox).", query);
                 write_inbox(&event)?;
+                eprintln!("{INBOX_NOTE}");
             }
+            None => anyhow::bail!("{}", no_match_message(&query, &list_active_sessions())),
         }
         return Ok(());
     }
@@ -80,10 +91,35 @@ pub async fn run(
                 );
             }
             write_inbox(&event)?;
+            eprintln!("{INBOX_NOTE}");
         }
     }
 
     Ok(())
+}
+
+/// Printed after every deliberate inbox drop: the file is not a delivery to
+/// any particular session.
+const INBOX_NOTE: &str = "Note: it went to the shared inbox; only a session with an attached \
+input owner takes it (exactly once). Use --session <id> to reach a detached session.";
+
+/// The error for a `--session` that matched nothing, naming what is running
+/// so a typo (or a short id suffix, which never matches) is easy to fix.
+fn no_match_message(query: &str, live: &[SessionRegistration]) -> String {
+    let mut msg = format!("no running session matches {query:?}; nothing was delivered.\n");
+    if live.is_empty() {
+        msg.push_str("No sessions are running.\n");
+    } else {
+        msg.push_str("Running sessions (match by full id, name, or id prefix):\n");
+        for reg in live {
+            match reg.name.as_deref() {
+                Some(name) => msg.push_str(&format!("  {}  ({name})\n", reg.session_id)),
+                None => msg.push_str(&format!("  {}\n", reg.session_id)),
+            }
+        }
+    }
+    msg.push_str("Add --inbox to leave it in the shared inbox instead.");
+    msg
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -202,4 +238,38 @@ fn write_inbox(event: &Event) -> anyhow::Result<()> {
     std::fs::rename(&tmp_path, &path)?;
     eprintln!("Event written to inbox: {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reg(id: &str, name: Option<&str>) -> SessionRegistration {
+        SessionRegistration {
+            kind: "session".into(),
+            session_id: id.into(),
+            name: name.map(str::to_string),
+            socket_path: format!("/tmp/{id}.sock"),
+            pid: 1,
+            started_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_session_miss_names_the_running_sessions_and_the_inbox_opt_in() {
+        let msg = no_match_message(
+            "49f6",
+            &[reg("20261014-042151-49f6", Some("ion")), reg("20261014-183459-3f61", None)],
+        );
+        assert!(msg.contains("\"49f6\""), "{msg}");
+        assert!(msg.contains("20261014-042151-49f6  (ion)"), "{msg}");
+        assert!(msg.contains("20261014-183459-3f61"), "{msg}");
+        assert!(msg.contains("--inbox"), "{msg}");
+    }
+
+    #[test]
+    fn a_session_miss_with_nothing_running_says_so() {
+        let msg = no_match_message("x", &[]);
+        assert!(msg.contains("No sessions are running."), "{msg}");
+    }
 }
