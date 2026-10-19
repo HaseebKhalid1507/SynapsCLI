@@ -186,7 +186,8 @@ impl<'a> ToolCallHookContext<'a> {
     ) -> Self {
         Self {
             session_id,
-            tool_call_id,
+            // An empty provider id identifies nothing.
+            tool_call_id: tool_call_id.filter(|id| !id.is_empty()),
             cwd: effective_tool_cwd(session_cwd),
         }
     }
@@ -201,9 +202,14 @@ impl<'a> ToolCallHookContext<'a> {
 /// `None` when the process cwd is needed but unavailable, or when the
 /// result is not valid UTF-8 (it travels as a JSON string).
 pub fn effective_tool_cwd(session_cwd: Option<&std::path::Path>) -> Option<String> {
-    // RED STUB: not resolved yet.
-    let _ = session_cwd;
-    None
+    let base = match session_cwd {
+        Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+        // `join("")` would add a trailing separator; an empty base anchors
+        // nothing, so the process cwd is the base as it is.
+        Some(dir) if !dir.as_os_str().is_empty() => std::env::current_dir().ok()?.join(dir),
+        _ => std::env::current_dir().ok()?,
+    };
+    base.into_os_string().into_string().ok()
 }
 
 /// A hook event payload dispatched to extension handlers.
@@ -288,8 +294,10 @@ impl HookEvent {
     /// Attach a tool call's context (builder): the owning conversation id,
     /// as [`HookEvent::with_session`], plus the call id and resolved cwd.
     pub fn with_tool_call(self, ctx: &ToolCallHookContext<'_>) -> Self {
-        // RED STUB: the call id and cwd are not attached yet.
-        self.with_session(ctx.session_id)
+        let mut event = self.with_session(ctx.session_id);
+        event.tool_call_id = ctx.tool_call_id.map(str::to_string);
+        event.cwd = ctx.cwd.clone();
+        event
     }
 
     /// Construct a `before_tool_call` event.
