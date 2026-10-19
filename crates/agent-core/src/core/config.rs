@@ -1313,10 +1313,15 @@ impl Default for SynapsConfig {
 /// `.slice`, only `[A-Za-z0-9:_.-]` (so no `/`), not starting with `-` and
 /// not the root slice `-.slice`; as in systemd's own check, the part before
 /// `.slice` is not empty, has no `--` and doesn't end in `-` (a `-` separates
-/// the parent slices: `worker-agent.slice` nests under `worker.slice`).
+/// the parent slices: `worker-agent.slice` nests under `worker.slice`). The
+/// config file is not TOML, so a quoted value keeps its quotes and gets its
+/// own hint.
 pub fn scope_slice_problem(name: &str) -> Option<&'static str> {
     if name.len() > 255 {
         return Some("longer than 255 bytes");
+    }
+    if name.starts_with(['"', '\'']) || name.ends_with(['"', '\'']) {
+        return Some("write the name without quotes (the config file is not TOML)");
     }
     if !name.ends_with(".slice") {
         return Some("expected a slice unit name ending in .slice");
@@ -2731,6 +2736,8 @@ mod tests {
     #[test]
     fn an_invalid_scope_slice_warns_and_keeps_the_default() {
         let too_long = format!("{}.slice", "a".repeat(256 - ".slice".len()));
+        // Every invalid value the function or the parser lets through.
+        let mut accepted: Vec<String> = Vec::new();
         for bad in [
             "worker",            // no .slice suffix
             "worker.service",    // another unit type
@@ -2744,13 +2751,33 @@ mod tests {
             "worker--agent.slice",
             "worker-.slice",
             too_long.as_str(),   // 256 bytes
+            "",                  // empty
+            "wörker.slice",      // non-ASCII
+            "worker\0.slice",    // NUL
+            "\"worker-agent.slice\"", // quoted: the file is not TOML
+            "'worker-agent.slice'",
+            "5",                 // other types: a number, a boolean
+            "true",
         ] {
-            assert!(super::scope_slice_problem(bad).is_some(), "{bad:?} accepted");
+            if super::scope_slice_problem(bad).is_none() {
+                accepted.push(bad.to_string());
+            }
             for key in ["tool_scope_slice", "daemon_scope_slice"] {
                 let c = super::load_config_from_str(&format!("{key} = {bad}\n"));
-                assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (None, None), "{key} = {bad}");
-                assert!(c.warnings.iter().any(|w| w.starts_with(&format!("{key} = "))), "{key} = {bad}: {:?}", c.warnings);
+                let unset = (c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()) == (None, None);
+                if !unset || !c.warnings.iter().any(|w| w.starts_with(&format!("{key} = "))) {
+                    accepted.push(format!("{key} = {bad}"));
+                }
             }
+        }
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn a_quoted_scope_slice_says_to_drop_the_quotes() {
+        for quoted in ["\"worker-agent.slice\"", "'worker-agent.slice'", "\"worker-agent.slice", "worker-agent.slice'"] {
+            let why = super::scope_slice_problem(quoted);
+            assert!(why.is_some_and(|w| w.contains("without quotes")), "{quoted}: {why:?}");
         }
     }
 
