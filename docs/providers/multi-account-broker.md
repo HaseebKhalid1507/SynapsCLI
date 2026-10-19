@@ -104,7 +104,7 @@ The default strategy is **soonest reset**, with these priority tiers:
 
 Tier 2 is a **heuristic**, not verification: usage ≤0.5% and reset within five minutes of `observation + window duration`. A freshly started window can look similar. It gives real work a chance to start an idle clock; it does not prove every natural Codex rollover needs activation. The chooser sends no activation probes.
 
-Selection is sticky by default: keep a healthy seat within the same tier to reduce churn, unless another seat reaches a higher-priority tier (or has an earlier urgent deadline). Hitting any applicable window limit, including Claude's five-hour limit, disqualifies it. Cooldowns follow the provider seat, not its alias; duplicate aliases cannot bypass them. A new login into a label does not inherit the previous seat's cooldown.
+Selection is sticky by default: keep a healthy seat within the same tier to reduce churn, unless another seat reaches a higher-priority tier (or has an earlier urgent deadline). Hitting any applicable window limit, including Claude's five-hour limit, disqualifies it. Cooldowns follow the provider seat, not its alias; duplicate aliases cannot bypass them. A new login into a label does not inherit the previous seat's cooldown. An account whose cooldown is active is not read while it lasts (no usage request, no token refresh): a selection that finds no account reports it as cooling down, and it is read again once the cooldown ends or `synaps auth state --clear` drops it.
 
 ```ini
 # Defaults; apply only to providers selected as auto:

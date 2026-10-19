@@ -2815,7 +2815,8 @@ impl LocalBroker {
             .map(|(plan, ..)| plan)
     }
 
-    /// Read every account's capacity and rank them. `exclude` lists the
+    /// Read every account's capacity and rank them; an account whose
+    /// cooldown is active is not read. `exclude` lists the
     /// accounts the request already used. An account in `failed` failed
     /// earlier in this selection: it counts as failed with that kind and is
     /// not read again; a read that fails now (other than a held transient
@@ -2851,7 +2852,23 @@ impl LocalBroker {
                 candidates.push(AccountCapacity::failed(cred, failure.clone()));
                 continue;
             }
-            let read = self.capacity_for(&cred).await;
+            // An account whose cooldown is active can't be chosen, so its
+            // usage is not read (no usage request, no token refresh). It
+            // keeps its stored seat, for stickiness and the duplicate-seat
+            // check; the policy rejects it as cooling down.
+            let read = if self
+                .cooldown_until(&cred.storage_key(), crate::epoch_millis())
+                .is_some()
+            {
+                CandidateRead {
+                    capacity: AccountCapacity::unobserved(cred.clone()),
+                    seat: self.stored_seat(&cred).ok(),
+                    transient: None,
+                    grace: None,
+                }
+            } else {
+                self.capacity_for(&cred).await
+            };
             let (mut capacity, seat) = (read.capacity, read.seat);
             match (read.transient, &capacity.failure) {
                 (Some(held), _) => {

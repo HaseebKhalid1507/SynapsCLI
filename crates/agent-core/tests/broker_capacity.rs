@@ -326,7 +326,7 @@ async fn usage_read_failures_keep_their_kind_status_and_retry_after() {
 /// credential_rejected (every account not cooling down needs a login) >
 /// action_required (every such account needs a login or an action outside
 /// synaps, at least one an action) > all_cooling_down (cooling down or at a
-/// limit) > quota_unknown. A cooling account keeps its own read failure.
+/// limit) > quota_unknown. A cooling account is not read: it is cooling down.
 #[tokio::test]
 #[serial_test::serial]
 async fn selection_failure_kind_follows_the_priority_rules() {
@@ -371,7 +371,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     assert!(err.to_string().contains("usage_unauthorized"), "{err}");
 
     // A cooling account doesn't count against "every account needs a login",
-    // and its own refused read stays visible next to the cooldown.
+    // and it is not read (S3): it is cooling down, nothing else.
     broker
         .report_cooldown(&anthropic("b"), Some(FAR_FUTURE), "test limit")
         .await
@@ -384,7 +384,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     let warn = selection_warn(&capture.take());
     assert!(warn.contains("kind=credential_rejected"), "{warn}");
     assert!(
-        warn.contains("accounts=a:usage_unauthorized:401,b:usage_unauthorized:403:cooling"),
+        warn.contains("accounts=a:usage_unauthorized:401,b:cooling_down"),
         "{warn}"
     );
 
@@ -403,10 +403,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
         .unwrap_err();
     let warn = selection_warn(&capture.take());
     assert!(warn.contains("kind=all_cooling_down"), "{warn}");
-    assert!(
-        warn.contains("accounts=a:exhausted,b:usage_unauthorized:403:cooling"),
-        "{warn}"
-    );
+    assert!(warn.contains("accounts=a:exhausted,b:cooling_down"), "{warn}");
 
     // Reads succeeded but proved nothing. A new broker (with `b` cooled
     // again): the step above left a good snapshot of `a` that is still
@@ -428,7 +425,7 @@ async fn selection_failure_kind_follows_the_priority_rules() {
     let warn = selection_warn(&capture.take());
     assert!(warn.contains("kind=quota_unknown"), "{warn}");
     assert!(
-        warn.contains("accounts=a:window_unknown,b:usage_unauthorized:403:cooling"),
+        warn.contains("accounts=a:window_unknown,b:cooling_down"),
         "{warn}"
     );
 
@@ -460,26 +457,24 @@ async fn plan_preview_logs_no_selection_failure() {
     assert!(!log.contains("auth_selection_failed"), "{log}");
 }
 
-/// r2 blocker 1: a cooldown does not erase what the account's last read or
-/// refresh said. Every account cooling, one with a refused usage read
-/// (401), one rate-limited (429, Retry-After 90) and one whose expired token
-/// the (loopback) token endpoint refused (400 invalid_grant): the kind stays
-/// all_cooling_down, each account keeps its own kind and status beside its
-/// cooldown, and the earliest time is the earliest cooldown end.
+/// S3 (a), replacing r2 blocker 1's test: an account whose cooldown is
+/// active is not read. Every account cooling, one whose usage read would be
+/// refused (401), one rate-limited (429) and one whose expired token the
+/// (loopback) token endpoint would refuse: no usage request and no token
+/// request at all; the kind is all_cooling_down, each account is cooling
+/// down with its own time, and the earliest time is the earliest cooldown
+/// end. `auth state` shows no read or refresh for any of them.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_cooldown_keeps_each_accounts_read_or_refresh_failure_beside_it() {
+async fn every_account_cooling_down_is_reported_without_a_read_or_refresh() {
     let _home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE), ("c", EXPIRED)]);
     let script: Script = Arc::default();
     script.lock().unwrap().insert("a", Reply::Status(401));
     script.lock().unwrap().insert("b", Reply::RateLimited(90));
-    let (token_url, token_hits) = spawn_token(
-        400,
-        r#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#,
-    )
-    .await;
-    let broker =
-        auto_broker(&spawn_usage(script).await).with_anthropic_token_url_for_tests(token_url);
+    script.lock().unwrap().insert("c", roomy());
+    let (usage_url, usage_hits) = spawn_counted_usage(script).await;
+    let (token_url, token_hits) = spawn_token(400, INVALID_GRANT).await;
+    let broker = auto_broker(&usage_url).with_anthropic_token_url_for_tests(token_url);
     let now = agent_core::epoch_millis();
     let (until_a, until_b, until_c) = (now + 3 * 3_600_000, now + 3_600_000, now + 2 * 3_600_000);
     for (label, until) in [("a", until_a), ("b", until_b), ("c", until_c)] {
@@ -497,10 +492,8 @@ async fn a_cooldown_keeps_each_accounts_read_or_refresh_failure_beside_it() {
             .await
             .unwrap_err()
     };
-    assert!(
-        token_hits.load(Ordering::SeqCst) >= 1,
-        "c's refresh was tried"
-    );
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 0, "no usage request");
+    assert_eq!(token_hits.load(Ordering::SeqCst), 0, "no token request");
     let BrokerError::NoAccountAvailable {
         failure: Some(failure),
         ..
@@ -513,12 +506,9 @@ async fn a_cooldown_keeps_each_accounts_read_or_refresh_failure_beside_it() {
         json!({
             "kind": "all_cooling_down",
             "accounts": [
-                {"account": "a", "kind": "usage_unauthorized", "http_status": 401,
-                 "until_ms": until_a, "cooling_down": true},
-                {"account": "b", "kind": "usage_rate_limited", "http_status": 429,
-                 "retry_after_s": 90, "until_ms": until_b, "cooling_down": true},
-                {"account": "c", "kind": "refresh_rejected", "http_status": 400,
-                 "until_ms": until_c, "cooling_down": true},
+                {"account": "a", "kind": "cooling_down", "until_ms": until_a, "cooling_down": true},
+                {"account": "b", "kind": "cooling_down", "until_ms": until_b, "cooling_down": true},
+                {"account": "c", "kind": "cooling_down", "until_ms": until_c, "cooling_down": true},
             ],
             "earliest_reset_ms": until_b,
         })
@@ -528,31 +518,70 @@ async fn a_cooldown_keeps_each_accounts_read_or_refresh_failure_beside_it() {
     let warn = selection_warn(&log);
     assert!(warn.contains("kind=all_cooling_down"), "{warn}");
     assert!(
-        warn.contains(
-            "accounts=a:usage_unauthorized:401:cooling,b:usage_rate_limited:429:cooling,\
-             c:refresh_rejected:400:cooling"
-        ),
+        warn.contains("accounts=a:cooling_down,b:cooling_down,c:cooling_down"),
         "{warn}"
     );
     assert_secret_free(&log);
 
-    // The report shows c's refused exchange with the endpoint's status,
-    // without another exchange.
-    let hits = token_hits.load(Ordering::SeqCst);
-    let report = serde_json::to_value(broker.auth_state(&anthropic_query()).unwrap()).unwrap();
-    let c = report["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["label"] == "c")
-        .unwrap()
-        .clone();
-    assert_eq!(
-        c["last_refresh"]["failure"],
-        json!({"kind": "refresh_rejected", "http_status": 400}),
-        "{c}"
+    for label in ["a", "b", "c"] {
+        let account = account_state(&broker, label);
+        assert!(account.get("last_usage").is_none(), "{account}");
+        assert!(account.get("last_refresh").is_none(), "{account}");
+        assert!(account["cooldown"].is_object(), "{account}");
+    }
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+}
+
+/// S3 (a): with a cooling and b roomy, selections and the preview read only
+/// b's usage and b serves. After `auth state --clear` of a (its cooldown
+/// gone), a is read again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_cooling_account_is_not_read_until_its_cooldown_is_gone() {
+    let _home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let (usage_url, usage_hits) = spawn_counted_usage(script).await;
+    let broker = auto_broker(&usage_url);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_cooldown(&anthropic("a"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 1, "only b is read");
+    let err = lookup_without_b(&broker)
+        .await
+        .expect_err("a is cooling down");
+    assert!(
+        matches!(err, BrokerError::NoAccountAvailable { .. }),
+        "{err:?}"
     );
-    assert_eq!(token_hits.load(Ordering::SeqCst), hits);
+    let plan = broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
+    assert_eq!(plan.rows[0].credential, anthropic("b"), "{plan:?}");
+    assert_eq!(
+        usage_hits.load(Ordering::SeqCst),
+        1,
+        "a is never read while cooling (b's reading is cached)"
+    );
+    assert!(account_state(&broker, "a").get("last_usage").is_none());
+
+    broker
+        .auth_state(&AuthStateQuery {
+            account: Some("a".into()),
+            clear: true,
+            ..anthropic_query()
+        })
+        .unwrap();
+    assert_eq!(
+        lookup_without_b(&broker).await.expect("a serves again"),
+        anthropic("a")
+    );
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 2, "a is read again");
 }
 
 /// r2 blocker 2 / item 5: automatic selection on an unreadable store fails
@@ -762,11 +791,13 @@ fn snapshot_dir(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
     files
 }
 
-/// After a cooldown report and a selection that read `a`'s usage (429) and
-/// `b`'s (ok), the report shows the cooldown with its reason, each read's
-/// kind, HTTP status and time, and the failed selection. Building it makes
-/// no usage request, and neither its JSON nor its text carries token
-/// material, the email, the account id or its prefix, or a seat identity.
+/// A selection reads `a`'s usage (429) and `b`'s (ok) and b serves; then b
+/// is reported cooling down and a second selection fails (a's 429 is held,
+/// b is not read while cooling). The report shows the cooldown with its
+/// reason, each read's kind, HTTP status and time, and the failed
+/// selection. Building it makes no usage request, and neither its JSON nor
+/// its text carries token material, the email, the account id or its
+/// prefix, or a seat identity.
 #[tokio::test]
 #[serial_test::serial]
 async fn auth_state_reports_memory_without_requests_or_secrets() {
@@ -781,6 +812,11 @@ async fn auth_state_reports_memory_without_requests_or_secrets() {
     );
     let (usage_url, hits) = spawn_counted_usage(script).await;
     let broker = auto_broker(&usage_url);
+    let served = broker
+        .access_token_pinned(OAuthProviderId::Anthropic)
+        .await
+        .expect("b has capacity");
+    assert_eq!(served.credential, anthropic("b"));
     let until = agent_core::epoch_millis() + 3_600_000;
     broker
         .report_cooldown(&anthropic("b"), Some(until), "anthropic_quota_exhausted")
@@ -791,7 +827,7 @@ async fn auth_state_reports_memory_without_requests_or_secrets() {
         .await
         .unwrap_err();
     let reads = hits.load(Ordering::SeqCst);
-    assert_eq!(reads, 2, "one usage read per account");
+    assert_eq!(reads, 2, "one usage read per account, none while held or cooling");
 
     let report = broker.auth_state(&anthropic_query()).unwrap();
     assert_eq!(
