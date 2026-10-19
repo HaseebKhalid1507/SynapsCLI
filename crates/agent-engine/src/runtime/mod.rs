@@ -72,8 +72,30 @@ pub async fn emit_before_tool_call(
     input: Value,
     session_id: Option<&str>,
 ) -> crate::extensions::hooks::events::HookResult {
+    emit_before_tool_call_with(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        &crate::extensions::hooks::events::ToolCallHookContext {
+            session_id,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// [`emit_before_tool_call`] with the call's context: the owning
+/// conversation, the provider's tool call id and the resolved cwd.
+pub async fn emit_before_tool_call_with(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> crate::extensions::hooks::events::HookResult {
     let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
-        .with_session(session_id);
+        .with_tool_call(call);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -377,6 +399,32 @@ pub async fn emit_after_tool_call(
     max_tool_output: usize,
     session_id: Option<&str>,
 ) -> String {
+    emit_after_tool_call_with(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        output,
+        max_tool_output,
+        &crate::extensions::hooks::events::ToolCallHookContext {
+            session_id,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// [`emit_after_tool_call`] with the call's context: the owning
+/// conversation, the provider's tool call id and the resolved cwd.
+pub async fn emit_after_tool_call_with(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+    max_tool_output: usize,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> String {
     emit_after_tool_call_outcome(
         hook_bus,
         tool_name,
@@ -384,7 +432,7 @@ pub async fn emit_after_tool_call(
         input,
         output,
         max_tool_output,
-        session_id,
+        call,
     )
     .await
     .output
@@ -404,14 +452,14 @@ pub(super) async fn emit_after_tool_call_outcome(
     input: Value,
     output: String,
     max_tool_output: usize,
-    session_id: Option<&str>,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
 ) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
     let mut event =
         crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output)
-            .with_session(session_id);
+            .with_tool_call(call);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -4237,14 +4285,20 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
+                                let hook_call =
+                                    crate::extensions::hooks::events::ToolCallHookContext::for_tool_call(
+                                        self.session_id.as_deref(),
+                                        Some(tool_id),
+                                        self.cwd.as_deref(),
+                                    );
                                 let decision = resolve_before_tool_call_decision(
                                     input.clone(),
-                                    emit_before_tool_call(
+                                    emit_before_tool_call_with(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
-                                        self.session_id.as_deref(),
+                                        &hook_call,
                                     )
                                     .await,
                                     None,
@@ -4264,14 +4318,14 @@ impl Runtime {
                                         Ok(output) => validated_single_tool_output(&self.model, output),
                                         Err(e) => (e.to_string(), None),
                                     };
-                                    let hooked_output = emit_after_tool_call(
+                                    let hooked_output = emit_after_tool_call_with(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
                                         output.clone(),
                                         self.max_tool_output,
-                                        self.session_id.as_deref(),
+                                        &hook_call,
                                     )
                                     .await;
                                     let rich_blocks = retain_single_tool_blocks(rich_blocks, &output, &hooked_output);
@@ -4342,17 +4396,23 @@ impl Runtime {
                             let runtime_name_for_hook = runtime_name.clone();
 
                             join_set.spawn(async move {
+                                let hook_call =
+                                    crate::extensions::hooks::events::ToolCallHookContext::for_tool_call(
+                                        session_id_inner.as_deref(),
+                                        Some(tool_id.as_str()),
+                                        cwd_inner.as_deref(),
+                                    );
                                 let result = match tool {
                                     Some(t) => {
                                         let decision =
                                             crate::runtime::resolve_before_tool_call_decision(
                                                 input.clone(),
-                                                crate::runtime::emit_before_tool_call(
+                                                crate::runtime::emit_before_tool_call_with(
                                                     &hook_bus_inner,
                                                     &tool_name_for_hook,
                                                     Some(&runtime_name_for_hook),
                                                     input.clone(),
-                                                    session_id_inner.as_deref(),
+                                                    &hook_call,
                                                 )
                                                 .await,
                                                 None,
@@ -4418,14 +4478,14 @@ impl Runtime {
                                                     Err(e) => (e.to_string(), None),
                                                 };
                                             let hooked_output =
-                                                crate::runtime::emit_after_tool_call(
+                                                crate::runtime::emit_after_tool_call_with(
                                                     &hook_bus_inner,
                                                     &tool_name_for_hook,
                                                     Some(&runtime_name_for_hook),
                                                     input_for_hook,
                                                     output.clone(),
                                                     cfg_max_tool_output,
-                                                    session_id_inner.as_deref(),
+                                                    &hook_call,
                                                 )
                                                 .await;
                                             let rich_blocks = retain_single_tool_blocks(

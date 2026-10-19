@@ -2,10 +2,10 @@ use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use super::{
-    emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
+    emit_after_tool_call_outcome, emit_before_tool_call_with, resolve_before_tool_call_decision,
     BeforeToolCallDecision,
 };
-use crate::extensions::hooks::events::{HookEvent, HookResult};
+use crate::extensions::hooks::events::{HookEvent, HookResult, ToolCallHookContext};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -1894,14 +1894,19 @@ impl StreamMethods {
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = authorized.runtime_name().to_string();
+                                let hook_call = ToolCallHookContext::for_tool_call(
+                                    session_id.as_deref(),
+                                    Some(tool_id.as_str()),
+                                    cwd.as_deref(),
+                                );
                                 let decision = resolve_before_tool_call_decision(
                                     input.clone(),
-                                    emit_before_tool_call(
+                                    emit_before_tool_call_with(
                                         &hook_bus,
                                         &tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
-                                        session_id.as_deref(),
+                                        &hook_call,
                                     )
                                     .await,
                                     secret_prompt.as_ref(),
@@ -1940,7 +1945,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
-                                                session_id.as_deref(),
+                                                &hook_call,
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
@@ -2272,14 +2277,19 @@ impl StreamMethods {
                                     let tool_call_started = std::time::Instant::now();
                                     let runtime_name_for_hook =
                                         authorized.runtime_name().to_string();
+                                    let hook_call = ToolCallHookContext::for_tool_call(
+                                        session_id_inner.as_deref(),
+                                        Some(tool_id.as_str()),
+                                        cwd_inner.as_deref(),
+                                    );
                                     let decision = resolve_before_tool_call_decision(
                                         input.clone(),
-                                        emit_before_tool_call(
+                                        emit_before_tool_call_with(
                                             &hook_bus_inner,
                                             &tool_name_for_hook,
                                             Some(&runtime_name_for_hook),
                                             input.clone(),
-                                            session_id_inner.as_deref(),
+                                            &hook_call,
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
@@ -2331,7 +2341,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
-                                                session_id_inner.as_deref(),
+                                                &hook_call,
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
@@ -3540,7 +3550,7 @@ mod rich_output_tests {
                     json!({}),
                     summary.clone(),
                     10,
-                    None,
+                    &ToolCallHookContext::default(),
                 )
                 .await;
                 assert_eq!(outcome.replaced, hook == Some(true));
@@ -3801,6 +3811,7 @@ mod rich_output_tests {
             std::time::Duration::from_secs(20),
             None,
             Some(continuation),
+            None,
         )
         .await
     }
@@ -3819,6 +3830,7 @@ mod rich_output_tests {
             tool_uses,
             hook_bus,
             std::time::Duration::from_secs(20),
+            None,
             None,
             None,
         )
@@ -3847,6 +3859,7 @@ mod rich_output_tests {
             deadline,
             None,
             None,
+            None,
         )
         .await;
         eprintln!(
@@ -3858,7 +3871,8 @@ mod rich_output_tests {
 
     /// `conversation_id` is the owning conversation id the stream runs
     /// under (`StreamSession.session_id`); `None` = worker/no conversation,
-    /// the harness default.
+    /// the harness default. `session_cwd` is `StreamSession.cwd` (`None`,
+    /// the harness default, = the process cwd).
     #[allow(clippy::too_many_arguments)]
     async fn drive_with_model_and_options(
         model: &str,
@@ -3869,6 +3883,7 @@ mod rich_output_tests {
         deadline: std::time::Duration,
         conversation_id: Option<&str>,
         continuation: Option<crate::runtime::continuation::SharedContinuation>,
+        session_cwd: Option<PathBuf>,
     ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
@@ -3899,6 +3914,7 @@ mod rich_output_tests {
             model,
         );
         session.session_id = conversation_id.map(str::to_string);
+        session.cwd = session_cwd;
         if let Some(continuation) = continuation {
             session.continuation = continuation;
         }
@@ -4710,6 +4726,7 @@ mod rich_output_tests {
                 std::time::Duration::from_secs(20),
                 conversation,
                 None,
+                None,
             )
             .await;
             let seen = seen.lock().unwrap().clone();
@@ -4719,6 +4736,97 @@ mod rich_output_tests {
                 "{} tool use(s) under {conversation:?}",
                 uses.len()
             );
+        }
+    }
+
+    /// Records every hook event it sees; answers Continue.
+    struct RecordingHook(Arc<std::sync::Mutex<Vec<HookEvent>>>);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for RecordingHook {
+        fn id(&self) -> &str {
+            "recording-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.clone());
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn recording_hook_bus(
+        events: Arc<std::sync::Mutex<Vec<HookEvent>>>,
+    ) -> Arc<crate::extensions::hooks::HookBus> {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> =
+            Arc::new(RecordingHook(events));
+        for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+            bus.subscribe(kind, handler.clone(), None, None, perms.clone())
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    /// Both tool hooks carry the provider's tool call id and the cwd a
+    /// relative tool path resolves against (the session cwd, else the
+    /// process cwd), on the single and the parallel lane.
+    #[tokio::test]
+    async fn tool_hooks_carry_the_call_id_and_the_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_cwd = dir.path().to_path_buf();
+        let process_cwd = std::env::current_dir().unwrap();
+        let single = &[("toolu_a", "session_probe")][..];
+        let parallel = &[("toolu_a", "session_probe"), ("toolu_b", "session_probe")][..];
+        for (cwd, expected, uses) in [
+            (Some(session_cwd.clone()), session_cwd.clone(), single),
+            (Some(session_cwd.clone()), session_cwd.clone(), parallel),
+            (None, process_cwd.clone(), single),
+            (None, process_cwd.clone(), parallel),
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_with_model_and_options(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                ))))],
+                uses,
+                recording_hook_bus(events.clone()).await,
+                std::time::Duration::from_secs(20),
+                Some("conv-1"),
+                None,
+                cwd.clone(),
+            )
+            .await;
+            let events = events.lock().unwrap().clone();
+            let expected = expected.to_str().unwrap().to_string();
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                let mut seen: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.kind == kind)
+                    .map(|e| (e.tool_call_id.clone(), e.cwd.clone(), e.session_id.clone()))
+                    .collect();
+                seen.sort();
+                let want: Vec<_> = uses
+                    .iter()
+                    .map(|(id, _)| {
+                        (
+                            Some(id.to_string()),
+                            Some(expected.clone()),
+                            Some("conv-1".to_string()),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    seen,
+                    want,
+                    "{kind:?}, {} tool use(s), session cwd {cwd:?}",
+                    uses.len()
+                );
+            }
         }
     }
 
