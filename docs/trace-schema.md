@@ -171,12 +171,18 @@ the preceding failed attempt was already recorded.
   the Anthropic Messages path (the only wire that carries cache markers);
   other transports leave the diagnostic fields absent.
   With `cache_diagnostics = true` the `cache` object may also carry
-  `server_diagnosis`: Anthropic's own verdict for the request, `reason`
+  `server_diagnosis`: Anthropic's verdict on how this request diverges
+  from the previous request in the chain (not what the cache did — a
+  reason can appear on a full cache hit, so read it alongside
+  `outcome.usage.cache_read_tokens`), `reason`
   (`model_changed`/`system_changed`/`tools_changed`/`messages_changed`/
   `previous_message_not_found`/`unavailable`, `pending` while the server's
   comparison was still running, `other` for an unknown type) and, for the
   `*_changed` reasons, `missed_input_tokens`. Absent when the setting is off
-  or the server found no divergence.
+  or the server found no divergence. An unknown or nonexistent previous id
+  is not an error: the request returns 200 with
+  `previous_message_not_found`. Readers map reason values they do not know
+  to `other`.
 - **`/context`:** metadata-only report (system/tool/history counts+bytes,
   latest cache component change and reuse estimates, writer/degradation
   counters). Skills/memories and — outside history-owning surfaces —
