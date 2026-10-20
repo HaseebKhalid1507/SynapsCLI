@@ -646,6 +646,9 @@ impl Runtime {
                 sent: Arc::clone(&tap.sent),
                 connect_failed: Arc::clone(&tap.connect_failed),
             }),
+            // Header only (cache-key parity with the turns this ping keeps
+            // warm); a ping never sends `diagnostics` nor moves the chain.
+            cache_diagnosis: self.cache_diagnosis(),
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1483,6 +1486,65 @@ mod tests {
         assert_eq!(tap.usage(), report.usage);
         assert!(tap.was_sent());
         assert_eq!(mock.bodies.lock().unwrap().len(), 1, "no transport retry");
+    }
+
+    /// `cache_diagnostics = true`: a ping keeps the turn's beta set (cache-key
+    /// parity — the probe and the ping agree on the fingerprint, so it is
+    /// sent) but never sends `diagnostics` and never moves the turn chain.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_never_carries_or_moves_the_diagnostics_chain() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.set_cache_diagnostics(true);
+        rt.cache_diagnosis().unwrap().record("msg_turn");
+        let mut ping_rt = rt.clone();
+        ping_rt.share_ttl_latches(&rt);
+        let fp = ping_rt
+            .cache_keepwarm_probe(&history)
+            .await
+            .unwrap()
+            .fingerprint;
+        let report = ping_rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+            .await;
+        assert!(report.result.is_ok(), "{report:?}");
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].contains("\"diagnostics\""), "{}", bodies[0]);
+        assert_eq!(
+            rt.cache_diagnosis()
+                .unwrap()
+                .previous_message_id()
+                .as_deref(),
+            Some("msg_turn"),
+            "the ping's msg_kw never enters the chain"
+        );
+    }
+
+    /// Driver-turn and ping clones continue the session's chain; a plain
+    /// clone (subagent-style) starts its own; off means no chain at all.
+    #[test]
+    fn diagnostics_chain_is_shared_like_the_ttl_latches() {
+        let mut rt = opus(CacheTtl::FiveMinutes);
+        assert!(rt.cache_diagnosis().is_none(), "off: wire unchanged");
+        rt.set_cache_diagnostics(true);
+        rt.cache_diagnosis().unwrap().record("msg_a");
+        let fresh = rt.clone();
+        assert_eq!(fresh.cache_diagnosis().unwrap().previous_message_id(), None);
+        let mut shared = rt.clone();
+        shared.share_ttl_latches(&rt);
+        shared.cache_diagnosis().unwrap().record("msg_b");
+        shared.cache_diagnosis().unwrap().reject(400);
+        let chain = rt.cache_diagnosis().unwrap();
+        assert_eq!(chain.previous_message_id().as_deref(), Some("msg_b"));
+        assert!(!chain.active(), "the rejection latch is session-wide");
     }
 
     /// The ping shares the session's silent-downgrade latch (not a fresh
