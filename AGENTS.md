@@ -470,7 +470,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `provider.<name>.url` | string | — | Custom base URL (e.g. `provider.local.url = http://...`) |
 | `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
 | `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (timing+usage+cost), `full` (adds rate-limit headers + cache diagnostics). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW) |
-| `cache_diagnostics` | bool | false | Opt into the `cache-diagnosis` beta — server-side cache miss reasons (recorded when telemetry is on) |
+| `cache_diagnostics` | bool | false | Anthropic cache diagnostics: each turn sends `diagnostics.previous_message_id` and records the server's cache-miss reason (`cache_diag` in `api-log.jsonl` when telemetry is on, `cache.server_diagnosis` in the request trace). Beta header `cache-diagnosis-2026-04-07` on API-key auth only; a rejection turns it off for the session and the request is re-sent without it |
 | `shell.*` / `server.*` / `bridge.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` / `parse_bridge_config_key` in `crates/agent-core/src/core/config.rs` — see those functions for the full key list |
 
 ---

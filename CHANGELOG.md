@@ -97,6 +97,20 @@ All notable changes to this project will be documented in this file.
   back the next time it was unparked or the daemon reloaded. The session
   now keeps its own choice; the default applies only to a session that
   never made one.
+- **`cache_diagnostics = true` now does something.** The setting was parsed
+  but never sent. Anthropic turns now ask the API why the prompt cache
+  missed: each request sends `diagnostics.previous_message_id` (the previous
+  turn's message id), and the server's verdict (`system_changed`,
+  `tools_changed`, `messages_changed`, `model_changed`, …, plus the
+  estimated missed input tokens) is written to the `cache_diag` field of
+  `api-log.jsonl` (telemetry `basic`/`full`) and to
+  `cache.server_diagnosis` in `request-trace.jsonl`, next to the local
+  prefix delta. The `cache-diagnosis-2026-04-07` beta header goes out with
+  API-key auth only; OAuth gets diagnostics without it. Keep-warm pings and
+  subagents never join the turn chain. If the API rejects the beta or the
+  field, diagnostics switch off for the rest of the session (logged once)
+  and the request is re-sent without them, so the turn goes through. With
+  the setting off (the default) requests are byte-identical to before.
 
 ### Upgrade notes
 
