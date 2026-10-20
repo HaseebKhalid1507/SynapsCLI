@@ -1836,6 +1836,12 @@ impl Runtime {
     pub fn begin_conversation(&mut self, id: Option<String>) {
         self.session_allow_all.revoke();
         self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
+        // New conversation, new cache-diagnosis chain (cleared in place so
+        // shared driver/ping clones see it too).
+        *self
+            .last_msg_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.set_session_id(id);
     }
 
@@ -5724,6 +5730,35 @@ mod tests {
             runtime.session_allow_all(),
             new_worker.session_allow_all()
         ));
+    }
+
+    #[test]
+    fn conversation_boundary_resets_the_cache_diagnosis_chain() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_cache_diagnostics(true);
+        let mut driver = runtime.clone();
+        driver.share_ttl_latches(&runtime);
+        runtime.cache_diagnosis().unwrap().record("msg_old");
+        // Compaction successor: same conversation, chain kept.
+        runtime.set_session_id(Some("successor".into()));
+        assert_eq!(
+            runtime
+                .cache_diagnosis()
+                .unwrap()
+                .previous_message_id()
+                .as_deref(),
+            Some("msg_old")
+        );
+        // `/clear` (and resume) start a new chain, seen by shared clones too.
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(
+            runtime.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
+        assert_eq!(
+            driver.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
     }
 
     #[test]
