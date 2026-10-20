@@ -680,6 +680,9 @@ impl RequestTracer {
             },
         };
         self.emit_record(outcome);
+        // The verdict belongs to this attempt: the next one starts without
+        // it, even if it fails before streaming.
+        self.structure.cache.server_diagnosis = None;
         self.retries.push(RetryMeta {
             attempt: self.attempt,
             class,

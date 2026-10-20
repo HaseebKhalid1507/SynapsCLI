@@ -539,6 +539,14 @@ mod tests {
     }
 
     async fn turn(options: &ApiOptions, level: TelemetryLevel) -> crate::error::Result<Value> {
+        turn_with_retries(options, level, 0).await
+    }
+
+    async fn turn_with_retries(
+        options: &ApiOptions,
+        level: TelemetryLevel,
+        max_retries: u32,
+    ) -> crate::error::Result<Value> {
         let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
         let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
         ApiMethods::call_api_stream(
@@ -551,7 +559,7 @@ mod tests {
             agent_core::reasoning::ReasoningLevel::Adaptive,
             &messages,
             tx,
-            0,
+            max_retries,
             0,
             options,
             level,
@@ -659,5 +667,82 @@ mod tests {
         let mut first = reqs[0].1.clone();
         first.as_object_mut().unwrap().remove("diagnostics");
         assert_eq!(first, reqs[1].1);
+    }
+
+    /// Attempt 1 streams a verdict and then drops; attempt 2 fails with a
+    /// 5xx before streaming. Attempt 2's trace record must not carry
+    /// attempt 1's verdict.
+    #[tokio::test]
+    async fn a_retry_record_never_inherits_the_previous_attempts_verdict() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move || {
+                let h = Arc::clone(&h);
+                async move {
+                    match h.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            let start = sse(
+                                "msg_1",
+                                r#","diagnostics":{"cache_miss_reason":{"type":"system_changed","cache_missed_input_tokens":2314}}"#,
+                            );
+                            let start = start.split("\n\n").next().unwrap();
+                            (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                format!(
+                                    "{start}\n\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"x\"}}}}\n\n"
+                                ),
+                            )
+                                .into_response()
+                        }
+                        1 => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("retry-after", "0")],
+                            r#"{"type":"error","error":{"type":"api_error","message":"x"}}"#,
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            sse("msg_3", r#","diagnostics":null"#),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sink = crate::runtime::trace::CollectingTraceSink::new();
+        let c = chain();
+        let options = ApiOptions {
+            anthropic_base_url: Some(format!("http://{addr}")),
+            trace: crate::runtime::trace::TraceContext::with_sink(sink.clone())
+                .with_key_path(tmp.path().join("digest.key")),
+            ..on(&c)
+        };
+        turn_with_retries(&options, TelemetryLevel::Off, 3)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let records = sink.records();
+        assert_eq!(records.len(), 3, "one record per attempt");
+        assert_eq!(
+            records[0].cache.server_diagnosis.map(|d| d.reason),
+            Some(CacheMissReason::SystemChanged),
+            "the dropped attempt keeps its own verdict"
+        );
+        assert_eq!(records[1].outcome.http_status, Some(500));
+        assert_eq!(
+            records[1].cache.server_diagnosis, None,
+            "the 5xx attempt never streamed — no verdict"
+        );
+        assert_eq!(records[2].cache.server_diagnosis, None);
     }
 }
