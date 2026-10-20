@@ -1199,7 +1199,7 @@ mod usage_tests {
         let entry = |body: &str| AccountUsageEntry {
             provider: "anthropic".into(),
             account: "work".into(),
-            identity: Some("person@example.com".into()),
+            identity: None,
             outcome: AccountUsageOutcome::ok(parse_anthropic_usage(body, "work", T0).unwrap()),
         };
         let mut report = UsageReport::new("local", T0);
