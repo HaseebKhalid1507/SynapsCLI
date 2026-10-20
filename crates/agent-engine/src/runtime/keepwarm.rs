@@ -1529,7 +1529,8 @@ mod tests {
     }
 
     /// Driver-turn and ping clones continue the session's chain; a plain
-    /// clone (subagent-style) starts its own; off means no chain at all.
+    /// clone (subagent-style) starts its own chain but shares the rejection
+    /// latch; off means no chain at all.
     #[test]
     fn diagnostics_chain_is_shared_like_the_ttl_latches() {
         let mut rt = opus(CacheTtl::FiveMinutes);
@@ -1545,6 +1546,12 @@ mod tests {
         let chain = rt.cache_diagnosis().unwrap();
         assert_eq!(chain.previous_message_id().as_deref(), Some("msg_b"));
         assert!(!chain.active(), "the rejection latch is session-wide");
+        // Subagent-style clones keep their own chain but share the latch:
+        // a rejecting API is paid for (and logged) once per session.
+        let fresh_chain = fresh.cache_diagnosis().unwrap();
+        assert!(!fresh_chain.active(), "latch shared across Clone");
+        assert_eq!(fresh_chain.previous_message_id(), None);
+        assert!(!rt.clone().cache_diagnosis().unwrap().active());
     }
 
     /// The ping shares the session's silent-downgrade latch (not a fresh

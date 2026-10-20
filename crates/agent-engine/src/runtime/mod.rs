@@ -678,7 +678,7 @@ pub struct Runtime {
     /// on. Fresh per clone, shared by `share_ttl_latches`.
     last_msg_id: Arc<Mutex<Option<String>>>,
     /// Set once the API rejected cache diagnostics: off for the session.
-    /// Scoped like `last_msg_id`.
+    /// Shared across `Clone` (subagents never re-probe a rejecting API).
     cache_diag_rejected: Arc<std::sync::atomic::AtomicBool>,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     /// Extension hook bus for dispatching events to extensions.
@@ -4783,7 +4783,7 @@ impl Clone for Runtime {
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
-            cache_diag_rejected: Default::default(),
+            cache_diag_rejected: Arc::clone(&self.cache_diag_rejected),
             session_manager: self.session_manager.clone(),
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None, // Cloned runtimes don't own the reaper
