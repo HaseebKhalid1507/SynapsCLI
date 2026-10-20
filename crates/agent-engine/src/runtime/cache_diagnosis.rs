@@ -271,6 +271,21 @@ mod tests {
         assert_eq!(CacheMissReason::from_wire("x\ny").as_str(), "other");
     }
 
+    #[test]
+    fn a_future_reason_in_a_record_deserializes_as_other() {
+        // A newer build may write a variant this build does not know; the
+        // fail-closed trace export must still accept the record.
+        let d: ServerCacheDiagnosis =
+            serde_json::from_value(json!({"reason": "brand_new_reason", "missed_input_tokens": 5}))
+                .unwrap();
+        assert_eq!(d.reason, CacheMissReason::Other);
+        assert_eq!(
+            serde_json::to_value(CacheMissReason::Other).unwrap(),
+            json!("other"),
+            "same spelling the writer uses for unknown wire types"
+        );
+    }
+
     // ── request gating ──────────────────────────────────────────────────
 
     #[test]

@@ -577,7 +577,9 @@ pub enum CacheMissReason {
     Unavailable,
     /// `{"cache_miss_reason": null}`: the comparison was still running.
     Pending,
-    /// A reason type this build does not know.
+    /// A reason type this build does not know (on the wire, or written by
+    /// a newer build).
+    #[serde(other)]
     Other,
 }
 
