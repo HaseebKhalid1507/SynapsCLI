@@ -1191,7 +1191,7 @@ mod usage_tests {
         assert!(text.contains("Provider schema unverified"));
     }
 
-    /// JR's ask: an account without extra usage enabled shows no extra_usage
+    /// An account without extra usage enabled shows no extra_usage
     /// line at all. An enabled one shows a single title, and an unknown
     /// reading draws no row of '?'.
     #[test]
