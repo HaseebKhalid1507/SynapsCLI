@@ -114,9 +114,23 @@ pub(super) fn wants_beta_header(auth_type: &str, options: &super::api::ApiOption
 /// A 4xx that blames the beta header or the `diagnostics` field. Probed
 /// shapes: `Unexpected value(s) `cache-diagnosis-…` for the `anthropic-beta`
 /// header` and `diagnostics.previous_message_id: must be the `id` …`.
+/// Only `error.message` is read: an error body may echo the request, and an
+/// ON request always contains `"diagnostics"`.
 pub(super) fn is_rejection(status: u16, body: &str) -> bool {
-    matches!(status, 400 | 422)
-        && (body.contains("cache-diagnosis") || body.contains("diagnostics"))
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(message) = v.pointer("/error/message").and_then(Value::as_str) else {
+        return false;
+    };
+    // Field-path form: the message is about `diagnostics` itself.
+    let names_field = message
+        .strip_prefix("diagnostics")
+        .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('.'));
+    names_field || message.contains(CACHE_DIAGNOSIS_BETA)
 }
 
 /// Remove the leading `"diagnostics":{…},` member from a serialized request
@@ -351,6 +365,31 @@ mod tests {
             "server errors keep the normal retry path"
         );
         assert!(!is_rejection(429, beta));
+    }
+
+    #[test]
+    fn rejection_classifier_reads_error_message_not_the_echoed_request() {
+        // A 400 about something else whose body echoes the ON request.
+        let echo = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0.image.source: invalid base64 data"},"request":{"diagnostics":{"previous_message_id":"msg_01abc"},"model":"claude-sonnet-4-6"}}"#;
+        assert!(
+            !is_rejection(400, echo),
+            "echoed request is not a rejection"
+        );
+        let echo_in_message = r#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid request: {\"diagnostics\":{\"previous_message_id\":null}}"}}"#;
+        assert!(!is_rejection(400, echo_in_message));
+        // Real field rejection (field-path form).
+        let field = r#"{"type":"error","error":{"type":"invalid_request_error","message":"diagnostics.previous_message_id: must be the `id` from a prior /v1/messages response (starts with `msg_`)"}}"#;
+        assert!(is_rejection(400, field));
+        // Beta rejection.
+        let beta = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `cache-diagnosis-2026-04-07` for the `anthropic-beta` header."}}"#;
+        assert!(is_rejection(400, beta));
+        // Unrelated 400.
+        let too_long = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#;
+        assert!(!is_rejection(400, too_long));
+        assert!(
+            !is_rejection(400, "not json diagnostics"),
+            "unparseable body"
+        );
     }
 
     // ── body bytes ──────────────────────────────────────────────────────
