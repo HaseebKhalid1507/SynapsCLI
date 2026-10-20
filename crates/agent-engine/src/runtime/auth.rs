@@ -37,7 +37,13 @@ impl AuthMethods {
     ) -> Result<()> {
         let mtime = local_mtime_for(source);
         let token = broker.recover_rejected_token(&credential, rejected).await
-            .map_err(|e| recovery_error(&credential, &e))?;
+            .map_err(|e| {
+                turn_auth_failed(
+                    broker_error_kind(&e),
+                    Some(&credential),
+                    recovery_error(&credential, &e),
+                )
+            })?;
         Self::bind_pinned_at(auth, source, PinnedToken { credential, token }, mtime).await;
         Ok(())
     }
@@ -337,6 +343,17 @@ impl AuthMethods {
         point: RefreshPoint,
     ) -> Result<()> {
         let selector = broker.account_selector(OAuthProviderId::Anthropic);
+        // Auto mid-turn: a seat this turn pinned that is now cooling down
+        // (another session met its limit) is not kept; the request would
+        // meet the same limit. Memory only, outside the auth lock.
+        let cooling = match (&selector, point) {
+            (AccountSelector::Auto, RefreshPoint::WithinTurn) => {
+                let bound = auth.read().await.bound_credential.clone();
+                turn_pinned_credential(source, bound.as_deref())
+                    .is_some_and(|cred| broker.active_cooldown(&cred).is_some())
+            }
+            _ => false,
+        };
         // Fast path: in-memory token still fresh AND still the selected account?
         // Local: also unchanged on disk (`recorded_mtime`, checked below).
         let recorded_mtime = {
@@ -357,7 +374,7 @@ impl AuthMethods {
                 } else {
                     !auth_guard.auth_token.is_empty() && crate::epoch_millis() < exp
                 };
-                if still_fresh && binding == BindingCheck::Matches {
+                if still_fresh && binding == BindingCheck::Matches && !cooling {
                     if source.is_remote() {
                         return Ok(());
                     }
@@ -410,10 +427,9 @@ impl AuthMethods {
             AccountSelector::Account(account) => {
                 // Explicit: exactly this credential, never a fallback.
                 let cred = CredentialRef::new(OAuthProviderId::Anthropic, account.clone());
-                let token = broker
-                    .access_token_for(&cred)
-                    .await
-                    .map_err(|e| vend_error(&cred, &e))?;
+                let token = broker.access_token_for(&cred).await.map_err(|e| {
+                    turn_auth_failed(broker_error_kind(&e), Some(&cred), vend_error(&cred, &e))
+                })?;
                 PinnedToken {
                     credential: cred,
                     token,
@@ -423,9 +439,9 @@ impl AuthMethods {
                 Self::vend_auto(broker, source, bound.as_deref(), model, point).await?
             }
             AccountSelector::Invalid { source, reason } => {
-                return Err(RuntimeError::Auth(format!(
+                return Err(turn_auth_failed("invalid_selector", None, RuntimeError::Auth(format!(
                     "Anthropic account selector from {source} is invalid ({reason}); refusing to fall back to another account. Fix it or run `synaps auth use --provider anthropic --account <label|default>`."
-                )));
+                ))));
             }
         };
         // Update shared auth state so all clones (including spawned stream
@@ -479,7 +495,8 @@ impl AuthMethods {
     /// long agentic turn keeps one account (and its prompt cache) instead
     /// of hopping to whichever seat now has the lowest utilization, and no
     /// per-round usage fetches are spent. Only if THAT seat can no longer be
-    /// vended does Auto fall back to re-selection (Auto opted in to switching;
+    /// vended, or is cooling down (another session met its limit), does
+    /// Auto fall back to re-selection (Auto opted in to switching;
     /// the fallback is logged, never silent).
     async fn vend_auto(
         broker: &dyn CredentialBroker,
@@ -490,18 +507,29 @@ impl AuthMethods {
     ) -> Result<PinnedToken> {
         if point == RefreshPoint::WithinTurn {
             if let Some(cred) = turn_pinned_credential(source, bound) {
-                match broker.access_token_for(&cred).await {
-                    Ok(token) => {
-                        return Ok(PinnedToken {
-                            credential: cred,
-                            token,
-                        })
-                    }
-                    Err(e) => tracing::warn!(
+                // A pinned seat that is cooling down is not re-vended: the
+                // selection below never picks it while the cooldown lasts,
+                // and with no other account it says until when.
+                if let Some(until_ms) = broker.active_cooldown(&cred) {
+                    tracing::info!(
                         credential = %cred,
-                        error = %e,
-                        "Anthropic auto selection: the seat pinned for this turn could not be re-vended; re-selecting"
-                    ),
+                        until_ms,
+                        "Anthropic auto selection: the seat pinned for this turn is cooling down; re-selecting"
+                    );
+                } else {
+                    match broker.access_token_for(&cred).await {
+                        Ok(token) => {
+                            return Ok(PinnedToken {
+                                credential: cred,
+                                token,
+                            })
+                        }
+                        Err(e) => tracing::warn!(
+                            credential = %cred,
+                            error = %e,
+                            "Anthropic auto selection: the seat pinned for this turn could not be re-vended; re-selecting"
+                        ),
+                    }
                 }
             }
         }
@@ -509,10 +537,279 @@ impl AuthMethods {
             .access_token_pinned_for(OAuthProviderId::Anthropic, model.map(quota_model_key))
             .await
             .map_err(|e| {
-                RuntimeError::Auth(format!(
-                    "Automatic account selection failed: {e}. Run `synaps login`, pick an account with `synaps auth use --provider anthropic --account <label>`, or check auth.remote_endpoint / broker reachability."
-                ))
+                turn_auth_failed(
+                    auto_selection_kind(&e),
+                    None,
+                    RuntimeError::Auth(auto_selection_text(&e, crate::epoch_millis())),
+                )
             })
+    }
+}
+
+/// Fixed kind of a failed automatic selection. In automatic Anthropic
+/// selection a `Credential` error comes only from listing the stored
+/// accounts, so it is a credential-store failure.
+fn auto_selection_kind(e: &crate::auth::BrokerError) -> &'static str {
+    match e {
+        crate::auth::BrokerError::Credential(_) => "credential_store",
+        other => broker_error_kind(other),
+    }
+}
+
+/// Log ONE WARN `turn_auth_failed` with a fixed kind (and the account
+/// label when one is known; never a token or identity) for an Anthropic
+/// auth error that ends the turn, and return it unchanged.
+fn turn_auth_failed(
+    kind: &str,
+    account: Option<&CredentialRef>,
+    err: RuntimeError,
+) -> RuntimeError {
+    tracing::warn!(
+        provider = %"anthropic",
+        kind = %kind,
+        account = %account.map_or("-", |c| c.account.label_str()),
+        "turn_auth_failed"
+    );
+    err
+}
+
+/// Fixed kind of a broker error for the `turn_auth_failed` WARN.
+fn broker_error_kind(e: &crate::auth::BrokerError) -> &'static str {
+    use crate::auth::{BrokerError, RefreshFailureKind as R};
+    match e {
+        BrokerError::NoAccountAvailable {
+            failure: Some(f), ..
+        } => f.kind.as_str(),
+        BrokerError::NoAccountAvailable { .. } => "no_account_available",
+        BrokerError::Refresh(f) => match f.kind {
+            R::Transient => "refresh_transient",
+            R::LockBusy => "refresh_lock_busy",
+            R::Other => "refresh_other",
+            R::Cooldown { .. } => "refresh_cooldown",
+            R::Credential => "refresh_rejected",
+            R::ActionRequired => "refresh_action_required",
+        },
+        BrokerError::NotConfigured(_) => "no_credentials",
+        BrokerError::UnknownAccount { .. } => "unknown_account",
+        BrokerError::InvalidAccount(_) => "invalid_account",
+        BrokerError::Credential(_) => "credential_error",
+        BrokerError::Unauthorized => "broker_unauthorized",
+        BrokerError::Transport(_) => "broker_transport",
+        _ => "broker_error",
+    }
+}
+
+/// User text for a failed automatic selection. Every clause is something
+/// the broker reported; login advice appears only for accounts whose
+/// failure a login fixes.
+fn auto_selection_text(e: &crate::auth::BrokerError, now_ms: u64) -> String {
+    use crate::auth::BrokerError;
+    match e {
+        BrokerError::NoAccountAvailable {
+            failure: Some(f), ..
+        } => selection_failure_text(f, now_ms),
+        BrokerError::Refresh(f) => chosen_seat_refresh_text(f),
+        // The broker itself is unreachable, or refused this client's
+        // machine auth (its text says what to set): a login fixes neither.
+        BrokerError::Transport(_) => format!(
+            "Automatic account selection failed: {e}. Check auth.remote_endpoint / broker \
+             reachability, then send again; no login needed."
+        ),
+        BrokerError::Unauthorized => {
+            format!("Automatic account selection failed: {}", sentence(&e.to_string()))
+        }
+        // Listing the stored accounts failed: no account was read, and
+        // neither a login nor a retry fixes the store.
+        BrokerError::Credential(msg) => format!(
+            "Automatic account selection failed (credential_store): the credential store could \
+             not be read ({msg}); repair or restore it."
+        ),
+        other => format!(
+            "Automatic account selection failed: {other}. Run `synaps login`, pick an account with `synaps auth use --provider anthropic --account <label>`, or check auth.remote_endpoint / broker reachability."
+        ),
+    }
+}
+
+/// `synaps login` for exactly one Anthropic slot.
+fn login_command(label: &str) -> String {
+    if label == "default" {
+        "`synaps login --provider anthropic`".to_string()
+    } else {
+        format!("`synaps login --provider anthropic --account {label}`")
+    }
+}
+
+/// `label: kind (HTTP s, retry after Ns, until HH:MM UTC)`. A cooling
+/// account whose kind is its last failed read or refresh says "cooling down
+/// until" (or just "cooling down" when the end is unknown).
+fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String {
+    let mut extra = Vec::new();
+    if let Some(status) = a.http_status {
+        extra.push(format!("HTTP {status}"));
+    }
+    if let Some(secs) = a.retry_after_s {
+        extra.push(format!("retry after {secs}s"));
+    }
+    let cooling = a.cooling_down && a.kind != crate::auth::AccountFailureKind::CoolingDown;
+    match a.until_ms.filter(|t| *t > now_ms) {
+        Some(until) => extra.push(format!(
+            "{}until {}",
+            if cooling { "cooling down " } else { "" },
+            super::anthropic_quota::describe_reset_utc(until, now_ms)
+        )),
+        None if cooling => extra.push("cooling down".to_string()),
+        None => {}
+    }
+    if extra.is_empty() {
+        format!("{}: {}", a.account, a.kind)
+    } else {
+        format!("{}: {} ({})", a.account, a.kind, extra.join(", "))
+    }
+}
+
+fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> String {
+    use crate::auth::SelectionFailureKind as K;
+    let what = match f.kind {
+        K::NoCredentials => "no Anthropic account is logged in",
+        K::UsageReadFailed => "reading account usage failed, so capacity is unproven (not used up)",
+        K::CredentialRejected => {
+            "every Anthropic account that is not cooling down had its login refused"
+        }
+        K::AllCoolingDown => "every Anthropic account is cooling down or at a usage limit",
+        K::QuotaUnknown => "no account's usage reading proved capacity",
+        K::SeatChurn => {
+            "the chosen account's stored login kept changing while its capacity was being read"
+        }
+        K::RemoteNoCapacity => "the credential broker found no account with proven capacity",
+        K::ActionRequired => {
+            "every Anthropic account that is not cooling down needs a new login or an action \
+             outside synaps"
+        }
+        K::CredentialStore => "the credential store could not be read, so no account was checked",
+    };
+    let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
+    if !f.accounts.is_empty() {
+        let parts: Vec<_> = f
+            .accounts
+            .iter()
+            .map(|a| account_failure_part(a, now_ms))
+            .collect();
+        text.push_str(&format!(" [{}]", parts.join("; ")));
+    }
+    let earliest = f
+        .earliest_reset_ms
+        .filter(|t| *t > now_ms)
+        .map(|t| super::anthropic_quota::describe_reset_utc(t, now_ms));
+    if let Some(at) = &earliest {
+        text.push_str(&format!("; earliest reset {at}"));
+    }
+    text.push('.');
+    if f.kind == K::NoCredentials {
+        text.push_str(
+            " Run `synaps login --provider anthropic` (add `--account <label>` for a named slot).",
+        );
+        return text;
+    }
+    let login = f.login_labels();
+    if !login.is_empty() {
+        let commands: Vec<_> = login.iter().map(|l| login_command(l)).collect();
+        text.push_str(&format!(
+            " {} need{} a new login: {}.",
+            login.join(", "),
+            if login.len() == 1 { "s" } else { "" },
+            commands.join(", ")
+        ));
+    }
+    for a in f.accounts.iter().filter(|a| a.kind.needs_action()) {
+        text.push(' ');
+        text.push_str(&action_remedy(a));
+    }
+    // "No login needed" only when no account needs a login or an action;
+    // "send again" only when sending again can help.
+    let nothing_to_fix = login.is_empty() && f.action_labels().is_empty();
+    match f.kind {
+        K::NoCredentials | K::CredentialRejected | K::ActionRequired | K::CredentialStore => {}
+        K::RemoteNoCapacity => text.push_str(
+            " The broker host's log has each account's reason (`auth_selection_failed`); send again to retry.",
+        ),
+        K::AllCoolingDown => match (&earliest, nothing_to_fix) {
+            (Some(at), true) => text.push_str(&format!(" No login needed; send again after {at}.")),
+            (None, true) => text.push_str(" No login needed; send again later."),
+            (Some(at), false) => text.push_str(&format!(" Send again after {at}.")),
+            (None, false) => {}
+        },
+        // Failed usage reads are held: the next selection reads usage again
+        // only after the hold ends, so name that time instead of "retry".
+        K::UsageReadFailed if f.usage_read_retry_ms.is_some_and(|t| t > now_ms) => {
+            let at = super::anthropic_quota::describe_reset_utc(
+                f.usage_read_retry_ms.unwrap_or(now_ms),
+                now_ms,
+            );
+            text.push_str(&format!(" Usage is read again after {at}; send again then."));
+            if nothing_to_fix {
+                text.push_str(" No login needed.");
+            }
+        }
+        _ if nothing_to_fix => text.push_str(" Send again to retry; no login needed."),
+        _ => text.push_str(" Send again to retry."),
+    }
+    text
+}
+
+/// The remedy for an account whose failure needs an action outside synaps.
+/// The `usage read needs action` WARN in the synaps log has the detail.
+fn action_remedy(a: &crate::auth::AccountFailure) -> String {
+    use crate::auth::AccountFailureKind as K;
+    match a.kind {
+        K::CredentialStore => format!(
+            "{}: its stored login could not be read; repair or restore the credential store \
+             (the `usage read needs action` line in the synaps log names the file).",
+            a.account
+        ),
+        _ => format!(
+            "{}: the token refresh needs an action outside synaps; the `usage read needs \
+             action` line in the synaps log says what to do.",
+            a.account
+        ),
+    }
+}
+
+/// The account the broker chose could not be vended because its token
+/// refresh failed. Only a refused login gets login advice.
+fn chosen_seat_refresh_text(f: &crate::auth::RefreshFailure) -> String {
+    use crate::auth::RefreshFailureKind as R;
+    let msg = sentence(f.message());
+    match f.kind {
+        R::Transient => format!(
+            "Token refresh failed for the automatically chosen Anthropic account (network or \
+             provider error, not a login problem): {msg} Send again to retry; no login needed."
+        ),
+        R::LockBusy => format!(
+            "Another synaps process is still refreshing the automatically chosen Anthropic \
+             account: {msg} Send again to retry; no login needed."
+        ),
+        R::Other => format!(
+            "Token refresh failed for the automatically chosen Anthropic account: {msg} Send \
+             again to retry."
+        ),
+        R::Cooldown { retry_in_secs } => format!(
+            "Token refresh of the automatically chosen Anthropic account is paused after a \
+             rejected token: {msg} Send again in {retry_in_secs}s."
+        ),
+        R::ActionRequired => {
+            format!("Can't refresh the token for the automatically chosen Anthropic account: {msg}")
+        }
+        // A broker that ends the selection on the chosen seat's refused
+        // refresh (an older or remote one) names the account and, for a
+        // local slot, the exact login command.
+        R::Credential if has_login_advice(f.message()) => {
+            format!("Anthropic refused the login of the automatically chosen account: {msg}")
+        }
+        R::Credential => format!(
+            "Anthropic refused the login of the automatically chosen account: {msg} Find it with \
+             `synaps auth list` and log it in again with `synaps login --provider anthropic \
+             --account <label>`."
+        ),
     }
 }
 /// A failed explicit-account vend.
@@ -1271,6 +1568,10 @@ mod tests {
         explicit_denied: Vec<String>,
         /// The seat the automatic selector picks.
         auto_pick: &'static str,
+        /// When set, the automatic selector fails with this error instead.
+        auto_error: Mutex<Option<BrokerError>>,
+        /// Storage keys of seats that are cooling down.
+        cooling: Vec<String>,
     }
 
     impl ScriptedBroker {
@@ -1281,6 +1582,8 @@ mod tests {
                 auto_calls: Mutex::new(Vec::new()),
                 explicit_denied: Vec::new(),
                 auto_pick: "auto-pick",
+                auto_error: Mutex::new(None),
+                cooling: Vec::new(),
             }
         }
         fn explicit(&self) -> Vec<String> {
@@ -1301,6 +1604,11 @@ mod tests {
         }
         fn account_selector(&self, _p: OAuthProviderId) -> AccountSelector {
             self.selector.clone()
+        }
+        fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
+            self.cooling
+                .contains(&cred.storage_key())
+                .then_some(FRESH)
         }
         async fn access_token_for(
             &self,
@@ -1325,6 +1633,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(model.map(str::to_string));
+            if let Some(e) = self.auto_error.lock().unwrap().clone() {
+                return Err(e);
+            }
             let credential = CredentialRef::new(
                 provider,
                 crate::auth::Account::parse(self.auto_pick).unwrap(),
@@ -1569,6 +1880,72 @@ mod tests {
         assert_eq!(broker.auto().len(), 1);
     }
 
+    /// S4: a seat this turn pinned that is now cooling down (another
+    /// session met its limit) is not kept mid-turn, fresh or stale: Auto
+    /// re-selects without re-vending it, so the turn's next request does
+    /// not meet the same limit. Without a cooldown the fresh seat is kept
+    /// with no broker call, and an explicit selector keeps its account
+    /// whatever its cooldown.
+    #[tokio::test]
+    async fn auto_within_turn_leaves_a_pinned_seat_that_is_cooling_down() {
+        let source = remote("principal-A");
+        for expires in [FRESH, STALE] {
+            let auth = bound_state(&source, &work_cred(), expires);
+            let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+            broker.cooling = vec!["anthropic@work".into()];
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("claude-opus-4-7"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .unwrap();
+            let g = auth.read().await;
+            assert_eq!(g.auth_token, "tok-auto-auto-pick", "expires {expires}");
+            assert!(g
+                .bound_credential
+                .as_deref()
+                .unwrap()
+                .ends_with("|anthropic@auto-pick"));
+            assert!(broker.explicit().is_empty(), "the cooling seat is not re-vended");
+            assert_eq!(broker.auto(), vec![Some("claude-opus-4-7".to_string())]);
+        }
+
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.cooling = vec!["anthropic@other".into()];
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let mut broker = ScriptedBroker::new(AccountSelector::Account(
+            crate::auth::Account::parse("work").unwrap(),
+        ));
+        broker.cooling = vec!["anthropic@work".into()];
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+    }
+
     /// An explicit selector with a stale token re-vends exactly that
     /// credential — never the selector's automatic pick — and a denied
     /// explicit vend is an error, not a silent switch.
@@ -1620,6 +1997,804 @@ mod tests {
         .expect_err("invalid selector must not serve any token");
         assert!(err.to_string().contains("invalid"), "{err}");
         assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+    }
+
+    // ── Typed automatic-selection failures (user text + one WARN) ────────
+
+    use agent_core::auth::{
+        AccountFailure, AccountFailureKind as AK, SelectionFailure, SelectionFailureKind as SK,
+    };
+
+    /// In-process sink for formatted tracing output.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        /// Formats into the capture through the daemon log file's own
+        /// filter: `with_crate_directives` over the ERROR default an unset
+        /// `RUST_LOG` gives, exactly what `init_logging` builds. A line
+        /// these tests find is a line synaps.log keeps.
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+            let unset = EnvFilter::builder()
+                .with_default_directive(LevelFilter::ERROR.into())
+                .parse_lossy("");
+            let sink = self.0.clone();
+            tracing_subscriber::fmt()
+                .with_env_filter(crate::logging::with_crate_directives(unset))
+                .with_writer(move || LogWriter(sink.clone()))
+                .with_ansi(false)
+                .finish()
+        }
+        fn take(&self) -> String {
+            String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+        }
+    }
+
+    fn account(label: &str, kind: AK) -> AccountFailure {
+        AccountFailure {
+            account: label.into(),
+            kind,
+            http_status: None,
+            retry_after_s: None,
+            until_ms: None,
+            cooling_down: false,
+        }
+    }
+
+    fn no_account(failure: SelectionFailure) -> BrokerError {
+        BrokerError::NoAccountAvailable {
+            provider: "anthropic".into(),
+            reason: "scripted".into(),
+            failure: Some(failure),
+        }
+    }
+
+    /// Run one turn-start Auto refresh against a selector failing with
+    /// `error`; returns the user text and the captured log.
+    async fn failed_turn_start(error: BrokerError) -> (String, String) {
+        let source = remote("principal-A");
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = ScriptedBroker::new(AccountSelector::Auto);
+        *broker.auto_error.lock().unwrap() = Some(error);
+        let capture = LogCapture::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("claude-opus-4-7"),
+                RefreshPoint::TurnStart,
+            )
+            .await
+            .expect_err("a failed selection ends the turn")
+        };
+        assert!(matches!(err, RuntimeError::Auth(_)), "{err:?}");
+        assert_eq!(
+            auth.read().await.auth_token,
+            "sk-HELD",
+            "no token may be bound"
+        );
+        (err.to_string(), capture.take())
+    }
+
+    /// The one `turn_auth_failed` WARN line in `log`.
+    fn turn_warn(log: &str) -> String {
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|l| l.contains("turn_auth_failed"))
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one turn_auth_failed WARN:\n{log}");
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        lines[0].to_string()
+    }
+
+    /// The turn_auth_failed WARN reaches the daemon log, and the capture
+    /// is the real filter, not a pass-through: in the same subscriber a
+    /// WARN at a target outside the crate directives is dropped while an
+    /// ERROR there is kept (ERROR is the unset-`RUST_LOG` default).
+    #[tokio::test]
+    async fn turn_auth_failed_passes_the_daemon_log_filter_and_a_foreign_warn_does_not() {
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (_, log) = failed_turn_start(no_account(failure)).await;
+        assert!(turn_warn(&log).contains("kind=usage_read_failed"), "{log}");
+
+        let capture = LogCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            tracing::warn!(target: "unrelated_crate::x", "foreign_warn_control");
+            tracing::error!(target: "unrelated_crate::x", "foreign_error_control");
+        }
+        let control = capture.take();
+        assert!(!control.contains("foreign_warn_control"), "{control}");
+        assert!(control.contains("foreign_error_control"), "{control}");
+    }
+
+    /// JR's incident: usage reads failed (endpoint 429/503) while one account
+    /// was cooling down. The text names the kind, each account and the
+    /// earliest reset, says what the user can do, and gives NO login advice:
+    /// a login would not have helped.
+    #[tokio::test]
+    async fn usage_read_failure_text_names_kind_accounts_and_reset_without_login_advice() {
+        let now = crate::epoch_millis();
+        let reset = now + 30 * 60 * 1000;
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        c2.retry_after_s = Some(120);
+        let mut c5 = account("claude5", AK::CoolingDown);
+        c5.until_ms = Some(reset);
+        let mut c6 = account("claude6", AK::UsageUpstream);
+        c6.http_status = Some(503);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2, c5, c6],
+            earliest_reset_ms: Some(reset),
+            usage_read_retry_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        let reset_text = super::super::anthropic_quota::describe_reset_utc(reset, now);
+        for needle in [
+            "usage_read_failed",
+            "claude2: usage_rate_limited (HTTP 429, retry after 120s)",
+            "claude5: cooling_down",
+            "claude6: usage_upstream (HTTP 503)",
+            reset_text.as_str(),
+            "Send again to retry; no login needed.",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        assert!(
+            !text.contains("synaps login"),
+            "no login advice for a read failure: {text}"
+        );
+        let warn = turn_warn(&log);
+        assert!(warn.contains("kind=usage_read_failed"), "{warn}");
+    }
+
+    /// Held usage reads: the text names when usage is read again (the next
+    /// selection reads only after the hold), not a bare "retry", and says no
+    /// login is needed unless an account needs one.
+    #[tokio::test]
+    async fn held_usage_read_text_names_the_read_time_and_no_login() {
+        let now = crate::epoch_millis();
+        let retry = now + 4 * 60 * 1000;
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2.clone()],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: Some(retry),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        let at = super::super::anthropic_quota::describe_reset_utc(retry, now);
+        let want = format!("Usage is read again after {at}; send again then. No login needed.");
+        assert!(text.contains(&want), "{want:?} missing from: {text}");
+        assert!(text.contains("capacity is unproven (not used up)"), "{text}");
+        assert!(!text.contains("Send again to retry"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+
+        // An account that needs a login keeps its advice and drops "No login needed".
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![account("claude3", AK::RefreshRejected), c2.clone()],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: Some(retry),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        let held = format!("Usage is read again after {at}; send again then.");
+        assert!(text.contains(&held), "{text}");
+        assert!(text.contains("--account claude3"), "{text}");
+        assert!(!text.contains("No login needed"), "{text}");
+
+        // A read time already past falls back to S1's text.
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: Some(now.saturating_sub(1000)),
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(text.contains("Send again to retry; no login needed."), "{text}");
+        assert!(!text.contains("Usage is read again"), "{text}");
+    }
+
+    /// Login advice names exactly the accounts with a credential kind, even
+    /// when the top-level kind is not a credential kind.
+    #[tokio::test]
+    async fn login_advice_names_exactly_the_accounts_whose_login_was_refused() {
+        let mut c2 = account("claude2", AK::UsageUnauthorized);
+        c2.http_status = Some(401);
+        let failure = SelectionFailure {
+            kind: SK::CredentialRejected,
+            accounts: vec![
+                c2,
+                account("claude3", AK::RefreshRejected),
+                account("default", AK::CredentialMissing),
+                account("claude5", AK::CoolingDown),
+            ],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        for needle in [
+            "credential_rejected",
+            "`synaps login --provider anthropic --account claude2`",
+            "`synaps login --provider anthropic --account claude3`",
+            "`synaps login --provider anthropic`",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.contains("--account claude5"), "{text}");
+        assert!(!text.contains("--account default"), "{text}");
+        assert!(!text.contains("no login needed"), "{text}");
+        assert!(turn_warn(&log).contains("kind=credential_rejected"));
+
+        // Mixed: a read failure elsewhere keeps "send again", and only the
+        // refused account gets login advice.
+        let mut c6 = account("claude6", AK::UsageTimeout);
+        c6.http_status = None;
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![account("claude3", AK::RefreshRejected), c6],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(text.contains("Send again to retry"), "{text}");
+        assert!(text.contains("--account claude3"), "{text}");
+        assert!(!text.contains("--account claude6"), "{text}");
+        assert!(!text.contains("no login needed"), "{text}");
+    }
+
+    /// Every account limited: the earliest reset, no login advice.
+    #[tokio::test]
+    async fn all_cooling_down_text_gives_the_earliest_reset_and_no_login_advice() {
+        let now = crate::epoch_millis();
+        let soon = now + 20 * 60 * 1000;
+        let mut c5 = account("claude5", AK::Exhausted);
+        c5.until_ms = Some(now + 3 * 60 * 60 * 1000);
+        let mut c6 = account("claude6", AK::CoolingDown);
+        c6.until_ms = Some(soon);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c5, c6],
+            earliest_reset_ms: Some(soon),
+            usage_read_retry_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
+        assert!(text.contains("all_cooling_down"), "{text}");
+        assert!(
+            text.contains(&format!("No login needed; send again after {soon_text}.")),
+            "{text}"
+        );
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+    }
+
+    /// S4 review: the seat this turn pinned is cooling down and no other
+    /// account can serve. The mid-turn re-selection ends the turn with the
+    /// usual all-cooling text (the earliest time, no login advice); the
+    /// cooling seat is not re-vended and no token is bound.
+    #[tokio::test]
+    async fn auto_within_turn_cooling_seat_with_no_other_account_gets_the_cooling_text() {
+        let now = crate::epoch_millis();
+        let until = now + 20 * 60 * 1000;
+        let mut work = account("work", AK::CoolingDown);
+        work.until_ms = Some(until);
+        work.cooling_down = true;
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![work],
+            earliest_reset_ms: Some(until),
+            usage_read_retry_ms: None,
+        };
+        let source = remote("principal-A");
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.cooling = vec!["anthropic@work".into()];
+        *broker.auto_error.lock().unwrap() = Some(no_account(failure));
+        let capture = LogCapture::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("claude-opus-4-7"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .expect_err("no account can serve")
+        };
+        let text = err.to_string();
+        let until_text = super::super::anthropic_quota::describe_reset_utc(until, now);
+        assert!(text.contains("all_cooling_down"), "{text}");
+        assert!(
+            text.contains(&format!("No login needed; send again after {until_text}.")),
+            "{text}"
+        );
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&capture.take()).contains("kind=all_cooling_down"));
+        assert!(broker.explicit().is_empty(), "the cooling seat is not re-vended");
+        assert_eq!(broker.auto(), vec![Some("claude-opus-4-7".to_string())]);
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "no token is bound");
+    }
+
+    /// r2 blocker 1: every account cooling, one of them with a refused
+    /// login. The kind stays all_cooling_down and the earliest time stays,
+    /// but that label's exact login command is named and the text never
+    /// says "No login needed".
+    #[tokio::test]
+    async fn all_cooling_with_one_refused_login_names_its_command_and_never_no_login_needed() {
+        let now = crate::epoch_millis();
+        let soon = now + 20 * 60 * 1000;
+        let later = now + 2 * 60 * 60 * 1000;
+        let mut c2 = account("claude2", AK::UsageUnauthorized);
+        c2.http_status = Some(401);
+        c2.cooling_down = true;
+        c2.until_ms = Some(later);
+        let mut c6 = account("claude6", AK::CoolingDown);
+        c6.cooling_down = true;
+        c6.until_ms = Some(soon);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c2, c6],
+            earliest_reset_ms: Some(soon),
+            usage_read_retry_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
+        let later_text = super::super::anthropic_quota::describe_reset_utc(later, now);
+        for needle in [
+            "all_cooling_down".to_string(),
+            format!("claude2: usage_unauthorized (HTTP 401, cooling down until {later_text})"),
+            "claude2 needs a new login: `synaps login --provider anthropic --account claude2`"
+                .to_string(),
+            format!("Send again after {soon_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.to_lowercase().contains("no login needed"), "{text}");
+        assert!(!text.contains("--account claude6"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+    }
+
+    /// r2 blocker 1: a cooling account whose usage read was rate limited
+    /// shows the 429 and its Retry-After beside the cooldown; no login.
+    #[tokio::test]
+    async fn a_cooling_account_with_a_usage_429_shows_status_retry_after_and_cooldown() {
+        let now = crate::epoch_millis();
+        let until = now + 40 * 60 * 1000;
+        let mut c5 = account("claude5", AK::UsageRateLimited);
+        c5.http_status = Some(429);
+        c5.retry_after_s = Some(90);
+        c5.cooling_down = true;
+        c5.until_ms = Some(until);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c5],
+            earliest_reset_ms: Some(until),
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        let until_text = super::super::anthropic_quota::describe_reset_utc(until, now);
+        for needle in [
+            format!(
+                "claude5: usage_rate_limited (HTTP 429, retry after 90s, cooling down until {until_text})"
+            ),
+            format!("No login needed; send again after {until_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.contains("synaps login"), "{text}");
+    }
+
+    // ── The same texts from a CLASSIFIED failure (r3) ────────────────────
+    //
+    // `select` + `SelectionFailure::from_rejections` over scripted account
+    // capacities: the headline kind is computed, never injected.
+
+    fn anthropic_ref(label: &str) -> CredentialRef {
+        CredentialRef::new(
+            OAuthProviderId::Anthropic,
+            crate::auth::Account::named(label).unwrap(),
+        )
+    }
+
+    /// An account whose last read or refresh failed with `failure`, cooling
+    /// down until `until` when given.
+    fn failed_capacity(
+        label: &str,
+        failure: agent_core::auth::ObservationFailure,
+        until: Option<u64>,
+    ) -> crate::auth::quota_policy::AccountCapacity {
+        let mut cap =
+            crate::auth::quota_policy::AccountCapacity::failed(anthropic_ref(label), failure);
+        cap.cooldown_until_ms = until;
+        cap
+    }
+
+    /// An account with no reading that is cooling down until `until`.
+    fn cooling_capacity(label: &str, until: u64) -> crate::auth::quota_policy::AccountCapacity {
+        let mut cap = crate::auth::quota_policy::AccountCapacity::unobserved(anthropic_ref(label));
+        cap.cooldown_until_ms = Some(until);
+        cap
+    }
+
+    /// Run the real selection over `candidates` and classify its failure.
+    fn classified(
+        candidates: &[crate::auth::quota_policy::AccountCapacity],
+        now: u64,
+    ) -> SelectionFailure {
+        use crate::auth::quota_policy::{select, Selection, SelectionRequest};
+        let req = SelectionRequest::new(OAuthProviderId::Anthropic, now, 60_000);
+        match select(&req, candidates) {
+            Selection::NoCapacity { rejections, .. } => {
+                SelectionFailure::from_rejections(&rejections, now)
+            }
+            other => panic!("expected no capacity, got {other:?}"),
+        }
+    }
+
+    fn throttled_429() -> agent_core::auth::ObservationFailure {
+        agent_core::auth::ObservationFailure::new(AK::UsageRateLimited)
+            .with_status(429)
+            .with_retry_after(Some(90))
+    }
+
+    /// r3, the B1 headline rule: the headline is what the user can act on
+    /// now, classified over the accounts that aren't cooling down; a
+    /// cooling account's read failure is shown per account. A: claude5
+    /// cools with a usage 429, claude6 cools plainly. B: claude5 cools with
+    /// a usage 429, claude2 is not cooling and its login was refused.
+    /// Neither text may claim capacity is "not used up" or that sending
+    /// again now retries anything.
+    #[tokio::test]
+    async fn classified_cooling_429_headlines_tell_what_can_be_done_now() {
+        let now = crate::epoch_millis();
+        let t5 = now + 30 * 60 * 1000;
+        let t6 = now + 2 * 60 * 60 * 1000;
+        let t5_text = super::super::anthropic_quota::describe_reset_utc(t5, now);
+        let c5_part = format!(
+            "claude5: usage_rate_limited (HTTP 429, retry after 90s, cooling down until {t5_text})"
+        );
+
+        let a = classified(
+            &[
+                failed_capacity("claude5", throttled_429(), Some(t5)),
+                cooling_capacity("claude6", t6),
+            ],
+            now,
+        );
+        assert_eq!(a.kind, SK::AllCoolingDown, "{a:?}");
+        let (text, log) = failed_turn_start(no_account(a)).await;
+        for needle in [
+            c5_part.clone(),
+            format!("earliest reset {t5_text}"),
+            format!("send again after {t5_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!lower.contains("send again to retry"), "{text}");
+        assert!(!lower.contains("not used up"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
+
+        let b = classified(
+            &[
+                failed_capacity("claude5", throttled_429(), Some(t5)),
+                failed_capacity(
+                    "claude2",
+                    agent_core::auth::ObservationFailure::new(AK::UsageUnauthorized)
+                        .with_status(401),
+                    None,
+                ),
+            ],
+            now,
+        );
+        assert_eq!(b.kind, SK::CredentialRejected, "{b:?}");
+        let (text, log) = failed_turn_start(no_account(b)).await;
+        for needle in [
+            c5_part,
+            format!("earliest reset {t5_text}"),
+            "claude2 needs a new login: `synaps login --provider anthropic --account claude2`"
+                .to_string(),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!lower.contains("send again to retry"), "{text}");
+        assert!(!lower.contains("not used up"), "{text}");
+        assert!(!lower.contains("no login needed"), "{text}");
+        assert!(
+            turn_warn(&log).contains("kind=credential_rejected"),
+            "{log}"
+        );
+    }
+
+    /// r3: the classified form of
+    /// `all_cooling_with_one_refused_login_names_its_command_and_never_no_login_needed`.
+    #[tokio::test]
+    async fn classified_all_cooling_with_one_refused_login_names_its_command_and_never_no_login_needed(
+    ) {
+        let now = crate::epoch_millis();
+        let soon = now + 20 * 60 * 1000;
+        let later = now + 2 * 60 * 60 * 1000;
+        let f = classified(
+            &[
+                failed_capacity(
+                    "claude2",
+                    agent_core::auth::ObservationFailure::new(AK::UsageUnauthorized)
+                        .with_status(401),
+                    Some(later),
+                ),
+                cooling_capacity("claude6", soon),
+            ],
+            now,
+        );
+        assert_eq!(f.kind, SK::AllCoolingDown, "{f:?}");
+        let (text, log) = failed_turn_start(no_account(f)).await;
+        let soon_text = super::super::anthropic_quota::describe_reset_utc(soon, now);
+        let later_text = super::super::anthropic_quota::describe_reset_utc(later, now);
+        for needle in [
+            format!("claude2: usage_unauthorized (HTTP 401, cooling down until {later_text})"),
+            "claude2 needs a new login: `synaps login --provider anthropic --account claude2`"
+                .to_string(),
+            format!("Send again after {soon_text}."),
+        ] {
+            assert!(text.contains(&needle), "{needle:?} missing from: {text}");
+        }
+        assert!(!text.to_lowercase().contains("no login needed"), "{text}");
+        assert!(!text.contains("--account claude6"), "{text}");
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
+    }
+
+    /// r2 item 7, the case the reviewer found untested: every account is
+    /// cooling AND needs a login or an action, so cooldowns ending fixes
+    /// nothing. The text names each fix and gives no time to send again,
+    /// no retry or "later" advice and no "no login needed".
+    #[tokio::test]
+    async fn classified_all_cooling_and_all_needing_a_fix_names_each_fix_and_no_time_to_retry() {
+        let now = crate::epoch_millis();
+        let hour = 60 * 60 * 1000;
+        let f = classified(
+            &[
+                failed_capacity(
+                    "claude3",
+                    agent_core::auth::ObservationFailure::new(AK::UsageUnauthorized)
+                        .with_status(401),
+                    Some(now + hour),
+                ),
+                failed_capacity(
+                    "claude4",
+                    agent_core::auth::ObservationFailure::new(AK::CredentialStore),
+                    Some(now + 2 * hour),
+                ),
+                failed_capacity(
+                    "claude5",
+                    agent_core::auth::ObservationFailure::new(AK::RefreshActionRequired),
+                    Some(now + 3 * hour),
+                ),
+            ],
+            now,
+        );
+        assert_eq!(f.kind, SK::AllCoolingDown, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, None, "{f:?}");
+        let (text, log) = failed_turn_start(no_account(f)).await;
+        for needle in [
+            "claude3 needs a new login: `synaps login --provider anthropic --account claude3`",
+            "claude4: its stored login could not be read; repair or restore the credential store",
+            "claude5: the token refresh needs an action outside synaps",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        for banned in [
+            "send again",
+            "later",
+            "retry",
+            "no login needed",
+            "earliest reset",
+        ] {
+            assert!(!lower.contains(banned), "{banned:?} in: {text}");
+        }
+        assert!(turn_warn(&log).contains("kind=all_cooling_down"), "{log}");
+    }
+
+    /// S2 c3 condition 1, rendered: every account's chosen-seat refresh was
+    /// refused in one selection (the broker carries each refusal as
+    /// `refresh_rejected`/400). The classified failure names every login
+    /// command, gives no time to send again, no retry or "later" advice and
+    /// no "no login needed". A guard: S1's renderer already does this; the
+    /// core test `every_chosen_accounts_refused_refresh_ends_the_selection_naming_each_login`
+    /// pins the failure the broker builds.
+    #[tokio::test]
+    async fn classified_every_refused_refresh_names_each_login_and_no_time_to_retry() {
+        let now = crate::epoch_millis();
+        let refused = || {
+            agent_core::auth::ObservationFailure::new(AK::RefreshRejected).with_status(400)
+        };
+        let f = classified(
+            &[
+                failed_capacity("claude2", refused(), None),
+                failed_capacity("claude3", refused(), None),
+            ],
+            now,
+        );
+        assert_eq!(f.kind, SK::CredentialRejected, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, None, "{f:?}");
+        let (text, log) = failed_turn_start(no_account(f)).await;
+        for needle in [
+            "claude2: refresh_rejected (HTTP 400)",
+            "claude3: refresh_rejected (HTTP 400)",
+            "claude2, claude3 need a new login: \
+             `synaps login --provider anthropic --account claude2`, \
+             `synaps login --provider anthropic --account claude3`.",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        for banned in [
+            "send again",
+            "later",
+            "retry",
+            "no login needed",
+            "earliest reset",
+        ] {
+            assert!(!lower.contains(banned), "{banned:?} in: {text}");
+        }
+        assert!(
+            turn_warn(&log).contains("kind=credential_rejected"),
+            "{log}"
+        );
+    }
+
+    /// r2 blocker 2: a refresh that needs an action outside synaps, or an
+    /// unreadable store, is named with its remedy, with no "send again"
+    /// retry advice, no "no login needed" and no login command.
+    #[tokio::test]
+    async fn action_required_selection_names_condition_and_remedy_without_retry_or_login_claims() {
+        let mut c5 = account("claude5", AK::CoolingDown);
+        c5.cooling_down = true;
+        let failure = SelectionFailure {
+            kind: SK::ActionRequired,
+            accounts: vec![
+                account("claude3", AK::RefreshActionRequired),
+                account("claude4", AK::CredentialStore),
+                c5,
+            ],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (text, log) = failed_turn_start(no_account(failure)).await;
+        for needle in [
+            "action_required",
+            "claude3: the token refresh needs an action outside synaps",
+            "usage read needs action",
+            "claude4: its stored login could not be read; repair or restore the credential store",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!lower.contains("send again"), "{text}");
+        assert!(!lower.contains("no login needed"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=action_required"));
+    }
+
+    /// r2 blocker 2 / item 5: automatic selection that could not even list
+    /// the accounts (a corrupt or unreadable store) says so, with the store
+    /// remedy instead of blanket login advice.
+    #[tokio::test]
+    async fn an_unreadable_store_in_automatic_selection_gets_store_advice_not_login_advice() {
+        let (text, log) = failed_turn_start(BrokerError::Credential(
+            "Failed to parse /scratch/auth.json: expected value at line 1 column 1".into(),
+        ))
+        .await;
+        for needle in [
+            "credential_store",
+            "Failed to parse /scratch/auth.json",
+            "repair or restore",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        let lower = text.to_lowercase();
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(!lower.contains("send again"), "{text}");
+        assert!(!lower.contains("no login needed"), "{text}");
+        assert!(turn_warn(&log).contains("kind=credential_store"));
+    }
+
+    /// A remote broker's 503 carries no per-account detail: the text points
+    /// at the broker host's log and makes no claim about logins.
+    #[tokio::test]
+    async fn remote_no_capacity_points_at_the_broker_log_without_login_claims() {
+        let (text, log) =
+            failed_turn_start(no_account(SelectionFailure::new(SK::RemoteNoCapacity))).await;
+        assert!(text.contains("remote_no_capacity"), "{text}");
+        assert!(text.contains("broker host"), "{text}");
+        assert!(
+            !text.contains("synaps login") && !text.contains("no login needed"),
+            "{text}"
+        );
+        assert!(turn_warn(&log).contains("kind=remote_no_capacity"));
+    }
+
+    /// The automatically chosen seat's refresh failed transiently: not a
+    /// login problem, and the text says so.
+    #[tokio::test]
+    async fn chosen_seat_transient_refresh_failure_is_not_login_advice() {
+        use agent_core::auth::{RefreshFailure, RefreshFailureKind};
+        let error = BrokerError::Refresh(RefreshFailure::new(
+            RefreshFailureKind::Transient,
+            "token endpoint returned HTTP 503",
+        ));
+        let (text, log) = failed_turn_start(error).await;
+        assert!(text.contains("not a login problem"), "{text}");
+        assert!(
+            text.contains("Send again to retry; no login needed."),
+            "{text}"
+        );
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=refresh_transient"));
+    }
+
+    /// The chosen seat's login was refused: the text keeps the broker's
+    /// account name and exact login command, once, and never says "no
+    /// login needed".
+    #[tokio::test]
+    async fn chosen_seat_refused_login_keeps_the_brokers_exact_login_command() {
+        use agent_core::auth::{RefreshFailure, RefreshFailureKind};
+        let error = BrokerError::Refresh(RefreshFailure::new(
+            RefreshFailureKind::Credential,
+            "account 'claude3': invalid_grant; log it in again with \
+             `synaps login --provider anthropic --account claude3`",
+        ));
+        let (text, log) = failed_turn_start(error).await;
+        assert!(text.contains("account 'claude3'"), "{text}");
+        assert_eq!(text.matches("synaps login").count(), 1, "{text}");
+        assert!(
+            text.contains("`synaps login --provider anthropic --account claude3`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("no login needed") && !text.contains("<label>"),
+            "{text}"
+        );
+        assert!(turn_warn(&log).contains("kind=refresh_rejected"));
+    }
+
+    /// An unreachable broker is not a login problem.
+    #[tokio::test]
+    async fn unreachable_broker_gives_no_login_advice() {
+        let (text, log) =
+            failed_turn_start(BrokerError::Transport("connection refused".into())).await;
+        assert!(text.contains("broker reachability"), "{text}");
+        assert!(text.contains("no login needed"), "{text}");
+        assert!(!text.contains("synaps login"), "{text}");
+        assert!(turn_warn(&log).contains("kind=broker_transport"));
     }
 
     #[test]

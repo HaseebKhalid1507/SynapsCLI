@@ -246,14 +246,16 @@ pub enum SeatVendError {
     /// The slot no longer holds the seat the caller's evidence was about
     /// (re-login, removal, or rotation by another party). Nothing was vended.
     SeatChanged,
-    Other(String),
+    /// The refresh failed; typed so a transient failure is never reported
+    /// as an unusable login.
+    Other(RefreshFailure),
 }
 
 impl std::fmt::Display for SeatVendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SeatChanged => f.write_str(SEAT_CHANGED),
-            Self::Other(e) => f.write_str(e),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }
@@ -294,12 +296,14 @@ impl RefreshFailureKind {
 }
 
 /// A refresh failure: its kind plus a log-safe message (our own texts, or
-/// provider errors that went through the provider's sanitizer). Never
+/// provider errors that went through the provider's sanitizer) and, when
+/// the token endpoint answered with a failure, its HTTP status. Never
 /// carries token material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshFailure {
     pub kind: RefreshFailureKind,
     message: String,
+    http_status: Option<u16>,
 }
 
 impl RefreshFailure {
@@ -307,11 +311,24 @@ impl RefreshFailure {
         Self {
             kind,
             message: message.into(),
+            http_status: None,
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The token endpoint's HTTP status, when it answered with a failure.
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// The same failure carrying `status` (kept when a caller rewords the
+    /// message).
+    pub fn with_http_status(mut self, status: Option<u16>) -> Self {
+        self.http_status = status;
+        self
     }
 }
 
@@ -369,7 +386,7 @@ impl RefreshFailure {
 
     /// The token endpoint answered `status`; see [`status_kind`].
     pub fn status(status: u16, message: impl Into<String>) -> Self {
-        Self::new(status_kind(status), message)
+        Self::new(status_kind(status), message).with_http_status(Some(status))
     }
 
     /// A success status whose body is not a usable token response.
@@ -392,20 +409,23 @@ impl RefreshFailure {
 /// already inspected (e.g. read its usage): the slot must still hold the same
 /// [`SeatIdentity`], checked under the same locks as the refresh, so the
 /// returned token is derived from exactly that seat — never from a
-/// credential that replaced it in between.
-pub async fn ensure_fresh_credential_for_seat(
+/// credential that replaced it in between. `endpoints` are the broker's
+/// refresh test seams. A failure stays typed ([`SeatVendError::Other`]).
+pub(super) async fn ensure_fresh_credential_for_seat(
     client: &Client,
     cred: &CredentialRef,
     expected: &SeatIdentity,
+    endpoints: &RefreshEndpoints,
+    memory: Option<Arc<dyn RefusalMemory>>,
 ) -> std::result::Result<OAuthCredentials, SeatVendError> {
     let path = auth_file_path();
-    ensure_fresh_credential_checked_at(client, cred, &path, Some(expected))
+    ensure_credential_checked_at(client, cred, &path, Some(expected), None, endpoints, memory)
         .await
-        .map_err(|e| {
-            if e == SEAT_CHANGED {
+        .map_err(|f| {
+            if f.message() == SEAT_CHANGED {
                 SeatVendError::SeatChanged
             } else {
-                SeatVendError::Other(e)
+                SeatVendError::Other(f)
             }
         })
 }
@@ -432,6 +452,7 @@ pub(crate) async fn ensure_fresh_credential_checked_at(
         expected_seat,
         None,
         &RefreshEndpoints::default(),
+        None,
     )
     .await
     .map_err(String::from)
@@ -446,18 +467,28 @@ pub(super) async fn recover_rejected_credential(
     rejected: &str,
     endpoints: &RefreshEndpoints,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure> {
-    ensure_credential_checked_at(client, cred, &auth_file_path(), None, Some(rejected), endpoints)
-        .await
+    ensure_credential_checked_at(
+        client,
+        cred,
+        &auth_file_path(),
+        None,
+        Some(rejected),
+        endpoints,
+        None,
+    )
+    .await
 }
 
 /// [`ensure_fresh_credential`] through `endpoints` (the broker's test
-/// seams).
+/// seams), with the slot's refusal `memory` if the caller keeps one.
 pub(super) async fn ensure_fresh_credential_via(
     client: &Client,
     cred: &CredentialRef,
     endpoints: &RefreshEndpoints,
+    memory: Option<Arc<dyn RefusalMemory>>,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure> {
-    ensure_credential_checked_at(client, cred, &auth_file_path(), None, None, endpoints).await
+    ensure_credential_checked_at(client, cred, &auth_file_path(), None, None, endpoints, memory)
+        .await
 }
 
 async fn ensure_credential_checked_at(
@@ -467,6 +498,7 @@ async fn ensure_credential_checked_at(
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
     endpoints: &RefreshEndpoints,
+    memory: Option<Arc<dyn RefusalMemory>>,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     // Cheap pre-check without gate, file lock or task: the common
     // fresh-token path stays a single file read. The locked core re-loads
@@ -487,6 +519,7 @@ async fn ensure_credential_checked_at(
             &path,
             seat.as_ref(),
             rejected.as_deref(),
+            memory.as_deref(),
             |refresh: String| async move {
                 super::provider::refresh_via(client, provider, &refresh, endpoints).await
             },
@@ -591,14 +624,80 @@ fn load_checked(
     Ok(creds)
 }
 
+/// The last token refresh exchange of one credential slot in this process
+/// (`synaps auth state`). `failure: None` = the provider issued a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshExchange {
+    pub at_ms: u64,
+    pub failure: Option<RefreshFailureKind>,
+    /// The token endpoint's HTTP status when it answered with a failure.
+    pub http_status: Option<u16>,
+}
+
+/// Process-wide, keyed by credential file + storage key; written only where
+/// an exchange with a token endpoint actually happened (a fresh-token read,
+/// a peer's rotation found under the lock or a refused forced refresh
+/// records nothing).
+static REFRESH_EXCHANGES: std::sync::Mutex<std::collections::BTreeMap<String, RefreshExchange>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn refresh_exchange_key(path: &Path, storage_key: &str) -> String {
+    format!("{}|{storage_key}", path.display())
+}
+
+fn record_refresh_exchange(path: &Path, storage_key: &str, failure: Option<&RefreshFailure>) {
+    let at_ms = crate::epoch_millis();
+    REFRESH_EXCHANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            refresh_exchange_key(path, storage_key),
+            RefreshExchange {
+                at_ms,
+                failure: failure.map(|f| f.kind),
+                http_status: failure.and_then(RefreshFailure::http_status),
+            },
+        );
+}
+
+/// The last refresh exchange of `storage_key` in the credential file at
+/// `path`, in this process.
+pub fn last_refresh_exchange(path: &Path, storage_key: &str) -> Option<RefreshExchange> {
+    REFRESH_EXCHANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&refresh_exchange_key(path, storage_key))
+        .copied()
+}
+
+/// A slot's memory of refused refreshes (the broker's refused-refresh
+/// hold), consulted and written by the gated refresh under the slot's gate
+/// and lock, after the stored login is re-read. So the check, the exchange
+/// and the record are one serialised decision per slot: a waiter sees the
+/// refusal its predecessor just got and sends nothing, and the record is
+/// of the login that was actually refused. Both calls run inside the
+/// detached refresh task, so a cancelled caller cannot skip the record.
+pub(super) trait RefusalMemory: Send + Sync {
+    /// The held refusal of `creds` (the login re-read under the gate), if
+    /// any; `None` lets the exchange go ahead.
+    fn held(&self, creds: &OAuthCredentials) -> Option<RefreshFailure>;
+    /// The token endpoint exchange of `creds` failed with `failure`. Only
+    /// the exchange's own outcome arrives here: a load, lock or save
+    /// failure (the local credential store) never does.
+    fn refused(&self, creds: &OAuthCredentials, failure: &RefreshFailure);
+}
+
 /// Gate → per-credential cross-process lock → CAS save, plus the forced
 /// refresh rate limit. `refresh` is the provider exchange (injected so the
-/// whole production composition is testable without a network).
+/// whole production composition is testable without a network). Each
+/// exchange's outcome is recorded for `synaps auth state`, and `memory`
+/// (if any) is consulted and told under the gate ([`RefusalMemory`]).
 async fn refresh_credential_locked<Refresh, RFut, RErr>(
     cred: &CredentialRef,
     path: &Path,
     expected_seat: Option<&SeatIdentity>,
     rejected: Option<&str>,
+    memory: Option<&dyn RefusalMemory>,
     refresh: Refresh,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
@@ -607,6 +706,16 @@ where
     RErr: Into<RefreshFailure>,
 {
     let key = cred.storage_key();
+    let refresh = |old_refresh: String| {
+        let exchange = refresh(old_refresh);
+        let key = &key;
+        async move {
+            let result: std::result::Result<OAuthCredentials, RefreshFailure> =
+                exchange.await.map_err(Into::into);
+            record_refresh_exchange(path, key, result.as_ref().err());
+            result
+        }
+    };
     let gate_key = format!("{}|{}", path.display(), key);
     let lock_path = refresh_lock_path(path, &key);
     let load = || load_checked(path, cred, expected_seat);
@@ -639,6 +748,7 @@ where
         rejected,
         |last_refresh_ms| forced_refresh_allowed(cred, last_refresh_ms, crate::epoch_millis()),
         expected_seat.is_none(),
+        memory,
     )
     .await
 }
@@ -1061,14 +1171,26 @@ where
     SFut: std::future::Future<Output = std::result::Result<CasOutcome, RefreshFailure>>,
     MayForce: Fn(Option<u64>) -> std::result::Result<(), RefreshFailure>,
 {
-    ensure_gated_locked_policy_with(gate, lock_path, load, refresh, save, rejected, may_force, false)
-        .await
+    ensure_gated_locked_policy_with(
+        gate,
+        lock_path,
+        load,
+        refresh,
+        save,
+        rejected,
+        may_force,
+        false,
+        None,
+    )
+    .await
 }
 
 /// [`ensure_gated_locked_policy`] plus `serve_parked`: while a parked
 /// sidecar can't be applied, hand out its still-valid ACCESS token (never
 /// its refresh token). Only for callers without a seat expectation: the
-/// parked credential never went through `load`'s seat check.
+/// parked credential never went through `load`'s seat check. `memory`
+/// ([`RefusalMemory`]) is asked before each exchange and told each
+/// exchange failure, under both locks.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_gated_locked_policy_with<Load, Refresh, RFut, RErr, Save, SFut, MayForce>(
     gate: Arc<Mutex<()>>,
@@ -1079,6 +1201,7 @@ async fn ensure_gated_locked_policy_with<Load, Refresh, RFut, RErr, Save, SFut, 
     rejected: Option<&str>,
     may_force: MayForce,
     serve_parked: bool,
+    memory: Option<&dyn RefusalMemory>,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure>
 where
     Load: Fn() -> std::result::Result<OAuthCredentials, RefreshFailure>,
@@ -1130,6 +1253,12 @@ where
         if !expired && !still_rejected {
             return Ok(creds);
         }
+        // A held refusal of exactly this login: no exchange. Checked here,
+        // under both locks and after the re-read, so a waiter sees the
+        // refusal its predecessor just got.
+        if let Some(held) = memory.and_then(|m| m.held(&creds)) {
+            return Err(held);
+        }
         if !expired {
             // Forced (rejection-driven) refresh of an unexpired credential.
             may_force(file_lock.as_ref().and_then(RefreshFileLock::last_refresh_ms))?;
@@ -1137,10 +1266,20 @@ where
         let old_refresh = creds.refresh.clone();
         // The provider exchange is deadline-bounded so the lock hold time is
         // bounded too (a slow-drip response cannot block every other process).
-        let mut fresh = tokio::time::timeout(REFRESH_HTTP_DEADLINE, refresh(old_refresh.clone()))
+        let exchanged = tokio::time::timeout(REFRESH_HTTP_DEADLINE, refresh(old_refresh.clone()))
             .await
-            .map_err(|_| RefreshFailure::new(RefreshFailureKind::Transient, "token refresh timed out"))?
-            .map_err(Into::into)?;
+            .map_err(|_| RefreshFailure::new(RefreshFailureKind::Transient, "token refresh timed out"))?;
+        let mut fresh = match exchanged {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                let failure: RefreshFailure = e.into();
+                // The exchange's own answer, for the login it was about.
+                if let Some(memory) = memory {
+                    memory.refused(&creds, &failure);
+                }
+                return Err(failure);
+            }
+        };
         if fresh.account_id.is_none() {
             fresh.account_id = creds.account_id.clone();
         }
@@ -2205,6 +2344,7 @@ mod rejected_token_tests {
             rejected,
             |_| Ok(()),
             serve_parked,
+            None,
         )
         .await;
         (out, pending_path(&lock).exists(), refreshes.load(Ordering::SeqCst))
@@ -2268,6 +2408,177 @@ mod rejected_token_tests {
         assert!(err.message().contains("no longer exists"), "{err}");
         assert!(kept, "the only live token survives");
         assert_eq!(refreshes, 0);
+    }
+
+    /// A refusal memory that holds every login it was told was refused.
+    #[derive(Default)]
+    struct Memory {
+        told: StdMutex<Vec<(String, RefreshFailure)>>,
+    }
+
+    impl Memory {
+        /// (access token of the refused login, kind) for each record.
+        fn told(&self) -> Vec<(String, RefreshFailureKind)> {
+            let told = self.told.lock().unwrap();
+            told.iter().map(|(access, f)| (access.clone(), f.kind)).collect()
+        }
+    }
+
+    impl RefusalMemory for Memory {
+        fn held(&self, creds: &OAuthCredentials) -> Option<RefreshFailure> {
+            let told = self.told.lock().unwrap();
+            told.iter()
+                .find(|(access, _)| *access == creds.access)
+                .map(|(_, f)| f.clone())
+        }
+
+        fn refused(&self, creds: &OAuthCredentials, failure: &RefreshFailure) {
+            let record = (creds.access.clone(), failure.clone());
+            self.told.lock().unwrap().push(record);
+        }
+    }
+
+    fn expired(access: &str) -> OAuthCredentials {
+        let mut creds = credential(access);
+        creds.expires = 0;
+        creds
+    }
+
+    /// One gated refresh of the login in `stored`; its exchange is refused
+    /// (400) after a short delay. The first exchange replaces the stored
+    /// login with `rotate_to` while it is in flight.
+    async fn refused_refresh(
+        gate: Arc<Mutex<()>>,
+        stored: &StdMutex<OAuthCredentials>,
+        rotate_to: Option<&OAuthCredentials>,
+        exchanges: &AtomicUsize,
+        memory: &Memory,
+    ) -> Result<OAuthCredentials, RefreshFailure> {
+        ensure_gated_locked_policy_with(
+            gate,
+            None,
+            || Ok(stored.lock().unwrap().clone()),
+            |_| {
+                if exchanges.fetch_add(1, Ordering::SeqCst) == 0 {
+                    if let Some(next) = rotate_to {
+                        *stored.lock().unwrap() = next.clone();
+                    }
+                }
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Err::<OAuthCredentials, _>(RefreshFailure::status(400, "invalid_grant"))
+                }
+            },
+            |_: &str, _: &OAuthCredentials| std::future::ready(Ok(CasOutcome::Saved)),
+            None,
+            |_| Ok(()),
+            false,
+            Some(memory as &dyn RefusalMemory),
+        )
+        .await
+    }
+
+    /// s2-r1 blocker 1, at the gate: a second caller of the slot waits while
+    /// the first one's exchange is refused, then re-reads the login under
+    /// the gate, finds that refusal and sends nothing.
+    #[tokio::test]
+    async fn a_waiter_takes_its_predecessors_refusal_without_an_exchange() {
+        let gate = Arc::new(Mutex::new(()));
+        let stored = StdMutex::new(expired("old-access"));
+        let (exchanges, memory) = (AtomicUsize::new(0), Memory::default());
+        let (first, second) = tokio::join!(
+            refused_refresh(gate.clone(), &stored, None, &exchanges, &memory),
+            refused_refresh(gate.clone(), &stored, None, &exchanges, &memory),
+        );
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1, "one exchange");
+        for out in [first, second] {
+            let err = out.unwrap_err();
+            assert_eq!(err.kind, RefreshFailureKind::Credential, "{err}");
+            assert_eq!(err.http_status(), Some(400), "{err}");
+        }
+        assert_eq!(
+            memory.told(),
+            vec![("old-access".to_string(), RefreshFailureKind::Credential)]
+        );
+    }
+
+    /// s2-r1 backlog 1: the record is of the login actually refused. The
+    /// stored login changes while the first exchange is in flight; the
+    /// waiter re-reads the new login, which nothing holds, so it is
+    /// exchanged once and its refusal recorded for it; a third call is held.
+    #[tokio::test]
+    async fn the_refusal_is_recorded_for_the_login_read_under_the_gate() {
+        let gate = Arc::new(Mutex::new(()));
+        let stored = StdMutex::new(expired("old-access"));
+        let rotated = expired("rotated-access");
+        let (exchanges, memory) = (AtomicUsize::new(0), Memory::default());
+        let (first, second) = tokio::join!(
+            refused_refresh(gate.clone(), &stored, Some(&rotated), &exchanges, &memory),
+            refused_refresh(gate.clone(), &stored, Some(&rotated), &exchanges, &memory),
+        );
+        first.unwrap_err();
+        second.unwrap_err();
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+        let refused = RefreshFailureKind::Credential;
+        assert_eq!(
+            memory.told(),
+            vec![
+                ("old-access".to_string(), refused),
+                ("rotated-access".to_string(), refused),
+            ]
+        );
+        refused_refresh(gate, &stored, None, &exchanges, &memory)
+            .await
+            .unwrap_err();
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2, "the new login is held");
+    }
+
+    /// s2-r1 backlog 2: only the exchange's own failure reaches the memory.
+    /// A corrupt store at the re-read (ActionRequired) and a failed save
+    /// after a good exchange (Credential) are local store failures, never
+    /// recorded as refusals.
+    #[tokio::test]
+    async fn store_failures_never_reach_the_refusal_memory() {
+        let memory = Memory::default();
+        let corrupt = ensure_gated_locked_policy_with(
+            Arc::new(Mutex::new(())),
+            None,
+            || {
+                Err::<OAuthCredentials, RefreshFailure>(
+                    StoreError::Corrupt("auth.json is not valid JSON".into()).into(),
+                )
+            },
+            |_| async { Ok::<_, String>(credential("never")) },
+            |_: &str, _: &OAuthCredentials| std::future::ready(Ok(CasOutcome::Saved)),
+            None,
+            |_| Ok(()),
+            false,
+            Some(&memory as &dyn RefusalMemory),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(corrupt.kind, RefreshFailureKind::ActionRequired, "{corrupt}");
+
+        let stale = expired("old-access");
+        let unsaved = ensure_gated_locked_policy_with(
+            Arc::new(Mutex::new(())),
+            None,
+            || Ok(stale.clone()),
+            |_| async { Ok::<_, String>(credential("rotated")) },
+            |_: &str, _: &OAuthCredentials| {
+                std::future::ready(Err::<CasOutcome, RefreshFailure>(
+                    StoreError::Failed("disk full".into()).into(),
+                ))
+            },
+            None,
+            |_| Ok(()),
+            false,
+            Some(&memory as &dyn RefusalMemory),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unsaved.kind, RefreshFailureKind::Credential, "{unsaved}");
+        assert!(memory.told().is_empty(), "{:?}", memory.told());
     }
 
     /// A store that vanishes between the provider exchange and the save
@@ -2581,7 +2892,7 @@ mod rejected_token_tests {
         rejected: &str,
         calls: &AtomicUsize,
     ) -> Result<OAuthCredentials, String> {
-        refresh_credential_locked(cred, path, None, Some(rejected), |old| async move {
+        refresh_credential_locked(cred, path, None, Some(rejected), None, |old| async move {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             Ok::<_, String>(OAuthCredentials {
                 auth_type: "oauth".into(),
@@ -2617,6 +2928,44 @@ mod rejected_token_tests {
         // Account b: a's refresh stamped only a's lock file.
         forced(&path, &b, "b-rejected", &calls).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "b has its own cooldown");
+    }
+
+    /// `synaps auth state` sees each slot's last refresh exchange: its kind
+    /// when the provider refused, none when it issued a token. A forced
+    /// refresh refused by the cooldown is no exchange, and a slot's record
+    /// is its own.
+    #[tokio::test]
+    async fn refresh_exchanges_are_recorded_per_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let (a, b) = (account("a"), account("b"));
+        seed_old(&path, &[(&a, "a-rejected"), (&b, "b-rejected")]);
+        let key = a.storage_key();
+        assert_eq!(last_refresh_exchange(&path, &key), None);
+
+        let refuse = |_old: String| async {
+            Err::<OAuthCredentials, _>(RefreshFailure::status(503, "token endpoint answered 503"))
+        };
+        let err = refresh_credential_locked(&a, &path, None, Some("a-rejected"), None, refuse)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, RefreshFailureKind::Transient);
+        let failed = last_refresh_exchange(&path, &key).expect("failed exchange recorded");
+        assert_eq!(failed.failure, Some(RefreshFailureKind::Transient));
+        // r2 item 8: the HTTP status the token endpoint answered is kept.
+        assert_eq!(failed.http_status, Some(503));
+
+        let calls = AtomicUsize::new(0);
+        let first = forced(&path, &a, "a-rejected", &calls).await.unwrap();
+        let ok = last_refresh_exchange(&path, &key).expect("exchange recorded");
+        assert_eq!(ok.failure, None);
+        assert_eq!(ok.http_status, None);
+        assert!(ok.at_ms >= failed.at_ms);
+
+        forced(&path, &a, &first.access, &calls).await.unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the cooldown refused it");
+        assert_eq!(last_refresh_exchange(&path, &key), Some(ok));
+        assert_eq!(last_refresh_exchange(&path, &b.storage_key()), None);
     }
 
     /// What another synaps process leaves behind after refreshing `cred`:

@@ -1277,8 +1277,8 @@ impl ApiMethods {
         router: &dyn super::anthropic_quota::AnthropicAccountRouter,
     ) -> Result<Value> {
         use super::anthropic_quota::{
-            body_prefix, classify_anthropic_429, describe_reset_utc, failover_permitted,
-            ratelimit_header_summary, Anthropic429, AnthropicFailoverGate, QUOTA_PROBE_BODY_CAP,
+            body_prefix, classify_anthropic_429, failover_permitted, ratelimit_header_summary,
+            Anthropic429, AnthropicFailoverGate, LimitText, NoHop, QUOTA_PROBE_BODY_CAP,
         };
         // Provider qualification is application identity; Anthropic's wire API
         // still receives its native bare model id.
@@ -1512,11 +1512,14 @@ impl ApiMethods {
         // this request — the strict, fail-closed reading of "nothing has been
         // streamed" that the hop requires (no cross-account replay).
         // `tool_activity`: an earlier attempt produced a tool_use block.
-        // `anthropic_failovers`: hops spent on this request (≤ 1).
+        // `anthropic_failovers`: hops spent on this request (a backstop).
+        // `anthropic_attempted`: every account this request used, in order
+        // (the pinned one, then each hop's); a hop never goes back to one.
         // `quota_headers_logged`: the one-time schema-capture warn fired.
         let mut output_started = false;
         let mut tool_activity = false;
         let mut anthropic_failovers: u32 = 0;
+        let mut anthropic_attempted: Vec<crate::auth::CredentialRef> = Vec::new();
         let mut quota_headers_logged = false;
 
         loop {
@@ -1737,8 +1740,6 @@ impl ApiMethods {
                                         )
                                     };
                                     let auto = router.auto_selected();
-                                    let until_ms = evidence.cooldown_until_ms(now_ms).unwrap_or(now_ms);
-                                    let until = describe_reset_utc(until_ms, now_ms);
                                     let label = seat
                                         .as_ref()
                                         .map(|s| s.account.label_str().to_string())
@@ -1763,39 +1764,69 @@ impl ApiMethods {
                                         failovers_so_far: anthropic_failovers,
                                     };
                                     let mut hop = None;
+                                    // Why there is no hop, when there isn't one.
+                                    // An unbound request never switches.
+                                    let mut no_hop = NoHop::Explicit;
                                     if let Some(seat) = seat.as_ref() {
+                                        // The exhausted account goes last in the
+                                        // attempted set (once).
+                                        anthropic_attempted.retain(|c| c != seat);
+                                        anthropic_attempted.push(seat.clone());
                                         match failover_permitted(&gate) {
                                             Ok(()) => {
-                                                match await_or_cancel(cancel, router.failover(model, seat))
-                                                    .await?
+                                                match await_or_cancel(
+                                                    cancel,
+                                                    router.failover(model, &anthropic_attempted),
+                                                )
+                                                .await?
                                                 {
-                                                    Ok(Some(next)) if next.credential != *seat => {
+                                                    Ok(Some(next))
+                                                        if !anthropic_attempted
+                                                            .contains(&next.credential) =>
+                                                    {
                                                         hop = Some(next);
                                                     }
-                                                    Ok(_) => tracing::info!(
-                                                        account = %seat,
-                                                        "anthropic window exhausted; no distinct account with capacity"
-                                                    ),
-                                                    Err(e) => tracing::warn!(
-                                                        account = %seat,
-                                                        error = %e,
-                                                        "anthropic failover candidate resolution failed; not switching"
-                                                    ),
+                                                    Ok(_) => {
+                                                        no_hop = NoHop::NoOtherAccount;
+                                                        tracing::info!(
+                                                            account = %seat,
+                                                            attempted = anthropic_attempted.len(),
+                                                            "anthropic window exhausted; no account this request hasn't used has capacity"
+                                                        )
+                                                    }
+                                                    Err(e) => {
+                                                        no_hop = NoHop::LookupFailed;
+                                                        tracing::warn!(
+                                                            account = %seat,
+                                                            error = %e,
+                                                            "anthropic failover candidate resolution failed; not switching"
+                                                        )
+                                                    }
                                                 }
                                             }
-                                            Err(reason) => tracing::info!(
-                                                account = %seat,
-                                                reason,
-                                                "anthropic window exhausted; account failover not permitted"
-                                            ),
+                                            Err(refusal) => {
+                                                no_hop = NoHop::from_refusal(refusal);
+                                                tracing::info!(
+                                                    account = %seat,
+                                                    reason = refusal.label(),
+                                                    "anthropic window exhausted; account failover not permitted"
+                                                )
+                                            }
                                         }
                                     }
+                                    // Every line about this limit comes from one place.
+                                    let text = LimitText {
+                                        label: &label,
+                                        evidence: &evidence,
+                                        now_ms,
+                                    };
                                     if let Some(next) = hop {
                                         let next_label = next.credential.account.label_str().to_string();
                                         tracing::warn!(
                                             from = %label,
                                             to = %next_label,
-                                            "anthropic window exhausted; switching account (one-time failover, no output replayed)"
+                                            hop = anthropic_failovers + 1,
+                                            "anthropic window exhausted; switching account (no output replayed)"
                                         );
                                         if let Some(t) = tracer.as_mut() {
                                             t.attempt_failed(
@@ -1807,12 +1838,12 @@ impl ApiMethods {
                                                 "account_failover",
                                             );
                                         }
-                                        // The ONE sanctioned mid-turn re-pin: bind the
-                                        // new seat exactly as the refresh path does, then
-                                        // rebuild the header from it (same as the 401
-                                        // path). The failed seat's token is still valid —
-                                        // only its capacity is spent — so no cache
-                                        // invalidation is needed.
+                                        // The sanctioned mid-turn re-pin (one per hop):
+                                        // bind the new seat exactly as the refresh path
+                                        // does, then rebuild the header from it (same as
+                                        // the 401 path). The failed seat's token is still
+                                        // valid — only its capacity is spent — so no
+                                        // cache invalidation is needed.
                                         await_or_cancel(
                                             cancel,
                                             super::auth::AuthMethods::bind_pinned(
@@ -1831,36 +1862,27 @@ impl ApiMethods {
                                         auth_header_value = v;
                                         auth_binding = binding;
                                         anthropic_failovers += 1;
-                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
-                                            "⚠ {label} exhausted until {until} — switching to {next_label}"
-                                        ))));
+                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                            text.hop(&next_label),
+                                        )));
                                         // Retry immediately on the new seat WITHOUT
                                         // consuming a 429 retry slot.
                                         continue;
                                     }
-                                    // No hop. Say why the wait is what it is, then either
-                                    // end the turn now (a reset hours away must not burn
-                                    // the whole 429 budget a minute at a time) or keep
-                                    // the existing retry path for short/unknown resets.
-                                    let notice = if auto {
-                                        format!("⚠ {label} exhausted until {until}; next turn will use another account")
-                                    } else {
-                                        format!("⚠ account limit reached until {until}")
-                                    };
-                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                                    // No hop. Say why, then either end the turn now
+                                    // (a reset hours away must not burn the whole 429
+                                    // budget a minute at a time) or keep the existing
+                                    // retry path for short/unknown resets. No text
+                                    // claims another account will serve.
+                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                        text.no_hop(no_hop),
+                                    )));
                                     if evidence.reset_is_long(now_ms) {
                                         if let Some(t) = tracer.take() {
                                             let terminal = t.failed_terminal("quota_exhausted");
                                             t.finish(clock, Some(429), trace_rid, None, None, terminal);
                                         }
-                                        let advice = if auto {
-                                            "The next turn will select another account."
-                                        } else {
-                                            "Wait for the reset, or switch accounts with `synaps auth use --provider anthropic --account <label|auto>`."
-                                        };
-                                        return Err(RuntimeError::ApiStatus(format!(
-                                            "Anthropic usage limit reached on account '{label}' — window resets at {until}. {advice}"
-                                        )));
+                                        return Err(RuntimeError::ApiStatus(text.terminal(no_hop)));
                                     }
                                 }
                             }
@@ -5121,20 +5143,25 @@ mod anthropic_failover_tests {
         }
     }
 
-    /// Scripted router: fixed selector mode, fixed failover answer, records
-    /// every report and failover request.
+    /// Scripted router: fixed selector mode, scripted failover answers (one
+    /// per lookup; the last one repeats), records every report and every
+    /// lookup with the accounts it was told to avoid.
     struct ScriptedRouter {
         auto: bool,
-        answer: Result<Option<PinnedToken>, String>,
+        answers: Mutex<Vec<Result<Option<PinnedToken>, String>>>,
         reports: Mutex<Vec<(CredentialRef, AnthropicQuotaEvidence)>>,
-        failovers: Mutex<Vec<(String, CredentialRef)>>,
+        failovers: Mutex<Vec<(String, Vec<CredentialRef>)>>,
     }
 
     impl ScriptedRouter {
         fn new(auto: bool, answer: Result<Option<PinnedToken>, String>) -> Self {
+            Self::scripted(auto, vec![answer])
+        }
+        fn scripted(auto: bool, answers: Vec<Result<Option<PinnedToken>, String>>) -> Self {
+            assert!(!answers.is_empty(), "a router needs at least one answer");
             Self {
                 auto,
-                answer,
+                answers: Mutex::new(answers),
                 reports: Mutex::new(Vec::new()),
                 failovers: Mutex::new(Vec::new()),
             }
@@ -5142,7 +5169,7 @@ mod anthropic_failover_tests {
         fn reports(&self) -> Vec<(CredentialRef, AnthropicQuotaEvidence)> {
             self.reports.lock().unwrap().clone()
         }
-        fn failovers(&self) -> Vec<(String, CredentialRef)> {
+        fn failovers(&self) -> Vec<(String, Vec<CredentialRef>)> {
             self.failovers.lock().unwrap().clone()
         }
     }
@@ -5165,13 +5192,18 @@ mod anthropic_failover_tests {
         async fn failover(
             &self,
             model: &str,
-            failed: &CredentialRef,
+            attempted: &[CredentialRef],
         ) -> Result<Option<PinnedToken>, String> {
             self.failovers
                 .lock()
                 .unwrap()
-                .push((model.to_string(), failed.clone()));
-            self.answer.clone()
+                .push((model.to_string(), attempted.to_vec()));
+            let mut answers = self.answers.lock().unwrap();
+            if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers[0].clone()
+            }
         }
     }
 
@@ -5278,10 +5310,10 @@ mod anthropic_failover_tests {
             AnthropicQuotaSignal::UnifiedStatusRejected
         );
         assert!(reports[0].1.resets_at_ms.is_some());
-        // One failover request, for the bare model id, naming the failed seat.
+        // One failover request, for the bare model id, told the failed seat.
         assert_eq!(
             router.failovers(),
-            vec![("claude-haiku-4-5".to_string(), seat("claude4"))]
+            vec![("claude-haiku-4-5".to_string(), vec![seat("claude4")])]
         );
         // The turn is now pinned to the new seat (mid-turn rounds keep it).
         let g = auth.read().await;
@@ -5293,7 +5325,7 @@ mod anthropic_failover_tests {
         assert!(
             out.notices
                 .iter()
-                .any(|n| n.starts_with("⚠ claude4 exhausted until ")
+                .any(|n| n.starts_with("⚠ claude4 is at a usage limit until ")
                     && n.ends_with(" — switching to claude2")),
             "notices: {:?}",
             out.notices
@@ -5324,7 +5356,15 @@ mod anthropic_failover_tests {
             msg.contains("usage limit reached on account 'claude4'"),
             "{msg}"
         );
-        assert!(msg.contains("next turn will select another account"), "{msg}");
+        // True text: nothing claims another account will serve.
+        assert!(
+            msg.contains(
+                "Output had already streamed, so this request could not switch accounts; \
+                 send again to select an account for the next turn."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("will select another account"), "{msg}");
         assert_no_body_leak(&msg, "error");
         assert_eq!(upstream.calls(), 2, "no third call on another seat");
         assert_eq!(router.reports().len(), 1, "cooldown still reported");
@@ -5332,16 +5372,25 @@ mod anthropic_failover_tests {
         assert!(router.failovers().is_empty(), "gate must veto the lookup");
         // Seat unchanged.
         assert_eq!(auth.read().await.auth_token, "tok-claude4");
-        assert!(out
-            .notices
-            .iter()
-            .any(|n| n.starts_with("⚠ claude4 exhausted until ")
-                && n.ends_with("; next turn will use another account")));
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.starts_with("⚠ claude4 is at a usage limit until ")
+                    && n.ends_with(
+                        "; output already streamed, so this request can't switch accounts"
+                    )),
+            "{:?}",
+            out.notices
+        );
     }
 
+    /// Each account at most once per logical request: after claude4 and then
+    /// claude2 are exhausted, the second lookup (told both) names claude2
+    /// again. That is refused, and the turn ends saying no other account has
+    /// proven capacity, not that the next turn will find one.
     #[tokio::test]
     #[serial_test::serial(anthropic_429_log_capture)]
-    async fn two_rejected_429s_hop_once_then_end_the_turn() {
+    async fn two_exhausted_accounts_and_no_other_end_the_turn_saying_so() {
         let upstream = spawn_upstream(vec![
             Reply::Rejected429 { reset_in_secs: 3 * 3600 },
             Reply::Rejected429 { reset_in_secs: 5 * 3600 },
@@ -5354,15 +5403,226 @@ mod anthropic_failover_tests {
 
         let msg = out.result.expect_err("second exhaustion is terminal").to_string();
         assert!(msg.contains("account 'claude2'"), "{msg}");
+        assert!(
+            msg.contains(
+                "No other account has proven capacity now; \
+                 `synaps auth state --provider anthropic` shows each account's state."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("will select another account"), "{msg}");
         assert_eq!(upstream.calls(), 2);
         assert_eq!(
             upstream.auth_seen(),
             vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude2".to_string()]
         );
-        // Both seats were reported; only one hop was attempted.
         let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
         assert_eq!(reported, vec![seat("claude4"), seat("claude2")]);
-        assert_eq!(router.failovers().len(), 1);
+        assert_eq!(
+            router.failovers(),
+            vec![
+                ("claude-haiku-4-5".to_string(), vec![seat("claude4")]),
+                (
+                    "claude-haiku-4-5".to_string(),
+                    vec![seat("claude4"), seat("claude2")]
+                ),
+            ],
+            "a second lookup, told every account this request used"
+        );
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.starts_with("⚠ claude2 is at a usage limit until ")
+                    && n.ends_with("; no other account has proven capacity now")),
+            "{:?}",
+            out.notices
+        );
+    }
+
+    /// Each account at most once per logical request, under the same
+    /// output/tool gates: claude4 and then claude5 are exhausted before any
+    /// output, and claude2 serves. Two hops, a notice for each, and each
+    /// lookup is told every account already tried.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn pre_output_exhaustion_hops_through_each_account_once_until_one_serves() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+            Reply::Rejected429 {
+                reset_in_secs: 5 * 3600,
+            },
+            Reply::SseOk,
+        ])
+        .await;
+        let router = ScriptedRouter::scripted(
+            true,
+            vec![Ok(Some(pinned("claude5"))), Ok(Some(pinned("claude2")))],
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let value = out.result.expect("claude2 serves the request");
+        assert_eq!(value["content"][0]["text"], "hi");
+        assert_eq!(
+            upstream.auth_seen(),
+            vec![
+                "Bearer tok-claude4".to_string(),
+                "Bearer tok-claude5".to_string(),
+                "Bearer tok-claude2".to_string()
+            ]
+        );
+        let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
+        assert_eq!(reported, vec![seat("claude4"), seat("claude5")]);
+        assert_eq!(
+            router.failovers(),
+            vec![
+                ("claude-haiku-4-5".to_string(), vec![seat("claude4")]),
+                (
+                    "claude-haiku-4-5".to_string(),
+                    vec![seat("claude4"), seat("claude5")]
+                ),
+            ]
+        );
+        assert_eq!(auth.read().await.auth_token, "tok-claude2");
+        for (from, to) in [("claude4", "claude5"), ("claude5", "claude2")] {
+            assert!(
+                out.notices
+                    .iter()
+                    .any(|n| n.starts_with(&format!("⚠ {from} is at a usage limit until "))
+                        && n.ends_with(&format!(" — switching to {to}"))),
+                "{from} -> {to}: {:?}",
+                out.notices
+            );
+        }
+    }
+
+    /// A lookup that names an account this request already used is refused:
+    /// no request goes back to it, and the turn ends on the account that was
+    /// exhausted last.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_hop_never_returns_to_an_account_already_tried_on_this_request() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+            Reply::Rejected429 {
+                reset_in_secs: 5 * 3600,
+            },
+            Reply::SseOk,
+        ])
+        .await;
+        let router = ScriptedRouter::scripted(
+            true,
+            vec![Ok(Some(pinned("claude5"))), Ok(Some(pinned("claude4")))],
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out
+            .result
+            .expect_err("claude4 was already tried; no other account")
+            .to_string();
+        assert!(msg.contains("account 'claude5'"), "{msg}");
+        assert!(
+            msg.contains("No other account has proven capacity now"),
+            "{msg}"
+        );
+        assert_eq!(upstream.calls(), 2, "never back to claude4");
+        assert_eq!(router.failovers().len(), 2);
+        assert_eq!(
+            router.failovers()[1].1,
+            vec![seat("claude4"), seat("claude5")]
+        );
+        assert_eq!(auth.read().await.auth_token, "tok-claude5");
+    }
+
+    /// A router that keeps naming accounts never tried before still stops:
+    /// the backstop bounds the hops of one request.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_router_naming_new_accounts_forever_stops_at_the_hop_backstop() {
+        let max = crate::runtime::anthropic_quota::MAX_ANTHROPIC_ACCOUNT_FAILOVERS as usize;
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600
+            };
+            max + 1
+        ])
+        .await;
+        let answers = (0..max + 4)
+            .map(|i| Ok(Some(pinned(&format!("spare{i}")))))
+            .collect();
+        let router = ScriptedRouter::scripted(true, answers);
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out
+            .result
+            .expect_err("the backstop ends the turn")
+            .to_string();
+        assert!(
+            msg.contains(&format!(
+                "Stopped after {max} account switches on this request; \
+                 `synaps auth state --provider anthropic` shows each account's state."
+            )),
+            "{msg}"
+        );
+        assert_eq!(upstream.calls(), max + 1);
+        assert_eq!(router.failovers().len(), max);
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.ends_with("; no more account switches on this request")),
+            "{:?}",
+            out.notices
+        );
+    }
+
+    /// The hop rules don't loosen the output gate: once this request has
+    /// streamed output, a later exhaustion reports the cooldown but never
+    /// switches accounts.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_later_hop_is_refused_once_output_streamed_on_this_request() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+        ])
+        .await;
+        let router = ScriptedRouter::scripted(
+            true,
+            vec![Ok(Some(pinned("claude5"))), Ok(Some(pinned("claude2")))],
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 1).await;
+
+        let msg = out.result.expect_err("no hop after output").to_string();
+        assert!(
+            msg.contains("usage limit reached on account 'claude5'"),
+            "{msg}"
+        );
+        assert!(msg.contains("Output had already streamed"), "{msg}");
+        assert_eq!(upstream.calls(), 3, "no fourth call on claude2");
+        assert_eq!(
+            router.failovers().len(),
+            1,
+            "the gate vetoed the second lookup"
+        );
+        let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
+        assert_eq!(reported, vec![seat("claude4"), seat("claude5")]);
+        assert_eq!(auth.read().await.auth_token, "tok-claude5");
     }
 
     #[tokio::test]
@@ -5390,7 +5650,24 @@ mod anthropic_failover_tests {
     #[tokio::test]
     #[serial_test::serial(anthropic_429_log_capture)]
     async fn same_seat_back_or_no_candidate_never_loops() {
-        for answer in [Ok(None), Ok(Some(pinned("claude4"))), Err("broker down".to_string())] {
+        for (answer, advice, notice) in [
+            (
+                Ok(None),
+                "No other account has proven capacity now",
+                "; no other account has proven capacity now",
+            ),
+            (
+                Ok(Some(pinned("claude4"))),
+                "No other account has proven capacity now",
+                "; no other account has proven capacity now",
+            ),
+            (
+                Err("broker down".to_string()),
+                "Looking up another account failed; \
+                 `synaps auth state --provider anthropic` shows each account's state.",
+                "; looking up another account failed",
+            ),
+        ] {
             let upstream =
                 spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
             let router = ScriptedRouter::new(true, answer);
@@ -5398,12 +5675,65 @@ mod anthropic_failover_tests {
 
             let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
 
-            assert!(out.result.is_err());
+            let msg = out.result.expect_err("no other account").to_string();
+            assert!(msg.contains(advice), "{msg}");
+            assert!(!msg.contains("will select another account"), "{msg}");
+            assert!(
+                out.notices.iter().any(|n| n.ends_with(notice)),
+                "{notice}: {:?}",
+                out.notices
+            );
             assert_eq!(upstream.calls(), 1, "no retry on the exhausted seat");
             assert_eq!(router.reports().len(), 1);
             assert_eq!(router.failovers().len(), 1);
             assert_eq!(auth.read().await.auth_token, "tok-claude4");
         }
+    }
+
+    /// A long wait on a 429 with no usage-limit header is not called a usage
+    /// limit: the notice and the error say it is a rate limit, and how we
+    /// know.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_long_wait_without_a_usage_limit_header_is_called_a_rate_limit() {
+        let upstream = spawn_upstream(vec![Reply::Plain429 {
+            retry_after: 3 * 3600,
+        }])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(None));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out.result.expect_err("a long wait is terminal").to_string();
+        assert!(
+            msg.contains("Anthropic rate limit on account 'claude4' until "),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "(HTTP 429 with a long wait, not a declared usage limit). \
+                 No other account has proven capacity now"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("usage limit reached"), "{msg}");
+        assert_no_body_leak(&msg, "error");
+        assert_eq!(upstream.calls(), 1);
+        let reports = router.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].1.signal,
+            AnthropicQuotaSignal::LongResetWithRateLimitBody
+        );
+        assert!(
+            out.notices.iter().any(|n| n.starts_with("⚠ claude4 is rate-limited until ")
+                && n.ends_with(
+                    "(HTTP 429, no usage-limit header); no other account has proven capacity now"
+                )),
+            "{:?}",
+            out.notices
+        );
     }
 
     #[tokio::test]

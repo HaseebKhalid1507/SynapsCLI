@@ -43,6 +43,22 @@ pub struct Pong {
     pub sessions: usize,
 }
 
+/// What `synaps auth state` got from the daemon.
+#[derive(Debug)]
+pub enum AuthStateReply {
+    Report(agent_core::auth::AuthStateReport),
+    /// The daemon predates `AuthState`: it answered the frame the way an
+    /// old daemon answers any frame it cannot decode. Its version and build
+    /// (empty when the daemon does not report one), from its `Welcome`.
+    DaemonPredates { daemon_version: String, daemon_build: String },
+}
+
+/// An old daemon's reply to `AuthState` (daemon/conn.rs `Read::Bad`: serde's
+/// unknown-variant error behind "malformed frame: "), and nothing else.
+pub fn predates_auth_state(message: &str) -> bool {
+    message.starts_with("malformed frame: unknown variant `auth_state`")
+}
+
 /// Reused line buffer for `read_frame`: a big `Attached`/`MessageHistory`
 /// frame grows it once; after any frame > 1 MiB it shrinks back to 64 KiB so
 /// the peak is not retained for the life of the connection (§2.1 #1).
@@ -182,6 +198,23 @@ impl Connected {
             DaemonFrame::Pong { pid, uptime_s, sessions } => Ok(Pong { pid, uptime_s, sessions }),
             DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
             other => Err(TransportError::Protocol(format!("expected pong, got {other:?}"))),
+        }
+    }
+
+    /// `AuthState` → the daemon broker's in-memory account state. A daemon
+    /// that predates the frame is [`AuthStateReply::DaemonPredates`]; any
+    /// other error is returned as itself.
+    pub async fn auth_state(&mut self, query: agent_core::auth::AuthStateQuery) -> Result<AuthStateReply, TransportError> {
+        match self.request(ClientFrame::AuthState(query)).await? {
+            DaemonFrame::AuthState { report } => Ok(AuthStateReply::Report(report)),
+            DaemonFrame::Error { session_id: None, message } if predates_auth_state(&message) => {
+                Ok(AuthStateReply::DaemonPredates {
+                    daemon_version: self.welcome.daemon_version.clone(),
+                    daemon_build: self.welcome.daemon_build.clone(),
+                })
+            }
+            DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
+            other => Err(TransportError::Protocol(format!("expected auth state, got {other:?}"))),
         }
     }
 
@@ -386,6 +419,14 @@ impl SocketTransport {
         let p = c.purge().await;
         c.bye().await;
         p
+    }
+
+    /// `AuthState` on a control connection (see [`Connected::auth_state`]).
+    pub async fn auth_state(path: &Path, query: agent_core::auth::AuthStateQuery) -> Result<AuthStateReply, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let reply = c.auth_state(query).await;
+        c.bye().await;
+        reply
     }
 
     /// `Reload{..}` on a control connection. `Ok(generation)` once the daemon
@@ -841,6 +882,48 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("d.sock");
         (d, p)
+    }
+
+    /// A daemon built before `AuthState` decodes the frame into a
+    /// `ClientFrame` without that variant, fails, and answers
+    /// `format!("malformed frame: {e}")` (daemon/conn.rs `Read::Bad`). That
+    /// reply, and no other error, means "the daemon predates auth state".
+    #[test]
+    fn predates_auth_state_matches_an_old_daemons_decode_error_and_nothing_else() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code, clippy::large_enum_variant)]
+        enum OldClientFrame {
+            Hello(Hello),
+            Ping,
+            Sessions,
+            Shutdown {
+                #[serde(default)]
+                force: bool,
+            },
+            Purge,
+            Bye,
+        }
+        for query in [
+            agent_core::auth::AuthStateQuery::default(),
+            agent_core::auth::AuthStateQuery { provider: Some("anthropic".into()), account: Some("b".into()), clear: true },
+        ] {
+            let line = encode_line(&ClientFrame::AuthState(query)).unwrap();
+            let err = decode_line::<OldClientFrame>(line.trim_end()).err().expect("an old daemon cannot decode it");
+            let reply = format!("malformed frame: {err}");
+            assert!(predates_auth_state(&reply), "{reply}");
+        }
+        for other in [
+            "auth state: unknown account `zzz`",
+            "malformed frame: expected value at line 1 column 1",
+            "malformed frame: unknown variant `auth_status`, expected one of `hello`, `ping`",
+            "malformed frame: missing field `clear`",
+            "control frames are not accepted on an attached connection",
+            "duplicate hello",
+            "",
+        ] {
+            assert!(!predates_auth_state(other), "{other:?}");
+        }
     }
 
     #[tokio::test]
