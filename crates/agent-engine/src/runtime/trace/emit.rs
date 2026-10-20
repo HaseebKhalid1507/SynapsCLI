@@ -720,6 +720,13 @@ impl RequestTracer {
         }
     }
 
+    /// Attach (or clear) the provider's cache diagnosis for the attempt
+    /// that is about to finish. Set per attempt so a retry never inherits
+    /// the previous attempt's verdict.
+    pub fn set_server_diagnosis(&mut self, diagnosis: Option<super::ServerCacheDiagnosis>) {
+        self.structure.cache.server_diagnosis = diagnosis;
+    }
+
     fn emit_record(&self, outcome: TransportOutcome) {
         let record = RequestTrace {
             schema: TraceSchemaVersion,

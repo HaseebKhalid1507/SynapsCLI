@@ -170,6 +170,13 @@ the preceding failed attempt was already recorded.
   read/write token counts remain in `outcome.usage`. Currently computed on
   the Anthropic Messages path (the only wire that carries cache markers);
   other transports leave the diagnostic fields absent.
+  With `cache_diagnostics = true` the `cache` object may also carry
+  `server_diagnosis`: Anthropic's own verdict for the request, `reason`
+  (`model_changed`/`system_changed`/`tools_changed`/`messages_changed`/
+  `previous_message_not_found`/`unavailable`, `pending` while the server's
+  comparison was still running, `other` for an unknown type) and, for the
+  `*_changed` reasons, `missed_input_tokens`. Absent when the setting is off
+  or the server found no divergence.
 - **`/context`:** metadata-only report (system/tool/history counts+bytes,
   latest cache component change and reuse estimates, writer/degradation
   counters). Skills/memories and — outside history-owning surfaces —

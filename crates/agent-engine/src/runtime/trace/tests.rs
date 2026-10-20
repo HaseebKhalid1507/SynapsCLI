@@ -95,6 +95,7 @@ fn sample_trace(key: &TraceDigestKey) -> RequestTrace {
             system_prefix: None,
             history_tail: None,
             delta: None,
+            server_diagnosis: None,
         },
         translation_losses: vec![TranslationLoss {
             action: TranslationAction::Downgraded,
