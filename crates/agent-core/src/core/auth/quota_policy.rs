@@ -328,6 +328,10 @@ pub enum AccountFailureKind {
     Excluded,
     NotPresent,
     InvalidLabel,
+    /// A kind this build does not know (from a newer daemon). Claims no
+    /// remedy: not transient, not a login, not an action, not limited.
+    #[serde(other)]
+    Unknown,
 }
 
 impl AccountFailureKind {
@@ -359,6 +363,7 @@ impl AccountFailureKind {
             Self::Excluded => "excluded",
             Self::NotPresent => "not_present",
             Self::InvalidLabel => "invalid_label",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -770,6 +775,9 @@ pub enum SelectionFailureKind {
     ActionRequired,
     /// The credential store could not be listed, so no account was read.
     CredentialStore,
+    /// A kind this build does not know (from a newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 impl SelectionFailureKind {
@@ -784,6 +792,7 @@ impl SelectionFailureKind {
             Self::RemoteNoCapacity => "remote_no_capacity",
             Self::ActionRequired => "action_required",
             Self::CredentialStore => "credential_store",
+            Self::Unknown => "unknown",
         }
     }
 }

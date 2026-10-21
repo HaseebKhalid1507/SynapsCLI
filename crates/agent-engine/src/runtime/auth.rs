@@ -663,6 +663,7 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
              outside synaps"
         }
         K::CredentialStore => "the credential store could not be read, so no account was checked",
+        K::Unknown => "the daemon reported a reason this synaps build does not know",
     };
     let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
     if !f.accounts.is_empty() {
