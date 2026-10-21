@@ -544,6 +544,29 @@ async fn a_submit_while_fenced_and_waiting_for_the_hook_is_refused_and_then_wait
     end(&mut f.client).await;
 }
 
+/// While a turn waits for the hook, the client is told why nothing happens
+/// yet: a Quick Start first turn can wait for extension discovery and the
+/// hook for many seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_waiting_for_the_hook_says_so() {
+    let _h = Home::new();
+    let (mut f, hold, _sid, _calls) = fixture_with_a_pending_hook().await;
+    f.client.send(submit("hello again")).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    let waiting = drain_for(&mut f.client, Duration::from_millis(500)).await;
+    assert!(
+        waiting.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n.contains("waiting for extensions")
+        )),
+        "no notice while the turn waits for the hook: {waiting:#?}"
+    );
+    drop(hold);
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut f.client).await;
+}
+
 /// `/clear` while a turn waits for the hook cancels that turn first. Its
 /// request never goes out, neither on the cleared history nor under the new
 /// journal id, and nothing starts once the hook has run.

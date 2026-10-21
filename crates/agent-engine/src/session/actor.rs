@@ -2652,6 +2652,12 @@ impl SessionActor {
         } else {
             tracing::debug!(session = %self.id, "turn waits for on_session_start");
             self.turn_awaiting_start = Some(start);
+            // Quick Start's first turn can wait here for extension discovery
+            // (`startup.extensions_ready_timeout_secs`) and then the hook:
+            // say so, or the silence looks like a hang.
+            self.emit(SessionEventWire::SystemNotice(
+                "waiting for extensions to start (on_session_start) before sending...".into(),
+            ));
         }
     }
 

@@ -313,13 +313,19 @@ fn parse_context_management_config_key(
 /// take effect at the next launch, never mid-session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupConfig {
-    /// Skip blocking on extension discovery before the first turn. When true
-    /// the attach path sets `await_extensions=false` (fast cold start; a tool
-    /// from a slow extension may be unavailable on turn 1). Default: true.
+    /// Create the session without waiting for extensions. When true the
+    /// attach path sets `await_extensions=false`: the session (and the TUI)
+    /// comes up at once, and `on_session_start` runs in the background. The
+    /// first turn starts at once too, but its model request waits until the
+    /// hook has run: for extension discovery (up to
+    /// `extensions_ready_timeout_secs`, default 30 s), then for the hook
+    /// (each handler up to 5 s). Clients are told while it waits. Default: true.
     pub quick_start: bool,
-    /// Max seconds to wait for extension discovery when Quick Start is off.
-    /// Default: 30. It does not bound the session's `on_session_start` call,
-    /// which then waits its turn at the host's one-at-a-time gate.
+    /// Max seconds to wait for extension discovery before a session's
+    /// `on_session_start`: at create when Quick Start is off, before the
+    /// first turn's request when it is on. Default: 30. It does not bound
+    /// the `on_session_start` call itself, which then waits its turn at the
+    /// host's one-at-a-time gate.
     pub extensions_ready_timeout_secs: u64,
 }
 

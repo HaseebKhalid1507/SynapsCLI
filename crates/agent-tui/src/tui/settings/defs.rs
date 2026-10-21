@@ -322,7 +322,7 @@ define_settings! {
         };
 
     "startup.quick_start", "Quick start", Startup, EditorKind::Cycler(&["on", "off"]),
-        "Skip waiting for extensions to finish loading before the first turn (faster startup; a tool from a slow extension may be unavailable on turn 1). Takes effect next launch.",
+        "Start without waiting for extensions to load (faster startup). The first message still waits for extensions to start before it is sent (up to the extensions-ready wait, 30 s by default, plus the extensions' session-start hooks). Takes effect next launch.",
         |_app, value| match value {
             "on" | "off" => SettingApply::Local(Ok(())),
             _ => SettingApply::Local(Err("expected on or off".to_string())),
@@ -330,7 +330,7 @@ define_settings! {
 
     "startup.extensions_ready_timeout_secs", "Extensions-ready wait", Startup,
         EditorKind::Text { numeric: true },
-        "Max seconds to wait for extension discovery when Quick Start is off. Takes effect next launch.",
+        "Max seconds to wait for extension discovery: at startup when Quick Start is off, before the first message is sent when it is on. Takes effect next launch.",
         |_app, value| match value.parse::<u64>() {
             Ok(_) => SettingApply::Local(Ok(())),
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),

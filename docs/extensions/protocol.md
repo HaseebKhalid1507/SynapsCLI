@@ -524,6 +524,15 @@ live in the system prompt):
   period starts only with an accepted request, and that request already
   waited for the hook (only a test seam builds a due ping with the hook
   pending). A manual `/compact` builds its own prompt and does not wait.
+  This is the first turn of every in-process TUI session, and of every
+  daemon TUI session with Quick Start (`startup.quick_start`, on by
+  default): the turn starts at once, but its request waits for
+  extension discovery (up to
+  `startup.extensions_ready_timeout_secs`, 30 s by default) and then for
+  the hook (each subscribed handler up to 5 s, in turn). Clients get a
+  `SystemNotice` ("waiting for extensions to start …") while it waits. A
+  `/clear` (`NewSession`) during that wait cancels the waiting turn first;
+  its request is never sent.
   A session restored Parked runs the hook once it is unparked; a park
   takes a hook not yet called out of line, a park that does not happen
   (held by running or uncollected workers) leaves it in place. While a
