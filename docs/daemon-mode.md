@@ -163,8 +163,9 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
   the session `KeepWarm{on}` with host authority and answers `Pinned{on}` once
   the session applied it (≤ 2 s, ≤ 10 s when pinning a parked session, which
   wakes it). Exit codes: 0 done; 3 refused (daemon reloading, or the session is
-  live in another process: pin it there); 1 no such session, ambiguous, no
-  daemon, timeout; 2 the daemon predates `daemon pin` (`synaps daemon reload`)
+  live in another process: an in-process session has no pin, so quit it there
+  and load it into the daemon with `synaps --attach --continue <id>` first); 1
+  no such session, ambiguous, prefix too short, no daemon, timeout; 2 the daemon predates `daemon pin` (`synaps daemon reload`)
   or a protocol mismatch. `--json` prints `{ok, session_id, outcome, pinned, text}`.
 - Pinning a **parked** session wakes it (a pinned session is live by
   definition); unpinning a parked one leaves it parked.

@@ -36,7 +36,14 @@ pub async fn pin_session(state: &DaemonState, id: &SessionId, on: bool) -> Daemo
     if let Some(holder) = handle.meta().locked_by.clone() {
         return DaemonFrame::Refused {
             reason: RefuseReason::Busy,
-            message: format!("session {sid} is live in another process ({holder}); pin it there"),
+            // Usually an in-process TUI, which has no pin (`/pin` there only
+            // says it applies to daemon sessions): name the way into the
+            // daemon instead of sending the user back to it.
+            message: format!(
+                "session {sid} is live in another process ({holder}), not in this daemon, so there is nothing \
+                 to pin here. Quit it there, then load it into the daemon with `synaps --attach --continue {sid}` \
+                 and pin it with /pin or `synaps daemon pin {sid}`"
+            ),
         };
     }
 

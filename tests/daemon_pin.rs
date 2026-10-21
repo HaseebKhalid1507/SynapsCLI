@@ -112,6 +112,37 @@ async fn stop(d: Daemon, sock: &Path) {
     tokio::time::timeout(Duration::from_secs(20), d.wait()).await.expect("daemon wait");
 }
 
+/// A session whose journal another process holds (F23: a lock placeholder
+/// here) cannot be pinned from this daemon. The holder is usually an
+/// in-process TUI, where `/pin` does nothing, so the refusal must not send
+/// the user there; it says how to get the session into the daemon instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pinning_a_session_live_in_another_process_says_how_to_bring_it_here() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, "never", None).await;
+    let sock = d.paths.sock.clone();
+    let sid = SessionId::from("20261021-090000-lock");
+    let (handle, task) = agent_engine::session::handle::locked_placeholder::spawn(
+        sid.clone(),
+        SessionConfig::default(),
+        "pid 4242 (tui)".into(),
+    );
+    d.state.insert(handle);
+
+    match SocketTransport::pin(&sock, &sid, true).await {
+        Err(TransportError::Refused(m)) => {
+            assert!(m.contains("pid 4242 (tui)"), "names the holder: {m}");
+            assert!(!m.contains("pin it there"), "an in-process /pin does nothing; no dead end: {m}");
+            assert!(m.contains(&format!("synaps --attach --continue {sid}")), "a real next step: {m}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    task.abort();
+    stop(d, &sock).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_pinned_session_is_listed_as_pinned_and_never_parks_until_unpinned() {
