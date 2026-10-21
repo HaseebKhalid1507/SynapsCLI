@@ -440,3 +440,46 @@ async fn a_codex_model_missing_from_the_good_reading_stays_ineligible_under_grac
     );
     assert_eq!(up.hits("acct-x"), 2, "one good read, one held 429");
 }
+
+/// `synaps auth state --clear` is the escape hatch from a held usage read:
+/// it drops the slot's hold (and last good reading), so the next selection
+/// reads usage again at once instead of waiting out the backoff. Clearing
+/// one account leaves the other's hold alone.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_state_clear_releases_a_held_usage_read() {
+    let _home = install(&["a", "b"]);
+    let up = Upstream::default();
+    up.all(&["a", "b"], Answer::Status(503));
+    let url = up.spawn().await;
+    let broker = auto_broker(&url);
+    assert!(chosen(&broker).await.is_err(), "no good reading yet");
+    assert_eq!((up.hits("a"), up.hits("b")), (1, 1));
+
+    up.all(&["a", "b"], URGENT);
+    past_fresh_age().await;
+    assert!(chosen(&broker).await.is_err(), "held: no request inside the hold");
+    assert_eq!((up.hits("a"), up.hits("b")), (1, 1));
+
+    let query = agent_core::auth::AuthStateQuery {
+        provider: Some("anthropic".into()),
+        account: Some("b".into()),
+        clear: true,
+    };
+    broker.auth_state(&query).unwrap();
+    assert_eq!(
+        chosen(&broker).await.expect("the cleared slot reads usage again"),
+        "b"
+    );
+    assert_eq!((up.hits("a"), up.hits("b")), (1, 2), "only the cleared slot was read");
+
+    // Every broker in the process shares the table: a clear through one
+    // releases the hold for all of them.
+    let query = agent_core::auth::AuthStateQuery {
+        provider: Some("anthropic".into()),
+        ..Default::default()
+    };
+    broker.auth_state(&agent_core::auth::AuthStateQuery { clear: true, ..query }).unwrap();
+    assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "a");
+    assert_eq!((up.hits("a"), up.hits("b")), (2, 3));
+}

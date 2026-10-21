@@ -2013,8 +2013,10 @@ impl LocalBroker {
             })
     }
 
-    /// Drop the in-memory state of `creds`: cooldowns, usage readings and
-    /// their gates, `auth state` records and stickiness. With
+    /// Drop the in-memory state of `creds`: cooldowns, cached usage
+    /// readings, held usage-read failures and last good readings in the
+    /// process-wide table (its gates stay), `auth state` records and
+    /// stickiness. With
     /// `whole_providers` (no single account was named), also every cooldown
     /// and selection record of those providers, including ones a previous
     /// occupant of a slot left. Never touches the credential store.
@@ -2033,6 +2035,7 @@ impl LocalBroker {
         }
         for cred in creds {
             self.forget_snapshots(cred);
+            self.usage_reads.forget(&self.read_key(cred));
         }
         {
             let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());

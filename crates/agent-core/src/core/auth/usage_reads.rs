@@ -285,6 +285,17 @@ impl UsageReads {
         }
     }
 
+    /// Drop the slot's hold and last good reading (`synaps auth state
+    /// --clear`): the next read goes to the network. The gate stays, so a
+    /// read in flight keeps its single flight; if one is in flight, its
+    /// result is still recorded when it lands.
+    pub fn forget(&self, key: &str) {
+        if let Some(e) = self.entries().get_mut(key) {
+            e.hold = None;
+            e.last_good = None;
+        }
+    }
+
     fn generation(&self, key: &str) -> u64 {
         self.entries().get(key).map_or(0, |e| e.generation)
     }
