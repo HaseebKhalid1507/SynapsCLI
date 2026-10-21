@@ -286,9 +286,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
             // `daemon close`: end one session with host authority. A
             // refusal is terminal (the writer closes after `Refused`).
-            Ok(Read::Frame(ClientFrame::Close { session_id, force })) => {
-                tracing::info!(session = %session_id, force, "daemon: close requested over the socket");
-                let reply = super::close::close_session(&state, &session_id, force).await;
+            Ok(Read::Frame(ClientFrame::Close { session_id, force, attached })) => {
+                tracing::info!(session = %session_id, force, attached, "daemon: close requested over the socket");
+                let reply = super::close::close_session(&state, &session_id, force, attached).await;
                 let _ = tx.send(reply).await;
             }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.

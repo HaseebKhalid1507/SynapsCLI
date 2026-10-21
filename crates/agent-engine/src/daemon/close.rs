@@ -6,7 +6,9 @@
 //! same blockers (and `force`), the same parked exemption (a parked session
 //! is never rebuilt), the same reply text. Host authority is no more power
 //! than `daemon stop`, which already ends every session from any same-uid
-//! shell.
+//! shell, but this command is targeted (and the target can be a prefix), so
+//! a session with clients attached is refused unless the caller passes
+//! `attached` (`--attached`). `force` does not imply it.
 
 use std::time::Duration;
 
@@ -31,7 +33,7 @@ pub const CLOSE_END_BUDGET: Duration =
 
 /// Serve `Close{session_id, force}`. Always answers with one frame:
 /// `Closed`, `Refused{Busy|UnknownSession}` or `Error`.
-pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool) -> DaemonFrame {
+pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, attached: bool) -> DaemonFrame {
     // The actor's reload fence swallows a host engine command (it only
     // emits a notice), so no reply would ever come.
     if state.reloading.load(std::sync::atomic::Ordering::SeqCst) {
@@ -43,6 +45,21 @@ pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool) -> 
     let sid = handle.id.clone();
     if let Some(holder) = handle.meta().locked_by.clone() {
         return close_placeholder(state, &handle, &holder).await;
+    }
+    // Someone is looking at it: closing would exit their TUI mid-draft.
+    // `force` is about work in flight, not people, so it does not cover this.
+    let presence = handle.presence();
+    if presence.clients > 0 && !attached {
+        let n = presence.clients;
+        let owner = presence.input_owner.map(|c| format!(", input owned by client #{}", c.0)).unwrap_or_default();
+        return DaemonFrame::Refused {
+            reason: RefuseReason::Busy,
+            message: format!(
+                "session {sid} has {n} client{} attached{owner}; closing it exits their TUI and drops unsent input. \
+                 Close it anyway with --attached",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
     }
 
     // Subscribe before sending: the reply can land before we would look.

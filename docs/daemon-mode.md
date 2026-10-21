@@ -32,7 +32,7 @@
 | `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does. |
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
-| `synaps daemon reload` / `stop` / `purge` / `close` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, and `daemon close` ends one session whoever owns its input (host authority, like `stop`). `Checkpoint` over the wire is owner-only. |
+| `synaps daemon reload` / `stop` / `purge` / `close` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, and `daemon close --attached` ends one session whoever owns its input (host authority, like `stop`; without `--attached` it refuses a session that has clients attached). `Checkpoint` over the wire is owner-only. |
 
 ## CLI
 
@@ -43,7 +43,7 @@ synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for
 synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
-synaps daemon close <ID|NAME> [--force] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
+synaps daemon close <ID|NAME> [--force] [--attached] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
 ```
@@ -123,16 +123,20 @@ session you are done with should be **closed**:
   (`subagent_cancelled`), so whoever continues the session knows no wake is coming.
 - A **parked** session closes without being rebuilt.
 - In-process, `/close` is `/quit` with the same checks.
-- **`synaps daemon close <ID|NAME> [--force] [--json]`** does the same from any
+- **`synaps daemon close <ID|NAME> [--force] [--attached] [--json]`** does the same from any
   shell, without attaching: no snapshot, no ownership change, a parked session is
   never rebuilt. The target is an id, a journal id, a name or a unique prefix of
   an id or journal id, resolved against the daemon's listing (a name two
-  sessions share, or a prefix of several, is an error that lists them). The
+  sessions share, or a prefix of several, is an error that lists them). A
+  session with clients attached is refused (it says how many and who owns
+  input) unless `--attached` is given: closing it exits their TUIs and drops
+  unsent input. `--force` only overrides work in flight, not attached
+  clients; an attached session that is mid-turn needs both. The
   daemon sends the session `close` (`force` with `--force`) with host authority
   under the reserved `CLOSE_QUERY_ID`, waits for the reply and for the actor to
   end, and answers `Closed`; the attached TUIs exit as above. Exit codes: 0
   closed; 3 refused (work in flight: the reply names it, `--force` closes
-  anyway; or the daemon is reloading); 1 no such session, ambiguous, no daemon,
+  anyway; clients attached: `--attached`; or the daemon is reloading); 1 no such session, ambiguous, no daemon,
   timeout; 2 the daemon predates `daemon close` (`synaps daemon reload`) or a
   protocol mismatch. `--json` prints `{ok, session_id, outcome, text}`. A
   session whose journal another process holds (`locked_by`) is only removed
@@ -207,7 +211,7 @@ C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, clie
 D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
-C: close{session_id, force}                   → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
+C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …

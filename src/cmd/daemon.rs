@@ -91,6 +91,10 @@ pub(crate) enum DaemonAction {
         /// in flight (it is cancelled).
         #[arg(long)]
         force: bool,
+        /// Close even while clients are attached (their TUIs exit and any
+        /// unsent input is lost). Independent of --force.
+        #[arg(long)]
+        attached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -125,15 +129,15 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Sessions { json }) => sessions(profile, json).await,
         Some(DaemonAction::Purge) => purge(profile).await,
         Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
-        Some(DaemonAction::Close { target, force, json }) => close(profile, target, force, json).await,
+        Some(DaemonAction::Close { target, force, attached, json }) => close(profile, target, force, attached, json).await,
     }
 }
 
 /// `daemon close`: resolve the target against the `Welcome` listing, send
-/// `Close`, report. Exit 0 closed; 3 refused (work in flight, daemon
-/// reloading); 2 daemon too old or protocol mismatch; 1 otherwise (not
+/// `Close`, report. Exit 0 closed; 3 refused (work in flight, clients
+/// attached, daemon reloading); 2 daemon too old or protocol mismatch; 1 otherwise (not
 /// found, ambiguous, no daemon, timeout).
-async fn close(profile: Option<String>, target: String, force: bool, json: bool) -> anyhow::Result<()> {
+async fn close(profile: Option<String>, target: String, force: bool, attached: bool, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         close_exit(json, 1, None, "no_daemon", "daemon not running");
@@ -161,7 +165,7 @@ async fn close(profile: Option<String>, target: String, force: bool, json: bool)
             close_exit(json, 1, None, "ambiguous", &text);
         }
     };
-    let outcome = conn.close(&id, force).await;
+    let outcome = conn.close(&id, force, attached).await;
     conn.bye().await;
     let sid = Some(id.as_str());
     match outcome {

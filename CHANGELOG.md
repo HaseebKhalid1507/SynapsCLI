@@ -32,12 +32,13 @@ All notable changes to this project will be documented in this file.
   `/close force` cancels those workers first and notes each in the
   conversation. Owner-only. A parked session closes without being rebuilt.
   See [docs/daemon-mode.md](docs/daemon-mode.md#closing-a-session-close).
-- **`synaps daemon close <ID|NAME> [--force] [--json]`** ends one daemon
+- **`synaps daemon close <ID|NAME> [--force] [--attached] [--json]`** ends one daemon
   session from any shell without attaching to it, the way `/close` does (the
   same checks; `--force` is `/close force`); the other sessions keep running.
   The target is an id, journal id, name or unique prefix; an ambiguous one is
-  listed, not guessed. A parked session is not rebuilt, and an attached TUI
-  exits with the usual "resume it with" line. Exit 0 closed, 3 refused, 1 not
+  listed, not guessed. A session with clients attached is refused unless you
+  pass `--attached` (`--force` does not imply it); a parked session is not
+  rebuilt, and an attached TUI exits with the usual "resume it with" line. Exit 0 closed, 3 refused, 1 not
   found/ambiguous/no daemon, 2 the daemon is too old (`synaps daemon reload`).
   An attached client now always receives `Ended` before its connection
   closes when its session ends from elsewhere (another client's `/close`,

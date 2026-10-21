@@ -202,15 +202,16 @@ impl Connected {
         }
     }
 
-    /// `Close{id, force}`: end one session with host authority. `Ok(text)` =
-    /// the session ended (the actor's `/close` reply, with how to continue
-    /// it). A refusal (work in flight, daemon reloading) → `Refused(text)`;
+    /// `Close{id, force, attached}`: end one session with host authority.
+    /// `Ok(text)` = the session ended (the actor's `/close` reply, with how
+    /// to continue it). A refusal (work in flight, clients attached without
+    /// `attached`, daemon reloading) → `Refused(text)`;
     /// no such session → `UnknownSession`; a daemon that predates `Close`
     /// → `DaemonTooOld`. Waits up to [`CLOSE_TIMEOUT`]: the session saves
     /// and runs its end hooks before the daemon answers.
-    pub async fn close(&mut self, id: &SessionId, force: bool) -> Result<String, TransportError> {
+    pub async fn close(&mut self, id: &SessionId, force: bool, attached: bool) -> Result<String, TransportError> {
         self.writer
-            .send(ClientFrame::Close { session_id: id.clone(), force })
+            .send(ClientFrame::Close { session_id: id.clone(), force, attached })
             .await
             .map_err(|_| TransportError::Closed)?;
         let frame = tokio::time::timeout(CLOSE_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
@@ -433,11 +434,11 @@ impl SocketTransport {
         p
     }
 
-    /// `Close{id, force}` on a fresh control connection (see
+    /// `Close{id, force, attached}` on a fresh control connection (see
     /// [`Connected::close`]).
-    pub async fn close(path: &Path, id: &SessionId, force: bool) -> Result<String, TransportError> {
+    pub async fn close(path: &Path, id: &SessionId, force: bool, attached: bool) -> Result<String, TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
-        let r = c.close(id, force).await;
+        let r = c.close(id, force, attached).await;
         c.bye().await;
         r
     }

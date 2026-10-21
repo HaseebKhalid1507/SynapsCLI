@@ -100,6 +100,16 @@ async fn wait_lifecycle(sock: &Path, sid: &SessionId, want: SessionLifecycle, bu
     }
 }
 
+/// After `detach()`, wait until the daemon lists no client on `sid` (the
+/// detach reaches the actor asynchronously).
+async fn wait_detached(sock: &Path, sid: &SessionId) {
+    let t0 = std::time::Instant::now();
+    while SocketTransport::sessions(sock).await.unwrap_or_default().iter().any(|m| &m.id == sid && m.clients > 0) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{sid} still lists a client after detach");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn stop(d: Daemon, sock: &Path) {
     SocketTransport::shutdown(sock, false).await.unwrap();
     tokio::time::timeout(Duration::from_secs(20), d.wait()).await.expect("daemon wait");
@@ -119,8 +129,9 @@ async fn close_ends_an_idle_session_and_leaves_the_others() {
     run_turn(&mut tb).await;
     ta.detach().await;
     tb.detach().await;
+    wait_detached(&sock, &a).await;
 
-    let text = SocketTransport::close(&sock, &a, false).await.expect("closed");
+    let text = SocketTransport::close(&sock, &a, false, false).await.expect("closed");
     assert!(text.contains(&format!("--continue {a}")), "{text}");
     assert_eq!(listed(&sock).await, vec![b.clone()], "only the closed session left");
 
@@ -145,7 +156,7 @@ async fn close_refuses_mid_turn_without_force_and_force_ends_it() {
     t.send_from_self(SessionCommand::Submit { text: "go".into(), attachments: vec![] }).await.unwrap();
     until(&mut t, |e| matches!(e, SessionEventWire::Stream(StreamEvent::Llm(_)))).await;
 
-    match SocketTransport::close(&sock, &sid, false).await {
+    match SocketTransport::close(&sock, &sid, false, true).await {
         Err(TransportError::Refused(m)) => {
             assert!(m.contains("a turn is running"), "{m}");
             assert!(m.contains("/close force"), "the daemon passes the actor's text through: {m}");
@@ -154,11 +165,43 @@ async fn close_refuses_mid_turn_without_force_and_force_ends_it() {
     }
     assert!(listed(&sock).await.contains(&sid), "a refused close leaves the session");
 
-    let text = SocketTransport::close(&sock, &sid, true).await.expect("force closes");
+    let text = SocketTransport::close(&sock, &sid, true, true).await.expect("force closes");
     assert!(text.contains("closing session"), "{text}");
     assert!(!listed(&sock).await.contains(&sid));
     let seen = until(&mut t, |e| matches!(e, SessionEventWire::Ended { .. })).await;
     assert!(matches!(seen.last().unwrap().event, SessionEventWire::Ended { reason: EndReason::ClientQuit }));
+
+    stop(d, &sock).await;
+}
+
+/// A session with a client attached is refused without `attached`, and
+/// `force` alone does not override that (it only overrides work in flight);
+/// the refusal says how many clients and how to close it anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn close_refuses_a_session_with_clients_attached_unless_asked() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, Script::Sse(ANTHROPIC_SSE), "never").await;
+    let sock = d.paths.sock.clone();
+    let (mut owner, sid) = create(&sock, guard.home.path()).await;
+    run_turn(&mut owner).await;
+
+    for force in [false, true] {
+        match SocketTransport::close(&sock, &sid, force, false).await {
+            Err(TransportError::Refused(m)) => {
+                assert!(m.contains("1 client attached"), "force={force}: {m}");
+                assert!(m.contains("--attached"), "force={force}: {m}");
+            }
+            other => panic!("force={force}: expected an attached refusal, got {other:?}"),
+        }
+        assert!(listed(&sock).await.contains(&sid), "a refused close leaves the session");
+    }
+    // The owner was not disturbed: it still runs turns.
+    run_turn(&mut owner).await;
+
+    let text = SocketTransport::close(&sock, &sid, false, true).await.expect("closed with attached");
+    assert!(text.contains("--continue"), "{text}");
+    assert!(!listed(&sock).await.contains(&sid));
 
     stop(d, &sock).await;
 }
@@ -175,7 +218,7 @@ async fn close_reaches_an_attached_owners_tui_with_ended_before_eof() {
     let (mut owner, sid) = create(&sock, guard.home.path()).await;
     run_turn(&mut owner).await;
 
-    let text = SocketTransport::close(&sock, &sid, false).await.expect("closed");
+    let text = SocketTransport::close(&sock, &sid, false, true).await.expect("closed");
     assert!(text.contains("--continue"), "{text}");
 
     let mut seen = Vec::new();
@@ -211,7 +254,7 @@ async fn close_does_not_unpark_a_parked_session() {
     let calls = hits.load(Ordering::SeqCst);
     let mut rx = d.state.attach(&sid).expect("parked session is listed").subscribe();
 
-    let text = SocketTransport::close(&sock, &sid, false).await.expect("closed");
+    let text = SocketTransport::close(&sock, &sid, false, false).await.expect("closed");
     assert!(text.contains(&format!("--continue {sid}")), "{text}");
     assert!(!listed(&sock).await.contains(&sid));
 
@@ -238,7 +281,7 @@ async fn close_unknown_session_is_refused_and_the_connection_closes() {
     let sock = d.paths.sock.clone();
 
     let mut c = Connected::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let err = c.close(&SessionId::from("no-such-session"), false).await.unwrap_err();
+    let err = c.close(&SessionId::from("no-such-session"), false, false).await.unwrap_err();
     assert!(matches!(err, TransportError::UnknownSession(ref m) if m.contains("no-such-session")), "{err}");
     assert!(c.ping().await.is_err(), "a refusal is terminal: the daemon closed the connection");
 
@@ -288,7 +331,7 @@ async fn close_on_an_attached_connection_is_refused_as_a_control_frame() {
     })
     .await;
 
-    write_frame(&mut w, &ClientFrame::Close { session_id: sid.clone(), force: true }).await;
+    write_frame(&mut w, &ClientFrame::Close { session_id: sid.clone(), force: true, attached: true }).await;
     let message = read_until(&mut lines, |f| match f {
         DaemonFrame::Error { message, .. } => Some(message),
         _ => None,
@@ -372,7 +415,7 @@ async fn an_owner_whose_socket_is_backed_up_still_gets_ended_before_eof() {
     .await
     .expect("the turn finishes");
 
-    let text = SocketTransport::close(&sock, &sid, false).await.expect("closed");
+    let text = SocketTransport::close(&sock, &sid, false, true).await.expect("closed");
     assert!(text.contains("--continue"), "{text}");
 
     // Only now does the owner drain its socket, to EOF.
@@ -432,7 +475,12 @@ async fn the_cli_resolves_a_prefix_and_reports_each_outcome_with_its_exit_code()
     let sock = d.paths.sock.clone();
     let (mut t, sid) = create(&sock, guard.home.path()).await;
     run_turn(&mut t).await;
+
+    let (code, json) = cli_close(&guard, &run, &[sid.as_str()]).await;
+    assert_eq!((code, json["outcome"].as_str()), (3, Some("refused")), "attached: {json}");
+    assert!(json["text"].as_str().unwrap().contains("--attached"), "{json}");
     t.detach().await;
+    wait_detached(&sock, &sid).await;
 
     let (code, json) = cli_close(&guard, &run, &["no-such-session"]).await;
     assert_eq!((code, json["outcome"].as_str()), (1, Some("not_found")), "{json}");

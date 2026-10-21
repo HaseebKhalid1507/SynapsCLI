@@ -123,13 +123,17 @@ pub enum ClientFrame {
     /// hygiene). Reply: `Pong`. (C2)
     Purge,
     /// Control fast path: end one session as `/close [force]` would, with
-    /// host authority (no attach, never unparks). Reply: `Closed`, or
+    /// host authority (no attach, never unparks). A session with clients
+    /// attached is refused unless `attached` (`--attached`); `force` only
+    /// overrides work in flight. Reply: `Closed`, or
     /// `Refused{Busy|UnknownSession}`. Not accepted on an attached
     /// connection (that client has `/close`).
     Close {
         session_id: SessionId,
         #[serde(default)]
         force: bool,
+        #[serde(default)]
+        attached: bool,
     },
     Bye,
 }
@@ -154,10 +158,11 @@ impl std::fmt::Debug for ClientFrame {
                 .field("exe", exe)
                 .finish(),
             Self::Purge => f.write_str("Purge"),
-            Self::Close { session_id, force } => f
+            Self::Close { session_id, force, attached } => f
                 .debug_struct("Close")
                 .field("session_id", session_id)
                 .field("force", force)
+                .field("attached", attached)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -1399,8 +1404,8 @@ mod tests {
             }},
             ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
             ClientFrame::Purge,
-            ClientFrame::Close { session_id: "s".into(), force: true },
-            ClientFrame::Close { session_id: "s".into(), force: false },
+            ClientFrame::Close { session_id: "s".into(), force: true, attached: true },
+            ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1477,7 +1482,7 @@ mod tests {
     #[test]
     fn close_defaults_force_off_and_older_daemons_reject_it_as_an_unknown_variant() {
         let f: ClientFrame = decode_line(r#"{"type":"close","session_id":"s"}"#).unwrap();
-        assert!(matches!(f, ClientFrame::Close { ref session_id, force: false } if session_id.as_str() == "s"));
+        assert!(matches!(f, ClientFrame::Close { ref session_id, force: false, attached: false } if session_id.as_str() == "s"));
         // A daemon built before `Close` decodes into an enum without it; the
         // client keys "daemon too old" on this exact serde wording.
         #[derive(Debug, Deserialize)]
