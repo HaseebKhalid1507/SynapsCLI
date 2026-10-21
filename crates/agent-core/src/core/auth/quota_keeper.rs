@@ -1322,6 +1322,7 @@ pub fn capacity_view(st: &AccountState) -> Option<AccountCapacity> {
             models: st.last_models.clone(),
         },
         cooldown_until_ms: None,
+        failure: None,
     })
 }
 

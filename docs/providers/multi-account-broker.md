@@ -157,6 +157,32 @@ First-use anchoring is documented for some reset paths, **not established as a u
 
 Activation is local-only, on the broker host, with a canonical private ledger beside the resolved credential file. Remote clients may poll, not activate. A disabled read-only systemd user-unit example is at `deploy/synaps-quota-keeper.service`; nothing is installed/enabled automatically.
 
+## Inspect and clear auth state
+
+`synaps auth state` shows what this machine's running daemon remembers about each OAuth account:
+
+- its cooldown: until when, and a fixed reason kind (`anthropic_quota_exhausted`, `codex_quota_exhausted`, `client_report` or `other`; never the reporter's own text);
+- its last usage read: ok, or the failure kind with the HTTP status and `Retry-After` when the endpoint sent them (delta-seconds only: an HTTP-date `Retry-After` is ignored, and a timeout has no status);
+- its last token refresh exchange, with the HTTP status when the token endpoint answered with an error;
+- the last automatic selection per provider and model: the account chosen, or the failure kind and each account's part in it.
+
+It reads memory only: no usage request, no token refresh, no write. It never shows tokens, emails, account ids or identity hashes.
+
+```bash
+"$SYNAPS" auth state --provider claude
+"$SYNAPS" auth state --provider claude --account claude5 --json
+# Forget in-memory state; credentials are never touched
+"$SYNAPS" auth state --provider claude --account claude5 --clear
+"$SYNAPS" auth state --provider claude --clear
+```
+
+- **NOT LIVE.** With no running daemon, or with one that predates `auth state` (the command names it), the report is built by the command itself, which has served no request: it lists the stored accounts with nothing recorded, under `auth state (NOT LIVE: …)`. Only a report from the daemon is live.
+- **`--account LABEL`** shows that account, and only the selections that chose it or list it as failed.
+- **`--clear`** first drops, in the running daemon, the matched accounts' cooldowns, cached usage readings and their read gates, last usage results, and stickiness (an account a provider and model currently keep). With `--account`, the selection history stays; only a clear without `--account` drops it, for the provider (or, without `--provider`, for every provider). The last token refresh record and everything on disk (credentials, refresh locks) are never touched. The daemon logs one INFO `auth_state_cleared` line. Without a daemon that answers `auth state`, nothing is cleared and the command fails.
+- **Remote brokers.** Where auth uses a remote credential broker (`auth.remote_endpoint`), `auth state` refuses: the state lives in the `synaps auth-broker` process on the broker host, which has no `auth state` endpoint.
+
+A failed automatic selection also logs one `auth_selection_failed` WARN line, with the kind and each account's `label:kind[:status][:cooling]`, in the log of the process that selected (for a remote broker, the broker host's).
+
 ## Remote clients and storage
 
 The existing machine-authenticated broker exposes account-aware token, usage, capability and proxy operations. Upgrade the broker host as well as clients before relying on named accounts/auto. An old broker that cannot confirm the requested named slot is rejected rather than silently using its default. Machine-token holders can see account labels/minimal identity metadata; keep that token private. Use TLS or a trusted private tunnel, not public plaintext HTTP.

@@ -939,6 +939,7 @@ mod chooser_tests {
                 credential: CredentialRef::new(provider, Account::named(label).unwrap()),
                 observed_at_ms: Some(now),
                 cooldown_until_ms: None,
+                failure: None,
                 observation: QuotaObservation::Ok {
                     windows: vec![WindowLimit {
                         id: "seven_day".into(),
@@ -963,5 +964,472 @@ mod chooser_tests {
         for secret_key in ["access_token", "refresh_token", "Bearer"] {
             assert!(!serialized.contains(secret_key));
         }
+    }
+}
+
+// ── `synaps auth state` ──
+
+/// Options for `synaps auth state`.
+#[derive(Debug, Clone, Default)]
+pub struct StateOptions {
+    pub provider: Option<String>,
+    pub account: Option<String>,
+    pub json: bool,
+    pub clear: bool,
+}
+
+/// What `synaps auth state` prints: the report on stdout, notices on
+/// stderr, and the error it exits with.
+#[derive(Debug, Default)]
+pub(crate) struct StateOutput {
+    pub stdout: String,
+    pub notices: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// `synaps auth state`: what the running daemon's broker (the one every
+/// session of that daemon uses) remembers about each account. Memory only:
+/// no usage request, no refresh. `--clear` drops the matched accounts'
+/// in-memory state in the daemon and never touches credentials.
+pub async fn state(profile: Option<String>, opts: StateOptions) -> Result<(), String> {
+    let cfg = config::load_config();
+    if cfg.auth.credential_source().is_remote() {
+        return Err("auth state reads the local broker of this machine's daemon, but auth here uses a remote credential broker: the account state lives in the `synaps auth-broker` process on the broker host".into());
+    }
+    let query = state_query(&opts)?;
+    let paths = agent_engine::daemon::registry::daemon_paths(profile.as_deref());
+    let sock = agent_engine::daemon::registry::is_alive(&paths).then(|| paths.sock.clone());
+    let out = state_with(sock.as_deref(), query, opts.json, |q| {
+        auth::local_auth_state(&auth::TokenCache::new(), q, false).map_err(|e| e.to_string())
+    })
+    .await;
+    print!("{}", out.stdout);
+    for notice in &out.notices {
+        eprintln!("{notice}");
+    }
+    match out.error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn state_query(opts: &StateOptions) -> Result<auth::AuthStateQuery, String> {
+    let provider = match opts.provider.as_deref() {
+        Some(p) => Some(parse_provider(p)?.as_str().to_string()),
+        None => None,
+    };
+    Ok(auth::AuthStateQuery {
+        provider,
+        account: opts.account.clone(),
+        clear: opts.clear,
+    })
+}
+
+/// [`state`] for the daemon socket `sock` (`None`: no daemon is running).
+/// `not_live` builds the report in this process when the daemon cannot
+/// answer; it is never asked to clear.
+pub(crate) async fn state_with(
+    sock: Option<&std::path::Path>,
+    query: auth::AuthStateQuery,
+    json: bool,
+    not_live: impl FnOnce(&auth::AuthStateQuery) -> Result<auth::AuthStateReport, String>,
+) -> StateOutput {
+    use agent_engine::session::socket_transport::{AuthStateReply, SocketTransport};
+    use agent_engine::session::TransportError;
+    let mut out = StateOutput::default();
+    let live = match sock {
+        None => {
+            out.notices.push(
+                "no daemon running: showing the account list only (a session without a daemon keeps its state in its own process)"
+                    .into(),
+            );
+            None
+        }
+        Some(sock) => match SocketTransport::auth_state(sock, query.clone()).await {
+            Ok(AuthStateReply::Report(report)) => Some(report),
+            Ok(AuthStateReply::DaemonPredates {
+                daemon_version,
+                daemon_build,
+            }) => {
+                let build = if daemon_build.is_empty() {
+                    String::new()
+                } else {
+                    format!(", build {daemon_build}")
+                };
+                out.notices.push(format!(
+                    "daemon predates auth state (daemon {daemon_version}{build}): its state cannot be read until it runs a synaps with `auth state`; showing the account list only"
+                ));
+                None
+            }
+            Err(TransportError::Protocol(message)) => {
+                out.error = Some(format!("daemon: {message}"));
+                return out;
+            }
+            Err(e) => {
+                out.error = Some(format!("daemon at {}: {e}", sock.display()));
+                return out;
+            }
+        },
+    };
+    let report = match live {
+        Some(report) => report,
+        None if query.clear => {
+            out.error =
+                Some("nothing cleared: only a running daemon that answers `auth state` holds state to clear".into());
+            return out;
+        }
+        None => match not_live(&query) {
+            Ok(report) => report,
+            Err(e) => {
+                out.error = Some(e);
+                return out;
+            }
+        },
+    };
+    out.stdout = if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => s + "\n",
+            Err(e) => {
+                out.error = Some(e.to_string());
+                return out;
+            }
+        }
+    } else {
+        auth::auth_state::render_text(&report)
+    };
+    out
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use agent_engine::session::wire::{
+        decode_line, encode_line, ClientFrame, DaemonFrame, Hello, Welcome, PROTOCOL_VERSION,
+    };
+    use auth::auth_state::{AccountState, IdentityKind};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// How the fixture daemon answers the `auth_state` frame.
+    #[derive(Clone)]
+    enum Answer {
+        /// As a daemon built before `AuthState` does: its `ClientFrame` has
+        /// no such variant, so decoding fails and daemon/conn.rs replies
+        /// `Error{session_id: None, "malformed frame: {e}"}`.
+        Old,
+        Report(auth::AuthStateReport),
+        Error(&'static str),
+    }
+
+    /// An old daemon's client frames (no `auth_state`).
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    #[allow(dead_code, clippy::large_enum_variant)]
+    enum OldClientFrame {
+        Hello(Hello),
+        Ping,
+        Sessions,
+        Purge,
+        Bye,
+    }
+
+    /// A fixture daemon serving `conns` connections: `Welcome` (version
+    /// 0.10.1, build oldbld1), then `answer` to each frame until `Bye`.
+    /// Returns the socket and the queries it decoded.
+    async fn fixture(
+        answer: Answer,
+        conns: usize,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<Mutex<Vec<auth::AuthStateQuery>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let queries: Arc<Mutex<Vec<auth::AuthStateQuery>>> = Arc::default();
+        let seen = queries.clone();
+        let task = tokio::spawn(async move {
+            for _ in 0..conns {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut lines = BufReader::new(r).lines();
+                let hello = lines.next_line().await.unwrap().expect("hello");
+                assert!(
+                    matches!(
+                        decode_line::<ClientFrame>(&hello),
+                        Ok(ClientFrame::Hello(_))
+                    ),
+                    "{hello}"
+                );
+                let welcome = DaemonFrame::Welcome(Welcome {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "0.10.1".into(),
+                    pid: 1,
+                    profile: None,
+                    sessions: vec![],
+                    progressive_tool_disclosure: false,
+                    generation: 1,
+                    daemon_build: "oldbld1".into(),
+                });
+                w.write_all(encode_line(&welcome).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let reply = match &answer {
+                        Answer::Old => match decode_line::<OldClientFrame>(&line) {
+                            Ok(OldClientFrame::Bye) => break,
+                            Ok(_) => panic!("unexpected frame {line}"),
+                            Err(e) => DaemonFrame::Error {
+                                session_id: None,
+                                message: format!("malformed frame: {e}"),
+                            },
+                        },
+                        answer => match decode_line::<ClientFrame>(&line).unwrap() {
+                            ClientFrame::Bye => break,
+                            ClientFrame::AuthState(query) => {
+                                seen.lock().unwrap().push(query);
+                                match answer {
+                                    Answer::Report(report) => DaemonFrame::AuthState {
+                                        report: report.clone(),
+                                    },
+                                    Answer::Error(message) => DaemonFrame::Error {
+                                        session_id: None,
+                                        message: (*message).into(),
+                                    },
+                                    Answer::Old => unreachable!(),
+                                }
+                            }
+                            other => panic!("unexpected frame {other:?}"),
+                        },
+                    };
+                    w.write_all(encode_line(&reply).unwrap().as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        (dir, sock, queries, task)
+    }
+
+    fn report(live: bool) -> auth::AuthStateReport {
+        auth::AuthStateReport {
+            schema_version: auth::AUTH_STATE_SCHEMA_VERSION,
+            live,
+            broker_active: live,
+            generated_at_ms: 1_800_000_000_000,
+            store: "/scratch/auth.json".into(),
+            accounts: vec![AccountState {
+                provider: "anthropic".into(),
+                label: "a".into(),
+                identity: IdentityKind::Rotating,
+                access_expires_ms: None,
+                cooldown: None,
+                last_usage: None,
+                last_usage_ok_ms: None,
+                last_refresh: None,
+            }],
+            selections: vec![],
+            cleared: vec![],
+        }
+    }
+
+    fn anthropic(account: Option<&str>, clear: bool) -> auth::AuthStateQuery {
+        auth::AuthStateQuery {
+            provider: Some("anthropic".into()),
+            account: account.map(str::to_string),
+            clear,
+        }
+    }
+
+    /// A not-live builder that records the queries it was asked.
+    fn not_live(
+        asked: &Arc<Mutex<Vec<auth::AuthStateQuery>>>,
+    ) -> impl FnOnce(&auth::AuthStateQuery) -> Result<auth::AuthStateReport, String> {
+        let asked = asked.clone();
+        move |q| {
+            asked.lock().unwrap().push(q.clone());
+            Ok(report(false))
+        }
+    }
+
+    fn mentions_old_daemon(out: &StateOutput) -> bool {
+        out.notices
+            .iter()
+            .chain(out.error.iter())
+            .any(|s| s.contains("predates"))
+    }
+
+    #[test]
+    fn provider_aliases_become_canonical_ids_and_unknown_ones_fail() {
+        let opts = StateOptions {
+            provider: Some("claude".into()),
+            account: Some("b".into()),
+            clear: true,
+            json: false,
+        };
+        assert_eq!(state_query(&opts).unwrap(), anthropic(Some("b"), true));
+        let opts = StateOptions {
+            provider: Some("nope".into()),
+            ..StateOptions::default()
+        };
+        assert!(state_query(&opts).is_err());
+        assert_eq!(
+            state_query(&StateOptions::default()).unwrap(),
+            auth::AuthStateQuery::default()
+        );
+    }
+
+    /// A live daemon's report is printed as it came: JSON is the report and
+    /// nothing else, text is the live rendering; the query (with `clear`)
+    /// reaches the daemon unchanged and nothing is built locally.
+    #[tokio::test]
+    async fn a_live_daemons_report_is_printed_as_it_came() {
+        let live = report(true);
+        let (_dir, sock, queries, task) = fixture(Answer::Report(live.clone()), 2).await;
+        let asked = Arc::default();
+        let out = state_with(
+            Some(&sock),
+            anthropic(Some("b"), true),
+            true,
+            not_live(&asked),
+        )
+        .await;
+        assert!(out.error.is_none() && out.notices.is_empty(), "{out:?}");
+        let back: auth::AuthStateReport = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(back, live);
+        let out = state_with(Some(&sock), anthropic(None, false), false, not_live(&asked)).await;
+        assert!(out.error.is_none() && out.notices.is_empty(), "{out:?}");
+        assert!(
+            out.stdout
+                .starts_with("auth state (live: the running daemon's broker)\n"),
+            "{}",
+            out.stdout
+        );
+        assert_eq!(
+            *queries.lock().unwrap(),
+            vec![anthropic(Some("b"), true), anthropic(None, false)]
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "built a local report for a live daemon"
+        );
+        task.await.unwrap();
+    }
+
+    /// A daemon that answers the frame the way an old one does is named as
+    /// predating `auth state` (version and build); the account list is built
+    /// locally, labelled not live, and JSON stays the report alone.
+    #[tokio::test]
+    async fn a_daemon_that_predates_auth_state_is_named_and_the_list_is_not_live() {
+        let (_dir, sock, _queries, task) = fixture(Answer::Old, 2).await;
+        let asked = Arc::default();
+        for json in [false, true] {
+            let out = state_with(Some(&sock), anthropic(None, false), json, not_live(&asked)).await;
+            assert!(out.error.is_none(), "{out:?}");
+            assert_eq!(out.notices.len(), 1, "{out:?}");
+            assert!(
+                out.notices[0]
+                    .starts_with("daemon predates auth state (daemon 0.10.1, build oldbld1)"),
+                "{out:?}"
+            );
+            if json {
+                let back: auth::AuthStateReport = serde_json::from_str(&out.stdout).unwrap();
+                assert_eq!(back, report(false));
+            } else {
+                assert!(
+                    out.stdout.starts_with("auth state (NOT LIVE"),
+                    "{}",
+                    out.stdout
+                );
+            }
+        }
+        assert_eq!(*asked.lock().unwrap(), vec![anthropic(None, false); 2]);
+        task.await.unwrap();
+    }
+
+    /// `--clear` against a daemon that predates `auth state` clears nothing
+    /// and fails; nothing is built locally.
+    #[tokio::test]
+    async fn clear_against_an_old_daemon_clears_nothing_and_fails() {
+        let (_dir, sock, _queries, task) = fixture(Answer::Old, 1).await;
+        let asked = Arc::default();
+        let out = state_with(
+            Some(&sock),
+            anthropic(Some("b"), true),
+            false,
+            not_live(&asked),
+        )
+        .await;
+        let error = out.error.clone().expect("clear must fail");
+        assert!(error.starts_with("nothing cleared"), "{error}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.starts_with("daemon predates auth state")),
+            "{out:?}"
+        );
+        assert!(asked.lock().unwrap().is_empty());
+        task.await.unwrap();
+    }
+
+    /// Any other daemon error is shown as itself, never as "old daemon",
+    /// and nothing is built locally in its place.
+    #[tokio::test]
+    async fn other_daemon_errors_are_shown_as_themselves() {
+        for message in [
+            "auth state: unknown account `zzz` for anthropic",
+            "malformed frame: missing field `clear` at line 1 column 30",
+        ] {
+            let (_dir, sock, _queries, task) = fixture(Answer::Error(message), 1).await;
+            let asked = Arc::default();
+            let out = state_with(
+                Some(&sock),
+                anthropic(Some("zzz"), false),
+                false,
+                not_live(&asked),
+            )
+            .await;
+            assert_eq!(
+                out.error.as_deref(),
+                Some(format!("daemon: {message}").as_str()),
+                "{out:?}"
+            );
+            assert!(!mentions_old_daemon(&out), "{out:?}");
+            assert!(out.stdout.is_empty() && out.notices.is_empty(), "{out:?}");
+            assert!(asked.lock().unwrap().is_empty());
+            task.await.unwrap();
+        }
+    }
+
+    /// No daemon: the account list is built locally (never asked to clear)
+    /// with a notice; `--clear` clears nothing and fails.
+    #[tokio::test]
+    async fn without_a_daemon_the_list_is_not_live_and_clear_fails() {
+        let asked = Arc::default();
+        let out = state_with(None, anthropic(None, false), false, not_live(&asked)).await;
+        assert!(out.error.is_none(), "{out:?}");
+        assert!(
+            out.notices.len() == 1 && out.notices[0].starts_with("no daemon running"),
+            "{out:?}"
+        );
+        assert!(
+            out.stdout.starts_with("auth state (NOT LIVE"),
+            "{}",
+            out.stdout
+        );
+        assert!(!mentions_old_daemon(&out));
+        let out = state_with(None, anthropic(Some("b"), true), true, not_live(&asked)).await;
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("nothing cleared")),
+            "{out:?}"
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(*asked.lock().unwrap(), vec![anthropic(None, false)]);
     }
 }

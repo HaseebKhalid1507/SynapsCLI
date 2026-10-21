@@ -129,11 +129,21 @@ pub enum UsageError {
     /// Provider rejected the credential (401/403).
     Unauthorized { status: u16 },
     /// 429 on the usage endpoint itself. Not proof of quota exhaustion.
-    RateLimited,
-    /// Any other non-2xx status.
-    UpstreamStatus { status: u16 },
+    /// `retry_after_s` is the delta-seconds `Retry-After` header, if sent.
+    RateLimited {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_s: Option<u64>,
+    },
+    /// Any other non-2xx status. `retry_after_s`: the delta-seconds
+    /// `Retry-After` header, if sent (an HTTP-date is ignored).
+    UpstreamStatus {
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_s: Option<u64>,
+    },
     /// 3xx. Redirects are never followed.
     Redirected { status: u16 },
+    /// No answer within the timeout: no status, no `Retry-After`.
     Timeout,
     /// Transport failure; `detail` is a coarse class, never a URL or body.
     Transport { detail: String },
@@ -151,7 +161,7 @@ impl UsageError {
             Self::IdentityMismatch => "identity_mismatch",
             Self::InvalidEndpointOverride => "invalid_endpoint_override",
             Self::Unauthorized { .. } => "unauthorized",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited { .. } => "rate_limited",
             Self::UpstreamStatus { .. } => "upstream_status",
             Self::Redirected { .. } => "redirected",
             Self::Timeout => "timeout",
@@ -167,6 +177,41 @@ impl UsageError {
             self,
             Self::Unauthorized { .. } | Self::AccountIdUnavailable | Self::IdentityMismatch
         )
+    }
+
+    /// The typed observation failure this error stands for (kind, HTTP
+    /// status, `Retry-After`), for selection reports and logs.
+    pub fn failure(&self) -> super::quota_policy::ObservationFailure {
+        use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
+        match self {
+            Self::UnsupportedProvider { .. } | Self::InvalidEndpointOverride => {
+                ObservationFailure::new(K::Unsupported)
+            }
+            Self::AccountIdUnavailable | Self::IdentityMismatch => {
+                ObservationFailure::new(K::UsageUnauthorized)
+            }
+            Self::Unauthorized { status } => {
+                ObservationFailure::new(K::UsageUnauthorized).with_status(*status)
+            }
+            Self::RateLimited { retry_after_s } => ObservationFailure::new(K::UsageRateLimited)
+                .with_status(429)
+                .with_retry_after(*retry_after_s),
+            Self::UpstreamStatus {
+                status,
+                retry_after_s,
+            } => ObservationFailure::new(K::UsageUpstream)
+                .with_status(*status)
+                .with_retry_after(*retry_after_s),
+            Self::Redirected { status } => {
+                ObservationFailure::new(K::UsageUpstream).with_status(*status)
+            }
+            // No answer arrived, so there is no status or Retry-After.
+            Self::Timeout => ObservationFailure::new(K::UsageTimeout),
+            Self::Transport { .. } => ObservationFailure::new(K::UsageTransport),
+            Self::BodyTooLarge { .. } | Self::Malformed { .. } => {
+                ObservationFailure::new(K::UsageMalformed)
+            }
+        }
     }
 
     /// Map onto the broker error vocabulary (secret-free by construction).
@@ -203,8 +248,25 @@ impl std::fmt::Display for UsageError {
             Self::Unauthorized { status } => {
                 write!(f, "provider rejected the access token (HTTP {status})")
             }
-            Self::RateLimited => write!(f, "usage endpoint rate limited (HTTP 429)"),
-            Self::UpstreamStatus { status } => write!(f, "usage request failed: HTTP {status}"),
+            Self::RateLimited {
+                retry_after_s: Some(secs),
+            } => write!(
+                f,
+                "usage endpoint rate limited (HTTP 429, retry after {secs}s)"
+            ),
+            Self::RateLimited {
+                retry_after_s: None,
+            } => {
+                write!(f, "usage endpoint rate limited (HTTP 429)")
+            }
+            Self::UpstreamStatus {
+                status,
+                retry_after_s: Some(secs),
+            } => write!(
+                f,
+                "usage request failed: HTTP {status}, retry after {secs}s"
+            ),
+            Self::UpstreamStatus { status, .. } => write!(f, "usage request failed: HTTP {status}"),
             Self::Redirected { status } => {
                 write!(f, "usage endpoint redirected (HTTP {status}); not followed")
             }
@@ -640,9 +702,9 @@ impl From<&UsageError> for UsageErrorSummary {
     fn from(e: &UsageError) -> Self {
         let http_status = match e {
             UsageError::Unauthorized { status }
-            | UsageError::UpstreamStatus { status }
+            | UsageError::UpstreamStatus { status, .. }
             | UsageError::Redirected { status } => Some(*status),
-            UsageError::RateLimited => Some(429),
+            UsageError::RateLimited { .. } => Some(429),
             _ => None,
         };
         Self {
@@ -1482,7 +1544,7 @@ impl Default for UsageFetchOptions {
 }
 
 /// True for `http(s)://127.0.0.1…`, `localhost`, `[::1]`.
-fn is_loopback_url(raw: &str) -> bool {
+pub(crate) fn is_loopback_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
@@ -1573,6 +1635,23 @@ async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Result<String,
     })
 }
 
+/// Longest `Retry-After` we record; a larger value is clamped to it.
+const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
+/// The delta-seconds form of `Retry-After` (an HTTP-date or garbage is
+/// ignored), clamped to [`MAX_RETRY_AFTER_SECS`]. Only the header is read;
+/// the body stays unread.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+}
+
 /// Send one pinned GET; classify status; return the capped body text.
 async fn get_json_text(
     client: &UsageClient,
@@ -1602,12 +1681,17 @@ async fn get_json_text(
             return Err(UsageError::Unauthorized { status });
         }
         429 => {
+            let retry_after_s = retry_after_secs(resp.headers());
             drop(resp);
-            return Err(UsageError::RateLimited);
+            return Err(UsageError::RateLimited { retry_after_s });
         }
         _ => {
+            let retry_after_s = retry_after_secs(resp.headers());
             drop(resp);
-            return Err(UsageError::UpstreamStatus { status });
+            return Err(UsageError::UpstreamStatus {
+                status,
+                retry_after_s,
+            });
         }
     }
     read_body_capped(resp, opts.max_body_bytes).await
@@ -2404,7 +2488,11 @@ mod tests {
             UsageError::InvalidEndpointOverride.into_broker_error(),
             BrokerError::Denied(_)
         ));
-        let v = serde_json::to_value(UsageError::UpstreamStatus { status: 502 }).unwrap();
+        let v = serde_json::to_value(UsageError::UpstreamStatus {
+            status: 502,
+            retry_after_s: None,
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({"kind":"upstream_status","status":502}));
         assert!(!supports_usage(OAuthProviderId::GitHubCopilot));
         assert!(!supports_usage(OAuthProviderId::GoogleGemini));
@@ -2661,10 +2749,74 @@ mod tests {
         use axum::routing::get;
         let hostile = "{\"error\":\"leak-me-ZZZ\",\"token\":\"sk-ant-secret\"}";
         let app = axum::Router::new()
-            .route("/401", get(move || async move { (axum::http::StatusCode::UNAUTHORIZED, hostile) }))
-            .route("/403", get(move || async move { (axum::http::StatusCode::FORBIDDEN, hostile) }))
-            .route("/429", get(move || async move { (axum::http::StatusCode::TOO_MANY_REQUESTS, hostile) }))
-            .route("/500", get(move || async move { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, hostile) }))
+            .route(
+                "/401",
+                get(move || async move { (axum::http::StatusCode::UNAUTHORIZED, hostile) }),
+            )
+            .route(
+                "/403",
+                get(move || async move { (axum::http::StatusCode::FORBIDDEN, hostile) }),
+            )
+            .route(
+                "/429",
+                get(move || async move { (axum::http::StatusCode::TOO_MANY_REQUESTS, hostile) }),
+            )
+            .route(
+                "/429r",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "120")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/429big",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "999999999")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/429date",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/500",
+                get(
+                    move || async move { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, hostile) },
+                ),
+            )
+            .route(
+                "/503r",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "30")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/503date",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                        hostile,
+                    )
+                }),
+            )
             .route(
                 "/302",
                 get(move || async move {
@@ -2677,11 +2829,56 @@ mod tests {
             );
         let url = spawn(app).await;
         let client = UsageClient::new().unwrap();
-        let cases: [(&str, UsageError); 5] = [
+        let cases: [(&str, UsageError); 10] = [
             ("401", UsageError::Unauthorized { status: 401 }),
             ("403", UsageError::Unauthorized { status: 403 }),
-            ("429", UsageError::RateLimited),
-            ("500", UsageError::UpstreamStatus { status: 500 }),
+            (
+                "429",
+                UsageError::RateLimited {
+                    retry_after_s: None,
+                },
+            ),
+            (
+                "429r",
+                UsageError::RateLimited {
+                    retry_after_s: Some(120),
+                },
+            ),
+            (
+                "429big",
+                UsageError::RateLimited {
+                    retry_after_s: Some(86_400),
+                },
+            ),
+            (
+                "429date",
+                UsageError::RateLimited {
+                    retry_after_s: None,
+                },
+            ),
+            (
+                "500",
+                UsageError::UpstreamStatus {
+                    status: 500,
+                    retry_after_s: None,
+                },
+            ),
+            // r2 item 6: a 5xx keeps its delta-seconds Retry-After too; an
+            // HTTP-date is still ignored.
+            (
+                "503r",
+                UsageError::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: Some(30),
+                },
+            ),
+            (
+                "503date",
+                UsageError::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: None,
+                },
+            ),
             ("302", UsageError::Redirected { status: 302 }),
         ];
         for (path, expected) in cases {
@@ -2692,6 +2889,14 @@ mod tests {
             secret_free(&err.to_string(), &["leak-me", "sk-ant", "tok-ZZ"]);
             secret_free(&serde_json::to_string(&err).unwrap(), &["leak-me", "sk-ant"]);
         }
+        // The selection report keeps that Retry-After with the 503.
+        let failure = UsageError::UpstreamStatus {
+            status: 503,
+            retry_after_s: Some(30),
+        }
+        .failure();
+        assert_eq!(failure.http_status, Some(503));
+        assert_eq!(failure.retry_after_s, Some(30));
     }
 
     #[tokio::test]

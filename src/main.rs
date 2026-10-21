@@ -412,6 +412,28 @@ enum AuthAction {
         #[arg(long)]
         json: bool,
     },
+    /// What the running daemon's broker remembers about each account: its
+    /// cooldown, last usage read, last token refresh and the last automatic
+    /// selection. Memory only: no usage request, no refresh. Without a
+    /// running daemon, lists the accounts with nothing recorded.
+    State {
+        /// Restrict to one OAuth provider (e.g. claude, openai-codex)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restrict to one account label (or `default`): its state, and only
+        /// the selections that chose it or list it as failed
+        #[arg(long, value_name = "LABEL|default")]
+        account: Option<String>,
+        /// Machine-readable JSON (the report only; notices go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Drop the matched accounts' in-memory cooldowns, usage readings and
+        /// stickiness in the running daemon first. Never touches credentials.
+        /// With --account, the selection history stays; only a clear without
+        /// --account also drops it.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// Tokio worker-thread count (§3.6 process diet). `SYNAPS_WORKER_THREADS`:
@@ -910,6 +932,22 @@ async fn async_main() -> anyhow::Result<()> {
                 force,
                 json,
             })
+            .await
+            .map_err(anyhow::Error::msg)?,
+            AuthAction::State {
+                provider,
+                account,
+                json,
+                clear,
+            } => cmd::auth_accounts::state(
+                cli.profile,
+                cmd::auth_accounts::StateOptions {
+                    provider,
+                    account,
+                    json,
+                    clear,
+                },
+            )
             .await
             .map_err(anyhow::Error::msg)?,
         },
