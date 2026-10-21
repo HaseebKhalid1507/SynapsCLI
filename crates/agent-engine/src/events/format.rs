@@ -1,28 +1,71 @@
 use super::types::Event;
 
-/// A rendered attribute value: `"` becomes `'`, `<` and `>` are dropped and
-/// control characters become spaces. A value can neither end its attribute
-/// nor close the tag nor open another one.
+/// A rendered attribute value: `"` becomes `'`, `<`, `>` and invisible
+/// format characters are dropped and control characters become spaces. A
+/// value can neither end its attribute nor close the tag nor open another one.
 fn attr(value: &str) -> String {
     value
         .chars()
         .filter_map(|c| match c {
             '"' => Some('\''),
             '<' | '>' => None,
+            c if is_invisible(c) => None,
             c if c.is_control() => Some(' '),
             c => Some(c),
         })
         .collect()
 }
 
-/// Rendered text (content and data). Every closing `</event>` tag is
+/// Unicode default-ignorable code points: zero-width (ZWSP, ZWNJ, ZWJ, WJ,
+/// BOM), bidi marks, embeddings, overrides and isolates (LRM, RLM, ALM,
+/// LRE..RLO, LRI..PDI), soft hyphen, variation selectors, tag characters and
+/// the like. They render as nothing, so they could hide inside a tag.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Invisible format characters are dropped and control characters other
+/// than `\n`, `\r` and `\t` become spaces.
+fn drop_invisible_and_controls(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(c),
+            c if is_invisible(c) => None,
+            c if c.is_control() => Some(' '),
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// Rendered text (content and data). Invisible format characters are
+/// dropped and control characters other than `\n`, `\r` and `\t` become
+/// spaces first, so neither can hide inside a tag. Every closing `</event>` tag is
 /// removed (any ASCII case, whitespace after `</` and before `>`). Then
 /// anything that could still read as an event tag (an opener `<event`, `< event`,
 /// `< /event>`, or a closer reassembled by the removal) has its `<` replaced
 /// with `&lt;`. Matching is per character and ASCII case-insensitive, so no
 /// Unicode case mapping can shift it.
 fn sanitize_text(s: &str) -> String {
-    neutralize_event_tags(&strip_event_close(s))
+    neutralize_event_tags(&strip_event_close(&drop_invisible_and_controls(s)))
 }
 
 fn strip_event_close(s: &str) -> String {
