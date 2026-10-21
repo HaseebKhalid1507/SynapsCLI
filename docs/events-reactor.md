@@ -23,6 +23,46 @@ This string is the **single canonical representation** used everywhere:
 **Invariant**: the formatted string produced for a given `Event` is identical
 regardless of which mode (chat, RPC, server) drains it.
 
+**Sanitising.** The rendering is a syntactic boundary: what an event carries
+cannot close its own tag or open another one that this renderer would read as
+an event tag. It is not a guarantee about how a model reads the text.
+- Every attribute value (`id`, `type`, `source`, `channel`): `"` becomes `'`,
+  `<`, `>` and invisible format characters are dropped, and control
+  characters become spaces.
+- "Invisible format characters" are the Unicode default-ignorable code
+  points: zero-width characters (ZWSP, ZWNJ, ZWJ, WJ, BOM), bidi marks,
+  embeddings, overrides and isolates (LRM, RLM, ALM, LRE to RLO, LRI to PDI),
+  the soft hyphen, variation selectors and tag characters.
+- Text and `Data:` first drop invisible format characters and turn control
+  characters other than `\n`, `\r` and `\t` into spaces, so `<ev\u200bent>`
+  and `<\x1fevent>` read as `<event>` and `< event>` and are neutralised
+  below. Then they lose every closing `</event>` tag (the ASCII word in
+  any case, Unicode whitespace allowed after `</` and before `>`). Then
+  anything still readable as an event tag has its `<` written as `&lt;`: an
+  opener (`<event`, `< EVENT x>`), `< /event>`, or a closer that the removal
+  reassembled.
+- "Readable as an event tag" means: an ASCII `<`, optional Unicode whitespace,
+  an optional `/` with optional whitespace after it, and the ASCII word
+  `event` in any case, followed by whitespace, `>`, `/` or the end of the
+  text.
+- Lookalikes are not neutralised and pass through unchanged: a fullwidth or
+  other non-ASCII `<`, or non-ASCII letters that look like `event`. This
+  renderer does not read them as tags, but a model may.
+- Entity spellings (`&lt;/event&gt;`, `&#60;event`) are not decoded or
+  neutralised. The renderer's own `&lt;` is not paired with `&amp;`
+  escaping, so a neutralised tag and a literal `&lt;event` look the same.
+- Other tags (`<b>`, `<events>`) and comparisons (`1 < 2`) are left alone.
+- An event without these characters renders exactly as before.
+- The boundary applies when an `Event` is rendered. History that was already
+  saved keeps the strings it was saved with (a compaction carries pending
+  events forward as formatted strings), and is not re-sanitised.
+
+**Ids at intake.** Events from outside the process (the event socket and the
+inbox) must carry a plain-token id: 1 to 128 ASCII letters, digits, `.`, `_`,
+`:` or `-`. Uuids qualify. Any other id is replaced by a fresh uuid, and a
+warning is logged with the rejected id's length in bytes and the replacement
+uuid, never the rejected bytes. The event is still delivered.
+
 ---
 
 ## Mode Policy Table
