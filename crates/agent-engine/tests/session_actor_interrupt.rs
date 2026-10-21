@@ -956,7 +956,6 @@ async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
     // An event wakes the next turn (no new user prompt): its turn start is
     // still the original prompt, never the note, and the note reaches the
     // provider without its host key.
-    use tokio::io::AsyncWriteExt;
     let reg = agent_engine::events::registry::find_session_registration(handle.id.as_str())
         .expect("registered");
     let event = agent_engine::events::types::Event::simple(
@@ -964,9 +963,7 @@ async fn slow_engine_finalize_notes_the_tool_call_that_may_have_run() {
         "build finished",
         Some(agent_engine::events::types::Severity::High),
     );
-    let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
-    c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
-    c.shutdown().await.unwrap();
+    agent_engine::events::socket::send_to_session_socket(&reg.socket_path, &serde_json::to_vec(&event).unwrap()).await.unwrap();
     let woke = until(&mut a, |e| {
         matches!(
             e,

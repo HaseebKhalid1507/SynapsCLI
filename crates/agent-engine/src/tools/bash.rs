@@ -676,6 +676,7 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(target_os = "linux")]
     fn own_cgroup() -> String {
         std::fs::read_to_string("/proc/self/cgroup")
             .unwrap_or_default()
@@ -733,6 +734,7 @@ mod tests {
         assert_eq!(out.lines().next().unwrap_or_default().trim(), own_cgroup());
     }
 
+    #[cfg(target_os = "linux")]
     fn processes_named(name: &str) -> Vec<String> {
         let out = std::process::Command::new("pgrep")
             .args(["-f", name])

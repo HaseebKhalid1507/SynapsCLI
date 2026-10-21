@@ -256,6 +256,8 @@ fn set_echo(on: bool) {
             .stdin(std::process::Stdio::inherit())
             .status();
     }
+    #[cfg(not(unix))]
+    let _ = on;
 }
 
 pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow::Result<()> {

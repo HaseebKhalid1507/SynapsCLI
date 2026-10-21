@@ -138,16 +138,9 @@ async fn event_triggered_turn_stops_at_the_event_round_budget() {
     let path = synaps_cli::events::registry::find_session_registration(t.session_id().as_str())
         .expect("published session endpoint")
         .socket_path;
-    {
-        use tokio::io::AsyncWriteExt;
-        let mut s = tokio::net::UnixStream::connect(&path)
-            .await
-            .expect("session socket");
-        s.write_all(serde_json::to_string(&ev).unwrap().as_bytes())
-            .await
-            .unwrap();
-        s.shutdown().await.unwrap();
-    }
+    synaps_cli::events::socket::send_to_session_socket(&path, serde_json::to_string(&ev).unwrap().as_bytes())
+        .await
+        .expect("session socket");
     loop {
         let env = tokio::time::timeout(Duration::from_secs(30), t.next_event())
             .await

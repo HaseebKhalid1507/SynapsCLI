@@ -41,6 +41,10 @@
 //! - The socket's parent directory must exist and be owned by our uid
 //!   before we connect (squat defense for the world-writable `/tmp`
 //!   fallback; `$XDG_RUNTIME_DIR` passes the same check trivially).
+// Myx publishes over a Unix socket only. On Windows the subscriber idles
+// (`socket_dir_trust` is always `Missing`), so the protocol layer is unused
+// outside the unit tests, which still exercise it there.
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -458,7 +462,10 @@ pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<(Theme
                 }
             }
             #[cfg(windows)]
-            SocketDirTrust::Trusted => unreachable!("socket_dir_trust never returns Trusted on Windows"),
+            SocketDirTrust::Trusted => {
+                let _ = (&tx, &mut skew_warned);
+                unreachable!("socket_dir_trust never returns Trusted on Windows")
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_CAP);
