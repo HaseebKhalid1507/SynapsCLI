@@ -163,6 +163,7 @@ pub(crate) async fn run_setup(
             name: None,
             max_session_cost: None,
             memory_mode: None,
+            restore_parked: false,
         })
         .await?;
     let (transport, snapshot) =

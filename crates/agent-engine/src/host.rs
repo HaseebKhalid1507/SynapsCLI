@@ -91,6 +91,12 @@ pub struct EngineHost {
     /// MCP discovery deferred by [`McpDiscovery::Background`]; taken (once)
     /// by [`Self::spawn_background_mcp_discovery`].
     pending_mcp_discovery: std::sync::Mutex<Option<crate::mcp::PendingMcpDiscovery>>,
+    /// One `on_session_start` at a time on this host, a hook that a turn
+    /// waits for first. A reload restores every session at once; their
+    /// hooks, all fired together, would queue in each single-process
+    /// extension and the tail would pass the handler timeout and lose its
+    /// injection for the whole session.
+    session_start_gate: crate::session::session_start::SessionStartGate,
 }
 
 /// (E-P2) Returned by [`EngineHost::claim_driver`] when another live session
@@ -212,6 +218,7 @@ impl EngineHost {
             extensions_ready: tokio::sync::watch::channel(false).0,
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
             pending_mcp_discovery: std::sync::Mutex::new(pending_mcp_discovery),
+            session_start_gate: crate::session::session_start::SessionStartGate::new(),
         }))
     }
 
@@ -307,6 +314,11 @@ impl EngineHost {
     /// to stderr and the log. The TUI shows them as notices instead.
     pub fn report_config_warnings(&self) {
         report_config_warnings(&self.config());
+    }
+
+    /// The host's `on_session_start` gate (one hook at a time).
+    pub(crate) fn session_start_gate(&self) -> &crate::session::session_start::SessionStartGate {
+        &self.session_start_gate
     }
 
     pub fn ext_manager(&self) -> &Arc<RwLock<crate::extensions::manager::ExtensionManager>> {

@@ -76,6 +76,47 @@ pub(crate) struct TurnDraftState {
     dirty: bool,
 }
 
+/// What a started turn needs to open its stream (`start_turn`), held while
+/// its request waits for `on_session_start`.
+pub(crate) struct TurnStart {
+    cancel: CancellationToken,
+    steer_rx: mpsc::UnboundedReceiver<String>,
+    auto_approve: bool,
+    completion: crate::runtime::TurnCompletion,
+    /// Events started this turn (nobody typed it): its stream runs under the
+    /// event turn budget (#251). Decided from the turn's trigger at
+    /// `start_turn`, applied when the stream opens (`open_turn_stream`),
+    /// which may be after `on_session_start` has run.
+    event_turn: bool,
+}
+
+/// Why autonomous work may not start now
+/// ([`SessionActor::autonomous_work_blocked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkBlock {
+    /// A reload checkpointed this session: nothing may start work the reload
+    /// record does not carry until the exec, or until the daemon reports
+    /// that it failed (#255's reload fence).
+    Fenced,
+    /// This session's `on_session_start` has not run yet: a request sent
+    /// now would lack its injection.
+    SessionStartPending,
+}
+
+/// A source of autonomous work in the actor's loop: work nobody asked for
+/// with a command ([`SessionActor::holds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkSource {
+    /// Queued events (inbox, `synaps send`, worker completions).
+    QueueWake,
+    /// The park grace or a worker re-check.
+    ParkTimer,
+    /// A due prompt-cache keep-warm ping.
+    KeepWarmTimer,
+    /// The armed session driver's 200 ms tick.
+    DriverTick,
+}
+
 /// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
 /// turn's stream.
 #[derive(Default)]
@@ -511,9 +552,18 @@ pub struct SessionActor {
     pub(crate) background: BackgroundTasks,
     /// B2: spawned compaction in flight (`busy` while `Some`).
     pub(crate) compact: Option<CompactionJob>,
-    /// `await_extensions=false`: fires when process-level discovery is done;
-    /// the actor then emits `on_session_start` without having blocked boot.
-    pub(crate) ext_ready: Option<oneshot::Receiver<()>>,
+    /// `on_session_start` for this session. `await_extensions=false`: a
+    /// task waits for process-level discovery and its turn at the host's
+    /// gate (one hook at a time), then calls it, so boot never blocks on
+    /// it. A turn that comes first moves it ahead of background hooks and
+    /// waits for it without blocking the loop (`turn_awaiting_start`); a
+    /// keep-warm ping waits with its timer off (`holds`).
+    pub(crate) session_start: super::session_start::SessionStart,
+    /// A started turn whose request waits for `on_session_start`: its
+    /// stream opens when the hook has run. The turn is live meanwhile
+    /// (`streaming`), so Cancel, End and a driver revocation end it as any
+    /// turn, with nothing sent.
+    pub(crate) turn_awaiting_start: Option<TurnStart>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
     /// Worker-registry generation of the current/last turn: a user
@@ -701,19 +751,14 @@ impl SessionActor {
 
         // C2: per-session on_session_start (keyed injection) once the
         // process-level discovery is known-finished. Never re-runs discovery.
-        // `await_extensions=false` (TUI): a spawned waiter fires the
-        // `ext_ready` arm instead, so boot never blocks on discovery.
+        // Every call goes through the host's session-start gate.
+        // `await_extensions=false` (TUI, a reload's restore): a spawned task
+        // runs it (`session_start` below), so boot never blocks on it.
         // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
-        // the wait on extension discovery; the const remains the fallback.
-        let ext_ready_timeout = {
-            let secs = config.startup.extensions_ready_timeout_secs;
-            if secs == 0 {
-                budgets::EXTENSIONS_READY_TIMEOUT
-            } else {
-                std::time::Duration::from_secs(secs)
-            }
-        };
-        let mut ext_ready = None;
+        // the wait on extension discovery only; the const remains the
+        // fallback. `run_at_create` then waits its turn at the gate, behind a
+        // running hook and older foreground ones (see `session_start`).
+        let ext_ready_timeout = extensions_ready_timeout(&config);
         if cfg.await_extensions {
             if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())
                 .await
@@ -724,17 +769,7 @@ impl SessionActor {
                     "extensions_ready timed out — on_session_start may miss late extensions"
                 );
             }
-            crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id)
-                .await;
-        } else {
-            let (tx, rx) = oneshot::channel();
-            let waiter_host = Arc::clone(host);
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(ext_ready_timeout, waiter_host.extensions_ready())
-                    .await;
-                let _ = tx.send(());
-            });
-            ext_ready = Some(rx);
+            super::session_start::run_at_create(host, runtime.hook_bus(), &sb.session.id).await;
         }
 
         let id = SessionId::from(sb.session.id.clone());
@@ -790,6 +825,19 @@ impl SessionActor {
         ) = SessionHandle::new(meta.clone(), view);
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
+        let session_start = if cfg.await_extensions {
+            super::session_start::SessionStart::Done
+        } else if cfg.restore_parked {
+            // Parked right after create: the hook waits for the unpark.
+            super::session_start::SessionStart::Pending
+        } else {
+            super::session_start::SessionStart::queue(
+                host,
+                Arc::clone(&hook_bus),
+                Arc::clone(&journal_id),
+                ext_ready_timeout,
+            )
+        };
 
         let mut actor = SessionActor {
             id,
@@ -838,7 +886,8 @@ impl SessionActor {
             state: AttachState::Detached { running: false },
             background,
             compact: None,
-            ext_ready,
+            session_start,
+            turn_awaiting_start: None,
             subagent_tick: None,
             turn_worker_generation: 0,
             lifecycle,
@@ -1008,6 +1057,11 @@ impl SessionActor {
         // checkpoint reply.
         self.sync_memory_choice();
         self.flush_saves().await;
+        // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
+        #[cfg(any(test, feature = "testing"))]
+        if super::session_start::testing::take_requeue(&self.journal_id.load()) {
+            self.queue_session_start();
+        }
         self.emit(SessionEventWire::Idle);
         self.cache_keepwarm_on_idle().await;
     }
@@ -1422,6 +1476,51 @@ impl SessionActor {
         Ok(())
     }
 
+    // ── autonomous work: the reload fence and on_session_start ───────────
+
+    /// Whether autonomous work may start now, and if not, why. Two states
+    /// hold it back: a reload's fence (#255) until the exec or its abort, and
+    /// this session's `on_session_start` until it has run. `Fenced` wins when
+    /// both hold. Each source of autonomous work asks [`Self::holds`]; none
+    /// reads the fence or the hook's state itself.
+    ///
+    /// | source          | `Fenced`  | `SessionStartPending`                                         |
+    /// |-----------------|-----------|---------------------------------------------------------------|
+    /// | queue wake      | waits     | runs: the turn starts, and its request waits for the hook      |
+    /// | park timer      | waits     | runs: a park that happens takes a hook not called out of line  |
+    /// | keep-warm timer | waits     | waits (timer off): a due ping goes out once the hook has run   |
+    /// | driver tick     | waits     | runs: an armed driver is revoked (`driver_idle_conflict`)      |
+    /// | driver start    | refused * | rejected in the tick (`driver_idle_conflict`)                  |
+    ///
+    /// \* `DriverStart` is a command: under the fence the command fence
+    /// refuses it first ("daemon reloading"); the tick never sees it.
+    ///
+    /// The queue wake must not wait for the hook: a parked session's hook is
+    /// out of line (`SessionStart::Pending`) and joins it only at the unpark,
+    /// and the unpark is what the queue wake does. Waiting there would leave
+    /// an event for a parked session queued for good. The turn's own wait
+    /// (`open_turn_stream` after `session_start_ready`) holds its request
+    /// instead, without blocking the loop.
+    pub(crate) fn autonomous_work_blocked(&self) -> Option<WorkBlock> {
+        if self.reload_fence.is_some() {
+            Some(WorkBlock::Fenced)
+        } else if !self.session_start.is_done() {
+            Some(WorkBlock::SessionStartPending)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `source` waits now (the table on
+    /// [`Self::autonomous_work_blocked`]).
+    pub(crate) fn holds(&self, source: WorkSource) -> bool {
+        match self.autonomous_work_blocked() {
+            None => false,
+            Some(WorkBlock::Fenced) => true,
+            Some(WorkBlock::SessionStartPending) => matches!(source, WorkSource::KeepWarmTimer),
+        }
+    }
+
     // ── E-P4: driver_tick ────────────────────────────────────────────────
 
     /// Actor-equivalent of the TUI's `idle_conflict()` (TUI :437-463).
@@ -1433,8 +1532,10 @@ impl SessionActor {
         if self.compact.is_some() {
             return Some("compaction");
         }
-        if self.ext_ready.is_some() {
-            return Some("extensions loading or reloading");
+        match self.autonomous_work_blocked() {
+            Some(WorkBlock::Fenced) => return Some("daemon reloading"),
+            Some(WorkBlock::SessionStartPending) => return Some("extensions loading or reloading"),
+            None => {}
         }
         if self.conv.context_head.is_blocked(&self.conv.session) {
             return Some("unverified context head");
@@ -1467,7 +1568,7 @@ impl SessionActor {
     /// spawned tasks. Mirrors the TUI's `tick()` (TUI :695-1027).
     pub(crate) async fn driver_tick(&mut self) {
         use crate::extensions::session_driver::Outcome;
-        if self.reload_fence.is_some() {
+        if self.holds(WorkSource::DriverTick) {
             return;
         }
 
@@ -1697,6 +1798,9 @@ impl SessionActor {
                         self.driver_revoke("foreground work took priority");
                         return;
                     }
+                    // This includes a pending `on_session_start`: a driver
+                    // turn opens its stream below, not through `start_turn`,
+                    // so it never waits for the hook and must not run before it.
                     if let Some(reason) = self.driver_idle_conflict() {
                         self.driver_revoke(reason);
                         return;
@@ -2094,6 +2198,19 @@ impl SessionActor {
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
+        let flow = self.park_now().await;
+        // Restored to be parked but still live (it could not park): its
+        // `on_session_start` runs now, as for any live session.
+        if flow.is_continue()
+            && !self.is_parked()
+            && matches!(self.session_start, super::session_start::SessionStart::Pending)
+        {
+            self.queue_session_start();
+        }
+        flow
+    }
+
+    async fn park_now(&mut self) -> std::ops::ControlFlow<EndReason> {
         // Fired by a worker re-check (not the grace, not an explicit Park)?
         let recheck = self.park_deadline.is_some() && self.park_deadline == self.park_recheck_at;
         self.park_recheck_at = None;
@@ -2168,6 +2285,8 @@ impl SessionActor {
         // pick up the parked session (the daemon will fail to re-acquire
         // on unpark and surface a clear error instead of a zombie).
         self.session_lock = None;
+        // A hook not called yet waits for the unpark, out of line.
+        self.session_start.withdraw_for_park();
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
@@ -2302,6 +2421,10 @@ impl SessionActor {
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
         self.update_attach_state();
+        // A hook that waited for the unpark runs now (once per session).
+        if matches!(self.session_start, super::session_start::SessionStart::Pending) {
+            self.queue_session_start();
+        }
         tracing::info!(session = %self.id, ms = started.elapsed().as_millis() as u64, "session unparked");
         Ok(())
     }
@@ -2385,6 +2508,118 @@ impl SessionActor {
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
+    /// This session's `on_session_start` task ended: the hook ran (or the
+    /// task failed, which counts as done: fail-open like a hook timeout).
+    /// Refresh the view, which shows the injection, then send what waited
+    /// for it: a started turn's request. A due keep-warm ping waited with its
+    /// timer off (`holds`); the loop's next pass arms it again.
+    async fn session_start_finished(
+        &mut self,
+        ran: std::result::Result<bool, tokio::task::JoinError>,
+    ) {
+        use super::session_start::SessionStart;
+        match ran {
+            Ok(true) => {}
+            // Withdrawn before it was called (a park): not run yet. Anything
+            // waiting for it puts it back in line.
+            Ok(false) => {
+                self.session_start = SessionStart::Pending;
+                if self.turn_awaiting_start.is_some() || self.cache_keepwarm.deadline().is_some() {
+                    self.session_start_ready();
+                }
+                return;
+            }
+            Err(e) => tracing::warn!(session = %self.id, "on_session_start task failed: {e}"),
+        }
+        self.session_start = SessionStart::Done;
+        if self.runtime.is_live() {
+            self.publish_view().await;
+        }
+        if let Some(start) = self.turn_awaiting_start.take() {
+            // A turn canceled from outside (a driver revocation) ends on its
+            // own path (`finish_revoked_turn`) with nothing sent.
+            if !start.cancel.is_cancelled() {
+                self.open_turn_stream(start).await;
+            }
+        }
+    }
+
+    /// No turn and no keep-warm ping goes out before `on_session_start` has
+    /// run. Its injection is part of their system prompt, so a request sent
+    /// before it would lack the extension context and the next request would
+    /// change the cached system prompt. (A manual `/compact` does not wait:
+    /// it builds its own prompt; a rolling summary reuses the request of the
+    /// turn before it or builds its own prompt.) A session created with
+    /// `await_extensions=false` (quick start, every session a reload
+    /// restores) has a task in line at the host's gate for it, or, while
+    /// parked, nothing in line until the unpark.
+    ///
+    /// `true` once the hook has run. Otherwise it puts the hook in line if
+    /// it is not (after a park) and moves it ahead of background hooks; the
+    /// caller waits for `session_start_finished` without blocking the loop.
+    /// The hook itself always runs in that task, through the gate, so it is
+    /// never called twice or beside another session's.
+    pub(crate) fn session_start_ready(&mut self) -> bool {
+        use super::session_start::SessionStart;
+        if matches!(self.session_start, SessionStart::Pending) {
+            self.queue_session_start();
+        }
+        match &self.session_start {
+            SessionStart::Done => true,
+            SessionStart::Queued { ticket, .. } => {
+                ticket.prefer();
+                false
+            }
+            SessionStart::Pending => false,
+        }
+    }
+
+    /// Put this session's `on_session_start` in line (in the background).
+    fn queue_session_start(&mut self) {
+        self.session_start = super::session_start::SessionStart::queue(
+            &self.host,
+            Arc::clone(&self.hook_bus),
+            Arc::clone(&self.journal_id),
+            extensions_ready_timeout(&self.host.config()),
+        );
+    }
+
+    /// Open the turn's stream: the request goes out.
+    async fn open_turn_stream(&mut self, start: TurnStart) {
+        // A turn started by events (nobody typed it) runs under the event
+        // turn budget for this turn only; the stream copies the budget when
+        // it starts, so the session budget is restored right after. Here and
+        // not in `start_turn`: a turn whose request waited for
+        // `on_session_start` opens its stream later, under its own budget.
+        let session_budget = start.event_turn.then(|| {
+            let event_budget = self
+                .runtime
+                .turn_budget()
+                .for_event_turn(&self.host.config().turn_budgets);
+            let session_budget = self.runtime.turn_budget().clone();
+            self.runtime.set_turn_budget(event_budget);
+            session_budget
+        });
+        let stream = self
+            .runtime
+            .run_stream_tracked(
+                self.conv.api_messages.clone(),
+                start.cancel,
+                Some(start.steer_rx),
+                Some(self.secret_prompt_handle.clone()),
+                start.auto_approve,
+                start.completion,
+            )
+            .await;
+        if let Some(session_budget) = session_budget {
+            self.runtime.set_turn_budget(session_budget);
+        }
+        self.stream = Some(stream);
+    }
+
+    /// Start a turn. Its request goes out at once, or, while this session's
+    /// `on_session_start` has not run, once it has (`session_start_ready`);
+    /// the turn is live from here either way.
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
         self.cache_keepwarm_turn_started();
         let ct = CancellationToken::new();
@@ -2421,39 +2656,31 @@ impl SessionActor {
             .begin_turn();
         let completion = crate::runtime::TurnCompletion::new();
         self.turn_completion = Some(completion.clone());
-        // A turn started by events (nobody typed it) runs under the event
-        // turn budget for this turn only; the stream copies the budget when
-        // it starts, so the session budget is restored right after.
-        let session_budget = (trigger == TurnTrigger::EventAuto).then(|| {
-            let event_budget = self
-                .runtime
-                .turn_budget()
-                .for_event_turn(&self.host.config().turn_budgets);
-            let session_budget = self.runtime.turn_budget().clone();
-            self.runtime.set_turn_budget(event_budget);
-            session_budget
-        });
-        let stream = self
-            .runtime
-            .run_stream_tracked(
-                self.conv.api_messages.clone(),
-                ct.clone(),
-                Some(s_rx),
-                Some(self.secret_prompt_handle.clone()),
-                auto_approve,
-                completion,
-            )
-            .await;
-        if let Some(session_budget) = session_budget {
-            self.runtime.set_turn_budget(session_budget);
-        }
-        self.stream = Some(stream);
-        self.cancel = Some(ct);
+        self.cancel = Some(ct.clone());
         self.steer_tx = Some(s_tx);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.reset();
         self.subagent_tick = Some(tick);
+        let start = TurnStart {
+            cancel: ct,
+            steer_rx: s_rx,
+            auto_approve,
+            completion,
+            event_turn: trigger == TurnTrigger::EventAuto,
+        };
+        if self.session_start_ready() {
+            self.open_turn_stream(start).await;
+        } else {
+            tracing::debug!(session = %self.id, "turn waits for on_session_start");
+            self.turn_awaiting_start = Some(start);
+            // Quick Start's first turn can wait here for extension discovery
+            // (`startup.extensions_ready_timeout_secs`) and then the hook:
+            // say so, or the silence looks like a hang.
+            self.emit(SessionEventWire::SystemNotice(
+                "waiting for extensions to start (on_session_start) before sending...".into(),
+            ));
+        }
     }
 
     /// Every turn-end path (Done/Error/Cancel/stream EOF). `streaming=false`
@@ -2465,6 +2692,7 @@ impl SessionActor {
     /// turn's final history, then the draft removal (`close_turn_draft`).
     pub(crate) fn clear_stream(&mut self) {
         self.stream = None;
+        self.turn_awaiting_start = None;
         self.cancel = None;
         self.steer_tx = None;
         self.streaming = false;
@@ -3234,7 +3462,7 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
-        if self.reload_fence.is_some() {
+        if self.holds(WorkSource::QueueWake) {
             // Fenced for a reload: the record carries what is queued.
             return;
         }
@@ -3308,8 +3536,8 @@ impl SessionActor {
                 // Starting a competing turn here would race the driver.
                 if self.driver.is_some() {
                     tracing::debug!("on_queue_wake: RunTurn inhibited — driver armed");
-                } else if self.stream.is_some() {
-                    tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
+                } else if self.streaming || self.stream.is_some() {
+                    tracing::warn!("handle_event_arm: RunTurn with active turn — skipping");
                 } else {
                     self.consecutive_auto_turns += 1;
                     self.start_turn(TurnTrigger::EventAuto, None).await;
@@ -4628,6 +4856,13 @@ impl SessionActor {
                 if self.driver.is_some() {
                     self.driver_revoke("session replaced");
                 }
+                // A turn still waiting for `on_session_start` would open its
+                // stream later on the cleared history, under the new journal
+                // id: cancel it first, so it ends (and is saved) in the old
+                // session with nothing sent.
+                if self.turn_awaiting_start.is_some() {
+                    self.cancel_turn(crate::engine::interrupt::InterruptReason::User).await;
+                }
                 // Before `clear` saves the old session: a ping in flight is
                 // aborted and booked to it, not to the new one.
                 self.cache_keepwarm_conversation_replaced();
@@ -4732,6 +4967,10 @@ impl SessionActor {
 
     async fn finish(&mut self, reason: EndReason) {
         self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::SessionEnding);
+        // Before on_session_end clears the keyed injection (STEP 2): a hook
+        // not yet called leaves the line; one in flight finishes holding the
+        // gate and drops what it injects (`SessionStart::end`).
+        self.session_start.end();
         self.lifecycle.store(
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
@@ -4934,12 +5173,23 @@ async fn driver_tick_timer(
     }
 }
 
-async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
-    match rx {
-        Some(r) => {
-            let _ = r.await;
-        }
-        None => std::future::pending().await,
+/// How long a session waits for process-level extension discovery before
+/// `on_session_start`: `startup.extensions_ready_timeout_secs`, or the
+/// budget constant when that is 0.
+fn extensions_ready_timeout(config: &crate::SynapsConfig) -> Duration {
+    match config.startup.extensions_ready_timeout_secs {
+        0 => budgets::EXTENSIONS_READY_TIMEOUT,
+        secs => Duration::from_secs(secs),
+    }
+}
+
+/// This session's `on_session_start` task, while it is in line or running.
+async fn session_start_task(
+    start: &mut super::session_start::SessionStart,
+) -> std::result::Result<bool, tokio::task::JoinError> {
+    match start {
+        super::session_start::SessionStart::Queued { task, .. } => task.await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -4988,13 +5238,13 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
-                // A reload fence keeps the wake (and its permit) queued.
-                _ = queue.notified(), if actor.reload_fence.is_none() => actor.on_queue_wake().await,
+                // A held wake (and its permit) stays queued.
+                _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
-                _ = park_timer(actor.park_deadline), if actor.reload_fence.is_none() => {
+                _ = park_timer(actor.park_deadline), if !actor.holds(WorkSource::ParkTimer) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
                     }
@@ -5002,23 +5252,17 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if actor.reload_fence.is_none() => {
+                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if !actor.holds(WorkSource::KeepWarmTimer) => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
                     actor.on_cache_keepwarm_done(res);
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
-                _ = ext_ready(&mut actor.ext_ready) => {
-                    actor.ext_ready = None;
-                    let id = (**actor.journal_id.load()).clone();
-                    let bus = Arc::clone(&actor.hook_bus);
-                    crate::extensions::loader::emit_session_start(&bus, &id).await;
-                    if actor.runtime.is_live() {
-                        actor.publish_view().await;
-                    }
+                ran = session_start_task(&mut actor.session_start) => {
+                    actor.session_start_finished(ran).await;
                 },
-                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
+                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if !actor.holds(WorkSource::DriverTick) => {
                     actor.driver_tick().await;
                 }
                 _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {

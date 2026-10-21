@@ -681,12 +681,27 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
     }
 }
 
+/// The config a session is restored with: as saved, except that the
+/// restore never waits on `on_session_start`. Each restored session runs
+/// the hook in the background (the deferred path quick-start sessions
+/// use), so the restore of N sessions does not take N hook round trips
+/// while the socket waits. A session restored Parked runs it only once it
+/// is unparked.
+fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
+    SessionConfig {
+        await_extensions: false,
+        restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
+        ..saved.clone()
+    }
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // Before any session can dispatch: ids continue where the old image
     // stopped, so `sa_1` never names two different workers.
     crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let created = match state.create(s.config.clone()).await {
+        let config = restore_config(&s.config, s.lifecycle);
+        let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
             // placeholder under the SAME id. No alias, no fresh session.
@@ -710,7 +725,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 state
                     .create(SessionConfig {
                         continue_session: None,
-                        ..s.config.clone()
+                        ..config.clone()
                     })
                     .await
             }
@@ -872,6 +887,37 @@ mod tests {
         assert_eq!(validate_exe(&l).unwrap(), f.canonicalize().unwrap());
     }
 
+    /// A restored session never waits on `on_session_start` at create; the
+    /// rest of its saved config is kept. One restored Parked defers the hook
+    /// to its unpark, and that flag never goes on the wire.
+    #[test]
+    fn a_restore_does_not_wait_on_the_session_start_hook() {
+        let saved = SessionConfig {
+            model_override: Some("claude-sonnet-4-5".into()),
+            keep_warm: true,
+            await_extensions: true,
+            ..Default::default()
+        };
+        let restored = restore_config(&saved, SessionLifecycle::Live);
+        assert!(!restored.await_extensions);
+        assert!(!restored.restore_parked);
+        let as_saved = SessionConfig {
+            await_extensions: true,
+            ..restored
+        };
+        assert_eq!(
+            serde_json::to_value(&as_saved).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        for parked in [SessionLifecycle::Parked, SessionLifecycle::Parking] {
+            let restored = restore_config(&saved, parked);
+            assert!(restored.restore_parked, "{parked:?}");
+            assert!(!restored.await_extensions);
+            let wire = serde_json::to_value(&restored).unwrap();
+            assert!(wire.get("restore_parked").is_none(), "never on the wire");
+        }
+    }
+
     #[test]
     fn reload_state_path_follows_profile() {
         let d = tempfile::tempdir().unwrap();
@@ -932,6 +978,25 @@ mod tests {
         }))
         .expect("the reload state still parses");
         assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
+    }
+
+    /// The restore without the hook wait keeps #255's `/memory` carry: the
+    /// session's recorded choice rides in the saved config, Parked or not.
+    #[test]
+    fn a_restore_keeps_the_sessions_memory_choice() {
+        use crate::session::SessionMemoryMode;
+        for mode in [Some(SessionMemoryMode::Off), Some(SessionMemoryMode::CaptureOnly), None] {
+            let saved = SessionConfig {
+                memory_mode: mode,
+                await_extensions: true,
+                ..Default::default()
+            };
+            for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
+                let restored = restore_config(&saved, lifecycle);
+                assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
+                assert!(!restored.await_extensions, "{lifecycle:?}");
+            }
+        }
     }
 
     /// Likewise the session's `/memory` choice: a reload without a
