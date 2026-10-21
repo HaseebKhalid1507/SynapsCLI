@@ -165,12 +165,19 @@ pub enum ResolveError {
     NotFound,
     /// Every session the query matched, so the caller can list them.
     Ambiguous(Vec<SessionMeta>),
+    /// The query only matched as a prefix, and it is shorter than `min`.
+    TooShort { min: usize },
 }
+
+/// Shortest prefix [`resolve_session`] accepts: the date part of an id
+/// (`20261021`). Exact ids, journal ids and names are not prefixes.
+pub const MIN_PREFIX_LEN: usize = 8;
 
 /// Resolve what a user typed (`synaps daemon close X`) against a session
 /// listing, most specific first: exact id, exact journal id, exact name
 /// (two sessions with that name = ambiguous), then a prefix of exactly one
-/// session's id or journal id. Never guesses between candidates.
+/// session's id or journal id, at least [`MIN_PREFIX_LEN`] characters long.
+/// Never guesses between candidates.
 pub fn resolve_session(sessions: &[SessionMeta], query: &str) -> Result<SessionId, ResolveError> {
     let q = query.trim();
     if q.is_empty() {
@@ -192,6 +199,9 @@ pub fn resolve_session(sessions: &[SessionMeta], query: &str) -> Result<SessionI
         .iter()
         .filter(|m| m.id.as_str().starts_with(q) || (!m.journal_id.is_empty() && m.journal_id.starts_with(q)))
         .collect();
+    if !prefixed.is_empty() && q.chars().count() < MIN_PREFIX_LEN {
+        return Err(ResolveError::TooShort { min: MIN_PREFIX_LEN });
+    }
     match prefixed.as_slice() {
         [one] => Ok(one.id.clone()),
         [] => Err(ResolveError::NotFound),
@@ -224,9 +234,11 @@ mod tests {
     fn sessions() -> Vec<SessionMeta> {
         vec![
             meta("alpha-1", "alpha-1", Some("work")),
-            meta("alpha-2", "beta-9", Some("play")),
+            meta("alpha-2", "20261020-120000-b9b9", Some("play")),
             meta("gamma-3", "gamma-3", Some("work")),
             meta("delta-4", "delta-4", None),
+            meta("20261021-093000-cafe", "20261021-093000-cafe", None),
+            meta("20261021-100000-beef", "20261021-100000-beef", None),
         ]
     }
 
@@ -239,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_journal_id_resolves_to_its_session() {
-        assert_eq!(resolve_session(&sessions(), "beta-9").unwrap().as_str(), "alpha-2");
+        assert_eq!(resolve_session(&sessions(), "20261020-120000-b9b9").unwrap().as_str(), "alpha-2");
     }
 
     #[test]
@@ -252,19 +264,33 @@ mod tests {
     #[test]
     fn a_unique_prefix_of_an_id_or_journal_id_resolves() {
         let s = sessions();
-        assert_eq!(resolve_session(&s, "gam").unwrap().as_str(), "gamma-3");
-        assert_eq!(resolve_session(&s, "bet").unwrap().as_str(), "alpha-2");
+        assert_eq!(resolve_session(&s, "20261021-0930").unwrap().as_str(), "20261021-093000-cafe");
+        assert_eq!(resolve_session(&s, "20261020-1").unwrap().as_str(), "alpha-2");
     }
 
     #[test]
     fn a_shared_prefix_is_ambiguous_and_lists_every_candidate() {
-        assert_eq!(ambiguous_ids(resolve_session(&sessions(), "alpha")), ["alpha-1", "alpha-2"]);
+        assert_eq!(ambiguous_ids(resolve_session(&sessions(), "20261021")), ["20261021-093000-cafe", "20261021-100000-beef"]);
+    }
+
+    #[test]
+    fn a_prefix_shorter_than_the_minimum_is_refused_even_when_unique() {
+        let s = sessions();
+        // `2` or `gam` would be a unique prefix, but one keystroke must not
+        // pick a session to end.
+        for q in ["2", "2026102", "gam", "alpha-"] {
+            assert!(matches!(resolve_session(&s, q), Err(ResolveError::TooShort { min: MIN_PREFIX_LEN })), "{q}");
+        }
+        // Exact ids and names are not prefixes: any length works.
+        assert_eq!(resolve_session(&s, "play").unwrap().as_str(), "alpha-2");
+        // A short query that matches nothing is still just not found.
+        assert!(matches!(resolve_session(&s, "zz"), Err(ResolveError::NotFound)));
     }
 
     #[test]
     fn no_match_and_an_empty_query_are_not_found() {
         let s = sessions();
-        assert!(matches!(resolve_session(&s, "zeta"), Err(ResolveError::NotFound)));
+        assert!(matches!(resolve_session(&s, "zeta-zeta"), Err(ResolveError::NotFound)));
         assert!(matches!(resolve_session(&s, "  "), Err(ResolveError::NotFound)));
         assert!(matches!(resolve_session(&[], "alpha"), Err(ResolveError::NotFound)));
     }

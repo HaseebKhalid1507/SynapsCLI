@@ -125,8 +125,8 @@ session you are done with should be **closed**:
 - In-process, `/close` is `/quit` with the same checks.
 - **`synaps daemon close <ID|NAME> [--force] [--attached] [--json]`** does the same from any
   shell, without attaching: no snapshot, no ownership change, a parked session is
-  never rebuilt. The target is an id, a journal id, a name or a unique prefix of
-  an id or journal id, resolved against the daemon's listing (a name two
+  never rebuilt. The target is an id, a journal id, a name or a unique prefix
+  (at least 8 characters, `MIN_PREFIX_LEN`) of an id or journal id, resolved against the daemon's listing (a name two
   sessions share, or a prefix of several, is an error that lists them). A
   session with clients attached is refused (it says how many and who owns
   input) unless `--attached` is given: closing it exits their TUIs and drops
@@ -136,7 +136,7 @@ session you are done with should be **closed**:
   under a fresh reserved id per request (from `CLOSE_QUERY_ID_BASE`), waits for that reply and for the actor to
   end, and answers `Closed`; the attached TUIs exit as above. Exit codes: 0
   closed; 3 refused (work in flight: the reply names it, `--force` closes
-  anyway; clients attached: `--attached`; or the daemon is reloading); 1 no such session, ambiguous, no daemon,
+  anyway; clients attached: `--attached`; or the daemon is reloading); 1 no such session, ambiguous, prefix too short, no daemon,
   timeout; 2 the daemon predates `daemon close` (`synaps daemon reload`) or a
   protocol mismatch. `--json` prints `{ok, session_id, outcome, text}`. A
   session whose journal another process holds (`locked_by`) is only removed

@@ -516,6 +516,11 @@ async fn the_cli_resolves_a_prefix_and_reports_each_outcome_with_its_exit_code()
     let (code, json) = cli_close(&guard, &run, &["no-such-session"]).await;
     assert_eq!((code, json["outcome"].as_str()), (1, Some("not_found")), "{json}");
 
+    // A one-character prefix of the only session is refused, not taken.
+    let (code, json) = cli_close(&guard, &run, &[&sid.as_str()[..1]]).await;
+    assert_eq!((code, json["outcome"].as_str()), (1, Some("too_short")), "{json}");
+    assert!(listed(&sock).await.contains(&sid));
+
     let prefix = &sid.as_str()[..sid.as_str().len() - 1];
     let (code, json) = cli_close(&guard, &run, &[prefix]).await;
     assert_eq!(code, 0, "{json}");

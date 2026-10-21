@@ -153,6 +153,16 @@ async fn close(profile: Option<String>, target: String, force: bool, attached: b
             conn.bye().await;
             close_exit(json, 1, None, "not_found", &format!("no live session matches {target} (see `synaps daemon sessions`)"));
         }
+        Err(ResolveError::TooShort { min }) => {
+            conn.bye().await;
+            close_exit(
+                json,
+                1,
+                None,
+                "too_short",
+                &format!("{target} is too short to pick a session by prefix; give at least {min} characters, the full id or the name"),
+            );
+        }
         Err(ResolveError::Ambiguous(matches)) => {
             conn.bye().await;
             let mut text = format!("{target} matches {} sessions; use a longer prefix or the full id:", matches.len());
