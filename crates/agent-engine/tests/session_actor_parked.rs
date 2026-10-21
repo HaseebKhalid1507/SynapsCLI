@@ -317,6 +317,158 @@ async fn event_injection_wakes_parked_session_and_runs_turn() {
     handle.closed().await;
 }
 
+/// Drop one valid event into the shared inbox the way `synaps send` does
+/// (write aside, rename in) and return its path.
+fn drop_inbox_event(home: &Home, text: &str) -> std::path::PathBuf {
+    let inbox = home.dir.path().join(".synaps-cli").join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let event = agent_engine::events::types::Event::simple(
+        "test",
+        text,
+        Some(agent_engine::events::types::Severity::High),
+    );
+    let path = inbox.join(format!("{}.json", event.id));
+    let tmp = inbox.join(format!("{}.json.tmp", event.id));
+    std::fs::write(&tmp, serde_json::to_vec(&event).unwrap()).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    path
+}
+
+/// What `watch` saw for `for_`: (unparked, EventAuto turns started).
+async fn watch_for(
+    watch: &mut tokio::sync::broadcast::Receiver<agent_engine::session::Envelope>,
+    for_: Duration,
+) -> (bool, usize) {
+    let mut saw_live = false;
+    let mut turns = 0;
+    let deadline = tokio::time::Instant::now() + for_;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return (saw_live, turns);
+        }
+        match tokio::time::timeout(left, watch.recv()).await {
+            Ok(Ok(env)) => match env.event {
+                SessionEventWire::Lifecycle(SessionLifecycle::Live) => saw_live = true,
+                SessionEventWire::TurnStarted {
+                    trigger: TurnTrigger::EventAuto,
+                    ..
+                } => turns += 1,
+                _ => {}
+            },
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => return (saw_live, turns),
+        }
+    }
+}
+
+/// The shared inbox is untargeted mail: it must never unpark a finished
+/// session (the 3f61 wakes). The file stays for a session someone is at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_inbox_file_does_not_unpark_a_parked_session_and_stays_on_disk() {
+    let h = Home::new();
+    let _g = Grace::set("0");
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut a).await;
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    let hits_before = hits.load(std::sync::atomic::Ordering::SeqCst);
+
+    let mut watch = handle.subscribe();
+    let file = drop_inbox_event(&h, "not for you");
+    // Past the watcher's 2 s rescan.
+    let (saw_live, turns) = watch_for(&mut watch, Duration::from_secs(4)).await;
+    assert!(!saw_live, "an inbox file unparked the session");
+    assert_eq!(turns, 0, "an inbox file started a turn");
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), hits_before);
+    assert!(file.exists(), "the file is left for an attached session");
+    handle
+        .send(SessionCommand::End {
+            reason: EndReason::HostShutdown,
+        })
+        .await
+        .unwrap();
+    handle.closed().await;
+}
+
+/// Only an input owner opens the inbox: a detached Live session and an
+/// `Observe` client (the keep-warm observer) leave the file; a `Mirror`
+/// attach takes it once and runs exactly one EventAuto turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_detached_session_ignores_the_inbox_until_an_input_owner_attaches() {
+    use agent_engine::session::AttachMode;
+    let h = Home::new();
+    let _g = Grace::set("never");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut a).await;
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+
+    let mut watch = handle.subscribe();
+    let file = drop_inbox_event(&h, "for whoever is at the keyboard");
+    let (_, turns) = watch_for(&mut watch, Duration::from_secs(3)).await;
+    assert_eq!(turns, 0, "a detached session took the inbox file");
+    assert!(file.exists());
+
+    let (_observer, _) = LocalTransport::attach_with(
+        handle.clone(),
+        ClientMeta::new(ClientKind::Attach),
+        AttachMode::Observe,
+    )
+    .await
+    .unwrap();
+    let (_, turns) = watch_for(&mut watch, Duration::from_secs(3)).await;
+    assert_eq!(turns, 0, "an Observe client opened the inbox");
+    assert!(file.exists(), "an Observe client never owns input");
+
+    let (mut b, _) = LocalTransport::attach_with(
+        handle.clone(),
+        ClientMeta::new(ClientKind::Tui),
+        AttachMode::Mirror,
+    )
+    .await
+    .unwrap();
+    let seen = until(&mut b, |e| {
+        matches!(
+            e,
+            SessionEventWire::TurnStarted {
+                trigger: TurnTrigger::EventAuto,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(!seen.is_empty());
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(!file.exists(), "the owner's session took the file");
+    // A second rescan finds nothing more: delivered exactly once.
+    let (_, turns) = watch_for(&mut watch, Duration::from_millis(2_500)).await;
+    assert_eq!(turns, 1, "exactly one EventAuto turn for one inbox file");
+    let left: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(left.is_empty(), "inbox should be empty, found {left:?}");
+    end(&mut b).await;
+}
+
 /// H2: a session whose journal vanished while Parked is NOT a zombie —
 /// `unpark` rebuilds an empty conversation under the same id (current
 /// model/thinking kept) and the attach succeeds.

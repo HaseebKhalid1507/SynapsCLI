@@ -77,6 +77,11 @@ impl EventQueue {
         self.inner.lock().unwrap().is_empty()
     }
 
+    /// Whether a `push` would be refused right now.
+    pub fn is_full(&self) -> bool {
+        self.inner.lock().unwrap().len() >= self.capacity
+    }
+
     /// Clone of every queued event, front first; the queue is untouched.
     pub fn snapshot(&self) -> Vec<Event> {
         self.inner.lock().unwrap().iter().cloned().collect()

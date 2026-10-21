@@ -53,6 +53,22 @@ All notable changes to this project will be documented in this file.
   logs, and on stderr for `synaps chat`, `synaps rpc` and the daemon.
   `/settings` no longer writes a new `0` for these rows.
   `max_elapsed_secs = 0` still means no wall-clock limit.
+- **`synaps send --session X` fails when nothing matches X.** It used to
+  drop the event into the shared inbox and exit 0, where (with the fix
+  below) it could sit undelivered. It now exits 1, writes nothing, and lists
+  the running sessions. Pass `--inbox` to keep the old drop. A bare
+  `synaps send` with zero or several sessions running still writes to the
+  inbox and now says on stderr that only a session with an attached input
+  owner takes it.
+- **An event addressed to a session reaches that session or fails.** When
+  the socket write failed, `synaps send --session X` used to fall back to
+  the shared inbox, where *every* live session took it: on 2026-10-19 one
+  axon-run alert for the foreman landed in three sessions at once. It now
+  retries the socket 3 times (re-reading the registration, so a reload's
+  new socket is found), then exits 1 with the error and writes nothing.
+  `--inbox` opts back in to the drop. `--broadcast` reports each session it
+  could not reach and exits 1, instead of re-routing via the inbox. Each
+  attempt is capped at 5 s.
 
 ### Fixed
 
@@ -116,9 +132,25 @@ All notable changes to this project will be documented in this file.
   field, diagnostics switch off for the rest of the session (logged once)
   and the request is re-sent without them, so the turn goes through. With
   the setting off (the default) requests are byte-identical to before.
+- **A detached or parked daemon session no longer takes shared-inbox
+  events** (a misaddressed `synaps send`, watcher `notify_inbox`). A daemon
+  session takes `~/.synaps-cli/inbox/` files only while a client owns its
+  input, so an untargeted file can no longer unpark a finished session and
+  start a turn. Each inbox file is now delivered to exactly one session:
+  before, 2-3 sessions could take the same file and each start a paid turn.
+  Events sent to a session's own socket (`--session`, agent-comms, workers)
+  still wake it when parked. A headless `synaps agent` no longer watches the
+  shared inbox at all, so it cannot win an alert meant for the session
+  someone is at; send to an agent with `synaps send --session <agent>`. See
+  "Event delivery" in [docs/daemon-mode.md](docs/daemon-mode.md).
 
 ### Upgrade notes
 
+- **Scripts that `synaps send --session` a session that may not be
+  running** now get exit 1 instead of a silent inbox drop. Pass the full
+  session id (a short id *suffix* never matched), or add `--inbox` to keep
+  the old behaviour. The same holds when the session's socket refuses the
+  event: exit 1, nothing written, instead of an inbox drop.
 - **Loopback `synaps auth-broker` now requires a machine token.** With no
   `--machine-token-file` / `SYNAPS_BROKER_TOKEN` it writes one to
   `~/.synaps-cli/auth-broker.token` (0600). Same-user clients pointed at a
