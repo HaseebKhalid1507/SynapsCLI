@@ -133,7 +133,7 @@ session you are done with should be **closed**:
   unsent input. `--force` only overrides work in flight, not attached
   clients; an attached session that is mid-turn needs both. The
   daemon sends the session `close` (`force` with `--force`) with host authority
-  under the reserved `CLOSE_QUERY_ID`, waits for the reply and for the actor to
+  under a fresh reserved id per request (from `CLOSE_QUERY_ID_BASE`), waits for that reply and for the actor to
   end, and answers `Closed`; the attached TUIs exit as above. Exit codes: 0
   closed; 3 refused (work in flight: the reply names it, `--force` closes
   anyway; clients attached: `--attached`; or the daemon is reloading); 1 no such session, ambiguous, no daemon,
@@ -255,7 +255,7 @@ C: bye | socket close = Detach (turn keeps running)
   `Error{"frame exceeds 64 MiB limit"}` + close. Tested: a > 1 MiB history attaches
   (`attach_to_session_with_history_over_1mib`), a 2 MiB `ping` is answered, a 64 MiB + 10 B frame is refused.
 - Query ids ≥ `RESERVED_QUERY_ID_BASE` (2^63) belong to the transport/daemon (`DIGEST_RESYNC_QUERY_ID`,
-  `IDLE_PROBE_QUERY_ID`, `CHECKPOINT_QUERY_ID`, `CLOSE_QUERY_ID`); `SocketTransport` never surfaces them
+  `IDLE_PROBE_QUERY_ID`, `CHECKPOINT_QUERY_ID`, `CLOSE_QUERY_ID_BASE`+n); `SocketTransport` never surfaces them
   as `QueryResult`.
 - `close` was added without a protocol bump: a daemon older than it answers the unknown frame with
   `Error{"malformed frame: unknown variant `close`…"}` and keeps the connection open, and

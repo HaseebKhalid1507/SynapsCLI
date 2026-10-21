@@ -174,6 +174,37 @@ async fn close_refuses_mid_turn_without_force_and_force_ends_it() {
     stop(d, &sock).await;
 }
 
+/// A plain close and a `--force` close of the same busy session, at once:
+/// each gets its own answer. With one shared reply id the plain close's
+/// refusal was taken by both, so `--force` reported "refused" while the
+/// session was force-closed right after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn concurrent_plain_and_force_closes_each_get_their_own_reply() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, Script::Endless(ANTHROPIC_SSE_PREFIX), "never").await;
+    let sock = d.paths.sock.clone();
+    for round in 0..3 {
+        let (mut t, sid) = create(&sock, guard.home.path()).await;
+        t.send_from_self(SessionCommand::Submit { text: "go".into(), attachments: vec![] }).await.unwrap();
+        until(&mut t, |e| matches!(e, SessionEventWire::Stream(StreamEvent::Llm(_)))).await;
+
+        let (plain, forced) =
+            tokio::join!(SocketTransport::close(&sock, &sid, false, true), SocketTransport::close(&sock, &sid, true, true));
+        let text = forced.unwrap_or_else(|e| panic!("round {round}: --force must report closed, got {e:?}"));
+        assert!(text.contains("closing session"), "round {round}: {text}");
+        // The plain one either lost the race to a running turn or found the
+        // session already ending; it never reports the force close's text.
+        match plain {
+            Err(TransportError::Refused(m)) => assert!(m.contains("a turn is running"), "round {round}: {m}"),
+            Ok(m) => assert!(!m.contains("closing session"), "round {round}: plain took the force reply: {m}"),
+            other => panic!("round {round}: {other:?}"),
+        }
+        assert!(!listed(&sock).await.contains(&sid));
+    }
+    stop(d, &sock).await;
+}
+
 /// A session with a client attached is refused without `attached`, and
 /// `force` alone does not override that (it only overrides work in flight);
 /// the refusal says how many clients and how to close it anyway.

@@ -61,9 +61,11 @@ pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 /// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
 /// so `reload.rs` can await it per session.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
-/// `synaps daemon close` sends the engine command `close` under this id and
-/// awaits its `QueryResult` (`daemon/close.rs`); attached clients never see it.
-pub const CLOSE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
+/// `synaps daemon close` sends the engine command `close` under a fresh id
+/// at or above this one per request (`daemon/close.rs`) and awaits that id's
+/// `QueryResult`, so concurrent closes never take each other's reply.
+/// Attached clients never see these.
+pub const CLOSE_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (1 << 32);
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {

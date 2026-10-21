@@ -10,13 +10,14 @@
 //! a session with clients attached is refused unless the caller passes
 //! `attached` (`--attached`). `force` does not imply it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
 
 use super::DaemonState;
 use crate::session::actor::CLOSE_COMMAND;
-use crate::session::wire::{DaemonFrame, RefuseReason, CLOSE_QUERY_ID};
+use crate::session::wire::{DaemonFrame, RefuseReason, CLOSE_QUERY_ID_BASE};
 use crate::session::{EndReason, SessionCommand, SessionEventWire, SessionHandle, SessionId, SessionMeta, TransportError};
 
 /// How long a full command queue is retried before giving up (the actor
@@ -31,12 +32,18 @@ pub const CLOSE_REPLY_BUDGET: Duration = Duration::from_secs(5);
 pub const CLOSE_END_BUDGET: Duration =
     Duration::from_secs(super::lifecycle::SESSION_END_BUDGET.as_secs() + 1);
 
-/// Serve `Close{session_id, force}`. Always answers with one frame:
+/// A reply id no other in-flight close uses.
+fn next_close_query_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    CLOSE_QUERY_ID_BASE + NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Serve `Close{session_id, force, attached}`. Always answers with one frame:
 /// `Closed`, `Refused{Busy|UnknownSession}` or `Error`.
 pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, attached: bool) -> DaemonFrame {
     // The actor's reload fence swallows a host engine command (it only
     // emits a notice), so no reply would ever come.
-    if state.reloading.load(std::sync::atomic::Ordering::SeqCst) {
+    if state.reloading.load(Ordering::SeqCst) {
         return DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() };
     }
     let Some(handle) = state.attach(id) else {
@@ -64,8 +71,9 @@ pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, att
 
     // Subscribe before sending: the reply can land before we would look.
     let mut rx = handle.subscribe();
+    let query_id = next_close_query_id();
     let cmd = || SessionCommand::EngineCommand {
-        id: CLOSE_QUERY_ID,
+        id: query_id,
         name: CLOSE_COMMAND.into(),
         arg: if force { "force".into() } else { String::new() },
     };
@@ -93,7 +101,7 @@ pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, att
         loop {
             match rx.recv().await {
                 Ok(env) => match env.event {
-                    SessionEventWire::QueryResult { id, value } if id == CLOSE_QUERY_ID => {
+                    SessionEventWire::QueryResult { id, value } if id == query_id => {
                         let text = value.get("text").and_then(|t| t.as_str()).unwrap_or_default().to_string();
                         let ok = value.get("kind").and_then(|k| k.as_str()) != Some("error");
                         return Reply::Answered { ok, text };
