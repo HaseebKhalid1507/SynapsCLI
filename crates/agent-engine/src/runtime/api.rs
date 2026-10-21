@@ -121,6 +121,9 @@ struct ParseState {
     trace_stop_reason: Option<crate::runtime::trace::StopReason>,
     /// Provider-reported usage for the trace record; `None` until observed.
     trace_usage: Option<crate::runtime::trace::UsageMeta>,
+    /// Cache-diagnosis verdict from message_start (only when this request
+    /// sent `diagnostics`); `None` = no divergence / not requested.
+    server_diagnosis: Option<crate::runtime::trace::ServerCacheDiagnosis>,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -197,6 +200,7 @@ impl ParseState {
             first_event_elapsed_ms: None,
             trace_stop_reason: None,
             trace_usage: None,
+            server_diagnosis: None,
         }
     }
 
@@ -290,6 +294,9 @@ struct EventCtx<'t> {
     /// Optional Task 23 turn-budget usage counters, recorded at the single
     /// authoritative Usage emission (and its residual twin) only.
     usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// This request sent `diagnostics`: capture the message id (chain) and
+    /// the server's verdict from message_start.
+    cache_diagnosis: bool,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -589,11 +596,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::MessageStart { message } => {
-            // ═══ TELEMETRY: capture msg_id ═══
-            if ctx.telemetry_level.enabled() {
+            // ═══ TELEMETRY: capture msg_id (also the diagnostics chain) ═══
+            if ctx.telemetry_level.enabled() || ctx.cache_diagnosis {
                 if let Some(id) = message.id {
                     state.telem_msg_id = Some(id.into_owned());
                 }
+            }
+            if ctx.cache_diagnosis {
+                state.server_diagnosis =
+                    super::cache_diagnosis::parse_server_diagnosis(message.diagnostics.as_ref());
             }
             if let Some(usage) = message.usage {
                 // CAPTURE ONLY — no Usage emission from this arm. Live
@@ -896,6 +907,12 @@ pub struct ApiOptions {
     /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
     /// record carries `"keepwarm": true`.
     pub keepwarm: Option<KeepWarmRequest>,
+    /// Anthropic cache diagnostics chain (`cache_diagnostics = true`).
+    /// `None` (default) keeps the wire byte-identical: no header, no
+    /// `diagnostics` field. Set on the foreground turn stream (which threads
+    /// `previous_message_id`) and on keep-warm pings (header only, so the
+    /// beta set matches the turns they keep warm).
+    pub cache_diagnosis: Option<super::cache_diagnosis::CacheDiagnosis>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -1396,6 +1413,12 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // Cache diagnostics (`cache_diagnostics = true`): the foreground
+        // chain only — pings and the setting-off path send no field.
+        let mut diagnostics = super::cache_diagnosis::diagnostics_for(options);
+        if let Some(d) = &diagnostics {
+            body.set_diagnostics(d.clone());
+        }
         // Keep-warm: cut the output cap (not part of the cache key), then
         // fingerprint the prefix exactly as it would go on the wire. A probe —
         // or a ping whose prefix no longer matches what is cached — returns
@@ -1436,7 +1459,7 @@ impl ApiMethods {
         // we called `req.json(&body).send()` per attempt, which re-ran
         // `serde_json::to_vec(&body)` over the entire conversation on every
         // 429 retry — wasted work since the payload is identical.
-        let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
+        let mut body_bytes: bytes::Bytes = serde_json::to_vec(&body)
             .map_err(|e| {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
@@ -1865,6 +1888,50 @@ impl ApiMethods {
                                 }
                             }
 
+                            // ═══ CACHE DIAGNOSTICS fail-soft ═══
+                            // The API refused the beta header or the
+                            // `diagnostics` field: latch it off for the session
+                            // and re-send this request without either (header
+                            // is rebuilt from the latch). Costs no retry budget;
+                            // a turn never fails because of diagnostics. The
+                            // trace keeps the first attempt's wire metadata.
+                            let diag_on_wire = diagnostics.is_some()
+                                || super::cache_diagnosis::wants_beta_header(&auth_type, options);
+                            if diag_on_wire
+                                && super::cache_diagnosis::is_rejection(
+                                    status.as_u16(),
+                                    &error_text,
+                                )
+                            {
+                                if let Some(chain) = &options.cache_diagnosis {
+                                    chain.reject(status.as_u16());
+                                }
+                                if let Some(d) = diagnostics.take() {
+                                    match super::cache_diagnosis::strip_diagnostics(&body_bytes, &d)
+                                    {
+                                        Some(stripped) => body_bytes = stripped.into(),
+                                        // Unreachable by construction (the
+                                        // field serializes first); keep the
+                                        // normal error path rather than resend
+                                        // a body we could not fix.
+                                        None => diagnostics = Some(d),
+                                    }
+                                }
+                                if diagnostics.is_none() {
+                                    if let Some(t) = tracer.as_mut() {
+                                        t.attempt_failed(
+                                            clock,
+                                            crate::runtime::trace::RetryClass::Other,
+                                            Duration::ZERO,
+                                            Some(status.as_u16()),
+                                            trace_rid,
+                                            "cache_diagnosis_rejected",
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Decide whether we've exhausted retries for this error class.
                             // A keep-warm ping never retries: any error stops it.
                             let retry_exhausted = if options.keepwarm.is_some() {
@@ -2064,6 +2131,7 @@ impl ApiMethods {
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
                 usage_counters: options.usage_counters.clone(),
+                cache_diagnosis: diagnostics.is_some(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2163,6 +2231,20 @@ impl ApiMethods {
                 None => "empty_response",
             };
 
+            // ═══ CACHE DIAGNOSTICS: advance the chain, tag the trace ═══
+            // The server fingerprints every request that carried
+            // `diagnostics`, keyed by its message id — so the next request
+            // compares against this one even if its stream later failed.
+            if diagnostics.is_some() {
+                if let (Some(chain), Some(id)) = (&options.cache_diagnosis, &state.telem_msg_id) {
+                    chain.record(id);
+                }
+            }
+            let server_diagnosis = state.server_diagnosis.take();
+            if let Some(t) = tracer.as_mut() {
+                t.set_server_diagnosis(server_diagnosis);
+            }
+
             // ═══ TELEMETRY: write the record ═══
             if telemetry_level.enabled() {
                 // Build context record — what we sent
@@ -2201,7 +2283,10 @@ impl ApiMethods {
                     stop_reason: state.telem_stop_reason,
                     usage: state.telem_usage,
                     ratelimit: telem_ratelimit,
-                    cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
+                    cache_diag: server_diagnosis.map(|d| telemetry::CacheDiagRecord {
+                        miss_reason: d.reason.as_str().to_string(),
+                        missed_tokens: d.missed_input_tokens,
+                    }),
                     context: telemetry::ContextRecord {
                         messages: cleaned_messages.len(),
                         tools: tools_schema.len(),
@@ -2548,6 +2633,7 @@ mod tests {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -2580,6 +2666,7 @@ mod tests {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -2604,6 +2691,7 @@ mod tests {
             // carry a 1h marker. The no-marker test overrides this.
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -4118,6 +4206,7 @@ mod tests {
             saw_1h_honored: honored.clone(),
             request_has_1h_marker: false,
             usage_counters: None,
+            cache_diagnosis: false,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(

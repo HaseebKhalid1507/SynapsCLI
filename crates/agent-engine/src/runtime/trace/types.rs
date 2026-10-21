@@ -557,6 +557,67 @@ pub struct CacheMeta {
     /// available to compare against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta: Option<CacheSegmentDelta>,
+    /// The provider's own verdict (`cache_diagnostics = true`, Anthropic
+    /// only): where this request first diverged from the previous one in
+    /// the chain. Absent when diagnostics is off or no divergence was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_diagnosis: Option<ServerCacheDiagnosis>,
+}
+
+/// `cache_miss_reason.type` from Anthropic cache diagnostics, normalized to
+/// a closed set (provider text is never copied into a record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheMissReason {
+    ModelChanged,
+    SystemChanged,
+    ToolsChanged,
+    MessagesChanged,
+    PreviousMessageNotFound,
+    Unavailable,
+    /// `{"cache_miss_reason": null}`: the comparison was still running.
+    Pending,
+    /// A reason type this build does not know (on the wire, or written by
+    /// a newer build).
+    #[serde(other)]
+    Other,
+}
+
+impl CacheMissReason {
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "model_changed" => Self::ModelChanged,
+            "system_changed" => Self::SystemChanged,
+            "tools_changed" => Self::ToolsChanged,
+            "messages_changed" => Self::MessagesChanged,
+            "previous_message_not_found" => Self::PreviousMessageNotFound,
+            "unavailable" => Self::Unavailable,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelChanged => "model_changed",
+            Self::SystemChanged => "system_changed",
+            Self::ToolsChanged => "tools_changed",
+            Self::MessagesChanged => "messages_changed",
+            Self::PreviousMessageNotFound => "previous_message_not_found",
+            Self::Unavailable => "unavailable",
+            Self::Pending => "pending",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Provider-side cache diagnosis for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerCacheDiagnosis {
+    pub reason: CacheMissReason,
+    /// `cache_missed_input_tokens`: the provider's estimate of the input
+    /// after the divergence point (`*_changed` reasons only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_input_tokens: Option<u64>,
 }
 
 /// What a provider adapter did to a non-representable element.

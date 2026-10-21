@@ -241,6 +241,7 @@ fn cache_meta(
         system_prefix: None,
         history_tail: None,
         delta: None,
+        server_diagnosis: None,
     }
 }
 

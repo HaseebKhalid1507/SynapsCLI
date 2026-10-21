@@ -680,6 +680,9 @@ impl RequestTracer {
             },
         };
         self.emit_record(outcome);
+        // The verdict belongs to this attempt: the next one starts without
+        // it, even if it fails before streaming.
+        self.structure.cache.server_diagnosis = None;
         self.retries.push(RetryMeta {
             attempt: self.attempt,
             class,
@@ -718,6 +721,13 @@ impl RequestTracer {
             code: code.to_string(),
             correlation_id: self.request_id.as_str().to_string(),
         }
+    }
+
+    /// Attach (or clear) the provider's cache diagnosis for the attempt
+    /// that is about to finish. Set per attempt so a retry never inherits
+    /// the previous attempt's verdict.
+    pub fn set_server_diagnosis(&mut self, diagnosis: Option<super::ServerCacheDiagnosis>) {
+        self.structure.cache.server_diagnosis = diagnosis;
     }
 
     fn emit_record(&self, outcome: TransportOutcome) {

@@ -19,6 +19,7 @@ mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
+mod cache_diagnosis;
 pub mod capture_worker;
 pub mod chat_capture;
 pub(crate) mod cloud_invoke;
@@ -672,11 +673,13 @@ pub struct Runtime {
     /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
     /// shared by `share_ttl_latches`, like the TTL latches above.
     cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
-    /// Last Anthropic message id (`msg_...`) — threaded into the next
-    /// request's `diagnostics.previous_message_id` when diagnostics is on.
-    /// Reserved for the cache-diagnosis beta wiring (handoff item).
-    #[allow(dead_code)]
+    /// Last foreground Anthropic message id (`msg_...`) — threaded into the
+    /// next request's `diagnostics.previous_message_id` when diagnostics is
+    /// on. Fresh per clone, shared by `share_ttl_latches`.
     last_msg_id: Arc<Mutex<Option<String>>>,
+    /// Set once the API rejected cache diagnostics: off for the session.
+    /// Shared across `Clone` (subagents never re-probe a rejecting API).
+    cache_diag_rejected: Arc<std::sync::atomic::AtomicBool>,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     /// Extension hook bus for dispatching events to extensions.
     hook_bus: Arc<crate::extensions::hooks::HookBus>,
@@ -1276,6 +1279,7 @@ impl Runtime {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
             last_msg_id: Arc::new(Mutex::new(None)),
+            cache_diag_rejected: Default::default(),
             session_manager,
             hook_bus: host.hook_bus,
             reaper_handle,
@@ -1832,6 +1836,12 @@ impl Runtime {
     pub fn begin_conversation(&mut self, id: Option<String>) {
         self.session_allow_all.revoke();
         self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
+        // New conversation, new cache-diagnosis chain (cleared in place so
+        // shared driver/ping clones see it too).
+        *self
+            .last_msg_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.set_session_id(id);
     }
 
@@ -3845,6 +3855,21 @@ impl Runtime {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
         self.cache_anchor = parent.cache_anchor.clone();
+        // Same session, same diagnostics chain: a driver turn continues it,
+        // and a ping sees the same rejection latch (it never moves the chain).
+        self.last_msg_id = parent.last_msg_id.clone();
+        self.cache_diag_rejected = parent.cache_diag_rejected.clone();
+    }
+
+    /// The cache-diagnosis chain for this runtime's requests, `None` when
+    /// `cache_diagnostics` is off (wire unchanged).
+    pub(crate) fn cache_diagnosis(&self) -> Option<cache_diagnosis::CacheDiagnosis> {
+        self.cache_diagnostics.then(|| {
+            cache_diagnosis::CacheDiagnosis::new(
+                Arc::clone(&self.last_msg_id),
+                Arc::clone(&self.cache_diag_rejected),
+            )
+        })
     }
 
     /// Change the cache TTL strategy mid-session. The next request re-marks
@@ -4027,6 +4052,8 @@ impl Runtime {
                     usage_counters: None,
                     cache_anchor: None,
                     keepwarm: None,
+                    // The non-stream transport never sends diagnostics.
+                    cache_diagnosis: None,
                 },
             )
             .await?;
@@ -4593,6 +4620,9 @@ impl Runtime {
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
             keepwarm: None,
+            // The foreground chain: the only requests that thread
+            // `diagnostics.previous_message_id`.
+            cache_diagnosis: self.cache_diagnosis(),
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4759,6 +4789,7 @@ impl Clone for Runtime {
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
+            cache_diag_rejected: Arc::clone(&self.cache_diag_rejected),
             session_manager: self.session_manager.clone(),
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None, // Cloned runtimes don't own the reaper
@@ -5699,6 +5730,35 @@ mod tests {
             runtime.session_allow_all(),
             new_worker.session_allow_all()
         ));
+    }
+
+    #[test]
+    fn conversation_boundary_resets_the_cache_diagnosis_chain() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_cache_diagnostics(true);
+        let mut driver = runtime.clone();
+        driver.share_ttl_latches(&runtime);
+        runtime.cache_diagnosis().unwrap().record("msg_old");
+        // Compaction successor: same conversation, chain kept.
+        runtime.set_session_id(Some("successor".into()));
+        assert_eq!(
+            runtime
+                .cache_diagnosis()
+                .unwrap()
+                .previous_message_id()
+                .as_deref(),
+            Some("msg_old")
+        );
+        // `/clear` (and resume) start a new chain, seen by shared clones too.
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(
+            runtime.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
+        assert_eq!(
+            driver.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
     }
 
     #[test]
