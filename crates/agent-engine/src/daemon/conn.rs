@@ -29,8 +29,10 @@ type Reader = BufReader<OwnedReadHalf>;
 /// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
 /// anything that drives the actor's *own* bookkeeping (`Attach`, `Detach`
 /// for another client, `Resync`, `HostEvent`) or ends the session for every
-/// other client (`End`) is refused with an `Error` frame. Ending a session
-/// is `daemon stop`'s job today.
+/// other client with a host reason (`End`) is refused with an `Error` frame.
+/// The owner ends a session with `/close` (an engine command, checked by the
+/// actor); `daemon close` does it from a control connection
+/// (`ClientFrame::Close`), `daemon stop` for every session.
 fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static str> {
     use SessionCommand as C;
     match cmd {
@@ -281,6 +283,20 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         return;
                     }
                 }
+            }
+            // `daemon close`: end one session with host authority. A
+            // refusal is terminal (the writer closes after `Refused`).
+            Ok(Read::Frame(ClientFrame::Close { session_id, force, attached })) => {
+                tracing::info!(session = %session_id, force, attached, "daemon: close requested over the socket");
+                let reply = super::close::close_session(&state, &session_id, force, attached).await;
+                let _ = tx.send(reply).await;
+            }
+            // `daemon pin`: pin/unpin one session with host authority. A
+            // refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::Pin { session_id, on })) => {
+                tracing::info!(session = %session_id, on, "daemon: pin requested over the socket");
+                let reply = super::pin::pin_session(&state, &session_id, on).await;
+                let _ = tx.send(reply).await;
             }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
@@ -557,7 +573,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
             }
-            Ok(Read::Frame(ClientFrame::Reload { .. })) | Ok(Read::Frame(ClientFrame::Purge)) => {
+            // An attached client closes its session with `/close` and pins
+            // it with `/pin`.
+            Ok(Read::Frame(ClientFrame::Reload { .. }))
+            | Ok(Read::Frame(ClientFrame::Purge))
+            | Ok(Read::Frame(ClientFrame::Close { .. }))
+            | Ok(Read::Frame(ClientFrame::Pin { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -604,6 +625,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 forward.abort();
                 let _ = forward.await;
             }
+        }
+    } else if ended {
+        // The actor broadcast `Ended` before it dropped its queue, so it is
+        // in the forwarder's receiver: let it go out before the `Bye`, or the
+        // client sees EOF and never learns the session ended (`/close` from
+        // another client, `daemon close`, eviction).
+        if tokio::time::timeout(Duration::from_secs(1), &mut forward).await.is_err() {
+            forward.abort();
+            let _ = forward.await;
         }
     } else {
         forward.abort();

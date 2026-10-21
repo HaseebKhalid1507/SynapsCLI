@@ -341,7 +341,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
             },
-            false,
+            // The pin is on the handle too, so it survives a reload whose
+            // checkpoint did not confirm.
+            handle.pinned(),
             handle.lifecycle(),
             Vec::new(),
             // Persisted independently of the checkpoint: an explicit
@@ -942,6 +944,19 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// Likewise the pin: an unconfirmed checkpoint must not unpin a
+    /// session (it would park, and stop holding the daemon's idle exit).
+    #[test]
+    fn the_pin_survives_an_unconfirmed_checkpoint() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("pin-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert!(!record(&handle, None).keep_warm);
+        ep.keep_warm.store(true, std::sync::atomic::Ordering::Release);
+        let r = record(&handle, None);
+        assert!(r.keep_warm && r.config.keep_warm);
     }
 
     /// A `memory_mode` this image does not know (written by a newer one)

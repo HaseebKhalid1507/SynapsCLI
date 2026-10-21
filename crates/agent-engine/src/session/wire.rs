@@ -34,6 +34,14 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// `DriverTurnOutcome`); old clients skip unknown via `#[serde(other)]`.
 /// Protocol stays exact-match; only *binary* versions compare directionally
 /// (reload, §2.8).
+/// `Close`/`Closed` were added without a bump: an older daemon answers the
+/// unknown `ClientFrame` with `Error{"malformed frame: unknown variant
+/// `close`…"}` (the client maps that to "daemon too old"), whereas a bump
+/// would refuse every older TUI that reconnects after a `daemon reload`.
+/// Additive `ClientFrame` variants that only a new client sends follow this
+/// rule; `Closed` only ever answers `Close`, so old clients never see it.
+/// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
+/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
 pub const PROTOCOL_VERSION: u32 = 3;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -55,6 +63,11 @@ pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 /// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
 /// so `reload.rs` can await it per session.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
+/// `synaps daemon close` sends the engine command `close` under a fresh id
+/// at or above this one per request (`daemon/close.rs`) and awaits that id's
+/// `QueryResult`, so concurrent closes never take each other's reply.
+/// Attached clients never see these.
+pub const CLOSE_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (1 << 32);
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {
@@ -113,6 +126,28 @@ pub enum ClientFrame {
     /// Control fast path: `memstat::purge_arenas()` in the daemon (bench
     /// hygiene). Reply: `Pong`. (C2)
     Purge,
+    /// Control fast path: end one session as `/close [force]` would, with
+    /// host authority (no attach, never unparks). A session with clients
+    /// attached is refused unless `attached` (`--attached`); `force` only
+    /// overrides work in flight. Reply: `Closed`, or
+    /// `Refused{Busy|UnknownSession}`. Not accepted on an attached
+    /// connection (that client has `/close`).
+    Close {
+        session_id: SessionId,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        attached: bool,
+    },
+    /// Control fast path: pin (`on`) or unpin one session, as `/pin on|off`
+    /// would, with host authority. `on` is required so a frame always says
+    /// which way it goes. Pinning a parked session unparks it; unpinning one
+    /// leaves it parked. Reply: `Pinned`, or `Refused{Busy|UnknownSession}`.
+    /// Not accepted on an attached connection (that client has `/pin`).
+    Pin {
+        session_id: SessionId,
+        on: bool,
+    },
     Bye,
 }
 
@@ -136,6 +171,17 @@ impl std::fmt::Debug for ClientFrame {
                 .field("exe", exe)
                 .finish(),
             Self::Purge => f.write_str("Purge"),
+            Self::Close { session_id, force, attached } => f
+                .debug_struct("Close")
+                .field("session_id", session_id)
+                .field("force", force)
+                .field("attached", attached)
+                .finish(),
+            Self::Pin { session_id, on } => f
+                .debug_struct("Pin")
+                .field("session_id", session_id)
+                .field("on", on)
+                .finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -246,6 +292,17 @@ pub enum DaemonFrame {
     Error {
         session_id: Option<SessionId>,
         message: String,
+    },
+    /// Reply to `Close`: the session ended; `text` is the actor's `/close`
+    /// reply (how to continue it).
+    Closed {
+        session_id: SessionId,
+        text: String,
+    },
+    /// Reply to `Pin`: the session's pin is now `on`.
+    Pinned {
+        session_id: SessionId,
+        on: bool,
     },
     /// `Some(Reloading{..})` before exec; `None` otherwise (today).
     Bye {
@@ -1370,6 +1427,10 @@ mod tests {
             }},
             ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
             ClientFrame::Purge,
+            ClientFrame::Close { session_id: "s".into(), force: true, attached: true },
+            ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
+            ClientFrame::Pin { session_id: "s".into(), on: true },
+            ClientFrame::Pin { session_id: "s".into(), on: false },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1408,6 +1469,9 @@ mod tests {
             )),
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
             DaemonFrame::Error { session_id: None, message: "e".into() },
+            DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
+            DaemonFrame::Pinned { session_id: "s".into(), on: true },
+            DaemonFrame::Pinned { session_id: "s".into(), on: false },
             DaemonFrame::Bye { reason: None },
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
@@ -1440,6 +1504,49 @@ mod tests {
         assert!(h2.env.is_some(), "Hello::new must capture client env");
         let b: DaemonFrame = serde_json::from_str(r#"{"type":"bye"}"#).unwrap();
         assert!(matches!(b, DaemonFrame::Bye { reason: None }));
+    }
+
+    #[test]
+    fn close_defaults_force_off_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"close","session_id":"s"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Close { ref session_id, force: false, attached: false } if session_id.as_str() == "s"));
+        // A daemon built before `Close` decodes into an enum without it; the
+        // client keys "daemon too old" on this exact serde wording.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"close","session_id":"s","force":true}"#).unwrap_err();
+        assert!(err.contains("unknown variant `close`"), "{err}");
+    }
+
+    #[test]
+    fn pin_requires_on_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"pin","session_id":"s","on":false}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Pin { ref session_id, on: false } if session_id.as_str() == "s"));
+        assert!(decode_line::<ClientFrame>(r#"{"type":"pin","session_id":"s"}"#).is_err());
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"pin","session_id":"s","on":true}"#).unwrap_err();
+        assert!(err.contains("unknown variant `pin`"), "{err}");
+    }
+
+    #[test]
+    fn a_session_meta_without_pinned_decodes_as_not_pinned() {
+        let mut v = serde_json::to_value(meta()).unwrap();
+        v.as_object_mut().unwrap().remove("pinned");
+        let m: SessionMeta = serde_json::from_value(v).unwrap();
+        assert!(!m.pinned);
+        let mut pinned = meta();
+        pinned.pinned = true;
+        let back: SessionMeta = serde_json::from_value(serde_json::to_value(&pinned).unwrap()).unwrap();
+        assert!(back.pinned);
     }
 
     #[test]

@@ -350,6 +350,11 @@ pub struct SessionMeta {
     /// `"pid N (kind)"`. Shown in `daemon sessions`; cleared on unpark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
+    /// Pinned (`KeepWarm{on}`, `/pin`): never parked, never idle-ended, and
+    /// the daemon does not idle-exit while it is set. An older daemon omits
+    /// it (→ false); an older client ignores it.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -678,7 +683,8 @@ pub enum SessionCommand {
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
-    /// (B3) pin/unpin (`--keep-warm`, `/keep-warm on|off`).
+    /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
+    /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
     KeepWarm { on: bool },
     /// Host-only (never wire): park now if `can_park()` (reload rehydrates
     /// a Parked session Parked). A no-op otherwise.

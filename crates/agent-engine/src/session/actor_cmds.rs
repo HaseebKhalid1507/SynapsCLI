@@ -237,6 +237,107 @@ impl SessionActor {
         }
     }
 
+    /// `/close [force]`: end this session in the daemon. It is saved and
+    /// ended exactly like the in-process quit (`End{ClientQuit}`), leaves the
+    /// daemon's session list, and every attached client is told (`Ended`);
+    /// `synaps --attach --continue <id>` brings it back from its journal.
+    /// Over a socket `/quit` only detaches, which leaves the session loaded.
+    ///
+    /// Refused while closing would destroy work in flight: a running turn or
+    /// compaction, a running worker (a session's workers die with its
+    /// runtime), an armed `/auto` run. `force` closes anyway: it cancels those
+    /// workers first and notes each one in the conversation, for whoever
+    /// continues it. A parked session has none of these and closes without
+    /// being rebuilt.
+    ///
+    /// Owner-only, like every engine command. Replies on the `QueryResult`
+    /// (`output` / `error`) before the `Ended`. `Some(reason)` = end now.
+    pub(crate) fn close_command(&mut self, id: u64, arg: &str) -> Option<EndReason> {
+        let reply = |text: String, kind: &str| SessionEventWire::QueryResult {
+            id,
+            value: serde_json::json!({ "kind": kind, "text": text }),
+        };
+        let force = match arg.trim() {
+            "" => false,
+            "force" => true,
+            _ => {
+                self.emit(reply("usage: /close [force]".into(), "error"));
+                return None;
+            }
+        };
+        let live = self.runtime.is_live();
+        let workers: Vec<(String, String)> = if live {
+            let mut running: Vec<(String, String)> = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .display_rows()
+                .into_iter()
+                .filter(|r| {
+                    r.status == crate::runtime::subagent::SubagentStatus::Running
+                        && !r.cancel_requested
+                })
+                .map(|r| (r.handle_id, r.agent_name))
+                .collect();
+            running.sort();
+            running
+        } else {
+            Vec::new()
+        };
+        let mut blockers = Vec::new();
+        if self.streaming {
+            blockers.push("a turn is running".to_string());
+        }
+        if self.compact.is_some() {
+            blockers.push("a compaction is running".to_string());
+        }
+        if !workers.is_empty() {
+            let names: Vec<String> = workers.iter().map(|(id, agent)| format!("{id} {agent}")).collect();
+            blockers.push(format!(
+                "{} worker{} running ({})",
+                workers.len(),
+                if workers.len() == 1 { " is" } else { "s are" },
+                names.join(", ")
+            ));
+        }
+        if self.driver.is_some() {
+            blockers.push("an /auto run is armed".to_string());
+        }
+        if !blockers.is_empty() && !force {
+            self.emit(reply(
+                format!(
+                    "not closed: {}. Closing the session would stop {}. Wait, or use /close force.",
+                    blockers.join("; "),
+                    if blockers.len() == 1 { "it" } else { "them" },
+                ),
+                "error",
+            ));
+            return None;
+        }
+        if !workers.is_empty() {
+            let cancelled = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .cancel_running(crate::runtime::subagent::WorkerCancelScope::All);
+            for (handle_id, agent) in workers.iter().filter(|(h, _)| cancelled.contains(h)) {
+                self.note_in_main_conversation(super::actor::subagent_close_cancel_event(handle_id, agent));
+            }
+        }
+        let session = (**self.journal_id.load()).clone();
+        // No history, no journal: there is nothing to continue (a parked
+        // session always has one).
+        let text = if self.conv.is_live() && self.conv.api_messages.is_empty() {
+            format!("closing session {session} (it never ran a turn, so there is nothing to resume)")
+        } else {
+            format!("closing session {session}; resume it with: synaps --attach --continue {session}")
+        };
+        self.emit(reply(text, "output"));
+        Some(EndReason::ClientQuit)
+    }
+
     /// `(id, agent)` of every worker with no cancel requested, sorted.
     fn uncancelled_workers(&self) -> Vec<(String, String)> {
         let mut workers: Vec<(String, String)> = self
