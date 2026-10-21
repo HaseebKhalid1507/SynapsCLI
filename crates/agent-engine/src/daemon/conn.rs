@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -19,11 +17,12 @@ use crate::session::handle::CMD_CHAN_CAP;
 use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
+use crate::ipc::{ServerReadHalf, ServerStream, ServerWriteHalf};
 use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-type Reader = BufReader<OwnedReadHalf>;
+type Reader = BufReader<ServerReadHalf>;
 
 /// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
 /// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
@@ -117,7 +116,7 @@ async fn read_frame(reader: &mut Reader, line: &mut String) -> std::io::Result<R
 }
 
 /// Writer task: owns the write half; bounded queue = per-client backpressure.
-fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<DaemonFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -149,8 +148,8 @@ fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::tas
     (tx, task)
 }
 
-pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: CancellationToken) {
-    let (r, w) = stream.into_split();
+pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
+    let (r, w) = crate::ipc::split_server(stream);
     let mut reader = BufReader::new(r);
     let (tx, writer) = spawn_writer(w);
     let mut line = String::new();
@@ -524,6 +523,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 if state.reloading.load(Ordering::SeqCst) && refused_while_draining(&cmd) {
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
+                }
+                // A client's own Detach ends its feed: nothing after it is
+                // forwarded (its `ClientLeft` included), whether its `Bye`
+                // shares the read (one socket segment) or comes in a later
+                // one (a named pipe often delivers the two writes apart).
+                if matches!(&cmd, SessionCommand::Detach { client: c } if *c == client) {
+                    forward.abort();
                 }
                 match handle.send_from(client, cmd).await {
                     Ok(()) => {}

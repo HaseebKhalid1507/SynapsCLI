@@ -6,9 +6,6 @@
 //! 4. Continue session with env=None → the session's journal-rehydrated env
 //!    must contain MARK=xyz.
 //!
-//! Unix only (daemon socket + spawn).
-
-#![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;

@@ -43,6 +43,7 @@ async fn next(t: &mut SocketTransport) -> Envelope {
         .expect("open")
 }
 
+#[cfg(unix)]
 fn mode_of(p: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -57,9 +58,13 @@ async fn socket_roundtrip_real_uds() {
     let paths = d.paths.clone();
 
     // perms + registry
-    assert_eq!(mode_of(&paths.dir), 0o700);
-    assert_eq!(mode_of(&paths.sock), 0o600);
-    assert_eq!(mode_of(&paths.json), 0o600);
+    // Windows: no socket file; the pipe's owner-only DACL is `ipc`'s job.
+    #[cfg(unix)]
+    {
+        assert_eq!(mode_of(&paths.dir), 0o700);
+        assert_eq!(mode_of(&paths.sock), 0o600);
+        assert_eq!(mode_of(&paths.json), 0o600);
+    }
     let info = registry::read_daemon_json(&paths).expect("daemon.json");
     assert_eq!(info.pid, std::process::id());
     assert_eq!(info.protocol_version, PROTOCOL_VERSION);
@@ -295,6 +300,8 @@ async fn stale_socket_reaped_and_second_daemon_refused() {
     std::fs::create_dir_all(&run).unwrap();
     let paths = registry::daemon_paths_in(&run, None);
     // stale leftovers: socket + json with a dead pid, nobody holding the lock
+    // (Windows leaves no socket behind: a pipe dies with its last handle)
+    #[cfg(unix)]
     std::os::unix::net::UnixListener::bind(&paths.sock).unwrap();
     registry::write_daemon_json(
         &paths,
