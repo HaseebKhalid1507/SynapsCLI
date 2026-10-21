@@ -543,3 +543,40 @@ async fn a_submit_while_fenced_and_waiting_for_the_hook_is_refused_and_then_wait
     assert_eq!(start_seam::calls(&sid), calls + 1, "the hook ran once");
     end(&mut f.client).await;
 }
+
+/// `/clear` while a turn waits for the hook cancels that turn first. Its
+/// request never goes out, neither on the cleared history nor under the new
+/// journal id, and nothing starts once the hook has run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_clear_while_the_turn_waits_for_the_hook_cancels_the_turn() {
+    let _h = Home::new();
+    let (mut f, hold, sid, calls) = fixture_with_a_pending_hook().await;
+    f.client.send(submit("hello again")).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+
+    f.client.send(SessionCommand::NewSession).await.unwrap();
+    let seen = until(&mut f.client, |e| matches!(e, SessionEventWire::Cleared { .. })).await;
+    assert!(
+        seen.iter().any(|e| matches!(e.event, SessionEventWire::Aborted { .. })),
+        "the waiting turn ends before the clear: {seen:#?}"
+    );
+
+    // The hook is keyed on the session's current journal id: it runs for
+    // the new conversation.
+    let new_id = seen
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEventWire::Cleared { session_id } => Some(session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(new_id, sid);
+    drop(hold);
+    assert!(hooks_run(&new_id, 0, 1).await, "the hook still runs, for the new id");
+    assert_eq!(start_seam::calls(&sid), calls, "not under the old id");
+    let after = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&after), 0, "{after:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1, "the canceled turn sent no request");
+    end(&mut f.client).await;
+}

@@ -4828,6 +4828,13 @@ impl SessionActor {
                 if self.driver.is_some() {
                     self.driver_revoke("session replaced");
                 }
+                // A turn still waiting for `on_session_start` would open its
+                // stream later on the cleared history, under the new journal
+                // id: cancel it first, so it ends (and is saved) in the old
+                // session with nothing sent.
+                if self.turn_awaiting_start.is_some() {
+                    self.cancel_turn(crate::engine::interrupt::InterruptReason::User).await;
+                }
                 // Before `clear` saves the old session: a ping in flight is
                 // aborted and booked to it, not to the new one.
                 self.cache_keepwarm_conversation_replaced();
