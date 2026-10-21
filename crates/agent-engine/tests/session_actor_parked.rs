@@ -254,7 +254,6 @@ async fn keep_warm_never_parks_and_never_grace_disables() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn event_injection_wakes_parked_session_and_runs_turn() {
-    use tokio::io::AsyncWriteExt;
     let _h = Home::new();
     let _g = Grace::set("0");
     let (url, hits) = stub(SSE_HI, false).await;
@@ -279,9 +278,7 @@ async fn event_injection_wakes_parked_session_and_runs_turn() {
         "wake up",
         Some(agent_engine::events::types::Severity::High),
     );
-    let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
-    c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
-    c.shutdown().await.unwrap();
+    agent_engine::events::socket::send_to_session_socket(&reg.socket_path, &serde_json::to_vec(&event).unwrap()).await.unwrap();
 
     // Live again, an EventAuto turn ran, and it parked again afterwards.
     let mut saw_live = false;

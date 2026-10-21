@@ -24,6 +24,9 @@
 //! same-UID process can deliberately rewrite private state; this is not a sandbox
 //! against the host user. Copying a private marker copies identity; ordinary clones
 //! do not copy Git-private files. Never initialize identity in a live repo in tests.
+// Off Unix `resolve` fails closed before reaching any Git/marker helper, so
+// they are unused there; Unix builds still lint every one of them.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use super::store::{MemoryError, ProjectScope};
 use serde::{Deserialize, Serialize};

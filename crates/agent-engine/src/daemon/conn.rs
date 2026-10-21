@@ -85,6 +85,9 @@ fn refused_while_draining(cmd: &SessionCommand) -> bool {
         )
 }
 
+// `ClientFrame` carries a `SessionConfig`, whose paths are wider on Windows
+// (32-byte `PathBuf`), tipping the variant gap over clippy's threshold there.
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 enum Read {
     Frame(ClientFrame),
     Eof,

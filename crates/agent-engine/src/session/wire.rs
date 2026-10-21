@@ -203,6 +203,9 @@ impl Hello {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "attach", rename_all = "snake_case")]
+// `SessionConfig`'s paths are wider on Windows (32-byte `PathBuf`), tipping
+// the variant gap over clippy's threshold there.
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 pub enum Attach {
     Existing {
         session_id: SessionId,

@@ -616,6 +616,7 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
 
 /// Our jemalloc boot conf for the re-exec'd thin client (`SYNAPS_CLIENT_MALLOC_CONF`
 /// overrides). `narenas` is boot-only — the one knob a mallctl cannot set.
+#[cfg(target_os = "linux")]
 const THIN_MALLOC_CONF: &str = "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0";
 
 /// Set by `main` when the daemon could not be started: `--attach` runs the

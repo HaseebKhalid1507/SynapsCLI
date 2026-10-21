@@ -384,6 +384,7 @@ pub(super) fn capture_text(message: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::Runtime;
     use super::*;
     use agent_core::memory::store::{MemoryProvenance, MemoryRetention};
