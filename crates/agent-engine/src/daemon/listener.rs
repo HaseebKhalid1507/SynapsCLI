@@ -1,20 +1,21 @@
-//! UDS listener: bind with 0600, accept until shutdown, one task per
+//! Daemon listener: bind (a UDS with 0600 on Unix, an owner-only named pipe
+//! on Windows — see [`crate::ipc`]), accept until shutdown, one task per
 //! connection.
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
 use super::DaemonState;
+use crate::ipc::Listener;
 
 /// Bind `path` (refusing to replace a symlink), then chmod 0600.
-pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
+#[cfg(unix)]
+pub fn bind(path: &Path) -> std::io::Result<Listener> {
     crate::events::socket::cleanup_socket(&path.to_string_lossy());
-    let listener = UnixListener::bind(path)?;
-    #[cfg(unix)]
+    let listener = tokio::net::UnixListener::bind(path)?;
     {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::io::AsRawFd;
@@ -30,17 +31,39 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
             unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
         }
     }
-    Ok(listener)
+    Ok(listener.into())
 }
 
-pub async fn accept_loop(state: Arc<DaemonState>, listener: UnixListener, shutdown: CancellationToken) {
+/// Create the endpoint's named pipe (owner-only DACL, see [`crate::ipc`]).
+/// Nothing is stale on Windows — a pipe dies with its last handle — but
+/// after a reload the previous image's instances can outlive its lock for
+/// the moment its process takes to be torn down, so a refused first
+/// instance is retried briefly.
+#[cfg(windows)]
+pub fn bind(path: &Path) -> std::io::Result<Listener> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match Listener::bind(path) {
+            Err(e)
+                if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            r => return r,
+        }
+    }
+}
+
+pub async fn accept_loop(state: Arc<DaemonState>, mut listener: Listener, shutdown: CancellationToken) {
     loop {
         let accepted = tokio::select! {
             _ = shutdown.cancelled() => break,
             r = listener.accept() => r,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 let state = Arc::clone(&state);
                 let shutdown = shutdown.clone();
                 state.connections.fetch_add(1, Ordering::SeqCst);

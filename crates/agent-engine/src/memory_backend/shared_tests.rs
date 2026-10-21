@@ -47,6 +47,7 @@ fn binding(base: &Path, root: &Path, exe: &Path) -> MemoryBinding {
     binding
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires SYNAPS_AXEL_TEST_BIN; synthetic repositories and brain only"]
 async fn shared_brain_worktrees_moves_aliases_user_notes_and_foreign_isolation() {
