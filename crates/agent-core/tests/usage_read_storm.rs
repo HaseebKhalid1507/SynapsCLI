@@ -379,10 +379,12 @@ async fn concurrent_failing_reads_from_two_brokers_send_one_request_per_account(
     assert_eq!((up.hits("a"), up.hits("b")), (1, 1), "a read in flight is shared");
 }
 
-/// Grace is bound to the account the good reading came from. A refresh
-/// rotation (same account id) keeps it; the same slot re-logged to another
-/// account id while its read is held is never chosen on the previous
-/// account's reading, so the other account (graced on its own) serves.
+/// Grace is bound to the account the good reading came from. Identified
+/// slots (`synaps login` stores the profile's account id when the lookup
+/// succeeds; `synaps auth identify` backfills it): a refresh rotation (same
+/// account id) keeps it; the same slot re-logged to another account id while
+/// its read is held is never chosen on the previous account's reading, so
+/// the other account (graced on its own) serves.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_slot_re_logged_to_another_account_is_never_graced_on_the_old_reading() {
@@ -405,6 +407,39 @@ async fn a_slot_re_logged_to_another_account_is_never_graced_on_the_old_reading(
     assert_eq!((up.hits("a"), up.hits("b")), (2, 2));
 
     write_slots(home.path(), &[("a", Some("acct-other"), "3"), ("b", Some("acct-b"), "1")]);
+    assert_eq!(chosen(&broker).await.unwrap(), "b");
+    assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "b", "a new broker too");
+    assert_eq!((up.hits("a"), up.hits("b")), (2, 2), "no request inside the hold");
+}
+
+/// Unidentified Anthropic slots (no account id stored: an older login, or a
+/// profile lookup that failed) can't tell a refresh rotation from a re-login
+/// to another account, so grace holds only for the exact credential the
+/// reading came from. A re-login of the slot (new refresh material) is never
+/// graced on the previous occupant's reading; losing grace after a rotation
+/// is the accepted cost.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unidentified_slot_is_graced_only_for_the_credential_that_was_read() {
+    let home = install_slots(&[("a", None, "1"), ("b", None, "1")]);
+    let up = Upstream::default();
+    up.set("a", URGENT);
+    up.set("b", LATER);
+    let url = up.spawn().await;
+    let broker = auto_broker(&url);
+    assert_eq!(chosen(&broker).await.unwrap(), "a");
+
+    up.all(&["a", "b"], LIMITED);
+    past_fresh_age().await;
+    assert_eq!(
+        chosen(&broker).await.unwrap(),
+        "a",
+        "the same credential is graced on its own reading"
+    );
+
+    // Slot `a` now holds other refresh material (a re-login to another
+    // Anthropic account looks exactly like this without an account id).
+    write_slots(home.path(), &[("a", None, "2"), ("b", None, "1")]);
     assert_eq!(chosen(&broker).await.unwrap(), "b");
     assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "b", "a new broker too");
     assert_eq!((up.hits("a"), up.hits("b")), (2, 2), "no request inside the hold");

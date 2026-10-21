@@ -21,10 +21,12 @@
 //! good is bound to the account it was read from: when the credential now in
 //! the slot carries an account id, the reading counts only for that same id
 //! (a refresh rotation keeps it; a re-login to another account drops it).
-//! Credentials without an account id cannot be told apart across rotation;
-//! for those a re-login of the slot to another subscription within the
-//! grace window could be graced on the previous occupant's reading, bounded
-//! by the 30-minute window and by the message path's own 429 cooldown.
+//! Credentials without an account id (an Anthropic login whose profile
+//! lookup failed, or one made before ids were recorded) cannot tell a
+//! rotation from a re-login, so their reading counts only for the exact
+//! credential it was read with: a rotation loses grace until the next good
+//! read, and a re-login to another account is never graced on the previous
+//! occupant's reading.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -171,11 +173,12 @@ struct Entry {
 
 /// Whether a reading taken from seat `read_from` may stand for the
 /// credential now stored in the slot (`now`): the same account id when
-/// either carries one; without ids on both sides, yes (see the module docs).
+/// either carries one; without ids on both sides, only the exact same
+/// credential (see the module docs).
 fn same_account(read_from: &SeatIdentity, now: &SeatIdentity) -> bool {
     match (read_from.seat_fingerprint(), now.seat_fingerprint()) {
         (Some(a), Some(b)) => a == b,
-        (None, None) => true,
+        (None, None) => read_from == now,
         _ => false,
     }
 }
@@ -463,8 +466,8 @@ mod tests {
 
     /// Last good is bound to the account it was read from: the same account
     /// id after a token rotation keeps it, another account id (or a switch
-    /// between id and no id) never sees it. Without ids the slot's reading
-    /// stands (bounded by the grace window; see the module docs).
+    /// between id and no id) never sees it. Without ids only the exact
+    /// credential the reading came from does (see the module docs).
     #[test]
     fn last_good_counts_only_for_the_account_it_was_read_from() {
         let t = UsageReads::default();
@@ -483,7 +486,11 @@ mod tests {
 
         let t = UsageReads::default();
         assert!(t.record_at("k", good_from(seat("r1", None)), 1).is_ok());
-        assert!(t.last_good_for("k", &seat("r2", None)).is_some());
+        assert!(t.last_good_for("k", &seat("r1", None)).is_some());
+        assert!(
+            t.last_good_for("k", &seat("r2", None)).is_none(),
+            "without ids, other refresh material may be another account"
+        );
         assert!(t.last_good_for("k", &seat("r1", Some("acct-1"))).is_none());
     }
 }
