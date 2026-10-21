@@ -120,8 +120,10 @@ All notable changes to this project will be documented in this file.
   start a turn. Each inbox file is now delivered to exactly one session:
   before, 2-3 sessions could take the same file and each start a paid turn.
   Events sent to a session's own socket (`--session`, agent-comms, workers)
-  still wake it when parked. See "Event delivery" in
-  [docs/daemon-mode.md](docs/daemon-mode.md).
+  still wake it when parked. A headless `synaps agent` no longer watches the
+  shared inbox at all, so it cannot win an alert meant for the session
+  someone is at; send to an agent with `synaps send --session <agent>`. See
+  "Event delivery" in [docs/daemon-mode.md](docs/daemon-mode.md).
 
 ### Upgrade notes
 

@@ -386,7 +386,10 @@ receives it.
   does not count). Detached and parked sessions leave the files on disk, and
   a session rehydrated by a reload takes none until a client reattaches. Each
   file is claimed by rename first, so exactly one session takes it. An
-  in-process session (no daemon) always takes inbox files.
+  in-process session (`synaps chat` without the daemon) takes inbox files
+  while it runs. A headless `synaps agent` never takes them: nobody is at
+  it, and it would race the session someone is at for the one copy. Reach
+  an agent through its socket (`synaps send --session <agent>`).
 - **`synaps send` and the inbox.** A `--session` that matches nothing is an
   error (exit 1, nothing written) that lists the running sessions; `--inbox`
   opts in to leaving it in the shared inbox instead. With no flag and zero or

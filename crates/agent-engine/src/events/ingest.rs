@@ -144,7 +144,7 @@ async fn process_file(path: &Path, queue: &EventQueue) {
 /// Predicate deciding whether this consumer may take an inbox file.
 pub type InboxFilter = fn(&Path) -> bool;
 
-/// Takes every file (sessions); headless agents use [`not_watcher_notice`].
+/// Takes every file (sessions). Headless agents take no inbox files.
 pub fn accept_all(_: &Path) -> bool {
     true
 }

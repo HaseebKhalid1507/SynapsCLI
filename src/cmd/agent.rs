@@ -315,22 +315,10 @@ pub async fn run(config_path: String, trigger_context: String) {
             return;
         }
     };
-    // Also start inbox watcher for file-drop fallback
-    let inbox_shutdown = Arc::new(AtomicBool::new(false));
-    let inbox_task = {
-        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
-        let eq = runtime.event_queue().clone();
-        let sd = inbox_shutdown.clone();
-        tokio::spawn(async move {
-            synaps_cli::events::watch_inbox_filtered(
-                inbox_dir,
-                eq,
-                sd,
-                synaps_cli::events::not_watcher_notice,
-            )
-            .await;
-        })
-    };
+    // No shared-inbox watcher: nobody is at a headless agent, and each inbox
+    // file goes to exactly one taker, so an agent taking them could win an
+    // alert meant for the session someone is at. Events for this agent come
+    // through its own socket above.
     // Setup signal handling for graceful shutdown — catch both SIGINT (Ctrl-C)
     // and SIGTERM (supervisor/systemd stop) so a headless agent is not ignored
     // when its parent process sends SIGTERM.
@@ -619,8 +607,6 @@ pub async fn run(config_path: String, trigger_context: String) {
     hb_running.store(false, Ordering::Release);
 
     endpoint.shutdown();
-    inbox_shutdown.store(true, Ordering::Release);
-    let _ = inbox_task.await;
 
     // If we still don't have a handoff, write a minimal one
     if !handoff_saved {
