@@ -735,6 +735,12 @@ impl AccountFailure {
         self.cooling_down || self.kind.is_limited()
     }
 
+    /// Counts toward the headline: not limited, and not an excluded slot
+    /// (a duplicate of a seat that is already counted).
+    pub fn is_live(&self) -> bool {
+        !self.is_limited() && self.kind != AccountFailureKind::Excluded
+    }
+
     /// `label:kind[:status][:cooling]`, the log form; `:cooling` marks a
     /// cooling account whose kind is its last failed read or refresh.
     pub fn log_form(&self) -> String {
@@ -849,10 +855,7 @@ impl SelectionFailure {
         // An excluded slot duplicates a seat that is already counted (it is
         // excluded before its cooldown is checked), so it never picks the
         // headline.
-        let live: Vec<_> = accounts
-            .iter()
-            .filter(|a| !a.is_limited() && a.kind != AccountFailureKind::Excluded)
-            .collect();
+        let live: Vec<_> = accounts.iter().filter(|a| a.is_live()).collect();
         let kind = if accounts.is_empty() {
             K::NoCredentials
         } else if live.iter().any(|a| a.kind.is_transient()) {
@@ -882,6 +885,20 @@ impl SelectionFailure {
             accounts,
             earliest_reset_ms,
         }
+    }
+
+    /// The shortest `Retry-After` among the live transient failures, when
+    /// every one of them carries one: sending again sooner only repeats
+    /// them. `None` when there is no live transient failure or one has no
+    /// `Retry-After`.
+    pub fn transient_retry_after_s(&self) -> Option<u64> {
+        let waits: Option<Vec<u64>> = self
+            .accounts
+            .iter()
+            .filter(|a| a.is_live() && a.kind.is_transient())
+            .map(|a| a.retry_after_s)
+            .collect();
+        waits?.into_iter().min()
     }
 
     /// Labels whose failure only a new login fixes, in order.
