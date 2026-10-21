@@ -56,8 +56,21 @@ same footprint as the policy's usage (system prompt + tool schemas + retained
 messages). An explicit value must be positive and below the effective pressure
 threshold. When a provider has reported usage for a recent request, the target
 is read in provider-reported tokens (what the status bar shows) and converted
-with that request's estimate/actual ratio; otherwise it is applied to the
-conservative estimate directly. A sample applies only to the model whose request
+with that request's ratios; otherwise it is applied to the conservative
+estimate directly. The fixed part (system prompt + tool schemas) is taken as
+counting about 1:1 in both units, so only the rest of the target is converted,
+at the sample's messages-only ratio (estimate - fixed) / (provider - fixed). The
+whole-request ratio blends the two and over-sizes the successor when the fixed
+part is large (~10% over a 100k target with a 59k fixed part). When no
+messages-only ratio exists (the
+provider count does not exceed the fixed part) or it lies outside 0.5–2.0, the
+whole target is converted at the whole-request ratio as before. The fixed
+part is assumed to count about 1:1, and the sample's messages and the
+successor's are assumed to have comparable messages-only ratios. With a fixed
+part lower in provider units, comparable message ratios, and a successor
+smaller than the sampled request, this approximation biases downward; other
+shapes can overshoot.
+A sample applies only to the model whose request
 produced it (switching models falls back to the estimator until that model
 reports usage), and only when the provider count is nonzero and the
 estimate/actual ratio lies within 0.5–2.0. Any newly booked usage replaces the
