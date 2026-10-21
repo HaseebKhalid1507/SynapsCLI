@@ -151,8 +151,8 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
 /// `daemon pin`: resolve the target against the `Welcome` listing (as
 /// `daemon close` does), send `Pin`, report. Exit 0 done; 3 refused (daemon
 /// reloading, session live in another process); 2 daemon too old or
-/// protocol mismatch; 1 otherwise (not found, ambiguous, no daemon,
-/// timeout).
+/// protocol mismatch; 1 otherwise (not found, ambiguous, prefix too
+/// short, no daemon, timeout).
 async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
@@ -219,8 +219,8 @@ fn pin_exit(json: bool, code: i32, session_id: Option<&str>, outcome: &str, on: 
 
 /// `daemon close`: resolve the target against the `Welcome` listing, send
 /// `Close`, report. Exit 0 closed; 3 refused (work in flight, clients
-/// attached, daemon reloading); 2 daemon too old or protocol mismatch; 1 otherwise (not
-/// found, ambiguous, no daemon, timeout).
+/// attached, daemon reloading); 2 daemon too old or protocol mismatch; 1
+/// otherwise (not found, ambiguous, prefix too short, no daemon, timeout).
 async fn close(profile: Option<String>, target: String, force: bool, attached: bool, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
