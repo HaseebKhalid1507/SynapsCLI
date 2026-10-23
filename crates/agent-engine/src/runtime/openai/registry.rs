@@ -310,13 +310,15 @@ pub fn providers() -> &'static [ProviderSpec] {
                 name: "Kimi (Moonshot AI)",
                 base_url: "https://api.moonshot.ai/v1",
                 env_vars: &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-                default_model: "kimi-k2.7-code",
+                // K3.1 Pro: Moonshot closes the K2 series to new users from
+                // 2026-10-31. It is a flagship model, unlocked after a top-up.
+                default_model: "kimi-k3.1-pro",
                 models: &[
-                    ("kimi-k2.7-code", "Kimi K2.7 Code", "S+"),
-                    ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", "S"),
                     ("kimi-k3.1-pro", "Kimi K3.1 Pro", "S+"),
                     ("kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed", "S+"),
                     ("kimi-k3", "Kimi K3", "S+"),
+                    ("kimi-k2.7-code", "Kimi K2.7 Code", "S+"),
+                    ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", "S"),
                     ("kimi-k2.6", "Kimi K2.6", "S"),
                 ],
             },

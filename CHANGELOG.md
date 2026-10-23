@@ -27,8 +27,7 @@ All notable changes to this project will be documented in this file.
   `kimi/kimi-k3.1-pro-highspeed`. Both always reason, and `/effort` offers
   the same exact modes as K3: `low` / `high` / `max` (default `max`) through
   the top-level `reasoning_effort` field; `off` and other levels are
-  rejected. K3.1 Pro is a flagship model that Moonshot unlocks after a
-  top-up. The provider default stays `kimi-k2.7-code`.
+  rejected.
 - **`/close` ends a daemon session.** Over a socket `/quit` and Ctrl+C only
   detach, so a finished session stayed loaded in the daemon, and every event
   queued for it (`synaps send`, an extension's inbox event, a worker's wake)
@@ -65,6 +64,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The `kimi` provider's default model is now `kimi-k3.1-pro`** (was
+  `kimi-k2.7-code`), and the picker lists the Kimi models newest first.
+  Moonshot closes the K2 series to new users from 2026-10-31 and retires it
+  by the end of December 2026. K3.1 Pro is a flagship model that Moonshot
+  unlocks after a top-up (minimum $1); until then, choose
+  `kimi/kimi-k2.7-code` explicitly.
 - The pin notice reads `pinned: this session stays loaded …` /
   `unpinned: this session parks again when idle` (was `keep-warm on: …` /
   `keep-warm off`).
