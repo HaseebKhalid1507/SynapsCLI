@@ -205,19 +205,25 @@ mod tests {
     use super::*;
     use ReasoningLevel::*;
 
+    /// Every static id with the K3 effort contract (top-level
+    /// `reasoning_effort` low/high/max, default max, never disableable).
+    const K3_EFFORT_IDS: [&str; 3] = ["kimi-k3", "kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"];
+
     #[test]
     fn k3_capability_is_exact_low_high_max_default_max_no_disable() {
-        let Some(KimiReasoningCapability::Effort {
-            supported,
-            default_level,
-            can_disable,
-        }) = kimi_static_capability("kimi-k3")
-        else {
-            panic!("kimi-k3 must have documented effort capability");
-        };
-        assert_eq!(supported, &[Low, High, Max]);
-        assert_eq!(default_level, Some(Max));
-        assert!(!can_disable);
+        for id in K3_EFFORT_IDS {
+            let Some(KimiReasoningCapability::Effort {
+                supported,
+                default_level,
+                can_disable,
+            }) = kimi_static_capability(id)
+            else {
+                panic!("{id} must have documented effort capability");
+            };
+            assert_eq!(supported, &[Low, High, Max], "{id}");
+            assert_eq!(default_level, Some(Max), "{id}");
+            assert!(!can_disable, "{id} reasoning must not be disableable");
+        }
     }
 
     #[test]
@@ -248,33 +254,42 @@ mod tests {
         assert_eq!(kimi_static_capability(""), None);
         // Never substring-based.
         assert_eq!(kimi_static_capability("kimi-k3-preview"), None);
+        assert_eq!(kimi_static_capability("kimi-k3.1"), None);
+        assert_eq!(kimi_static_capability("kimi-k3.1-pro-preview"), None);
+        assert_eq!(kimi_static_capability("kimi-k3.1-pro-highspeed-preview"), None);
     }
 
     #[test]
     fn k3_body_carries_exact_reasoning_effort() {
-        for (level, label) in [(Low, "low"), (High, "high"), (Max, "max")] {
-            let mut body = Map::new();
-            apply_kimi_reasoning_params(&mut body, "kimi-k3", level);
-            assert_eq!(body.get("reasoning_effort"), Some(&json!(label)));
-            assert!(!body.contains_key("thinking"));
+        for id in K3_EFFORT_IDS {
+            for (level, label) in [(Low, "low"), (High, "high"), (Max, "max")] {
+                let mut body = Map::new();
+                apply_kimi_reasoning_params(&mut body, id, level);
+                assert_eq!(body.get("reasoning_effort"), Some(&json!(label)), "{id}");
+                assert!(!body.contains_key("thinking"), "{id}");
+            }
         }
     }
 
     #[test]
     fn k3_adaptive_omits_the_field() {
-        let mut body = Map::new();
-        apply_kimi_reasoning_params(&mut body, "kimi-k3", Adaptive);
-        assert!(body.is_empty());
+        for id in K3_EFFORT_IDS {
+            let mut body = Map::new();
+            apply_kimi_reasoning_params(&mut body, id, Adaptive);
+            assert!(body.is_empty(), "{id}");
+        }
     }
 
     #[test]
     fn k3_unsupported_levels_are_omitted_never_guessed() {
         // Validation rejects these upstream; the wire layer must still never
         // invent a value for them.
-        for level in [Off, Medium, XHigh, Ultra, UltraCode] {
-            let mut body = Map::new();
-            apply_kimi_reasoning_params(&mut body, "kimi-k3", level);
-            assert!(body.is_empty(), "{level:?} must not serialize");
+        for id in K3_EFFORT_IDS {
+            for level in [Off, Medium, XHigh, Ultra, UltraCode] {
+                let mut body = Map::new();
+                apply_kimi_reasoning_params(&mut body, id, level);
+                assert!(body.is_empty(), "{id} {level:?} must not serialize");
+            }
         }
     }
 
@@ -333,6 +348,8 @@ mod tests {
         assert_eq!(kimi_code_capability("k3-preview"), None);
         // Static-platform ids never leak into the managed table.
         assert_eq!(kimi_code_capability("kimi-k3"), None);
+        assert_eq!(kimi_code_capability("kimi-k3.1-pro"), None);
+        assert_eq!(kimi_code_capability("kimi-k3.1-pro-highspeed"), None);
         assert_eq!(kimi_code_capability(""), None);
     }
 

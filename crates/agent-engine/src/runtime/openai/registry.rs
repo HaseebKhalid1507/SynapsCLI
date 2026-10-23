@@ -526,6 +526,43 @@ mod model_list_tests {
     }
 
     #[test]
+    fn kimi_catalog_lists_k3_1_pro_and_highspeed() {
+        let spec = providers()
+            .iter()
+            .find(|spec| spec.key == "kimi")
+            .expect("Kimi must be registered");
+        assert_eq!(spec.base_url, "https://api.moonshot.ai/v1");
+        for (id, label) in [
+            ("kimi-k3.1-pro", "Kimi K3.1 Pro"),
+            ("kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed"),
+        ] {
+            let row = spec
+                .models
+                .iter()
+                .find(|(model, _, _)| *model == id)
+                .unwrap_or_else(|| panic!("{id} must be in the Kimi catalog"));
+            assert_eq!(row.1, label, "{id}");
+        }
+    }
+
+    /// Every Kimi catalog row has a documented reasoning capability, so a
+    /// model the picker offers never falls into the unknown-id (adaptive
+    /// only) path by omission.
+    #[test]
+    fn every_kimi_catalog_row_has_a_reasoning_capability() {
+        let spec = providers()
+            .iter()
+            .find(|spec| spec.key == "kimi")
+            .expect("Kimi must be registered");
+        for (id, _, _) in spec.models {
+            assert!(
+                crate::runtime::openai::catalog::kimi::kimi_static_capability(id).is_some(),
+                "{id} has no Kimi reasoning capability row"
+            );
+        }
+    }
+
+    #[test]
     fn parses_openrouter_models_response() {
         let json = r#"{
             "data": [
