@@ -21,6 +21,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Kimi K3.1 Pro and K3.1 Pro Highspeed.** The `kimi` provider's catalog
+  now lists `kimi-k3.1-pro` and `kimi-k3.1-pro-highspeed` (about 2-3x the
+  speed, the same intelligence). Use them as `kimi/kimi-k3.1-pro` and
+  `kimi/kimi-k3.1-pro-highspeed`. Both always reason, and `/effort` offers
+  the same exact modes as K3: `low` / `high` / `max` (default `max`) through
+  the top-level `reasoning_effort` field; `off` and other levels are
+  rejected. K3.1 Pro is a flagship model that Moonshot unlocks after a
+  top-up. The provider default stays `kimi-k2.7-code`.
 - **`/close` ends a daemon session.** Over a socket `/quit` and Ctrl+C only
   detach, so a finished session stayed loaded in the daemon, and every event
   queued for it (`synaps send`, an extension's inbox event, a worker's wake)

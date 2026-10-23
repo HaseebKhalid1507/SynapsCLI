@@ -2,12 +2,19 @@
 //!
 //! Evidence: official Moonshot platform docs
 //! (platform.kimi.ai/docs/guide/use-thinking-effort,
-//! platform.kimi.ai/docs/guide/use-kimi-k2-thinking-model), verified live
+//! platform.kimi.ai/docs/guide/use-kimi-k2-thinking-model,
+//! platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart,
+//! platform.kimi.ai/docs/guide/use-reasoning-effort), verified live
 //! against `api.moonshot.ai`:
 //!
 //! * `kimi-k3` — always reasons; graduated control via the **top-level**
 //!   `reasoning_effort` request field with exactly `"low"` / `"high"` /
 //!   `"max"` (provider default `"max"`). Reasoning cannot be disabled.
+//! * `kimi-k3.1-pro` / `kimi-k3.1-pro-highspeed` — the K3.1 series; the same
+//!   contract as `kimi-k3` (always reasons, top-level `reasoning_effort`
+//!   `"low"` / `"high"` / `"max"`, default `"max"`, no `thinking` field).
+//!   The highspeed variant is documented as "the same intelligence" at about
+//!   2-3x the speed; the docs give no separate effort table for it.
 //! * `kimi-k2.7-code` / `kimi-k2.7-code-highspeed` — thinking is always on;
 //!   the K2.x `thinking` field accepts only `{"type":"enabled"}` and the
 //!   live API errors on `"disabled"`. No effort control exists.
@@ -50,11 +57,13 @@ pub enum KimiReasoningCapability {
 pub fn kimi_static_capability(model_id: &str) -> Option<KimiReasoningCapability> {
     use ReasoningLevel::*;
     match model_id {
-        "kimi-k3" => Some(KimiReasoningCapability::Effort {
-            supported: &[Low, High, Max],
-            default_level: Some(Max),
-            can_disable: false,
-        }),
+        "kimi-k3" | "kimi-k3.1-pro" | "kimi-k3.1-pro-highspeed" => {
+            Some(KimiReasoningCapability::Effort {
+                supported: &[Low, High, Max],
+                default_level: Some(Max),
+                can_disable: false,
+            })
+        }
         "kimi-k2.7-code" | "kimi-k2.7-code-highspeed" => {
             Some(KimiReasoningCapability::AlwaysThinking)
         }
@@ -256,7 +265,10 @@ mod tests {
         assert_eq!(kimi_static_capability("kimi-k3-preview"), None);
         assert_eq!(kimi_static_capability("kimi-k3.1"), None);
         assert_eq!(kimi_static_capability("kimi-k3.1-pro-preview"), None);
-        assert_eq!(kimi_static_capability("kimi-k3.1-pro-highspeed-preview"), None);
+        assert_eq!(
+            kimi_static_capability("kimi-k3.1-pro-highspeed-preview"),
+            None
+        );
     }
 
     #[test]

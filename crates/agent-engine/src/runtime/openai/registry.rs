@@ -314,6 +314,8 @@ pub fn providers() -> &'static [ProviderSpec] {
                 models: &[
                     ("kimi-k2.7-code", "Kimi K2.7 Code", "S+"),
                     ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", "S"),
+                    ("kimi-k3.1-pro", "Kimi K3.1 Pro", "S+"),
+                    ("kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed", "S+"),
                     ("kimi-k3", "Kimi K3", "S+"),
                     ("kimi-k2.6", "Kimi K2.6", "S"),
                 ],
