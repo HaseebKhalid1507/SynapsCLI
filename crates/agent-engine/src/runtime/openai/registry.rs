@@ -528,12 +528,16 @@ mod model_list_tests {
     }
 
     #[test]
-    fn kimi_catalog_lists_k3_1_pro_and_highspeed() {
+    fn kimi_catalog_lists_k3_1_pro_and_highspeed_with_k3_1_pro_as_default() {
         let spec = providers()
             .iter()
             .find(|spec| spec.key == "kimi")
             .expect("Kimi must be registered");
         assert_eq!(spec.base_url, "https://api.moonshot.ai/v1");
+        // K3.1 Pro is the default and leads the picker (the K2 series closes
+        // to new Moonshot users from 2026-10-31).
+        assert_eq!(spec.default_model, "kimi-k3.1-pro");
+        assert_eq!(spec.models[0].0, spec.default_model);
         for (id, label) in [
             ("kimi-k3.1-pro", "Kimi K3.1 Pro"),
             ("kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed"),
