@@ -45,6 +45,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::read::ReadTool),
             Arc::new(crate::tools::write::WriteTool),
             Arc::new(crate::tools::edit::EditTool),
+            Arc::new(crate::tools::multi_edit::MultiEditTool),
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
@@ -149,6 +150,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::read::ReadTool),
             Arc::new(crate::tools::write::WriteTool),
             Arc::new(crate::tools::edit::EditTool),
+            Arc::new(crate::tools::multi_edit::MultiEditTool),
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
@@ -1088,7 +1090,7 @@ mod tests {
         // tools remain outside the progressive essential foreground core.
         assert_eq!(
             registry.tools_schema().len(),
-            28 + usize::from(cfg!(windows))
+            29 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget"] {
             assert!(registry.get(name).is_some(), "missing {name}");
@@ -1148,10 +1150,10 @@ mod tests {
     fn test_tool_registry_without_subagent() {
         let registry = ToolRegistry::without_subagent();
 
-        // 7 base + 3 shell + 3 forum tools (plus PowerShell on Windows).
+        // 8 base + 3 shell + 3 forum tools (plus PowerShell on Windows).
         assert_eq!(
             registry.tools_schema().len(),
-            13 + usize::from(cfg!(windows))
+            14 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget"] {
             assert!(registry.get(name).is_some(), "missing {name}");
@@ -1325,7 +1327,7 @@ mod tests {
         let mut extensions = ToolRegistry::empty();
         extensions.register(Arc::new(OwnedTool("peer:probe", Some("peer"))));
         let merged = ToolRegistry::without_subagent_with_extensions(&extensions);
-        assert_eq!(merged.tools_schema().len(), 14 + usize::from(cfg!(windows)));
+        assert_eq!(merged.tools_schema().len(), 15 + usize::from(cfg!(windows)));
         assert!(merged.get("peer:probe").is_some());
         for registry in [&main, &ToolRegistry::without_subagent(), &merged] {
             for (name, effect) in [
@@ -1367,7 +1369,7 @@ mod tests {
             ] {
                 assert!(registry.get(name).is_none(), "worker must not gain {name}");
             }
-            for name in ["bash", "write", "edit"] {
+            for name in ["bash", "write", "edit", "multi_edit"] {
                 assert!(registry.get(name).is_some(), "worker must retain {name}");
             }
         }
