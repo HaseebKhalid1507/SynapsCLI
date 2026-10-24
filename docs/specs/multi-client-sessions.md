@@ -1,6 +1,6 @@
 # Spec: Multi-client sessions: one user, many clients
 
-**Status:** v1, accepted direction (owner, 2026-10-24). Verified against dev `978a1890` + PR #296 (`/takeover`).
+**Status:** v1.1, accepted direction (owner, 2026-10-24); amended after item 3 was built (no `SessionQuery::Clients`; `ClientInfo` carries `mode`). Verified against dev `978a1890` + PR #296 (`/takeover`).
 **Scope:** the daemon socket (`daemon.sock`), the session actor's input rules, the TUI, `synaps attach`, `synaps daemon sessions`.
 **Out of scope:** event-inbox sockets (`s-<hash>.sock`, their own trust model); remote access; several people sharing one session (§9).
 
@@ -70,13 +70,15 @@ The file permissions already enforce this. The check keeps it true when someone 
 - The resolved name is what every client sees. The joiner learns its own from its snapshot.
 
 **Carried in:**
-- `ClientJoined { client, kind, name }` (new field, `serde(default)`).
+- `ClientJoined { client, kind, name, mode }`. On the wire `name` is `serde(default)` and `mode` is an `Option`, read as `Mirror` when absent.
 - `AttachSnapshot.roster: Vec<ClientInfo>` (new field, `serde(default)`). The old `clients` tuple list stays for older clients.
-- `ClientInfo { id, name, kind, role, attached_at_ms, last_input_ms: Option<u64> }`.
-- `Presence` gains `owner_name: Option<String>` and `names: Vec<String>`.
+- `ClientInfo { id, name, kind, mode, attached_at_ms }`. The role follows from `mode`: `Observe` is observe, and `Mirror`/`Takeover` are drive.
+- `Roster`: the client-side copy, kept by every transport from the snapshot plus `ClientJoined`/`ClientLeft` (`ClientTransport::roster()`).
+- `Presence` and `SessionMeta` gain `roster: Vec<ClientInfo>` (`SessionMeta`'s is `serde(default)`).
 
 **Shown in:**
-- `/clients` (new TUI command): one row per client with name, kind, role, `active`, `you` and the time since its last input. It uses a new `SessionQuery::Clients`, so `last_input_ms` is fresh; the snapshot's copy is attach-time only.
+- `/clients` (new TUI command, works mid-stream): one row per client with name (#id), kind, drive or observe, `owns input`, `you` and how long it has been attached. It reads the transport's roster.
+  - There is **no new query**. An older daemon answers a frame it can't decode with "malformed frame" and never sends a `QueryResult`, so a `SessionQuery::Clients` would hang `/clients` against it.
 - Toasts and notices: "input moved to discord", "input taken over by terminal-2", "input owned by terminal (#3) · /takeover to take it".
 - Refusal reasons: "input owned by terminal (#3)" (`#N` stays for scripts that grep it).
 - `synaps daemon sessions`: `clients=terminal*,discord,dashboard(observe)`, where `*` marks the active client.
@@ -125,7 +127,7 @@ Both modes keep `input_owner`, renamed *active client* in docs and UI. Wire name
   - Activity from a drive client that isn't active makes it active *before* the command runs.
   - Every client gets `InputOwnerChanged { reason: Input }`. `Input` is a new variant, gated by a `owner_reason_input` capability; older clients get `Takeover`.
 - **"Allow all"**: because an answer is activity, the answering drive client is active by the time the existing "only the owner" check runs. In shared mode, any drive client can pick it, within its limits, with no new rule.
-- **Promotion on detach:** the active client goes to the drive client with the most recent `last_input_ms`, not the lowest id. Ties go to the lowest id. With no input yet, it's the lowest id, as today. This way a script that sends one prompt and leaves hands input back to the tab you were typing in.
+- **Promotion on detach:** the active client goes to the drive client with the most recent input, tracked by the actor per client, not the lowest id. Ties go to the lowest id. With no input yet, it's the lowest id, as today. This way a script that sends one prompt and leaves hands input back to the tab you were typing in.
 - **Attaching never moves the active marker** if someone already holds it, as in Mirror today. A new tab becomes active when you type in it. `--takeover` still makes the joiner active immediately.
 - **Concurrency is ordinary:** two tabs submitting at once is one user submitting twice. The actor already serialises commands, and a submit during a stream follows the existing queue and steer rules.
 
@@ -178,7 +180,6 @@ A command outside the limits gets `Refused { reason: "not allowed for client 'di
 | `OwnerChangeReason::Input` | older client would fail the frame | capability `owner_reason_input`; older clients get `Takeover` |
 | `SessionSetting::ClientInput` in `SettingChanged` | same | capability `client_input` |
 | `AttachMode::Status` | older daemon fails the Attach decode | client error "daemon too old for --status" |
-| `SessionQuery::Clients` | older daemon | `Refused` / unknown query. `/clients` falls back to the snapshot roster |
 | peer-uid check | n/a | same-user clients see nothing new |
 
 ---
@@ -195,7 +196,7 @@ Each item is one PR to `dev`, with tests that fail before the change.
 
 1. **This spec** (docs only).
 2. **Same-user check** (§3). `daemon/listener.rs` or `conn.rs`. Test: accepting a stream whose peer uid differs is refused, using a seam over `peer_cred` since tests can't switch uid.
-3. **Client names + roster** (§4). `ClientMeta.name`, validation, per-session resolution, `ClientJoined.name`, `roster`, `Presence` names, `SessionQuery::Clients`, `/clients`, names in toasts, refusals and `daemon sessions`, `--as` and `SYNAPS_CLIENT_NAME`.
+3. **Client names + roster** (§4). `ClientMeta.name`, validation, per-session resolution, `ClientJoined.name`, `roster`, `Presence`/`SessionMeta` roster, `/clients`, names in toasts, refusals and `daemon sessions`, `--as` and `SYNAPS_CLIENT_NAME`.
 4. **Shared input** (§6). Builds on #296 and item 3. `client_input` config and setting, the activity rule, `OwnerChangeReason::Input` + capability, promotion by recency, the TUI's "may drive", the quiet shared mode and the header block.
 5. **Status role** (§5).
 6. **Limits** (§7), with `Welcome.features`.
