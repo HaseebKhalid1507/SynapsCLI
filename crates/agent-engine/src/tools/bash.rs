@@ -48,9 +48,8 @@ enum PromptKind {
     Password,
 }
 
-fn sanitize_output(input: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(input);
-    let stripped = strip_ansi(&lossy);
+fn sanitize_output(input: &str) -> String {
+    let stripped = strip_ansi(input);
     stripped
         .chars()
         .filter(|ch| {
@@ -60,7 +59,10 @@ fn sanitize_output(input: &[u8]) -> String {
 }
 
 /// Read one child stream in `READ_CHUNK_SIZE` chunks and forward the
-/// sanitized text to the bash executor, tagged stdout/stderr.
+/// sanitized text to the bash executor, tagged stdout/stderr. A character
+/// split between two reads is held back and decoded whole (#286); only an
+/// incomplete sequence (at most 3 bytes) waits, so prompts without a
+/// trailing newline are still forwarded as soon as they are read.
 async fn forward_output<R>(
     mut reader: R,
     is_stderr: bool,
@@ -71,23 +73,25 @@ async fn forward_output<R>(
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; READ_CHUNK_SIZE];
+    let mut decoder = super::utf8_stream::Utf8StreamDecoder::new();
     loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let msg = sanitize_output(&buf[..n]);
-                if !msg.is_empty() {
-                    BASH_INTERMEDIARY_PRODUCED_BYTES.fetch_add(msg.len() as u64, Ordering::Relaxed);
-                    let len = msg.len();
-                    if tx.send((is_stderr, msg)).await.is_ok() {
-                        BASH_INTERMEDIARY_ACCEPTED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                    } else {
-                        BASH_INTERMEDIARY_DROPPED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                        break;
-                    }
-                }
+        let (text, eof) = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => (decoder.finish(), true),
+            Ok(n) => (decoder.decode(&buf[..n]), false),
+        };
+        let msg = sanitize_output(&text);
+        if !msg.is_empty() {
+            BASH_INTERMEDIARY_PRODUCED_BYTES.fetch_add(msg.len() as u64, Ordering::Relaxed);
+            let len = msg.len();
+            if tx.send((is_stderr, msg)).await.is_ok() {
+                BASH_INTERMEDIARY_ACCEPTED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            } else {
+                BASH_INTERMEDIARY_DROPPED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                break;
             }
-            Err(_) => break,
+        }
+        if eof {
+            break;
         }
     }
 }
@@ -844,7 +848,7 @@ mod tests {
 
     #[test]
     fn sanitizes_terminal_control_sequences_and_nuls() {
-        let cleaned = sanitize_output(b"ok\x1b[2J\x00done");
+        let cleaned = sanitize_output("ok\x1b[2J\x00done");
         assert_eq!(cleaned, "okdone");
     }
 

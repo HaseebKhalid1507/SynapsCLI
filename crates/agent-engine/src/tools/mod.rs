@@ -43,6 +43,7 @@ pub mod respond;
 pub mod send_channel;
 pub mod shell;
 pub(crate) mod util;
+pub(crate) mod utf8_stream;
 pub(crate) use util::expand_path;
 pub mod watcher_exit;
 

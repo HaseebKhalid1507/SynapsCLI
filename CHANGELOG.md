@@ -124,6 +124,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Bash and shell-session output keep multi-byte characters whole.** Output
+  was decoded one read at a time, so a character split between two reads
+  (box drawing, emoji, CJK, accents) reached the model as U+FFFD. The
+  incomplete tail of a read is now held and joined with the next one; only
+  genuinely invalid bytes become U+FFFD (#286).
 - **Watcher agent session limits bind inside a turn.** The agent's
   `max_session_cost_usd`, `max_session_tokens`, `max_session_duration_mins`,
   `max_tool_calls` and `max_daily_cost_usd` were only checked between
