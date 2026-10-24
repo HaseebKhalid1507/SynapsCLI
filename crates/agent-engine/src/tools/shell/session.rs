@@ -717,6 +717,37 @@ mod tests {
         let _ = mgr.close_session(&id).await;
     }
 
+    /// Issue #286: a character whose bytes arrive in separate PTY polls must
+    /// come back whole. The sleep is longer than the 50 ms poll interval and
+    /// shorter than the 300 ms silence timeout.
+    #[tokio::test]
+    async fn test_character_split_across_polls_is_not_replaced() {
+        let mgr = default_manager();
+        let (id, _initial, _status) = mgr
+            .create_session(opts_for("bash"), None, 256 * 1024)
+            .await
+            .expect("failed to create session");
+
+        let result = mgr
+            .send_input(
+                &id,
+                "printf 'A\\342\\226'; sleep 0.15; printf '\\200B'; echo\n",
+                Some(2000),
+                None,
+                256 * 1024,
+            )
+            .await
+            .expect("failed to send input");
+        let _ = mgr.close_session(&id).await;
+
+        assert!(
+            !result.output.contains('\u{FFFD}'),
+            "split character became U+FFFD: {:?}",
+            result.output
+        );
+        assert!(result.output.contains("A\u{2580}B"), "{:?}", result.output);
+    }
+
     // 3. Close session → idempotent (close twice is fine)
     #[tokio::test]
     async fn test_close_session_idempotent() {

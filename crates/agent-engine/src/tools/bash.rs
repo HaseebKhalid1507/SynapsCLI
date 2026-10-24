@@ -1324,3 +1324,158 @@ exit 1
         );
     }
 }
+
+/// Issue #286: a multi-byte character split across two reads must come back
+/// whole, not as U+FFFD.
+#[cfg(test)]
+mod utf8_chunk_tests {
+    use super::*;
+    use crate::tools::Tool;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Yields exactly the given chunks, one per `read`, then EOF.
+    struct ChunkedReader(VecDeque<Vec<u8>>);
+
+    impl tokio::io::AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.0.pop_front() {
+                assert!(chunk.len() <= buf.remaining(), "test chunk larger than read buffer");
+                buf.put_slice(&chunk);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// `forward_output` feeds the process-global handoff counters; count what
+    /// the test consumes too, or the conservation test running alongside
+    /// sees bytes produced that nobody consumed.
+    fn consumed(msg: &str) {
+        BASH_INTERMEDIARY_CONSUMED_BYTES
+            .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn forward_chunks(chunks: Vec<Vec<u8>>, is_stderr: bool) -> String {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        forward_output(ChunkedReader(chunks.into()), is_stderr, tx).await;
+        let mut out = String::new();
+        while let Some((stderr, msg)) = rx.recv().await {
+            consumed(&msg);
+            assert_eq!(stderr, is_stderr);
+            out.push_str(&msg);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn characters_split_at_every_offset_survive_both_streams() {
+        for ch in ['é', '▀', '😀'] {
+            let text = format!("a{ch}b{ch}{ch}c");
+            let bytes = text.as_bytes();
+            for split in 1..bytes.len() {
+                for is_stderr in [false, true] {
+                    let out = forward_chunks(
+                        vec![bytes[..split].to_vec(), bytes[split..].to_vec()],
+                        is_stderr,
+                    )
+                    .await;
+                    assert!(!out.contains('\u{FFFD}'), "{ch:?} split at {split}: {out:?}");
+                    assert_eq!(out.as_bytes(), bytes, "{ch:?} split at {split}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_byte_reads_reassemble_every_character() {
+        let text = "é▀😀 mixed ascii ✓ 日本語";
+        let chunks = text.bytes().map(|b| vec![b]).collect();
+        assert_eq!(forward_chunks(chunks, false).await, text);
+    }
+
+    #[tokio::test]
+    async fn genuinely_invalid_bytes_still_become_replacement_characters() {
+        assert_eq!(forward_chunks(vec![b"ok\xffok".to_vec()], false).await, "ok\u{FFFD}ok");
+        // A lead byte followed by a non-continuation byte in the next read.
+        assert_eq!(
+            forward_chunks(vec![b"a\xe2".to_vec(), b"Xb".to_vec()], false).await,
+            "a\u{FFFD}Xb"
+        );
+        // A stray continuation byte at the start of a read.
+        assert_eq!(
+            forward_chunks(vec![b"a".to_vec(), b"\x80b".to_vec()], false).await,
+            "a\u{FFFD}b"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_sequence_at_eof_is_flushed_not_dropped() {
+        assert_eq!(forward_chunks(vec![b"ab\xe2\x96".to_vec()], false).await, "ab\u{FFFD}");
+        assert_eq!(
+            forward_chunks(vec![b"ab".to_vec(), b"\xf0\x9f".to_vec()], true).await,
+            "ab\u{FFFD}"
+        );
+    }
+
+    /// A password prompt has no trailing newline; it must be forwarded as soon
+    /// as it is read, not held back waiting for more output or EOF.
+    #[tokio::test]
+    async fn prompt_without_newline_is_forwarded_before_eof() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(forward_output(reader, true, tx));
+        use tokio::io::AsyncWriteExt;
+        writer.write_all("[sudo] password for x: ".as_bytes()).await.unwrap();
+        let (is_stderr, msg) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("prompt must arrive without EOF")
+                .unwrap();
+        consumed(&msg);
+        assert!(is_stderr);
+        assert_eq!(detect_password_prompt(&msg), Some(PromptKind::Sudo), "{msg:?}");
+        drop(writer);
+        task.await.unwrap();
+    }
+
+    /// Through the real tool: more than 1 KiB of 3-byte characters on both
+    /// streams. 1024 is not a multiple of 3, so the reads split characters.
+    #[tokio::test]
+    async fn bash_tool_output_over_1kib_keeps_multibyte_characters_whole() {
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
+        let mut ctx = super::super::test_helpers::create_tool_context();
+        ctx.channels.tx_delta = Some(delta_tx);
+        let result = BashTool
+            .execute(json!({"command": "printf '▀%.0s' {1..2000}", "timeout": 30}), ctx)
+            .await
+            .unwrap();
+        let mut streamed = String::new();
+        while let Some(delta) = delta_rx.try_drain() {
+            streamed.push_str(&delta);
+        }
+        let expected = "▀".repeat(2000);
+        assert!(!result.contains('\u{FFFD}'), "result has U+FFFD");
+        assert_eq!(result, expected);
+        assert!(!streamed.contains('\u{FFFD}'), "deltas have U+FFFD");
+        assert!(expected.starts_with(&streamed) && !streamed.is_empty());
+
+        let ctx = super::super::test_helpers::create_tool_context();
+        let err = BashTool
+            .execute(
+                json!({"command": "python3 -c \"import sys; sys.stderr.write(('▀'*119+'\\n')*45)\"; exit 3", "timeout": 30}),
+                ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\u{FFFD}'), "stderr has U+FFFD: {err}");
+        assert!(err.contains(&("▀".repeat(119) + "\n").repeat(45)), "{err}");
+    }
+}
