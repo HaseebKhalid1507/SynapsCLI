@@ -140,6 +140,14 @@ All notable changes to this project will be documented in this file.
   prints nothing (`sleep 40`) now ends with `└─ ok (no output) Ns` instead of
   no footer, in the main thread too. A steer replayed late keeps the time
   the worker took it.
+- **A running tool card keeps counting when something lands below it.** A
+  steer, a system notice, an event or subagent completion, or a second tool
+  card running in parallel froze the card above it: its clock and sweep
+  stopped (`5.4s`) while the header kept counting, and caught up only when
+  the tool finished. The thinking spinner froze the same way. The animation
+  tick now re-renders every live card and spinner wherever it is, in the
+  main thread and in a subagent view, and only those; with nothing running
+  it does nothing. Parallel cards each count from their own start.
 - **Watcher agent session limits bind inside a turn.** The agent's
   `max_session_cost_usd`, `max_session_tokens`, `max_session_duration_mins`,
   `max_tool_calls` and `max_daily_cost_usd` were only checked between

@@ -564,7 +564,9 @@ fn a_running_tool_card_in_a_worker_view_keeps_counting() {
 
 /// #287: a view opened while the tool is already running shows how long it
 /// has really been running (the journal says when it started), not the
-/// time since the view opened.
+/// time since the view opened. The clock counts from the call's own start
+/// (its `ToolUseStart`, 5.0s), the same start its finished footer measures
+/// from.
 #[test]
 fn a_view_opened_mid_tool_shows_the_tools_real_age() {
     let mut h = TestHarness::boot_with_size(120, 30);
@@ -573,12 +575,12 @@ fn a_view_opened_mid_tool_shows_the_tools_real_age() {
     let p = page("sa_5", "sleeper", "running", bash_call("t1", "sleep 40"), 3);
     answer_poll_timed(&mut h, p, &[5_000, 5_000, 5_100], 17_100);
     let header = card_header(&h.snapshot(), "sleep 40");
-    assert!(header.contains("12.0s"), "started 12s ago: {header:?}");
+    assert!(header.contains("12.1s"), "started 12.1s ago: {header:?}");
 
     h.advance_clock_ms(5_000);
     h.tick_animations(3);
     let header = card_header(&h.snapshot(), "sleep 40");
-    assert!(header.contains("17.0s"), "{header:?}");
+    assert!(header.contains("17.1s"), "{header:?}");
 }
 
 /// #287: a finished card gets its `└─ ok (n lines) Ns` footer, with the

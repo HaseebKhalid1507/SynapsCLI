@@ -29,6 +29,7 @@
 //! clears the selection; width changes clear it explicitly in `sync_cache`.
 
 pub(crate) mod estimate;
+mod live;
 
 /// Read-only App state the transcript renderer needs. Constructed fresh at
 /// each cache-sync call site — cheap (a usize, a bool, a &str). This makes
@@ -603,6 +604,17 @@ pub(crate) struct TranscriptStore {
     /// (the main thread, always): the event is happening now.
     event_time: Option<std::time::Instant>,
 
+    // ── Live slots (transcript/live.rs) ──────────────────────────────────────
+    /// Indices of the messages that animate on their own (a running tool
+    /// card's clock and sweep, the thinking placeholder's spinner), sorted
+    /// ascending. Kept in step with every insert/remove so the tick can
+    /// refresh exactly these slots wherever they are, and costs nothing
+    /// when it is empty.
+    live: Vec<usize>,
+    /// The tick asked for the live slots to be re-rendered; the next
+    /// [`Self::sync_cache`] does it.
+    live_refresh: bool,
+
     // ── Viewport geometry (moved in slice e) ─────────────────────────────────
     /// Inner content rect of the message area as of the last
     /// [`Self::visible_window`] call (was `App.msg_area_rect`; store-side name
@@ -687,6 +699,8 @@ impl TranscriptStore {
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
             event_time: None,
+            live: Vec::new(),
+            live_refresh: false,
             viewport: None,
             visible_range: None,
             selection_anchor: None,
@@ -807,6 +821,7 @@ impl TranscriptStore {
         let n = if had_sentinel { n.max(1) } else { n };
         let dropped_real = if had_sentinel { n - 1 } else { n };
         self.messages.drain(0..n);
+        self.live_drained_front(n);
         self.scrollback_dropped += dropped_real;
         let reload = if self.worker_view {
             "a subagent view keeps only its newest messages".to_string()
@@ -824,6 +839,7 @@ impl TranscriptStore {
             time: chrono::Local::now().format("%H:%M").to_string(),
         };
         self.messages.insert(0, sentinel);
+        self.live_inserted(0);
         // Net index shift: −n (drained) +1 (sentinel).
         self.response_start = self.response_start.and_then(|s| (s >= n).then(|| s - n + 1));
         self.scroll_anchor = match self.scroll_anchor.take() {
@@ -1107,6 +1123,7 @@ impl TranscriptStore {
         if self.scroll_pinned {
             self.scroll_back = 0;
         }
+        self.live_note(self.messages.len() - 1);
         // New tail message — mark last slot dirty (append to per_msg on next rebuild).
         self.invalidate_last();
         let pushed = self.messages.last().map(|m| m.msg.approx_len()).unwrap_or(0);
@@ -1167,6 +1184,7 @@ impl TranscriptStore {
                         time: self.event_stamp(),
                     },
                 );
+                self.live_inserted(at);
                 if self.scroll_pinned {
                     self.scroll_back = 0;
                 }
@@ -1215,6 +1233,7 @@ impl TranscriptStore {
                 time: chrono::Local::now().format("%H:%M").to_string(),
             },
         );
+        self.relive();
     }
 
     // ── Invalidate family (moved in slice b′) ────────────────────────────────
@@ -1409,6 +1428,13 @@ impl TranscriptStore {
             self.clear_selection();
         }
 
+        if !needs_full_rebuild {
+            // Live slots above the watermark: re-render them in place.
+            self.refresh_live_slots(content_width, ctx);
+        } else {
+            self.live_refresh = false;
+        }
+
         if needs_full_rebuild {
             // T241 Slice 3 (the core flip): width changed or no cache.
             // Do NOT render anything — build ESTIMATED slots for every
@@ -1483,6 +1509,7 @@ impl TranscriptStore {
             self.cache = CacheState::Clean(LineCache::new(content_width, per_msg));
         }
         self.debug_assert_cum_identity();
+        self.debug_assert_live();
         needs_full_rebuild
     }
 
@@ -2400,20 +2427,10 @@ impl TranscriptStore {
 
     /// True when any transcript line is spinner-animated, i.e. re-rendering
     /// the message cache on a spinner tick would change output. Was
-    /// `App::render_lines_uses_spinner` (design §3.4).
+    /// `App::render_lines_uses_spinner` (design §3.4). O(1): reads the
+    /// tracked live slots (transcript/live.rs) instead of scanning.
     pub(crate) fn uses_spinner(&self) -> bool {
-        self.messages
-            .iter()
-            .enumerate()
-            .any(|(idx, msg)| match &msg.msg {
-                ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
-                ChatMessage::ToolUseStart { .. } => true,
-                ChatMessage::ToolUse { .. } => {
-                    idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
-                }
-                ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
-                _ => false,
-            })
+        self.has_live()
     }
 
     // ── Tool state queries + find_* helpers (moved in slice b′) ──────────────
@@ -2575,10 +2592,10 @@ impl TranscriptStore {
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
         self.drop_empty_thinking();
         let now = self.event_now();
-        self.tool_start_time = Some(now);
         if !tool_id.is_empty() {
             self.tool_start_times.insert(tool_id.clone(), now);
         }
+        self.set_tool_clock(Some(now));
         self.push_msg(ChatMessage::ToolUseStart {
             tool_id,
             tool_name,
@@ -2630,7 +2647,7 @@ impl TranscriptStore {
         if !tool_id.is_empty() {
             self.tool_start_times.entry(tool_id.clone()).or_insert(now);
         }
-        self.tool_start_time = Some(now);
+        self.set_tool_clock(Some(now));
 
         if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
             self.messages[idx].msg = ChatMessage::ToolUse {
@@ -2638,6 +2655,7 @@ impl TranscriptStore {
                 tool_name,
                 input: input_str,
             };
+            self.live_note(idx);
             // P11 narrowing + lock L2: idx IS the matched use index, so
             // dirtying from idx covers the stale-header trap directly. The
             // in-place ToolUseStart→ToolUse swap can also change the render
@@ -2698,7 +2716,7 @@ impl TranscriptStore {
         // Clear the shared "active tool" timer once the *latest* tool
         // finishes — otherwise the bash trace animation lingers.
         if self.tool_start_times.is_empty() {
-            self.tool_start_time = None;
+            self.set_tool_clock(None);
         }
 
         // Lock L2 — the stale-header trap: stamping elapsed_ms (and dropping
@@ -2719,6 +2737,14 @@ impl TranscriptStore {
                 )
             })
         };
+        // The card stopped running: its rows are no longer live (before any
+        // insert below shifts the indices).
+        if let Some(u) = use_idx {
+            self.live_note(u);
+        }
+        if let Some(r) = self.find_tool_result_idx(&tool_id) {
+            self.live_note(r);
+        }
 
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
             if let ChatMessage::ToolResult {
@@ -2819,6 +2845,7 @@ impl TranscriptStore {
             // appending to it (otherwise content reads "…​<thinking>").
             if existing == THINKING_PLACEHOLDER {
                 *existing = text.to_string();
+                self.live_note(self.messages.len() - 1);
             } else {
                 existing.push_str(text);
             }
@@ -2847,6 +2874,7 @@ impl TranscriptStore {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
                 if t == THINKING_PLACEHOLDER || t.is_empty() {
                     self.messages.remove(idx);
+                    self.live_removed(idx);
                     self.anchor_remap_remove(idx);
                     // Structural change (remove) — full invalidate to resync per_msg lengths.
                     self.invalidate_structural();
@@ -2887,6 +2915,7 @@ impl TranscriptStore {
         if self.tool_start_times.is_empty() {
             self.tool_start_time = None;
         }
+        self.relive();
         // An anchor inside the discarded preview re-anchors on the restored
         // message the preview hung off.
         if let Some(a) = self.scroll_anchor.as_mut() {
@@ -2932,6 +2961,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.live.clear();
         self.response_start = None;
         self.clear_selection();
         self.cache = CacheState::Missing;
@@ -2958,20 +2988,6 @@ impl TranscriptStore {
     #[allow(dead_code)]
     pub(crate) fn is_pinned(&self) -> bool {
         self.scroll_pinned
-    }
-
-    /// Returns the elapsed time since the current tool started, if one is active.
-    /// Used by render.rs (in `impl TranscriptStore`) to format elapsed displays —
-    /// must go through this accessor because render.rs is in a sibling module.
-    pub(crate) fn tool_start_time(&self) -> Option<std::time::Instant> {
-        self.tool_start_time
-    }
-
-    /// Returns the per-tool start time for `tool_id`, if present.
-    /// Query surface (seam design §3.4) — P10/P11 consumers pending.
-    #[allow(dead_code)]
-    pub(crate) fn tool_start_time_for(&self, tool_id: &str) -> Option<std::time::Instant> {
-        self.tool_start_times.get(tool_id).copied()
     }
 
     /// Returns the dirty watermark index if the cache is in the `Dirty` state.
@@ -3033,12 +3049,14 @@ impl TranscriptStore {
     #[cfg(test)]
     pub(crate) fn test_insert_at(&mut self, idx: usize, msg: TimestampedMsg) {
         self.messages.insert(idx, msg);
+        self.relive();
     }
 
     /// Set `tool_start_time` for tests that exercise the spinner / elapsed path.
     #[cfg(test)]
     pub(crate) fn test_set_tool_start_time(&mut self, t: Option<std::time::Instant>) {
         self.tool_start_time = t;
+        self.relive();
     }
 
     /// Insert a per-tool start-time entry for tests that exercise parallel-tool
@@ -3046,6 +3064,7 @@ impl TranscriptStore {
     #[cfg(test)]
     pub(crate) fn test_insert_tool_start_time(&mut self, id: String, t: std::time::Instant) {
         self.tool_start_times.insert(id, t);
+        self.relive();
     }
 
     /// Directly set `scroll_back` for scroll unit tests that need to start from
