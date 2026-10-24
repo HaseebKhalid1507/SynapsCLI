@@ -122,6 +122,33 @@ async fn within_deadline<T>(fut: impl std::future::Future<Output = T>) -> T {
         .expect("trigger event never observed: stream did not reach mid-stream")
 }
 
+/// Loopback upstream that records the full request body arrived (the send
+/// happened), then never answers: the client is left awaiting headers.
+async fn spawn_headerless_stub(path: &str) -> (String, Arc<tokio::sync::Notify>) {
+    let received = Arc::new(tokio::sync::Notify::new());
+    let received_c = Arc::clone(&received);
+    let app = Router::new().route(
+        path,
+        axum_post(move |_body: Bytes| {
+            let received = Arc::clone(&received_c);
+            async move {
+                received.notify_one();
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }
+        }),
+    );
+    (serve(app).await, received)
+}
+
+fn cancel_on(received: Arc<tokio::sync::Notify>, cancel: &CancellationToken) {
+    let canceler = cancel.clone();
+    tokio::spawn(async move {
+        received.notified().await;
+        canceler.cancel();
+    });
+}
+
 // ═══ Chat Completions (broker-proxied) ══════════════════════════════════════
 
 const CHAT_SSE_SUCCESS: &str = concat!(
@@ -331,6 +358,31 @@ async fn chat_cancel_mid_stream_emits_one_canceled_record() {
     assert_eq!(r.attempt, 1);
     assert!(r.outcome.timings.stream_end_ms.is_some());
     assert!(r.outcome.stop_reason.is_none(), "unobserved must stay None");
+}
+
+/// Follow-up evidence, not fixed here: the broker chat path awaits
+/// `proxy_stream` under `await_or_cancel` and maps a cancel to an error
+/// without finishing the attempt, so a send canceled before headers leaves
+/// no record despite `trace::emit`'s one-record-per-send rule.
+#[tokio::test]
+#[ignore = "known gap: cancel while awaiting headers emits no record (follow-up)"]
+async fn chat_cancel_while_awaiting_headers_emits_one_canceled_record() {
+    let (upstream, received) = spawn_headerless_stub("/chat/completions").await;
+    let h = harness();
+    let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+        reqwest::Client::new(),
+        upstream.clone(),
+    ));
+    let cancel = CancellationToken::new();
+    cancel_on(received, &cancel);
+
+    let err = within_deadline(drive_chat(&upstream, broker, &h.trace, true, &cancel))
+        .await
+        .expect_err("cancellation surfaces as request canceled");
+    assert!(err.to_string().contains("canceled"), "{err}");
+    let records = h.sink.records();
+    assert_eq!(records.len(), 1, "a sent attempt must still be recorded");
+    assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
 }
 
 #[tokio::test]
@@ -1042,6 +1094,25 @@ async fn codex_cancel_mid_stream_emits_one_canceled_record() {
     assert_schema_valid_and_content_free(&records);
     assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
     assert_eq!(records[0].outcome.http_status, Some(200));
+}
+
+/// Contrast with the Anthropic and broker-chat gaps: Codex's
+/// `send_with_retries` finishes the attempt as canceled when the cancel
+/// lands during the send, so the one-record-per-send rule holds here.
+#[tokio::test]
+async fn codex_cancel_while_awaiting_headers_emits_one_canceled_record() {
+    let (upstream, received) = spawn_headerless_stub("/codex/responses").await;
+    let h = harness();
+    let cancel = CancellationToken::new();
+    cancel_on(received, &cancel);
+
+    within_deadline(drive_codex(&upstream, &h.trace, 0, &cancel))
+        .await
+        .expect_err("cancellation surfaces as request canceled");
+    let records = h.sink.records();
+    assert_eq!(records.len(), 1, "a sent attempt must still be recorded");
+    assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
+    assert_eq!(records[0].outcome.http_status, None, "no headers observed");
 }
 
 // ═══ Unit coverage for the new helpers ══════════════════════════════════════

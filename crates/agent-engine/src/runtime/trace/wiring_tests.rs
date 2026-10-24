@@ -385,6 +385,54 @@ async fn cancellation_mid_stream_emits_one_canceled_record() {
     );
 }
 
+/// Follow-up evidence, not fixed here: `trace::emit` promises one record per
+/// actual transport attempt (one HTTP send), but a cancel that lands while
+/// awaiting response headers — after the server has received the full body —
+/// currently returns `Err(Canceled)` from `await_or_cancel(.. send ..)` with
+/// no record (`api.rs`, `call_api_stream_inner`).
+#[tokio::test]
+#[ignore = "known gap: cancel while awaiting headers emits no record (follow-up)"]
+async fn cancellation_while_awaiting_headers_emits_one_canceled_record() {
+    let received = Arc::new(tokio::sync::Notify::new());
+    let received_c = Arc::clone(&received);
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(move |_body: Bytes| {
+            let received = Arc::clone(&received_c);
+            async move {
+                // The whole request body is in: the send happened. Never
+                // answer, so the client sits waiting for headers.
+                received.notify_one();
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }
+        }),
+    );
+    let h = harness(serve(app).await);
+    let cancel = CancellationToken::new();
+    let canceler = cancel.clone();
+    tokio::spawn(async move {
+        received.notified().await;
+        canceler.cancel();
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(30), drive_stream(&h.options, 0, &cancel))
+        .await
+        .expect("server never received the request");
+    assert!(
+        matches!(result, Err(crate::error::RuntimeError::Canceled)),
+        "{result:?}"
+    );
+    let records = h.sink.records();
+    assert_eq!(
+        records.len(),
+        1,
+        "a sent attempt canceled before headers must still be recorded"
+    );
+    assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
+    assert!(records[0].outcome.timings.headers_ms.is_none());
+}
+
 // ─── Timing buckets ─────────────────────────────────────────────────────────
 
 #[tokio::test]
