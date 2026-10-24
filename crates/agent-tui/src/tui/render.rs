@@ -39,6 +39,13 @@ fn with_bar(line: Line<'static>, accent: Color, band: Color) -> Line<'static> {
 
 /// Input-panel background: the theme's `tool_input_bg`, or derived from the
 /// palette when it's `Color::Reset` (see `Theme::tool_input_background`).
+/// The header marker of a tool card whose call waits behind another in its
+/// scheduler lane: static and muted, so nothing on the card moves until
+/// the call starts.
+fn queued_marker() -> Span<'static> {
+    Span::styled(" \u{25cb} queued", Style::default().fg(THEME.load().muted))
+}
+
 fn input_panel_bg() -> Color {
     THEME.load().tool_input_background()
 }
@@ -556,6 +563,8 @@ impl TranscriptStore {
                             .fg(THEME.load().status_streaming)
                             .add_modifier(Modifier::DIM),
                     ));
+                } else if self.tool_queued(tool_id) {
+                    header.push(queued_marker());
                 }
                 lines.push(Line::from(header));
                 // Show accumulated partial input with newlines rendered
@@ -676,6 +685,10 @@ impl TranscriptStore {
                                 .add_modifier(Modifier::DIM),
                         ));
                     }
+                } else if self.tool_queued(tool_id) {
+                    // Waiting behind another call in its lane: a calm,
+                    // static marker — no sweep, no clock (it isn't running).
+                    header.push(queued_marker());
                 }
                 lines.push(Line::from(header));
                 // Params — key:value on one line each, dimmed

@@ -22,6 +22,8 @@ pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
         event,
         StreamEvent::Llm(LlmEvent::ToolUse { .. })
             | StreamEvent::Llm(LlmEvent::ToolResult { .. })
+            | StreamEvent::Llm(LlmEvent::ToolQueued { .. })
+            | StreamEvent::Llm(LlmEvent::ToolStarted { .. })
             | StreamEvent::Agent(AgentEvent::SubagentStart { .. })
             | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
             | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
@@ -85,6 +87,13 @@ pub(super) fn apply_transcript_event(
         StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
             store.on_tool_result(tool_id.clone(), result.clone());
         }
+        // Scheduler lane waits (opt-in: only calls that wait get them).
+        StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => {
+            store.on_tool_queued(tool_id.clone());
+        }
+        StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => {
+            store.on_tool_started(tool_id.clone());
+        }
         StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
             // Queue-drained events (subagent completion wakes, watcher
             // alerts) ride the same steering channel as genuine user
@@ -138,10 +147,6 @@ pub(super) fn apply_transcript_event(
             let start = store.response_start().unwrap_or(start);
             store.reset_response_preview(start, last);
             return Applied::RolledBack;
-        }
-        // RED placeholder (replaced by the fix).
-        StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. }) => {
-            return Applied::Ignored
         }
         StreamEvent::Session(SessionEvent::Usage { .. })
         | StreamEvent::Session(SessionEvent::MessageHistory(_))
