@@ -1397,7 +1397,7 @@ async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model(
     handle.closed().await;
 }
 
-/// 4b: `thinking_options` with no model names what a new session gets: the
+/// `thinking_options` with no model names what a new session gets: the
 /// model a session created right after carries. Both read the host's config
 /// snapshot, so an edit after boot (without a reload) changes neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

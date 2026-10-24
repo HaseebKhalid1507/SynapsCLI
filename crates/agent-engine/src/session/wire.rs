@@ -2107,7 +2107,7 @@ mod tests {
         }
     }
 
-    /// The names PD vendors (4/4b v1.1). Changing one breaks the app.
+    /// The names clients already decode. Changing one breaks them.
     #[test]
     fn children_frames_keep_the_agreed_names() {
         let q: serde_json::Value = serde_json::to_value(&ClientFrame::Children {
@@ -2161,7 +2161,7 @@ mod tests {
         assert_eq!(w["features"], serde_json::json!(["children"]));
     }
 
-    /// The `thinking_options` names PD vendors (4/4b v1.1 §3.1).
+    /// The `thinking_options` names clients already decode.
     #[test]
     fn thinking_options_frames_keep_the_agreed_names() {
         let q = serde_json::to_value(&ClientFrame::ThinkingOptions {
@@ -2190,11 +2190,11 @@ mod tests {
         assert_eq!(crate::daemon::control_queries::FEATURE_THINKING_OPTIONS, "thinking_options");
     }
 
-    /// Old peers: a pre-4/4b client decodes the new Welcome (it ignores
-    /// `features`), a new client reads an old Welcome as no features, and a
-    /// pre-4/4b daemon rejects `children` as an unknown variant (conn.rs
-    /// answers that with `Error{"malformed frame: ..."}` and keeps the
-    /// connection).
+    /// Old peers: a client from before the child ledger decodes the new
+    /// Welcome (it ignores `features`), a new client reads an old Welcome as
+    /// no features, and a daemon from before it rejects `children` as an
+    /// unknown variant (conn.rs answers that with
+    /// `Error{"malformed frame: ..."}` and keeps the connection).
     #[test]
     fn children_and_features_are_compatible_with_old_decoders() {
         #[derive(Deserialize)]
@@ -2257,7 +2257,7 @@ mod tests {
         }
     }
 
-    /// C4a: `accepted_events` (the names PD vendors), the negotiation rule
+    /// `accepted_events` (the names clients already send), the negotiation rule
     /// and old peers.
     /// The frozen `tool_child` / `tool_child_ended` shapes, their opt-in
     /// names, and an old client's decode (`Unknown`, then the usual notice).

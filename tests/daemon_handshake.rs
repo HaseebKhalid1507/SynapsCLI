@@ -375,7 +375,7 @@ fn auth_state_cli_without_a_daemon_lists_accounts_and_refuses_to_clear() {
     );
 }
 
-/// 4/4b: `Welcome.features` lists "children", and the `children` query is a
+/// `Welcome.features` lists "children", and the `children` query is a
 /// control frame answered before Attach and on an attached connection, from
 /// the process-wide ledger (session filter, sid filter, unknown session).
 #[tokio::test]
@@ -468,7 +468,7 @@ async fn children_query_is_answered_before_and_after_attach() {
     let _ = sleeper.wait();
 }
 
-/// 4b: `thinking_options` is a control frame (before Attach and attached).
+/// `thinking_options` is a control frame (before Attach and attached).
 /// No model = what a new session on this daemon gets; a malformed id gets
 /// `options: null`; "thinking_options" is in `Welcome.features`.
 #[tokio::test]

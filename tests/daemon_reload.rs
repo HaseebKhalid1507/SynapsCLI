@@ -869,7 +869,7 @@ async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildLis
     }
 }
 
-/// 4/4b across a reload: the child ledger is carried in the reload state,
+/// Across a reload: the child ledger is carried in the reload state,
 /// `features` is on the new image's Welcome, and each connection's optional
 /// events come from its own (new) Hello, never from state kept across the
 /// exec.

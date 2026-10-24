@@ -494,7 +494,7 @@ mod tests {
     use super::*;
     use ReasoningLevel::*;
 
-    /// 4b: the basis per route (wire note §3.2), and the old function is
+    /// The basis per route, and the old function is
     /// the same list for every row.
     #[test]
     fn options_basis_per_route() {
