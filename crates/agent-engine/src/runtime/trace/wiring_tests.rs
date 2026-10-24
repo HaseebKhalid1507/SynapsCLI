@@ -10,7 +10,7 @@ use super::{CollectingTraceSink, RequestTrace, StopReason, TraceContext};
 use crate::runtime::api::{ApiMethods, ApiOptions};
 use crate::runtime::telemetry::TelemetryLevel;
 use crate::runtime::types::AuthState;
-use crate::{StreamEvent, ToolRegistry};
+use crate::{LlmEvent, StreamEvent, ToolRegistry};
 use agent_core::TurnOutcome;
 use axum::body::Bytes;
 use axum::http::StatusCode;
@@ -136,13 +136,24 @@ async fn drive_stream(
     max_retries: u32,
     cancel: &CancellationToken,
 ) -> crate::error::Result<serde_json::Value> {
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    drive_stream_with_events(options, max_retries, cancel, tx).await
+}
+
+/// `drive_stream` with a caller-owned event channel, for tests that must
+/// react to what the client has actually observed (never to a timer).
+async fn drive_stream_with_events(
+    options: &ApiOptions,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> crate::error::Result<serde_json::Value> {
     let client = Client::new();
     let tools = ToolRegistry::new();
     let messages = vec![Arc::new(json!({
         "role": "user",
         "content": format!("{SENTINEL} hello"),
     }))];
-    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     ApiMethods::call_api_stream_inner(
         &auth(),
         &client,
@@ -333,14 +344,28 @@ async fn cancellation_mid_stream_emits_one_canceled_record() {
     let url = serve(app).await;
     let h = harness(url);
 
+    // Cancel on an observed event, not a wall-clock timer: `ResponseStart`
+    // is sent only after a 2xx response opened the stream, so the cancel is
+    // guaranteed to land mid-stream. A timer could fire before or during
+    // the send on a loaded runner, which legitimately emits no record.
     let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
     let canceler = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        canceler.cancel();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StreamEvent::Llm(LlmEvent::ResponseStart)) {
+                canceler.cancel();
+                break;
+            }
+        }
     });
 
-    let result = drive_stream(&h.options, 0, &cancel).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        drive_stream_with_events(&h.options, 0, &cancel, tx),
+    )
+    .await
+    .expect("stream never opened: no ResponseStart observed");
     assert!(result.is_ok(), "cancellation is not an error: {result:?}");
 
     let records = h.sink.records();

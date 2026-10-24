@@ -158,6 +158,21 @@ async fn run_gemini(
     exact: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (tx, _rx) = mpsc::unbounded_channel();
+    run_gemini_with_events(h, broker, tools, system, msgs, cancel, exact, tx).await
+}
+
+/// `run_gemini` with a caller-owned event channel.
+#[allow(clippy::too_many_arguments)]
+async fn run_gemini_with_events(
+    h: &Harness,
+    broker: &Arc<dyn CredentialBroker>,
+    tools: &[Value],
+    system: &Option<String>,
+    msgs: &[crate::SharedMessage],
+    cancel: &CancellationToken,
+    exact: bool,
+    tx: mpsc::UnboundedSender<crate::StreamEvent>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     call_google_gemini_stream_inner(
         &cfg(),
         broker,
@@ -488,16 +503,27 @@ async fn gemini_cancellation_mid_stream_records_canceled_terminal() {
     }
 
     let broker: Arc<dyn CredentialBroker> = Arc::new(BlockingBroker(Mutex::new(Some(chunk_rx))));
+    // Cancel once the client has forwarded the delivered chunk's text — an
+    // observed mid-stream point, never a wall-clock timer.
     let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::StreamEvent>();
     let canceller = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        canceller.cancel();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, crate::StreamEvent::Llm(crate::LlmEvent::Text(_))) {
+                canceller.cancel();
+                break;
+            }
+        }
     });
 
-    let err = run_gemini(&h, &broker, &[], &None, &messages(), &cancel, true)
-        .await
-        .expect_err("cancel must surface");
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_gemini_with_events(&h, &broker, &[], &None, &messages(), &cancel, true, tx),
+    )
+    .await
+    .expect("first text delta never observed")
+    .expect_err("cancel must surface");
     assert!(err.to_string().contains("canceled"), "{err}");
     drop(chunk_tx);
 

@@ -10,7 +10,7 @@ use crate::runtime::openai::stream::{
     call_codex_stream_inner, call_oai_stream_inner, call_xai_responses_stream_inner,
 };
 use crate::runtime::openai::types::ProviderConfig;
-use crate::StreamEvent;
+use crate::{LlmEvent, StreamEvent};
 use agent_core::auth::{
     AccessToken, BrokerError, CredentialBroker, LocalBroker, ProxyByteStream, ProxyRequest,
     ProxyResponse, RemoteBroker, TokenCache,
@@ -95,6 +95,33 @@ fn assert_exact_wire(r: &RequestTrace, key_path: &std::path::Path, received: &[u
     );
 }
 
+/// Event channel whose receiver cancels `cancel` once the client has
+/// forwarded its first model text delta. Cancel tests key off this observed
+/// mid-stream point, never a wall-clock timer: a timer can fire before or
+/// during the send on a loaded runner, where no record is (correctly)
+/// emitted, so "mid-stream" would not be what the test exercised.
+fn cancel_on_first_text(cancel: &CancellationToken) -> mpsc::UnboundedSender<StreamEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let canceler = cancel.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StreamEvent::Llm(LlmEvent::Text(_))) {
+                canceler.cancel();
+                break;
+            }
+        }
+    });
+    tx
+}
+
+/// Hang guard for the endless-stream cancel fixtures: if the trigger event
+/// never arrives the test fails instead of blocking forever.
+async fn within_deadline<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .expect("trigger event never observed: stream did not reach mid-stream")
+}
+
 // ═══ Chat Completions (broker-proxied) ══════════════════════════════════════
 
 const CHAT_SSE_SUCCESS: &str = concat!(
@@ -142,12 +169,24 @@ async fn drive_chat(
     exact: bool,
     cancel: &CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    drive_chat_with_events(upstream, broker, trace, exact, cancel, tx).await
+}
+
+/// `drive_chat` with a caller-owned event channel.
+async fn drive_chat_with_events(
+    upstream: &str,
+    broker: Arc<dyn CredentialBroker>,
+    trace: &TraceContext,
+    exact: bool,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = ProviderConfig {
         base_url: upstream.to_string(),
         model: "test-model".to_string(),
         provider: "local".to_string(),
     };
-    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     call_oai_stream_inner(
         &cfg,
         &broker,
@@ -275,15 +314,13 @@ async fn chat_cancel_mid_stream_emits_one_canceled_record() {
         upstream.clone(),
     ));
     let cancel = CancellationToken::new();
-    let canceler = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        canceler.cancel();
-    });
+    let tx = cancel_on_first_text(&cancel);
 
-    let err = drive_chat(&upstream, broker, &h.trace, true, &cancel)
-        .await
-        .expect_err("cancellation surfaces as request canceled");
+    let err = within_deadline(drive_chat_with_events(
+        &upstream, broker, &h.trace, true, &cancel, tx,
+    ))
+    .await
+    .expect_err("cancellation surfaces as request canceled");
     assert!(err.to_string().contains("canceled"));
 
     let records = h.sink.records();
@@ -722,13 +759,24 @@ async fn drive_codex(
     max_retries: u32,
     cancel: &CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    drive_codex_with_events(base_url, trace, max_retries, cancel, tx).await
+}
+
+/// `drive_codex` with a caller-owned event channel.
+async fn drive_codex_with_events(
+    base_url: &str,
+    trace: &TraceContext,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = ProviderConfig {
         base_url: base_url.to_string(),
         model: "gpt-5.6-sol".to_string(),
         provider: "openai-codex".to_string(),
     };
     let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
-    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     call_codex_stream_inner(
         &cfg,
         &reqwest::Client::new(),
@@ -983,13 +1031,9 @@ async fn codex_cancel_mid_stream_emits_one_canceled_record() {
     let upstream = serve(app).await;
     let h = harness();
     let cancel = CancellationToken::new();
-    let canceler = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        canceler.cancel();
-    });
+    let tx = cancel_on_first_text(&cancel);
 
-    drive_codex(&upstream, &h.trace, 0, &cancel)
+    within_deadline(drive_codex_with_events(&upstream, &h.trace, 0, &cancel, tx))
         .await
         .expect_err("cancellation surfaces as request canceled");
 
