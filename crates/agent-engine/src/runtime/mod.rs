@@ -741,6 +741,10 @@ pub struct Runtime {
     /// Per-turn budget (Task 23, spec §8.1). Resolved from role + typed
     /// config at boot; every stream turn is metered against it.
     turn_budget: crate::runtime::budget::TurnBudget,
+    /// Set while an event-started turn's stream starts (like the event
+    /// budget in `turn_budget`): the owner's steer moves that stream onto
+    /// the session budget. `None` for every other stream.
+    owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -1300,6 +1304,7 @@ impl Runtime {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
@@ -1578,6 +1583,16 @@ impl Runtime {
     /// their role's budget explicitly.
     pub fn set_turn_budget(&mut self, budget: crate::runtime::budget::TurnBudget) {
         self.turn_budget = budget;
+    }
+
+    /// Hand the next stream an [`OwnerSteerBudget`](crate::runtime::budget::OwnerSteerBudget)
+    /// (`None` clears it). Like [`Self::set_turn_budget`], the stream takes it
+    /// when it starts.
+    pub fn set_owner_steer_budget(
+        &mut self,
+        lift: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    ) {
+        self.owner_steer_budget = lift;
     }
 
     /// The currently configured per-turn budget.
@@ -4679,6 +4694,7 @@ impl Runtime {
             extension_runtime: self.extension_runtime.clone(),
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            owner_steer_budget: self.owner_steer_budget.clone(),
         };
 
         tokio::spawn(async move {
@@ -4811,6 +4827,7 @@ impl Clone for Runtime {
             // Same durable shared-scope rule for extension leases.
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            owner_steer_budget: self.owner_steer_budget.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and

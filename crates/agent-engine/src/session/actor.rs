@@ -534,6 +534,11 @@ pub struct SessionActor {
     pub(crate) stream: Option<ActiveStream>,
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) steer_tx: Option<mpsc::UnboundedSender<String>>,
+    /// An event-started turn's way onto the session budget: `steer` sends
+    /// the owner's message through it, and the turn's stream switches to the
+    /// session budget when it delivers that message. `None` for every other
+    /// turn (they already run on the session budget).
+    pub(crate) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
     pub(crate) consecutive_auto_turns: u32,
@@ -902,6 +907,7 @@ impl SessionActor {
             stream: None,
             cancel: None,
             steer_tx: None,
+            owner_steer_budget: None,
             streaming: false,
             turn_baseline: 0,
             consecutive_auto_turns: 0,
@@ -1956,6 +1962,7 @@ impl SessionActor {
                             self.turn_completion = Some(completion.clone());
                             let (tx, rx) = mpsc::unbounded_channel();
                             self.steer_tx = Some(tx);
+                            self.owner_steer_budget = None;
                             let mut runtime = self.runtime.clone();
                             // F2: share the parent's TTL latches so the
                             // driver turn doesn't fire a redundant 1h→5m
@@ -2645,6 +2652,8 @@ impl SessionActor {
                 .for_event_turn(&self.host.config().turn_budgets);
             let session_budget = self.runtime.turn_budget().clone();
             self.runtime.set_turn_budget(event_budget);
+            self.runtime
+                .set_owner_steer_budget(self.owner_steer_budget.clone());
             session_budget
         });
         let stream = self
@@ -2660,6 +2669,7 @@ impl SessionActor {
             .await;
         if let Some(session_budget) = session_budget {
             self.runtime.set_turn_budget(session_budget);
+            self.runtime.set_owner_steer_budget(None);
         }
         self.stream = Some(stream);
     }
@@ -2705,6 +2715,8 @@ impl SessionActor {
         self.turn_completion = Some(completion.clone());
         self.cancel = Some(ct.clone());
         self.steer_tx = Some(s_tx);
+        let event_turn = trigger == TurnTrigger::EventAuto;
+        self.owner_steer_budget = event_turn.then(Default::default);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.reset();
@@ -2714,7 +2726,7 @@ impl SessionActor {
             steer_rx: s_rx,
             auto_approve,
             completion,
-            event_turn: trigger == TurnTrigger::EventAuto,
+            event_turn,
         };
         if self.session_start_ready() {
             self.open_turn_stream(start).await;
@@ -2742,6 +2754,7 @@ impl SessionActor {
         self.turn_awaiting_start = None;
         self.cancel = None;
         self.steer_tx = None;
+        self.owner_steer_budget = None;
         self.streaming = false;
         self.turn_completion = None;
         self.revoked_turn_deadline = None;
@@ -3008,12 +3021,21 @@ impl SessionActor {
     }
 
     /// dispatch.rs StreamingInput plain-text branch (:1369-1378).
+    ///
+    /// Only the input owner steers (`is_input_command`). In an event-started
+    /// turn, the owner's message also moves the turn onto the session budget
+    /// (`self.runtime.turn_budget()`, which a `/budget` changes) once the
+    /// stream delivers it. A steer that misses the turn (its stream ended)
+    /// stays queued and starts a typed turn, on that budget anyway.
     pub(crate) fn steer(&mut self, text: String) {
-        let delivered = self
-            .steer_tx
-            .as_ref()
-            .map(|tx| tx.send(text.clone()).is_ok())
-            .unwrap_or(false);
+        let send = |tx: &mpsc::UnboundedSender<String>| tx.send(text.clone()).is_ok();
+        let delivered = match (self.steer_tx.as_ref(), self.owner_steer_budget.as_deref()) {
+            (Some(tx), Some(lift)) => {
+                lift.send_owner_steer(self.runtime.turn_budget().clone(), || send(tx))
+            }
+            (Some(tx), None) => send(tx),
+            (None, _) => false,
+        };
         self.emit(SessionEventWire::Steered {
             text: text.clone(),
             delivered,
