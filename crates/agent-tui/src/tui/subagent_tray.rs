@@ -48,17 +48,14 @@ pub(crate) fn row_at(tray: Rect, n: usize, x: u16, y: u16) -> Option<usize> {
 const TRAY_DEPTH: f32 = 0.55;
 
 /// The row of the worker whose view is open (ctrl+↑/↓): the tray surface
-/// tinted toward the agent colour, then lifted toward the text colour, so the
-/// row reads as selected on every palette.
-const WATCHED_TINT: f32 = 0.22;
-const WATCHED_LIFT: f32 = 0.10;
+/// tinted toward the prompt's `❯` colour. While that view is open the input
+/// steers that worker, so the row takes the prompt's accent.
+const WATCHED_TINT: f32 = 0.14;
 
-/// The watched row's background for a tray `surface`.
+/// The watched row's background over a tray `surface`.
 fn watched_bg(t: &Theme, surface: Rgb) -> Rgb {
     let d = Theme::default();
-    let agent = rgb(t.subagent_name, d.subagent_name);
-    let text = rgb(t.claude_text, d.claude_text);
-    mix(mix(surface, agent, WATCHED_TINT), text, WATCHED_LIFT)
+    mix(surface, rgb(t.prompt_fg, d.prompt_fg), WATCHED_TINT)
 }
 
 /// Rows the tray adds above the prompt for `n` agents: its top rim, then one
@@ -411,19 +408,20 @@ pub(crate) fn paint_tray(
         .max()
         .unwrap_or(4)
         .clamp(4, 16);
-    // The watched worker's row: a brighter band across the tray, its ink
-    // resolved against the band so every word still reads.
-    let sel = watched_bg(theme, surface);
+    // The watched worker's row: a band across the tray, its ink resolved
+    // against the band so every word still reads. On the first row it also
+    // fills the tray's top half-cell of padding, and on the last (no "+N
+    // more" under it) the bottom half-cell, which runs into the input.
+    let sel_at = |rx: u16| watched_bg(theme, tray_at(rx));
+    let sel = sel_at(tray.width / 2);
     let sel_ink = Ink::on(theme, sel);
+    let shown = snaps.len().min(MAX_ROWS);
     let mut y = top + 1;
-    for s in snaps.iter().take(MAX_ROWS) {
+    for (i, s) in snaps.iter().take(MAX_ROWS).enumerate() {
         if y >= tray.bottom() {
             return;
         }
         if s.watched {
-            for rx in l..=r {
-                put(buf, tray.x + rx, y, " ", sel, sel);
-            }
             row(
                 buf,
                 x,
@@ -435,6 +433,21 @@ pub(crate) fn paint_tray(
                 &sel_ink,
                 color(sel),
             );
+            for rx in l..=r {
+                if let Some(cell) = buf.cell_mut((tray.x + rx, y)) {
+                    cell.set_bg(color(sel_at(rx)));
+                }
+            }
+            if i == 0 {
+                for rx in l..=r {
+                    put(buf, tray.x + rx, top, "\u{2584}", sel_at(rx), slab.halo_at(rx));
+                }
+            }
+            if i + 1 == shown && snaps.len() <= MAX_ROWS {
+                for rx in l..=r {
+                    put(buf, input.x + rx, input.y, "\u{2584}", slab.fill_at(rx), sel_at(rx));
+                }
+            }
         } else {
             row(buf, x, right, y, s, name_w, spinner_frame, &ink, bg);
         }
@@ -551,7 +564,7 @@ mod tests {
                 lb.min(lo) <= lt && lt <= lb.max(lo),
                 "{name}: tray between chrome and body"
             );
-            // The watched row is brighter than the tray and still legible.
+            // The watched row stands off the tray and is still legible.
             let sel = watched_bg(&theme, tray);
             assert!(
                 contrast(sel, tray) > 1.08,
@@ -590,6 +603,9 @@ mod tests {
 mod render_tests {
     use crate::tui::app::SPINNER_FRAMES;
     use crate::tui::testing::TestHarness;
+    use super::{watched_bg, Theme};
+    use crate::tui::neon_prompt::{contrast, rgb};
+    use crate::tui::theme::THEME;
     use agent_engine::session::SessionEventWire;
     use ratatui::buffer::Buffer;
     use synaps_cli::{AgentEvent, StreamEvent};
@@ -714,10 +730,13 @@ mod render_tests {
         }
     }
 
-    /// ctrl+↑ opens a worker's view: its tray row gets a brighter band across
-    /// the whole tray (no underline); the others stay as they are.
+    /// ctrl+↑ opens a worker's view: its tray row becomes a band in the
+    /// prompt's accent across the whole tray (no bar, no underline); the
+    /// others stay as they are. The band fills the tray's half-cell padding
+    /// on its open side: under the last row (running into the input), over
+    /// the first.
     #[test]
-    fn the_watched_worker_row_is_a_brighter_band() {
+    fn the_watched_worker_row_is_a_band_in_the_prompt_accent() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut h = TestHarness::boot_with_size(W, H);
         start(&mut h, 1, "chrollo");
@@ -743,11 +762,28 @@ mod render_tests {
             assert_eq!(buf[(x, y)].bg, band, "across the tray at x={x}");
         }
         assert_eq!(buf[(2, other)].bg, tray_bg, "the other row is unchanged");
-        let lum = |c: ratatui::style::Color| match c {
-            ratatui::style::Color::Rgb(r, g, b) => crate::tui::neon_prompt::luminance((r, g, b)),
-            _ => 0.0,
+        let rgb_of = |c: ratatui::style::Color| match c {
+            ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("not rgb: {other:?}"),
         };
-        assert!(lum(band) > lum(tray_bg), "brighter than the tray");
+        assert!(
+            contrast(rgb_of(band), rgb_of(tray_bg)) > 1.08,
+            "the band stands off the tray"
+        );
+        let accent = rgb(
+            THEME.load().prompt_fg,
+            Theme::default().prompt_fg,
+        );
+        assert_eq!(
+            rgb_of(band),
+            watched_bg(&THEME.load(), rgb_of(tray_bg)),
+            "the tray tinted toward ❯ ({accent:?})"
+        );
+        assert_ne!(
+            buf[(2, y)].symbol(),
+            "\u{2503}",
+            "no selection bar"
+        );
         let x = (0..W)
             .find(|&x| buf[(x, y)].symbol() == "s" && buf[(x + 1, y)].symbol() == "p")
             .unwrap();
@@ -758,6 +794,29 @@ mod render_tests {
                 .contains(ratatui::style::Modifier::UNDERLINED),
             "the band marks it; no underline"
         );
+
+        // spike is the last row: the band runs down into the input's rim
+        // (the upper half of that row), and the top padding stays the tray.
+        let rim = prompt_row(&buf) - 1;
+        assert_eq!(y, rim - 1, "spike is the last row");
+        for x in [2, W / 2, W - 3] {
+            assert_eq!(buf[(x, rim)].symbol(), "\u{2584}");
+            assert_eq!(buf[(x, rim)].bg, buf[(x, y)].bg, "bottom padding at x={x}");
+            assert_eq!(buf[(x, top)].fg, before[(x, top)].fg, "top padding unchanged");
+        }
+
+        // chrollo is the first row: the band fills the top padding instead.
+        h.key(KeyCode::Up, KeyModifiers::CONTROL);
+        let buf = h.render().clone();
+        let first = top + 1;
+        assert!(row(&buf, first).contains("chrollo"));
+        assert_ne!(buf[(2, first)].bg, tray_bg, "chrollo is watched");
+        for x in [2, W / 2, W - 3] {
+            assert_eq!(buf[(x, top)].symbol(), "\u{2584}");
+            assert_eq!(buf[(x, top)].fg, buf[(x, first)].bg, "top padding at x={x}");
+            assert_eq!(buf[(x, top)].bg, before[(x, top)].bg, "above it is unchanged");
+            assert_eq!(buf[(x, rim)].bg, before[(x, rim)].bg, "bottom padding back to the tray");
+        }
     }
 
     /// The input box is exactly as without agents (corners, padding, every
