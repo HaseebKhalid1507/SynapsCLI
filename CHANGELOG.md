@@ -124,6 +124,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Bash and shell-session output keep multi-byte characters whole.** Output
+  was decoded one read at a time, so a character split between two reads
+  (box drawing, emoji, CJK, accents) reached the model as U+FFFD. The
+  incomplete tail of a read is now held and joined with the next one; only
+  genuinely invalid bytes become U+FFFD (#286).
 - **Tool cards in a subagent view tick and get their footer** (#287). In a
   worker's view (Ctrl+↑) a running tool card's clock stayed at `░ 0ms`, and
   a finished card's duration was the time between two polls of the view
