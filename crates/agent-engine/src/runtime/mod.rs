@@ -762,6 +762,10 @@ pub struct Runtime {
     /// turns (exact activations are session-scoped). Minted empty with the
     /// runtime and shared by `Clone`, exactly like `host_tool_session`.
     retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+    /// Activations carried over from this conversation's previous runtime
+    /// (daemon reload, unpark), restored at the first progressive turn
+    /// start. Shared by `Clone` like `retained_tool_set`.
+    pending_tool_restore: crate::tools::activation::PendingToolRestore,
     /// Conversation/session identity this runtime serves. Keys the
     /// `on_session_start` hook injection (Phase 2 keys everything).
     /// `None` = unkeyed (workers, tests) — reads no injection.
@@ -1308,6 +1312,7 @@ impl Runtime {
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
+            pending_tool_restore: Default::default(),
             session_id: None,
             cwd: None,
             env: None,
@@ -1926,6 +1931,60 @@ impl Runtime {
     /// Whether this runtime projects a progressive (core-only) tool schema.
     pub fn progressive_tool_disclosure(&self) -> bool {
         self.progressive_tool_disclosure
+    }
+
+    /// This conversation's exact tool activations as plain data, for the
+    /// next runtime that serves it (daemon reload, park → unpark). The
+    /// retained set's activations once a progressive turn ran; before that,
+    /// whatever this runtime was itself handed and has not applied yet — so
+    /// a reload or park before the first turn does not lose them either.
+    pub fn carried_tool_activations(&self) -> Vec<crate::tools::activation::CarriedActivation> {
+        let retained = self
+            .retained_tool_set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(shared) = retained {
+            return shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .carried_activations();
+        }
+        self.pending_tool_restore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Hand this runtime the activations the same conversation held in its
+    /// previous runtime. Nothing is granted here: they are re-validated and
+    /// restored (or dropped and reported) at the first progressive turn
+    /// start, against that moment's catalog and this runtime's
+    /// `tools.activation_confirm` (see
+    /// `runtime::stream::restore_pending_activations`). An empty list
+    /// clears nothing that is already pending.
+    pub fn restore_tool_activations(
+        &self,
+        carried: Vec<crate::tools::activation::CarriedActivation>,
+    ) {
+        if carried.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_tool_restore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pending.as_mut() {
+            Some(list) => {
+                for c in carried {
+                    if !list.iter().any(|p| p.tool_id == c.tool_id) {
+                        list.push(c);
+                    }
+                }
+            }
+            None => *pending = Some(carried),
+        }
     }
 
     /// `tools.activation_confirm` policy in force for this runtime.
@@ -4689,6 +4748,7 @@ impl Runtime {
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
+            pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
             extension_runtime: self.extension_runtime.clone(),
@@ -4835,6 +4895,7 @@ impl Clone for Runtime {
             host_tool_session: self.host_tool_session.clone(),
             tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
+            pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
@@ -4963,6 +5024,31 @@ mod tests {
             other.host_tool_session_id(),
             "independently constructed runtimes must never share a session"
         );
+    }
+
+    /// Activations handed to a runtime before its first turn are what it
+    /// hands on (a second reload, or a park, before any turn loses
+    /// nothing); clones share them; another runtime does not see them.
+    #[test]
+    fn handed_activations_are_carried_on_before_the_first_turn() {
+        use crate::tools::activation::{CarriedActivation, CarriedProvenance};
+        let probe = |name: &str| CarriedActivation {
+            tool_id: format!("builtin:{name}"),
+            schema_digest: "ab".repeat(32),
+            provenance: CarriedProvenance::BuiltinRuntime,
+        };
+        let rt = Runtime::new_headless();
+        assert!(rt.carried_tool_activations().is_empty());
+        rt.restore_tool_activations(vec![probe("subagent_start")]);
+        rt.restore_tool_activations(Vec::new());
+        rt.restore_tool_activations(vec![probe("subagent_start"), probe("subagent_status")]);
+        assert_eq!(
+            rt.carried_tool_activations(),
+            vec![probe("subagent_start"), probe("subagent_status")],
+            "merged without duplicates; an empty hand-off clears nothing"
+        );
+        assert_eq!(rt.clone().carried_tool_activations().len(), 2);
+        assert!(Runtime::new_headless().carried_tool_activations().is_empty());
     }
 
     /// Task 11 config rule (documented until Task 12 adds explicit trace

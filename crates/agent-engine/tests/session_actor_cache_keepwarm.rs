@@ -246,6 +246,8 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::Park
         // Its wakes reach the event queue like any other event.
         | SessionCommand::AdoptWorkers { .. }
+        // Hands the runtime pins only; the next turn start restores them.
+        | SessionCommand::RestoreToolActivations { .. }
         | SessionCommand::ReloadAborted
         | SessionCommand::HostEvent(_) => Effect::Untouched,
         SessionCommand::DriverStart { .. } => Effect::DriverOwned,

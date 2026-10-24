@@ -211,6 +211,10 @@ pub(super) struct StreamSession {
     /// across turns, so exact activations live for the session (as the
     /// `activate_tools` contract says), not for one provider turn.
     pub(super) retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+    /// Activations handed over from this conversation's previous runtime,
+    /// restored at the first progressive turn start (see
+    /// `restore_pending_activations`).
+    pub(super) pending_tool_restore: crate::tools::activation::PendingToolRestore,
     /// Shared exact MCP lease manager (Task 19); `None` when MCP exact
     /// mode is not active.
     pub(super) mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
@@ -245,23 +249,36 @@ pub(super) struct StreamMethods;
 /// Flag-off (full-schema) sessions keep the per-turn set: every trusted tool
 /// is already in their core. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores the
 /// zero-inherit behavior here too.
+///
+/// Activations handed over from the same conversation's previous runtime
+/// (`pending`: a daemon reload or an unpark) are restored into the selected
+/// set here, at the first turn start, against this turn's catalog — see
+/// [`restore_pending_activations`] for the checks and the policy.
 fn retain_session_tool_set(
     retained: &crate::tools::activation::RetainedSessionToolSet,
+    pending: &crate::tools::activation::PendingToolRestore,
     fresh: crate::tools::activation::SessionToolSet,
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
+    activation_confirm: agent_core::config::ActivationConfirm,
 ) -> crate::tools::activation::SharedSessionToolSet {
     if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        // Nothing to restore into: a full-schema set already holds every
+        // trusted tool. `pending` stays, so a later export still carries it.
         return std::sync::Arc::new(std::sync::RwLock::new(fresh));
     }
     let mut slot = retained
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let fresh = if let Some(existing) = slot.as_ref() {
+    let carried = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let mut fresh = if let Some(existing) = slot.as_ref() {
         let mut set = existing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (next, dropped, reused) =
+        let (mut next, dropped, reused) =
             select_turn_start_tool_set(Some(&*set), fresh, catalog, progressive);
         if reused {
             for d in &dropped {
@@ -271,6 +288,14 @@ fn retain_session_tool_set(
                     "activation dropped at turn start"
                 );
             }
+            if let Some(carried) = &carried {
+                log_restore(&restore_pending_activations(
+                    &mut next,
+                    carried,
+                    catalog,
+                    activation_confirm,
+                ));
+            }
             *set = next;
             drop(set);
             return std::sync::Arc::clone(existing);
@@ -279,9 +304,66 @@ fn retain_session_tool_set(
     } else {
         fresh
     };
+    if let Some(carried) = &carried {
+        log_restore(&restore_pending_activations(
+            &mut fresh,
+            carried,
+            catalog,
+            activation_confirm,
+        ));
+    }
     let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
     *slot = Some(std::sync::Arc::clone(&shared));
     shared
+}
+
+/// Restore activations the same conversation held in its previous runtime
+/// (daemon reload, park → unpark) into `set`, a set built for THIS runtime's
+/// tool session against `catalog`.
+///
+/// Policy (`tools.activation_confirm`, read from the RESTORING runtime):
+/// - `deny`: nothing is restored. Under `deny` this runtime refuses every
+///   model-initiated activation and lists no activatable tools in the
+///   system prompt, so a carried grant is dropped (reported `Denied`).
+/// - `auto` / `prompt`: restored without a new prompt. The grant was
+///   already approved in this conversation; restoring continues it, it is
+///   not a new grant. Each entry is still re-validated against the current
+///   catalog (schema digest + trust provenance pins + source trust,
+///   [`crate::tools::activation::SessionToolSet::restore_carried`]); a
+///   drifted or removed tool is dropped fail-closed and reported.
+pub(super) fn restore_pending_activations(
+    set: &mut crate::tools::activation::SessionToolSet,
+    carried: &[crate::tools::activation::CarriedActivation],
+    catalog: &crate::tools::catalog::ToolCatalog,
+    activation_confirm: agent_core::config::ActivationConfirm,
+) -> crate::tools::activation::RestoreReport {
+    use crate::tools::activation::{RestoreDropReason, RestoreReport};
+    if activation_confirm == agent_core::config::ActivationConfirm::Deny {
+        return RestoreReport {
+            restored: Vec::new(),
+            dropped: carried
+                .iter()
+                .map(|c| (c.tool_id.clone(), RestoreDropReason::Denied))
+                .collect(),
+        };
+    }
+    set.restore_carried(carried, catalog)
+}
+
+fn log_restore(report: &crate::tools::activation::RestoreReport) {
+    for (tool, reason) in &report.dropped {
+        tracing::warn!(
+            tool = %tool,
+            reason = ?reason,
+            "carried activation not restored (dropped fail-closed)"
+        );
+    }
+    if !report.restored.is_empty() {
+        tracing::info!(
+            restored = ?report.restored.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            "restored activations carried from the previous runtime"
+        );
+    }
 }
 
 /// The pre-request context assessment of a stream round over the round's
@@ -582,6 +664,7 @@ impl StreamMethods {
             activation_confirm,
             tool_session_id,
             retained_tool_set,
+            pending_tool_restore,
             mcp_runtime,
             mcp_session_scope,
             extension_runtime,
@@ -712,9 +795,11 @@ impl StreamMethods {
             );
             retain_session_tool_set(
                 &retained_tool_set,
+                &pending_tool_restore,
                 fresh,
                 registry.catalog(),
                 progressive_tool_disclosure,
+                activation_confirm,
             )
         };
         // Thread the RETAINED handle into the extension-provider route so
@@ -3672,6 +3757,7 @@ mod rich_output_tests {
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set,
+            pending_tool_restore: Default::default(),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -3928,6 +4014,29 @@ mod rich_output_tests {
         retained: crate::tools::activation::RetainedSessionToolSet,
         progressive: bool,
     ) -> Driven {
+        drive_turn_with(
+            tools,
+            tool_uses,
+            tool_session_id,
+            retained,
+            Default::default(),
+            agent_core::config::ActivationConfirm::default(),
+            progressive,
+        )
+        .await
+    }
+
+    /// [`drive_turn`] for a runtime that was handed activations from the
+    /// conversation's previous runtime (`pending`), under `confirm`.
+    async fn drive_turn_with(
+        tools: Arc<RwLock<ToolRegistry>>,
+        tool_uses: &[(&str, &str, &str)],
+        tool_session_id: crate::tools::activation::SessionId,
+        retained: crate::tools::activation::RetainedSessionToolSet,
+        pending: crate::tools::activation::PendingToolRestore,
+        confirm: agent_core::config::ActivationConfirm,
+        progressive: bool,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(tool_uses)).await;
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let session_manager =
@@ -3943,6 +4052,9 @@ mod rich_output_tests {
             progressive,
             "claude-sonnet-4-6",
         );
+        let mut session = session;
+        session.pending_tool_restore = pending;
+        session.activation_confirm = confirm;
         let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -4112,6 +4224,140 @@ mod rich_output_tests {
         )
         .await;
         assert!(retained.lock().unwrap().is_none());
+    }
+
+    /// Non-deferred (`loaded`) tool names of one request body, in order.
+    fn loaded_tool_names(body: &Value) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter(|t| t.get("defer_loading").is_none())
+                    .filter_map(|t| t["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The previous runtime's activations (what a reload record carries).
+    fn carried_probe(
+        tools: &Arc<RwLock<ToolRegistry>>,
+    ) -> Vec<crate::tools::activation::CarriedActivation> {
+        let registry = tools.try_read().expect("no writer");
+        let mut set = crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
+            fresh_tool_session(),
+            registry.catalog(),
+        );
+        crate::tools::activation::activate_exact_for_user(
+            &mut set,
+            registry.catalog(),
+            &crate::tools::catalog::ToolId::builtin("deferred_probe"),
+        )
+        .unwrap();
+        let carried = set.carried_activations();
+        serde_json::from_slice(&serde_json::to_vec(&carried).unwrap()).unwrap()
+    }
+
+    /// Reload regression (request trace 2026-10-24 05:37): a runtime handed
+    /// the previous runtime's activations restores them at its first turn
+    /// start. Its first request carries the same non-deferred tools array as
+    /// the previous runtime's request with the reference lost (no cache
+    /// rewrite), and the tool is callable without re-activation.
+    #[tokio::test]
+    async fn carried_activation_is_restored_at_the_first_turn_start() {
+        let tools = probe_registry();
+        // Previous runtime, after a rollover dropped the probe's reference:
+        // the probe rides in the non-deferred tools.
+        let old_sid = fresh_tool_session();
+        let old_retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            old_sid.clone(),
+            Arc::clone(&old_retained),
+            true,
+        )
+        .await;
+        let before = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            old_sid,
+            Arc::clone(&old_retained),
+            true,
+        )
+        .await;
+        let before_tools = before.bodies[0]["tools"].clone();
+        assert!(loaded_tool_names(&before.bodies[0]).contains(&"deferred_probe".to_string()));
+        let carried = old_retained
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .carried_activations();
+        assert_eq!(carried, carried_probe(&tools));
+
+        // Next runtime: new tool session, empty retained slot, pending.
+        let pending: crate::tools::activation::PendingToolRestore =
+            Arc::new(Mutex::new(Some(carried)));
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let after = drive_turn_with(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            Arc::clone(&pending),
+            agent_core::config::ActivationConfirm::Prompt,
+            true,
+        )
+        .await;
+        assert_eq!(
+            after.bodies[0]["tools"].to_string(),
+            before_tools.to_string(),
+            "the first request after the hand-off keeps the tools array byte-identical"
+        );
+        assert!(
+            after.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "restored without re-activation (and without a prompt under `prompt`): {:?}",
+            after.ui_results
+        );
+        assert!(pending.lock().unwrap().is_none(), "consumed by the turn start");
+        let slot = retained.lock().unwrap();
+        let set = slot.as_ref().unwrap().read().unwrap();
+        assert!(set
+            .activation(&crate::tools::catalog::ToolId::builtin("deferred_probe"))
+            .is_some());
+    }
+
+    /// `tools.activation_confirm = deny` in the restoring runtime: nothing
+    /// carried is restored, and the tool is denied.
+    #[tokio::test]
+    async fn deny_policy_drops_carried_activations() {
+        let tools = probe_registry();
+        let pending: crate::tools::activation::PendingToolRestore =
+            Arc::new(Mutex::new(Some(carried_probe(&tools))));
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let driven = drive_turn_with(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            Arc::clone(&pending),
+            agent_core::config::ActivationConfirm::Deny,
+            true,
+        )
+        .await;
+        assert!(!loaded_tool_names(&driven.bodies[0]).contains(&"deferred_probe".to_string()));
+        assert!(
+            !driven.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "{:?}",
+            driven.ui_results
+        );
+        assert!(pending.lock().unwrap().is_none(), "dropped, not kept for later");
+        let slot = retained.lock().unwrap();
+        assert_eq!(slot.as_ref().unwrap().read().unwrap().activated().count(), 0);
     }
 
     /// on_message_complete hook that records every event's `data` and reports
@@ -5111,6 +5357,7 @@ mod rich_output_tests {
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set: Default::default(),
+            pending_tool_restore: Default::default(),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,

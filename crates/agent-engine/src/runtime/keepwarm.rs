@@ -595,13 +595,32 @@ impl Runtime {
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
             });
-            let (set, _, _) = super::stream::select_turn_start_tool_set(
+            let (mut set, _, _) = super::stream::select_turn_start_tool_set(
                 existing.as_deref(),
                 fresh,
                 tools_snapshot.catalog(),
                 true,
             );
             drop(existing);
+            // Activations carried from the previous runtime (reload, unpark)
+            // that the next turn start will restore: projected here too, on
+            // this local copy only, so a ping before that turn warms the
+            // prefix the turn will send.
+            let pending = self
+                .pending_tool_restore
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(carried) = pending {
+                if crate::tools::activation::carry_forward_enabled() {
+                    let _ = super::stream::restore_pending_activations(
+                        &mut set,
+                        &carried,
+                        tools_snapshot.catalog(),
+                        self.activation_confirm,
+                    );
+                }
+            }
             let schema = tools_snapshot.session_tools_schema(&set).schema;
             let split = self.deferred_tool_loading.then(|| {
                 let referenced = HelperMethods::referenced_tool_ids(request_messages);
@@ -1333,6 +1352,85 @@ mod tests {
         rt.progressive_tool_disclosure = true;
         rt.deferred_tool_loading = true;
         assert_identity_1h(&rt).await;
+    }
+
+    /// A ping projects exactly what the next turn start selects — including
+    /// activations handed over by a daemon reload or an unpark that the turn
+    /// start has not restored yet. (The session only schedules pings after
+    /// an accepted request of the same runtime, so this is the projection
+    /// invariant, not a reachable pre-turn ping.)
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_projects_carried_activations_the_turn_start_restores() {
+        use crate::tools::activation::{activate_exact_for_user, SessionId, SessionToolSet};
+        use crate::tools::catalog::ToolId;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.progressive_tool_disclosure = true;
+        rt.deferred_tool_loading = true;
+        let carried = {
+            let registry = rt.tools.read().await;
+            let mut previous = SessionToolSet::progressive_core_for_catalog(
+                SessionId::parse("previous-runtime").unwrap(),
+                registry.catalog(),
+            );
+            activate_exact_for_user(
+                &mut previous,
+                registry.catalog(),
+                &ToolId::builtin("subagent_status"),
+            )
+            .unwrap();
+            previous.carried_activations()
+        };
+        rt.restore_tool_activations(carried);
+
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let report = rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+            .await;
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        let mut next = history.clone();
+        next.push(user("next"));
+        real_turn(&rt, next).await;
+
+        let bodies: Vec<Value> = mock
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        let (ping, real) = (&bodies[0], &bodies[1]);
+        // The non-deferred tools are the cached prefix. (The deferred list
+        // can still differ here: this runtime's first turn applies its
+        // idempotent setup, e.g. hiding the forum tools under the legacy
+        // memory backend; deferred definitions are outside the prefix.)
+        let loaded = |b: &Value| -> Vec<Value> {
+            b["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t.get("defer_loading").is_none())
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            serde_json::to_string(&loaded(ping)).unwrap(),
+            serde_json::to_string(&loaded(real)).unwrap()
+        );
+        assert!(
+            real["tools"].as_array().unwrap().iter().any(|t| {
+                t["name"] == "subagent_status" && t.get("defer_loading").is_none()
+            }),
+            "the restored activation is a loaded tool: {}",
+            real["tools"]
+        );
     }
 
     /// Context management on: the guidance is appended to the system prompt

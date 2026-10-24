@@ -726,6 +726,15 @@ pub enum SessionCommand {
     /// against their archives and wakes the parent once per worker.
     #[serde(skip)]
     AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): reload's rehydrate hands the new image the
+    /// exact tool activations the session held in the previous image
+    /// (`SessionReloadRecord::tool_activations`). The runtime re-validates
+    /// and restores them at its first turn start; a parked session keeps
+    /// them for its unpark. Sent before anything can start a turn.
+    #[serde(skip)]
+    RestoreToolActivations {
+        activations: Vec<crate::tools::activation::CarriedActivation>,
+    },
     /// Host-only (never wire): the reload this session checkpointed for
     /// did not exec (the exec failed, or the reload stopped after the
     /// checkpoints). The checkpoint's reload fence lifts, and the workers
@@ -749,7 +758,7 @@ pub enum SessionCommand {
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
 /// session as it IS (not as it was created): the actor's config, keep-warm
 /// pin, lifecycle, the non-persisted knobs (`settings_replay`, incl.
-/// `/system`), and the CURRENT model/thinking.
+/// `/system`), the CURRENT model/thinking, and its tool activations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionReloadRecord {
     pub config: SessionConfig,
@@ -766,6 +775,11 @@ pub struct SessionReloadRecord {
     /// the next image can re-register their ids and wake the parent.
     #[serde(default)]
     pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+    /// The session's exact tool activations (`activate_tools` grants), so
+    /// the next image's runtime keeps the tools array the cached prompt
+    /// prefix starts with. Pins only, re-validated on restore.
+    #[serde(default)]
+    pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// What a session tells a client whose command a daemon reload refused.
@@ -848,6 +862,13 @@ impl std::fmt::Debug for SessionCommand {
             Self::AdoptWorkers { workers } => f
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
+                .finish(),
+            Self::RestoreToolActivations { activations } => f
+                .debug_struct("RestoreToolActivations")
+                .field(
+                    "tools",
+                    &activations.iter().map(|a| a.tool_id.as_str()).collect::<Vec<_>>(),
+                )
                 .finish(),
             Self::ReloadAborted => f.write_str("ReloadAborted"),
             Self::Query { id, query } => {

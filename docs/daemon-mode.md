@@ -505,8 +505,8 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    cancel (partial history kept + restart marker), answer prompts `None`, save, close PTYs, notice.
    Workers do not hold the drain: an idle parent waiting on workers counts as idle.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
-   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers}`, and `next_subagent_id`
-   (the `sa_N` counter).
+   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations}`, and
+   `next_subagent_id` (the `sa_N` counter).
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
    `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
@@ -528,8 +528,9 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
    ids for one generation (they differ only after a LinkedSuccessor compaction). Before the first session
-   the handle counter is raised to `next_subagent_id` (and past every carried id); each session with
-   carried workers gets the host-only `AdoptWorkers` (before any `Park`). The restore does not wait
+   the handle counter is raised to `next_subagent_id` (and past every carried id); each continued
+   session with tool activations gets the host-only `RestoreToolActivations` first, and each session
+   with carried workers gets the host-only `AdoptWorkers` (both before any `Park`). The restore does not wait
    for `on_session_start`: each session runs it in the background, one hook at a time per host (a
    session restored Parked once it is unparked), so the restore does not add the hooks' serial
    latency (this does not bound the restore's other work); a session's first request still waits
@@ -548,8 +549,10 @@ LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, pr
 compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
 back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
 (`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
-worker grants, **`/system`**), and the **current** model/thinking (a `/model` change mid-session
-survives; the create-time `--model` override is not re-applied). A session that never ran a turn has no
+worker grants, **`/system`**), the **current** model/thinking (a `/model` change mid-session
+survives; the create-time `--model` override is not re-applied), and the session's **exact tool
+activations** (`activate_tools` grants under progressive disclosure; see
+[Tool activations across a reload](#tool-activations-across-a-reload-or-a-park)). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
 A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
 NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
@@ -562,6 +565,34 @@ owner again, second turn works; older `--exe` refused with the daemon still serv
 checkpointed and its partial history + restart marker come back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
+
+### Tool activations across a reload or a park
+
+Under progressive disclosure with deferred loading, an activated tool whose `tool_reference` has left
+the history (context rollover, compaction) is part of the **non-deferred** tools array, which is the
+start of the cached prompt prefix. A reload or an unpark builds a new runtime, so a session that lost
+its activations sent a shorter tools array and rewrote its whole prompt cache on the next request
+(request trace, 2026-10-24 05:37: 19 → 14 tools, cache read 85,679 → 5,784, write 70,268), and the
+model lost tools it was using mid-session.
+
+So the activations go with the conversation. `Checkpoint{Reload}` records them in
+`SessionReloadRecord::tool_activations` as **pins only** — tool id, schema digest, trust provenance —
+never as grants. Park stashes them on the actor; a reload of a Parked session records the stash. The
+new runtime gets them (`RestoreToolActivations` after a reload; directly on unpark) and restores
+them at its **first turn start**, against that moment's catalog
+(`SessionToolSet::restore_carried`): each one must still be cataloged with the same schema digest,
+the same trust provenance and a source that agrees with it — the pins `session_tools_schema` and the
+execution gate check. A drifted, removed or unparsable entry is dropped fail-closed and logged
+(`carried activation not restored`), never re-granted. A keep-warm ping projects them the same way.
+
+**Policy** (`tools.activation_confirm` of the restoring runtime): `deny` drops every carried
+activation — that runtime refuses model-initiated activation and lists no activatable tools in the
+system prompt. `auto` and `prompt` restore without a new prompt: the grant was already approved in
+this conversation, and restoring continues it; it is not a new grant.
+
+Not carried: a checkpoint that did not confirm in budget, a session recreated fresh (its journal was
+not continuable — a new conversation inherits no grants), a lock-held placeholder, and `--continue`
+from the journal (activations are not journaled).
 
 ### Workers across a reload
 
