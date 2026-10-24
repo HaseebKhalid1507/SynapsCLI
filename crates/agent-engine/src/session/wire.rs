@@ -644,6 +644,12 @@ pub enum WireLlmEvent {
     ToolResultDelta { tool_id: String, delta: String },
     ResponseStart,
     ResponseReset,
+    /// Opt-in (`ClientCapabilities::tool_queue`): this enum has no
+    /// `#[serde(other)]`, so an older client fails the WHOLE frame on an
+    /// unknown variant — the daemon never sends these two to a client that
+    /// did not declare it can decode them (`daemon/conn.rs`).
+    ToolQueued { tool_id: String },
+    ToolStarted { tool_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,6 +760,8 @@ impl From<StreamEvent> for WireStreamEvent {
                 LlmEvent::ToolResultDelta { tool_id, delta } => WireLlmEvent::ToolResultDelta { tool_id, delta },
                 LlmEvent::ResponseStart => WireLlmEvent::ResponseStart,
                 LlmEvent::ResponseReset => WireLlmEvent::ResponseReset,
+                LlmEvent::ToolQueued { tool_id } => WireLlmEvent::ToolQueued { tool_id },
+                LlmEvent::ToolStarted { tool_id } => WireLlmEvent::ToolStarted { tool_id },
             }),
             StreamEvent::Session(s) => Self::Session(match s {
                 SessionEvent::MessageHistory(messages) => WireSessionStreamEvent::MessageHistory { messages },
@@ -811,6 +819,8 @@ impl From<WireStreamEvent> for StreamEvent {
                 WireLlmEvent::ToolResultDelta { tool_id, delta } => LlmEvent::ToolResultDelta { tool_id, delta },
                 WireLlmEvent::ResponseStart => LlmEvent::ResponseStart,
                 WireLlmEvent::ResponseReset => LlmEvent::ResponseReset,
+                WireLlmEvent::ToolQueued { tool_id } => LlmEvent::ToolQueued { tool_id },
+                WireLlmEvent::ToolStarted { tool_id } => LlmEvent::ToolStarted { tool_id },
             }),
             WireStreamEvent::Session(s) => Self::Session(match s {
                 WireSessionStreamEvent::MessageHistory { messages } => SessionEvent::MessageHistory(messages),
@@ -976,6 +986,21 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }
     }
+}
+
+// ── per-client decode gate ────────────────────────────────────────────────────
+
+/// Whether a client that declared `caps` can decode `event` once it is a
+/// wire frame. The enums nested under `Stream` have no `#[serde(other)]`,
+/// so an older client does not skip an unknown nested variant: the whole
+/// frame fails to decode, `SocketTransport::next_event` treats that as a
+/// dead socket and the TUI drops into reconnect — whose `Attached` replay
+/// may carry the very same event and fail again. The daemon therefore
+/// drops, per connection, every event the client did not opt into
+/// (`daemon/conn.rs`, live pump and attach replay alike).
+pub fn client_decodes(caps: ClientCapabilities, event: &SessionEventWire) -> bool {
+    let _ = (caps, event);
+    true // RED: gate not implemented yet
 }
 
 // ── framing helpers ───────────────────────────────────────────────────────────
@@ -1144,6 +1169,8 @@ mod tests {
             }),
             StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "id1".into(), result: "/tmp".into() }),
             StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: "id1".into(), delta: "/t".into() }),
+            StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "id2".into() }),
+            StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "id2".into() }),
             StreamEvent::Session(SessionEvent::MessageHistory(vec![Arc::new(serde_json::json!({"role":"user","content":"a"}))])),
             StreamEvent::Session(SessionEvent::Usage {
                 input_tokens: 1,
@@ -1299,11 +1326,126 @@ mod tests {
         v
     }
 
+    fn queued_frame() -> String {
+        let ev = env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })));
+        encode_line(&DaemonFrame::Event(ev.into())).unwrap()
+    }
+
+    /// What an OLDER client does with a new nested `llm` variant: its
+    /// `WireLlmEvent` lacks the tag, so serde fails the WHOLE frame (no
+    /// `#[serde(other)]` down there) — `SocketTransport::next_event` then
+    /// ends the stream as if the socket closed. Simulated the way the
+    /// driver-event test does: rename the tag to one this build lacks.
+    /// Only the top level (`ev`) has an `Unknown` fallback, and that one
+    /// shows the user a notice.
+    #[test]
+    fn an_unknown_nested_llm_variant_fails_the_whole_frame() {
+        let line = queued_frame();
+        assert!(line.contains(r#""llm":"tool_queued""#), "{line}");
+        let as_old = line.replace(r#""llm":"tool_queued""#, r#""llm":"tool_from_the_future""#);
+        let err = decode_line::<DaemonFrame>(as_old.trim_end()).unwrap_err();
+        assert!(err.contains("unknown variant `tool_from_the_future`"), "{err}");
+        // The same inside an attach replay sinks the whole `Attached`.
+        let attached = AttachedWire::new(
+            ClientId(1),
+            AttachSnapshot {
+                meta: meta(),
+                view: view(),
+                conversation: conv(),
+                streaming: true,
+                replay: vec![env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })))],
+                pending_prompts: vec![],
+                clients: vec![],
+                input_owner: None,
+                display_tail: None,
+            },
+        );
+        let line = encode_line(&DaemonFrame::Attached(attached)).unwrap();
+        let as_old = line.replace(r#""llm":"tool_queued""#, r#""llm":"tool_from_the_future""#);
+        assert!(decode_line::<DaemonFrame>(as_old.trim_end()).is_err());
+        // Whereas an unknown TOP-level event decodes, as a user-visible notice.
+        let top_frame = queued_frame().replace(r#""ev":"stream""#, r#""ev":"zz_new""#);
+        match decode_line::<DaemonFrame>(top_frame.trim_end()).unwrap() {
+            DaemonFrame::Event(w) => match Envelope::from(w).event {
+                SessionEventWire::SystemNotice(t) => assert!(t.contains("newer daemon"), "{t}"),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The gate: a client that did not declare `tool_queue` (every client
+    /// that predates it) is never sent the queue signals; everything else
+    /// it decodes exactly as before. A current client gets them.
+    #[test]
+    fn queue_signals_reach_only_clients_that_opted_in() {
+        let old = ClientCapabilities::default();
+        let new = ClientCapabilities::current();
+        for ev in fixtures() {
+            let queue = matches!(
+                ev,
+                SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. }))
+            );
+            assert_eq!(client_decodes(old, &ev), !queue, "old client: {ev:?}");
+            assert!(client_decodes(new, &ev), "new client: {ev:?}");
+        }
+    }
+
+    /// Hello compat both ways: an older client's meta has no capabilities
+    /// (decodes as none), a current one declares `tool_queue`, and an older
+    /// daemon's `ClientMeta` (no such field) still decodes the new frame.
+    #[test]
+    fn client_capabilities_default_off_and_old_daemons_ignore_them() {
+        let legacy = r#"{"kind":"tui","terminal":null,"instance":"i"}"#;
+        let m: ClientMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.capabilities, ClientCapabilities::default());
+        assert!(!m.capabilities.tool_queue);
+
+        let h = Hello::new(ClientKind::Tui);
+        assert!(h.client.capabilities.tool_queue);
+        let line = encode_line(&ClientFrame::Hello(h)).unwrap();
+        assert!(line.contains(r#""capabilities":{"tool_queue":true}"#), "{line}");
+        match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
+            other => panic!("{other:?}"),
+        }
+
+        // The ClientMeta an older daemon decodes (as of da1eb372).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldClientMeta {
+            kind: ClientKind,
+            terminal: Option<String>,
+            instance: String,
+            #[serde(default)]
+            history: HistoryMode,
+            #[serde(default)]
+            tail_items: usize,
+        }
+        let json = serde_json::to_string(&ClientMeta::new(ClientKind::Tui)).unwrap();
+        let old: OldClientMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.kind, ClientKind::Tui);
+    }
+
+    /// The watch query's opt-in: an older client's query omits it (off), an
+    /// off flag is not serialized (an older daemon sees the old bytes).
+    #[test]
+    fn the_watch_queries_tool_queue_flag_defaults_off() {
+        let old: SessionQuery =
+            serde_json::from_str(r#"{"query":"subagent_watch","handle_id":"sa_1","since":4}"#).unwrap();
+        assert!(matches!(old, SessionQuery::SubagentWatch { tool_queue: false, since: 4, .. }));
+        let off = SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 4, tool_queue: false };
+        assert!(!serde_json::to_string(&off).unwrap().contains("tool_queue"));
+        let on = SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 4, tool_queue: true };
+        let back: SessionQuery = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(matches!(back, SessionQuery::SubagentWatch { tool_queue: true, .. }));
+    }
+
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 19 StreamEvent leaves.
-        assert_eq!(all.len(), 36 + 19);
+        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
+        assert_eq!(all.len(), 36 + 21);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
@@ -1387,7 +1529,7 @@ mod tests {
                     session_id: "s".into(),
                     cmd: SessionCommand::Query {
                         id: 1,
-                        query: SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 0 },
+                        query: SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 0, tool_queue: false },
                     },
                 },
                 "subagent_watch",

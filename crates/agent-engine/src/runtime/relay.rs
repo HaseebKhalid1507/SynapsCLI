@@ -562,6 +562,60 @@ mod tests {
         );
     }
 
+    /// The scheduler's queue signals are semantic too: under a flood they
+    /// are never dropped, never coalesced into a neighbouring delta, and
+    /// keep their place — a queued call's output never overtakes its
+    /// `started`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(stream_relay)]
+    async fn queue_signals_survive_flood_in_order() {
+        let (tx, rx_in) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let mut rx_out = spawn_bounded_stream_relay(rx_in, cancel);
+        let delta = |id: &str| {
+            StreamEvent::Llm(LlmEvent::ToolResultDelta {
+                tool_id: id.into(),
+                delta: "y".repeat(CHUNK),
+            })
+        };
+        tx.send(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_q".into() }))
+            .unwrap();
+        for _ in 0..2_000 {
+            tx.send(delta("toolu_first")).unwrap();
+        }
+        tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "toolu_first".into(),
+            result: "ok".into(),
+        }))
+        .unwrap();
+        tx.send(StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "toolu_q".into() }))
+            .unwrap();
+        for _ in 0..2_000 {
+            tx.send(delta("toolu_q")).unwrap();
+        }
+        drop(tx);
+
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(event) = rx_out.recv().await {
+            let tag = match &event {
+                StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => format!("queued:{tool_id}"),
+                StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => format!("started:{tool_id}"),
+                StreamEvent::Llm(LlmEvent::ToolResult { tool_id, .. }) => format!("result:{tool_id}"),
+                StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id, .. }) => format!("delta:{tool_id}"),
+                _ => continue,
+            };
+            if seen.last() != Some(&tag) {
+                seen.push(tag);
+            }
+        }
+        // Runs of deltas collapse to one tag; some may be dropped, never moved.
+        seen.retain(|t| !t.starts_with("delta:toolu_first"));
+        assert_eq!(
+            seen,
+            vec!["queued:toolu_q", "result:toolu_first", "started:toolu_q", "delta:toolu_q"],
+        );
+    }
+
     /// Dropping the caller stream cancels the turn token (releasing the
     /// producing provider tasks) and terminates the relay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

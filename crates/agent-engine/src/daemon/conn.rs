@@ -434,6 +434,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             return;
         }
     };
+    let snapshot = replay_for(hello.client.capabilities, snapshot);
     if tx.send(DaemonFrame::Attached(AttachedWire::new(client, snapshot))).await.is_err() {
         let _ = handle.send(SessionCommand::Detach { client }).await;
         return;
@@ -460,14 +461,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // Phase 4 §2.3: Digest clients never receive the per-round full history;
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
-    let skip = move |env: &Envelope| -> bool {
-        matches!(env.event, SessionEventWire::Attached { .. })
-            || (history == HistoryMode::Digest
-                && matches!(
-                    env.event,
-                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
-                ))
-    };
+    let caps = hello.client.capabilities;
+    let skip = move |env: &Envelope| -> bool { !forwarded(history, caps, env) };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -656,6 +651,29 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
 }
 
+/// Whether the pump forwards `env` to this connection's client. Never the
+/// actor's `Attached` (the conn sends its own). Digest clients never get the
+/// per-round full history; the `Conversation` digest the actor emits right
+/// after is what they key on (phase 4 §2.3). And never an event the client
+/// cannot decode ([`client_decodes`]: an older client fails the whole frame).
+fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> bool {
+    !(matches!(env.event, SessionEventWire::Attached { .. })
+        || (history == HistoryMode::Digest
+            && matches!(
+                env.event,
+                SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+            ))
+        || !client_decodes(caps, &env.event))
+}
+
+/// The attach snapshot as this client may receive it: its turn replay
+/// without events it cannot decode — one would sink the whole `Attached`
+/// frame, and with it every reconnect.
+fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
+    snapshot.replay.retain(|env| client_decodes(caps, &env.event));
+    snapshot
+}
+
 fn reload_bye(state: &DaemonState) -> ByeReason {
     ByeReason::Reloading {
         generation: state.reload_generation.load(Ordering::SeqCst),
@@ -689,6 +707,65 @@ mod tests {
         assert!(client_may_send(&reload, own).is_err());
         let host = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
         assert!(client_may_send(&host, own).is_ok());
+    }
+
+    fn stream_env(ev: StreamEvent) -> Envelope {
+        Envelope {
+            session_id: SessionId::from("s"),
+            seq: 1,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::Stream(ev),
+        }
+    }
+
+    /// An older client (no `tool_queue` capability) is never sent the queue
+    /// signals — live or in the attach replay — and still gets every other
+    /// event; a current client gets them all.
+    #[test]
+    fn queue_signals_are_only_forwarded_to_clients_that_opted_in() {
+        use crate::LlmEvent;
+        let queued = stream_env(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "t2".into() }));
+        let started = stream_env(StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "t2".into() }));
+        let result = stream_env(StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "t1".into(),
+            result: "ok".into(),
+        }));
+        let old = ClientCapabilities::default();
+        let new = ClientCapabilities::current();
+        for history in [HistoryMode::Full, HistoryMode::Digest] {
+            assert!(!forwarded(history, old, &queued));
+            assert!(!forwarded(history, old, &started));
+            assert!(forwarded(history, old, &result));
+            assert!(forwarded(history, new, &queued));
+            assert!(forwarded(history, new, &started));
+            assert!(forwarded(history, new, &result));
+        }
+
+        let session = crate::session::handle::echo::meta_for(&SessionId::from("s"));
+        let snapshot = AttachSnapshot {
+            meta: session,
+            view: crate::session::handle::echo::view_for(),
+            conversation: Default::default(),
+            streaming: true,
+            replay: vec![queued.clone(), result.clone(), started.clone()],
+            pending_prompts: vec![],
+            clients: vec![],
+            input_owner: None,
+            display_tail: None,
+        };
+        let kinds = |s: &AttachSnapshot| -> Vec<String> {
+            s.replay
+                .iter()
+                .map(|e| match &e.event {
+                    SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. })) => "queued",
+                    SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolStarted { .. })) => "started",
+                    _ => "other",
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(kinds(&replay_for(old, snapshot.clone())), vec!["other"]);
+        assert_eq!(kinds(&replay_for(new, snapshot)), vec!["queued", "other", "started"]);
     }
 
     /// The drain gate refuses work that would start after the record, and

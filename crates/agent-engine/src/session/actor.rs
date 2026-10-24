@@ -4368,7 +4368,7 @@ impl SessionActor {
                         .collect(),
                 )
             }
-            SessionQuery::SubagentWatch { handle_id, since } => {
+            SessionQuery::SubagentWatch { handle_id, since, tool_queue: _tool_queue } => {
                 let mut registry = self
                     .runtime
                     .subagent_registry()

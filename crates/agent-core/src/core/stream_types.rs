@@ -52,6 +52,19 @@ pub enum LlmEvent {
         tool_id: String,
         delta: String,
     },
+    /// The call `tool_id` is waiting behind another call in its scheduler
+    /// lane (serial / same-key lane) and has NOT started executing.
+    /// Opt-in: only calls that actually wait get it, always before their
+    /// [`LlmEvent::ToolStarted`]. A consumer that ignores both keeps the
+    /// old behaviour (every call "runs" from its `ToolUse`).
+    ToolQueued {
+        tool_id: String,
+    },
+    /// A call previously announced by [`LlmEvent::ToolQueued`] has begun
+    /// executing. Never sent for a call that was not queued.
+    ToolStarted {
+        tool_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -139,6 +139,10 @@ pub(super) fn apply_transcript_event(
             store.reset_response_preview(start, last);
             return Applied::RolledBack;
         }
+        // RED placeholder (replaced by the fix).
+        StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. }) => {
+            return Applied::Ignored
+        }
         StreamEvent::Session(SessionEvent::Usage { .. })
         | StreamEvent::Session(SessionEvent::MessageHistory(_))
         | StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. })

@@ -506,6 +506,8 @@ fn poll_query(app: &mut App, now: Instant) -> Option<(String, SessionQuery)> {
         SessionQuery::SubagentWatch {
             handle_id: id,
             since: w.next_seq,
+            // This build renders queued tool cards; an older daemon ignores it.
+            tool_queue: true,
         },
     ))
 }
@@ -975,7 +977,7 @@ mod tests {
         assert!(due > Instant::now() && due <= Instant::now() + POLL_INTERVAL);
         let (_, q) = poll_query(&mut app, Instant::now()).unwrap();
         assert!(
-            matches!(&q, SessionQuery::SubagentWatch { handle_id, since: 3 } if handle_id == "sa_7"),
+            matches!(&q, SessionQuery::SubagentWatch { handle_id, since: 3, tool_queue: true } if handle_id == "sa_7"),
             "{q:?}"
         );
     }

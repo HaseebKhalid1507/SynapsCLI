@@ -398,6 +398,35 @@ pub struct ClientMeta {
     /// Display items in `Attached.display_tail` / `DisplayTail` queries (phase 4).
     #[serde(default = "default_tail_items")]
     pub tail_items: usize,
+    /// Additive stream events this client can decode. Absent from older
+    /// clients (all `false`), so a newer daemon never sends them one; an
+    /// older daemon ignores the unknown field.
+    #[serde(default, skip_serializing_if = "ClientCapabilities::is_none")]
+    pub capabilities: ClientCapabilities,
+}
+
+/// Opt-in stream signals (see [`ClientMeta::capabilities`]). The daemon's
+/// event enums nested under `Stream` (`WireLlmEvent`, ...) have no
+/// `#[serde(other)]`: an older client fails the whole frame on an unknown
+/// variant — and a failed frame reads as a dead socket (the TUI drops into
+/// reconnect, whose `Attached` replay would carry the same variant). So
+/// every new nested variant is sent only to a client that declares it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+    /// `LlmEvent::ToolQueued` / `ToolStarted` (scheduler lane waits).
+    #[serde(default)]
+    pub tool_queue: bool,
+}
+
+impl ClientCapabilities {
+    /// What this build decodes.
+    pub fn current() -> Self {
+        Self { tool_queue: true }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Default for `ClientMeta.tail_items`: matches the TUI's resumed-display cap.
@@ -425,6 +454,7 @@ impl ClientMeta {
             instance: uuid::Uuid::new_v4().to_string(),
             history: HistoryMode::default(),
             tail_items: tail_items_from_env(),
+            capabilities: ClientCapabilities::current(),
         }
     }
 }
@@ -943,8 +973,16 @@ pub enum SessionQuery {
     DisplayTail { items: usize },
     /// `runtime::subagent_watch::WatchPage`: one of this session's workers,
     /// its journal from `since` (the previous page's `next_seq`; 0 = all).
-    /// Unknown handle → `{"error": ..}`.
-    SubagentWatch { handle_id: String, since: u64 },
+    /// Unknown handle → `{"error": ..}`. `tool_queue`: include
+    /// `WatchEvent::ToolQueued`/`ToolStarted` entries (an older client
+    /// omits it and would fail to decode a page that had them; an older
+    /// daemon ignores it and never records them).
+    SubagentWatch {
+        handle_id: String,
+        since: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tool_queue: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1520,7 +1558,7 @@ mod tests {
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
             SessionCommand::Query {
                 id: 4,
-                query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 7 },
+                query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 7, tool_queue: true },
             },
             SessionCommand::SubagentSteer { handle_id: "sa_2".into(), text: "focus on X".into() },
             SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
