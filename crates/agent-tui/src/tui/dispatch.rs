@@ -1180,35 +1180,19 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::StreamingInput(input) => {
-            // Check for streaming slash commands
-            if let Some(rest) = input.strip_prefix('/') {
-                let raw_cmd = rest.split_whitespace().next().unwrap_or("");
-                let streaming_cmds = commands::to_owned_commands(commands::STREAMING_COMMANDS);
-                let cmd = commands::resolve_prefix(raw_cmd, &streaming_cmds);
-                match commands::handle_streaming_command(&cmd, &input, app) {
+            match commands::resolve_streaming_input(&input, app, registry) {
+                commands::StreamingSlash::Refused => {}
+                commands::StreamingSlash::Steer => {
+                    // Normal or unknown slash text during streaming —
+                    // steer/queue ("→ steering:" / "queued:" on `Steered`).
+                    let _ = link
+                        .send(agent_engine::session::SessionCommand::Steer { text: input })
+                        .await;
+                }
+                commands::StreamingSlash::Ran(action) => match action {
                     // A streaming command that finished in place (/theme,
                     // /attachments, /detach): nothing more to do.
-                    CommandAction::None if commands::is_streaming_command(&cmd) => {}
-                    CommandAction::None => {
-                        // Not a streaming-safe command. If it's still a KNOWN
-                        // command (settings, model, system, etc.), refuse with
-                        // a clear message — don't leak command text into the
-                        // model stream as steering input.
-                        let all_cmds = commands::all_commands_with_skills(registry);
-                        let resolved_full = commands::resolve_prefix(raw_cmd, &all_cmds);
-                        if all_cmds.iter().any(|c| c == &resolved_full) {
-                            app.push_msg(ChatMessage::System(format!(
-                                "/{} can't run while streaming — press Esc to cancel first",
-                                resolved_full
-                            )));
-                        } else {
-                            // Unknown slash text — treat as steering
-                            // ("→ steering:" / "queued:" on `Steered`).
-                            let _ = link
-                                .send(agent_engine::session::SessionCommand::Steer { text: input })
-                                .await;
-                        }
-                    }
+                    CommandAction::None => {}
                     CommandAction::Quit => {
                         // F27: same guard as Ctrl+C.
                         if is_socket && app.streaming {
@@ -1266,13 +1250,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::Ping => {}
                     CommandAction::SidecarToggle { .. } => {}
                     CommandAction::SidecarStatus { .. } => {}
-                }
-            } else {
-                // Normal text during streaming — steer/queue
-                // ("→ steering:" / "queued:" on `Steered`).
-                let _ = link
-                    .send(agent_engine::session::SessionCommand::Steer { text: input })
-                    .await;
+                },
             }
         }
         InputAction::ModelsApply(model) => {
