@@ -149,6 +149,8 @@ impl Drop for TestHarness {
     fn drop(&mut self) {
         // `set_build_id` is per harness, not per thread.
         super::header::set_build_id_for_thread(None);
+        // Same for the injected terminal default bg.
+        super::theme::set_terminal_default_bg_for_thread(None);
     }
 }
 
@@ -255,6 +257,14 @@ impl TestHarness {
     }
 
     // ── Render / assertion surface ───────────────────────────────────────────
+
+    /// Pretend the terminal answered OSC 11 with `bg` (or, with `None`, that
+    /// it never answered). Per thread, like [`TestHarness::set_build_id`], so
+    /// the process-global detected bg is never written by tests.
+    pub fn set_terminal_bg(&mut self, bg: Option<(u8, u8, u8)>) -> &mut Self {
+        super::theme::set_terminal_default_bg_for_thread(Some(bg));
+        self
+    }
 
     /// Advance to steady state and render one frame into the [`TestBackend`].
     ///
