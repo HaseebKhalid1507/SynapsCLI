@@ -363,8 +363,7 @@ pub async fn resolve_before_tool_call_result_for_call(
                     } else {
                         Vec::new()
                     },
-                    // RED stub: the call's id is not carried yet.
-                    tool_id: tool_call_id.and(None::<String>),
+                    tool_id: tool_call_id.map(str::to_string),
                 }
             });
             let response = prompt
@@ -4403,22 +4402,26 @@ impl Runtime {
                                         Some(tool_id),
                                         self.cwd.as_deref(),
                                     );
-                                let decision = resolve_before_tool_call_decision(
+                                let (hook_result, mut call_events) = emit_before_tool_call_recorded(
+                                    &self.hook_bus,
+                                    tool_name,
+                                    Some(&runtime_name),
                                     input.clone(),
-                                    emit_before_tool_call_with(
-                                        &self.hook_bus,
-                                        tool_name,
-                                        Some(&runtime_name),
-                                        input.clone(),
-                                        &hook_call,
-                                    )
-                                    .await,
+                                    &hook_call,
+                                    self.tool_call_owner.as_ref(),
+                                )
+                                .await;
+                                let decision = resolve_before_tool_call_decision_for(
+                                    &hook_call,
+                                    input.clone(),
+                                    hook_result,
                                     None,
                                     false,
                                     Some(&self.session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
+                                    call_events.finish(tool_call_events::ToolCallStatus::Blocked);
                                     (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
@@ -4426,7 +4429,13 @@ impl Runtime {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
-                                    let (output, rich_blocks) = match tool.execute_rich(input, ctx).await {
+                                    let executed = tool.execute_rich(input, ctx).await;
+                                    call_events.finish(if executed.is_ok() {
+                                        tool_call_events::ToolCallStatus::Ok
+                                    } else {
+                                        tool_call_events::ToolCallStatus::Error
+                                    });
+                                    let (output, rich_blocks) = match executed {
                                         Ok(output) => validated_single_tool_output(&self.model, output),
                                         Err(e) => (e.to_string(), None),
                                     };
@@ -4506,6 +4515,7 @@ impl Runtime {
                             let attachment_model = self.model.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
+                            let tool_call_owner_inner = self.tool_call_owner.clone();
 
                             join_set.spawn(async move {
                                 let hook_call =
@@ -4516,17 +4526,21 @@ impl Runtime {
                                     );
                                 let result = match tool {
                                     Some(t) => {
-                                        let decision =
-                                            crate::runtime::resolve_before_tool_call_decision(
+                                        let (hook_result, mut call_events) =
+                                            crate::runtime::emit_before_tool_call_recorded(
+                                                &hook_bus_inner,
+                                                &tool_name_for_hook,
+                                                Some(&runtime_name_for_hook),
                                                 input.clone(),
-                                                crate::runtime::emit_before_tool_call_with(
-                                                    &hook_bus_inner,
-                                                    &tool_name_for_hook,
-                                                    Some(&runtime_name_for_hook),
-                                                    input.clone(),
-                                                    &hook_call,
-                                                )
-                                                .await,
+                                                &hook_call,
+                                                tool_call_owner_inner.as_ref(),
+                                            )
+                                            .await;
+                                        let decision =
+                                            crate::runtime::resolve_before_tool_call_decision_for(
+                                                &hook_call,
+                                                input.clone(),
+                                                hook_result,
                                                 None,
                                                 false,
                                                 Some(&session_allow_all_inner),
@@ -4536,6 +4550,7 @@ impl Runtime {
                                             reason,
                                         } = decision
                                         {
+                                            call_events.finish(tool_call_events::ToolCallStatus::Blocked);
                                             (format!("Tool call blocked by extension: {}", reason), None)
                                         } else {
                                             let crate::runtime::BeforeToolCallDecision::Continue {
@@ -4581,8 +4596,14 @@ impl Runtime {
                                                 },
                                             };
                                             let input_for_hook = input.clone();
+                                            let executed = t.execute_rich(input, ctx).await;
+                                            call_events.finish(if executed.is_ok() {
+                                                tool_call_events::ToolCallStatus::Ok
+                                            } else {
+                                                tool_call_events::ToolCallStatus::Error
+                                            });
                                             let (output, rich_blocks) =
-                                                match t.execute_rich(input, ctx).await {
+                                                match executed {
                                                     Ok(output) => validated_single_tool_output(
                                                         &attachment_model,
                                                         output,

@@ -1,9 +1,10 @@
 use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
+use super::tool_call_events::ToolCallStatus;
 use super::{
-    emit_after_tool_call_outcome, emit_before_tool_call_with, resolve_before_tool_call_decision,
-    BeforeToolCallDecision,
+    emit_after_tool_call_outcome, emit_before_tool_call_recorded,
+    resolve_before_tool_call_decision_for, BeforeToolCallDecision,
 };
 use crate::extensions::hooks::events::{HookEvent, HookResult, ToolCallHookContext};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
@@ -1903,22 +1904,26 @@ impl StreamMethods {
                                     Some(tool_id.as_str()),
                                     cwd.as_deref(),
                                 );
-                                let decision = resolve_before_tool_call_decision(
+                                let (hook_result, mut call_events) = emit_before_tool_call_recorded(
+                                    &hook_bus,
+                                    &tool_name,
+                                    Some(&runtime_name),
                                     input.clone(),
-                                    emit_before_tool_call_with(
-                                        &hook_bus,
-                                        &tool_name,
-                                        Some(&runtime_name),
-                                        input.clone(),
-                                        &hook_call,
-                                    )
-                                    .await,
+                                    &hook_call,
+                                    tool_call_owner.as_ref(),
+                                )
+                                .await;
+                                let decision = resolve_before_tool_call_decision_for(
+                                    &hook_call,
+                                    input.clone(),
+                                    hook_result,
                                     secret_prompt.as_ref(),
                                     auto_approve_confirms,
                                     Some(&session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
+                                    call_events.finish(ToolCallStatus::Blocked);
                                     (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
@@ -1932,6 +1937,7 @@ impl StreamMethods {
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
+                                            call_events.finish(if res.is_ok() { ToolCallStatus::Ok } else { ToolCallStatus::Error });
                                             let (output, rich_blocks) = match res {
                                                 Ok(o) => validated_tool_output(&model, o),
                                                 Err(e) => {
@@ -1961,6 +1967,7 @@ impl StreamMethods {
                                             (outcome.output, rich_blocks)
                                         }
                                         (None, started) => {
+                                            call_events.finish(ToolCallStatus::Cancelled);
                                             canceled = true;
                                             // Ledger: this call STARTED but
                                             // never recorded a result. A
@@ -2220,6 +2227,7 @@ impl StreamMethods {
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
                         let delegation_parent_inner = delegation_parent.clone();
+                        let tool_call_owner_inner = tool_call_owner.clone();
                         let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
                         let turn_completion_inner = turn_completion.clone();
@@ -2286,20 +2294,24 @@ impl StreamMethods {
                                         Some(tool_id.as_str()),
                                         cwd_inner.as_deref(),
                                     );
-                                    let decision = resolve_before_tool_call_decision(
+                                    let (hook_result, mut call_events) = emit_before_tool_call_recorded(
+                                        &hook_bus_inner,
+                                        &tool_name_for_hook,
+                                        Some(&runtime_name_for_hook),
                                         input.clone(),
-                                        emit_before_tool_call_with(
-                                            &hook_bus_inner,
-                                            &tool_name_for_hook,
-                                            Some(&runtime_name_for_hook),
-                                            input.clone(),
-                                            &hook_call,
-                                        ).await,
+                                        &hook_call,
+                                        tool_call_owner_inner.as_ref(),
+                                    ).await;
+                                    let decision = resolve_before_tool_call_decision_for(
+                                        &hook_call,
+                                        input.clone(),
+                                        hook_result,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
                                         Some(&session_allow_all_inner),
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
+                                        call_events.finish(ToolCallStatus::Blocked);
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
@@ -2334,6 +2346,7 @@ impl StreamMethods {
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
+                                            call_events.finish(if res.is_ok() { ToolCallStatus::Ok } else { ToolCallStatus::Error });
                                             let (output, rich_blocks, errored) = match res {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
@@ -2356,6 +2369,7 @@ impl StreamMethods {
                                             (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
+                                            call_events.finish(ToolCallStatus::Cancelled);
                                             (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }

@@ -336,8 +336,8 @@ pub enum DaemonFrame {
     /// `ToolCall` frames. Sent only to a connection that asked, so an older
     /// client never sees it (nor `ToolCall`).
     ToolCallsSubscribed {},
-    /// One tool-call record (metadata only: no input, output, path or
-    /// command). `seq` is daemon-wide and increasing within one daemon
+    /// One tool-call record (metadata only: no input, output or command
+    /// text; the one path is `called.cwd`, the call's base directory). `seq` is daemon-wide and increasing within one daemon
     /// image; `dropped` counts records this subscriber missed since its
     /// previous `ToolCall` because it read too slowly.
     ToolCall {

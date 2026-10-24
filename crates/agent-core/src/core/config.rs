@@ -455,6 +455,13 @@ fn parse_daemon_config_key(
         "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
         "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
         "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        "daemon.tool_call_events" => {
+            config.tool_call_events = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
         _ => return Err("unknown daemon key"),
     }
     Ok(())
@@ -1330,6 +1337,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon.idle_exit_secs",
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
+    "daemon.tool_call_events",
     "max_tool_output",
     "bash_timeout",
     "bash_max_timeout",

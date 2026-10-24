@@ -5,9 +5,9 @@
 //!   (after the `before_tool_call` hook chain) and `finished` (after the
 //!   tool ran, was blocked or was cancelled).
 //! - **No content.** A record names the tool, the call's ids, the owning
-//!   session and a fingerprint of the input ([`call_fingerprint`]), never
-//!   the input, the output, a path or a command. Its `Debug` is the same
-//!   metadata.
+//!   session, a fingerprint of the input ([`call_fingerprint`]) and the
+//!   call's base directory (`called.cwd`), never the input, the output or
+//!   command text. Its `Debug` is the same metadata.
 //! - **Opt-in.** The hub is off until the daemon turns it on from
 //!   `daemon.tool_call_events`. Off, or on with nobody subscribed, a call
 //!   builds nothing ([`ToolCallEvents::is_active`] is false).
@@ -34,7 +34,7 @@ pub const TOOL_CALL_HUB_CAPACITY: usize = 4096;
 pub const TOOL_CALL_EVENTS_KEY: &str = "daemon.tool_call_events";
 
 /// One phase of one tool call. Metadata only: never the call's input,
-/// output, paths or command text.
+/// output or command text (the one path is `called.cwd`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// Record version ([`TOOL_CALL_RECORD_VERSION`]).
@@ -149,10 +149,6 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// algorithm and vectors as pria-gate's `call_fingerprint`. It links
 /// records; it is not a secret and not a security boundary.
 pub fn call_fingerprint(tool_name: &str, input: &Value) -> String {
-    // RED stub.
-    if !tool_name.is_empty() || input.is_null() {
-        return String::new();
-    }
     let mut canon = String::with_capacity(128);
     canonical_json(input, &mut canon);
     let mut h = FNV_OFFSET;
@@ -393,8 +389,8 @@ impl ToolCallEvents {
         owner: Option<&ToolCallOwner>,
         input: &Value,
     ) -> Self {
-        // RED stub: nothing is recorded yet.
-        if hub.is_active() || !hub.is_active() {
+        // Off, or nobody subscribed: build nothing, hash nothing.
+        if !hub.is_active() {
             return Self::inactive();
         }
         let (session_id, handle_id) = match owner {

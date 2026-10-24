@@ -360,6 +360,10 @@ define_settings! {
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
         };
 
+    "daemon.tool_call_events", "Tool-call events", Daemon, EditorKind::Cycler(&["on", "off"]),
+        "Let a client on the daemon socket subscribe to a content-free record of every tool call (no input or output). Off by default. Takes effect at the next daemon start or reload.",
+        |_app, value| on_off("daemon.tool_call_events", value);
+
     // ── Context & cache ──────────────────────────────────────────────────
     // Config-only rows below validate through the real config parser
     // (`config_edit`), so /settings can never write a value `load_config`

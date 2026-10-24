@@ -310,9 +310,22 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::AuthState(query))) => {
                 let _ = tx.send(auth_state_reply(&state, &query)).await;
             }
-            // RED stub: the subscription is not served yet.
+            // Tool-call events: this connection becomes a subscription
+            // until it ends. Refused (connection kept) while the key is off.
             Ok(Read::Frame(ClientFrame::ToolCalls {})) => {
-                let _ = tx.send(DaemonFrame::Error { session_id: None, message: "tool_calls: not implemented".into() }).await;
+                let hub = state.host.parts().hook_bus.tool_call_hub();
+                let Some(sub) = hub.subscribe() else {
+                    let _ = tx
+                        .send(DaemonFrame::Error { session_id: None, message: TOOL_CALLS_OFF.into() })
+                        .await;
+                    continue;
+                };
+                if tx.send(DaemonFrame::ToolCallsSubscribed {}).await.is_err() {
+                    return;
+                }
+                serve_tool_calls(&state, sub, &mut reader, &mut line, tx, &shutdown).await;
+                let _ = writer.await;
+                return;
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
@@ -678,6 +691,70 @@ fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> 
 fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
     snapshot.replay.retain(|env| client_decodes(caps, &env.event));
     snapshot
+}
+
+/// The refusal of a `ToolCalls` subscribe while the events are off.
+const TOOL_CALLS_OFF: &str =
+    "tool_calls: tool-call events are off (set daemon.tool_call_events = on in the config, then restart or reload the daemon)";
+
+/// A `ToolCalls` subscription: forward every record to this connection
+/// until it says `Bye` or closes, the daemon stops (`Bye`) or reloads
+/// (`Bye{Reloading}`: the client subscribes again on the new image). The
+/// connection still answers `Ping`; any other frame is an `Error`. Records
+/// travel through the writer's bounded queue, so a slow client only lags
+/// its own broadcast receiver (reported as `dropped`), never a tool call.
+async fn serve_tool_calls(
+    state: &DaemonState,
+    mut sub: crate::runtime::tool_call_events::ToolCallSubscription,
+    reader: &mut Reader,
+    line: &mut String,
+    tx: mpsc::Sender<DaemonFrame>,
+    shutdown: &CancellationToken,
+) {
+    let fwd_tx = tx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(d) = sub.next().await {
+            let frame = DaemonFrame::ToolCall { seq: d.seq, dropped: d.dropped, record: (*d.record).clone() };
+            if fwd_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let announce = state.announce();
+    loop {
+        let frame = tokio::select! {
+            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; break; }
+            _ = announce.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(state)) }).await; break; }
+            r = read_frame(reader, line) => r,
+        };
+        match frame {
+            Ok(Read::Frame(ClientFrame::Ping)) => {
+                let _ = tx
+                    .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
+                    .await;
+            }
+            Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+                break;
+            }
+            Ok(Read::Oversize) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: None, message: frame_limit_msg() }).await;
+                break;
+            }
+            Ok(Read::Frame(_)) => {
+                let _ = tx
+                    .send(DaemonFrame::Error { session_id: None, message: "subscribed to tool calls: only ping and bye are accepted".into() })
+                    .await;
+            }
+            Ok(Read::Bad(e)) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("malformed frame: {e}") }).await;
+            }
+        }
+    }
+    // The writer ends after the Bye (or once every sender is gone).
+    forwarder.abort();
+    let _ = forwarder.await;
+    drop(tx);
 }
 
 fn reload_bye(state: &DaemonState) -> ByeReason {

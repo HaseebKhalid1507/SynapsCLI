@@ -263,16 +263,20 @@ pub async fn execute_provider_tool_use(
         Some(tool_id.as_str()),
         ctx.capabilities.cwd.as_deref(),
     );
-    let decision = crate::runtime::resolve_before_tool_call_decision(
+    // Tool-call events: no owner here (no conversation, no worker handle).
+    let (hook_result, mut call_events) = crate::runtime::emit_before_tool_call_recorded(
+        hook_bus,
+        &tool_name,
+        Some(&runtime_name),
         input.clone(),
-        crate::runtime::emit_before_tool_call_with(
-            hook_bus,
-            &tool_name,
-            Some(&runtime_name),
-            input.clone(),
-            &hook_call,
-        )
-        .await,
+        &hook_call,
+        None,
+    )
+    .await;
+    let decision = crate::runtime::resolve_before_tool_call_decision_for(
+        &hook_call,
+        input.clone(),
+        hook_result,
         ctx.capabilities.secret_prompt.as_ref(),
         false,
         // The session's latch, so "Allow all" here arms (and honours) the
@@ -285,6 +289,7 @@ pub async fn execute_provider_tool_use(
         let crate::runtime::BeforeToolCallDecision::Block { reason } = decision else {
             unreachable!()
         };
+        call_events.finish(crate::runtime::tool_call_events::ToolCallStatus::Blocked);
         return serde_json::json!({
             "type": "tool_result",
             "tool_use_id": tool_id,
@@ -298,6 +303,11 @@ pub async fn execute_provider_tool_use(
         Ok(output) => (output, false),
         Err(error) => (format!("Tool execution failed: {}", error), true),
     };
+    call_events.finish(if is_error {
+        crate::runtime::tool_call_events::ToolCallStatus::Error
+    } else {
+        crate::runtime::tool_call_events::ToolCallStatus::Ok
+    });
     let result = crate::runtime::emit_after_tool_call_with(
         hook_bus,
         &tool_name,
