@@ -124,6 +124,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Tool cards in a subagent view tick and get their footer** (#287). In a
+  worker's view (Ctrl+↑) a running tool card's clock stayed at `░ 0ms`, and
+  a finished card's duration was the time between two polls of the view
+  (or `0ms` when the view opened after the tool ended). The animation tick
+  now drives the focused view, not just the main thread, and the watch
+  journal stamps each event with when it happened (optional `at_ms` /
+  `now_ms` page fields; an older daemon's pages still work, timed by
+  arrival). A view opened mid-tool shows the tool's real age. A tool that
+  prints nothing (`sleep 40`) now ends with `└─ ok (no output) Ns` instead of
+  no footer, in the main thread too. A steer replayed late keeps the time
+  the worker took it.
 - **Watcher agent session limits bind inside a turn.** The agent's
   `max_session_cost_usd`, `max_session_tokens`, `max_session_duration_mins`,
   `max_tool_calls` and `max_daily_cost_usd` were only checked between

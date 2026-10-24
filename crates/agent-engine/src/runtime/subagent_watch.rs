@@ -16,6 +16,15 @@
 //! - past [`JOURNAL_MAX_BYTES`] the oldest entries drop and readers asking
 //!   for them get `truncated: true`.
 //!
+//! Every entry is stamped with when it was recorded (ms on the journal's own
+//! monotonic clock), and each page says what that clock read when it was
+//! taken (`at_ms`, `now_ms`). A client only applies a page when it polls —
+//! only while the view is focused, and the first page is the whole run so
+//! far — so its own arrival times say nothing about when a worker's tool
+//! started or how long it ran. With the stamps it can place each event in
+//! its own clock and show the same running clock and `└─ ok … Ns` duration
+//! the main thread shows.
+//!
 //! Raw provider error text never enters the journal (same rule as
 //! [`SubagentState::safe_fail`]): errors carry only their category label,
 //! and retry notices are not recorded.
@@ -24,6 +33,7 @@
 //! [`SubagentState::safe_fail`]: super::subagent::SubagentState::safe_fail
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -232,15 +242,30 @@ fn cap_input(input: &Value) -> Value {
 }
 
 /// Bounded, append-only record of a worker's presentation events.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WatchJournal {
-    /// `(seq, event)`, oldest first; `seq` is contiguous.
-    entries: VecDeque<(u64, WatchEvent)>,
+    /// `(seq, at_ms, event)`, oldest first; `seq` is contiguous; `at_ms` is
+    /// when the entry was recorded, on the [`Self::epoch`] clock.
+    entries: VecDeque<(u64, u64, WatchEvent)>,
+    /// The journal's clock origin (`at_ms` / `now_ms` count from here).
+    epoch: Instant,
     /// `seq` the next new entry gets.
     next_seq: u64,
     /// Entries with `seq < sealed` were returned to a reader: never mutated.
     sealed: u64,
     bytes: usize,
+}
+
+impl Default for WatchJournal {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            epoch: Instant::now(),
+            next_seq: 0,
+            sealed: 0,
+            bytes: 0,
+        }
+    }
 }
 
 /// One page of a worker's journal (`SessionQuery::SubagentWatch` reply).
@@ -263,6 +288,15 @@ pub struct WatchPage {
     /// More entries are ready right now (this page hit its byte budget).
     pub more: bool,
     pub events: Vec<WatchEvent>,
+    /// When each of `events` was recorded (same length), in ms on the
+    /// journal's clock. A coalesced delta entry carries its first part's
+    /// time. Empty from older peers: clients then time events by arrival.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub at_ms: Vec<u64>,
+    /// The journal's clock when this page was read, so a client can turn
+    /// `at_ms` into "this long ago". Absent from older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_ms: Option<u64>,
 }
 
 impl WatchJournal {
@@ -274,7 +308,17 @@ impl WatchJournal {
     }
 
     pub fn push(&mut self, ev: WatchEvent) {
-        if let Some((seq, last)) = self.entries.back_mut() {
+        let at_ms = self.clock_ms();
+        self.push_at(ev, at_ms);
+    }
+
+    /// Milliseconds since the journal was created.
+    fn clock_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn push_at(&mut self, ev: WatchEvent, at_ms: u64) {
+        if let Some((seq, _, last)) = self.entries.back_mut() {
             if *seq >= self.sealed {
                 if let Some(added) = last.absorb(&ev) {
                     self.bytes += added;
@@ -284,14 +328,14 @@ impl WatchJournal {
             }
         }
         self.bytes += ev.size();
-        self.entries.push_back((self.next_seq, ev));
+        self.entries.push_back((self.next_seq, at_ms, ev));
         self.next_seq += 1;
         self.trim();
     }
 
     fn trim(&mut self) {
         while self.bytes > JOURNAL_MAX_BYTES && self.entries.len() > 1 {
-            if let Some((_, ev)) = self.entries.pop_front() {
+            if let Some((_, _, ev)) = self.entries.pop_front() {
                 self.bytes = self.bytes.saturating_sub(ev.size());
             }
         }
@@ -301,16 +345,21 @@ impl WatchJournal {
     /// one). Seals everything returned so later appends start new entries.
     /// Fills the journal fields of a [`WatchPage`]; the caller adds identity.
     pub fn read(&mut self, since: u64) -> WatchPage {
-        let first = self.entries.front().map_or(self.next_seq, |(s, _)| *s);
+        self.read_at(since, self.clock_ms())
+    }
+
+    fn read_at(&mut self, since: u64, now_ms: u64) -> WatchPage {
+        let first = self.entries.front().map_or(self.next_seq, |(s, _, _)| *s);
         let truncated = since < first;
         let mut page = WatchPage {
             truncated,
             // A cursor past the end (stale client) restarts at the end.
             next_seq: since.clamp(first, self.next_seq),
+            now_ms: Some(now_ms),
             ..WatchPage::default()
         };
         let mut budget = 0usize;
-        for (seq, ev) in self.entries.iter().filter(|(s, _)| *s >= since) {
+        for (seq, at_ms, ev) in self.entries.iter().filter(|(s, _, _)| *s >= since) {
             let size = ev.size();
             if !page.events.is_empty() && budget + size > PAGE_MAX_BYTES {
                 page.more = true;
@@ -318,6 +367,7 @@ impl WatchJournal {
             }
             budget += size;
             page.events.push(ev.clone());
+            page.at_ms.push(*at_ms);
             page.next_seq = seq + 1;
         }
         self.sealed = self.sealed.max(page.next_seq);
@@ -529,5 +579,77 @@ mod tests {
         let page: WatchPage = serde_json::from_str(old).expect("old page");
         assert_eq!(page.model, "", "older peers send no model");
         assert_eq!(page.agent_name, "scout");
+        assert!(page.at_ms.is_empty() && page.now_ms.is_none(), "nor timing");
+    }
+
+    /// #287: each event carries when it was recorded and the page says what
+    /// the journal's clock read, so a client can tell how long a worker's
+    /// tool has run — it only sees the events when it polls.
+    #[test]
+    fn pages_say_when_each_entry_was_recorded() {
+        let mut j = WatchJournal::default();
+        j.push_at(
+            WatchEvent::ToolUseStart {
+                tool_id: "t".into(),
+                tool_name: "bash".into(),
+            },
+            1_000,
+        );
+        j.push_at(text("a"), 2_000);
+        j.push_at(text("b"), 3_000); // coalesces: keeps the first part's time
+        j.push_at(
+            WatchEvent::ToolResult {
+                tool_id: "t".into(),
+                result: String::new(),
+            },
+            41_000,
+        );
+        let page = j.read_at(0, 41_250);
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.at_ms, vec![1_000, 2_000, 41_000]);
+        assert_eq!(page.now_ms, Some(41_250));
+
+        let later = j.read_at(page.next_seq, 50_000);
+        assert!(later.events.is_empty() && later.at_ms.is_empty());
+        assert_eq!(
+            later.now_ms,
+            Some(50_000),
+            "an empty page still says the time"
+        );
+    }
+
+    #[test]
+    fn the_live_clock_stamps_entries_in_order() {
+        let mut j = WatchJournal::default();
+        j.push(text("a"));
+        let _ = j.read(0); // seal, so the next push is its own entry
+        j.push(WatchEvent::Done);
+        let page = j.read(0);
+        assert_eq!(page.at_ms.len(), page.events.len());
+        assert!(page.at_ms[0] <= page.at_ms[1]);
+        assert!(page.at_ms[1] <= page.now_ms.unwrap());
+    }
+
+    /// A page from this build still reads in a client that predates the
+    /// timing fields (they are extra keys, which serde ignores), and pages
+    /// without them omit the keys entirely.
+    #[test]
+    fn timing_fields_are_optional_on_the_wire() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldPage {
+            handle_id: String,
+            next_seq: u64,
+            events: Vec<WatchEvent>,
+        }
+        let mut j = WatchJournal::default();
+        j.push(WatchEvent::Done);
+        let json = serde_json::to_value(j.read(0)).unwrap();
+        assert!(json.get("at_ms").is_some() && json.get("now_ms").is_some());
+        let old: OldPage = serde_json::from_value(json).expect("old client reads it");
+        assert_eq!(old.events, vec![WatchEvent::Done]);
+
+        let bare = serde_json::to_value(WatchPage::default()).unwrap();
+        assert!(bare.get("at_ms").is_none() && bare.get("now_ms").is_none());
     }
 }

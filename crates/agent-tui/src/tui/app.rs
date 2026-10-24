@@ -729,7 +729,9 @@ impl App {
         self.invalidate();
     }
 
-    /// Mark only the tail message dirty. O(1) during streaming.
+    /// Mark only the main transcript's tail message dirty. O(1). The run
+    /// loop's animation tick uses [`Self::tick_message_animations`].
+    #[cfg(test)]
     pub(crate) fn invalidate_last(&mut self) {
         self.transcript.invalidate_last();
         self.needs_redraw = true;
@@ -796,7 +798,9 @@ impl App {
     /// Advance spinner/animation state.
     ///
     /// Returns true only when text generated from `render_lines` may have changed
-    /// and the cached message lines must be rebuilt. Full-screen overlays and
+    /// and the cached message lines must be rebuilt — for the FOCUSED thread's
+    /// transcript, the one on screen (a watched subagent's running tool card
+    /// animates and counts just like main's, #287). Full-screen overlays and
     /// header/panel spinners are redrawn from current state without touching the
     /// message cache, avoiding unnecessary whole-terminal clears on every frame.
     pub(crate) fn advance_animations(&mut self) -> bool {
@@ -805,19 +809,20 @@ impl App {
             return false;
         }
 
-        self.transcript.uses_spinner()
+        super::threads::active(&self.transcript, &self.threads).uses_spinner()
     }
 
     /// One animation frame for the message area: advance the spinner and,
     /// when an animated line (spinner, running tool clock) may have changed,
-    /// dirty the tail so the next frame re-renders it. The run loop's tick
-    /// arm calls this once per tick.
+    /// dirty the tail of the focused thread's transcript so the next frame
+    /// re-renders it. The run loop's tick arm calls this once per tick.
     pub(crate) fn tick_message_animations(&mut self) {
         if self.advance_animations() {
             // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
             // active tool animation). Mark just the last slot dirty instead of
             // full invalidation — O(1) instead of O(n) per frame.
-            self.invalidate_last();
+            super::threads::active_mut(&mut self.transcript, &mut self.threads).invalidate_last();
+            self.needs_redraw = true;
         }
     }
 

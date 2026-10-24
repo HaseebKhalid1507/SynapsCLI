@@ -42,6 +42,7 @@ fn page(
         truncated: false,
         more: false,
         events,
+        ..WatchPage::default()
     }
 }
 
@@ -492,7 +493,6 @@ fn the_footer_names_slash_watch_when_there_are_workers() {
     let footer = frame.lines().last().unwrap_or("");
     assert!(footer.contains("/watch list"), "{footer:?}");
 }
-
 // ── #287: tool cards in a worker view tick and get their footer ─────────────
 
 /// Answer the poll with `p` plus the journal timing a current daemon sends:
@@ -544,7 +544,10 @@ fn a_running_tool_card_in_a_worker_view_keeps_counting() {
     let mut h = TestHarness::boot_with_size(120, 30);
     start(&mut h, 4, "sleeper");
     ctrl(&mut h, KeyCode::Up);
-    answer_poll(&mut h, page("sa_4", "sleeper", "running", bash_call("t1", "sleep 40"), 3));
+    answer_poll(
+        &mut h,
+        page("sa_4", "sleeper", "running", bash_call("t1", "sleep 40"), 3),
+    );
     let first = card_header(&h.snapshot(), "sleep 40");
     assert!(first.contains("0ms"), "just started: {first:?}");
 
@@ -591,7 +594,9 @@ fn a_finished_tool_card_in_a_worker_view_gets_its_footer_and_duration() {
         tool_id: "t1".into(),
         result: "agent-engine\nagent-tui".into(),
     });
-    events.push(WatchEvent::Text { text: "done".into() });
+    events.push(WatchEvent::Text {
+        text: "done".into(),
+    });
     let p = page("sa_6", "lister", "running", events, 5);
     answer_poll_timed(&mut h, p, &[1_000, 1_000, 1_200, 41_000, 41_500], 41_600);
     let frame = h.snapshot();
@@ -610,7 +615,10 @@ fn a_finished_tool_with_no_output_still_gets_its_footer() {
     let mut h = TestHarness::boot_with_size(120, 30);
     start(&mut h, 7, "sleeper");
     ctrl(&mut h, KeyCode::Up);
-    answer_poll(&mut h, page("sa_7", "sleeper", "running", bash_call("t1", "sleep 40"), 3));
+    answer_poll(
+        &mut h,
+        page("sa_7", "sleeper", "running", bash_call("t1", "sleep 40"), 3),
+    );
     h.advance_clock_ms(40_000);
     h.tick_animations(3);
     let result = vec![
@@ -618,7 +626,9 @@ fn a_finished_tool_with_no_output_still_gets_its_footer() {
             tool_id: "t1".into(),
             result: String::new(),
         },
-        WatchEvent::Text { text: "done".into() },
+        WatchEvent::Text {
+            text: "done".into(),
+        },
     ];
     answer_poll(&mut h, page("sa_7", "sleeper", "running", result, 5));
     let frame = h.snapshot();
@@ -628,5 +638,62 @@ fn a_finished_tool_with_no_output_still_gets_its_footer() {
         .unwrap_or_else(|| panic!("no ok footer:\n{frame}"));
     assert!(footer.contains("ok (no output) 40.0s"), "{footer:?}");
     let header = card_header(&frame, "sleep 40");
-    assert!(!header.contains("ms") && !header.contains("s "), "done: no clock on the header: {header:?}");
+    assert!(
+        !header.contains("ms") && !header.contains("s "),
+        "done: no clock on the header: {header:?}"
+    );
+}
+
+/// #287 parity: the same card in the main thread — the behaviour a worker
+/// view now matches (clock ticks, footer with its duration once done).
+#[test]
+fn the_same_card_in_the_main_thread_ticks_and_gets_its_footer() {
+    use agent_engine::LlmEvent;
+    let mut h = TestHarness::boot_with_size(120, 30);
+    h.set_streaming(true);
+    for ev in bash_call("m1", "sleep 40") {
+        h.feed_event(SessionEventWire::Stream(ev.to_stream().unwrap()));
+    }
+    h.advance_clock_ms(3_000);
+    h.tick_animations(3);
+    let header = card_header(&h.snapshot(), "sleep 40");
+    assert!(header.contains("3.0s"), "{header:?}");
+
+    h.advance_clock_ms(37_000);
+    h.feed_event(SessionEventWire::Stream(StreamEvent::Llm(
+        LlmEvent::ToolResult {
+            tool_id: "m1".into(),
+            result: String::new(),
+        },
+    )));
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("\u{2514}\u{2500} ok (no output) 40.0s"),
+        "{frame}"
+    );
+}
+
+/// A worker view's tick never dirties the hidden main transcript, and an
+/// unfocused worker view's card is left alone until it is looked at.
+#[test]
+fn only_the_focused_views_running_card_is_ticked() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    start(&mut h, 8, "sleeper");
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(
+        &mut h,
+        page("sa_8", "sleeper", "running", bash_call("t1", "sleep 40"), 3),
+    );
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(h.watched(), None);
+    h.advance_clock_ms(5_000);
+    h.tick_animations(3);
+    let main = h.snapshot();
+    assert!(!main.contains("sleep 40"), "main shows none of it:\n{main}");
+
+    // Back in the view: the card is re-rendered at its current age.
+    ctrl(&mut h, KeyCode::Up);
+    h.tick_animations(3);
+    let header = card_header(&h.snapshot(), "sleep 40");
+    assert!(header.contains("5.0s"), "{header:?}");
 }
