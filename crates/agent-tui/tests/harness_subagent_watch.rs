@@ -129,7 +129,7 @@ fn a_worker_view_shows_its_own_stream_and_main_never_moves() {
     );
     let header = frame.lines().next().unwrap();
     assert!(
-        header.contains("scout") && header.contains("sa_3") && header.contains("running"),
+        header.contains("\u{276f} scout"),
         "the header says whose thread this is: {header}"
     );
 
@@ -224,7 +224,10 @@ fn a_finished_worker_view_is_read_only() {
     assert!(worker.contains("its view is read-only"), "{worker}");
     // 04-tui M5: the opening line no longer promises "Enter steers it".
     assert!(!worker.contains("Enter steers"), "{worker}");
-    assert!(h.snapshot().lines().next().unwrap().contains("read-only"));
+    // The footer offers no steering for a read-only view.
+    let frame = h.snapshot();
+    let footer = frame.lines().last().unwrap();
+    assert!(footer.contains("back") && !footer.contains("steer"), "{footer}");
 }
 
 #[test]

@@ -60,7 +60,7 @@ pub(crate) fn tray_height(n: usize) -> u16 {
 // ───────────────────────────── colour ──────────────────────────────────────
 
 /// `c` pushed toward `toward` just until it reads at `target` on `bg`.
-fn legible(c: Rgb, toward: Rgb, bg: Rgb, target: f32) -> Rgb {
+pub(super) fn legible(c: Rgb, toward: Rgb, bg: Rgb, target: f32) -> Rgb {
     let mut t = 0.0;
     loop {
         let out = mix(c, toward, t);

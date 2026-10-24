@@ -103,7 +103,7 @@ fn vt100_parses_captured_frame_content() {
         .map(|c| c.contents())
         .collect();
     assert!(
-        row0.contains("synaps"),
+        row0.contains("SynapsCLI"),
         "header not on parsed row 0: {row0:?}"
     );
 
