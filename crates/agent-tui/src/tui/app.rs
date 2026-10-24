@@ -720,6 +720,15 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// A theme change: like [`Self::invalidate`], but for every subagent view
+    /// too. Each worker view keeps its own line cache, so invalidating only
+    /// the main one left a worker's older tool cards and thinking blocks in
+    /// the previous palette until they happened to re-render.
+    pub(crate) fn invalidate_theme(&mut self) {
+        self.threads.invalidate_all();
+        self.invalidate();
+    }
+
     /// Mark only the tail message dirty. O(1) during streaming.
     pub(crate) fn invalidate_last(&mut self) {
         self.transcript.invalidate_last();
@@ -1023,7 +1032,7 @@ impl App {
             requested,
             std::time::Instant::now(),
         );
-        self.invalidate();
+        self.invalidate_theme();
     }
 
     /// Reconcile the background MXC subscriber with the active theme name.

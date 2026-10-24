@@ -1162,4 +1162,43 @@ mod tests {
         prune(&mut app, now + FINISHED_THREAD_TTL + Duration::from_secs(1));
         assert!(app.threads.worker("sa_1").is_none(), "past its window");
     }
+
+    /// A theme change restyles every open worker view, not only the main
+    /// one: each view has its own line cache, and a view left out kept its
+    /// older tool cards and thinking blocks in the previous palette.
+    #[test]
+    fn a_theme_change_restyles_every_worker_view() {
+        use crate::tui::transcript::RenderCtx;
+        let ctx = RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        };
+        let area = ratatui::layout::Rect::new(0, 1, 82, 30);
+        let rendered = |app: &App, id: &str| {
+            app.threads.worker(id).unwrap().store.line_cache().map_or(0, |c| {
+                c.per_msg.iter().filter(|s| s.lines.is_some()).count()
+            })
+        };
+        let mut app = app();
+        app.subagent_rows = vec![
+            row(1, "a", SubagentStatus::Running),
+            row(2, "b", SubagentStatus::Running),
+        ];
+        for id in ["sa_1", "sa_2"] {
+            focus_and_answer(
+                &mut app,
+                id,
+                page(id, "running", vec![WatchEvent::ResponseStart, text("hi")], 2),
+            );
+            let w = app.threads.worker_mut(id).unwrap();
+            let _ = w.store.visible_window(area, &ctx);
+            assert!(rendered(&app, id) > 0, "{id}: precondition, rendered");
+        }
+        // sa_2 is focused; sa_1 sits in the background.
+        app.invalidate_theme();
+        for id in ["sa_1", "sa_2"] {
+            assert_eq!(rendered(&app, id), 0, "{id}: re-renders in the new theme");
+        }
+    }
 }

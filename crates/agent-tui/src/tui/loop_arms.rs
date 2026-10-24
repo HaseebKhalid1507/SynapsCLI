@@ -687,7 +687,7 @@ pub(crate) async fn handle_animation_tick(
         theme::transition::advance(&mut app.theme_transition, std::time::Instant::now())
     {
         theme::set_theme(frame);
-        app.invalidate();
+        app.invalidate_theme();
     }
     // P7.8: activation/deactivation happen OUTSIDE any input event
     // (async queue + auto-chaining); reconcile the stack to the
