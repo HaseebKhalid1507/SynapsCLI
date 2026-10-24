@@ -850,7 +850,7 @@ impl SessionActor {
             input_owner: None,
             awaiting_input: 0,
             roster: Vec::new(),
-            client_input: None,
+            client_input: Some(client_input),
             journal_id: sb.session.id.clone(),
             locked_by: None,
             pinned: cfg.keep_warm,
@@ -889,6 +889,15 @@ impl SessionActor {
                 memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        // The mode is fixed for the session: seed the listing with it now.
+        // Otherwise only a presence publish (attach, detach, input) carries
+        // it, so a session restored at reload, with no client back yet,
+        // listed as `owner=-`. Not `publish_presence()`: that also sets the
+        // inbox gate, which stays as `SessionHandle::new` left it.
+        presence.store(Arc::new(super::handle::Presence {
+            client_input: Some(client_input),
+            ..Default::default()
+        }));
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {

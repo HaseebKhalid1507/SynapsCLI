@@ -694,6 +694,34 @@ fn shared_cfg() -> agent_engine::session::SessionConfig {
     }
 }
 
+/// The listing knows a session's input mode before any client attaches: a
+/// session the daemon restores at reload, with nobody back yet, listed as
+/// `owner=-` instead of `active=-` because only a presence publish
+/// (attach, detach, input) carried the mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_input_mode_is_listed_before_any_client_attaches() {
+    let _h = Home::new();
+    let host = host().await;
+    let shared = host.create_session(shared_cfg()).await.unwrap();
+    let exclusive = host
+        .create_session(agent_engine::session::SessionConfig {
+            client_input: Some(agent_engine::session::ClientInput::Exclusive),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert_eq!(shared.meta_live().clients, 0);
+    assert_eq!(
+        shared.meta_live().client_input,
+        Some(agent_engine::session::ClientInput::Shared)
+    );
+    assert_eq!(
+        exclusive.meta_live().client_input,
+        Some(agent_engine::session::ClientInput::Exclusive)
+    );
+}
+
 /// Shared input: every drive client may type and the one that did last is
 /// the active client (`InputOwnerChanged{reason: Input}`); an observer is
 /// still read-only. When the active client leaves, input goes back to
