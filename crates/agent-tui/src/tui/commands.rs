@@ -360,6 +360,10 @@ pub(super) const TAKEOVER_IN_PROCESS: &str =
 pub(super) const TAKEOVER_OBSERVING: &str =
     "takeover: this client is observing (--observe) and never owns input; attach without --observe to take it";
 pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
+pub(super) const TAKEOVER_SHARED: &str = "takeover: input is shared, so every client can already type; \
+     this one is now the active client (it gets input back first after a daemon reload)";
+pub(super) const TAKEOVER_SHARED_ALREADY: &str =
+    "takeover: input is shared, so every client can already type; this one is already the active client";
 
 /// `/takeover`: take input ownership from the client that holds it, in
 /// place (the in-session form of `synaps --attach --takeover`). The session
@@ -368,12 +372,13 @@ pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
 /// the turn keeps running, only who drives the session changes.
 pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::SessionLink) {
     let t = link.transport();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
     let note = if t.daemon_pid() == 0 {
         Some(TAKEOVER_IN_PROCESS)
     } else if t.mode() == agent_engine::session::AttachMode::Observe {
         Some(TAKEOVER_OBSERVING)
     } else if t.input_owner() == Some(t.client_id()) {
-        Some(TAKEOVER_ALREADY)
+        Some(if shared { TAKEOVER_SHARED_ALREADY } else { TAKEOVER_ALREADY })
     } else {
         None
     };
@@ -381,8 +386,11 @@ pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::Sess
         app.push_msg(ChatMessage::System(note.to_string()));
         return;
     }
-    if let Err(e) = link.send(agent_engine::session::SessionCommand::TakeInput).await {
-        app.push_msg(ChatMessage::Error(format!("takeover failed: {e}")));
+    match link.send(agent_engine::session::SessionCommand::TakeInput).await {
+        // Shared mode shows no toast when the active client moves: say it here.
+        Ok(()) if shared => app.push_msg(ChatMessage::System(TAKEOVER_SHARED.to_string())),
+        Ok(()) => {}
+        Err(e) => app.push_msg(ChatMessage::Error(format!("takeover failed: {e}"))),
     }
 }
 
@@ -2109,6 +2117,34 @@ mod tests {
             assert!(log.lock().unwrap().sent.is_empty(), "{note}: nothing reaches the session");
         }
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"takeover"));
+    }
+
+    /// With `client_input = shared` every client already types: `/takeover`
+    /// only makes this one the active client, and says so (no toast comes).
+    #[tokio::test]
+    async fn takeover_with_shared_input_says_it_only_moves_the_active_client() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInput};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_ownership(AttachMode::Mirror, Some(ClientId(7)))
+            .with_client_input(ClientInput::Shared);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        assert!(crate::tui::session_link::may_drive(link.transport()), "shared: a non-active mirror drives");
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        assert!(says(&app, super::TAKEOVER_SHARED));
+        link.next_event().await.expect("the active marker moves");
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "already active: nothing sent");
+        assert!(says(&app, super::TAKEOVER_SHARED_ALREADY));
     }
 
     /// Mid-stream `/takeover` runs (it never steers): the dispatcher gets

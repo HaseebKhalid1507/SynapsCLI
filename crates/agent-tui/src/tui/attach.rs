@@ -440,6 +440,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
 
     let mut app = app_from_snapshot(&snapshot);
     app.observing = transport.mode() == AttachMode::Observe;
+    app.attached_clients = transport.roster().clients().len();
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
@@ -479,7 +480,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     // the actor's pending prompts.
     let replay = snapshot.replay.clone();
     let pending = snapshot.pending_prompts.clone();
-    let owns_input = snapshot.input_owner == Some(transport.client_id());
+    let owns_input = super::session_link::may_drive(&transport);
     app.streaming = snapshot.streaming;
 
     let mut ctx = finish_setup(

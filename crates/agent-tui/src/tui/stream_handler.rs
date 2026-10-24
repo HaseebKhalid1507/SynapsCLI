@@ -644,9 +644,12 @@ pub(super) async fn handle_session_event_arm(
             // Unsolicited (another client's Set): the view was refreshed by
             // `SessionLink::note`; nothing to render.
         }
-        SessionEventWire::Attached { .. }
-        | SessionEventWire::ClientJoined { .. }
-        | SessionEventWire::ClientLeft { .. } => {}
+        SessionEventWire::Attached { .. } => {}
+        // The transport's roster already took the change.
+        SessionEventWire::ClientJoined { .. } | SessionEventWire::ClientLeft { .. } => {
+            app.attached_clients = link.transport().roster().clients().len();
+            app.request_redraw();
+        }
         SessionEventWire::Ended { reason } => {
             app.session_ended = Some(reason);
             return ArmFlow::Ended;
@@ -755,12 +758,17 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
-            prompt_bridge.set_owns_input(to == Some(me));
-            if to != Some(me) {
+            let may_drive = super::session_link::may_drive_with_owner(link.transport(), to);
+            prompt_bridge.set_owns_input(may_drive);
+            if !may_drive {
                 // A prompt already on screen loses its Allow-all button too.
                 app.secret_prompts.drop_allow_all();
             }
-            if from == Some(me) && to != Some(me) {
+            let shared = link.transport().client_input() == agent_engine::session::ClientInput::Shared;
+            if shared {
+                // Input is shared: the active marker moving (you typed in
+                // another tab) is not news. `/clients` shows it.
+            } else if from == Some(me) && to != Some(me) {
                 let who = to
                     .map(|c| link.transport().roster().label(c))
                     .unwrap_or_else(|| "nobody".to_string());

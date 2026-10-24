@@ -338,6 +338,7 @@ pub struct SocketTransport {
     mode: AttachMode,
     input_owner: Option<ClientId>,
     roster: Roster,
+    client_input: ClientInput,
     ended: bool,
     path: PathBuf,
     hello: Hello,
@@ -421,6 +422,7 @@ impl SocketTransport {
                 mode,
                 input_owner: snapshot.input_owner,
                 roster: Roster::from_snapshot(&snapshot),
+                client_input: snapshot.client_input,
                 ended: false,
                 path: conn.path,
                 hello: conn.hello,
@@ -775,6 +777,10 @@ impl ClientTransport for SocketTransport {
         self.roster.clone()
     }
 
+    fn client_input(&self) -> ClientInput {
+        self.client_input
+    }
+
     /// C3: after `Reloading`/EOF — backoff 100 ms ×2 → cap 5 s, total ≤
     /// `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (60); `Hello{reconnect_of}` →
     /// `Attach::Existing{alias-resolved id, mode}` where `mode = Takeover`
@@ -897,6 +903,7 @@ mod tests {
                         pending_prompts: vec![],
                         clients: vec![],
                         roster: Vec::new(),
+                        client_input: ClientInput::wire_default(),
                         input_owner: Some(ClientId(7)),
                         display_tail: None,
                     },

@@ -488,6 +488,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         if skip(&env) {
                             continue;
                         }
+                        let env = Envelope { event: for_client(caps, env.event), ..env };
                         if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
                             break;
                         }
@@ -502,6 +503,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         continue;
                     }
                     let ended = matches!(env.event, SessionEventWire::Ended { .. });
+                    let env = Envelope { event: for_client(caps, env.event), ..env };
                     if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
                         break;
                     }
@@ -682,6 +684,9 @@ fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> 
 /// frame, and with it every reconnect.
 fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
     snapshot.replay.retain(|env| client_decodes(caps, &env.event));
+    for env in &mut snapshot.replay {
+        env.event = for_client(caps, std::mem::replace(&mut env.event, SessionEventWire::Idle));
+    }
     snapshot
 }
 
@@ -769,6 +774,7 @@ mod tests {
             pending_prompts: vec![],
             clients: vec![],
             roster: Vec::new(),
+            client_input: ClientInput::wire_default(),
             input_owner: None,
             display_tail: None,
         };

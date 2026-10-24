@@ -160,6 +160,7 @@ pub(crate) async fn run_setup(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: false,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
             memory_mode: None,

@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use super::handle::SessionHandle;
 use super::types::{
-    AttachMode, AttachSnapshot, ClientId, ClientMeta, Envelope, Roster, SessionCommand,
+    AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, Roster, SessionCommand,
     SessionEventWire, SessionId, SessionMeta,
 };
 use super::view::RuntimeView;
@@ -73,6 +73,11 @@ pub trait ClientTransport: Send {
     /// `ClientLeft`. Empty for a transport that doesn't track them.
     fn roster(&self) -> Roster {
         Roster::default()
+    }
+    /// Who may drive (from the attach snapshot). `Exclusive` for a
+    /// transport that doesn't know.
+    fn client_input(&self) -> ClientInput {
+        ClientInput::wire_default()
     }
     /// Socket only (Local returns `Err(Unsupported)`): after `Reloading`/EOF,
     /// reconnect with backoff and re-attach with `mode` (C3/A4).
@@ -189,6 +194,7 @@ pub struct LocalTransport {
     mode: AttachMode,
     input_owner: Option<ClientId>,
     roster: Roster,
+    client_input: ClientInput,
     /// Set after `Ended` (or actor gone): `next_event` returns `None` from then on.
     ended: bool,
 }
@@ -258,6 +264,7 @@ impl LocalTransport {
                 mode,
                 input_owner: snapshot.input_owner,
                 roster: Roster::from_snapshot(&snapshot),
+                client_input: snapshot.client_input,
                 ended: false,
             },
             snapshot,
@@ -351,6 +358,10 @@ impl ClientTransport for LocalTransport {
 
     fn roster(&self) -> Roster {
         self.roster.clone()
+    }
+
+    fn client_input(&self) -> ClientInput {
+        self.client_input
     }
 
     async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {

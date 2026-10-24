@@ -370,6 +370,7 @@ pub mod echo {
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
                 roster: Vec::new(),
+                client_input: ClientInput::wire_default(),
                 input_owner: None,
                 display_tail,
             }

@@ -171,6 +171,10 @@ pub struct SessionConfig {
     /// Never `Park` this session (`--keep-warm`). Default `false`.
     #[serde(default)]
     pub keep_warm: bool,
+    /// Who may drive this session ([`ClientInput`]); `None` = config
+    /// `client_input`. An older daemon ignores it (and enforces the owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input: Option<ClientInput>,
     /// `--name`: name the session at create (same rules as `/cmd saveas`;
     /// must be unique among saved sessions). Applied before the registry
     /// entry is written so `synaps send --session <name>` resolves at once.
@@ -292,6 +296,7 @@ impl Default for SessionConfig {
             compaction_policy: CompactionPolicyWire::InPlace,
             await_extensions: true,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
             memory_mode: None,
@@ -382,6 +387,8 @@ impl SessionLifecycle {
         }
     }
 }
+
+pub use crate::core::config::ClientInput;
 
 /// Minted by the actor per Attach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -553,12 +560,15 @@ pub struct ClientCapabilities {
     /// `LlmEvent::ToolQueued` / `ToolStarted` (scheduler lane waits).
     #[serde(default)]
     pub tool_queue: bool,
+    /// `OwnerChangeReason::Input` (`client_input = shared`).
+    #[serde(default)]
+    pub owner_reason_input: bool,
 }
 
 impl ClientCapabilities {
     /// What this build decodes.
     pub fn current() -> Self {
-        Self { tool_queue: true }
+        Self { tool_queue: true, owner_reason_input: true }
     }
 
     fn is_none(&self) -> bool {
@@ -1322,6 +1332,10 @@ pub enum OwnerChangeReason {
     Takeover,
     OwnerDetached,
     Reload,
+    /// `client_input = shared`: this client sent input, so it is now the
+    /// active one. Sent only to clients declaring
+    /// `ClientCapabilities::owner_reason_input`; older ones get `Takeover`.
+    Input,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1469,6 +1483,8 @@ pub struct AttachSnapshot {
     /// Every attached client with its resolved name (`clients` stays for
     /// older clients). Empty from an older daemon.
     pub roster: Vec<ClientInfo>,
+    /// Who may drive ([`ClientInput`]); `Exclusive` from an older daemon.
+    pub client_input: ClientInput,
     /// Who owns input right now (B1) — so a joiner knows immediately
     /// whether its keystrokes will be honoured.
     pub input_owner: Option<ClientId>,
@@ -1484,7 +1500,11 @@ impl AttachSnapshot {
     /// snapshot; the actor used to broadcast it as a `SystemNotice`, which
     /// every attached client (the owner included) and later attach replays
     /// showed.
+    /// `None` with `client_input = shared`: every drive client may type.
     pub fn input_owned_elsewhere(&self, me: ClientId) -> Option<String> {
+        if self.client_input == ClientInput::Shared {
+            return None;
+        }
         let owner = self.input_owner.filter(|o| *o != me)?;
         let who = Roster::from_snapshot(self).label(owner);
         Some(format!("input is owned by {who}; attach with --takeover to steal it"))

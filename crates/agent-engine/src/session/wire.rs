@@ -420,6 +420,9 @@ pub struct AttachedWire {
     /// Empty from an older daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roster: Vec<super::types::ClientInfo>,
+    /// Absent from an older daemon, which enforces the owner: `Exclusive`.
+    #[serde(default = "ClientInput::wire_default")]
+    pub client_input: ClientInput,
     #[serde(default)]
     pub input_owner: Option<ClientId>,
     #[serde(default)]
@@ -438,6 +441,7 @@ impl AttachedWire {
             pending_prompts: s.pending_prompts,
             clients: s.clients,
             roster: s.roster,
+            client_input: s.client_input,
             input_owner: s.input_owner,
             display_tail: s.display_tail,
         }
@@ -455,6 +459,7 @@ impl AttachedWire {
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
                 roster: self.roster,
+                client_input: self.client_input,
                 input_owner: self.input_owner,
                 display_tail: self.display_tail,
             },
@@ -1012,6 +1017,18 @@ impl From<WireSessionEvent> for SessionEventWire {
 
 // ── per-client decode gate ────────────────────────────────────────────────────
 
+/// `event` as a client with `caps` can read it, for additive variants that
+/// have an older equivalent (unlike [`client_decodes`]' events, which are
+/// dropped): `OwnerChangeReason::Input` reads as `Takeover`.
+pub fn for_client(caps: ClientCapabilities, mut event: SessionEventWire) -> SessionEventWire {
+    if let SessionEventWire::InputOwnerChanged { reason, .. } = &mut event {
+        if *reason == OwnerChangeReason::Input && !caps.owner_reason_input {
+            *reason = OwnerChangeReason::Takeover;
+        }
+    }
+    event
+}
+
 /// Whether a client that declared `caps` can decode `event` once it is a
 /// wire frame. The enums nested under `Stream` have no `#[serde(other)]`,
 /// so an older client does not skip an unknown nested variant: the whole
@@ -1295,6 +1312,7 @@ mod tests {
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
                     roster: Vec::new(),
+                    client_input: ClientInput::Shared,
                     input_owner: Some(ClientId(1)),
                     display_tail: None,
                 },
@@ -1384,6 +1402,7 @@ mod tests {
                 pending_prompts: vec![],
                 clients: vec![],
                 roster: Vec::new(),
+                client_input: ClientInput::Shared,
                 input_owner: None,
                 display_tail: None,
             },
@@ -1400,6 +1419,47 @@ mod tests {
             },
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `client_input` on the wire: a current daemon sends it; an `Attached`
+    /// from an older daemon (no field) means `Exclusive`, the owner rule it
+    /// enforces. `OwnerChangeReason::Input` reaches only clients that
+    /// declared `owner_reason_input`; the others read `Takeover`.
+    #[test]
+    fn client_input_absent_means_exclusive_and_input_reason_is_gated() {
+        let snap = |client_input| AttachSnapshot {
+            meta: meta(),
+            view: view(),
+            conversation: conv(),
+            streaming: false,
+            replay: vec![],
+            pending_prompts: vec![],
+            clients: vec![],
+            roster: Vec::new(),
+            client_input,
+            input_owner: Some(ClientId(1)),
+            display_tail: None,
+        };
+        let line = encode_line(&DaemonFrame::Attached(AttachedWire::new(ClientId(2), snap(ClientInput::Shared)))).unwrap();
+        assert!(line.contains(r#""client_input":"shared""#), "{line}");
+        let decoded = |line: &str| match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+            DaemonFrame::Attached(a) => a.into_snapshot().1,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(decoded(&line).client_input, ClientInput::Shared);
+        let old = line.replace(r#""client_input":"shared","#, "");
+        assert!(!old.contains("client_input"), "{old}");
+        let s = decoded(&old);
+        assert_eq!(s.client_input, ClientInput::Exclusive);
+        assert!(s.input_owned_elsewhere(ClientId(2)).is_some(), "an older daemon's non-owner is read-only");
+
+        let ev = SessionEventWire::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Input };
+        let reason = |caps| match for_client(caps, ev.clone()) {
+            SessionEventWire::InputOwnerChanged { reason, .. } => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reason(ClientCapabilities::current()), OwnerChangeReason::Input);
+        assert_eq!(reason(ClientCapabilities::default()), OwnerChangeReason::Takeover);
     }
 
     /// The gate: a client that did not declare `tool_queue` (every client
@@ -1432,7 +1492,7 @@ mod tests {
         let h = Hello::new(ClientKind::Tui);
         assert!(h.client.capabilities.tool_queue);
         let line = encode_line(&ClientFrame::Hello(h)).unwrap();
-        assert!(line.contains(r#""capabilities":{"tool_queue":true}"#), "{line}");
+        assert!(line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true}"#), "{line}");
         match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
             ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
             other => panic!("{other:?}"),
@@ -1722,6 +1782,7 @@ mod tests {
                     pending_prompts: vec![],
                     clients: vec![],
                     roster: Vec::new(),
+                    client_input: ClientInput::Shared,
                     input_owner: None,
                     display_tail: None,
                 },

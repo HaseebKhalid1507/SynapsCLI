@@ -341,6 +341,8 @@ pub(crate) struct AttachedClient {
     pub(crate) name: String,
     /// Unix ms.
     pub(crate) attached_at_ms: u64,
+    /// `SessionActor::input_seq` at this client's last input; 0 = none yet.
+    pub(crate) last_input: u64,
 }
 
 /// B2: a spawned `compact_conversation` (§2.5).
@@ -581,8 +583,13 @@ pub struct SessionActor {
     pub(crate) view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub(crate) attached: HashMap<ClientId, AttachedClient>,
     /// B1: the one client whose input commands are honoured (`None` = any
-    /// host-originated sender only).
+    /// host-originated sender only). With `client_input = shared` it is the
+    /// *active* client: the drive client that sent input last.
     pub(crate) input_owner: Option<ClientId>,
+    /// Who may drive (config `client_input`, or the create override).
+    pub(crate) client_input: ClientInput,
+    /// Bumped on each input from a client ([`AttachedClient::last_input`]).
+    pub(crate) input_seq: u64,
     pub(crate) next_client_id: u64,
     pub(crate) seq: u64,
     pub(crate) turn_replay: VecDeque<Envelope>,
@@ -689,6 +696,7 @@ impl SessionActor {
             runtime.restore_session_memory_mode(mode);
         }
         let config: crate::SynapsConfig = (**host.config()).clone();
+        let client_input = cfg.client_input.unwrap_or(config.client_input);
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
             &mut runtime,
@@ -937,6 +945,8 @@ impl SessionActor {
             view,
             attached: HashMap::new(),
             input_owner: None,
+            client_input,
+            input_seq: 0,
             next_client_id: 1,
             seq: 0,
             turn_replay: VecDeque::new(),
@@ -1248,6 +1258,43 @@ impl SessionActor {
         match self.attached.get(&id) {
             Some(a) => format!("{} (#{})", a.name, id.0),
             None => format!("client #{}", id.0),
+        }
+    }
+
+    /// Why client `c` may not send an input command, if it may not.
+    /// `exclusive`: anyone but the owner. `shared`: observers (and clients
+    /// that aren't attached); every drive client may.
+    fn input_refusal(&self, c: ClientId) -> Option<String> {
+        match self.client_input {
+            ClientInput::Exclusive => (self.input_owner != Some(c)).then(|| match self.input_owner {
+                Some(o) => format!("input owned by {}", self.client_label(o)),
+                None => "input has no owner; attach with --takeover".to_string(),
+            }),
+            ClientInput::Shared => match self.attached.get(&c).map(|a| a.mode) {
+                Some(AttachMode::Mirror | AttachMode::Takeover) => None,
+                Some(AttachMode::Observe) => {
+                    Some("this client is read-only (attached with --observe)".to_string())
+                }
+                None => Some("this client is not attached".to_string()),
+            },
+        }
+    }
+
+    /// Client `c` sent input (or answered a prompt): remember when, and with
+    /// `client_input = shared` make it the active client. Observers never
+    /// become active.
+    fn note_input(&mut self, c: ClientId) {
+        let Some(a) = self.attached.get_mut(&c) else { return };
+        if a.mode == AttachMode::Observe {
+            return;
+        }
+        self.input_seq += 1;
+        a.last_input = self.input_seq;
+        if self.client_input == ClientInput::Shared && self.input_owner != Some(c) {
+            let from = self.input_owner;
+            self.input_owner = Some(c);
+            self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason: OwnerChangeReason::Input });
+            self.publish_presence();
         }
     }
 
@@ -4178,6 +4225,12 @@ impl SessionActor {
             v.trim()
                 .eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL)
         });
+        // An answer is input too: with `client_input = shared` the answering
+        // drive client becomes active first, so "Allow all" (owner only)
+        // is its to choose.
+        if let Some(c) = from {
+            self.note_input(c);
+        }
         if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].0, allow_all) {
             if let Some(c) = from {
                 self.emit(SessionEventWire::Refused {
@@ -4471,6 +4524,7 @@ impl SessionActor {
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
             roster: self.roster(),
+            client_input: self.client_input,
             input_owner: self.input_owner,
             display_tail: None,
         }
@@ -4520,7 +4574,7 @@ impl SessionActor {
         let attached_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         self.attached.insert(
             cid,
-            AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms },
+            AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms, last_input: 0 },
         );
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
@@ -4590,6 +4644,7 @@ impl SessionActor {
         self.input_owner = Some(c);
         self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason });
         self.publish_presence();
+        self.note_input(c); // most recent, for promotion on detach
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
@@ -4602,12 +4657,16 @@ impl SessionActor {
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
+            // `shared`: back to whoever typed last (a script that sent one
+            // prompt and left hands input back to the tab in use);
+            // `exclusive`: the lowest id, as before. Ties: the lowest id.
+            let shared = self.client_input == ClientInput::Shared;
             let next = self
                 .attached
                 .iter()
                 .filter(|(_, a)| a.mode != AttachMode::Observe)
-                .map(|(c, _)| *c)
-                .min_by_key(|c| c.0);
+                .max_by_key(|(c, a)| (if shared { a.last_input } else { 0 }, std::cmp::Reverse(c.0)))
+                .map(|(c, _)| *c);
             self.input_owner = next;
             self.emit(SessionEventWire::InputOwnerChanged {
                 from: Some(client),
@@ -4940,11 +4999,7 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
-            if is_input_command(&cmd) && self.input_owner != Some(c) {
-                let reason = match self.input_owner {
-                    Some(o) => format!("input owned by {}", self.client_label(o)),
-                    None => "input has no owner; attach with --takeover".to_string(),
-                };
+            if let Some(reason) = is_input_command(&cmd).then(|| self.input_refusal(c)).flatten() {
                 self.emit(SessionEventWire::Refused {
                     client: c,
                     command: command_name(&cmd).to_string(),
@@ -4968,6 +5023,14 @@ impl SessionActor {
                 None => self.emit(SessionEventWire::SystemNotice(reason)),
             }
             return ControlFlow::Continue(());
+        }
+        // Accepted input: with `client_input = shared` its sender becomes the
+        // active client. `KeepWarm` doesn't count: `--keep-warm` sends it
+        // on attach, not a person typing.
+        if let Some(c) = from {
+            if is_input_command(&cmd) && !matches!(cmd, SessionCommand::KeepWarm { .. }) {
+                self.note_input(c);
+            }
         }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {

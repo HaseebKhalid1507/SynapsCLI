@@ -50,6 +50,8 @@ pub struct ScriptedTransport {
     /// `mode()` / `input_owner()`: this client is #1, by default the owner.
     mode: AttachMode,
     input_owner: Option<ClientId>,
+    /// `client_input()`; `Exclusive` (an older daemon's) unless a test sets it.
+    client_input: agent_engine::session::ClientInput,
 }
 
 impl ScriptedTransport {
@@ -96,6 +98,7 @@ impl ScriptedTransport {
             roster: Default::default(),
             mode: AttachMode::Mirror,
             input_owner: Some(ClientId(1)),
+            client_input: agent_engine::session::ClientInput::wire_default(),
         }
     }
 
@@ -104,6 +107,12 @@ impl ScriptedTransport {
     pub fn with_ownership(mut self, mode: AttachMode, owner: Option<ClientId>) -> Self {
         self.mode = mode;
         self.input_owner = owner;
+        self
+    }
+
+    /// Who may drive (`client_input()`), as the attach snapshot says.
+    pub fn with_client_input(mut self, client_input: agent_engine::session::ClientInput) -> Self {
+        self.client_input = client_input;
         self
     }
 
@@ -508,6 +517,9 @@ impl ClientTransport for ScriptedTransport {
     }
     fn roster(&self) -> agent_engine::session::Roster {
         self.roster.clone()
+    }
+    fn client_input(&self) -> agent_engine::session::ClientInput {
+        self.client_input
     }
     async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
         Err(TransportError::Unsupported("reconnect: scripted transport"))

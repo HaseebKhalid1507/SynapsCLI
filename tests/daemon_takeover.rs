@@ -53,7 +53,7 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
         &paths,
         ClientKind::Tui,
         Attach::Create {
-            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, ..Default::default() },
+            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Exclusive), ..Default::default() },
             mode: AttachMode::Mirror,
         },
     )
@@ -141,7 +141,7 @@ async fn clients_are_named_in_the_roster_listing_and_refusals() {
     let (mut a, snap_a) = SocketTransport::attach(
         conn,
         Attach::Create {
-            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, ..Default::default() },
+            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Exclusive), ..Default::default() },
             mode: AttachMode::Mirror,
         },
     )
@@ -191,6 +191,67 @@ async fn clients_are_named_in_the_roster_listing_and_refusals() {
         Err(e) => assert!(e.to_string().contains("invalid client name"), "{e}"),
         Ok(_) => panic!("an invalid name was accepted"),
     }
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// `client_input = shared` over the wire (multi-client-sessions §6): the
+/// snapshot says so, a second mirror's input runs, and the move of the
+/// active marker reaches a current client as `reason: Input`, but an older
+/// one (no `owner_reason_input` capability) as `Takeover`, which it can
+/// decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn shared_input_over_the_wire_and_older_clients_read_takeover() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+
+    let (mut a, snap) = attach(
+        &paths,
+        ClientKind::Tui,
+        Attach::Create {
+            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Shared), ..Default::default() },
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await;
+    assert_eq!(snap.client_input, ClientInput::Shared);
+    let sid = a.session_id().clone();
+
+    // An older client: it declares no `owner_reason_input`.
+    let mut old_hello = Hello::new(ClientKind::Attach);
+    old_hello.client.capabilities.owner_reason_input = false;
+    let conn = SocketTransport::connect(&paths.sock, old_hello).await.unwrap();
+    let (mut old, _) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Observe }).await.unwrap();
+    let (mut b, snap_b) = attach(&paths, ClientKind::Attach, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await;
+    assert_eq!(snap_b.input_owned_elsewhere(b.client_id()), None);
+
+    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    let b_id = b.client_id();
+    let ev = until(&mut a, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+    let a_id = a.client_id();
+    assert!(
+        matches!(ev, SessionEventWire::InputOwnerChanged { from: Some(f), to: Some(t), reason: OwnerChangeReason::Input } if f == a_id && t == b_id),
+        "{ev:?}"
+    );
+    let ev = until(&mut old, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+    assert!(
+        matches!(ev, SessionEventWire::InputOwnerChanged { from: Some(f), to: Some(t), reason: OwnerChangeReason::Takeover } if f == a_id && t == b_id),
+        "an older client reads Takeover: {ev:?}"
+    );
+    assert_eq!(old.input_owner(), Some(b_id));
+
+    // a was not active, and still drives.
+    a.send_from_self(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
 
     d.shutdown_token().cancel();
     d.wait().await;

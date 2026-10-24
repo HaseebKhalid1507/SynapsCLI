@@ -731,6 +731,10 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .and_then(|v| cfg::CacheKeepWarm::parse(&v))
             .unwrap_or_default()
             .to_string(),
+        "client_input" => raw_config(key)
+            .and_then(|v| cfg::ClientInput::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
         "cache_keepwarm_auto_max_hours" => raw_config(key)
             .and_then(|v| v.trim_end_matches(['h', 'H']).parse::<u32>().ok())
             .filter(|h| (1..=cfg::MAX_CACHE_KEEPWARM_HOURS).contains(h))
