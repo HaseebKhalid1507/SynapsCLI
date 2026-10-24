@@ -131,6 +131,12 @@ impl WatchEvent {
                 tool_id: tool_id.clone(),
                 result: cap_text(result, TOOL_PAYLOAD_MAX_BYTES),
             },
+            StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => Self::ToolQueued {
+                tool_id: tool_id.clone(),
+            },
+            StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => Self::ToolStarted {
+                tool_id: tool_id.clone(),
+            },
             StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => Self::Steered {
                 text: message.clone(),
             },
@@ -322,8 +328,26 @@ impl WatchPage {
     /// (`SessionQuery::SubagentWatch { tool_queue: false }`, i.e. every
     /// client that predates them): `WatchEvent` has no `#[serde(other)]`,
     /// so such a client would fail to decode the whole page.
-    pub fn without_tool_queue(self) -> Self {
-        self // RED: not implemented yet
+    pub fn without_tool_queue(mut self) -> Self {
+        let queue = |ev: &WatchEvent| {
+            matches!(ev, WatchEvent::ToolQueued { .. } | WatchEvent::ToolStarted { .. })
+        };
+        if !self.events.iter().any(queue) {
+            return self;
+        }
+        let timed = self.at_ms.len() == self.events.len();
+        let at_ms = std::mem::take(&mut self.at_ms);
+        let events = std::mem::take(&mut self.events);
+        for (i, ev) in events.into_iter().enumerate() {
+            if queue(&ev) {
+                continue;
+            }
+            if timed {
+                self.at_ms.push(at_ms[i]);
+            }
+            self.events.push(ev);
+        }
+        self
     }
 }
 

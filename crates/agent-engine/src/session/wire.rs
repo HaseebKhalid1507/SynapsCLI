@@ -999,8 +999,12 @@ impl From<WireSessionEvent> for SessionEventWire {
 /// drops, per connection, every event the client did not opt into
 /// (`daemon/conn.rs`, live pump and attach replay alike).
 pub fn client_decodes(caps: ClientCapabilities, event: &SessionEventWire) -> bool {
-    let _ = (caps, event);
-    true // RED: gate not implemented yet
+    match event {
+        SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. })) => {
+            caps.tool_queue
+        }
+        _ => true,
+    }
 }
 
 // ── framing helpers ───────────────────────────────────────────────────────────

@@ -4368,13 +4368,18 @@ impl SessionActor {
                         .collect(),
                 )
             }
-            SessionQuery::SubagentWatch { handle_id, since, tool_queue: _tool_queue } => {
+            SessionQuery::SubagentWatch { handle_id, since, tool_queue } => {
                 let mut registry = self
                     .runtime
                     .subagent_registry()
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 match registry.watch_page(&handle_id, since) {
+                    // An older client did not ask for queue entries and
+                    // could not decode a page that had them.
+                    Some(page) if !tool_queue => {
+                        serde_json::to_value(page.without_tool_queue()).unwrap_or_default()
+                    }
                     Some(page) => serde_json::to_value(page).unwrap_or_default(),
                     None => serde_json::json!({
                         "error": format!("no subagent {handle_id} in this session")

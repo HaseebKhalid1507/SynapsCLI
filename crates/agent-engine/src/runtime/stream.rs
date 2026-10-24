@@ -2102,6 +2102,23 @@ impl StreamMethods {
                         lanes[index].push((model_order, tool_id, tool_name, prepared));
                     }
 
+                    // Every call behind another in its lane waits for it:
+                    // say so before any lane starts, in model order, so a
+                    // client can show it as queued rather than running.
+                    // Opt-in signal — a call that leads its lane gets none,
+                    // and each queued call gets `ToolStarted` when it begins.
+                    let mut waiting: Vec<(usize, &str)> = lanes
+                        .iter()
+                        .flat_map(|lane| lane.iter().skip(1))
+                        .map(|(model_order, tool_id, _, _)| (*model_order, tool_id.as_str()))
+                        .collect();
+                    waiting.sort_unstable_by_key(|(model_order, _)| *model_order);
+                    for (_, tool_id) in waiting {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolQueued {
+                            tool_id: tool_id.to_string(),
+                        }));
+                    }
+
                     // One task per lane; calls inside a lane run
                     // SEQUENTIALLY in model order, lanes run concurrently.
                     for lane in lanes {
@@ -2141,7 +2158,14 @@ impl StreamMethods {
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
-                            for (model_order, tool_id, tool_name, prepared) in lane {
+                            let mut calls = lane.into_iter().enumerate();
+                            for (position, (model_order, tool_id, tool_name, prepared)) in calls.by_ref() {
+                            if position > 0 {
+                                // It was announced `ToolQueued`; it runs now.
+                                let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolStarted {
+                                    tool_id: tool_id.clone(),
+                                }));
+                            }
                             let gate_outcome = match prepared {
                                 PreparedCall::ParseError(err) => {
                                     let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -2329,6 +2353,16 @@ impl StreamMethods {
                                 // for any calls this lane never reached.
                                 break;
                             }
+                            }
+                            // Calls the lane never reached were announced
+                            // queued and will never start: settle them for
+                            // the UI with the cancel phrase their history
+                            // result gets, or their cards would wait forever.
+                            for (_, (_, tool_id, _, _)) in calls {
+                                let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                    tool_id,
+                                    result: turn_completion_inner.cancel_phrase().to_string(),
+                                }));
                             }
                             lane_results
                         });
