@@ -66,6 +66,12 @@ pub(crate) struct HeaderSnap {
     /// Monotonic animation clock in milliseconds (wall clock, so the
     /// indicators keep their speed however busy the event loop is).
     pub(crate) anim_ms: u64,
+    /// The working folder, `~`-abbreviated ([`folder_label`]).
+    #[allow(dead_code)] // drawn by the slab header (next commit)
+    pub(crate) folder: String,
+    /// This client is attached read-only (`synaps --attach --observe`).
+    #[allow(dead_code)] // drawn by the slab header (next commit)
+    pub(crate) observing: bool,
 }
 
 /// What the header shows, derived per frame from the snapshot.
@@ -384,6 +390,25 @@ pub(crate) fn session_label(name: Option<&str>, title: &str, id: &str) -> String
         }
     }
     out
+}
+
+/// `path` with the home directory written `~`, for the header's folder.
+pub(crate) fn folder_label(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    if let Some(rest) = home.and_then(|h| path.strip_prefix(h).ok()) {
+        if rest.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
+}
+
+/// The process's working folder as the header shows it.
+pub(crate) fn current_folder() -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    std::env::current_dir()
+        .map(|cwd| folder_label(&cwd, home.as_deref()))
+        .unwrap_or_default()
 }
 
 /// `s` cut to at most `max` cells, with `…` when cut.

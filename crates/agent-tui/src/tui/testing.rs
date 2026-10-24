@@ -169,6 +169,8 @@ impl TestHarness {
         // suffix, and the header shows it when the session has no name or
         // title — pin it so replays are byte-identical across boots.
         app.session.id = "test-session".to_string();
+        // Determinism: the header shows the working folder.
+        app.header_folder = "~/Projects/SynapsCLI".to_string();
         // Skip the boot animation; a fixed frame beats a time-parametric one.
         app.logo_build_t = None;
 
@@ -835,6 +837,24 @@ impl TestHarness {
     /// drop.
     pub fn set_build_id(&mut self, id: &str) -> &mut Self {
         super::header::set_build_id_for_thread(Some(id));
+        self
+    }
+
+    /// Pin the working folder the header shows.
+    pub fn set_folder(&mut self, folder: &str) -> &mut Self {
+        self.app.header_folder = folder.to_string();
+        self
+    }
+
+    /// Mark this client as attached read-only (`--observe`).
+    pub fn set_observing(&mut self, observing: bool) -> &mut Self {
+        self.app.observing = observing;
+        self
+    }
+
+    /// Name the session (the header's session label).
+    pub fn set_session_name(&mut self, name: &str) -> &mut Self {
+        self.app.session.name = Some(name.to_string());
         self
     }
 
