@@ -236,6 +236,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     // (the prompt-cache pings, which cost money).
     "pin",
     "keep-warm",
+    "clients",
     "trace",
     "memory",
     "auth",

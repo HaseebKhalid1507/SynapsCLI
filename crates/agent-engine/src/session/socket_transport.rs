@@ -337,6 +337,7 @@ pub struct SocketTransport {
     pub welcome: Welcome,
     mode: AttachMode,
     input_owner: Option<ClientId>,
+    roster: Roster,
     ended: bool,
     path: PathBuf,
     hello: Hello,
@@ -419,6 +420,7 @@ impl SocketTransport {
                 welcome: conn.welcome,
                 mode,
                 input_owner: snapshot.input_owner,
+                roster: Roster::from_snapshot(&snapshot),
                 ended: false,
                 path: conn.path,
                 hello: conn.hello,
@@ -718,7 +720,7 @@ impl ClientTransport for SocketTransport {
                         SessionEventWire::Reloading { generation, .. } => {
                             self.reload_pending = Some(*generation);
                         }
-                        _ => {}
+                        other => self.roster.apply(other),
                     }
                     return Some(env);
                 }
@@ -767,6 +769,10 @@ impl ClientTransport for SocketTransport {
 
     fn input_owner(&self) -> Option<ClientId> {
         self.input_owner
+    }
+
+    fn roster(&self) -> Roster {
+        self.roster.clone()
     }
 
     /// C3: after `Reloading`/EOF — backoff 100 ms ×2 → cap 5 s, total ≤
@@ -890,6 +896,7 @@ mod tests {
                         replay: vec![],
                         pending_prompts: vec![],
                         clients: vec![],
+                        roster: Vec::new(),
                         input_owner: Some(ClientId(7)),
                         display_tail: None,
                     },

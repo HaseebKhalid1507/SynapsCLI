@@ -45,6 +45,8 @@ pub struct ScriptedTransport {
     daemon_pid: u32,
     /// The pin, as `KeepWarm{on}` left it (answered in `Status`).
     pinned: bool,
+    /// `roster()`; empty unless a test sets one ([`Self::with_roster`]).
+    roster: agent_engine::session::Roster,
 }
 
 impl ScriptedTransport {
@@ -68,6 +70,7 @@ impl ScriptedTransport {
             clients: 1,
             input_owner: Some(ClientId(1)),
             awaiting_input: 0,
+            roster: Vec::new(),
             journal_id: session.id.clone(),
             locked_by: None,
             pinned: false,
@@ -87,7 +90,23 @@ impl ScriptedTransport {
             refuse_input: None,
             daemon_pid: 0,
             pinned: false,
+            roster: Default::default(),
         }
+    }
+
+    /// The clients `roster()` reports (as an attach snapshot would).
+    pub fn with_roster(mut self, clients: Vec<agent_engine::session::ClientInfo>) -> Self {
+        let mut snapshot_like = agent_engine::session::Roster::default();
+        for c in clients {
+            snapshot_like.apply(&agent_engine::session::SessionEventWire::ClientJoined {
+                client: c.id,
+                kind: c.kind,
+                name: c.name,
+                mode: c.mode,
+            });
+        }
+        self.roster = snapshot_like;
+        self
     }
 
     /// Report `pid` as the daemon's, so the TUI treats this as a daemon
@@ -455,6 +474,9 @@ impl ClientTransport for ScriptedTransport {
     }
     fn input_owner(&self) -> Option<ClientId> {
         Some(ClientId(1))
+    }
+    fn roster(&self) -> agent_engine::session::Roster {
+        self.roster.clone()
     }
     async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
         Err(TransportError::Unsupported("reconnect: scripted transport"))

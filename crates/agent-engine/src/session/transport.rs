@@ -10,8 +10,8 @@ use tokio::sync::broadcast;
 
 use super::handle::SessionHandle;
 use super::types::{
-    AttachMode, AttachSnapshot, ClientId, ClientMeta, Envelope, SessionCommand, SessionEventWire,
-    SessionId, SessionMeta,
+    AttachMode, AttachSnapshot, ClientId, ClientMeta, Envelope, Roster, SessionCommand,
+    SessionEventWire, SessionId, SessionMeta,
 };
 use super::view::RuntimeView;
 
@@ -69,6 +69,11 @@ pub trait ClientTransport: Send {
     fn mode(&self) -> AttachMode;
     /// Current input owner — updated from `Attached` / `InputOwnerChanged`.
     fn input_owner(&self) -> Option<ClientId>;
+    /// Attached clients, named — updated from `Attached` / `ClientJoined` /
+    /// `ClientLeft`. Empty for a transport that doesn't track them.
+    fn roster(&self) -> Roster {
+        Roster::default()
+    }
     /// Socket only (Local returns `Err(Unsupported)`): after `Reloading`/EOF,
     /// reconnect with backoff and re-attach with `mode` (C3/A4).
     async fn reconnect(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError>;
@@ -183,6 +188,7 @@ pub struct LocalTransport {
     meta: SessionMeta,
     mode: AttachMode,
     input_owner: Option<ClientId>,
+    roster: Roster,
     /// Set after `Ended` (or actor gone): `next_event` returns `None` from then on.
     ended: bool,
 }
@@ -251,6 +257,7 @@ impl LocalTransport {
                 meta,
                 mode,
                 input_owner: snapshot.input_owner,
+                roster: Roster::from_snapshot(&snapshot),
                 ended: false,
             },
             snapshot,
@@ -303,7 +310,7 @@ impl ClientTransport for LocalTransport {
                 match &env.event {
                     SessionEventWire::Ended { .. } => self.ended = true,
                     SessionEventWire::InputOwnerChanged { to, .. } => self.input_owner = *to,
-                    _ => {}
+                    other => self.roster.apply(other),
                 }
                 Some(env)
             }
@@ -340,6 +347,10 @@ impl ClientTransport for LocalTransport {
 
     fn input_owner(&self) -> Option<ClientId> {
         self.input_owner
+    }
+
+    fn roster(&self) -> Roster {
+        self.roster.clone()
     }
 
     async fn reconnect(&mut self, _mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
@@ -453,7 +464,8 @@ mod tests {
             joined.event,
             SessionEventWire::ClientJoined {
                 client: ClientId(1),
-                kind: ClientKind::Test
+                kind: ClientKind::Test,
+                ..
             }
         ));
 

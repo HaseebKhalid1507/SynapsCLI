@@ -762,7 +762,7 @@ pub(super) async fn handle_session_event_arm(
             }
             if from == Some(me) && to != Some(me) {
                 let who = to
-                    .map(|c| format!("client #{}", c.0))
+                    .map(|c| link.transport().roster().label(c))
                     .unwrap_or_else(|| "nobody".to_string());
                 app.toasts.upsert(
                     super::toast::Toast::new("input-owner", format!("input taken over by {who}"))

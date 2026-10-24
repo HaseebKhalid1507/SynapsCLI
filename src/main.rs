@@ -107,6 +107,13 @@ struct Cli {
     #[arg(long, global = true)]
     takeover: bool,
 
+    /// With --attach: what this client is called in the session (`/clients`,
+    /// `synaps daemon sessions`, "input moved to …"). 1–32 letters, digits,
+    /// `-` or `_`. Default: SYNAPS_CLIENT_NAME, else `tui` (`tui-2`, … when
+    /// taken).
+    #[arg(long = "as", value_name = "NAME", global = true)]
+    client_name: Option<String>,
+
     /// With --attach: pin the session live (never parked).
     #[arg(long = "keep-warm", global = true)]
     keep_warm: bool,
@@ -832,6 +839,7 @@ async fn async_main() -> anyhow::Result<()> {
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
                     name: cli.session_name,
+                    client_name: cli.client_name,
                     adopted: ADOPTED.load(std::sync::atomic::Ordering::SeqCst),
                 })
                 .await?;
@@ -1022,7 +1030,7 @@ async fn async_main() -> anyhow::Result<()> {
             cmd::daemon::run(active_profile, args).await?;
         }
         Some(Command::Attach(args)) => {
-            cmd::attach::run(active_profile, args).await?;
+            cmd::attach::run(active_profile, args, cli.client_name).await?;
         }
         Some(Command::Rpc {
             continue_id,

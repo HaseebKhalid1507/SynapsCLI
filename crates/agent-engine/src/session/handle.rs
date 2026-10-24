@@ -13,11 +13,13 @@ use super::transport::TransportError;
 use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Presence {
     pub clients: usize,
     pub input_owner: Option<ClientId>,
     pub awaiting_input: usize,
+    /// Every attached client, named (`synaps daemon sessions`).
+    pub roster: Vec<super::types::ClientInfo>,
 }
 use super::view::RuntimeView;
 
@@ -173,7 +175,7 @@ impl SessionHandle {
 
     /// Clients / input owner / pending prompts as last published.
     pub fn presence(&self) -> Presence {
-        **self.presence.load()
+        (**self.presence.load()).clone()
     }
 
     /// Current session name (create `--name` or a later `saveas`).
@@ -212,6 +214,7 @@ impl SessionHandle {
         m.clients = p.clients;
         m.input_owner = p.input_owner;
         m.awaiting_input = p.awaiting_input;
+        m.roster = p.roster;
         m.journal_id = self.journal_id();
         m.name = self.name();
         m.pinned = self.pinned();
@@ -286,6 +289,7 @@ pub mod echo {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
             journal_id: id.0.clone(),
             locked_by: None,
             pinned: false,
@@ -365,6 +369,7 @@ pub mod echo {
                 replay: Vec::new(),
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
+                roster: Vec::new(),
                 input_owner: None,
                 display_tail,
             }
@@ -388,7 +393,8 @@ pub mod echo {
                         client: cid,
                         snapshot,
                     });
-                    self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+                    let name = kind.default_name().to_string();
+                    self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode: AttachMode::Mirror });
                 }
                 SessionCommand::Detach { client } => {
                     if self.clients.remove(&client).is_some() {
@@ -524,6 +530,7 @@ pub mod locked_placeholder {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
             pinned: false,

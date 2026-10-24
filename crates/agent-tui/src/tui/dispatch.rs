@@ -318,6 +318,7 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::OpenSettings => open_settings(app, http),
+                CommandAction::Clients => super::commands::clients(app, link),
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();
                     match synaps_cli::skills::state::PluginsState::load_from(&path) {
@@ -1226,6 +1227,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::OpenModels => {}
                     CommandAction::OpenEffort => {}
                     CommandAction::OpenSettings => open_settings(app, http),
+                    CommandAction::Clients => super::commands::clients(app, link),
                     CommandAction::OpenPlugins => {}
                     CommandAction::OpenHelpFind { .. } => {}
                     CommandAction::ReloadPlugins => {}

@@ -40,7 +40,7 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
     assert_eq!(snap_b.input_owner, Some(a.client_id()), "a keeps input");
     // b learns it from ITS snapshot; the owner is told nothing.
     let owned = snap_b.input_owned_elsewhere(b.client_id()).expect("owned elsewhere");
-    assert!(owned.contains("input is owned by client #1 (tui)"), "{owned}");
+    assert!(owned.contains("input is owned by tui (#1)"), "{owned}");
     assert!(owned.contains("--takeover"), "{owned}");
     assert_eq!(snap_a.input_owned_elsewhere(a.client_id()), None, "a owns it");
     let a_saw = drain_for(&mut a, std::time::Duration::from_millis(300)).await;
@@ -63,7 +63,7 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
         } => {
             assert_eq!(*client, b.client_id());
             assert_eq!(command, "submit");
-            assert!(reason.contains("client #1"), "{reason}");
+            assert_eq!(reason, "input owned by tui (#1)");
         }
         _ => unreachable!(),
     }

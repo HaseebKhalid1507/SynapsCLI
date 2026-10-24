@@ -89,6 +89,8 @@ fn refused_while_draining(cmd: &SessionCommand) -> bool {
         )
 }
 
+// One per line read, consumed at once: not worth boxing every frame.
+#[allow(clippy::large_enum_variant)]
 enum Read {
     Frame(ClientFrame),
     Eof,
@@ -193,6 +195,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 ),
             })
             .await;
+        let _ = writer.await;
+        return;
+    }
+    // Clients validate their name before connecting; this is the backstop.
+    if let Some(Err(message)) = hello.client.name.as_deref().map(crate::session::validate_client_name) {
+        let _ = tx.send(DaemonFrame::Refused { reason: RefuseReason::Protocol, message }).await;
         let _ = writer.await;
         return;
     }
@@ -751,6 +759,7 @@ mod tests {
             replay: vec![queued.clone(), result.clone(), started.clone()],
             pending_prompts: vec![],
             clients: vec![],
+            roster: Vec::new(),
             input_owner: None,
             display_tail: None,
         };

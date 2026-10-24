@@ -241,6 +241,12 @@ impl Hello {
         }
     }
 
+    /// Ask to be called `name` in the session ([`ClientMeta::name`]).
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.client.name = name;
+        self
+    }
+
     /// Ask for `Full` (mirror) or `Digest` (digest + display tail) history.
     pub fn with_history(mut self, history: HistoryMode) -> Self {
         self.client.history = history;
@@ -411,6 +417,9 @@ pub struct AttachedWire {
     pub replay: Vec<WireEnvelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    /// Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster: Vec<super::types::ClientInfo>,
     #[serde(default)]
     pub input_owner: Option<ClientId>,
     #[serde(default)]
@@ -428,6 +437,7 @@ impl AttachedWire {
             replay: s.replay.into_iter().map(Into::into).collect(),
             pending_prompts: s.pending_prompts,
             clients: s.clients,
+            roster: s.roster,
             input_owner: s.input_owner,
             display_tail: s.display_tail,
         }
@@ -444,6 +454,7 @@ impl AttachedWire {
                 replay: self.replay.into_iter().map(Into::into).collect(),
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
+                roster: self.roster,
                 input_owner: self.input_owner,
                 display_tail: self.display_tail,
             },
@@ -561,7 +572,16 @@ pub enum WireSessionEvent {
     SettingChanged { applied: SettingApplied },
     QueryResult { id: u64, value: serde_json::Value },
     Attached { client: ClientId, snapshot: AttachedWire },
-    ClientJoined { client: ClientId, kind: ClientKind },
+    ClientJoined {
+        client: ClientId,
+        kind: ClientKind,
+        /// Empty from an older daemon (the client falls back to the kind).
+        #[serde(default)]
+        name: String,
+        /// Absent from an older daemon (read as `Mirror`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<AttachMode>,
+    },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     Aborted { context_saved: bool },
@@ -886,7 +906,7 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::SettingChanged(applied) => Self::SettingChanged { applied },
             S::QueryResult { id, value } => Self::QueryResult { id, value },
             S::Attached { client, snapshot } => Self::Attached { client, snapshot: AttachedWire::new(client, snapshot) },
-            S::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
+            S::ClientJoined { client, kind, name, mode } => Self::ClientJoined { client, kind, name, mode: Some(mode) },
             S::ClientLeft { client } => Self::ClientLeft { client },
             S::Ended { reason } => Self::Ended { reason },
             S::Aborted { context_saved } => Self::Aborted { context_saved },
@@ -951,7 +971,9 @@ impl From<WireSessionEvent> for SessionEventWire {
                 let (client, snapshot) = snapshot.into_snapshot();
                 Self::Attached { client, snapshot }
             }
-            W::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
+            W::ClientJoined { client, kind, name, mode } => {
+                Self::ClientJoined { client, kind, name, mode: mode.unwrap_or(AttachMode::Mirror) }
+            }
             W::ClientLeft { client } => Self::ClientLeft { client },
             W::Ended { reason } => Self::Ended { reason },
             W::Aborted { context_saved } => Self::Aborted { context_saved },
@@ -1272,11 +1294,12 @@ mod tests {
                     replay: vec![env(S::Stream(StreamEvent::Llm(LlmEvent::Text("partial".into()))))],
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
+                    roster: Vec::new(),
                     input_owner: Some(ClientId(1)),
                     display_tail: None,
                 },
             },
-            S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach },
+            S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach, name: "discord".into(), mode: AttachMode::Observe },
             S::ClientLeft { client: ClientId(1) },
             S::Ended { reason: EndReason::HostShutdown },
             S::Aborted { context_saved: true },
@@ -1360,6 +1383,7 @@ mod tests {
                 replay: vec![env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })))],
                 pending_prompts: vec![],
                 clients: vec![],
+                roster: Vec::new(),
                 input_owner: None,
                 display_tail: None,
             },
@@ -1429,6 +1453,29 @@ mod tests {
         let json = serde_json::to_string(&ClientMeta::new(ClientKind::Tui)).unwrap();
         let old: OldClientMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(old.kind, ClientKind::Tui);
+    }
+
+    /// Client names, both directions: an older daemon's `ClientJoined` (no
+    /// name, no mode) decodes as the kind's name in `Mirror`; a `Hello`
+    /// without a name sends no `name` key (older daemons see the old
+    /// bytes), with one it round-trips.
+    #[test]
+    fn client_names_are_additive_on_the_wire() {
+        let old = r#"{"ev":"client_joined","client":4,"kind":"attach"}"#;
+        let ev: SessionEventWire = serde_json::from_str::<WireSessionEvent>(old).unwrap().into();
+        let mut roster = Roster::default();
+        roster.apply(&ev);
+        let c = roster.get(ClientId(4)).unwrap();
+        assert_eq!((c.name.as_str(), c.mode), ("attach", AttachMode::Mirror));
+
+        let unnamed = encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Tui))).unwrap();
+        assert!(!unnamed.contains(r#""name""#), "{unnamed}");
+        let named = Hello::new(ClientKind::Tui).with_name(Some("discord".into()));
+        let line = encode_line(&ClientFrame::Hello(named)).unwrap();
+        match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => assert_eq!(h.client.name.as_deref(), Some("discord")),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The watch query's opt-in: an older client's query omits it (off), an
@@ -1674,6 +1721,7 @@ mod tests {
                     replay: vec![],
                     pending_prompts: vec![],
                     clients: vec![],
+                    roster: Vec::new(),
                     input_owner: None,
                     display_tail: None,
                 },

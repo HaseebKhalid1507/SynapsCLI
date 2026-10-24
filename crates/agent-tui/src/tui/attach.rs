@@ -50,6 +50,9 @@ pub struct AttachOpts {
     /// `--name`: name the created session (`synaps send --session <name>`
     /// resolves it at once).
     pub name: Option<String>,
+    /// `--as`: what this client is called in the session; `None` =
+    /// `SYNAPS_CLIENT_NAME`, else the daemon's default (`tui`, `tui-2`, …).
+    pub client_name: Option<String>,
     /// A plain `synaps` adopted a running daemon (no explicit `--attach`):
     /// after attaching, show what else lives in this daemon so parked
     /// work stays discoverable (F1).
@@ -319,7 +322,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None,
         )));
     }
+    let client_name = opts.client_name.clone().or_else(agent_engine::session::client_name_from_env);
+    if let Some(name) = client_name.as_deref() {
+        agent_engine::session::validate_client_name(name).map_err(cfg_err)?;
+    }
     let hello = Hello::new(ClientKind::Tui)
+        .with_name(client_name)
         .with_history(HistoryMode::from_env_or(HistoryMode::attach_client_default()));
     let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
@@ -649,6 +657,7 @@ mod tests {
             keep_warm: false,
             new_session,
             name: None,
+            client_name: None,
             adopted: false,
         }
     }
@@ -667,6 +676,7 @@ mod tests {
             clients,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
             journal_id: String::new(),
             locked_by: None,
             pinned: false,

@@ -337,6 +337,10 @@ fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
 pub(crate) struct AttachedClient {
     pub(crate) meta: ClientMeta,
     pub(crate) mode: AttachMode,
+    /// Resolved at attach ([`resolve_client_name`]); unique in the session.
+    pub(crate) name: String,
+    /// Unix ms.
+    pub(crate) attached_at_ms: u64,
 }
 
 /// B2: a spawned `compact_conversation` (§2.5).
@@ -836,6 +840,7 @@ impl SessionActor {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
             journal_id: sb.session.id.clone(),
             locked_by: None,
             pinned: cfg.keep_warm,
@@ -1216,7 +1221,33 @@ impl SessionActor {
             clients: self.attached.len(),
             input_owner: self.input_owner,
             awaiting_input: self.pending_prompts.len(),
+            roster: self.roster(),
         }));
+    }
+
+    /// Every attached client, by id.
+    pub(crate) fn roster(&self) -> Vec<ClientInfo> {
+        let mut roster: Vec<ClientInfo> = self
+            .attached
+            .iter()
+            .map(|(id, a)| ClientInfo {
+                id: *id,
+                name: a.name.clone(),
+                kind: a.meta.kind,
+                mode: a.mode,
+                attached_at_ms: a.attached_at_ms,
+            })
+            .collect();
+        roster.sort_by_key(|c| c.id.0);
+        roster
+    }
+
+    /// `tui (#1)`, or `client #1` for an id that isn't attached.
+    fn client_label(&self, id: ClientId) -> String {
+        match self.attached.get(&id) {
+            Some(a) => format!("{} (#{})", a.name, id.0),
+            None => format!("client #{}", id.0),
+        }
     }
 
     /// Recomputes `state` from clients/streaming and (re)arms or disarms the
@@ -4166,7 +4197,7 @@ impl SessionActor {
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
         let by = match from {
-            Some(c) => format!("client #{}", c.0),
+            Some(c) => self.client_label(c),
             None => "the host".to_string(),
         };
         // prA N3: the tool card shows the model's original input; when the
@@ -4438,6 +4469,7 @@ impl SessionActor {
             replay: self.turn_replay.iter().cloned().collect(),
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
+            roster: self.roster(),
             input_owner: self.input_owner,
             display_tail: None,
         }
@@ -4479,7 +4511,16 @@ impl SessionActor {
         let kind = client.kind;
         self.cache_keepwarm_note_attach(kind, mode);
         let snapshot_meta = client.clone();
-        self.attached.insert(cid, AttachedClient { meta: client, mode });
+        let name = resolve_client_name(
+            client.name.as_deref(),
+            kind,
+            self.attached.values().map(|a| a.name.as_str()),
+        );
+        let attached_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        self.attached.insert(
+            cid,
+            AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms },
+        );
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -4515,7 +4556,7 @@ impl SessionActor {
             client: cid,
             snapshot,
         });
-        self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+        self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
@@ -4868,7 +4909,7 @@ impl SessionActor {
             }
             if is_input_command(&cmd) && self.input_owner != Some(c) {
                 let reason = match self.input_owner {
-                    Some(o) => format!("input owned by client #{}", o.0),
+                    Some(o) => format!("input owned by {}", self.client_label(o)),
                     None => "input has no owner; attach with --takeover".to_string(),
                 };
                 self.emit(SessionEventWire::Refused {
