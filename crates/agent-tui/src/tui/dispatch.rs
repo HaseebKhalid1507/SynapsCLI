@@ -28,6 +28,14 @@ use super::*;
 
 use std::ops::ControlFlow;
 
+/// Open `/settings` (idle or mid-turn) plus the same live-catalog refresh
+/// the /models modal runs: the settings model picker feeds off
+/// `app.catalog_overrides`.
+fn open_settings(app: &mut App, http: &LazyHttp) {
+    settings::open_modal(app);
+    spawn_auto_catalog_refreshes(app, http);
+}
+
 fn spawn_auto_catalog_refreshes(app: &mut App, http: &LazyHttp) {
     let http = match http.get() {
         Ok(c) => c,
@@ -309,19 +317,7 @@ pub(crate) async fn handle_input_action(
                         focus::debug_assert_stack_sync(app);
                     }
                 }
-                CommandAction::OpenSettings => {
-                    app.settings = Some(settings::SettingsState::new());
-                    // P7.7: mirror the `= Some(..)` open with a stack
-                    // push (§6). GATE-1 note B: settings opens on this
-                    // async command arm, so assert sync RIGHT HERE — a
-                    // missed push is caught this event, not one later.
-                    app.modal_stack.push(focus::PaneId::Settings);
-                    #[cfg(debug_assertions)]
-                    focus::debug_assert_stack_sync(app);
-                    // Same live-catalog refresh the /models modal runs: the
-                    // settings model picker feeds off app.catalog_overrides.
-                    spawn_auto_catalog_refreshes(app, http);
-                }
+                CommandAction::OpenSettings => open_settings(app, http),
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();
                     match synaps_cli::skills::state::PluginsState::load_from(&path) {
@@ -1180,35 +1176,19 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::StreamingInput(input) => {
-            // Check for streaming slash commands
-            if let Some(rest) = input.strip_prefix('/') {
-                let raw_cmd = rest.split_whitespace().next().unwrap_or("");
-                let streaming_cmds = commands::to_owned_commands(commands::STREAMING_COMMANDS);
-                let cmd = commands::resolve_prefix(raw_cmd, &streaming_cmds);
-                match commands::handle_streaming_command(&cmd, &input, app) {
+            match commands::resolve_streaming_input(&input, app, registry) {
+                commands::StreamingSlash::Refused => {}
+                commands::StreamingSlash::Steer => {
+                    // Normal or unknown slash text during streaming —
+                    // steer/queue ("→ steering:" / "queued:" on `Steered`).
+                    let _ = link
+                        .send(agent_engine::session::SessionCommand::Steer { text: input })
+                        .await;
+                }
+                commands::StreamingSlash::Ran(action) => match action {
                     // A streaming command that finished in place (/theme,
                     // /attachments, /detach): nothing more to do.
-                    CommandAction::None if commands::is_streaming_command(&cmd) => {}
-                    CommandAction::None => {
-                        // Not a streaming-safe command. If it's still a KNOWN
-                        // command (settings, model, system, etc.), refuse with
-                        // a clear message — don't leak command text into the
-                        // model stream as steering input.
-                        let all_cmds = commands::all_commands_with_skills(registry);
-                        let resolved_full = commands::resolve_prefix(raw_cmd, &all_cmds);
-                        if all_cmds.iter().any(|c| c == &resolved_full) {
-                            app.push_msg(ChatMessage::System(format!(
-                                "/{} can't run while streaming — press Esc to cancel first",
-                                resolved_full
-                            )));
-                        } else {
-                            // Unknown slash text — treat as steering
-                            // ("→ steering:" / "queued:" on `Steered`).
-                            let _ = link
-                                .send(agent_engine::session::SessionCommand::Steer { text: input })
-                                .await;
-                        }
-                    }
+                    CommandAction::None => {}
                     CommandAction::Quit => {
                         // F27: same guard as Ctrl+C.
                         if is_socket && app.streaming {
@@ -1245,7 +1225,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::StartStream => {}
                     CommandAction::OpenModels => {}
                     CommandAction::OpenEffort => {}
-                    CommandAction::OpenSettings => {}
+                    CommandAction::OpenSettings => open_settings(app, http),
                     CommandAction::OpenPlugins => {}
                     CommandAction::OpenHelpFind { .. } => {}
                     CommandAction::ReloadPlugins => {}
@@ -1266,13 +1246,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::Ping => {}
                     CommandAction::SidecarToggle { .. } => {}
                     CommandAction::SidecarStatus { .. } => {}
-                }
-            } else {
-                // Normal text during streaming — steer/queue
-                // ("→ steering:" / "queued:" on `Steered`).
-                let _ = link
-                    .send(agent_engine::session::SessionCommand::Steer { text: input })
-                    .await;
+                },
             }
         }
         InputAction::ModelsApply(model) => {

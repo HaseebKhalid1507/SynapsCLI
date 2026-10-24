@@ -14,8 +14,9 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
 /// Commands that work while streaming.
-pub(super) const STREAMING_COMMANDS: &[&str] =
-    &["gamba", "theme", "quit", "exit", "attachments", "detach", "watch"];
+pub(super) const STREAMING_COMMANDS: &[&str] = &[
+    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings",
+];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
@@ -1563,6 +1564,9 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         "quit" | "exit" => CommandAction::Quit,
+        // Mid-turn rules live with the rows (settings::mid_turn_refusal,
+        // helpers::apply_setting's next-turn notice).
+        "settings" => CommandAction::OpenSettings,
         "attachments" => {
             let summaries = app.pending_attachments.summaries();
             if summaries.is_empty() {
@@ -1609,6 +1613,50 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
+    }
+}
+
+/// What a line typed mid-turn resolves to (the `StreamingInput` arm).
+pub(super) enum StreamingSlash {
+    /// A streaming command ran; the caller performs its `CommandAction`
+    /// (`None` when it finished in place, e.g. `/theme`).
+    Ran(CommandAction),
+    /// A known command that can't run mid-turn: the refusal notice is
+    /// already in the transcript; nothing is sent to the model.
+    Refused,
+    /// Plain text or unknown slash text: send it as a steer.
+    Steer,
+}
+
+/// Resolve input typed while a turn streams. Known slash commands never
+/// leak into the stream as steering text: they run (the streaming set) or
+/// are refused with a notice.
+pub(super) fn resolve_streaming_input(
+    input: &str,
+    app: &mut App,
+    registry: &synaps_cli::skills::registry::CommandRegistry,
+) -> StreamingSlash {
+    let Some(rest) = input.strip_prefix('/') else {
+        return StreamingSlash::Steer;
+    };
+    let raw_cmd = rest.split_whitespace().next().unwrap_or("");
+    let streaming_cmds = to_owned_commands(STREAMING_COMMANDS);
+    let cmd = resolve_prefix(raw_cmd, &streaming_cmds);
+    match handle_streaming_command(&cmd, input, app) {
+        CommandAction::None if !is_streaming_command(&cmd) => {
+            let all_cmds = all_commands_with_skills(registry);
+            let resolved_full = resolve_prefix(raw_cmd, &all_cmds);
+            if all_cmds.iter().any(|c| c == &resolved_full) {
+                app.push_msg(super::app::ChatMessage::System(format!(
+                    "/{} can't run while streaming — press Esc to cancel first",
+                    resolved_full
+                )));
+                StreamingSlash::Refused
+            } else {
+                StreamingSlash::Steer
+            }
+        }
+        action => StreamingSlash::Ran(action),
     }
 }
 
@@ -2689,11 +2737,13 @@ mod streaming_command_tests {
     #[test]
     fn theme_and_friends_are_streaming_commands() {
         let cmds = to_owned_commands(STREAMING_COMMANDS);
-        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba", "watch"] {
+        for typed in [
+            "theme", "th", "attachments", "detach", "quit", "gamba", "watch", "settings",
+        ] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");
         }
-        for typed in ["settings", "model", "compact"] {
+        for typed in ["model", "compact", "effort"] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(
                 !is_streaming_command(&cmd),

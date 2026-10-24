@@ -40,6 +40,10 @@ pub(super) async fn apply_setting(
     // Resolve (generated from settings/defs.rs). Runtime keys round-trip
     // through `Set{id}`; on Err/rejection: set row_error and do NOT write to
     // config — the value was rejected.
+    // A session setting changed mid-turn lands in the session now, but the
+    // running turn keeps the values its stream copied when it started
+    // (`run_stream_tracked`), in-process and daemon alike: say so.
+    let mut next_turn = false;
     match settings::defs::apply_setting_dispatch(key, value, app) {
         settings::defs::SettingApply::Local(Ok(())) => {}
         settings::defs::SettingApply::Local(Err(msg)) => {
@@ -50,6 +54,7 @@ pub(super) async fn apply_setting(
         }
         settings::defs::SettingApply::Session(setting) => match link.set_checked(setting).await {
             Ok(applied) => {
+                next_turn = app.streaming;
                 if key == "context_window" {
                     // Also update the bar denominator immediately so the UI
                     // reflects the change.
@@ -92,12 +97,31 @@ pub(super) async fn apply_setting(
                 st.row_error = None;
                 st.edit_mode = None;
             }
+            if next_turn {
+                next_turn_notice(key, app);
+            }
         }
         Err(e) => {
             if let Some(st) = app.settings.as_mut() {
                 st.row_error = Some((key.to_string(), e.to_string()));
             }
         }
+    }
+}
+
+/// "<setting> change applies from the next turn": in the transcript and
+/// on the row (a `saved` note, drawn dim).
+fn next_turn_notice(key: &str, app: &mut App) {
+    let label = settings::defs::ALL_SETTINGS
+        .iter()
+        .find(|d| d.key == key)
+        .map_or(key, |d| d.label)
+        .to_lowercase();
+    app.push_msg(ChatMessage::System(format!(
+        "{label} change applies from the next turn"
+    )));
+    if let Some(st) = app.settings.as_mut() {
+        st.row_error = Some((key.to_string(), "saved — applies from the next turn".to_string()));
     }
 }
 
