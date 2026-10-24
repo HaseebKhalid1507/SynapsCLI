@@ -1225,7 +1225,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::StartStream => {}
                     CommandAction::OpenModels => {}
                     CommandAction::OpenEffort => {}
-                    CommandAction::OpenSettings => {}
+                    CommandAction::OpenSettings => open_settings(app, http),
                     CommandAction::OpenPlugins => {}
                     CommandAction::OpenHelpFind { .. } => {}
                     CommandAction::ReloadPlugins => {}

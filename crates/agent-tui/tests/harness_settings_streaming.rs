@@ -156,6 +156,10 @@ fn theme_applies_live_mid_turn() {
     let mut h = streaming_harness();
     open_settings_mid_turn(&mut h);
     assert_eq!(h.top_pane_name(), "settings");
+    // Draw once first: the active theme is loaded lazily from config, and
+    // loading it after the write below would make "dracula" the starting
+    // theme (no fade to run).
+    h.snapshot();
     h.apply_setting("theme", "dracula");
     assert!(
         base.config().contains("theme = dracula"),
@@ -269,4 +273,18 @@ fn plugin_marketplace_is_refused_mid_turn() {
         matches!(&note, Some((k, m)) if k == "plugins" && m.contains("turn")),
         "refused with a reason: {note:?}"
     );
+}
+
+/// A tool's prompt that arrives while settings is open mid-turn goes on top
+/// of the modal and takes the keys; closing it leaves settings open.
+#[test]
+fn a_mid_turn_prompt_lands_on_top_of_settings() {
+    let _base = BaseDir::new();
+    let mut h = streaming_harness();
+    open_settings_mid_turn(&mut h);
+    let _rx = h.activate_confirm_prompt("Confirm tool activation", "activate: shell");
+    assert_eq!(h.top_pane_name(), "secret-prompt", "the prompt owns input");
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(h.top_pane_name(), "settings", "settings resumes under it");
+    assert!(h.is_streaming());
 }

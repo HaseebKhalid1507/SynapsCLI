@@ -64,6 +64,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`/settings` opens while a turn is streaming.** The reply keeps
+  streaming behind it, and Esc closes the modal without cancelling the turn.
+  Theme and other appearance settings apply at once. Model, thinking and the
+  other session settings are saved at once but the running turn keeps its
+  values: they apply from the next turn, and Synaps says so. Provider keys,
+  plugin toggles, the marketplace and plugin settings are refused until the
+  turn ends.
+
 - **The `kimi` provider's default model is now `kimi-k3.1-pro`** (was
   `kimi-k2.7-code`), and the picker lists the Kimi models newest first.
   Moonshot closes the K2 series to new users from 2026-10-31 and retires it

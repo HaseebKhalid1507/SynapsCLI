@@ -893,7 +893,14 @@ fn route_settings(
                 app.model_health.clone(),
             );
             snap.catalog_overrides = app.catalog_overrides.clone();
-            match super::settings::handle_event(state, key, &snap) {
+            let outcome = super::settings::handle_event(state, key, &snap);
+            if app.streaming {
+                if let Some(refusal) = super::settings::mid_turn_refusal(&outcome) {
+                    state.row_error = Some(refusal);
+                    return InputAction::None;
+                }
+            }
+            match outcome {
                 super::settings::InputOutcome::Close => {
                     app.settings = None;
                     app.modal_stack.pop();

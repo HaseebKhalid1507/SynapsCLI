@@ -14,8 +14,9 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
 /// Commands that work while streaming.
-pub(super) const STREAMING_COMMANDS: &[&str] =
-    &["gamba", "theme", "quit", "exit", "attachments", "detach", "watch"];
+pub(super) const STREAMING_COMMANDS: &[&str] = &[
+    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings",
+];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
@@ -1563,6 +1564,9 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         "quit" | "exit" => CommandAction::Quit,
+        // Mid-turn rules live with the rows (settings::mid_turn_refusal,
+        // helpers::apply_setting's next-turn notice).
+        "settings" => CommandAction::OpenSettings,
         "attachments" => {
             let summaries = app.pending_attachments.summaries();
             if summaries.is_empty() {
