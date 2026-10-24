@@ -808,6 +808,19 @@ impl App {
         self.transcript.uses_spinner()
     }
 
+    /// One animation frame for the message area: advance the spinner and,
+    /// when an animated line (spinner, running tool clock) may have changed,
+    /// dirty the tail so the next frame re-renders it. The run loop's tick
+    /// arm calls this once per tick.
+    pub(crate) fn tick_message_animations(&mut self) {
+        if self.advance_animations() {
+            // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
+            // active tool animation). Mark just the last slot dirty instead of
+            // full invalidation — O(1) instead of O(n) per frame.
+            self.invalidate_last();
+        }
+    }
+
     /// True when a full terminal clear is needed before an animated redraw.
     ///
     /// The message pane is already cleared locally in `draw()` before rendering
