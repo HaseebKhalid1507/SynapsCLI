@@ -756,7 +756,7 @@ pub(crate) async fn handle_animation_tick(
         app.request_redraw();
     }
     if app.spinner_frame % 3 == 0 && app.header_animating() {
-        // Ghost header indicators (~20 fps; their speed is wall-clock).
+        // Header block sweep + spinner (~20 fps; wall-clock speed).
         app.request_redraw();
     }
     if app.advance_animations() {

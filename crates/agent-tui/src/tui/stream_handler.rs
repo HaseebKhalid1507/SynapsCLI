@@ -149,7 +149,7 @@ pub(super) fn apply_transcript_event(
     Applied::Changed
 }
 
-/// Ghost header state for the MAIN thread: what the turn is doing now and
+/// Header state for the MAIN thread: what the turn is doing now and
 /// how it ended. App-level, so it stays out of [`apply_transcript_event`]
 /// (a watched worker's thread never drives the main header).
 fn track_activity(app: &mut App, event: &StreamEvent) {
@@ -335,7 +335,7 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
     }
 }
 
-/// Short label the Ghost header keeps after a failed turn (`None` = the
+/// Short label the header keeps after a failed turn (`None` = the
 /// turn didn't fail in a way worth flagging).
 fn failure_label(err: &TurnError) -> Option<String> {
     match &err.outcome {

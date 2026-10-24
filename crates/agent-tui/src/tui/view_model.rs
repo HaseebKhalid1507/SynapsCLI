@@ -47,7 +47,7 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── status / spinner / identity ──
-    /// Ghost header snapshot (header.rs), built once per frame.
+    /// Header snapshot (header.rs), built once per frame.
     pub(crate) header: super::header::HeaderSnap,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
