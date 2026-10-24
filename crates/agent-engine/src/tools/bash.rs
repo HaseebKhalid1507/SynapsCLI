@@ -59,6 +59,39 @@ fn sanitize_output(input: &[u8]) -> String {
         .collect()
 }
 
+/// Read one child stream in `READ_CHUNK_SIZE` chunks and forward the
+/// sanitized text to the bash executor, tagged stdout/stderr.
+async fn forward_output<R>(
+    mut reader: R,
+    is_stderr: bool,
+    tx: tokio::sync::mpsc::Sender<(bool, String)>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; READ_CHUNK_SIZE];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let msg = sanitize_output(&buf[..n]);
+                if !msg.is_empty() {
+                    BASH_INTERMEDIARY_PRODUCED_BYTES.fetch_add(msg.len() as u64, Ordering::Relaxed);
+                    let len = msg.len();
+                    if tx.send((is_stderr, msg)).await.is_ok() {
+                        BASH_INTERMEDIARY_ACCEPTED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    } else {
+                        BASH_INTERMEDIARY_DROPPED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 fn detect_password_prompt(text: &str) -> Option<PromptKind> {
     let lower = text.to_ascii_lowercase();
     let has_password = lower.contains("password");
@@ -388,65 +421,8 @@ pub(crate) async fn run_shell_command(
         let (tx_inter, mut rx_inter) =
             tokio::sync::mpsc::channel::<(bool, String)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
 
-        let tx_o = tx_inter.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = stdout;
-            let mut buf = vec![0u8; READ_CHUNK_SIZE];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let msg = sanitize_output(&buf[..n]);
-                        if !msg.is_empty() {
-                            use std::sync::atomic::Ordering;
-                            BASH_INTERMEDIARY_PRODUCED_BYTES
-                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
-                            let len = msg.len();
-                            if tx_o.send((false, msg)).await.is_ok() {
-                                BASH_INTERMEDIARY_ACCEPTED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                            } else {
-                                BASH_INTERMEDIARY_DROPPED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let tx_e = tx_inter.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = stderr;
-            let mut buf = vec![0u8; READ_CHUNK_SIZE];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let msg = sanitize_output(&buf[..n]);
-                        if !msg.is_empty() {
-                            use std::sync::atomic::Ordering;
-                            BASH_INTERMEDIARY_PRODUCED_BYTES
-                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
-                            let len = msg.len();
-                            if tx_e.send((true, msg)).await.is_ok() {
-                                BASH_INTERMEDIARY_ACCEPTED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                            } else {
-                                BASH_INTERMEDIARY_DROPPED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        tokio::spawn(forward_output(stdout, false, tx_inter.clone()));
+        tokio::spawn(forward_output(stderr, true, tx_inter.clone()));
 
         drop(tx_inter);
 
