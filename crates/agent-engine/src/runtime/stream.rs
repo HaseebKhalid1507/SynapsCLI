@@ -226,6 +226,9 @@ pub(super) struct StreamSession {
         Option<Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
     /// Per-turn budget (Task 23, spec §8.1).
     pub(super) turn_budget: crate::runtime::budget::TurnBudget,
+    /// Event-started turns only: the owner's steer moves the turn onto the
+    /// session budget it carries.
+    pub(super) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
 }
 
 pub(super) struct StreamMethods;
@@ -584,6 +587,7 @@ impl StreamMethods {
             extension_runtime,
             extension_session_scope,
             turn_budget,
+            owner_steer_budget,
         } = session;
         let codex_parent_plan = crate::Runtime::codex_delegation_plan(
             &model,
@@ -781,6 +785,33 @@ impl StreamMethods {
             }};
         }
 
+        // Every steering drain. In an event-started turn, the drain that
+        // delivers the owner's own message also moves the turn onto the
+        // session budget; usage so far keeps counting.
+        macro_rules! drain_steering {
+            () => {{
+                let mut drain = || HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                let (steered, owner_budget) = match owner_steer_budget.as_deref() {
+                    Some(lift) => lift.drain(drain),
+                    None => (drain(), None),
+                };
+                if let Some(budget) = owner_budget {
+                    if &budget != budget_meter.budget() {
+                        tracing::info!(
+                            event = "turn_budget_owner_steer",
+                            rounds_used = budget_meter.rounds_used(),
+                            tool_calls_used = budget_meter.tool_calls_used(),
+                            max_provider_rounds = ?budget.max_provider_rounds,
+                            max_tool_calls = ?budget.max_tool_calls,
+                            "event turn moved to the session budget: the owner steered it"
+                        );
+                    }
+                    budget_meter.switch_budget(budget);
+                }
+                steered
+            }};
+        }
+
         let mut round_checkpoint = RoundCheckpoint::default();
         // Muse dangling-preamble continuation: at most once per user turn
         // (this run), so a model that keeps stopping on a preamble cannot loop.
@@ -795,7 +826,7 @@ impl StreamMethods {
             // Steering accepted while async stream setup was connecting must
             // reach the FIRST request, not wait until its tools have executed.
             // Subsequent rounds use the same path and normal request validation.
-            HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+            drain_steering!();
 
             // ═══ ROUND CHECKPOINT ═══
             // Every iteration starts on a valid history (the prompt on the
@@ -1558,7 +1589,7 @@ impl StreamMethods {
                     // the channel stays undelivered (the frontend dequeues it)
                     // instead of entering history after the cancel.
                     let steered = !cancel.is_cancelled()
-                        && HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                        && drain_steering!();
                     // Muse ended on an announced-but-unperformed action ("Blocking
                     // question before I build anything:"). Continue ONCE with a
                     // visible harness note instead of silently ending the turn.
@@ -2443,7 +2474,7 @@ impl StreamMethods {
                 // allowing the user to redirect the agent mid-work. Not after
                 // a cancel: the loop top returns the history as-is.
                 if !cancel.is_cancelled() {
-                    HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    drain_steering!();
                 }
 
                 // Continue the loop to get Claude's response with tool results
@@ -3611,6 +3642,7 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
         }
     }
 
@@ -4915,6 +4947,7 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
         };
 
         let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];

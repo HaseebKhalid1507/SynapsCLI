@@ -410,3 +410,118 @@ async fn during_an_event_turn_the_budget_command_sees_the_session_budget() {
         "the mid-turn change outlives the event turn: {status}"
     );
 }
+
+// ── An owner message delivered into an event turn ───────────────────────────
+//
+// An event-started turn runs under the event budget because nobody is
+// watching. Once the owner's own message is delivered into it (a steer),
+// someone is: the turn switches to the session's budget, counting what it
+// has used so far. Event injections into the same turn change nothing.
+
+/// A session home whose event turns stop after two provider rounds.
+fn tiny_event_budget(guard: &HomeGuard) {
+    std::fs::write(
+        guard.home.path().join(".synaps-cli").join("config"),
+        "turn_budget.event.max_provider_rounds = 2\n",
+    )
+    .unwrap();
+}
+
+/// A model that asks for a tool every round, each round taking ~0.5s: a
+/// window in which a steer or event lands in the running turn.
+const PACED_TOOL_ROUNDS: Script = Script::Paced {
+    body: ANTHROPIC_SSE_TOOL_USE,
+    frame_delay: Duration::from_millis(100),
+};
+
+/// Pump events until `hits` reaches `want` (`Ok(steers delivered)`) or the
+/// turn goes idle first (`Err(outcome)`).
+async fn pump_until_hits(
+    t: &mut LocalTransport,
+    hits: &std::sync::atomic::AtomicUsize,
+    want: usize,
+) -> Result<usize, Option<TurnOutcome>> {
+    let mut outcome = None;
+    let mut delivered = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while hits.load(Ordering::SeqCst) < want {
+        assert!(tokio::time::Instant::now() < deadline, "turn stalled");
+        let Ok(env) = tokio::time::timeout(Duration::from_millis(50), t.next_event()).await else {
+            continue;
+        };
+        match env.expect("actor alive").event {
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Error(e))) => {
+                outcome = Some(e.outcome)
+            }
+            SessionEventWire::Stream(StreamEvent::Agent(
+                synaps_cli::AgentEvent::SteeringDelivered { .. },
+            )) => delivered += 1,
+            SessionEventWire::Idle => return Err(outcome),
+            _ => {}
+        }
+    }
+    Ok(delivered)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_owner_steer_moves_an_event_turn_to_the_session_budget() {
+    let guard = HomeGuard::new();
+    tiny_event_budget(&guard);
+    let (url, hits, _) = spawn_stub(PACED_TOOL_ROUNDS).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let mut t = session(&host).await;
+
+    send_event(&t, "evt-owner-steer").await;
+    until_turn_started(&mut t).await;
+    pump_until_hits(&mut t, &hits, 1).await.expect("first round");
+    t.send(SessionCommand::Steer {
+        text: "keep going, I'm here".into(),
+    })
+    .await
+    .unwrap();
+
+    let delivered = pump_until_hits(&mut t, &hits, 5).await.unwrap_or_else(|outcome| {
+        panic!(
+            "the steered event turn stopped at {} rounds: {outcome:?}",
+            hits.load(Ordering::SeqCst)
+        )
+    });
+    assert_eq!(delivered, 1, "the owner's steer was delivered into the turn");
+
+    t.send(SessionCommand::Cancel).await.unwrap();
+    let (outcome, _) = drive_to_idle(&mut t).await;
+    assert!(
+        !matches!(outcome, Some(TurnOutcome::BudgetExceeded { .. })),
+        "no budget stop after the steer: {outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_event_turn_without_an_owner_steer_stops_at_the_event_cap() {
+    let guard = HomeGuard::new();
+    tiny_event_budget(&guard);
+    let (url, hits, _) = spawn_stub(PACED_TOOL_ROUNDS).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let mut t = session(&host).await;
+
+    send_event(&t, "evt-no-steer").await;
+    until_turn_started(&mut t).await;
+    pump_until_hits(&mut t, &hits, 1).await.expect("first round");
+    // Another event lands in the running turn: not the owner.
+    send_event(&t, "evt-no-steer-2").await;
+
+    let outcome = pump_until_hits(&mut t, &hits, 3)
+        .await
+        .expect_err("the event turn must stop at its cap");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "event turns stop at 2 rounds here");
+    assert_eq!(
+        outcome,
+        Some(TurnOutcome::BudgetExceeded {
+            dimension: BudgetDimension::ProviderRounds
+        })
+    );
+}
