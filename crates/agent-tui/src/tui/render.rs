@@ -457,7 +457,7 @@ impl TranscriptStore {
                 let ts_str = format!("{} ", ts);
                 let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                 // Pulse the agent label when streaming (same sin-wave as header dot)
-                let label_color = if ctx.streaming && i == self.messages().len() - 1 {
+                let label_color = if ctx.streaming && self.streaming_text_idx() == Some(i) {
                     let pulse = ((ctx.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
                     if let Color::Rgb(r, g, b) = THEME.load().claude_label {
                         Color::Rgb(
@@ -501,9 +501,9 @@ impl TranscriptStore {
             }
 
             ChatMessage::ToolUseStart {
+                tool_id,
                 tool_name,
                 partial_input,
-                ..
             } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
@@ -528,7 +528,7 @@ impl TranscriptStore {
                     ));
                 }
                 // Show elapsed time while tool is running
-                let elapsed_str = if let Some(start) = self.tool_start_time() {
+                let elapsed_str = if let Some(start) = self.tool_started_at(tool_id) {
                     let secs = self.now().saturating_duration_since(start).as_secs_f64();
                     if secs >= 1.0 {
                         format!(" {:.1}s", secs)
@@ -539,14 +539,17 @@ impl TranscriptStore {
                     String::new()
                 };
                 let spinner_idx = (ctx.spinner_frame / 3) % SPINNER_FRAMES.len();
+                // Only while it runs (wherever the card is); the result row
+                // carries the clock once one is beneath it.
+                let runs = self.tool_header_runs(i, tool_id);
                 // Bash gets a special animated execution trace
-                if tool_name == "bash" {
+                if runs && tool_name == "bash" {
                     let (trace, color) = bash_trace(ctx.spinner_frame);
                     header.push(Span::styled(
                         format!(" {}{}", trace, elapsed_str),
                         Style::default().fg(color),
                     ));
-                } else {
+                } else if runs {
                     header.push(Span::styled(
                         format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
                         Style::default()
@@ -616,7 +619,9 @@ impl TranscriptStore {
             }
 
             ChatMessage::ToolUse {
-                tool_name, input, ..
+                tool_id,
+                tool_name,
+                input,
             } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
@@ -641,10 +646,11 @@ impl TranscriptStore {
                         Style::default().fg(THEME.load().muted),
                     ));
                 }
-                // If this is the last message and a tool is executing, show animation
-                let is_last = i == self.messages().len() - 1;
-                if is_last && self.tool_start_time().is_some() {
-                    let elapsed_str = if let Some(start) = self.tool_start_time() {
+                // While the tool runs, the header carries its clock — wherever
+                // the card is (messages may have landed below it), until its
+                // result row takes over.
+                if self.tool_header_runs(i, tool_id) {
+                    let elapsed_str = if let Some(start) = self.tool_started_at(tool_id) {
                         let secs = self.now().saturating_duration_since(start).as_secs_f64();
                         if secs >= 1.0 {
                             format!(" {:.1}s", secs)
@@ -835,9 +841,9 @@ impl TranscriptStore {
             }
 
             ChatMessage::ToolResult {
+                ref tool_id,
                 ref content,
                 elapsed_ms,
-                ..
             } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
@@ -986,7 +992,7 @@ impl TranscriptStore {
                 } else if !is_error && (show > 0 || result_lines.is_empty()) {
                     if self.is_active_tool_result(i) {
                         // Tool still executing — show animation only for the active result.
-                        let elapsed_str = if let Some(start) = self.tool_start_time() {
+                        let elapsed_str = if let Some(start) = self.tool_started_at(tool_id) {
                             let secs = self.now().saturating_duration_since(start).as_secs_f64();
                             if secs >= 1.0 {
                                 format!(" {:.1}s", secs)

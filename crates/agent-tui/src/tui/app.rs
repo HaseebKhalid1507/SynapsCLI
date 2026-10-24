@@ -814,14 +814,14 @@ impl App {
 
     /// One animation frame for the message area: advance the spinner and,
     /// when an animated line (spinner, running tool clock) may have changed,
-    /// dirty the tail of the focused thread's transcript so the next frame
-    /// re-renders it. The run loop's tick arm calls this once per tick.
+    /// have the focused thread's transcript re-render its live slots — every
+    /// running card and the thinking placeholder, wherever they are (a steer,
+    /// a notice or a second card may sit below them), and nothing else. The
+    /// run loop's tick arm calls this once per tick.
     pub(crate) fn tick_message_animations(&mut self) {
-        if self.advance_animations() {
-            // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
-            // active tool animation). Mark just the last slot dirty instead of
-            // full invalidation — O(1) instead of O(n) per frame.
-            super::threads::active_mut(&mut self.transcript, &mut self.threads).invalidate_last();
+        if self.advance_animations()
+            && super::threads::active_mut(&mut self.transcript, &mut self.threads).tick_live()
+        {
             self.needs_redraw = true;
         }
     }
