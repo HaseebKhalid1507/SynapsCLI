@@ -96,26 +96,34 @@ impl FrameBuf {
 }
 
 async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
+    // Cancel-safe: the TUI polls this inside `select!`, so a partial line
+    // stays in `buf.line` across a dropped future and is cleared only once
+    // a whole frame has been taken out of it.
     loop {
-        buf.line.clear();
         // `take` bounds the read so an oversize frame cannot grow memory.
-        let n = tokio::io::AsyncReadExt::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1)
+        let limit = (MAX_FRAME_BYTES as u64 + 1).saturating_sub(buf.line.len() as u64);
+        let n = tokio::io::AsyncReadExt::take(&mut *reader, limit)
             .read_until(b'\n', &mut buf.line)
             .await?;
         if n == 0 {
             return Ok(None);
         }
-        if n > MAX_FRAME_BYTES {
+        if buf.line.len() > MAX_FRAME_BYTES {
+            buf.line.clear();
             return Err(TransportError::Protocol(frame_limit_msg()));
         }
-        let t = std::str::from_utf8(&buf.line)
-            .map_err(|e| TransportError::Protocol(format!("frame is not utf-8: {e}")))?
-            .trim_end();
-        if t.is_empty() {
-            continue;
-        }
-        let decoded = decode_line::<DaemonFrame>(t).map(Some).map_err(TransportError::Protocol);
-        let len = t.len();
+        let decoded = {
+            let t = std::str::from_utf8(&buf.line)
+                .map_err(|e| TransportError::Protocol(format!("frame is not utf-8: {e}")))
+                .map(str::trim_end);
+            match t {
+                Ok("") => None,
+                Ok(t) => Some((decode_line::<DaemonFrame>(t).map(Some).map_err(TransportError::Protocol), t.len())),
+                Err(e) => Some((Err(e), 0)),
+            }
+        };
+        buf.line.clear();
+        let Some((decoded, len)) = decoded else { continue };
         buf.after_frame(len);
         return decoded;
     }
@@ -976,7 +984,18 @@ mod tests {
                 ClientFrame::Cmd { cmd: SessionCommand::Detach { .. }, .. } => continue,
                 _ => DaemonFrame::Error { session_id: None, message: "nope".into() },
             };
-            w.write_all(encode_line(&reply).unwrap().as_bytes()).await.unwrap();
+            let bytes = encode_line(&reply).unwrap();
+            // `split:` Submit text: the frame arrives in two writes 50 ms
+            // apart (a frame split across reads, as a large one can be).
+            if bytes.contains("split:") {
+                let (a, b) = bytes.as_bytes().split_at(bytes.len() / 2);
+                w.write_all(a).await.unwrap();
+                w.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                w.write_all(b).await.unwrap();
+                continue;
+            }
+            w.write_all(bytes.as_bytes()).await.unwrap();
         }
     }
 
@@ -1026,6 +1045,35 @@ mod tests {
         ] {
             assert!(!predates_auth_state(other), "{other:?}");
         }
+    }
+
+    /// The TUI polls `next_event()` inside `tokio::select!` next to a 16 ms
+    /// tick, so the future is dropped whenever the tick wins. A frame split
+    /// across reads must survive that cancellation.
+    #[tokio::test]
+    async fn next_event_survives_cancellation_mid_frame() {
+        let (_d, path) = sock();
+        let l = UnixListener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+        t.send(SessionCommand::Submit { text: "split:hello".into(), attachments: vec![] }).await.unwrap();
+        // First half is in; the tick wins and drops the read.
+        tokio::select! {
+            e = t.next_event() => panic!("frame cannot be complete yet: {e:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        let e = tokio::time::timeout(std::time::Duration::from_secs(2), t.next_event())
+            .await
+            .expect("no event");
+        match e.map(|e| e.event) {
+            Some(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s)))) => assert_eq!(s, "split:hello"),
+            other => panic!("frame lost to cancellation: {other:?} (last_error={:?})", t.last_error()),
+        }
+        t.detach().await;
+        let _ = srv.await;
     }
 
     #[tokio::test]
