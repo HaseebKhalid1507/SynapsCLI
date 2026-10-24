@@ -925,7 +925,12 @@ pub(crate) fn render_frame(
                 terminal,
                 caps,
                 model.protected_bottom_rows,
-                Style::default().bg(THEME.load().message_background()),
+                // The scrub paints straight to the backend, outside the
+                // buffer the opaque guard steers — steer its bg here too.
+                Style::default().bg(super::theme::steer_off_terminal_bg(
+                    THEME.load().message_background(),
+                    super::theme::opaque_guard_target(),
+                )),
             )?;
         }
 
@@ -1618,6 +1623,16 @@ pub(crate) fn render_frame_into(
             super::focus::PaneId::PluginEditor | super::focus::PaneId::Chat => {}
         }
     }
+
+    // ── Opaque guard (LAST: after effects, toasts and modals) ─────────────
+    // Terminals with background opacity (kitty `background_opacity`) make
+    // every cell whose bg EQUALS the terminal's default bg see-through, so a
+    // theme whose canvas matches the user's terminal colour (ocean on a
+    // #030810 kitty) rendered see-through even in opaque mode. One pass over
+    // the finished frame catches every painter, including derived/animated
+    // mixes (slab shimmer, boot fx fades, selection inversion, transitions).
+    // No-op in invisible mode or when the terminal bg is unknown.
+    super::theme::guard_opaque_frame(frame.buffer_mut());
 }
 
 /// Number of terminal rows `text` occupies when word-wrapped at `width`
@@ -2041,6 +2056,106 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
             if let Some(cell) = frame.buffer_mut().cell_mut((rect.x, y)) {
                 cell.set_symbol("\u{2503}").set_fg(accent).set_bg(surface);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod opaque_terminal_bg_tests {
+    //! End-to-end through the production frame body: with opaque mode on and
+    //! a detected terminal bg equal to the active theme's canvas, no painted
+    //! cell may carry that exact bg. The terminal bg is injected per thread
+    //! (`TestHarness::set_terminal_bg`); the global theme is never replaced.
+    use super::super::testing::TestHarness;
+    use super::super::theme::{background_is_opaque, set_background_opaque, Rgb8, THEME};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use serial_test::serial;
+
+    fn rgb(c: Color) -> Option<Rgb8> {
+        match c {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            _ => None,
+        }
+    }
+
+    fn frame(h: &mut TestHarness) -> Buffer {
+        h.push_user_message("hello")
+            .push_text_message("some `code` and text");
+        h.render().clone()
+    }
+
+    fn count_bg(buf: &Buffer, c: Rgb8) -> usize {
+        let c = Color::Rgb(c.0, c.1, c.2);
+        buf.content.iter().filter(|cell| cell.bg == c).count()
+    }
+
+    /// The bug: opaque + terminal bg == theme canvas/chrome ⇒ see-through.
+    #[test]
+    #[serial]
+    fn opaque_never_paints_the_detected_terminal_bg() {
+        let prior = background_is_opaque();
+        set_background_opaque(true);
+        let theme = THEME.load_full();
+        for target in [theme.bg, theme.message_background()] {
+            let Some(target) = rgb(target) else { continue };
+            let mut h = TestHarness::boot_with_size(80, 24);
+            let unguarded = frame(&mut h);
+            assert!(
+                count_bg(&unguarded, target) > 0,
+                "fixture: the frame must paint {target:?} before the guard"
+            );
+            let mut h = TestHarness::boot_with_size(80, 24);
+            h.set_terminal_bg(Some(target));
+            let guarded = frame(&mut h);
+            assert_eq!(
+                count_bg(&guarded, target),
+                0,
+                "opaque frame still paints the terminal default bg {target:?}"
+            );
+            // Glyphs and fg are untouched; only the matching bgs moved.
+            for (a, b) in unguarded.content.iter().zip(guarded.content.iter()) {
+                assert_eq!(a.symbol(), b.symbol());
+                assert_eq!(a.fg, b.fg);
+            }
+        }
+        set_background_opaque(prior);
+    }
+
+    /// Invisible mode: see-through is intended, the frame is byte-identical.
+    #[test]
+    #[serial]
+    fn invisible_is_unchanged_by_a_detected_terminal_bg() {
+        let prior = background_is_opaque();
+        set_background_opaque(false);
+        let Some(target) = rgb(THEME.load().bg) else {
+            set_background_opaque(prior);
+            return;
+        };
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let before = frame(&mut h);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        h.set_terminal_bg(Some(target));
+        let after = frame(&mut h);
+        set_background_opaque(prior);
+        assert_eq!(before, after, "invisible mode must not be steered");
+    }
+
+    /// Unknown terminal bg (no OSC 11 reply / timeout): opaque frame unchanged.
+    #[test]
+    #[serial]
+    fn unknown_terminal_bg_leaves_the_opaque_frame_unchanged() {
+        let prior = background_is_opaque();
+        set_background_opaque(true);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let baseline = frame(&mut h);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        h.set_terminal_bg(None);
+        let unknown = frame(&mut h);
+        set_background_opaque(prior);
+        assert_eq!(baseline, unknown);
+        if let Some(bg) = rgb(THEME.load().bg) {
+            assert!(count_bg(&unknown, bg) > 0, "theme bg still painted as-is");
         }
     }
 }

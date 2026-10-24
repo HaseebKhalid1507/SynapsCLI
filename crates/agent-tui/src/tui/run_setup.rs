@@ -352,6 +352,10 @@ pub(crate) async fn finish_setup(
     let term_caps =
         termcaps::negotiate(termcaps::TermCaps::detect(), termcaps::BURST_TIMEOUT).await;
     ladder_stage("termcaps", &format_args!("burst_ms={}", t_caps.elapsed().as_millis()));
+    // OSC 11: publish the terminal's default bg (None = unknown ⇒ unchanged)
+    // before the render thread starts, so the opaque guard sees it from the
+    // first frame.
+    super::theme::set_terminal_default_bg(term_caps.terminal_bg);
 
     // P16.3: hand the negotiated caps to the render thread so `render_frame`
     // can gate edge-scrub (tmux provenance) and synchronized-output (mode 2026)
