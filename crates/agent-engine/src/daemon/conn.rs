@@ -310,6 +310,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::AuthState(query))) => {
                 let _ = tx.send(auth_state_reply(&state, &query)).await;
             }
+            // RED stub: the subscription is not served yet.
+            Ok(Read::Frame(ClientFrame::ToolCalls {})) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: None, message: "tool_calls: not implemented".into() }).await;
+            }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
@@ -579,7 +583,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             | Ok(Read::Frame(ClientFrame::Purge))
             | Ok(Read::Frame(ClientFrame::Close { .. }))
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
-            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
+            | Ok(Read::Frame(ClientFrame::AuthState(_)))
+            | Ok(Read::Frame(ClientFrame::ToolCalls {})) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,

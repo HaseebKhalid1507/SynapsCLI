@@ -545,6 +545,7 @@ impl TestHarness {
                 extensions: vec![extension.to_string()],
                 tool: Some(tool.to_string()),
                 rewritten_by: vec![],
+                tool_id: None,
             }),
         )
     }
@@ -595,6 +596,7 @@ impl TestHarness {
                 extensions: vec![extension.to_string()],
                 tool: Some(tool.to_string()),
                 rewritten_by: vec![],
+                tool_id: None,
             }),
             response_tx,
         })

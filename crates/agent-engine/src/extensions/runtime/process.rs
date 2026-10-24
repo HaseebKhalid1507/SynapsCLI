@@ -3489,4 +3489,56 @@ mod provider_tool_hook_context_tests {
             );
         }
     }
+
+    /// Group 7 (the extension-provider site): a provider's interior call is
+    /// recorded called → decided(allow) → finished(ok) under its call id,
+    /// with no conversation (`null`), no handle, and the tool's cwd on
+    /// `called`.
+    #[tokio::test]
+    async fn a_provider_tool_call_is_recorded_without_a_conversation() {
+        use crate::runtime::tool_call_events::{ToolCallDecision, ToolCallPhase, ToolCallStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::empty();
+        registry.register(Arc::new(EchoTool));
+        let session_tools = SessionToolSet::default_core_for_catalog(
+            SessionId::parse("provider-tool-call-events-test").unwrap(),
+            registry.catalog(),
+        );
+        let bus = Arc::new(HookBus::new());
+        bus.tool_call_hub().set_enabled(true);
+        let mut sub = bus.tool_call_hub().subscribe().unwrap();
+        let result = execute_provider_tool_use(
+            &registry,
+            &session_tools,
+            &bus,
+            ProviderToolUse {
+                id: "call-7".to_string(),
+                name: "echo_test".to_string(),
+                input: json!({"message": "hello"}),
+            },
+            context_with_cwd(Some(dir.path().to_path_buf())),
+            1000,
+        )
+        .await;
+        assert_eq!(result["content"], "hello");
+        let got: Vec<_> = std::iter::from_fn(|| sub.try_next()).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(matches!(
+            &got[0].record.phase,
+            ToolCallPhase::Called { cwd: Some(c), .. } if c.as_str() == dir.path().to_str().unwrap()
+        ));
+        assert!(matches!(
+            &got[1].record.phase,
+            ToolCallPhase::Decided { decision: ToolCallDecision::Allow, by, .. } if by.is_empty()
+        ));
+        assert!(matches!(
+            got[2].record.phase,
+            ToolCallPhase::Finished { status: ToolCallStatus::Ok, .. }
+        ));
+        for d in &got {
+            assert_eq!(d.record.tool_id, "call-7");
+            assert_eq!(d.record.tool, "echo_test");
+            assert_eq!((d.record.session_id.as_deref(), d.record.handle_id.as_deref()), (None, None));
+        }
+    }
 }

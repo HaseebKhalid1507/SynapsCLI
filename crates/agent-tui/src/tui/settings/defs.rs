@@ -746,6 +746,19 @@ mod tests {
     }
 
     #[test]
+    fn daemon_tool_call_events_is_an_on_off_daemon_row() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "daemon.tool_call_events")
+            .expect("daemon.tool_call_events setting should be defined");
+        assert_eq!(def.category, Category::Daemon);
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
+            _ => panic!("daemon.tool_call_events editor should be a Cycler"),
+        }
+    }
+
+    #[test]
     fn extensions_ready_timeout_is_in_startup_category() {
         let def = ALL_SETTINGS
             .iter()

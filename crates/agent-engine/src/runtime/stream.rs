@@ -195,6 +195,9 @@ pub(super) struct StreamSession {
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
+    /// A worker's tool-call record owner (parent session + handle); read
+    /// only by the tool-call events.
+    pub(super) tool_call_owner: Option<super::tool_call_events::ToolCallOwner>,
     /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
@@ -658,6 +661,7 @@ impl StreamMethods {
             telemetry_level,
             orchestration,
             delegation_parent,
+            tool_call_owner,
             turn_correlation_id,
             progressive_tool_disclosure,
             deferred_tool_loading,
@@ -3761,6 +3765,7 @@ mod rich_output_tests {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            tool_call_owner: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
             deferred_tool_loading: true,
@@ -4830,6 +4835,329 @@ mod rich_output_tests {
         }
     }
 
+    // ── tool-call events at the stream dispatch sites (single + parallel) ──
+
+    use crate::runtime::tool_call_events::{
+        call_fingerprint, ToolCallDecision, ToolCallDelivery, ToolCallOwner, ToolCallPhase,
+        ToolCallSubscription,
+    };
+
+    const TCE_SECRET: &str = "sk-ant-api03-STREAMTOOLCALLSECRET0123456789abcdef";
+
+    /// Returns a secret-shaped output.
+    struct SecretEcho;
+    #[async_trait::async_trait]
+    impl Tool for SecretEcho {
+        fn name(&self) -> &str {
+            "secret_echo"
+        }
+        fn description(&self) -> &str {
+            "echoes a credential"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{"text":{"type":"string"}}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok(format!("token={TCE_SECRET} at /tce-out/.secret"))
+        }
+    }
+
+    /// Always fails.
+    struct FailingProbe;
+    #[async_trait::async_trait]
+    impl Tool for FailingProbe {
+        fn name(&self) -> &str {
+            "failing_probe"
+        }
+        fn description(&self) -> &str {
+            "fails"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Err(crate::RuntimeError::Tool("probe failed".into()))
+        }
+    }
+
+    /// Answers every `before_tool_call` with `result`.
+    struct FixedHook(&'static str, HookResult);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for FixedHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            self.1.clone()
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// `bus` with its tool-call events on and one subscription.
+    fn subscribed(bus: &Arc<crate::extensions::hooks::HookBus>) -> ToolCallSubscription {
+        bus.tool_call_hub().set_enabled(true);
+        bus.tool_call_hub().subscribe().expect("events on: subscribe works")
+    }
+
+    fn drained(sub: &mut ToolCallSubscription) -> Vec<ToolCallDelivery> {
+        std::iter::from_fn(|| sub.try_next()).collect()
+    }
+
+    /// `(tool_id, phase[:decision|:status])` per record, in seq order.
+    fn phases_of(got: &[ToolCallDelivery]) -> Vec<(String, String)> {
+        got.iter()
+            .map(|d| {
+                let phase = match &d.record.phase {
+                    ToolCallPhase::Called { .. } => "called".to_string(),
+                    ToolCallPhase::Decided { decision, .. } => format!("decided:{decision:?}"),
+                    ToolCallPhase::Finished { status, .. } => format!("finished:{status:?}"),
+                };
+                (d.record.tool_id.clone(), phase)
+            })
+            .collect()
+    }
+
+    /// One stream turn whose first round asks for `tool_uses` (`(id, name,
+    /// input_json)`), as `conversation_id`, in `session_cwd`, with `owner`
+    /// on the session.
+    async fn drive_tool_call_events(
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        conversation_id: Option<&str>,
+        session_cwd: Option<std::path::PathBuf>,
+        owner: Option<ToolCallOwner>,
+    ) {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(tool_uses)).await;
+        let mut registry = ToolRegistry::new();
+        for t in tools_to_register {
+            registry.register(t);
+        }
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            session_manager,
+            hook_bus,
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        session.session_id = conversation_id.map(str::to_string);
+        session.cwd = session_cwd;
+        session.tool_call_owner = owner;
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish")
+        .expect("stream loop ok");
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+    }
+
+    /// Group 2 + group 7 (stream single and parallel): every call gives
+    /// called → decided(allow) → finished(ok) under its own tool id, in
+    /// increasing seq, with the same fp before and after the chain, and
+    /// `called.cwd` is the cwd the call's hook event got.
+    #[tokio::test]
+    async fn tool_call_events_record_each_call_on_the_single_and_the_parallel_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let single = &[("toolu_a", "session_probe", "{}")][..];
+        let parallel = &[("toolu_a", "session_probe", "{}"), ("toolu_b", "session_probe", "{}")][..];
+        for (uses, session_cwd) in [(single, Some(dir.path().to_path_buf())), (parallel, None)] {
+            let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = recording_hook_bus(hooks.clone()).await;
+            let mut sub = subscribed(&bus);
+            drive_tool_call_events(
+                vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(Vec::new()))))],
+                uses,
+                bus,
+                Some("conv-1"),
+                session_cwd.clone(),
+                None,
+            )
+            .await;
+            let hooks = hooks.lock().unwrap().clone();
+            let got = drained(&mut sub);
+            for (id, _, _) in uses {
+                let hook_cwd = hooks
+                    .iter()
+                    .find(|e| matches!(e.kind, HookKind::BeforeToolCall) && e.tool_call_id.as_deref() == Some(*id))
+                    .map(|e| e.cwd.clone())
+                    .expect("the call's before_tool_call event");
+                assert!(hook_cwd.is_some());
+                assert_eq!(hook_cwd, crate::extensions::hooks::events::effective_tool_cwd(session_cwd.as_deref()));
+                let called_cwd = got.iter().find_map(|d| match &d.record.phase {
+                    ToolCallPhase::Called { cwd, .. } if d.record.tool_id == *id => Some(cwd.clone()),
+                    _ => None,
+                });
+                assert_eq!(called_cwd, Some(hook_cwd), "{id}: called.cwd is the hook event's");
+            }
+            assert!(got.windows(2).all(|w| w[1].seq > w[0].seq), "seq increases: {got:?}");
+            assert!(got.iter().all(|d| d.dropped == 0));
+            for (id, _, _) in uses {
+                let mine: Vec<_> = got.iter().filter(|d| d.record.tool_id == *id).collect();
+                let phases: Vec<_> = phases_of(&got)
+                    .into_iter()
+                    .filter(|(t, _)| t == id)
+                    .map(|(_, p)| p)
+                    .collect();
+                assert_eq!(phases, ["called", "decided:Allow", "finished:Ok"], "{id}, {} use(s)", uses.len());
+                for d in &mine {
+                    assert_eq!(d.record.session_id.as_deref(), Some("conv-1"));
+                    assert_eq!(d.record.handle_id, None);
+                    assert_eq!((d.record.tool.as_str(), d.record.tool_runtime.as_str()), ("session_probe", "session_probe"));
+                }
+                let fps: Vec<_> = mine
+                    .iter()
+                    .filter_map(|d| match &d.record.phase {
+                        ToolCallPhase::Called { fp, .. } | ToolCallPhase::Decided { fp, .. } => Some(fp.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(fps, vec![call_fingerprint("session_probe", &json!({})); 2]);
+            }
+        }
+    }
+
+    /// Group 4 at the site: a blocked call is decided(block) by its blocker
+    /// and finished(blocked); a failing tool finishes `error`.
+    #[tokio::test]
+    async fn a_blocked_call_finishes_blocked_and_a_failing_one_error() {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+        bus.subscribe(
+            HookKind::BeforeToolCall,
+            Arc::new(FixedHook("guard", HookResult::Block { reason: "no".into() })),
+            Some("session_probe".into()),
+            None,
+            perms,
+        )
+        .await
+        .unwrap();
+        let mut sub = subscribed(&bus);
+        drive_tool_call_events(
+            vec![
+                Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(Vec::new())))),
+                Arc::new(FailingProbe),
+            ],
+            &[("toolu_blk", "session_probe", "{}"), ("toolu_err", "failing_probe", "{}")],
+            bus,
+            Some("conv-1"),
+            None,
+            None,
+        )
+        .await;
+        let got = drained(&mut sub);
+        let phases = phases_of(&got);
+        let of = |id: &str| -> Vec<String> {
+            phases.iter().filter(|(t, _)| t == id).map(|(_, p)| p.clone()).collect()
+        };
+        assert_eq!(of("toolu_blk"), ["called", "decided:Block", "finished:Blocked"]);
+        assert_eq!(of("toolu_err"), ["called", "decided:Allow", "finished:Error"]);
+        let decided = got
+            .iter()
+            .find(|d| d.record.tool_id == "toolu_blk" && matches!(d.record.phase, ToolCallPhase::Decided { .. }))
+            .unwrap();
+        assert!(matches!(
+            &decided.record.phase,
+            ToolCallPhase::Decided { decision: ToolCallDecision::Block, by, .. } if by == &["guard".to_string()]
+        ));
+    }
+
+    /// Group 7 (owner): a worker's calls carry its parent's session id and
+    /// its handle, while the worker's own session id stays `None`: its hook
+    /// events still say `null`. A worker's runtime has no cwd of its own
+    /// (`worker_runtime` sets none), so `called.cwd` is the process cwd.
+    #[tokio::test]
+    async fn a_workers_calls_carry_its_parent_and_handle_while_its_hooks_see_null() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bus = recording_hook_bus(events.clone()).await;
+        let mut sub = subscribed(&bus);
+        let owner = ToolCallOwner {
+            parent_session_id: Some("conv-parent".into()),
+            handle_id: "sa_3".into(),
+        };
+        drive_tool_call_events(
+            vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(Vec::new()))))],
+            &[("toolu_w1", "session_probe", "{}"), ("toolu_w2", "session_probe", "{}")],
+            bus,
+            None,
+            None,
+            Some(owner),
+        )
+        .await;
+        let got = drained(&mut sub);
+        assert_eq!(got.len(), 6, "{got:?}");
+        let process_cwd = crate::extensions::hooks::events::effective_tool_cwd(None);
+        assert!(process_cwd.is_some());
+        for d in &got {
+            assert_eq!(d.record.session_id.as_deref(), Some("conv-parent"));
+            assert_eq!(d.record.handle_id.as_deref(), Some("sa_3"));
+            if let ToolCallPhase::Called { cwd, .. } = &d.record.phase {
+                assert_eq!(cwd, &process_cwd, "a worker's base is the process cwd");
+            }
+        }
+        let hooks = events.lock().unwrap().clone();
+        assert!(!hooks.is_empty());
+        assert!(hooks.iter().all(|e| e.session_id.is_none()), "a worker's hooks keep null");
+    }
+
+    /// Group 5 at the site: neither the input nor the output (a secret,
+    /// a path) appears in any record or its Debug line.
+    #[tokio::test]
+    async fn tool_call_records_never_carry_the_input_or_the_output() {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut sub = subscribed(&bus);
+        let input = json!({"text": format!("{TCE_SECRET} /tce-in/input.txt")}).to_string();
+        let dir = tempfile::tempdir().unwrap();
+        drive_tool_call_events(
+            vec![Arc::new(SecretEcho)],
+            &[("toolu_s", "secret_echo", input.as_str())],
+            bus,
+            Some("conv-1"),
+            Some(dir.path().to_path_buf()),
+            None,
+        )
+        .await;
+        let got = drained(&mut sub);
+        assert_eq!(got.len(), 3, "{got:?}");
+        // The base directory is a path, not input or output: it is let through.
+        assert!(matches!(&got[0].record.phase, ToolCallPhase::Called { cwd: Some(_), .. }), "{got:?}");
+        for d in &got {
+            for text in [serde_json::to_string(&*d.record).unwrap(), format!("{d:?}")] {
+                for needle in [TCE_SECRET, "/tce-in", "input.txt", "/tce-out", ".secret", "token="] {
+                    assert!(!text.contains(needle), "{needle} leaked: {text}");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn rich_output_and_hook_replace() {
@@ -5459,6 +5787,7 @@ mod rich_output_tests {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            tool_call_owner: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
             deferred_tool_loading: true,
