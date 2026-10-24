@@ -132,6 +132,20 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A daemon reload or a park no longer drops the session's activated
+  tools.** Under progressive disclosure, an activated tool whose reference
+  left the history (after a context rollover) is part of the cached tools
+  array. The rebuilt runtime started with the core tools only, so the first
+  request after `synaps daemon reload` (or after an unpark) sent a shorter
+  tools array and rewrote the whole prompt cache (request traces, Oct 20–24:
+  five such requests inside the 1h cache TTL lost ~558k cached tokens) and
+  the model had to re-activate tools it was using. The reload record and the park now carry each activation's pins
+  (tool id, schema digest, trust provenance); the new runtime re-validates
+  them against its catalog at its first turn start and restores them. A
+  drifted or removed tool is dropped and logged, never re-granted.
+  `tools.activation_confirm = deny` drops them; `auto` and `prompt` restore
+  without a new prompt (the grant was already approved in this session).
+
 - **Bash and shell-session output keep multi-byte characters whole.** Output
   was decoded one read at a time, so a character split between two reads
   (box drawing, emoji, CJK, accents) reached the model as U+FFFD. The
