@@ -529,7 +529,7 @@ impl TranscriptStore {
                 }
                 // Show elapsed time while tool is running
                 let elapsed_str = if let Some(start) = self.tool_start_time() {
-                    let secs = start.elapsed().as_secs_f64();
+                    let secs = self.now().saturating_duration_since(start).as_secs_f64();
                     if secs >= 1.0 {
                         format!(" {:.1}s", secs)
                     } else {
@@ -645,7 +645,7 @@ impl TranscriptStore {
                 let is_last = i == self.messages().len() - 1;
                 if is_last && self.tool_start_time().is_some() {
                     let elapsed_str = if let Some(start) = self.tool_start_time() {
-                        let secs = start.elapsed().as_secs_f64();
+                        let secs = self.now().saturating_duration_since(start).as_secs_f64();
                         if secs >= 1.0 {
                             format!(" {:.1}s", secs)
                         } else {
@@ -983,11 +983,11 @@ impl TranscriptStore {
                         ),
                         Span::styled(elapsed_str, Style::default().fg(THEME.load().subagent_time)),
                     ]));
-                } else if !is_error && show > 0 {
+                } else if !is_error && (show > 0 || result_lines.is_empty()) {
                     if self.is_active_tool_result(i) {
                         // Tool still executing — show animation only for the active result.
                         let elapsed_str = if let Some(start) = self.tool_start_time() {
-                            let secs = start.elapsed().as_secs_f64();
+                            let secs = self.now().saturating_duration_since(start).as_secs_f64();
                             if secs >= 1.0 {
                                 format!(" {:.1}s", secs)
                             } else {
@@ -1024,13 +1024,16 @@ impl TranscriptStore {
                             Some(ms) => format!(" {}ms", ms),
                             None => String::new(),
                         };
+                        // A tool that printed nothing still ends: say so
+                        // rather than leave its card open-ended (#287).
+                        let summary = if result_lines.is_empty() {
+                            "no output".to_string()
+                        } else {
+                            format!("{} lines", result_lines.len())
+                        };
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!(
-                                    "{}     \u{2514}\u{2500} ok ({} lines)",
-                                    m,
-                                    result_lines.len()
-                                ),
+                                format!("{}     \u{2514}\u{2500} ok ({})", m, summary),
                                 Style::default().fg(THEME.load().tool_result_ok),
                             ),
                             Span::styled(

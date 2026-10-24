@@ -42,6 +42,7 @@ fn page(
         truncated: false,
         more: false,
         events,
+        ..WatchPage::default()
     }
 }
 
@@ -491,4 +492,208 @@ fn the_footer_names_slash_watch_when_there_are_workers() {
     let frame = h.snapshot();
     let footer = frame.lines().last().unwrap_or("");
     assert!(footer.contains("/watch list"), "{footer:?}");
+}
+// ── #287: tool cards in a worker view tick and get their footer ─────────────
+
+/// Answer the poll with `p` plus the journal timing a current daemon sends:
+/// `at_ms` per event and the journal's `now_ms` when it was read. Built as
+/// JSON so the page means the same to every client.
+fn answer_poll_timed(h: &mut TestHarness, p: WatchPage, at_ms: &[u64], now_ms: u64) {
+    assert!(h.watch_poll_due(), "a focused worker view polls");
+    let id = h.drive_watch_poll().expect("the poll went out");
+    let mut value = serde_json::to_value(p).unwrap();
+    value["at_ms"] = serde_json::json!(at_ms);
+    value["now_ms"] = serde_json::json!(now_ms);
+    h.feed_event(SessionEventWire::QueryResult { id, value });
+}
+
+fn bash_call(id: &str, command: &str) -> Vec<WatchEvent> {
+    vec![
+        WatchEvent::ResponseStart,
+        WatchEvent::ToolUseStart {
+            tool_id: id.into(),
+            tool_name: "bash".into(),
+        },
+        WatchEvent::ToolUse {
+            tool_id: id.into(),
+            tool_name: "bash".into(),
+            input: serde_json::json!({ "command": command }),
+        },
+    ]
+}
+
+/// The `❯ bash` header row of the card that runs `command`.
+fn card_header(frame: &str, command: &str) -> String {
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains(&format!("command: {command}")))
+        .unwrap_or_else(|| panic!("no card for {command:?}:\n{frame}"));
+    lines[..at]
+        .iter()
+        .rev()
+        .find(|l| l.contains("\u{276f} bash"))
+        .unwrap_or_else(|| panic!("no header above {command:?}:\n{frame}"))
+        .to_string()
+}
+
+/// #287: the running card's clock in a worker view advances as time passes,
+/// like the same card in the main thread (it stayed at `░ 0ms`).
+#[test]
+fn a_running_tool_card_in_a_worker_view_keeps_counting() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    start(&mut h, 4, "sleeper");
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(
+        &mut h,
+        page("sa_4", "sleeper", "running", bash_call("t1", "sleep 40"), 3),
+    );
+    let first = card_header(&h.snapshot(), "sleep 40");
+    assert!(first.contains("0ms"), "just started: {first:?}");
+
+    h.advance_clock_ms(3_000);
+    h.tick_animations(3);
+    let later = card_header(&h.snapshot(), "sleep 40");
+    assert!(later.contains("3.0s"), "the clock moved on: {later:?}");
+
+    h.advance_clock_ms(9_500);
+    h.tick_animations(3);
+    let later = card_header(&h.snapshot(), "sleep 40");
+    assert!(later.contains("12.5s"), "and keeps moving: {later:?}");
+}
+
+/// #287: a view opened while the tool is already running shows how long it
+/// has really been running (the journal says when it started), not the
+/// time since the view opened.
+#[test]
+fn a_view_opened_mid_tool_shows_the_tools_real_age() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    start(&mut h, 5, "sleeper");
+    ctrl(&mut h, KeyCode::Up);
+    let p = page("sa_5", "sleeper", "running", bash_call("t1", "sleep 40"), 3);
+    answer_poll_timed(&mut h, p, &[5_000, 5_000, 5_100], 17_100);
+    let header = card_header(&h.snapshot(), "sleep 40");
+    assert!(header.contains("12.0s"), "started 12s ago: {header:?}");
+
+    h.advance_clock_ms(5_000);
+    h.tick_animations(3);
+    let header = card_header(&h.snapshot(), "sleep 40");
+    assert!(header.contains("17.0s"), "{header:?}");
+}
+
+/// #287: a finished card gets its `└─ ok (n lines) Ns` footer, with the
+/// tool's real duration even when its start and its result arrive in the
+/// same page (a view opened late, or one left and come back to).
+#[test]
+fn a_finished_tool_card_in_a_worker_view_gets_its_footer_and_duration() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    start(&mut h, 6, "lister");
+    ctrl(&mut h, KeyCode::Up);
+    let mut events = bash_call("t1", "ls crates");
+    events.push(WatchEvent::ToolResult {
+        tool_id: "t1".into(),
+        result: "agent-engine\nagent-tui".into(),
+    });
+    events.push(WatchEvent::Text {
+        text: "done".into(),
+    });
+    let p = page("sa_6", "lister", "running", events, 5);
+    answer_poll_timed(&mut h, p, &[1_000, 1_000, 1_200, 41_000, 41_500], 41_600);
+    let frame = h.snapshot();
+    let footer = frame
+        .lines()
+        .find(|l| l.contains("\u{2514}\u{2500} ok"))
+        .unwrap_or_else(|| panic!("no ok footer:\n{frame}"));
+    assert!(footer.contains("ok (2 lines) 40.0s"), "{footer:?}");
+}
+
+/// #287 (the issue's own repro): `sleep 40` prints nothing. Its card still
+/// gets the `└─ ok` footer once it finishes — it ended with nothing under
+/// the command.
+#[test]
+fn a_finished_tool_with_no_output_still_gets_its_footer() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    start(&mut h, 7, "sleeper");
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(
+        &mut h,
+        page("sa_7", "sleeper", "running", bash_call("t1", "sleep 40"), 3),
+    );
+    h.advance_clock_ms(40_000);
+    h.tick_animations(3);
+    let result = vec![
+        WatchEvent::ToolResult {
+            tool_id: "t1".into(),
+            result: String::new(),
+        },
+        WatchEvent::Text {
+            text: "done".into(),
+        },
+    ];
+    answer_poll(&mut h, page("sa_7", "sleeper", "running", result, 5));
+    let frame = h.snapshot();
+    let footer = frame
+        .lines()
+        .find(|l| l.contains("\u{2514}\u{2500} ok"))
+        .unwrap_or_else(|| panic!("no ok footer:\n{frame}"));
+    assert!(footer.contains("ok (no output) 40.0s"), "{footer:?}");
+    let header = card_header(&frame, "sleep 40");
+    assert!(
+        !header.contains("ms") && !header.contains("s "),
+        "done: no clock on the header: {header:?}"
+    );
+}
+
+/// #287 parity: the same card in the main thread — the behaviour a worker
+/// view now matches (clock ticks, footer with its duration once done).
+#[test]
+fn the_same_card_in_the_main_thread_ticks_and_gets_its_footer() {
+    use agent_engine::LlmEvent;
+    let mut h = TestHarness::boot_with_size(120, 30);
+    h.set_streaming(true);
+    for ev in bash_call("m1", "sleep 40") {
+        h.feed_event(SessionEventWire::Stream(ev.to_stream().unwrap()));
+    }
+    h.advance_clock_ms(3_000);
+    h.tick_animations(3);
+    let header = card_header(&h.snapshot(), "sleep 40");
+    assert!(header.contains("3.0s"), "{header:?}");
+
+    h.advance_clock_ms(37_000);
+    h.feed_event(SessionEventWire::Stream(StreamEvent::Llm(
+        LlmEvent::ToolResult {
+            tool_id: "m1".into(),
+            result: String::new(),
+        },
+    )));
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("\u{2514}\u{2500} ok (no output) 40.0s"),
+        "{frame}"
+    );
+}
+
+/// A worker view's tick never dirties the hidden main transcript, and an
+/// unfocused worker view's card is left alone until it is looked at.
+#[test]
+fn only_the_focused_views_running_card_is_ticked() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    start(&mut h, 8, "sleeper");
+    ctrl(&mut h, KeyCode::Up);
+    answer_poll(
+        &mut h,
+        page("sa_8", "sleeper", "running", bash_call("t1", "sleep 40"), 3),
+    );
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(h.watched(), None);
+    h.advance_clock_ms(5_000);
+    h.tick_animations(3);
+    let main = h.snapshot();
+    assert!(!main.contains("sleep 40"), "main shows none of it:\n{main}");
+
+    // Back in the view: the card is re-rendered at its current age.
+    ctrl(&mut h, KeyCode::Up);
+    h.tick_animations(3);
+    let header = card_header(&h.snapshot(), "sleep 40");
+    assert!(header.contains("5.0s"), "{header:?}");
 }

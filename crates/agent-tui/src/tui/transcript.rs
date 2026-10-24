@@ -597,6 +597,11 @@ pub(crate) struct TranscriptStore {
     /// each show their own elapsed-time on the result block, instead of
     /// sharing a single timer that the last-started tool clobbers.
     tool_start_times: std::collections::HashMap<String, std::time::Instant>,
+    /// When the event being applied happened, if not "now": a subagent view
+    /// applies its journal only when it polls, so it replays each event at
+    /// the time the engine recorded it ([`Self::set_event_time`]). `None`
+    /// (the main thread, always): the event is happening now.
+    event_time: Option<std::time::Instant>,
 
     // ── Viewport geometry (moved in slice e) ─────────────────────────────────
     /// Inner content rect of the message area as of the last
@@ -681,6 +686,7 @@ impl TranscriptStore {
             worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
+            event_time: None,
             viewport: None,
             visible_range: None,
             selection_anchor: None,
@@ -698,6 +704,36 @@ impl TranscriptStore {
     pub(crate) fn set_scrollback(&mut self, msgs: usize, bytes: usize) {
         self.max_msgs = msgs;
         self.max_bytes = bytes;
+    }
+
+    /// The store's clock — what running tool timers count up to.
+    pub(crate) fn now(&self) -> std::time::Instant {
+        self.clock.now()
+    }
+
+    /// Apply the following events as having happened at `at` (`None`: now).
+    /// Tool timers start, and finished tools are timed, from it. Never later
+    /// than now: a running clock must not start out negative.
+    pub(crate) fn set_event_time(&mut self, at: Option<std::time::Instant>) {
+        let now = self.clock.now();
+        self.event_time = at.map(|t| t.min(now));
+    }
+
+    /// When the event being applied happened (see `event_time`).
+    fn event_now(&self) -> std::time::Instant {
+        self.event_time.unwrap_or_else(|| self.clock.now())
+    }
+
+    /// The `HH:MM` a message pushed now is stamped with: the wall-clock time
+    /// of the event being applied (a subagent view's steer shows when the
+    /// worker took it, not when the view polled).
+    fn event_stamp(&self) -> String {
+        let ago = self.event_time.map_or(std::time::Duration::ZERO, |t| {
+            self.clock.now().saturating_duration_since(t)
+        });
+        let wall = chrono::Local::now()
+            - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero());
+        wall.format("%H:%M").to_string()
     }
 
     /// Mark this store as a subagent view's (see `worker_view`).
@@ -1065,7 +1101,7 @@ impl TranscriptStore {
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
         self.messages.push(TimestampedMsg {
             msg,
-            time: chrono::Local::now().format("%H:%M").to_string(),
+            time: self.event_stamp(),
         });
         // Auto-scroll only when pinned to bottom
         if self.scroll_pinned {
@@ -1128,7 +1164,7 @@ impl TranscriptStore {
                     at,
                     TimestampedMsg {
                         msg,
-                        time: chrono::Local::now().format("%H:%M").to_string(),
+                        time: self.event_stamp(),
                     },
                 );
                 if self.scroll_pinned {
@@ -2538,7 +2574,7 @@ impl TranscriptStore {
     /// elapsed-ms is correct under parallel execution.
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
         self.drop_empty_thinking();
-        let now = self.clock.now();
+        let now = self.event_now();
         self.tool_start_time = Some(now);
         if !tool_id.is_empty() {
             self.tool_start_times.insert(tool_id.clone(), now);
@@ -2590,7 +2626,7 @@ impl TranscriptStore {
         self.drop_empty_thinking();
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
-        let now = self.clock.now();
+        let now = self.event_now();
         if !tool_id.is_empty() {
             self.tool_start_times.entry(tool_id.clone()).or_insert(now);
         }
@@ -2654,10 +2690,11 @@ impl TranscriptStore {
     /// this `tool_id` (including a delta-buffered one) and stamps the
     /// elapsed time using the per-tool start time.
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
+        let now = self.event_now();
         let elapsed = self
             .tool_start_times
             .remove(&tool_id)
-            .map(|t| t.elapsed().as_millis() as u64);
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64);
         // Clear the shared "active tool" timer once the *latest* tool
         // finishes — otherwise the bash trace animation lingers.
         if self.tool_start_times.is_empty() {

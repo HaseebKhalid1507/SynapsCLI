@@ -146,7 +146,6 @@ impl Threads {
 }
 
 /// The focused thread's transcript (read).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn active<'a>(main: &'a TranscriptStore, threads: &'a Threads) -> &'a TranscriptStore {
     match &threads.focus {
         ThreadFocus::Main => main,

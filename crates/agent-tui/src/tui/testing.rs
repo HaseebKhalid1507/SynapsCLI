@@ -794,6 +794,17 @@ impl TestHarness {
         self
     }
 
+    /// Run `frames` animation ticks exactly as the run loop's tick arm
+    /// does for the message area (spinner advance + tail invalidation).
+    /// Pair with [`Self::advance_clock_ms`] to let a running tool's clock
+    /// move between frames.
+    pub fn tick_animations(&mut self, frames: usize) -> &mut Self {
+        for _ in 0..frames {
+            self.app.tick_message_animations();
+        }
+        self
+    }
+
     /// Publish a toast with an explicit TTL (seconds) through the same
     /// provider the app uses. Expiry is governed by the frozen clock.
     pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {

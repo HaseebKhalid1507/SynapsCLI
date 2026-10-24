@@ -759,12 +759,7 @@ pub(crate) async fn handle_animation_tick(
         // Header block sweep + spinner (~20 fps; wall-clock speed).
         app.request_redraw();
     }
-    if app.advance_animations() {
-        // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
-        // active tool animation). Mark just the last slot dirty instead of
-        // full invalidation — O(1) instead of O(n) per frame.
-        app.invalidate_last();
-    }
+    app.tick_message_animations();
     if let Some(msg) = app.check_gamba_exited() {
         // check_gamba_exited() already called restore_terminal();
         // resume the render thread now that we own the terminal again.
